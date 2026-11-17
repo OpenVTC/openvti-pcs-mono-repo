@@ -144,5 +144,3 @@ lattice-plain = ["lattice"]
 lattice-extractable = ["lattice"]
 
 # Optimise test builds: the tests are dominated by pairings and scalar multiplications.
-[profile.test]
-opt-level = 3

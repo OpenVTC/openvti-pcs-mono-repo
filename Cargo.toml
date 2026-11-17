@@ -1087,6 +1087,11 @@ split-debuginfo = "packed"
 debug = false
 opt-level = 2
 
+# The pairing arithmetic of pcs/ is unusably slow unoptimised; its upstream
+# manifest sets this for its own tests.
+[profile.test.package.predicate-credential-system]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
