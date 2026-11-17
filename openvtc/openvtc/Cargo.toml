@@ -40,6 +40,7 @@ anyhow.workspace = true
 # commit-msg hook, so the Repos view and `openvtc repo sign` can set up and
 # check commit signing for a persona. Version and the `vta-sdk` lockstep rule
 # live in the root manifest.
+did-git-sign.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -102,5 +103,7 @@ openvtc-core = { workspace = true, features = ["test-support"] }
 name = "openvtc"
 path = "src/main.rs"
 
-[lints]
-workspace = true
+# OpenVTC's own lint table (its workspace denied rather than forbade
+# `unsafe_code`, so the TUI's one audited `libc::poll` can opt out).
+[lints.rust]
+unsafe_code = "deny"

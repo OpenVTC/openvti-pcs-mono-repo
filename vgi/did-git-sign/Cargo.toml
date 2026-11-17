@@ -1,0 +1,82 @@
+[package]
+name = "did-git-sign"
+description = "Git commit signing proxy using DID Ed25519 keys via VTA"
+readme = "README.md"
+keywords = ["git", "did", "ssh", "commit-signing", "vta"]
+categories = ["command-line-utilities", "cryptography"]
+version = "0.33.0"
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/OpenVTC/verifiable-git-infrastructure"
+
+[lib]
+name = "did_git_sign"
+path = "src/lib.rs"
+
+[[bin]]
+name = "did-git-sign"
+path = "src/main.rs"
+
+[features]
+# TSP is a default transport: `init` provisions over the VTA's advertised
+# bindings (TSP, then DIDComm) and a VTA that publishes no REST service is
+# reachable only that way. A build without it skips the TSP leg ("built
+# without the `tsp` feature") and falls back to DIDComm.
+default = ["tsp"]
+tsp = ["vta-sdk/tsp"]
+# Test-only: lets DID_GIT_SIGN_BYPASS_POLICY skip the parent-process check.
+# Never enable it in a published or released build; with it on, a build
+# without debug assertions (any release profile) fails to compile.
+insecure-policy-bypass = []
+
+[dependencies]
+# Shared sshsig codec (create_ssh_signature) — kept in lockstep with the verifier.
+vgi-core = { workspace = true }
+vta-sdk = { workspace = true, features = [
+    "client",
+    "session",
+    "didcomm",
+    "provision-client",
+    # DID → human name for the setup pickers and `health`.
+    "agent-names",
+    # The platform credential store, chosen exactly as OpenVTC chooses it
+    # (`keyring_init::install_default_store`), so the credential OpenVTC
+    # writes through this crate is the one this binary reads.
+    "keyring",
+] }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+keyring-core = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+dirs = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+multibase = { workspace = true }
+# Parses the VTA URL for the transport check (vta.rs).
+url = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dialoguer = { workspace = true }
+# 0.39 as released (v0.33.0); the workspace pins 0.40, whose System::new is fallible.
+sysinfo = "0.39"
+chrono = { workspace = true }
+hex = { workspace = true }
+
+# The kernel keyring: did-git-sign <= 0.18.1 kept its credentials here on Linux.
+# Read on a miss in the platform store and copied across (store.rs), and
+# selectable with OPENVTC_SECURE_STORE=keyutils to match OpenVTC.
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+rand = "0.8"
+proptest = { workspace = true }

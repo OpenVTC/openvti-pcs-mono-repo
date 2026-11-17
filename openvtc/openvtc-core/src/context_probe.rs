@@ -111,14 +111,27 @@ impl ProbeOutcome {
     }
 }
 
+/// The filter for "the did:webvh DIDs in this context" over the VTA's
+/// method-neutral `vta/dids/list`, which replaced the webvh-only listing.
+pub(crate) fn webvh_dids_in(context_id: &str) -> vta_sdk::client::DidListFilter {
+    vta_sdk::client::DidListFilter {
+        context_id: Some(context_id.to_string()),
+        methods: Some(vec!["webvh".to_string()]),
+        ..Default::default()
+    }
+}
+
 /// Ask `context_id` what it already contains.
 ///
 /// Read-only, and cheap — three list calls against a context we have just
 /// authenticated to (D6). Runs on every setup rather than behind a flag,
 /// because a user who needs the answer is by definition not expecting to.
 pub async fn probe(client: &VtaClient, context_id: &str) -> ProbeOutcome {
-    let dids = match client.list_dids_webvh(Some(context_id), None).await {
-        Ok(body) => body.dids,
+    let dids = match client
+        .list_dids(&webvh_dids_in(context_id))
+        .await
+    {
+        Ok(dids) => dids,
         Err(e) => {
             // The listing OpenVTC most depends on. If this one is refused the
             // probe cannot claim the context is empty, so it says so.
@@ -147,7 +160,7 @@ pub async fn probe(client: &VtaClient, context_id: &str) -> ProbeOutcome {
     };
 
     let contents = ContextContents {
-        persona_dids: dids.into_iter().map(|d| d.did).collect(),
+        persona_dids: dids.into_iter().map(|d| d.did.to_string()).collect(),
         sub_context_count,
     };
 

@@ -51,6 +51,9 @@ members = [
   "vti/room-host",
   "vti/vti-witness",
   "vti/vti-voting-service",
+  # OpenVTC's commit signer (from verifiable-git-infrastructure), built against
+  # the in-repo vta-sdk.
+  "vgi/did-git-sign",
   "openvtc/openvtc-core",
   "openvtc/openvtc",
 ]
@@ -1048,6 +1051,12 @@ strum_macros = "0.28"
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 tokio-stream = "0.1"
 tui-input = "0.15"
+# did-git-sign (vgi/) and OpenVTC's git-signing panel. vgi-core has no VTA
+# dependency, so it stays the published crate.
+did-git-sign = { version = "0.33.0", path = "vgi/did-git-sign" }
+vgi-core = "0.33.0"
+serial_test = "4"
+proptest = "1"
 openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
 openpgp-card-rpgp = "0.8"

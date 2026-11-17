@@ -38,8 +38,10 @@ test-support = []
 # The commit signer the Repos panel sets up for a persona (`git_signing`): its
 # library writes the keyring entry, profile and include file exactly as
 # `did-git-sign init --profile` does. Version rule: see the root manifest.
+did-git-sign.workspace = true
 # The SSHSIG encoding did-git-sign signs with, to check the VTA's proof
 # signature (`git_signing::verify_signer`). Same release as did-git-sign.
+vgi-core.workspace = true
 
 aes-gcm.workspace = true
 anyhow.workspace = true
@@ -157,5 +159,7 @@ harness = false
 [target.'cfg(windows)'.dev-dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }
 
-[lints]
-workspace = true
+# OpenVTC's own lint table (its workspace denied rather than forbade
+# `unsafe_code`, so the TUI's one audited `libc::poll` can opt out).
+[lints.rust]
+unsafe_code = "deny"

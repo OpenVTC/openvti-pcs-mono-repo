@@ -1,0 +1,656 @@
+use anyhow::{Context, Result};
+use ed25519_dalek::SigningKey;
+use std::io::Read;
+use std::path::Path;
+use vgi_core::{
+    GIT_SSHSIG_NAMESPACE, assemble_ssh_signature, create_ssh_signature, sshsig_message_hash,
+};
+
+use crate::config::{self, SigningConfig};
+use crate::policy;
+use crate::vta;
+
+/// Refuse to sign in any sshsig namespace other than `git`.
+///
+/// git signs commits, tags and push certificates in the `git` namespace, and
+/// that is the only use the persona key is provisioned for. Without this, the
+/// same key would sign for `file`, `email` or any other namespace a caller
+/// passes with `-n`. This is friction against misuse through this binary, not
+/// a boundary: see the security model in [`crate::policy`].
+fn check_namespace(namespace: &str) -> Result<()> {
+    if namespace == GIT_SSHSIG_NAMESPACE {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "did-git-sign: refusing to sign in sshsig namespace {namespace:?}. did-git-sign only \
+         signs git objects, in the {GIT_SSHSIG_NAMESPACE:?} namespace; use ssh-keygen with a \
+         separate key for other namespaces."
+    )
+}
+
+/// Environment variable that selects which persona signs (R-G-1), as a
+/// per-invocation override. Its value is the persona's `did:webvh:…#key-N`.
+pub const SIGNING_KEY_ENV: &str = "DID_GIT_SIGN_KEY";
+
+/// Per-repo git config key that selects which persona signs (R-G-1):
+/// `git config did-git-sign.key did:webvh:…#key-N`.
+pub const SIGNING_KEY_GIT_CONFIG: &str = "did-git-sign.key";
+
+/// Environment variable choosing where the signature is made — see [`SignerMode`].
+pub const SIGNER_ENV: &str = "DID_GIT_SIGN_SIGNER";
+
+/// Git config key choosing where the signature is made — see [`SignerMode`].
+pub const SIGNER_GIT_CONFIG: &str = "did-git-sign.signer";
+
+/// Where the signature is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerMode {
+    /// The VTA signs (`keys/sign-sshsig`) and the key never leaves it. A VTA
+    /// that does not serve the task is an error, never a reason to export.
+    Vta,
+    /// The VTA signs where it can; against a VTA that predates
+    /// `keys/sign-sshsig`, the key is exported for the one signature, with a
+    /// warning. The default, so existing installs keep signing.
+    Auto,
+    /// The key is exported and the signature made here — the behaviour before
+    /// `keys/sign-sshsig` existed.
+    Export,
+}
+
+impl std::fmt::Display for SignerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SignerMode::Vta => "vta",
+            SignerMode::Auto => "auto",
+            SignerMode::Export => "export",
+        })
+    }
+}
+
+impl SignerMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim() {
+            "vta" => Ok(SignerMode::Vta),
+            "auto" | "" => Ok(SignerMode::Auto),
+            "export" => Ok(SignerMode::Export),
+            other => anyhow::bail!(
+                "did-git-sign: unknown signer {other:?} (from {SIGNER_ENV} or \
+                 `git config {SIGNER_GIT_CONFIG}`); expected vta, auto or export"
+            ),
+        }
+    }
+}
+
+/// The signer mode: [`SIGNER_ENV`] over [`SIGNER_GIT_CONFIG`] over
+/// [`SignerMode::Auto`].
+pub fn resolve_signer_mode() -> Result<SignerMode> {
+    if let Ok(v) = std::env::var(SIGNER_ENV)
+        && !v.trim().is_empty()
+    {
+        return SignerMode::parse(&v);
+    }
+    match git_config_get(SIGNER_GIT_CONFIG) {
+        Some(v) => SignerMode::parse(&v),
+        None => Ok(SignerMode::Auto),
+    }
+}
+
+/// Sign `data` with the persona's key: by the VTA where `mode` allows it,
+/// otherwise by exporting the key for this one signature.
+pub async fn sign_with_vta(
+    client: &vta_sdk::client::VtaClient,
+    key_id: &str,
+    namespace: &str,
+    data: &[u8],
+    mode: SignerMode,
+) -> Result<String> {
+    if mode != SignerMode::Export {
+        match vta::sign_sshsig(client, key_id, &sshsig_message_hash(data)).await? {
+            vta::RemoteSignature::Signed(raw) => {
+                let verifying_key = vta::signing_public_key(client, key_id).await?;
+                return assemble_ssh_signature(&verifying_key, namespace, data, &raw);
+            }
+            vta::RemoteSignature::Unsupported if mode == SignerMode::Vta => anyhow::bail!(
+                "did-git-sign: this VTA does not serve keys/sign-sshsig, and {SIGNER_GIT_CONFIG} \
+                 is `vta`, so the key will not be exported to sign locally. Upgrade the VTA, or \
+                 set `git config {SIGNER_GIT_CONFIG} auto` to allow the export."
+            ),
+            vta::RemoteSignature::Unsupported => eprintln!(
+                "did-git-sign: warning: this VTA does not serve keys/sign-sshsig; exporting the \
+                 key to sign locally. Set `git config {SIGNER_GIT_CONFIG} vta` to refuse instead."
+            ),
+            vta::RemoteSignature::NotPermitted(why) if mode == SignerMode::Vta => anyhow::bail!(
+                "did-git-sign: the VTA will not sign with this credential ({why}), and \
+                 {SIGNER_GIT_CONFIG} is `vta`, so the key will not be exported to sign locally. \
+                 Give the credential the sign-sshsig capability (`pnm acl update <credential DID> \
+                 --capabilities sign-sshsig`; `did-git-sign health` names the credential), or set \
+                 `git config {SIGNER_GIT_CONFIG} auto` to allow the export."
+            ),
+            // A credential provisioned before keys/sign-sshsig existed may hold
+            // only `key-export`. `auto` keeps it signing, as it was, and says
+            // how to stop the key leaving the VTA.
+            vta::RemoteSignature::NotPermitted(why) => eprintln!(
+                "did-git-sign: warning: this credential may not ask the VTA to sign ({why}); \
+                 exporting the key to sign locally. Give it the sign-sshsig capability \
+                 (`pnm acl update <credential DID> --capabilities sign-sshsig,key-export`) so the \
+                 key stays in the VTA."
+            ),
+        }
+    }
+    let seed = vta::get_signing_key(client, key_id).await?;
+    let signing_key = SigningKey::from_bytes(seed.as_bytes());
+    let verifying_key = signing_key.verifying_key();
+    create_ssh_signature(&signing_key, &verifying_key, namespace, data)
+}
+
+/// Where the effective signing-key selection came from (for clear diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// The [`SIGNING_KEY_ENV`] environment variable.
+    Env,
+    /// The [`SIGNING_KEY_GIT_CONFIG`] per-repo git config setting.
+    GitConfig,
+    /// The `did_key_id` from the config file git passed via `-f`.
+    ConfigFile,
+}
+
+impl std::fmt::Display for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            KeySource::Env => "the DID_GIT_SIGN_KEY environment variable",
+            KeySource::GitConfig => "git config did-git-sign.key",
+            KeySource::ConfigFile => "the did-git-sign config file",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Pure selection precedence (R-G-1): env var > per-repo git config > the config
+/// file's own `did_key_id`. Whitespace is trimmed and an empty value is treated
+/// as unset, so an exported-but-empty variable doesn't shadow the others.
+fn select_signing_key(
+    config_did: &str,
+    env: Option<&str>,
+    git: Option<&str>,
+) -> (String, KeySource) {
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(v) = clean(env) {
+        return (v, KeySource::Env);
+    }
+    if let Some(v) = clean(git) {
+        return (v, KeySource::GitConfig);
+    }
+    (config_did.to_string(), KeySource::ConfigFile)
+}
+
+/// Read the per-repo git config selector (`did-git-sign.key`), if set. Runs in
+/// the current directory — git sets the signer's cwd to the repo.
+fn git_config_signing_key() -> Option<String> {
+    git_config_get(SIGNING_KEY_GIT_CONFIG)
+}
+
+/// `git config --get <key>` in the current directory, if set and non-empty.
+fn git_config_get(key: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Resolve the effective signing `did_key_id` and where it came from (R-G-1),
+/// reading the env var and the per-repo git config around the pure
+/// [`select_signing_key`].
+fn resolve_signing_key(config_did: &str) -> (String, KeySource) {
+    let env = std::env::var(SIGNING_KEY_ENV).ok();
+    let git = git_config_signing_key();
+    select_signing_key(config_did, env.as_deref(), git.as_deref())
+}
+
+/// The bare DID of a verification-method id (`did:webvh:…#key-0` → `did:webvh:…`).
+fn bare_did(did_key_id: &str) -> &str {
+    did_key_id
+        .split(['#', '?', '/'])
+        .next()
+        .unwrap_or(did_key_id)
+}
+
+/// Refuse to sign a commit whose signer identity disagrees with the key
+/// being used (R-G-3).
+///
+/// Two settings choose an identity — the DID the commit claims, and the
+/// persona selection that picks the key — and when they name different DIDs
+/// the commit is born unverifiable. `verify-trust` would reject it as
+/// `unknownKey`: the claimed DID does not publish the key that signed. That
+/// is a correct verdict pointing at the wrong thing, arriving in CI, on a
+/// commit already written. Catching it here turns a confusing remote failure
+/// into a local one that names both halves.
+///
+/// The claim is read the same way `verify-trust` reads it — [`signer_did`]:
+/// the `Signed-by-DID:` trailer first, then the committer email for legacy
+/// commits. At sign time the trailer may already be present (the commit-msg
+/// hook ran) or absent (no hook, legacy flow), so only a *conflicting* claim
+/// is refused.
+///
+/// Only commit-shaped payloads are checked. A payload with no `committer`
+/// header (a tag, or a non-git namespace) carries no claim to disagree with.
+/// The comparison is on **bare DIDs**, matching what the verifier actually
+/// requires — signing with `#key-1` while the claim says `#key-0` verifies
+/// fine, since the check is that the DID publishes the key, not which one.
+fn check_committer_matches_key(data: &[u8], did_key_id: &str, source: KeySource) -> Result<()> {
+    use vgi_core::{committer_identity, conflicting_signer_dids, same_signer, signer_did};
+
+    let signing_did = bare_did(did_key_id);
+
+    // Two explicit claims that disagree with each other. No key satisfies
+    // both, so there is no point asking which one matches ours —
+    // `verify-trust` fails the commit closed whichever key signs it.
+    if let Some((trailer, committer)) = conflicting_signer_dids(data) {
+        anyhow::bail!(
+            "did-git-sign: Signed-by-DID trailer claims '{trailer}' but committer claims \
+             '{committer}'. Remove one claim or make them match before signing."
+        );
+    }
+
+    match signer_did(data) {
+        Some(claimed) if same_signer(&claimed, signing_did) => Ok(()),
+        Some(claimed) => anyhow::bail!(
+            "did-git-sign: this commit claims signer '{claimed}' but would be signed with a key \
+             held by '{signing_did}' (selected via {source}), so it would fail verification as \
+             unknownKey. Point the claim at the signing key — \
+             `git config did-git-sign.key '{did_key_id}'` for the Signed-by-DID trailer, or \
+             `git config user.email` for a legacy DID committer — or select the persona \
+             matching the claim."
+        ),
+        // Tags and non-git namespaces carry no committer header, so there is
+        // no commit identity claim for this guard to compare.
+        None if committer_identity(data).is_none() => Ok(()),
+        // A committer exists but neither it nor a trailer names a DID: the
+        // commit-msg hook did not run.
+        None => anyhow::bail!(
+            "did-git-sign: no Signed-by-DID trailer and user.email is not a DID, so the commit \
+             would state no signer identity and fail verification as noSignerDid. Run \
+             'did-git-sign init' to install the commit-msg hook, or set user.email to \
+             '{did_key_id}'."
+        ),
+    }
+}
+
+/// The most [`handle_sign`] reads to sign. git signs commit and tag objects
+/// (and push certificates), which name their trees rather than contain them:
+/// a real one is kilobytes. Anything larger is not git's, and is refused
+/// before it is held in memory whole.
+pub const MAX_SIGN_INPUT: u64 = 16 * 1024 * 1024;
+
+/// Read all of `input`, refusing more than [`MAX_SIGN_INPUT`] bytes.
+fn read_bounded(input: impl Read) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    input.take(MAX_SIGN_INPUT + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_SIGN_INPUT {
+        anyhow::bail!(
+            "refusing to sign more than {MAX_SIGN_INPUT} bytes: git's commit and tag objects \
+             are far smaller"
+        );
+    }
+    Ok(buf)
+}
+
+/// Handle the signing invocation from git.
+/// Git calls: `did-git-sign -Y sign -f <config_path> -n <namespace> <file_to_sign>`
+/// The file to sign is passed as a positional argument; the armored SSH signature is written
+/// to `<file_to_sign>.sig` on disk, matching ssh-keygen behaviour. Falls back to stdout
+/// when no file argument is present (stdin mode).
+pub async fn handle_sign(
+    config_path: &Path,
+    namespace: &str,
+    sign_file: Option<&Path>,
+) -> Result<()> {
+    // Checked before anything is read, so a refused namespace touches neither
+    // the buffer nor the VTA.
+    check_namespace(namespace)?;
+
+    // Read data to sign from the file argument (git passes the buffer file path)
+    // or fall back to stdin for compatibility.
+    let data = if let Some(path) = sign_file {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to read file to sign: {}", path.display()))?;
+        read_bounded(file)
+            .with_context(|| format!("failed to read file to sign: {}", path.display()))?
+    } else {
+        read_bounded(std::io::stdin()).context("failed to read data from stdin")?
+    };
+
+    // Policy gate: parent process must be git, audit every attempt. This
+    // guards against accidental and naive use, not against code running as
+    // the user; see the module docs of `policy`.
+    let decision = policy::evaluate(namespace, sign_file, &data);
+    policy::write_audit(&decision);
+    if !decision.allowed {
+        anyhow::bail!(
+            "did-git-sign: signing refused by policy (parent process {:?} is not git). \
+             did-git-sign signs only when git runs it as gpg.ssh.program. \
+             Attempt recorded in {}.",
+            decision.parent_name.as_deref().unwrap_or("<unknown>"),
+            policy::audit_log_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<audit log unavailable>".to_string())
+        );
+    }
+
+    // Load the config git pointed us at (`-f`).
+    let cfg = SigningConfig::load(config_path)?;
+
+    // R-G-1: resolve which community persona signs — an env var or a per-repo
+    // git-config setting may override the config file's persona. R-G-2: when an
+    // override names a persona with no stored credentials, fail clearly rather
+    // than silently signing as an arbitrary (the config file's) persona.
+    let (did_key_id, source) = resolve_signing_key(&cfg.did_key_id);
+    if did_key_id != cfg.did_key_id && config::load_vta_credentials(&did_key_id).is_err() {
+        anyhow::bail!(
+            "did-git-sign: the signing persona '{did_key_id}' selected via {source} has no \
+             stored credentials. Run `did-git-sign init` for that persona, or clear the \
+             override ({} / `git config --unset {}`).",
+            SIGNING_KEY_ENV,
+            SIGNING_KEY_GIT_CONFIG,
+        );
+    }
+    // R-G-3: the committer header is the identity claim this signature will be
+    // checked against. Refuse now if it names a different DID than the key we
+    // are about to sign with — see [`check_committer_matches_key`].
+    check_committer_matches_key(&data, &did_key_id, source)?;
+
+    let cfg = SigningConfig {
+        did_key_id,
+        user_name: cfg.user_name,
+    };
+
+    // Read before any I/O, so a mistyped setting fails without touching the VTA.
+    let mode = resolve_signer_mode()?;
+
+    let (client, creds) = vta::authenticate(&cfg).await?;
+    let signature = sign_with_vta(&client, &creds.key_id, namespace, &data, mode).await?;
+
+    // Write the signature to <file>.sig, mirroring ssh-keygen -Y sign behaviour.
+    // Git reads the signature back from that path after the signing program exits.
+    // Fall back to stdout only when no input file was given (stdin mode).
+    if let Some(path) = sign_file {
+        // Append ".sig" to the full path (not replace the extension), matching ssh-keygen.
+        let mut sig_os = path.as_os_str().to_owned();
+        sig_os.push(".sig");
+        let sig_path = std::path::PathBuf::from(sig_os);
+        std::fs::write(&sig_path, signature.as_bytes())
+            .with_context(|| format!("failed to write signature to {}", sig_path.display()))?;
+    } else {
+        print!("{signature}");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIGNER: &str = "did:webvh:QmSigner:example.com";
+
+    #[test]
+    fn input_up_to_the_bound_is_read_and_past_it_refused() {
+        let limit = MAX_SIGN_INPUT as usize;
+        assert_eq!(read_bounded(&vec![7u8; limit][..]).unwrap().len(), limit);
+        let err = read_bounded(&vec![7u8; limit + 1][..]).unwrap_err();
+        assert!(err.to_string().contains("refusing to sign"), "{err}");
+        // An endless input stops at the bound instead of exhausting memory.
+        assert!(read_bounded(std::io::repeat(0)).is_err());
+    }
+
+    fn commit_committed_by(committer: &str) -> Vec<u8> {
+        format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A U Thor <a@example.com> 1700000000 +0000\n\
+             committer A U Thor <{committer}> 1700000000 +0000\n\
+             \n\
+             a message\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_matching_committer_and_key_may_sign() {
+        let commit = commit_committed_by(&format!("{SIGNER}#key-0"));
+        assert!(
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-0"), KeySource::ConfigFile)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_different_key_of_the_same_did_still_signs() {
+        // The verifier requires the claimed DID to publish the signing key, not
+        // that the fragments agree — being stricter here would fail commits CI
+        // would happily accept.
+        let commit = commit_committed_by(&format!("{SIGNER}#key-0"));
+        assert!(
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-3"), KeySource::GitConfig)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn signing_as_one_community_while_claiming_another_is_refused() {
+        // The multi-community footgun: a persona override moved but user.email
+        // did not, so the commit would be born unverifiable.
+        let commit = commit_committed_by("did:webvh:QmOther:community.example#key-0");
+        let error =
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-0"), KeySource::GitConfig)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("QmOther"), "names the claim: {error}");
+        assert!(error.contains("QmSigner"), "names the key's DID: {error}");
+        assert!(
+            error.contains("git config did-git-sign.key"),
+            "names where the selection came from: {error}"
+        );
+    }
+
+    #[test]
+    fn a_non_did_committer_without_trailer_is_refused() {
+        // No trailer and no DID in committer email = missing commit-msg hook.
+        let commit = commit_committed_by("alice@example.com");
+        let error =
+            check_committer_matches_key(&commit, &format!("{SIGNER}#key-0"), KeySource::ConfigFile)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("noSignerDid"),
+            "must refuse when no DID claim exists: {error}"
+        );
+    }
+
+    #[test]
+    fn trailer_matching_key_is_accepted() {
+        let commit = format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A <a@x.com> 1700000000 +0000\n\
+             committer A <alice@example.com> 1700000000 +0000\n\
+             \n\
+             message\n\
+             \n\
+             Signed-by-DID: {SIGNER}#key-0\n"
+        );
+        assert!(
+            check_committer_matches_key(
+                commit.as_bytes(),
+                &format!("{SIGNER}#key-0"),
+                KeySource::ConfigFile
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn trailer_conflicting_with_key_is_refused() {
+        let commit = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A <a@x.com> 1700000000 +0000\n\
+             committer A <alice@example.com> 1700000000 +0000\n\
+             \n\
+             message\n\
+             \n\
+             Signed-by-DID: did:webvh:QmOther:other.example#key-0\n";
+        assert!(
+            check_committer_matches_key(
+                commit.as_bytes(),
+                &format!("{SIGNER}#key-0"),
+                KeySource::ConfigFile
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn conflicting_trailer_and_committer_dids_are_refused() {
+        let commit = format!(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author A <a@x.com> 1700000000 +0000\n\
+             committer A <did:webvh:QmOther:other.example#key-0> 1700000000 +0000\n\
+             \n\
+             message\n\
+             \n\
+             Signed-by-DID: {SIGNER}#key-0\n"
+        );
+        let error = check_committer_matches_key(
+            commit.as_bytes(),
+            &format!("{SIGNER}#key-0"),
+            KeySource::ConfigFile,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Signed-by-DID"), "names trailer: {error}");
+        assert!(error.contains("committer"), "names committer: {error}");
+    }
+
+    #[test]
+    fn a_payload_with_no_committer_is_not_a_claim_to_check() {
+        // Tags and non-git namespaces carry no committer header, so there is
+        // nothing to disagree with — signing must not be blocked.
+        assert!(
+            check_committer_matches_key(b"not a commit object", SIGNER, KeySource::ConfigFile)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn signing_key_selection_precedence() {
+        // env wins over git config and the config file (R-G-1).
+        let (key, src) = select_signing_key("cfg#k", Some("env#k"), Some("git#k"));
+        assert_eq!(key, "env#k");
+        assert_eq!(src, KeySource::Env);
+
+        // git config wins over the config file when no env override.
+        let (key, src) = select_signing_key("cfg#k", None, Some("git#k"));
+        assert_eq!(key, "git#k");
+        assert_eq!(src, KeySource::GitConfig);
+
+        // Falls back to the config file's own did_key_id (back-compat).
+        let (key, src) = select_signing_key("cfg#k", None, None);
+        assert_eq!(key, "cfg#k");
+        assert_eq!(src, KeySource::ConfigFile);
+    }
+
+    #[test]
+    fn signing_key_selection_ignores_blank_overrides() {
+        // An exported-but-empty / whitespace var must not shadow lower precedence.
+        let (key, src) = select_signing_key("cfg#k", Some("   "), Some("git#k"));
+        assert_eq!(key, "git#k");
+        assert_eq!(src, KeySource::GitConfig);
+
+        let (key, src) = select_signing_key("cfg#k", Some(""), None);
+        assert_eq!(key, "cfg#k");
+        assert_eq!(src, KeySource::ConfigFile);
+
+        // A value is trimmed.
+        let (key, _) = select_signing_key("cfg#k", Some("  env#k \n"), None);
+        assert_eq!(key, "env#k");
+    }
+
+    #[test]
+    fn key_source_messages_name_the_origin() {
+        assert!(KeySource::Env.to_string().contains("DID_GIT_SIGN_KEY"));
+        assert!(
+            KeySource::GitConfig
+                .to_string()
+                .contains("did-git-sign.key")
+        );
+    }
+
+    #[test]
+    fn signer_mode_parses_the_three_settings_and_refuses_others() {
+        assert_eq!(SignerMode::parse("vta").unwrap(), SignerMode::Vta);
+        assert_eq!(SignerMode::parse(" auto\n").unwrap(), SignerMode::Auto);
+        assert_eq!(SignerMode::parse("").unwrap(), SignerMode::Auto);
+        assert_eq!(SignerMode::parse("export").unwrap(), SignerMode::Export);
+        let error = SignerMode::parse("remote").unwrap_err().to_string();
+        assert!(error.contains(SIGNER_GIT_CONFIG), "{error}");
+    }
+
+    #[test]
+    fn only_the_git_namespace_may_sign() {
+        assert!(check_namespace("git").is_ok());
+        for namespace in ["file", "email", "", "Git", "git ", "git\0"] {
+            let error = check_namespace(namespace).unwrap_err().to_string();
+            assert!(
+                error.contains("namespace"),
+                "{namespace:?} must be refused with a namespace error: {error}"
+            );
+        }
+    }
+
+    /// The namespace is refused before the buffer, config or VTA are touched:
+    /// every path handed in here is missing, so any later step would fail with
+    /// a different error.
+    #[tokio::test]
+    async fn a_non_git_namespace_is_refused_before_anything_is_read() {
+        let missing = std::path::Path::new("/nonexistent/did-git-sign/buffer");
+        let error = handle_sign(missing, "file", Some(missing))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to sign in sshsig namespace \"file\""),
+            "{error}"
+        );
+    }
+
+    /// Regression guard: the .sig path must be formed by appending ".sig" to the full
+    /// filename, not by replacing an existing extension.  git's buffer files can have
+    /// names like "COMMIT_EDITMSG" (no extension) or, in theory, dotted names.
+    /// Using Path::with_extension("sig") would silently drop any existing extension,
+    /// so the production code uses OsString::push instead.  This test encodes that
+    /// contract so any future refactor breaks loudly.
+    #[test]
+    fn sig_path_appends_dot_sig_not_replaces_extension() {
+        let base = std::path::Path::new("/tmp/buffer.diff");
+        let mut sig_os = base.as_os_str().to_owned();
+        sig_os.push(".sig");
+        let sig_path = std::path::PathBuf::from(sig_os);
+        assert_eq!(sig_path, std::path::PathBuf::from("/tmp/buffer.diff.sig"));
+
+        // Also verify a name with no extension is handled correctly.
+        let base2 = std::path::Path::new("/tmp/COMMIT_EDITMSG");
+        let mut sig_os2 = base2.as_os_str().to_owned();
+        sig_os2.push(".sig");
+        let sig_path2 = std::path::PathBuf::from(sig_os2);
+        assert_eq!(
+            sig_path2,
+            std::path::PathBuf::from("/tmp/COMMIT_EDITMSG.sig")
+        );
+    }
+}
