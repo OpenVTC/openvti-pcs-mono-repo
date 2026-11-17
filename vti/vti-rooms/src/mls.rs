@@ -1,0 +1,1161 @@
+//! The room's group-key layer, on MLS (RFC 9420).
+//!
+//! # Why MLS rather than a room key per epoch
+//!
+//! An earlier draft of the design hand-rolled this: one symmetric key per epoch, sealed to
+//! each member on every change. Every part of that is something MLS already standardises,
+//! and two of the parts it adds are not optional for a system that expects to outlive a
+//! compromise:
+//!
+//! - **Post-compromise security.** A stolen member key stops working at the next commit. The
+//!   fan-out design had none — a stolen key read every future epoch until somebody noticed.
+//! - **O(log n) membership change.** Fan-out is O(n) per change. Fine for a five-person
+//!   room, wrong for one whose membership is a whole community roster.
+//!
+//! # How it maps onto a room
+//!
+//! MLS separates an **Authentication Service** (who is this leaf?) from a **Delivery
+//! Service** (who stores and orders the group's messages, and is trusted for availability
+//! only). That is the room design's own shape, arrived at independently:
+//!
+//! | MLS | Room |
+//! |---|---|
+//! | Authentication Service | the DTG — a leaf's credential is the room VMC |
+//! | Delivery Service | the room's host, trusted per invariant I2 |
+//! | Group | the room |
+//! | Epoch | the room's epoch, the number the host stores |
+//! | Commit | a membership change — **only the owner commits** |
+//! | Exporter secret | the room's storage key |
+//!
+//! # One leaf per member, not per device
+//!
+//! A member's leaf is their **VTA**, and devices and agents hang off it through the oracle
+//! model rather than joining the group themselves. That sidesteps MLS's multi-device
+//! complexity entirely, and it is the same reason the design puts key custody in the VTA:
+//! an agent asks its VTA to open a record and never holds the key.
+//!
+//! # Storage keys come from the exporter, not from the group's message keys
+//!
+//! Records are sealed with a key derived from [`RoomGroup::storage_key`], which is the MLS
+//! exporter under a room-specific label. This is the pattern
+//! `draft-sullivan-mls-attachments` uses for encrypted attachments, following SFrame
+//! (RFC 9605): the group provides authenticated key agreement, and the application derives
+//! its own keys from the exporter rather than borrowing the ones MLS uses for its own
+//! messages.
+//!
+//! # What this module does not do
+//!
+//! It does not talk to a host. Commits, welcomes and key packages are returned to the
+//! caller as bytes to send however it likes — the design's fork risk (a host showing
+//! different members different commit sequences) is addressed by anchoring epoch
+//! authenticators in the room's witnessed DID log, which is a separate concern from
+//! producing them. [`RoomGroup::epoch_authenticator`] is what gets anchored.
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_traits::OpenMlsProvider;
+use tls_codec::{Deserialize as _, Serialize as _};
+
+use crate::error::RoomKeyError;
+
+/// The MLS ciphersuite every room uses.
+///
+/// One ciphersuite, not a negotiation. A room whose members disagree about the ciphersuite
+/// is a room that cannot form, and offering a choice here would mean carrying the weakest
+/// option a peer might pick.
+pub const ROOM_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+/// Exporter label for a room's record-storage key.
+///
+/// Domain-separated so that a key derived for record sealing can never collide with one
+/// derived for another purpose from the same group. A new purpose gets a new label, never a
+/// parameter on this one.
+const STORAGE_KEY_LABEL: &str = "openvtc/room/storage/v1";
+
+/// Bytes of the derived storage key — 32, for a ChaCha20-Poly1305 or AES-256 key.
+pub const STORAGE_KEY_LEN: usize = 32;
+
+/// A member's MLS identity: their signature keypair and the credential naming them.
+///
+/// The credential is a basic one carrying the member's DID. In the finished design the
+/// leaf's credential is the room VMC; a basic credential carrying the same identifier is
+/// the interim, and the swap is confined to this struct.
+pub struct RoomIdentity {
+    signer: SignatureKeyPair,
+    credential: CredentialWithKey,
+    /// The member this identity is for.
+    ///
+    /// Retained because a snapshot has to restore it: the DID is inside the credential as
+    /// opaque bytes, and reaching back in to parse it out would tie custody to the
+    /// credential encoding. Cheap to keep, and it keeps the two independent.
+    member_did: String,
+}
+
+impl RoomIdentity {
+    /// Create an identity for `member_did`.
+    pub fn new(member_did: &str, provider: &impl OpenMlsProvider) -> Result<Self, RoomKeyError> {
+        let signer = SignatureKeyPair::new(ROOM_CIPHERSUITE.signature_algorithm())
+            .map_err(|e| RoomKeyError::Group(format!("generate MLS signature key: {e:?}")))?;
+        signer
+            .store(provider.storage())
+            .map_err(|e| RoomKeyError::Group(format!("store MLS signature key: {e:?}")))?;
+
+        let credential = Credential::new(CredentialType::Basic, member_did.as_bytes().to_vec());
+        Ok(Self {
+            credential: CredentialWithKey {
+                credential,
+                signature_key: signer.public().into(),
+            },
+            signer,
+            member_did: member_did.to_string(),
+        })
+    }
+
+    /// A key package this member can be added to a room with.
+    ///
+    /// Published to whoever is inviting them — **over the invitation channel, never through
+    /// the host**. A host that collected key packages would learn who is being invited to
+    /// what, which un-blinds a sealed room at the door.
+    pub fn key_package(&self, provider: &impl OpenMlsProvider) -> Result<KeyPackage, RoomKeyError> {
+        KeyPackage::builder()
+            .build(
+                ROOM_CIPHERSUITE,
+                provider,
+                &self.signer,
+                self.credential.clone(),
+            )
+            .map(|b| b.key_package().clone())
+            .map_err(|e| RoomKeyError::Group(format!("build MLS key package: {e:?}")))
+    }
+}
+
+/// One member's view of a room's MLS group.
+pub struct RoomGroup {
+    group: MlsGroup,
+    identity: RoomIdentity,
+    provider: OpenMlsRustCrypto,
+}
+
+/// What a membership change produces.
+///
+/// The caller sends `commit` to every existing member and `welcome` to whoever was just
+/// added. Both are opaque bytes here: this module produces them and takes no view on how
+/// they travel.
+pub struct MembershipChange {
+    /// The commit, for members already in the group.
+    pub commit: Vec<u8>,
+    /// The welcome, for members just added. `None` on a removal.
+    pub welcome: Option<Vec<u8>>,
+    /// The epoch the group is in after merging.
+    pub epoch: u64,
+}
+
+impl RoomGroup {
+    /// Create a room's group. The creator is its first member and its owner.
+    pub fn create(member_did: &str) -> Result<Self, RoomKeyError> {
+        let provider = OpenMlsRustCrypto::default();
+        let identity = RoomIdentity::new(member_did, &provider)?;
+
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(ROOM_CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
+            .build();
+
+        let group = MlsGroup::new(
+            &provider,
+            &identity.signer,
+            &config,
+            identity.credential.clone(),
+        )
+        .map_err(|e| RoomKeyError::Group(format!("create MLS group: {e:?}")))?;
+
+        Ok(Self {
+            group,
+            identity,
+            provider,
+        })
+    }
+
+    /// Join a room from the welcome its owner sent.
+    pub fn join(member_did: &str, welcome: &[u8]) -> Result<Self, RoomKeyError> {
+        let provider = OpenMlsRustCrypto::default();
+        let identity = RoomIdentity::new(member_did, &provider)?;
+        Self::join_with(identity, provider, welcome)
+    }
+
+    /// Join using an identity whose key package the inviter already holds.
+    ///
+    /// The ordinary path: a member publishes a key package, is added, and joins with the
+    /// *same* identity — [`RoomGroup::join`] mints a fresh one, which only works if the
+    /// inviter used that identity's key package.
+    pub fn join_with(
+        identity: RoomIdentity,
+        provider: OpenMlsRustCrypto,
+        welcome: &[u8],
+    ) -> Result<Self, RoomKeyError> {
+        let msg = MlsMessageIn::tls_deserialize_exact(welcome)
+            .map_err(|e| RoomKeyError::Group(format!("parse welcome: {e:?}")))?;
+        let welcome = match msg.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            _ => {
+                return Err(RoomKeyError::Group(
+                    "expected a Welcome message, got another MLS body".into(),
+                ));
+            }
+        };
+
+        let config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+        let staged = StagedWelcome::new_from_welcome(&provider, &config, welcome, None)
+            .map_err(|e| RoomKeyError::Group(format!("stage welcome: {e:?}")))?;
+        let group = staged
+            .into_group(&provider)
+            .map_err(|e| RoomKeyError::Group(format!("join group from welcome: {e:?}")))?;
+
+        Ok(Self {
+            group,
+            identity,
+            provider,
+        })
+    }
+
+    /// Add a member and commit.
+    ///
+    /// Only the owner should call this — the design restricts epoch minting to `admin`
+    /// precisely because a group where any key-holder can commit is a group where any
+    /// member can evict any other. MLS itself does not enforce that; the room's authority
+    /// credentials do, and the host checks them before accepting the epoch advance.
+    pub fn add_member(
+        &mut self,
+        key_package: KeyPackage,
+    ) -> Result<MembershipChange, RoomKeyError> {
+        let (commit, welcome, _) = self
+            .group
+            .add_members(&self.provider, &self.identity.signer, &[key_package])
+            .map_err(|e| RoomKeyError::Group(format!("add member: {e:?}")))?;
+
+        self.group
+            .merge_pending_commit(&self.provider)
+            .map_err(|e| RoomKeyError::Group(format!("merge add commit: {e:?}")))?;
+
+        Ok(MembershipChange {
+            commit: commit
+                .tls_serialize_detached()
+                .map_err(|e| RoomKeyError::Group(format!("serialise commit: {e:?}")))?,
+            welcome: Some(
+                welcome
+                    .tls_serialize_detached()
+                    .map_err(|e| RoomKeyError::Group(format!("serialise welcome: {e:?}")))?,
+            ),
+            epoch: self.group.epoch().as_u64(),
+        })
+    }
+
+    /// Remove a member and commit — the mechanism of removal.
+    ///
+    /// **Forward-only, and worth being plain about.** The removed member keeps whatever they
+    /// could already read; they held the plaintext. What they lose is everything sealed
+    /// under the new epoch. An interface that implies otherwise has mis-stated the
+    /// guarantee.
+    pub fn remove_member(
+        &mut self,
+        index: LeafNodeIndex,
+    ) -> Result<MembershipChange, RoomKeyError> {
+        let (commit, _, _) = self
+            .group
+            .remove_members(&self.provider, &self.identity.signer, &[index])
+            .map_err(|e| RoomKeyError::Group(format!("remove member: {e:?}")))?;
+
+        self.group
+            .merge_pending_commit(&self.provider)
+            .map_err(|e| RoomKeyError::Group(format!("merge remove commit: {e:?}")))?;
+
+        Ok(MembershipChange {
+            commit: commit
+                .tls_serialize_detached()
+                .map_err(|e| RoomKeyError::Group(format!("serialise commit: {e:?}")))?,
+            welcome: None,
+            epoch: self.group.epoch().as_u64(),
+        })
+    }
+
+    /// Advance the epoch with **no membership change** — a renewal.
+    ///
+    /// # Why this had to exist
+    ///
+    /// [`Self::add_member`] and [`Self::remove_member`] both produce a commit,
+    /// and until this existed they were the *only* things that did. So "a room
+    /// renews" meant "a room adds or removes somebody", which is not what
+    /// renewal means — and §9's lifecycle, and every epoch anchor, ride
+    /// renewals. A room with a stable membership could not renew at all.
+    ///
+    /// # What it buys, and what it does not
+    ///
+    /// It is MLS's post-compromise security, taken deliberately rather than as a
+    /// side effect of somebody joining: the committer replaces its own leaf key,
+    /// so an attacker holding the old one is locked out from the next epoch. A
+    /// group that never commits never heals.
+    ///
+    /// It does **not** change who is in the room, and it does not by itself
+    /// preserve readability. Advancing the epoch makes everything sealed below
+    /// it unreadable to anyone who has not derived those keys — which is what
+    /// [`crate::retention::RetentionPolicy::Chained`] exists to prevent, by
+    /// sealing the outgoing epoch's key under the incoming one. **The rung is
+    /// minted by [`crate::sealed::SealedRoom`], not here**: a rung is bound to
+    /// the room, and this type deliberately does not know which room it is for.
+    /// A caller that advances without minting one severs the history.
+    ///
+    /// Returns the same [`MembershipChange`] shape as its two siblings, with
+    /// `welcome: None` — there is nobody new to welcome, and a caller that
+    /// looked for one would be looking for a party that does not exist.
+    pub fn self_update(&mut self) -> Result<MembershipChange, RoomKeyError> {
+        let bundle = self
+            .group
+            .self_update(
+                &self.provider,
+                &self.identity.signer,
+                LeafNodeParameters::default(),
+            )
+            .map_err(|e| RoomKeyError::Group(format!("self update: {e:?}")))?;
+
+        self.group
+            .merge_pending_commit(&self.provider)
+            .map_err(|e| RoomKeyError::Group(format!("merge self-update commit: {e:?}")))?;
+
+        Ok(MembershipChange {
+            commit: bundle
+                .into_commit()
+                .tls_serialize_detached()
+                .map_err(|e| RoomKeyError::Group(format!("serialise commit: {e:?}")))?,
+            welcome: None,
+            epoch: self.group.epoch().as_u64(),
+        })
+    }
+
+    /// Apply a commit produced by another member.
+    ///
+    /// Returns the new epoch. The epoch **link** that keeps everything below it readable is
+    /// minted by [`crate::sealed::SealedRoom`], not here: a rung is bound to the room, and
+    /// this type deliberately does not know which room it is for.
+    pub fn apply_commit(&mut self, commit: &[u8]) -> Result<u64, RoomKeyError> {
+        let msg = MlsMessageIn::tls_deserialize_exact(commit)
+            .map_err(|e| RoomKeyError::Group(format!("parse commit: {e:?}")))?;
+        let protocol_message: ProtocolMessage = msg
+            .try_into_protocol_message()
+            .map_err(|e| RoomKeyError::Group(format!("not a protocol message: {e:?}")))?;
+
+        let processed = self
+            .group
+            .process_message(&self.provider, protocol_message)
+            .map_err(|e| RoomKeyError::Group(format!("process commit: {e:?}")))?;
+
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged) => {
+                self.group
+                    .merge_staged_commit(&self.provider, *staged)
+                    .map_err(|e| RoomKeyError::Group(format!("merge staged commit: {e:?}")))?;
+                // A commit removing our own leaf merges cleanly and leaves a group that can
+                // export nothing. Say so here, rather than as the key-export failure the
+                // next step would hit.
+                if !self.group.is_active() {
+                    let epoch = u32::try_from(self.group.epoch().as_u64() + 1).unwrap_or(u32::MAX);
+                    return Err(RoomKeyError::Removed { epoch });
+                }
+                Ok(self.group.epoch().as_u64())
+            }
+            _ => Err(RoomKeyError::Group(
+                "expected a commit, got another message type".into(),
+            )),
+        }
+    }
+
+    /// The room's current epoch.
+    ///
+    /// This is the number the host stores so it can serve the right ciphertext. The host
+    /// learns the number and never the key.
+    pub fn epoch(&self) -> u64 {
+        self.group.epoch().as_u64()
+    }
+
+    /// The key records in this epoch are sealed with.
+    ///
+    /// Derived from the MLS exporter under a room-specific label rather than borrowed from
+    /// the group's own message keys — so a change to how records are sealed cannot weaken
+    /// the group's messaging, and vice versa.
+    pub fn storage_key(&self) -> Result<[u8; STORAGE_KEY_LEN], RoomKeyError> {
+        let secret = self
+            .group
+            .export_secret(
+                self.provider.crypto(),
+                STORAGE_KEY_LABEL,
+                &[],
+                STORAGE_KEY_LEN,
+            )
+            .map_err(|e| RoomKeyError::Group(format!("export storage key: {e:?}")))?;
+        let mut key = [0u8; STORAGE_KEY_LEN];
+        key.copy_from_slice(&secret);
+        Ok(key)
+    }
+
+    /// The epoch authenticator — what gets anchored in the room's witnessed DID log.
+    ///
+    /// A host acting as the Delivery Service can attempt to **fork** a group: show one
+    /// member one commit sequence and another member a different one, so each believes it
+    /// is in the room. Members cannot detect that by comparing through the host, because the
+    /// host is what they would be comparing through.
+    ///
+    /// Anchoring this value where the host cannot forge it — the room's witnessed log —
+    /// gives every member a reference to check their own against. Detection latency is the
+    /// anchoring cadence, which is why the design makes that a room parameter rather than a
+    /// constant.
+    pub fn epoch_authenticator(&self) -> Vec<u8> {
+        self.group.epoch_authenticator().as_slice().to_vec()
+    }
+
+    /// How many members the group has.
+    pub fn member_count(&self) -> usize {
+        self.group.members().count()
+    }
+
+    /// The leaf index of the member whose credential identity is `member_did`.
+    pub fn leaf_of(&self, member_did: &str) -> Option<LeafNodeIndex> {
+        self.group.members().find_map(|m| {
+            (m.credential.serialized_content() == member_did.as_bytes()).then_some(m.index)
+        })
+    }
+
+    /// Whether the group's ratchet tree holds a leaf whose signature key is `signature_key`.
+    ///
+    /// **The way to recognise one particular leaf, never [`Self::leaf_of`].** A member
+    /// removed and admitted again has a new leaf carrying the same identifier under a new
+    /// signature key, so the identifier says only that *a* leaf names the member; the
+    /// signature key says whether it is *this* leaf. Every identity is minted with a fresh
+    /// signature keypair ([`IdentitySnapshot::mint`]) and a leaf's own updates here keep it
+    /// ([`Self::self_update`]), so a leaf keeps its signature key for as long as it is in the
+    /// tree. `rooms/keys/welcome/0.1`, *Rejoining after a removal*: a Welcome whose tree no
+    /// longer holds the leaf of the state a key holder already has is the evidence that the
+    /// member was removed from that state.
+    pub fn has_leaf_with_signature_key(&self, signature_key: &[u8]) -> bool {
+        self.group
+            .members()
+            .any(|m| m.signature_key.as_slice() == signature_key)
+    }
+
+    /// The MLS group id. Two states are of the same group only when these are equal — which
+    /// [`Self::has_leaf_with_signature_key`]'s answer is meaningless without: a group other
+    /// than the one a leaf was in has none of its leaves by construction.
+    pub fn group_id(&self) -> Vec<u8> {
+        self.group.group_id().as_slice().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_creator_forms_a_group_of_one() {
+        let room = RoomGroup::create("did:key:zAlice").expect("create");
+        assert_eq!(room.member_count(), 1);
+        assert_eq!(room.epoch(), 0, "a fresh group starts at epoch 0");
+    }
+
+    #[test]
+    fn a_storage_key_is_derived_and_is_stable_within_an_epoch() {
+        let room = RoomGroup::create("did:key:zAlice").expect("create");
+        let a = room.storage_key().expect("export");
+        let b = room.storage_key().expect("export again");
+        assert_eq!(a, b, "the same epoch must derive the same key");
+        assert_ne!(a, [0u8; STORAGE_KEY_LEN], "and it must not be zeroes");
+    }
+
+    /// The whole point of an epoch: two members reach the same key without it ever
+    /// crossing the host.
+    #[test]
+    fn an_added_member_derives_the_same_storage_key() {
+        let mut alice = RoomGroup::create("did:key:zAlice").expect("alice");
+
+        let bob_provider = OpenMlsRustCrypto::default();
+        let bob_identity = RoomIdentity::new("did:key:zBob", &bob_provider).expect("bob identity");
+        let bob_kp = bob_identity.key_package(&bob_provider).expect("bob kp");
+
+        let change = alice.add_member(bob_kp).expect("add bob");
+        let welcome = change.welcome.expect("an add produces a welcome");
+
+        let bob = RoomGroup::join_with(bob_identity, bob_provider, &welcome).expect("bob joins");
+
+        assert_eq!(alice.member_count(), 2);
+        assert_eq!(
+            alice.storage_key().unwrap(),
+            bob.storage_key().unwrap(),
+            "both members must derive the same storage key, without the host seeing it"
+        );
+        assert_eq!(alice.epoch(), bob.epoch());
+    }
+
+    /// Removal is forward-only, and this is what "forward" means mechanically: the key
+    /// changes, so nothing sealed afterwards is reachable with the old one.
+    #[test]
+    fn removing_a_member_changes_the_storage_key() {
+        let mut alice = RoomGroup::create("did:key:zAlice").expect("alice");
+
+        let bob_provider = OpenMlsRustCrypto::default();
+        let bob_identity = RoomIdentity::new("did:key:zBob", &bob_provider).expect("bob identity");
+        let bob_kp = bob_identity.key_package(&bob_provider).expect("bob kp");
+        let change = alice.add_member(bob_kp).expect("add bob");
+        let bob = RoomGroup::join_with(
+            bob_identity,
+            bob_provider,
+            &change.welcome.expect("welcome"),
+        )
+        .expect("bob joins");
+
+        let shared = alice.storage_key().unwrap();
+        assert_eq!(shared, bob.storage_key().unwrap());
+
+        let bob_leaf = alice.leaf_of("did:key:zBob").expect("bob is a member");
+        alice.remove_member(bob_leaf).expect("remove bob");
+
+        let after = alice.storage_key().unwrap();
+        assert_ne!(
+            shared, after,
+            "after removal the key must differ, or removal removes nothing"
+        );
+        assert_ne!(
+            bob.storage_key().unwrap(),
+            after,
+            "and the removed member must not be able to derive the new one"
+        );
+    }
+
+    /// Every member's view of an epoch must agree, or the anchor cannot detect a fork.
+    #[test]
+    fn members_in_the_same_epoch_share_an_epoch_authenticator() {
+        let mut alice = RoomGroup::create("did:key:zAlice").expect("alice");
+        let bob_provider = OpenMlsRustCrypto::default();
+        let bob_identity = RoomIdentity::new("did:key:zBob", &bob_provider).expect("bob identity");
+        let bob_kp = bob_identity.key_package(&bob_provider).expect("bob kp");
+        let change = alice.add_member(bob_kp).expect("add bob");
+        let bob = RoomGroup::join_with(
+            bob_identity,
+            bob_provider,
+            &change.welcome.expect("welcome"),
+        )
+        .expect("bob joins");
+
+        assert_eq!(
+            alice.epoch_authenticator(),
+            bob.epoch_authenticator(),
+            "a member whose authenticator differs from the anchored one has been forked"
+        );
+        assert!(!alice.epoch_authenticator().is_empty());
+    }
+
+    /// A removed member is told it was removed, not that its group failed to export a key —
+    /// the raw failure read like a fault in the holder (found in a live run).
+    #[test]
+    fn a_member_applying_its_own_removal_is_told_it_was_removed() {
+        let mut alice = RoomGroup::create("did:key:zAlice").expect("alice");
+        let bob_provider = OpenMlsRustCrypto::default();
+        let bob_identity = RoomIdentity::new("did:key:zBob", &bob_provider).expect("bob identity");
+        let bob_kp = bob_identity.key_package(&bob_provider).expect("bob kp");
+        let change = alice.add_member(bob_kp).expect("add bob");
+        let mut bob = RoomGroup::join_with(
+            bob_identity,
+            bob_provider,
+            &change.welcome.expect("welcome"),
+        )
+        .expect("bob joins");
+
+        let leaf = alice.leaf_of("did:key:zBob").expect("bob's leaf");
+        let removal = alice.remove_member(leaf).expect("remove bob");
+
+        match bob.apply_commit(&removal.commit) {
+            Err(RoomKeyError::Removed { epoch }) => {
+                assert_eq!(u64::from(epoch), alice.epoch() + 1, "names the room epoch")
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_epoch_advances_on_every_membership_change() {
+        let mut alice = RoomGroup::create("did:key:zAlice").expect("alice");
+        let start = alice.epoch();
+
+        let p = OpenMlsRustCrypto::default();
+        let id = RoomIdentity::new("did:key:zBob", &p).expect("identity");
+        alice
+            .add_member(id.key_package(&p).expect("kp"))
+            .expect("add");
+
+        assert!(
+            alice.epoch() > start,
+            "a membership change must move the epoch, or the host serves stale ciphertext"
+        );
+    }
+}
+
+// ─── Custody ─────────────────────────────────────────────────────────────
+
+/// A [`RoomGroup`] at rest.
+///
+/// # Why this exists
+///
+/// A group is only useful to an agent that still has it tomorrow. `rooms/keys/open` opens a
+/// record under the epoch's storage key, and an agent that lost its group between the
+/// welcome and the read has nothing to open with — so custody is not an optimisation, it is
+/// the difference between an oracle and a demo.
+///
+/// # What is in here
+///
+/// **Group secrets.** The whole point of an MLS group is the key schedule, and a snapshot
+/// carries it: whoever holds this blob can decrypt everything the group could, up to its
+/// epoch. It belongs in a keyspace at the same protection level as the key store and the
+/// credential vault — which in a TEE deployment means the KMS storage key, and outside one
+/// means the VTA's data directory is trusted, exactly as it already is for those two.
+///
+/// # Why a whole-provider snapshot rather than a group serialization
+///
+/// OpenMLS persists a group *through* its storage provider rather than as a value you can
+/// serialize, and the pieces a group needs — its own state, the signature keypair, the
+/// pending key packages — live in that store under keys OpenMLS owns. Reaching in to pick
+/// out "just the group" would mean reimplementing its layout and re-breaking on every
+/// upgrade. Taking the map whole is duller and survives the library moving.
+/// An identity and its provider, before any group exists.
+///
+/// The state a joiner holds between minting a KeyPackage and receiving the Welcome that
+/// consumes it. Separate from [`GroupSnapshot`] because at this point there *is* no group,
+/// and a type that pretended otherwise would need a throwaway one to satisfy itself.
+///
+/// It is still key material: the private half of the KeyPackage lives here, and it is what
+/// the Welcome is sealed to.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentitySnapshot {
+    /// The provider's key-value store, base64url on both sides.
+    entries: Vec<(String, String)>,
+    /// The member this identity is for.
+    member_did: String,
+    /// The signature public key, base64url — how the keypair is found again.
+    signature_public: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSnapshot {
+    /// The provider's key-value store, base64url on both sides.
+    ///
+    /// Base64 rather than raw byte arrays because these round-trip through JSON, where a
+    /// `Vec<u8>` becomes a list of integers — an order of magnitude larger and unreadable
+    /// in a dump.
+    entries: Vec<(String, String)>,
+    /// The MLS group id, base64url. What `restore` loads by.
+    group_id: String,
+    /// The member this group belongs to.
+    member_did: String,
+    /// The identity's signature public key, base64url — how `restore` finds the keypair
+    /// again in the store above.
+    signature_public: String,
+}
+
+impl RoomGroup {
+    /// Take a snapshot for storage.
+    pub fn snapshot(&self) -> Result<GroupSnapshot, RoomKeyError> {
+        let store = self.provider.storage();
+        let values = store
+            .values
+            .read()
+            .map_err(|_| RoomKeyError::Group("group store lock poisoned".into()))?;
+
+        Ok(GroupSnapshot {
+            entries: values
+                .iter()
+                .map(|(k, v)| (B64.encode(k), B64.encode(v)))
+                .collect(),
+            group_id: B64.encode(self.group.group_id().as_slice()),
+            member_did: self.identity.member_did.clone(),
+            signature_public: B64.encode(self.identity.signer.public()),
+        })
+    }
+
+    /// Restore a group from a snapshot.
+    ///
+    /// Fails rather than returning a half-built group: a `RoomGroup` that loaded its store
+    /// but not its signer would look usable and fail at the first commit, which is the worst
+    /// time to find out.
+    pub fn restore(snapshot: &GroupSnapshot) -> Result<Self, RoomKeyError> {
+        let provider = OpenMlsRustCrypto::default();
+        {
+            let mut values = provider
+                .storage()
+                .values
+                .write()
+                .map_err(|_| RoomKeyError::Group("group store lock poisoned".into()))?;
+            for (k, v) in &snapshot.entries {
+                let key = B64
+                    .decode(k)
+                    .map_err(|e| RoomKeyError::Group(format!("decode a store key: {e}")))?;
+                let value = B64
+                    .decode(v)
+                    .map_err(|e| RoomKeyError::Group(format!("decode a store value: {e}")))?;
+                values.insert(key, value);
+            }
+        }
+
+        let group_id = GroupId::from_slice(
+            &B64.decode(&snapshot.group_id)
+                .map_err(|e| RoomKeyError::Group(format!("decode the group id: {e}")))?,
+        );
+        let group = MlsGroup::load(provider.storage(), &group_id)
+            .map_err(|e| RoomKeyError::Group(format!("load the group: {e:?}")))?
+            .ok_or_else(|| {
+                RoomKeyError::Group("the snapshot's store holds no group at that id".into())
+            })?;
+
+        let public = B64
+            .decode(&snapshot.signature_public)
+            .map_err(|e| RoomKeyError::Group(format!("decode the signature key: {e}")))?;
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            &public,
+            ROOM_CIPHERSUITE.signature_algorithm(),
+        )
+        .ok_or_else(|| {
+            RoomKeyError::Group("the snapshot's store holds no signature keypair".into())
+        })?;
+
+        let credential = Credential::new(
+            CredentialType::Basic,
+            snapshot.member_did.as_bytes().to_vec(),
+        );
+
+        Ok(Self {
+            group,
+            identity: RoomIdentity {
+                member_did: snapshot.member_did.clone(),
+                credential: CredentialWithKey {
+                    credential,
+                    signature_key: signer.public().into(),
+                },
+                signer,
+            },
+            provider,
+        })
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+    use crate::sealed::SealedRoom;
+
+    /// The property custody exists for: a group that went to disk and came back can still
+    /// open what it sealed before it went. Anything less makes the oracle a demo.
+    #[test]
+    fn a_restored_group_opens_what_the_original_sealed() {
+        let room_id = "did:key:zRoom";
+        let group = RoomGroup::create("did:key:zAlice").expect("create");
+        let sealed_room = SealedRoom::new(room_id, group);
+
+        let ciphertext = sealed_room
+            .seal_record("k1", 1, b"survives a restart")
+            .expect("seal");
+        let snapshot = sealed_room.group().snapshot().expect("snapshot");
+
+        // Everything in memory goes away.
+        drop(sealed_room);
+
+        let mut restored =
+            SealedRoom::new(room_id, RoomGroup::restore(&snapshot).expect("restore"));
+        let opened = restored.open_record("k1", 1, &ciphertext).expect("open");
+        assert_eq!(opened, b"survives a restart");
+    }
+
+    /// A snapshot survives the round trip through storage, not just through memory — the
+    /// blob a keyspace holds is JSON, and a `Vec<u8>` that only works in-process would pass
+    /// the test above and fail in a service.
+    #[test]
+    fn a_snapshot_round_trips_through_json() {
+        let group = RoomGroup::create("did:key:zAlice").expect("create");
+        let snapshot = group.snapshot().expect("snapshot");
+
+        let wire = serde_json::to_string(&snapshot).expect("serialise");
+        let back: GroupSnapshot = serde_json::from_str(&wire).expect("deserialise");
+
+        let restored = RoomGroup::restore(&back).expect("restore");
+        assert_eq!(restored.epoch(), group.epoch());
+        assert_eq!(restored.member_count(), group.member_count());
+    }
+
+    /// Custody has to survive the thing it exists for: a membership change. A group
+    /// snapshotted after a commit must come back at the new epoch, or the agent silently
+    /// falls behind and every later record "does not open".
+    #[test]
+    fn a_restored_group_is_at_the_epoch_it_was_snapshotted_at() {
+        let mut alice = RoomGroup::create("did:key:zAlice").expect("create");
+        let bob_provider = OpenMlsRustCrypto::default();
+        let bob = RoomIdentity::new("did:key:zBob", &bob_provider).expect("bob");
+        let package = bob.key_package(&bob_provider).expect("key package");
+
+        alice.add_member(package).expect("add");
+        assert_eq!(alice.epoch(), 1, "a membership change advanced the epoch");
+
+        let restored = RoomGroup::restore(&alice.snapshot().expect("snapshot")).expect("restore");
+        assert_eq!(restored.epoch(), 1);
+        assert_eq!(restored.member_count(), 2);
+    }
+
+    /// The full three-step path a key-holder actually walks: mint, be welcomed, and open
+    /// something the owner sealed. If the identity did not survive the mint→welcome gap,
+    /// the join produces a group whose leaf nobody added and this fails at the read.
+    #[test]
+    fn a_minted_identity_joins_and_can_read_the_room() {
+        let room_id = "did:key:zRoom";
+
+        // The joiner mints and retains; only the bytes travel.
+        let (pending, package_bytes) =
+            IdentitySnapshot::mint("did:key:zBob").expect("mint an identity");
+        // The owner adds and produces a Welcome.
+        let mut owner = RoomGroup::create("did:key:zAlice").expect("create");
+        let change = owner
+            .add_member_from_bytes(&package_bytes)
+            .expect("add from the bytes that travelled");
+        let welcome = change.welcome.expect("adding produces a welcome");
+
+        // The joiner uses the identity it retained — not a fresh one.
+        let joined = RoomGroup::join_from_identity(&pending, &welcome).expect("join");
+        assert_eq!(joined.member_count(), 2);
+
+        // And the two agree on the storage key, which is the whole point.
+        let sealed = SealedRoom::new(room_id, owner)
+            .seal_record("k1", 1, b"for the new member")
+            .expect("seal");
+        let opened = SealedRoom::new(room_id, joined)
+            .open_record("k1", 1, &sealed)
+            .expect("the joiner reads what the owner sealed");
+        assert_eq!(opened, b"for the new member");
+    }
+
+    /// A snapshot whose store lost the group is refused rather than half-built — a
+    /// `RoomGroup` that loaded its store but not its group would look usable and fail at
+    /// the first read, which is the worst time to find out.
+    #[test]
+    fn a_snapshot_with_no_group_is_refused() {
+        let group = RoomGroup::create("did:key:zAlice").expect("create");
+        let mut snapshot = group.snapshot().expect("snapshot");
+        snapshot.entries.clear();
+
+        let Err(err) = RoomGroup::restore(&snapshot) else {
+            panic!("a snapshot with no group must not restore");
+        };
+        assert!(format!("{err}").contains("no group"), "{err}");
+    }
+}
+
+/// Restore a provider from a base64url entry list.
+fn provider_from(entries: &[(String, String)]) -> Result<OpenMlsRustCrypto, RoomKeyError> {
+    let provider = OpenMlsRustCrypto::default();
+    {
+        let mut values = provider
+            .storage()
+            .values
+            .write()
+            .map_err(|_| RoomKeyError::Group("group store lock poisoned".into()))?;
+        for (k, v) in entries {
+            let key = B64
+                .decode(k)
+                .map_err(|e| RoomKeyError::Group(format!("decode a store key: {e}")))?;
+            let value = B64
+                .decode(v)
+                .map_err(|e| RoomKeyError::Group(format!("decode a store value: {e}")))?;
+            values.insert(key, value);
+        }
+    }
+    Ok(provider)
+}
+
+/// Snapshot a provider's store as base64url pairs.
+fn entries_of(provider: &OpenMlsRustCrypto) -> Result<Vec<(String, String)>, RoomKeyError> {
+    let values = provider
+        .storage()
+        .values
+        .read()
+        .map_err(|_| RoomKeyError::Group("group store lock poisoned".into()))?;
+    Ok(values
+        .iter()
+        .map(|(k, v)| (B64.encode(k), B64.encode(v)))
+        .collect())
+}
+
+impl GroupSnapshot {
+    /// The signature public key of this member's own leaf — the key
+    /// [`RoomGroup::has_leaf_with_signature_key`] recognises that leaf by — read without
+    /// restoring the group.
+    pub fn signature_public_key(&self) -> Result<Vec<u8>, RoomKeyError> {
+        B64.decode(&self.signature_public)
+            .map_err(|e| RoomKeyError::Group(format!("decode the signature key: {e}")))
+    }
+
+    /// The MLS group id this snapshot is of ([`RoomGroup::group_id`]), read without restoring
+    /// the group.
+    pub fn group_id(&self) -> Result<Vec<u8>, RoomKeyError> {
+        B64.decode(&self.group_id)
+            .map_err(|e| RoomKeyError::Group(format!("decode the group id: {e}")))
+    }
+}
+
+impl IdentitySnapshot {
+    /// Mint an identity and a KeyPackage for one room, and snapshot both.
+    ///
+    /// Returns the snapshot to retain and the KeyPackage to send. **Mint one per room**: a
+    /// KeyPackage is a stable public identifier, so the same one offered to two rooms tells
+    /// anyone who sees both that one party is in both — the correlation a `private` room
+    /// exists to deny, arriving through the door rather than the wall.
+    pub fn mint(member_did: &str) -> Result<(Self, Vec<u8>), RoomKeyError> {
+        let provider = OpenMlsRustCrypto::default();
+        let identity = RoomIdentity::new(member_did, &provider)?;
+        let package = identity.key_package(&provider)?;
+
+        let bytes = package
+            .tls_serialize_detached()
+            .map_err(|e| RoomKeyError::Group(format!("serialise the key package: {e:?}")))?;
+
+        Ok((
+            Self {
+                entries: entries_of(&provider)?,
+                member_did: member_did.to_string(),
+                signature_public: B64.encode(identity.signer.public()),
+            },
+            bytes,
+        ))
+    }
+
+    /// The member this identity is for.
+    pub fn member_did(&self) -> &str {
+        &self.member_did
+    }
+}
+
+impl RoomGroup {
+    /// Add a member from the KeyPackage bytes they sent.
+    ///
+    /// The counterpart to [`IdentitySnapshot::mint`], which returns bytes: what travels
+    /// between a joiner and an owner is a serialized KeyPackage, and turning it back into
+    /// one means a TLS decode and a validation against the ciphersuite. Both belong in the
+    /// crate that owns MLS rather than in every caller — a caller that skipped the
+    /// validation would be adding a leaf on an unchecked key package.
+    pub fn add_member_from_bytes(
+        &mut self,
+        key_package: &[u8],
+    ) -> Result<MembershipChange, RoomKeyError> {
+        let incoming = KeyPackageIn::tls_deserialize_exact(key_package)
+            .map_err(|e| RoomKeyError::Group(format!("parse the key package: {e:?}")))?;
+        let validated = incoming
+            .validate(self.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| RoomKeyError::Group(format!("validate the key package: {e:?}")))?;
+        self.add_member(validated)
+    }
+
+    /// Join a group from a Welcome, using the identity whose KeyPackage the owner added.
+    ///
+    /// This is the only correct way to accept a Welcome: joining with a *fresh* identity
+    /// produces a group whose leaf nobody added, which fails at the first read in a way that
+    /// looks like the Welcome was bad rather than the identity wrong.
+    pub fn join_from_identity(
+        snapshot: &IdentitySnapshot,
+        welcome: &[u8],
+    ) -> Result<Self, RoomKeyError> {
+        let provider = provider_from(&snapshot.entries)?;
+        let public = B64
+            .decode(&snapshot.signature_public)
+            .map_err(|e| RoomKeyError::Group(format!("decode the signature key: {e}")))?;
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            &public,
+            ROOM_CIPHERSUITE.signature_algorithm(),
+        )
+        .ok_or_else(|| {
+            RoomKeyError::Group("the snapshot's store holds no signature keypair".into())
+        })?;
+
+        let credential = Credential::new(
+            CredentialType::Basic,
+            snapshot.member_did.as_bytes().to_vec(),
+        );
+        let identity = RoomIdentity {
+            member_did: snapshot.member_did.clone(),
+            credential: CredentialWithKey {
+                credential,
+                signature_key: signer.public().into(),
+            },
+            signer,
+        };
+
+        Self::join_with(identity, provider, welcome)
+    }
+}
+
+/// The `KeyPackageRef` of a serialized KeyPackage ([RFC 9420 §5.2]): the hash MLS itself
+/// names a KeyPackage by, and what a Welcome is addressed to.
+///
+/// **The only identity of a KeyPackage worth comparing.** Equal references mean
+/// byte-identical KeyPackages, and so the same init key — which is why
+/// `rooms/owner/group/add/0.3` recognises a repeated admission by it, and
+/// `rooms/keys/act/0.3` a KeyPackage its key holder minted. The leaf credential is not
+/// such an identity: it is signed by the leaf's own key, so anybody can make one naming
+/// anybody.
+///
+/// The bytes are parsed and validated against [`ROOM_CIPHERSUITE`] first, as an add would
+/// validate them; a KeyPackage that does not validate has no reference worth trusting.
+///
+/// [RFC 9420 §5.2]: https://www.rfc-editor.org/rfc/rfc9420#section-5.2
+pub fn key_package_ref(key_package: &[u8]) -> Result<Vec<u8>, RoomKeyError> {
+    let provider = OpenMlsRustCrypto::default();
+    let incoming = KeyPackageIn::tls_deserialize_exact(key_package)
+        .map_err(|e| RoomKeyError::Group(format!("parse the key package: {e:?}")))?;
+    let validated = incoming
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .map_err(|e| RoomKeyError::Group(format!("validate the key package: {e:?}")))?;
+    if validated.ciphersuite() != ROOM_CIPHERSUITE {
+        return Err(RoomKeyError::Group(
+            "the key package is for another ciphersuite".into(),
+        ));
+    }
+    validated
+        .hash_ref(provider.crypto())
+        .map(|r| r.as_slice().to_vec())
+        .map_err(|e| RoomKeyError::Group(format!("hash the key package: {e:?}")))
+}
+
+#[cfg(test)]
+mod leaf_recognition_tests {
+    use super::*;
+
+    /// A leaf is recognised by its signature key: present while the member is in the group,
+    /// gone once it is removed, and not confused with a later leaf for the same member.
+    #[test]
+    fn a_leaf_is_recognised_by_its_signature_key_and_not_by_the_member() {
+        let mut alice = RoomGroup::create("did:key:zAlice").unwrap();
+        let (first, kp) = IdentitySnapshot::mint("did:key:zBob").unwrap();
+        let first_key = B64.decode(&first.signature_public).unwrap();
+        alice.add_member_from_bytes(&kp).unwrap();
+        assert!(alice.has_leaf_with_signature_key(&first_key));
+
+        let leaf = alice.leaf_of("did:key:zBob").unwrap();
+        alice.remove_member(leaf).unwrap();
+        assert!(!alice.has_leaf_with_signature_key(&first_key));
+
+        let (second, kp) = IdentitySnapshot::mint("did:key:zBob").unwrap();
+        let change = alice.add_member_from_bytes(&kp).unwrap();
+        let bob = RoomGroup::join_from_identity(&second, &change.welcome.unwrap()).unwrap();
+        assert!(
+            bob.leaf_of("did:key:zBob").is_some(),
+            "the member is in the tree again"
+        );
+        assert!(
+            !bob.has_leaf_with_signature_key(&first_key),
+            "but not under its earlier leaf"
+        );
+        assert!(bob.has_leaf_with_signature_key(&B64.decode(&second.signature_public).unwrap()));
+        assert_eq!(
+            bob.snapshot().unwrap().signature_public_key().unwrap(),
+            B64.decode(&second.signature_public).unwrap()
+        );
+        assert_eq!(bob.group_id(), alice.group_id());
+        assert_eq!(
+            bob.snapshot().unwrap().group_id().unwrap(),
+            alice.group_id()
+        );
+        assert_ne!(
+            RoomGroup::create("did:key:zCarol").unwrap().group_id(),
+            alice.group_id(),
+            "another group has another id"
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_package_ref_tests {
+    use super::*;
+
+    /// Two KeyPackages for one member are two references; one KeyPackage is always the
+    /// same reference; and bytes that are not a KeyPackage have none.
+    #[test]
+    fn a_reference_names_exactly_one_key_package() {
+        let (_, a) = IdentitySnapshot::mint("did:example:alice").expect("mints");
+        let (_, b) = IdentitySnapshot::mint("did:example:alice").expect("mints");
+        let ra = key_package_ref(&a).expect("a reference");
+        assert_eq!(ra, key_package_ref(&a).expect("again"), "deterministic");
+        assert_ne!(
+            ra,
+            key_package_ref(&b).expect("b"),
+            "another KeyPackage for the same member is another reference"
+        );
+        assert!(key_package_ref(b"not a key package").is_err());
+    }
+}
+
+#[cfg(test)]
+mod self_update_tests {
+    use super::*;
+
+    /// A renewal advances the epoch and changes nobody.
+    ///
+    /// Until `self_update` existed, the only way to advance was to add or remove
+    /// somebody — so a room with a stable membership could not renew at all, and
+    /// "a room renews" meant something else.
+    #[test]
+    fn a_renewal_advances_the_epoch_and_changes_nobody() {
+        let mut group = RoomGroup::create("did:example:owner").expect("creates");
+        let before = group.epoch();
+        let members = group.member_count();
+
+        let change = group.self_update().expect("renews");
+
+        assert_eq!(change.epoch, before + 1, "the epoch moved by exactly one");
+        assert_eq!(group.epoch(), before + 1);
+        assert_eq!(
+            group.member_count(),
+            members,
+            "a renewal is not a membership change"
+        );
+        assert!(
+            change.welcome.is_none(),
+            "there is nobody new to welcome, and a caller looking for one would be \
+             looking for a party that does not exist"
+        );
+        assert!(!change.commit.is_empty(), "a renewal produces a commit");
+    }
+
+    /// Renewing twice keeps moving. A commit that did not advance would be a
+    /// renewal that healed nothing, which is the whole point of taking one.
+    #[test]
+    fn renewals_compose() {
+        let mut group = RoomGroup::create("did:example:owner").expect("creates");
+        let start = group.epoch();
+        group.self_update().expect("renews");
+        group.self_update().expect("renews again");
+        assert_eq!(group.epoch(), start + 2);
+    }
+
+    /// The exporter moves with the epoch, which is why a renewal severs history
+    /// unless a rung is minted — and is the reason that warning is on the method
+    /// rather than left to a caller to discover.
+    #[test]
+    fn a_renewal_changes_the_key_records_are_sealed_under() {
+        let mut group = RoomGroup::create("did:example:owner").expect("creates");
+        let before = group.storage_key().expect("exports");
+        group.self_update().expect("renews");
+        let after = group.storage_key().expect("exports");
+        assert_ne!(
+            before, after,
+            "if the storage key survived a commit, post-compromise security would be a \
+             claim this type does not keep"
+        );
+    }
+}

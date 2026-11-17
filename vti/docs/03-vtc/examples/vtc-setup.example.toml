@@ -1,0 +1,206 @@
+# vtc-setup.example.toml — full reference for `vtc setup --from <file>`.
+#
+# Non-interactive VTC provisioning for CI, immutable images, or any
+# unattended bring-up. Mirrors the decisions the interactive `vtc setup`
+# wizard collects via prompts. See docs/03-vtc/getting-started.md.
+#
+# IMPORTANT — the ephemeral setup key is a TWO-PHASE bridge (the same
+# shape the mediator and did-hosting services use). Provisioning
+# authenticates to the VTA with an ephemeral did:key whose DID must
+# already be ACL-authorised at the VTA. A non-interactive run can't pause
+# to grant it, so do this first, out of band:
+#
+#   1. Mint + persist an ephemeral setup key (phase 1):
+#        vtc setup --setup-key-out /srv/vtc/setup-key.json --context <context>
+#      This writes the key (0600) and prints the exact `pnm contexts
+#      create … --admin-did <setup-did>` command to run next.
+#   2. Grant that did:key an admin ACL at the VTA (run the printed command
+#      on a host with PNM authenticated to the VTA):
+#        pnm contexts create --id <context> --name "VTC" \
+#          --admin-did <setup-did> --admin-expires 1h --admin-handoff
+#      (or `pnm acl create ... --expires 1h --handoff` if the context already exists).
+#   3. Provision (phase 2):
+#        vtc setup --from vtc-setup.toml
+#      with `setup_key_file` below pointing at that persisted key.
+#
+# See docs/03-vtc/non-interactive-setup.md for the full walkthrough
+# (incl. a Kubernetes example).
+
+# ── Required ────────────────────────────────────────────────────────────
+config_path    = "/srv/vtc/config.toml"
+base_url       = "https://vtc.example.com"   # host base, no trailing slash, no /v1
+vta_did        = "did:webvh:vta.example.com:abc"
+setup_key_file = "/srv/vtc/setup-key.json"   # persisted + ACL-granted (see above)
+
+# ── Optional top-level ──────────────────────────────────────────────────
+context = "default"   # the VTA context this community provisions under
+
+# The method of the community's own DID: "webvh" (default) or "webs", a
+# level-1 did:webs (alpha) from the `vtc-host-classical` template — one
+# signing key, no post-quantum key, no did.jsonl. "webs" requires
+# [webvh] server_id below (no serverless did:webs) and the VTA's
+# `[dids] webs_enabled` + `webs_service_dids`. See docs/02-vta/did-webs.md.
+# identity_method = "webs"
+
+# The trust registry authoritative for this community, if it has one.
+# Publishes a TrustRegistry referral in the VTC's DID document, so a client
+# holding only this community's DID resolves one hop to the registry instead
+# of being configured with both DIDs. Must be a DID, not a URL — the referral
+# names the registry by DID. Omit for a community with no registry.
+#
+# Can be changed after mint, but not here: the VTA holds the keys that change
+# the DID document. For a did:webvh the change is `pnm did-mgmt dids edit` at
+# the VTA. A VTC that serves its own did.jsonl then installs the new log with
+# `pnm did-mgmt dids get-log <did> --out did.jsonl` and
+# `cnm did-log install --file did.jsonl`; one on a DID host needs neither. For
+# a did:webs it is `vta/webs/dids/update` with `services.additional`; there is
+# no log to install (docs/02-vta/did-webs.md).
+# See docs/03-vtc/community-lifecycle.md.
+# registry_did = "did:webvh:abc:registry.example.com"
+
+# ── Second administrator (optional, recommended) ────────────────────────
+# Making anyone a community administrator (or granting any
+# authority-conferring capability) needs the consent of another holder of it
+# (VTI-APV-018). A community installed with one has nobody to give it, so a
+# second could then only be added offline, with the daemon stopped (`vtc acl
+# add`), unless it runs in single-administrator mode (below). Name a second
+# administrator's DID here and the install bootstrap writes both as
+# community-admin. They need no passkey to approve — an approval is a document
+# their DID signs — and enrol a step-up factor later: an approver device
+# through an invite, or a passkey through an admin invite. Omit to install a
+# single administrator.
+# co_admin_did = "did:key:z6Mk…"
+
+# ── Single-administrator mode (optional) ────────────────────────────────
+# For a community run by one person (VTI-APV-022), even one who administers it
+# under several identifiers (one per device). An operation that ordinarily
+# needs another administrator's approval is authorized by the requester's
+# step-up bound to that operation (passkey or approver device) instead —
+# whether or not other administrators' entries exist — audited at the highest
+# severity and shown to every administrator in every session. Turn it on only
+# where every administrator is the same person; if someone else joins as an
+# administrator, turn it off on the host. Removing or narrowing another
+# administrator keeps its cooling-off. Writes `[acl] single_admin_mode = true`
+# to config.toml; it can be changed afterwards only there, on the host, and by
+# a restart — never online. `vtc setup --single-admin` sets it too. Beside
+# co_admin_did, setup warns: keep it only if that DID is also yours.
+# Default false.
+# single_admin_mode = true
+
+# How setup reaches the VTA: "tsp", "didcomm" or "rest". Omit for the
+# automatic TSP > DIDComm > REST, which moves on only when a transport fails to
+# connect. A reply lost after the VTA acted on the request is final — the setup
+# DID's one-time hand-off is spent, and the VTA keeps an admin entry nobody
+# holds the key to — so force a transport here to avoid a mediator known to
+# drop replies. One the VTA does not advertise is ignored. Not persisted.
+# provision_transport = "rest"
+
+# ── DID hosting (optional) ──────────────────────────────────────────────
+# For a did:webvh, omit the whole [webvh] table for the serverless default:
+# the VTC self-hosts its did.jsonl at base_url. A did:webs
+# (identity_method = "webs") has no serverless mode and needs server_id.
+# [webvh]
+# server_id = "host-1"                 # a registered did-hosting server id
+# domain    = "tenant.example.com"     # tenant domain on a multi-domain host
+# path      = "communities/acme"       # did:webvh:<scid>:<host>:<path>, or
+#                                      # did:webs:<host>:<path>:<AID>; omitted:
+#                                      # server-assigned (webvh), top level (webs)
+
+# ── Messaging (optional) ────────────────────────────────────────────────
+# Omit the whole table for no messaging — the daemon stays healthy on REST
+# and logs a one-line "messaging not configured" warning at startup.
+#
+# When present, `mediator_did` and `transports` are both REQUIRED;
+# `mediator_url` is informational (the endpoint is resolved from the
+# mediator's DID document).
+#
+# `transports` decides what this community's DID document advertises, and
+# therefore how anyone reaches it. Every entry points at `mediator_did` —
+# TSP and DIDComm share one dual-protocol mediator.
+#
+#   ["tsp", "didcomm"]  both. The recommended shape: clients prefer TSP,
+#                       and peers that don't speak it fall back to DIDComm.
+#   ["didcomm"]         mediator routes DIDComm only.
+#   ["tsp"]             TSP only — strands every peer that can't speak it.
+#
+# ⚠ Advertising a transport your mediator does not route makes this
+#   community unreachable on it: conforming clients prefer it and fail.
+#   Confirm your mediator advertises the matching service first — nothing
+#   here can check it for you.
+#
+# Changing this after mint is the same VTA-side `pnm did-mgmt dids edit`
+#   (then `cnm did-log install` for a VTC that serves its own did.jsonl) —
+#   see docs/03-vtc/community-lifecycle.md. Setup is still the easy moment
+#   to get it right.
+# [messaging]
+# mediator_did = "did:web:mediator.example.com"
+# transports   = ["tsp", "didcomm"]
+# mediator_url = "https://mediator.example.com"
+
+# ── Secret-store backend (required) ─────────────────────────────────────
+# Where the VTC's key bundle is stored. Same shape as the [secrets] block
+# in config.toml. The choice is security-sensitive — there is no implicit
+# default. Pick exactly one backend; the others are shown commented.
+[secrets]
+# `backend` selects the store explicitly (recommended for declarative /
+# K8s deploys). When set it wins outright and setup validates that its
+# required field(s) below are present. Accepts:
+#   keyring | vault | k8s | aws | gcp | azure | config | encrypted-file | plaintext
+# Omit `backend` to keep the legacy "whichever field is set wins"
+# resolution. TEE-KMS is intentionally not a VTC backend.
+backend = "keyring"
+
+# OS keyring (backend = "keyring", the default). Change `keyring_service`
+# to run multiple VTC instances on one machine.
+keyring_service = "vtc"
+
+# HashiCorp Vault (backend = "vault", vault-secrets feature). In K8s,
+# `vault_auth_method = "kubernetes"` (the default) uses the pod's
+# ServiceAccount token — no static secret to mount.
+# backend            = "vault"
+# vault_addr         = "https://vault.internal:8200"
+# vault_secret_path  = "vtc/key-bundle"     # path under the KV v2 mount
+# vault_kv_mount     = "secret"             # default
+# vault_secret_key   = "seed"               # field in the KV secret (default)
+# vault_auth_method  = "kubernetes"         # kubernetes | token | approle
+# vault_k8s_role     = "vtc"                # Vault role bound to the SA
+# vault_namespace    = "team-a"             # Vault Enterprise, optional
+
+# Kubernetes Secret (backend = "k8s", k8s-secrets feature). Reads the hex
+# bundle straight from a mounted/API Secret; namespace defaults to the
+# in-cluster ServiceAccount namespace when unset.
+# backend         = "k8s"
+# k8s_secret_name = "vtc-key-bundle"
+# k8s_namespace   = "vtc"
+# k8s_secret_key  = "secret"
+
+# AWS Secrets Manager (backend = "aws", aws-secrets feature)
+# backend         = "aws"
+# aws_secret_name = "vtc/prod/key-bundle"
+# aws_region      = "us-east-1"
+
+# GCP Secret Manager (backend = "gcp", gcp-secrets feature)
+# backend         = "gcp"
+# gcp_project     = "my-project"
+# gcp_secret_name = "vtc-prod-key-bundle"
+
+# Azure Key Vault (backend = "azure", azure-secrets feature)
+# backend           = "azure"
+# azure_vault_url   = "https://my-vault.vault.azure.net"
+# azure_secret_name = "vtc-prod-key-bundle"
+
+# Inline config-secret (backend = "config", dev/test): setup writes the
+# hex key bundle into this file's [secrets] secret. Read-only at runtime.
+# backend = "config"
+
+# AES-256-GCM encrypted file (backend = "encrypted-file") — the secure local
+# option for a host with no OS keyring. Default <data_dir>/secret.enc. The
+# key-encryption key comes from a file, a systemd credential or the TPM, never
+# from this file or an environment variable. Must be readable while setup runs.
+# backend = "encrypted-file"
+# [secrets.encrypted_file]
+# kek = { source = "systemd_creds", credential = "vtc-secret-kek" }
+
+# Plaintext file (backend = "plaintext", NOT secure — dev/test only): the
+# bundle is written to <data_dir>/secret.plaintext.
+# backend = "plaintext"

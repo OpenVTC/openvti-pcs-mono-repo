@@ -1,0 +1,3695 @@
+//! The room group slice — `spec/rooms/keys/{key-package,welcome,commit,open}`.
+//!
+//! How a group reaches a key-holding agent, and what it does once it has one. The
+//! orchestration is [`crate::operations::room_groups`]; this is the dispatch surface.
+//!
+//! # Four tasks, four different gates
+//!
+//! Deliberately not one gate applied four times, because these are four different acts:
+//!
+//! | | authorized by |
+//! |---|---|
+//! | `key-package` | an invitation naming a persona the caller may act as — minting retains a private key, so a VTA that minted for anyone is one anyone can fill |
+//! | `welcome` | that same invitation, **consumed** |
+//! | `commit` | the group itself — MLS authenticates the committer as a member of the group we already hold |
+//! | `open` | [`Capability::RoomOpen`] |
+//!
+//! The member a group admits is the **persona** the invitation names — a DID this VTA
+//! holds for the person ([`crate::operations::persona`]) — and their MLS leaf carries it.
+//! The caller is whoever delivers the invitation, and is never the member's identity.
+//!
+//! Only the last is a capability, and that asymmetry is the point. The first three are
+//! *inbound* — a room's owner reaching this VTA — and an ACL of ours has no opinion about
+//! who a room's owner is. The fourth is our own principal's agent asking us to decrypt, and
+//! that is exactly what a capability is for.
+//!
+//! # Every request type here is generated
+//!
+//! `rooms/keys/{key-package,welcome,commit}` merged upstream in
+//! `trustoverip/dtgwg-trust-tasks-tf#355` and released in `trust-tasks-rs` 0.17.8, so none
+//! of the four needs a hand-written request body. Only the responses are local, because a
+//! handler returns a struct rather than a `Value`.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use trust_tasks_rs::TrustTask;
+use vti_common::acl::Capability;
+
+use crate::audit;
+use crate::auth::AuthClaims;
+use crate::operations::{room_groups, room_invitation, room_member};
+use crate::server::AppState;
+
+use super::helpers::{
+    TRANSPORT_TRUST_TASK, TrustTaskOutcome, app_error_to_reject, parse_payload, success_response,
+};
+
+/// How long a KeyPackage `rooms/keys/key-package/0.2` minted is held.
+///
+/// Bounded because the private half *is* retained key material: a caller that minted and
+/// never joined has left a key behind. Fourteen days because the KeyPackage is the one an
+/// acceptance begun on one surface is finished with on another, and the community keeps the Welcome for it for
+/// seven days **from the admission**, which comes after the mint. Held seven days from
+/// the mint, the KeyPackage would expire first and an acceptance the community still
+/// offers to finish could not be (key-package 0.2 *The private half is retained*: a
+/// recipient SHOULD NOT expire one sooner than the communities it serves keep theirs).
+/// Fourteen covers an admission up to a week after the mint; the private half is still
+/// discarded the moment the Welcome is processed.
+const KEY_PACKAGE_V0_2_LIFETIME_SECS: u64 = 14 * 24 * 60 * 60;
+
+// ─── Response types ──────────────────────────────────────────────────────
+//
+// Requests come from the generated bindings; only the responses are written
+// here, and only because a handler returns a struct rather than a `Value`.
+
+/// `rooms/keys/key-package/0.2#response`: `alreadyMinted` says whether this is the
+/// KeyPackage already held.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPackageResponseV0_2 {
+    pub key_package: String,
+    pub expires_at: String,
+    pub already_minted: bool,
+}
+
+/// `rooms/keys/welcome/0.1#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WelcomeResponse {
+    pub epoch: u64,
+}
+
+/// `rooms/keys/commit/0.1#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitResponse {
+    pub epoch: u64,
+}
+
+// ─── Handlers ────────────────────────────────────────────────────────────
+
+/// `rooms/keys/key-package/0.2`: the KeyPackage already held for this room, member and
+/// invitation while it is outstanding (recipient item 3), else a new one (item 4).
+///
+/// What lets a member finish, from any surface, an acceptance another began: the second
+/// surface is given the KeyPackage the community already admitted, and the community
+/// answers its acceptance with the Welcome it kept, rather than a second mint replacing
+/// the first's private half — the one that Welcome is sealed to.
+///
+/// The leaf the KeyPackage carries identifies the persona the invitation names — the
+/// member's identity in the room — never the client that asked for it.
+pub(super) async fn handle_key_package_v0_2(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: vti_specs::rooms::keys::key_package::v0_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let room_id = req.room_id.to_string();
+    // Item 1: never without a valid invitation to the room. Item 2: the member is its
+    // subject, and the caller must act as them.
+    let invitation =
+        match require_invitation(state, Some(req.invitation.as_str()), &room_id, auth).await {
+            Ok(i) => i,
+            Err(e) => return app_error_to_reject(&doc, e),
+        };
+    let member = match room_member::member_as(state, auth, &room_id, invitation.subject()).await {
+        Ok(m) => m,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    // Item 6: the invitation is identified by its credential id, never by what it says.
+    let (pending, already_minted) = match room_groups::outstanding_or_mint(
+        &state.room_groups_ks,
+        &member,
+        invitation.credential_id(),
+        KEY_PACKAGE_V0_2_LIFETIME_SECS,
+        now(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    if !already_minted {
+        record(state, "rooms.keys.key-package", auth, &room_id).await;
+    }
+    success_response(
+        &doc,
+        KeyPackageResponseV0_2 {
+            key_package: pending.key_package,
+            expires_at: rfc3339(pending.expires_at),
+            already_minted,
+        },
+    )
+}
+
+/// `rooms/keys/welcome/0.1`.
+pub(super) async fn handle_welcome(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: vti_specs::rooms::keys::welcome::v0_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // The load-bearing gate. A Welcome carries a group's secrets; without a matching
+    // invitation this VTA would be accepting key material for a room nobody agreed to join.
+    let invitation =
+        match verify_invitation(state, req.invitation.as_deref(), &req.room_id, auth).await {
+            Ok(i) => i,
+            Err(e) => return app_error_to_reject(&doc, e),
+        };
+    // A spent invitation is the join already made — by this request's lost answer, or by
+    // another surface finishing the same acceptance. For the member who joined with it,
+    // that is `alreadyJoined` (welcome/0.1: a recipient already holding group state for the
+    // member the invitation names MUST answer it), which a surface reads as success; for
+    // anyone else it is a used invitation.
+    match room_invitation::is_consumed(&state.room_invitations_ks, invitation.credential_id()).await
+    {
+        Ok(false) => {}
+        Ok(true) => {
+            let joined =
+                match room_member::member_as(state, auth, &req.room_id, invitation.subject()).await
+                {
+                    // A current membership only: group state a removal ended is a prior
+                    // membership (welcome/0.1), and this spent invitation is not what
+                    // admitted the member again.
+                    Ok(member) => room_groups::holds_current(&state.room_groups_ks, &member)
+                        .await
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+            if joined {
+                return super::helpers::reject_declared(
+                    &doc,
+                    vti_specs::rooms::keys::welcome::v0_1::error_codes::ALREADY_JOINED,
+                    format!(
+                        "this VTA already holds group state for `{}` in room `{}`, joined with \
+                         this invitation",
+                        invitation.subject(),
+                        req.room_id
+                    ),
+                );
+            }
+            return app_error_to_reject(&doc, used_invitation(&invitation));
+        }
+        Err(e) => return app_error_to_reject(&doc, e),
+    }
+
+    let welcome = match decode_b64(&req.welcome, "welcome") {
+        Ok(b) => b,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    // The member joining is the invitation's subject, and "already joined" is asked of
+    // that member alone: another persona this VTA holds for somebody else in the same room
+    // is a different leaf, and its group is no reason to refuse this one.
+    let member = match room_member::member_as(state, auth, &req.room_id, invitation.subject()).await
+    {
+        Ok(m) => m,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let epoch = match room_groups::join(&state.room_groups_ks, &member, &welcome, now()).await {
+        Ok(e) => e,
+        Err(room_groups::JoinError::AlreadyJoined) => {
+            return super::helpers::reject_declared(
+                &doc,
+                vti_specs::rooms::keys::welcome::v0_1::error_codes::ALREADY_JOINED,
+                format!(
+                    "this VTA already holds group state for `{}` in room `{}`; leaving and \
+                     rejoining is a removal and a fresh invitation, not a second welcome",
+                    member.persona(),
+                    req.room_id
+                ),
+            );
+        }
+        Err(room_groups::JoinError::KeyPackageExpired) => {
+            return super::helpers::reject_declared(
+                &doc,
+                vti_specs::rooms::keys::welcome::v0_1::error_codes::WELCOME_INVALID,
+                format!(
+                    "the key package this welcome is sealed to expired and has been discarded; \
+                     mint a fresh one for room `{}` (rooms/keys/key-package) and have the owner \
+                     add that",
+                    req.room_id
+                ),
+            );
+        }
+        Err(room_groups::JoinError::WelcomeForAnotherGroup) => {
+            return super::helpers::reject_declared(
+                &doc,
+                vti_specs::rooms::keys::welcome::v0_1::error_codes::WELCOME_INVALID,
+                format!(
+                    "this welcome is for an MLS group other than the one this VTA holds for \
+                     `{}` in room `{}`; a re-admission is into that group, so nothing was \
+                     joined or consumed",
+                    member.persona(),
+                    req.room_id
+                ),
+            );
+        }
+        Err(room_groups::JoinError::App(e)) => return app_error_to_reject(&doc, e),
+    };
+
+    // Consumed only after the join succeeded. Burning it on a Welcome that then failed to
+    // process would strand the member: the invitation is spent and they are not in.
+    if let Err(e) = room_groups::consume_invitation(
+        &state.room_invitations_ks,
+        invitation.credential_id(),
+        &req.room_id,
+        now(),
+    )
+    .await
+    {
+        return app_error_to_reject(&doc, e);
+    }
+
+    record(state, "rooms.keys.welcome", auth, &req.room_id).await;
+    success_response(&doc, WelcomeResponse { epoch })
+}
+
+/// `rooms/keys/commit/0.1`.
+pub(super) async fn handle_commit(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: vti_specs::rooms::keys::commit::v0_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let commit = match decode_b64(&req.commit, "commit") {
+        Ok(b) => b,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    // No gate of ours on the committer. MLS authenticates the committer as a member of the
+    // group we already hold, and an ACL here would be this service deciding who may commit
+    // to a room it is not part of — the mistake the whole family is arranged to avoid.
+    //
+    // *Which* group is ours to decide, though: the one member the caller acts as. A caller
+    // in another context reaches no group here, and is told what a room nobody holds is.
+    let named = match named_member(&doc) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let member =
+        match room_member::require_acting_as(state, auth, &req.room_id, named.as_deref()).await {
+            Ok(m) => m,
+            Err(e) => return app_error_to_reject(&doc, e),
+        };
+    let epoch = match room_groups::apply_commit(
+        &state.room_groups_ks,
+        &member,
+        &commit,
+        u64::from(req.epoch),
+        now(),
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    record(state, "rooms.keys.commit", auth, &req.room_id).await;
+    success_response(&doc, CommitResponse { epoch })
+}
+
+/// What `rooms/keys/list` says about whose an entry is: the member (persona DID), the
+/// trust context its key lives in, and the actions the room's grant to it confers — so a
+/// client can tell the community's own place in a room (one that administers it) from a
+/// member's. `context` and `actions` are descriptions, never gates, and are left out
+/// where they cannot be read rather than failing the listing.
+pub(super) async fn held_by(state: &AppState, auth: &AuthClaims, m: &room_groups::Member) -> Value {
+    let mut out = serde_json::json!({ "member": m.persona() });
+    let stores = crate::operations::persona::PersonaStores::from_state(state);
+    if let Ok(Some(key)) =
+        crate::operations::persona::persona_signing_key(stores, auth, m.persona()).await
+        && let Ok(Some(record)) = state
+            .keys_ks
+            .get::<vta_sdk::keys::KeyRecord>(vta_keys::store_key(&key.key_id))
+            .await
+        && let Some(context) = record.context_id
+    {
+        out["context"] = Value::String(context);
+    }
+    if let Ok(principals) =
+        crate::operations::room_oracle::principals(state, auth, m.room_id()).await
+        && let Some(p) = principals.iter().find(|p| p.did == m.persona())
+    {
+        out["actions"] = serde_json::json!(p.actions());
+    }
+    out
+}
+
+/// The member the request names in `ext["org.openvtc.rooms"].member`
+/// ([`room_member::named_member`]), or a malformed-request refusal.
+#[allow(clippy::result_large_err)]
+pub(super) fn named_member(doc: &TrustTask<Value>) -> Result<Option<String>, TrustTaskOutcome> {
+    room_member::named_member(&doc.payload).map_err(super::helpers::malformed_request_response)
+}
+
+/// The rungs a `rooms/keys/chain` request carries, as this crate's type. Converted rather
+/// than clamped: an epoch outside `u32` is a malformed rung.
+fn chain_links(payload: &Value) -> Result<Vec<vti_rooms::wire::EpochLink>, String> {
+    let Some(links) = payload.get("links") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value::<Vec<vti_rooms::wire::EpochLink>>(links.clone())
+        .map_err(|_| "an epoch link names an epoch outside the representable range".to_string())
+}
+
+/// `rooms/keys/chain/0.2`.
+///
+/// The principal hands this VTA the room's epoch key chain, so it can open records sealed
+/// before the principal joined, and the room's epoch floor relayed with the rungs — or
+/// alone — which this key holder applies before answering (`EpochFloor`; trust-tasks-tf
+/// #869): it discards what it holds below the floor, never stores a rung at or below it,
+/// and reports the floor it now holds.
+///
+/// # Gated on `RoomOpen`, and that is the whole of the authorization
+///
+/// The specification's entitlement is *being this key holder's own principal* — not a
+/// credential the room issued. Fetching these rungs from a host took a room-issued `read`
+/// chain; handing them on takes none, because this VTA is not being asked to believe
+/// anything about the room. It is being handed material it will verify by trying to use it.
+/// `RoomOpen` governs *reading a room's records*, and this extends how far back that
+/// reaches; anything wider (`Sign`) would grant more than the task needs.
+///
+/// The request is read against its **schema**, not through the generated type: the
+/// generated `Payload` is an untagged enum of "links" or "epochFloor" that, with
+/// `deny_unknown_fields`, cannot hold the request the specification requires most often —
+/// rungs **and** the floor they came with.
+pub(super) async fn handle_chain_v0_2(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(r) = super::helpers::require_capability(
+        state,
+        auth,
+        &doc,
+        Capability::RoomOpen,
+        "extending a room's readable history",
+    )
+    .await
+    {
+        return r;
+    }
+
+    if let Err(e) = vta_sdk::schema_cache::check_payload::<
+        vti_specs::rooms::keys::chain::v0_2::Payload,
+    >(&doc.payload)
+    {
+        return super::helpers::malformed_request_response(format!(
+            "payload refused by its schema: {}",
+            e.messages().join("; ")
+        ));
+    }
+    let room_id = doc.payload["roomId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let relayed_floor = doc
+        .payload
+        .get("epochFloor")
+        .and_then(Value::as_u64)
+        .map(|f| u32::try_from(f).unwrap_or(u32::MAX));
+    // Converted rather than clamped: an epoch outside `u32` is a malformed rung, and
+    // saturating it to `u32::MAX` would store one under an epoch nobody will ever ask for —
+    // a delivery that reports success and extends nothing.
+    let links = match chain_links(&doc.payload) {
+        Ok(l) => l,
+        Err(reason) => {
+            return app_error_to_reject(&doc, vti_common::error::AppError::Validation(reason));
+        }
+    };
+
+    let named = match named_member(&doc) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let member = match room_member::require_acting_as(state, auth, &room_id, named.as_deref()).await
+    {
+        Ok(m) => m,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    // The floor first (item 2: before answering, and before any rung is stored). With no
+    // group, `store_links` refuses as before: never keep a floor for a room this key
+    // holder holds nothing for.
+    if let Some(floor) = relayed_floor
+        && room_groups::load(&state.room_groups_ks, &member)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        && let Err(e) =
+            room_groups::apply_epoch_floor(&state.room_groups_ks, &member, floor, now()).await
+    {
+        return app_error_to_reject(&doc, e);
+    }
+    let (earliest, stored) =
+        match room_groups::store_links(&state.room_groups_ks, &member, links, now()).await {
+            Ok(r) => r,
+            Err(e) => return app_error_to_reject(&doc, e),
+        };
+
+    record(state, "rooms.keys.chain", auth, &room_id).await;
+    let mut body = serde_json::json!({
+        "roomId": room_id,
+        "earliestReadableEpoch": earliest,
+        "stored": stored,
+    });
+    match room_groups::epoch_floor(&state.room_groups_ks, &member).await {
+        Ok(0) => {}
+        Ok(held) => body["epochFloor"] = serde_json::json!(held),
+        Err(e) => return app_error_to_reject(&doc, e),
+    }
+    success_response(&doc, body)
+}
+
+/// Everything the gated signer needs, gathered from the running service.
+///
+/// A copy of `room_owner`'s rather than a shared one: the two modules sign as
+/// different identities and the struct is the argument list, not the policy.
+pub(super) fn signing_context<'a>(
+    state: &'a AppState,
+    auth: &'a AuthClaims,
+) -> crate::operations::room_issuance::SigningContext<'a> {
+    crate::operations::room_issuance::SigningContext {
+        keys_ks: &state.keys_ks,
+        imported_ks: &state.imported_ks,
+        internal_ks: &state.internal_ks,
+        contexts_ks: &state.contexts_ks,
+        acl_ks: &state.acl_ks,
+        seed_store: &state.seed_store,
+        audit: &state.audit_sink,
+        auth,
+    }
+}
+
+/// `rooms/keys/backfill/0.2` — fetch the chain from the host and keep it.
+///
+/// Three hops folded into one, performed by the party that can perform all three:
+/// mint a presentation, ask the host for the rungs, store what comes back. The
+/// member could do the first and third and not the second — a browser reaches its
+/// own agent and no third party — which is the whole reason this task exists.
+///
+/// **This VTA acts as its principal** (`rooms/keys/backfill/0.2`, *What the recipient
+/// presents, and to whom*): the `read` grant is the principal persona's own, narrowed
+/// to `read` and granted to the persona, and the `rooms/epoch/chain` document is
+/// issued and signed by the persona ([`send_as_member`]). This VTA's own DID never
+/// reaches the host — it used to be the leaf's subject, the document's issuer and its
+/// signer, which named an identity no room admitted and, for a context-scoped caller,
+/// failed outright: the caller may not sign with the VTA's `#key-0`.
+///
+/// Fetched with `rooms/epoch/chain/0.2`, and the floor that carries applied before
+/// answering and reported (`EpochFloor`; trust-tasks-tf #869).
+pub(super) async fn handle_backfill_v0_2(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(r) = super::helpers::require_capability(
+        state,
+        auth,
+        &doc,
+        Capability::RoomOpen,
+        "fetching a room's readable history",
+    )
+    .await
+    {
+        return r;
+    }
+
+    let req: vti_specs::rooms::keys::backfill::v0_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let resolver = match outbound_resolver(state, &doc) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // `read`, and only `read`. Reading the room and reading the parts of it
+    // written earlier are the same act, so they take the same grant; asking for
+    // more would hand the host authority the operation never needed.
+    //
+    // The caller-named `host` is not bound into the presentation. What makes a
+    // caller-named host safe is that the leaf grants to the principal and is
+    // usable only by a party that can sign as the principal: a host of the
+    // caller's choosing receives something it cannot act with. What it does gain
+    // is sight of the principal's credentials, which is a disclosure rather than
+    // an escalation — see `rooms/keys/backfill/0.2`.
+    let named = match named_member(&doc) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let member = match presenting_member(state, auth, &req.room_id, named.as_deref()).await {
+        Ok(v) => v,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    // Item 5: never ask for rungs below the floor already held — they would be discarded.
+    let held_floor = room_groups::epoch_floor(&state.room_groups_ks, &member.member)
+        .await
+        .unwrap_or(0);
+    let mut payload = serde_json::json!({ "roomId": req.room_id });
+    if let Some(from) = req.from_epoch {
+        payload["fromEpoch"] = serde_json::json!(u64::from(from).max(u64::from(held_floor) + 1));
+    }
+    if let Some(limit) = req.limit {
+        payload["limit"] = serde_json::json!(u64::from(limit));
+    }
+
+    // Item 1: fetch with `rooms/epoch/chain/0.2` — the version carrying the floor.
+    let fetched = send_as_member_typed(
+        state,
+        auth,
+        &member,
+        &resolver,
+        &req.host,
+        vti_rooms::wire::ROOMS_EPOCH_CHAIN_V2_TYPE,
+        payload,
+    )
+    .await;
+    let reply = match fetched {
+        Ok(v) => v,
+        Err(e) => {
+            use vti_specs::rooms::keys::backfill::v0_2::error_codes as codes;
+            return host_failure(
+                &doc,
+                e,
+                &req.host,
+                codes::HOST_UNREACHABLE,
+                codes::HOST_REFUSED,
+            );
+        }
+    };
+    let member = member.member;
+
+    // Item 2: a floor the host served, applied before anything is stored or answered.
+    if let Some(floor) = reply.get("epochFloor").and_then(Value::as_u64)
+        && let Err(e) = room_groups::apply_epoch_floor(
+            &state.room_groups_ks,
+            &member,
+            u32::try_from(floor).unwrap_or(u32::MAX),
+            now(),
+        )
+        .await
+    {
+        return app_error_to_reject(&doc, e);
+    }
+
+    let links: Vec<vti_rooms::wire::EpochLink> =
+        match serde_json::from_value(reply.get("links").cloned().unwrap_or(Value::Array(vec![]))) {
+            Ok(l) => l,
+            Err(e) => {
+                return app_error_to_reject(
+                    &doc,
+                    vti_common::error::AppError::Internal(format!(
+                        "room host `{}` served rungs this agent cannot read: {e}",
+                        req.host
+                    )),
+                );
+            }
+        };
+    let fetched = links.len();
+
+    // Nothing served is a real answer rather than an error — the host holds no
+    // rungs below what this agent already reads — and it needs no special case:
+    // `store_links` with an empty delivery stores nothing and still walks what
+    // is held, which is the reach this must report either way.
+    let (earliest, stored) =
+        match room_groups::store_links(&state.room_groups_ks, &member, links, now()).await {
+            Ok(r) => r,
+            Err(e) => return app_error_to_reject(&doc, e),
+        };
+
+    record(state, "rooms.keys.backfill", auth, &req.room_id).await;
+    let mut body = serde_json::json!({
+        "roomId": req.room_id,
+        "earliestReadableEpoch": earliest,
+        "fetched": fetched,
+        "stored": stored,
+    });
+    match room_groups::epoch_floor(&state.room_groups_ks, &member).await {
+        Ok(0) => {}
+        Ok(held) => body["epochFloor"] = serde_json::json!(held),
+        Err(e) => return app_error_to_reject(&doc, e),
+    }
+    success_response(&doc, body)
+}
+
+/// The member a presentation-bearing task acts as, and the presentation it carries.
+///
+/// One resolution for both: the persona whose credentials are presented
+/// ([`crate::operations::room_oracle::principal`]) is the member whose group opens what
+/// comes back and whose root memory the host's answer is compared against. Resolving them
+/// separately could pair one persona's authority with another's keys.
+pub(super) struct PresentingMember {
+    /// The member — the persona, in this room — whose group state is used.
+    pub member: room_groups::Member,
+    /// The persona's DID: the documents' issuer and signer, and the leaf's subject.
+    pub did: String,
+    /// The persona's own `read` authority, narrowed to `read` and granted to the persona.
+    pub presentation: Value,
+}
+
+/// [`PresentingMember`] for `room_id`: the principal persona, and their own `read` grant.
+///
+/// The grant is made out to **the persona**, never to this VTA: the host authenticates
+/// the persona as presenter, because the persona signs what it receives
+/// ([`send_as_member`]). `rooms/keys/{read,browse,backfill}/0.1` require exactly this, and
+/// that this VTA's own identifier never reach the host.
+///
+/// `named` is the member the request names ([`room_member::named_member`]); `None` keeps the
+/// rule that a caller who may act as several members of the room is refused.
+pub(super) async fn presenting_member(
+    state: &AppState,
+    auth: &AuthClaims,
+    room_id: &str,
+    named: Option<&str>,
+) -> Result<PresentingMember, vti_common::error::AppError> {
+    let principal =
+        crate::operations::room_oracle::principal_named(state, auth, room_id, named).await?;
+    let member = room_member::member_as(state, auth, room_id, &principal.did).await?;
+    let minted = crate::operations::room_oracle::present_as(
+        state,
+        auth,
+        &principal,
+        &principal.did,
+        room_id,
+        "read",
+    )
+    .await?;
+    Ok(PresentingMember {
+        member,
+        did: principal.did,
+        presentation: minted.presentation,
+    })
+}
+
+/// Send one room request to `host` **as the member**: the member's presentation in the
+/// payload, the member as `issuer`, the member's `authentication` proof
+/// ([`crate::operations::room_act::sign_as`]) — and return the response's `payload`.
+pub(super) async fn send_as_member(
+    state: &AppState,
+    auth: &AuthClaims,
+    member: &PresentingMember,
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    host: &str,
+    task: &str,
+    payload: Value,
+) -> Result<Value, vti_common::error::AppError> {
+    send_as_member_typed(state, auth, member, resolver, host, task, payload)
+        .await
+        .map_err(MemberSendError::into_app_error)
+}
+
+/// Why [`send_as_member_typed`] got no answer: something here, or the host.
+pub(super) enum MemberSendError {
+    /// Building or signing the request failed before anything was sent.
+    Local(vti_common::error::AppError),
+    /// The host refused, could not be reached, or answered unusably.
+    Host(crate::operations::room_host::RoomTaskError),
+}
+
+impl MemberSendError {
+    pub(super) fn into_app_error(self) -> vti_common::error::AppError {
+        match self {
+            Self::Local(e) => e,
+            Self::Host(e) => e.into_app_error(),
+        }
+    }
+}
+
+/// [`send_as_member`], keeping the host's failures apart from this agent's, so a task that
+/// declares `hostUnreachable` / `hostRefused` can say which.
+pub(super) async fn send_as_member_typed(
+    state: &AppState,
+    auth: &AuthClaims,
+    member: &PresentingMember,
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    host: &str,
+    task: &str,
+    mut payload: Value,
+) -> Result<Value, MemberSendError> {
+    payload["presentation"] = member.presentation.clone();
+    let document = crate::operations::room_host::build_room_task(task, host, &member.did, payload);
+    crate::operations::room_act::check_schema(&document).map_err(MemberSendError::Local)?;
+    let document = crate::operations::room_act::sign_as(state, auth, &member.did, document)
+        .await
+        .map_err(MemberSendError::Local)?;
+    crate::operations::room_host::send_signed_room_task_typed(
+        &state.room_groups_ks,
+        &member.member,
+        &crate::operations::outbound::Outbound::from_app_state(state, resolver),
+        host,
+        document,
+        &format!("{task}#response"),
+    )
+    .await
+    .map_err(MemberSendError::Host)
+}
+
+/// A failed send as the task's declared `hostUnreachable` / `hostRefused` (`rooms/keys/read`
+/// and `rooms/keys/backfill` 0.1). A host that could not be found or did not answer is
+/// `unreachable`, never a malformed request: the request was fine.
+pub(super) fn host_failure(
+    doc: &TrustTask<Value>,
+    e: MemberSendError,
+    host: &str,
+    unreachable: trust_tasks_rs::DeclaredErrorCode,
+    refused: trust_tasks_rs::DeclaredErrorCode,
+) -> TrustTaskOutcome {
+    use crate::operations::room_host::RoomTaskError;
+    match e {
+        MemberSendError::Local(e) => app_error_to_reject(doc, e),
+        MemberSendError::Host(RoomTaskError::Refused { code, reason, .. }) => {
+            super::helpers::reject_with_code(
+                doc,
+                declared(refused),
+                format!("room host `{host}` refused: {code}: {reason}"),
+                Some(serde_json::json!({ "code": code, "reason": reason })),
+            )
+        }
+        MemberSendError::Host(RoomTaskError::Unknown(e)) => super::helpers::reject_with_code(
+            doc,
+            declared(unreachable),
+            format!("room host `{host}` could not be reached: {e}"),
+            None,
+        ),
+    }
+}
+
+/// A resolver, or the refusal that says there is none — every task that speaks to a host
+/// has to find it.
+pub(super) fn outbound_resolver(
+    state: &AppState,
+    doc: &TrustTask<Value>,
+) -> Result<affinidi_did_resolver_cache_sdk::DIDCacheClient, TrustTaskOutcome> {
+    state.did_resolver.clone().ok_or_else(|| {
+        app_error_to_reject(
+            doc,
+            vti_common::error::AppError::Validation(
+                "this agent has no DID resolver configured, so it cannot find the host".into(),
+            ),
+        )
+    })
+}
+
+/// This agent's own DID and a resolver, or the refusal that says which is missing.
+///
+/// Every task in this family that acts **outward** needs both: it presents as
+/// itself, and it has to find the host it was told to speak to. Extracted when
+/// the third caller appeared — `backfill`, `read` and `browse` refusing in three
+/// slightly different sentences would be three chances for one of them to say
+/// something untrue about why.
+pub(super) async fn outbound_identity(
+    state: &AppState,
+    doc: &TrustTask<Value>,
+) -> Result<(String, affinidi_did_resolver_cache_sdk::DIDCacheClient), TrustTaskOutcome> {
+    let Some(vta_did) = state.config.read().await.vta_did.clone() else {
+        return Err(app_error_to_reject(
+            doc,
+            vti_common::error::AppError::Validation(
+                "this agent has no DID of its own, so it cannot present to a host as itself".into(),
+            ),
+        ));
+    };
+    let Some(resolver) = state.did_resolver.clone() else {
+        return Err(app_error_to_reject(
+            doc,
+            vti_common::error::AppError::Validation(
+                "this agent has no DID resolver configured, so it cannot find the host".into(),
+            ),
+        ));
+    };
+    Ok((vta_did, resolver))
+}
+
+/// The three values a host asserts about a room, as this agent passes them on.
+///
+/// All three or none: a root without the state it describes is not comparable
+/// to another root, which is the whole of `headVersion` — see
+/// `trust-tasks-tf#422`.
+pub(super) fn head_of(
+    commitment: Option<&String>,
+    record_count: Option<u64>,
+    head_version: Option<u64>,
+) -> Option<Value> {
+    match (commitment, record_count, head_version) {
+        (Some(c), Some(n), Some(v)) => Some(serde_json::json!({
+            "dataCommitment": c,
+            "recordCount": n,
+            "headVersion": v,
+        })),
+        _ => None,
+    }
+}
+
+/// Record what a host asserted about a room, and say what comparing it came to.
+///
+/// **This is the comparison no other party on the member's side can make.** A
+/// tab does not outlive itself and a CLI keeps nothing; the agent is the only
+/// one that saw both reads.
+///
+/// It is keyed by **room, not host**, which buys a comparison the specification
+/// does not list: two hosts of one room reporting different roots at one
+/// `headVersion` is exactly as damning as one host disagreeing with itself, and
+/// a room may deliberately have several — a mirror serving reads while its
+/// primary takes writes. A mirror that merely *lags* reports a lower
+/// `headVersion` and is correctly not compared at all.
+///
+/// A host that asserted nothing is `notChecked` rather than `noneHeld`: one says
+/// nothing was found, the other says nothing was looked for.
+/// Compare a host's head against the room's **own witnessed anchor**.
+///
+/// The only one of this family's comparisons a first-time reader can make:
+/// `priorRoots` needs this agent to have read the room before, and `count` needs
+/// a complete unfiltered listing. This needs neither — every member resolves the
+/// same room DID and reads the same witness-co-signed entry.
+///
+/// A resolver failure answers `notChecked` rather than a verdict. An agent that
+/// could not resolve the room has learned nothing about the host, and saying
+/// otherwise would put a network failure in the same sentence as a finding.
+pub(super) async fn compare_anchor(
+    state: &AppState,
+    room_id: &str,
+    head: Option<&Value>,
+) -> &'static str {
+    use crate::operations::room_anchor::{AnchorVerdict, compare_to_anchor};
+
+    let Some(head) = head else {
+        return AnchorVerdict::NotChecked.as_wire();
+    };
+    let Some(version) = head["headVersion"].as_u64() else {
+        return AnchorVerdict::NotChecked.as_wire();
+    };
+    let Some(resolver) = state.did_resolver.as_ref() else {
+        return AnchorVerdict::NotChecked.as_wire();
+    };
+    let Ok(resolved) = resolver.resolve(room_id).await else {
+        return AnchorVerdict::NotChecked.as_wire();
+    };
+    let Ok(document) = serde_json::to_value(&resolved.doc) else {
+        return AnchorVerdict::NotChecked.as_wire();
+    };
+    compare_to_anchor(&document, version, head["dataCommitment"].as_str()).as_wire()
+}
+
+pub(super) async fn compare_head(
+    state: &AppState,
+    member: &room_groups::Member,
+    head: Option<&Value>,
+) -> &'static str {
+    let room_id = member.room_id();
+    let Some(head) = head else {
+        return "notChecked";
+    };
+    let (Some(version), Some(root)) = (
+        head["headVersion"].as_u64(),
+        head["dataCommitment"].as_str(),
+    ) else {
+        return "notChecked";
+    };
+    match room_groups::observe_head(&state.room_groups_ks, member, version, root).await {
+        Ok(room_groups::RootVerdict::Agree) => "agree",
+        Ok(room_groups::RootVerdict::Conflict) => "conflict",
+        Ok(room_groups::RootVerdict::NoneHeld) => "noneHeld",
+        Err(e) => {
+            // A memory this agent could not read is not a host that behaved. It
+            // says so rather than reporting a comparison it did not make.
+            tracing::error!(
+                room = %room_id,
+                error = %e,
+                "could not read this agent's root history; answering without a comparison"
+            );
+            "notChecked"
+        }
+    }
+}
+
+/// Replay a record's trace against the commitment served **beside it**.
+///
+/// The leaf preimage is the response payload with its verification members
+/// removed, which is exactly `CommittedRecord` — so this hashes what it was
+/// given rather than reconstructing anything, and a reader that cannot reach the
+/// leaf has been served a record that does not match what the host committed to.
+///
+/// Never a root from an earlier read. A trace is a statement about the tree it
+/// was cut from, and a room moves.
+pub(super) fn verify_trace(reply: &vti_rooms::wire::GetRecordResponse) -> &'static str {
+    let (Some(commitment), Some(trace)) = (&reply.data_commitment, &reply.trace) else {
+        // A host that maintains no tree must not invent a root, so its silence
+        // is legal and informative rather than a failure.
+        return "notOffered";
+    };
+    let Ok(root) = vti_rooms::merkle::from_multibase(commitment) else {
+        return "failed";
+    };
+    let Ok(leaf) = vti_rooms::merkle::leaf_hash(&reply.record) else {
+        return "failed";
+    };
+    if vti_rooms::merkle::verify_inclusion(&root, &leaf, trace) {
+        "verified"
+    } else {
+        "failed"
+    }
+}
+
+/// `rooms/keys/read/0.1` ([`super::room_read`], which serves 0.2 beside it).
+///
+/// Mint the presentation, ask the host, check what came back, open it. The
+/// fourth act is why the other three are here: the epoch key never leaves this
+/// agent, so a surface that fetched the record itself would come back to open
+/// it anyway, holding a half-verified record in between.
+pub(super) async fn handle_read(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    super::room_read::handle_read_v0_1(state, auth, doc).await
+}
+
+/// Every key the room's profile can be at for `member`: `profile_key(E)` for each epoch its
+/// chain reaches on a sealed tier, and `room-profile` on an `open` room (where this VTA holds
+/// no group). A location this VTA cannot compute is not one it can tell apart, so it is not
+/// in the set.
+async fn profile_keys(
+    state: &AppState,
+    member: &room_groups::Member,
+) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    match room_groups::load(&state.room_groups_ks, member).await {
+        Ok(Some(_)) => {
+            if let Ok(found) =
+                room_groups::profile_locations(&state.room_groups_ks, member, usize::MAX).await
+            {
+                keys.extend(found.into_iter().map(|(_, k)| k));
+            }
+        }
+        _ => {
+            keys.insert(vti_rooms::profile::OPEN_PROFILE_KEY.to_string());
+        }
+    }
+    keys
+}
+
+/// Whether `record` sits at the room's profile location for the epoch it was sealed under
+/// (or, on an `open` room, at `room-profile`).
+pub(super) async fn is_profile_location(
+    state: &AppState,
+    member: &room_groups::Member,
+    record: &vti_rooms::wire::CommittedRecord,
+) -> bool {
+    match &record.sealed {
+        Some(sealed) => {
+            room_groups::profile_location(&state.room_groups_ks, member, Some(sealed.epoch))
+                .await
+                .is_ok_and(|(key, _)| key == record.key)
+        }
+        None => record.key == vti_rooms::profile::OPEN_PROFILE_KEY,
+    }
+}
+
+/// `rooms/keys/browse/0.3`: 0.1, and the room's `lastPrune` passed through exactly as the
+/// host served it (its instant `prunedAt`, `rooms/_shared/0.2`), so a caller keeping its
+/// own copy of the room knows to rebuild it.
+pub(super) async fn handle_browse_v0_3(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    browse_at(state, auth, doc, BrowseVersion::V0_3).await
+}
+
+/// `rooms/keys/browse/0.4`: 0.3, its rows the `RecordMetadataV3` the host's
+/// `rooms/records/list/0.6` serves, passed through exactly as served — `createdAt`,
+/// `bodyStoredAt`, `createdBy` (`open` and `attributed`), `kind` (`open`) and `blobs`. A host
+/// that answers list/0.6 `unsupportedType` is listed with 0.5, and its rows carry what 0.5
+/// carries.
+pub(super) async fn handle_browse_v0_4(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    browse_at(state, auth, doc, BrowseVersion::V0_4).await
+}
+
+/// `rooms/keys/browse/0.5`: 0.4, and `order` passed through to the host's
+/// `rooms/records/list/0.7`, `maxPages` to stop early, and `cursor` / `nextCursor` to come
+/// back for the next page — how a member's surface opens a conversation at its newest
+/// records (trust-tasks-tf #1088, *Order and paging*).
+pub(super) async fn handle_browse_v0_5(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    browse_at(state, auth, doc, BrowseVersion::V0_5).await
+}
+
+/// `rooms/keys/browse/0.6`: 0.5, and `beforeVersion` passed through to the host's
+/// `rooms/records/list/0.8` — how a member's surface loads older records from the lowest
+/// version it holds, without the host's short-lived cursor (trust-tasks-tf #1289). A host
+/// that does not serve list/0.8 is `hostRefused` for a browse naming `beforeVersion`, never
+/// listed without the bound; without it, the browse falls back as 0.5's does.
+pub(super) async fn handle_browse_v0_6(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    browse_at(state, auth, doc, BrowseVersion::V0_6).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowseVersion {
+    V0_3,
+    V0_4,
+    V0_5,
+    V0_6,
+}
+
+/// The request members `browse` reads.
+struct BrowseRequest {
+    room_id: String,
+    host: String,
+    prefix: Option<String>,
+    since_version: Option<u64>,
+    limit: Option<u64>,
+    /// 0.5: the order as the caller gave it (`oldestFirst` / `newestFirst`), absent where
+    /// the caller omitted it — passed through exactly so (*Order and paging* item 1).
+    order: Option<&'static str>,
+    /// 0.5: the most host pages to read.
+    max_pages: Option<u64>,
+    /// 0.5: the host's cursor, passed through on the first page, never read here.
+    cursor: Option<String>,
+    /// 0.6: the exclusive upper bound on `version`, passed through to list/0.8.
+    before_version: Option<u64>,
+}
+
+/// The most host pages one browse reads of its own accord, whatever the caller asked.
+const BROWSE_MAX_PAGES: usize = 64;
+
+/// `rooms/keys/browse/0.3` lists with `rooms/records/list/0.5` (*The room's prunes*): a
+/// host that predates it is not read from. 0.4 lists with `rooms/records/list/0.6` where
+/// the host serves it, else 0.5. 0.5 lists with `rooms/records/list/0.7` where the host
+/// serves it; else, for a request that does not ask for `newestFirst`, as 0.4 does — and
+/// for one that does, it answers `hostRefused` rather than list oldest first. 0.1 and 0.2
+/// are not served.
+#[allow(deprecated)] // browse/0.3–0.5 and list/0.5–0.7 are still served and read beside browse/0.6 and list/0.8
+async fn browse_at(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+    version: BrowseVersion,
+) -> TrustTaskOutcome {
+    if let Err(r) = super::helpers::require_capability(
+        state,
+        auth,
+        &doc,
+        Capability::RoomOpen,
+        "listing a room's records",
+    )
+    .await
+    {
+        return r;
+    }
+
+    let parsed = match version {
+        BrowseVersion::V0_3 => parse_payload::<vti_specs::rooms::keys::browse::v0_3::Payload>(&doc)
+            .map(|r| BrowseRequest {
+                room_id: r.room_id.to_string(),
+                host: r.host.to_string(),
+                prefix: r.prefix.map(|p| p.to_string()),
+                since_version: r.since_version,
+                limit: r.limit.map(u64::from),
+                order: None,
+                max_pages: None,
+                cursor: None,
+                before_version: None,
+            }),
+        BrowseVersion::V0_4 => parse_payload::<vti_specs::rooms::keys::browse::v0_4::Payload>(&doc)
+            .map(|r| BrowseRequest {
+                room_id: r.room_id.to_string(),
+                host: r.host.to_string(),
+                prefix: r.prefix.map(|p| p.to_string()),
+                since_version: r.since_version,
+                limit: r.limit.map(u64::from),
+                order: None,
+                max_pages: None,
+                cursor: None,
+                before_version: None,
+            }),
+        BrowseVersion::V0_5 => {
+            use vti_specs::rooms::keys::browse::v0_5 as browse;
+            match parse_payload::<browse::Payload>(&doc) {
+                Ok(r) => {
+                    let order = match r.order {
+                        None => Ok(None),
+                        Some(browse::ListOrder::OldestFirst) => Ok(Some("oldestFirst")),
+                        Some(browse::ListOrder::NewestFirst) => Ok(Some("newestFirst")),
+                        Some(other) => Err(other),
+                    };
+                    match order {
+                        Ok(order) => Ok(BrowseRequest {
+                            room_id: r.room_id.to_string(),
+                            host: r.host.to_string(),
+                            prefix: r.prefix.map(|p| p.to_string()),
+                            since_version: r.since_version,
+                            limit: r.limit.map(u64::from),
+                            order,
+                            max_pages: r.max_pages.map(u64::from),
+                            cursor: r.cursor.map(|c| c.to_string()),
+                            before_version: None,
+                        }),
+                        Err(other) => Err(app_error_to_reject(
+                            &doc,
+                            vti_common::error::AppError::Validation(format!(
+                                "`order` {other} is not one this agent lists in"
+                            )),
+                        )),
+                    }
+                }
+                Err(resp) => Err(resp),
+            }
+        }
+        BrowseVersion::V0_6 => {
+            use vti_specs::rooms::keys::browse::v0_6 as browse;
+            match parse_payload::<browse::Payload>(&doc) {
+                Ok(r) => {
+                    let order = match r.order {
+                        None => Ok(None),
+                        Some(browse::ListOrder::OldestFirst) => Ok(Some("oldestFirst")),
+                        Some(browse::ListOrder::NewestFirst) => Ok(Some("newestFirst")),
+                        Some(other) => Err(other),
+                    };
+                    match order {
+                        Ok(order) => Ok(BrowseRequest {
+                            room_id: r.room_id.to_string(),
+                            host: r.host.to_string(),
+                            prefix: r.prefix.map(|p| p.to_string()),
+                            since_version: r.since_version,
+                            limit: r.limit.map(u64::from),
+                            order,
+                            max_pages: r.max_pages.map(u64::from),
+                            cursor: r.cursor.map(|c| c.to_string()),
+                            before_version: r.before_version.map(|b| b.get()),
+                        }),
+                        Err(other) => Err(app_error_to_reject(
+                            &doc,
+                            vti_common::error::AppError::Validation(format!(
+                                "`order` {other} is not one this agent lists in"
+                            )),
+                        )),
+                    }
+                }
+                Err(resp) => Err(resp),
+            }
+        }
+    };
+    let req = match parsed {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let resolver = match outbound_resolver(state, &doc) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // As the principal, with the principal's own `read` grant — as `read` does.
+    let named = match named_member(&doc) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let presenting = match presenting_member(state, auth, &req.room_id, named.as_deref()).await {
+        Ok(v) => v,
+        // 0.4 answers a principal holding nothing this room issued with its declared code;
+        // 0.3 keeps the refusal it has always given.
+        Err(vti_common::error::AppError::NotFound(why)) if version != BrowseVersion::V0_3 => {
+            let code = match version {
+                BrowseVersion::V0_6 => {
+                    vti_specs::rooms::keys::browse::v0_6::error_codes::NOT_A_MEMBER
+                }
+                BrowseVersion::V0_5 => {
+                    vti_specs::rooms::keys::browse::v0_5::error_codes::NOT_A_MEMBER
+                }
+                _ => vti_specs::rooms::keys::browse::v0_4::error_codes::NOT_A_MEMBER,
+            };
+            return super::helpers::reject_declared(&doc, code, why);
+        }
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    // 0.4 asks list/0.6 first; a host answering it `unsupportedType` is listed with 0.5 for
+    // the rest of the request. Only before the first page: a cursor is the version's own.
+    let mut list_task = match version {
+        BrowseVersion::V0_3 => vti_rooms::wire::ROOMS_RECORDS_LIST_V5_TYPE,
+        BrowseVersion::V0_4 => vti_rooms::wire::ROOMS_RECORDS_LIST_V6_TYPE,
+        BrowseVersion::V0_5 => vti_rooms::wire::ROOMS_RECORDS_LIST_V7_TYPE,
+        BrowseVersion::V0_6 => vti_rooms::wire::ROOMS_RECORDS_LIST_V8_TYPE,
+    };
+    let newest_first = req.order == Some("newestFirst");
+
+    let mut records: Vec<Value> = Vec::new();
+    // On the first page, the caller's cursor (0.5 item 5) — the host's, never read here.
+    let mut cursor: Option<String> = req.cursor.clone();
+    let mut head: Option<Value> = None;
+    let mut complete = false;
+    // The host's `lastPrune`, exactly as served.
+    let mut last_prune: Option<Value> = None;
+    // A listing is read to its END, and absence of the cursor is the only thing
+    // that says so. A short page says nothing — which is exactly why the count
+    // check below is conditioned on having reached the end. 0.5's `maxPages` stops it
+    // sooner, where the caller asks (item 3).
+    let max_pages = req
+        .max_pages
+        .map_or(BROWSE_MAX_PAGES, |m| {
+            usize::try_from(m)
+                .unwrap_or(usize::MAX)
+                .min(BROWSE_MAX_PAGES)
+        })
+        .max(1);
+    for page in 0..max_pages {
+        let mut payload = serde_json::json!({ "roomId": req.room_id });
+        if let Some(p) = &req.prefix {
+            payload["prefix"] = serde_json::json!(p);
+        }
+        if let Some(v) = req.since_version {
+            payload["sinceVersion"] = serde_json::json!(v);
+        }
+        if let Some(l) = req.limit {
+            payload["limit"] = serde_json::json!(l);
+        }
+        if let Some(c) = &cursor {
+            payload["cursor"] = serde_json::json!(c);
+        }
+        let ordered = list_task == vti_rooms::wire::ROOMS_RECORDS_LIST_V7_TYPE
+            || list_task == vti_rooms::wire::ROOMS_RECORDS_LIST_V8_TYPE;
+        if ordered && let Some(o) = req.order {
+            payload["order"] = serde_json::json!(o);
+        }
+        if list_task == vti_rooms::wire::ROOMS_RECORDS_LIST_V8_TYPE
+            && let Some(b) = req.before_version
+        {
+            payload["beforeVersion"] = serde_json::json!(b);
+        }
+
+        let mut sent = send_as_member_typed(
+            state,
+            auth,
+            &presenting,
+            &resolver,
+            &req.host,
+            list_task,
+            payload.clone(),
+        )
+        .await;
+        // A host predating the version asked is listed with the one before it — only on
+        // the first page, since a listing is answered at one version throughout — except
+        // that a `newestFirst` browse is never answered oldest first (0.5 item 1).
+        let unsupported = |sent: &Result<Value, MemberSendError>| {
+            matches!(
+                sent,
+                Err(MemberSendError::Host(
+                    crate::operations::room_host::RoomTaskError::Refused { code, .. }
+                )) if code == "unsupportedType"
+            )
+        };
+        // 0.6: a host without list/0.8 is asked list/0.7 only for a browse that names no
+        // `beforeVersion` — one that does is `hostRefused`, never listed without its bound.
+        if page == 0
+            && unsupported(&sent)
+            && list_task == vti_rooms::wire::ROOMS_RECORDS_LIST_V8_TYPE
+            && req.before_version.is_none()
+        {
+            list_task = vti_rooms::wire::ROOMS_RECORDS_LIST_V7_TYPE;
+            sent = send_as_member_typed(
+                state,
+                auth,
+                &presenting,
+                &resolver,
+                &req.host,
+                list_task,
+                payload.clone(),
+            )
+            .await;
+        }
+        if page == 0
+            && unsupported(&sent)
+            && list_task == vti_rooms::wire::ROOMS_RECORDS_LIST_V7_TYPE
+            && !newest_first
+        {
+            list_task = vti_rooms::wire::ROOMS_RECORDS_LIST_V6_TYPE;
+            if let Some(obj) = payload.as_object_mut() {
+                obj.remove("order");
+            }
+            sent = send_as_member_typed(
+                state,
+                auth,
+                &presenting,
+                &resolver,
+                &req.host,
+                list_task,
+                payload.clone(),
+            )
+            .await;
+        }
+        if page == 0
+            && unsupported(&sent)
+            && list_task == vti_rooms::wire::ROOMS_RECORDS_LIST_V6_TYPE
+        {
+            list_task = vti_rooms::wire::ROOMS_RECORDS_LIST_V5_TYPE;
+            sent = send_as_member_typed(
+                state,
+                auth,
+                &presenting,
+                &resolver,
+                &req.host,
+                list_task,
+                payload,
+            )
+            .await;
+        }
+        let reply = match (sent, version) {
+            (Ok(v), _) => v,
+            (Err(e), BrowseVersion::V0_3) => return app_error_to_reject(&doc, e.into_app_error()),
+            (Err(e), BrowseVersion::V0_4) => {
+                use vti_specs::rooms::keys::browse::v0_4::error_codes as codes;
+                return host_failure(
+                    &doc,
+                    e,
+                    &req.host,
+                    codes::HOST_UNREACHABLE,
+                    codes::HOST_REFUSED,
+                );
+            }
+            (Err(e), BrowseVersion::V0_6) => {
+                use vti_specs::rooms::keys::browse::v0_6::error_codes as codes;
+                return host_failure(
+                    &doc,
+                    e,
+                    &req.host,
+                    codes::HOST_UNREACHABLE,
+                    codes::HOST_REFUSED,
+                );
+            }
+            (Err(e), BrowseVersion::V0_5) => {
+                use vti_specs::rooms::keys::browse::v0_5::error_codes as codes;
+                return host_failure(
+                    &doc,
+                    e,
+                    &req.host,
+                    codes::HOST_UNREACHABLE,
+                    codes::HOST_REFUSED,
+                );
+            }
+        };
+        if let Some(mark) = reply.get("lastPrune") {
+            last_prune = Some(mark.clone());
+        }
+
+        // List 0.5 names the continuation token `nextCursor`; the stored listing shape
+        // (`ListRecordsResponse`) still calls it `cursor`.
+        let mut reply = reply;
+        if let Some(obj) = reply.as_object_mut()
+            && let Some(next) = obj.remove("nextCursor")
+        {
+            obj.insert("cursor".into(), next);
+        }
+        let listing: vti_rooms::wire::ListRecordsResponse = match serde_json::from_value(reply) {
+            Ok(l) => l,
+            Err(e) => {
+                return app_error_to_reject(
+                    &doc,
+                    vti_common::error::AppError::Internal(format!(
+                        "room host `{}` served a listing this agent cannot read: {e}",
+                        req.host
+                    )),
+                );
+            }
+        };
+
+        // The head is the LAST page's, because that is the snapshot the caller's
+        // view ends at. Taking the first page's would label a set the agent went
+        // on to extend.
+        head = head_of(
+            listing.data_commitment.as_ref(),
+            listing.record_count,
+            listing.head_version,
+        );
+        records.extend(listing.records);
+
+        match listing.cursor {
+            Some(next) => cursor = Some(next),
+            None => {
+                cursor = None;
+                complete = true;
+                break;
+            }
+        }
+        // Stopping — at the caller's `maxPages` or of this agent's own accord — is not the
+        // end of the listing, and saying otherwise would turn a page bound into a withheld
+        // record. The loop ends with the host's cursor in hand.
+    }
+
+    // The one check a listing can make with no anchor and no second party — and
+    // it is only meaningful against a complete, unfiltered listing. Anything
+    // else legitimately holds fewer, and comparing it is a discrepancy the
+    // reader manufactured. A listing resumed from a cursor did not start at the room's
+    // first record in its order, however it ends (0.5 item 6); the order itself does not
+    // matter — a whole room read newest first holds what one read oldest first does.
+    // `beforeVersion` bounds the listing above, so it is never comparable either (0.6).
+    let filtered = req.prefix.is_some()
+        || req.since_version.is_some()
+        || req.before_version.is_some()
+        || req.cursor.is_some();
+    let count = match (&head, complete, filtered) {
+        (None, _, _) => "notOffered",
+        (Some(_), false, _) | (Some(_), _, true) => "notComparable",
+        (Some(h), true, false) => {
+            let committed = h["recordCount"].as_u64().unwrap_or_default();
+            if records.len() as u64 == committed {
+                "agrees"
+            } else {
+                "short"
+            }
+        }
+    };
+
+    let member = presenting.member;
+    // Counted above against everything the host listed; the room's own profile records are
+    // then left out — they are how the room describes itself, not records of it
+    // (`SealedRecordBody`, *A profile record*; `rooms/keys/profile/read`).
+    let profile_keys = profile_keys(state, &member).await;
+    records.retain(|r| {
+        r.get("key")
+            .and_then(Value::as_str)
+            .is_none_or(|k| !profile_keys.contains(k))
+    });
+    let mut verification = serde_json::json!({
+        "priorRoots": compare_head(state, &member, head.as_ref()).await,
+        "anchor": compare_anchor(state, &req.room_id, head.as_ref()).await,
+        "count": count,
+    });
+    if let Some(h) = head {
+        verification["head"] = h;
+    }
+
+    record(state, "rooms.keys.browse", auth, &req.room_id).await;
+    let mut body = serde_json::json!({
+        "roomId": req.room_id,
+        "records": records,
+        "complete": complete,
+        "verification": verification,
+    });
+    if let Some(mark) = last_prune {
+        body["lastPrune"] = mark;
+    }
+    // 0.5 item 4: the host's continuation, unchanged, exactly when the listing is not
+    // complete. Earlier versions carry none.
+    if matches!(version, BrowseVersion::V0_5 | BrowseVersion::V0_6)
+        && !complete
+        && let Some(next) = cursor
+    {
+        body["nextCursor"] = serde_json::json!(next);
+    }
+    success_response(&doc, body)
+}
+
+/// `rooms/keys/open/0.2`: decrypt one sealed record; the key never crosses.
+/// `unknownEpoch`'s `details` say why a record did not open — `notDelivered`, `removed`
+/// or `beyondChain` for an older epoch the retained chain does not reach.
+///
+/// Purpose-bound like every opening (VTI-ACL-102), and naming no purpose: served under an
+/// entry stating `any` or listing one, refused as `taskFailed` under one listing more.
+#[allow(deprecated)] // superseded by 0.3, and still served
+pub(super) async fn handle_open_v0_2(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    open_record(state, auth, doc, None, None).await
+}
+
+/// `rooms/keys/open/0.3`: 0.2's open, for the `purpose` the caller names
+/// (VTI-ACL-103); a purpose not granted is `purposeNotGranted`, and nothing is opened.
+pub(super) async fn handle_open_v0_3(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use vti_specs::rooms::keys::open::v0_3 as spec;
+    if let Err(resp) = parse_payload::<spec::Payload>(&doc) {
+        return resp;
+    }
+    let (doc, requested) = take_member(doc, "purpose");
+    open_record(
+        state,
+        auth,
+        doc,
+        requested,
+        Some(spec::error_codes::PURPOSE_NOT_GRANTED),
+    )
+    .await
+}
+
+/// `doc` without its `member`, and the member's string value: a 0.3 request is its 0.2
+/// predecessor's payload plus that one member (`extends`).
+fn take_member(mut doc: TrustTask<Value>, member: &str) -> (TrustTask<Value>, Option<String>) {
+    let value = doc
+        .payload
+        .as_object_mut()
+        .and_then(|m| m.remove(member))
+        .and_then(|v| v.as_str().map(str::to_string));
+    (doc, value)
+}
+
+/// Hold an opening to the caller's purposes (VTI-ACL-103 – 106): the decision to record
+/// with it, or the refusal, which is recorded too. The principal's room authority states no
+/// purposes yet — credentials cannot carry them until the VAC defines the member — so it
+/// grants `any`, and the caller's ACL entry is what narrows.
+pub(super) async fn admit_room_purpose(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: &TrustTask<Value>,
+    action: &str,
+    room_id: &str,
+    requested: Option<&str>,
+    code: Option<trust_tasks_rs::DeclaredErrorCode>,
+) -> Result<vti_common::acl::PurposeDecision, TrustTaskOutcome> {
+    let decision = super::helpers::decide_purpose(state, auth, requested).await;
+    if decision.is_granted() {
+        return Ok(decision);
+    }
+    record_purpose(state, action, auth, room_id, &decision, "denied").await;
+    Err(super::helpers::purpose_refusal(doc, &decision, code))
+}
+
+/// A room-holder audit row carrying the purpose an opening was made for (VTI-ACL-106).
+pub(super) async fn record_purpose(
+    state: &AppState,
+    action: &str,
+    auth: &AuthClaims,
+    room_id: &str,
+    decision: &vti_common::acl::PurposeDecision,
+    outcome: &str,
+) {
+    let detail = if decision.is_granted() {
+        format!("purpose={}", decision.audit_label())
+    } else {
+        format!(
+            "refused=purposeNotGranted purpose={}",
+            decision.audit_label()
+        )
+    };
+    if let Err(e) = vta_audit::record_with_detail(
+        &state.audit_sink,
+        action,
+        &auth.did,
+        Some(room_id),
+        outcome,
+        Some(TRANSPORT_TRUST_TASK),
+        None,
+        Some(&detail),
+    )
+    .await
+    {
+        tracing::error!(error = %e, action, "failed to record a room-group audit entry");
+    }
+}
+
+/// [`handle_open_v0_2`] and [`handle_open_v0_3`].
+#[allow(deprecated)] // the 0.2 payload type reads 0.3's too (`extends`)
+async fn open_record(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+    requested: Option<String>,
+    purpose_code: Option<trust_tasks_rs::DeclaredErrorCode>,
+) -> TrustTaskOutcome {
+    if let Err(r) = super::helpers::require_capability(
+        state,
+        auth,
+        &doc,
+        Capability::RoomOpen,
+        "opening a room record",
+    )
+    .await
+    {
+        return r;
+    }
+
+    let req: vti_specs::rooms::keys::open::v0_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let room_id = req.room_id.to_string();
+    let version = u64::from(req.version);
+
+    let named = match named_member(&doc) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let member = match room_member::require_acting_as(state, auth, &room_id, named.as_deref()).await
+    {
+        Ok(m) => m,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let decision = match admit_room_purpose(
+        state,
+        auth,
+        &doc,
+        "rooms.keys.open",
+        &room_id,
+        requested.as_deref(),
+        purpose_code,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    // `version` is where the caller believes the body was sealed: `sealed.version` from the
+    // host where it served one, else the record's own. A record curated by a host that
+    // predates `sealed.version` opens at neither, so earlier versions are searched — and the
+    // answer says which opened, because the caller verifies the author's signed location
+    // against it (rooms `_shared/0.1` `SealedRecordBody`).
+    let (plaintext, opened_at) = match room_groups::open_record_at(
+        &state.room_groups_ks,
+        &member,
+        req.key.as_str(),
+        version,
+        req.sealed.ciphertext.as_str(),
+        req.sealed.nonce.as_str(),
+        u32::try_from(u64::from(req.sealed.epoch)).unwrap_or(u32::MAX),
+        room_groups::Search::Earlier,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(e) => return open_refused(&doc, e),
+    };
+
+    record_purpose(
+        state,
+        "rooms.keys.open",
+        auth,
+        &room_id,
+        &decision,
+        "success",
+    )
+    .await;
+    let mut payload = serde_json::json!({
+        "plaintext": base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &plaintext,
+        )
+    });
+    if opened_at != version {
+        payload["ext"] = serde_json::json!({
+            room_member::MEMBER_EXT: { "sealedAt": opened_at },
+        });
+    }
+    success_response(&doc, payload)
+}
+
+/// `rooms/keys/file-key/0.2`.
+///
+/// The one `rooms/keys/*` task that releases a key. `open` keeps the key and returns
+/// plaintext; a file can be a gigabyte, and its bytes must not pass through this VTA, so
+/// the member's own client gets **that file's** key and does the encryption itself. What
+/// crosses opens one file: it is derived per file from the epoch's storage key, which never
+/// leaves, so no sibling can be derived from it.
+///
+/// Gated on `RoomOpen` for both purposes, as `seal` and `open` are: a sealing key opens the
+/// file it seals. A file sealed at or after the member's removal is `unknownEpoch` reason
+/// `removed`.
+#[allow(deprecated)] // superseded by 0.3, and still served
+pub(super) async fn handle_file_key_v0_2(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    file_key(state, auth, doc, None, None).await
+}
+
+/// `rooms/keys/file-key/0.3`: 0.2's, for the `purposeOfUse` the caller names. Only a key
+/// to **open** a file discloses content, so only that is held to it (VTI-ACL-102); a
+/// sealing key is for content the caller is adding.
+pub(super) async fn handle_file_key_v0_3(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use vti_specs::rooms::keys::file_key::v0_3 as spec;
+    if let Err(resp) = parse_payload::<spec::Payload>(&doc) {
+        return resp;
+    }
+    let (doc, requested) = take_member(doc, "purposeOfUse");
+    file_key(
+        state,
+        auth,
+        doc,
+        requested,
+        Some(spec::error_codes::PURPOSE_NOT_GRANTED),
+    )
+    .await
+}
+
+/// [`handle_file_key_v0_2`] and [`handle_file_key_v0_3`].
+#[allow(deprecated)] // the 0.2 payload type reads 0.3's too (`extends`)
+async fn file_key(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+    requested: Option<String>,
+    purpose_code: Option<trust_tasks_rs::DeclaredErrorCode>,
+) -> TrustTaskOutcome {
+    use vti_specs::rooms::keys::file_key::v0_2 as spec;
+
+    if let Err(r) = super::helpers::require_capability(
+        state,
+        auth,
+        &doc,
+        Capability::RoomOpen,
+        "releasing a room file's key",
+    )
+    .await
+    {
+        return r;
+    }
+
+    let req: spec::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // `purpose` is non-exhaustive in the generated binding: a purpose this build does not
+    // know is refused, never treated as either of the two it does.
+    let purpose = match req.purpose {
+        spec::PayloadPurpose::Seal => "seal",
+        spec::PayloadPurpose::Open => "open",
+        _ => {
+            return super::helpers::malformed_request_response(format!(
+                "unknown purpose `{}`",
+                req.purpose
+            ));
+        }
+    };
+    // Which epoch is the caller's choice only when opening. A sealing key is always
+    // derived under the current epoch — letting a caller pick an older one would seal new
+    // files under a key a removed member can still derive.
+    let open_epoch = match (purpose, req.epoch) {
+        ("seal", None) => None,
+        ("open", Some(e)) => match u32::try_from(e.get()) {
+            Ok(e) => Some(e),
+            Err(_) => {
+                return super::helpers::malformed_request_response(format!(
+                    "epoch {e} is beyond any epoch a room reaches"
+                ));
+            }
+        },
+        ("seal", Some(_)) => {
+            return super::helpers::malformed_request_response(
+                "a sealing key is always derived under the current epoch; `epoch` is \
+                 forbidden with purpose `seal`"
+                    .into(),
+            );
+        }
+        _ => {
+            return super::helpers::malformed_request_response(
+                "`epoch` is required with purpose `open`: it is the epoch the file's \
+                 manifest names"
+                    .into(),
+            );
+        }
+    };
+
+    let file_id = match vti_rooms::files::decode_file_id(&req.file_id) {
+        Ok(id) => id,
+        Err(e) => return super::helpers::malformed_request_response(e.to_string()),
+    };
+
+    let named = match named_member(&doc) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let member = match room_member::acting_as(state, auth, &req.room_id, named.as_deref()).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return super::helpers::reject_declared(
+                &doc,
+                spec::error_codes::NO_GROUP,
+                format!("this VTA holds no group for room `{}`", req.room_id),
+            );
+        }
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let decision = if purpose == "open" {
+        match admit_room_purpose(
+            state,
+            auth,
+            &doc,
+            "rooms.keys.file-key",
+            &req.room_id,
+            requested.as_deref(),
+            purpose_code,
+        )
+        .await
+        {
+            Ok(d) => Some(d),
+            Err(r) => return r,
+        }
+    } else {
+        None
+    };
+    let (key, epoch) =
+        match room_groups::file_key(&state.room_groups_ks, &member, &file_id, open_epoch).await {
+            Ok(k) => k,
+            // Declared rather than `taskFailed` + a reason: the framework has no standard
+            // not-found code, and a caller deciding whether to deliver a welcome needs to tell
+            // this apart from a failure.
+            Err(room_groups::FileKeyError::NoGroup) => {
+                return super::helpers::reject_declared(
+                    &doc,
+                    spec::error_codes::NO_GROUP,
+                    format!("this VTA holds no group for room `{}`", req.room_id),
+                );
+            }
+            Err(room_groups::FileKeyError::App(e)) => return app_error_to_reject(&doc, e),
+            Err(room_groups::FileKeyError::NotDelivered { epoch, held }) => {
+                return super::helpers::reject_with_code(
+                    &doc,
+                    declared(spec::error_codes::UNKNOWN_EPOCH),
+                    format!(
+                        "the file is sealed under epoch {epoch} and this VTA holds room `{}` \
+                         at epoch {held}; a commit has not been delivered",
+                        req.room_id
+                    ),
+                    Some(serde_json::json!({ "reason": "notDelivered", "heldEpoch": held })),
+                );
+            }
+            // Oracle item 4: `removed`, with `removedAtEpoch`, takes precedence over
+            // `notDelivered` — an oracle that knows of the removal MUST NOT tell the
+            // caller to catch up.
+            Err(room_groups::FileKeyError::Removed { epoch, removed_at }) => {
+                let details = serde_json::json!({
+                    "reason": "removed",
+                    "removedAtEpoch": removed_at,
+                });
+                return super::helpers::reject_with_code(
+                    &doc,
+                    declared(spec::error_codes::UNKNOWN_EPOCH),
+                    format!(
+                        "the file is sealed under epoch {epoch}, and this member was removed \
+                         from room `{}`'s group at epoch {removed_at}: no commit will make its \
+                         key derivable here",
+                        req.room_id
+                    ),
+                    Some(details),
+                );
+            }
+            Err(room_groups::FileKeyError::BeyondChain { epoch, earliest }) => {
+                return super::helpers::reject_with_code(
+                    &doc,
+                    declared(spec::error_codes::UNKNOWN_EPOCH),
+                    format!(
+                        "the file is sealed under epoch {epoch}, which this VTA cannot reach — \
+                         the epoch key chain reaches back only to {earliest}"
+                    ),
+                    Some(serde_json::json!({
+                        "reason": "beyondChain",
+                        "earliestEpoch": earliest,
+                    })),
+                );
+            }
+        };
+
+    // Who asked for which file's key, for what, under which epoch — never the key. This
+    // row is how a principal sees which files their agents and clients opened.
+    if let Err(e) = audit::record_with_detail(
+        &state.audit_sink,
+        "rooms.keys.file-key",
+        &auth.did,
+        Some(&req.room_id),
+        "success",
+        Some(TRANSPORT_TRUST_TASK),
+        None,
+        Some(&format!(
+            "fileId={} purpose={purpose} epoch={epoch}{}",
+            req.file_id.as_str(),
+            decision
+                .as_ref()
+                .map(|d| format!(" purposeOfUse={}", d.audit_label()))
+                .unwrap_or_default(),
+        )),
+    )
+    .await
+    {
+        tracing::error!(error = %e, "failed to record a room file-key audit entry");
+    }
+
+    success_response(
+        &doc,
+        serde_json::json!({
+            "key": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key),
+            "epoch": epoch,
+        }),
+    )
+}
+
+/// `rooms/keys/open`'s refusal for a record that did not open.
+///
+/// The epoch cases are the declared `unknownEpoch` with `details.reason` saying which, as
+/// `rooms/keys/open/0.2` declares them: `notDelivered` (catch up with the commits),
+/// `removed` (nothing will — this member was removed) and `beyondChain` (the retained
+/// chain does not reach back). A client tells them apart by reason, never by message.
+fn open_refused(doc: &TrustTask<Value>, e: room_groups::OpenError) -> TrustTaskOutcome {
+    use vti_specs::rooms::keys::open::v0_2::error_codes::UNKNOWN_EPOCH;
+    let message = e.to_string();
+    match e {
+        room_groups::OpenError::NotDelivered { held, .. } => super::helpers::reject_with_code(
+            doc,
+            declared(UNKNOWN_EPOCH),
+            message,
+            Some(serde_json::json!({ "reason": "notDelivered", "heldEpoch": held })),
+        ),
+        room_groups::OpenError::Removed { removed_at, .. } => super::helpers::reject_with_code(
+            doc,
+            declared(UNKNOWN_EPOCH),
+            message,
+            Some(serde_json::json!({ "reason": "removed", "removedAtEpoch": removed_at })),
+        ),
+        room_groups::OpenError::BeyondChain { earliest, .. } => super::helpers::reject_with_code(
+            doc,
+            declared(UNKNOWN_EPOCH),
+            message,
+            Some(serde_json::json!({ "reason": "beyondChain", "earliestEpoch": earliest })),
+        ),
+        room_groups::OpenError::App(e) => app_error_to_reject(doc, e),
+    }
+}
+
+/// A declared code, as the framework's extended form.
+pub(super) fn declared(code: trust_tasks_rs::DeclaredErrorCode) -> trust_tasks_rs::TrustTaskCode {
+    trust_tasks_rs::TrustTaskCode::Extended {
+        slug: code.namespace().to_string(),
+        local: code.local().to_string(),
+    }
+}
+
+// ─── Shared ──────────────────────────────────────────────────────────────
+
+/// Verify the invitation, and refuse if it is missing, bad, or already spent.
+///
+/// The subject must be a **persona** the caller may act as
+/// ([`crate::operations::persona::persona_signing_key`]) — the DID this agent holds for the
+/// member, in a context the caller acts in. Never the caller's own DID merely because it is
+/// the caller: an interface client's key lives in the client, and a member is the same
+/// member whichever client they joined from.
+async fn require_invitation(
+    state: &AppState,
+    encoded: Option<&str>,
+    room_id: &str,
+    auth: &AuthClaims,
+) -> Result<room_invitation::VerifiedInvitation, vti_common::error::AppError> {
+    let invitation = verify_invitation(state, encoded, room_id, auth).await?;
+    if room_invitation::is_consumed(&state.room_invitations_ks, invitation.credential_id()).await? {
+        return Err(used_invitation(&invitation));
+    }
+    Ok(invitation)
+}
+
+fn used_invitation(
+    invitation: &room_invitation::VerifiedInvitation,
+) -> vti_common::error::AppError {
+    vti_common::error::AppError::Conflict(format!(
+        "invitation `{}` has already been used",
+        invitation.credential_id()
+    ))
+}
+
+/// [`require_invitation`] without the check that it is unspent.
+async fn verify_invitation(
+    state: &AppState,
+    encoded: Option<&str>,
+    room_id: &str,
+    auth: &AuthClaims,
+) -> Result<room_invitation::VerifiedInvitation, vti_common::error::AppError> {
+    let encoded = encoded.ok_or_else(|| {
+        vti_common::error::AppError::Validation(format!(
+            "no invitation presented for room `{room_id}`; joining a room is a two-party \
+             act and the invitation is the other party's half"
+        ))
+    })?;
+
+    let keys = vti_rooms_dtg::DataIntegrityKeys(state.trust_task_vm_resolver());
+    let stores = crate::operations::persona::PersonaStores::from_state(state);
+    let invitation = room_invitation::verify(
+        encoded,
+        room_id,
+        async |subject: &str| {
+            Ok(
+                crate::operations::persona::persona_signing_key(stores, auth, subject)
+                    .await?
+                    .is_some(),
+            )
+        },
+        &keys,
+    )
+    .await?;
+    Ok(invitation)
+}
+
+fn decode_b64(s: &str, what: &str) -> Result<Vec<u8>, vti_common::error::AppError> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.trim())
+        .map_err(|e| vti_common::error::AppError::Validation(format!("decode the {what}: {e}")))
+}
+
+pub(super) fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn rfc3339(unix_seconds: u64) -> String {
+    chrono::DateTime::from_timestamp(unix_seconds as i64, 0)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch is in range"))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Audit one group operation.
+///
+/// Every one of these is consequential: joining a room, advancing its keys, or opening one
+/// of its records. "Which agent got into which room, and when" is the sentence an incident
+/// review needs, and none of it is reconstructible from anywhere else.
+pub(super) async fn record(state: &AppState, action: &str, auth: &AuthClaims, room_id: &str) {
+    if let Err(e) = audit::record(
+        &state.audit_sink,
+        action,
+        &auth.did,
+        Some(room_id),
+        "success",
+        Some(TRANSPORT_TRUST_TASK),
+        None,
+    )
+    .await
+    {
+        tracing::error!(error = %e, action, "failed to record a room-group audit entry");
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    use vti_rooms::{Record, RecordStatus};
+
+    fn room() -> Vec<Record> {
+        ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, key)| Record {
+                key: (*key).into(),
+                version: i as u64 + 1,
+                epoch: Some(2),
+                status: RecordStatus::Active,
+                pinned: false,
+                sealed: Some("c2VhbGVkLWJvZHk".into()),
+                nonce: Some("bm9uY2UtMTI".into()),
+                sealed_version: None,
+                cleartext: None,
+                author: None,
+                updated_at: 1_756_000_000,
+                created_at: None,
+                created_by: None,
+                body_stored_at: None,
+            })
+            .collect()
+    }
+
+    /// A host that serves a real trace is believed, and one that serves a bad
+    /// one is not — checked from the response alone, which is all the agent has.
+    #[test]
+    fn a_trace_is_replayed_against_the_root_served_beside_it() {
+        let mut records = room();
+        let head = vti_rooms::merkle::tree_head(&mut records).expect("commits");
+        let leaves: Vec<_> = records
+            .iter()
+            .map(|r| vti_rooms::merkle::leaf_hash(&r.committed()).expect("hashes"))
+            .collect();
+        let trace = vti_rooms::merkle::inclusion_proof(&leaves, 1).expect("a trace");
+
+        let good = vti_rooms::wire::GetRecordResponse::of(&records[1], Some(&head), Some(trace));
+        assert_eq!(verify_trace(&good), "verified");
+
+        // The same trace against a different record. The arithmetic does not
+        // close, and this is the case a host that substitutes a record produces.
+        let wrong = vti_rooms::wire::GetRecordResponse {
+            record: records[0].committed(),
+            ..good.clone()
+        };
+        assert_eq!(verify_trace(&wrong), "failed");
+    }
+
+    /// A host that maintains no tree is legal, and its silence is not a failure.
+    ///
+    /// The distinction matters because the two would otherwise be rendered the
+    /// same: a member told "unverified" for a host that never claimed anything
+    /// learns nothing, while one told "notOffered" has learned that this host
+    /// offers no completeness guarantee — which is true, and theirs to act on.
+    #[test]
+    fn a_host_that_offers_no_tree_is_not_a_host_that_failed() {
+        let records = room();
+        let bare = vti_rooms::wire::GetRecordResponse::of(&records[0], None, None);
+        assert_eq!(verify_trace(&bare), "notOffered");
+
+        // A commitment with no trace is the same answer: there is nothing to
+        // replay, and calling that a failure would accuse a host of arithmetic
+        // it never did.
+        let mut records = room();
+        let head = vti_rooms::merkle::tree_head(&mut records).expect("commits");
+        let rootless = vti_rooms::wire::GetRecordResponse::of(&records[0], Some(&head), None);
+        assert_eq!(verify_trace(&rootless), "notOffered");
+    }
+
+    /// The head travels whole or not at all.
+    ///
+    /// A root without the state it describes is not comparable to another root,
+    /// so passing one on alone would hand a member a value that looks like
+    /// evidence and cannot be used as any.
+    #[test]
+    fn a_partial_head_is_no_head() {
+        assert!(head_of(Some(&"zQm…".to_string()), Some(118), Some(412)).is_some());
+        assert!(head_of(Some(&"zQm…".to_string()), None, Some(412)).is_none());
+        assert!(head_of(Some(&"zQm…".to_string()), Some(118), None).is_none());
+        assert!(head_of(None, Some(118), Some(412)).is_none());
+    }
+}
+
+/// `rooms/keys/file-key` and `rooms/keys/open` refusals, as a caller receives them: the
+/// declared code, and `details` that validate against the `detailsSchema` the
+/// specification declares.
+#[cfg(test)]
+mod file_key_refusal_tests {
+    use super::*;
+    use trust_tasks_rs::TypeUri;
+    use vti_rooms::mls::{IdentitySnapshot, RoomGroup};
+    use vti_rooms::sealed::SealedRoom;
+
+    const ROOM: &str = "did:webvh:example.com:rooms:northwind";
+    const FILE_ID: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+    fn request(payload: Value) -> TrustTask<Value> {
+        request_at(vta_sdk::trust_tasks::TASK_ROOMS_KEYS_FILE_KEY_0_2, payload)
+    }
+
+    fn request_at(uri: &str, payload: Value) -> TrustTask<Value> {
+        let uri: TypeUri = uri.parse().unwrap();
+        TrustTask::new("urn:uuid:file-key-test", uri, payload)
+    }
+
+    fn body(outcome: TrustTaskOutcome) -> Value {
+        serde_json::from_slice(&outcome.body).expect("the outcome is a document")
+    }
+
+    /// A room this VTA holds at epoch 2 for a persona the super-admin acts as, with no rung
+    /// back to 1. Returns the member.
+    async fn hold_room_at_epoch_2(state: &AppState) -> room_groups::Member {
+        let alice = crate::test_support::seed_holder_key(state, "m/44'/0'/9'/0'/1'", None).await;
+        let mut room = SealedRoom::new(ROOM, RoomGroup::create(&alice).unwrap());
+        let (_bob, kp) = IdentitySnapshot::mint("did:key:zBob").unwrap();
+        room.add_member(&kp).unwrap();
+        room_groups::store_for_test(
+            &state.room_groups_ks,
+            &room_groups::Member::new(ROOM, &alice).unwrap(),
+            room.group(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        room_groups::Member::new(ROOM, &alice).unwrap()
+    }
+
+    async fn ask(state: &AppState, payload: Value) -> Value {
+        let auth = crate::test_support::super_admin_claims();
+        body(handle_file_key_v0_2(state, &auth, request(payload)).await)
+    }
+
+    async fn open_at_epoch(state: &AppState, epoch: u32) -> Value {
+        let auth = crate::test_support::super_admin_claims();
+        let payload = serde_json::json!({
+            "roomId": ROOM,
+            "key": "k",
+            "version": 1,
+            "sealed": { "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA", "nonce": "AAAAAAAAAAAAAAAA", "epoch": epoch },
+        });
+        let doc = request_at(vta_sdk::trust_tasks::TASK_ROOMS_KEYS_OPEN_0_2, payload);
+        body(handle_open_v0_2(state, &auth, doc).await)
+    }
+
+    /// The super admin's stored entry, narrowed to `purposes`.
+    async fn narrow(state: &AppState, purposes: &[&str]) {
+        let did = crate::test_support::super_admin_claims().did;
+        let mut entry = crate::acl::get_acl_entry(&state.acl_ks, &did)
+            .await
+            .unwrap()
+            .expect("the super admin's entry");
+        entry.purposes = vti_common::acl::PurposeScope::listed(purposes.iter().copied()).unwrap();
+        crate::acl::store_acl_entry(&state.acl_ks, &entry)
+            .await
+            .unwrap();
+    }
+
+    /// `rooms/keys/open/0.3` (VTI-ACL-102 – 104): an opening is held to the caller's
+    /// purposes before anything is decrypted; 0.2 names none.
+    #[tokio::test]
+    async fn open_0_3_is_held_to_the_callers_purposes() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        hold_room_at_epoch_2(&state).await;
+        narrow(&state, &["personalisation", "taskExecution"]).await;
+        let auth = crate::test_support::super_admin_claims();
+        let open3 = |purpose: &str| {
+            let payload = serde_json::json!({
+                "roomId": ROOM,
+                "key": "k",
+                "version": 1,
+                "sealed": { "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA", "nonce": "AAAAAAAAAAAAAAAA", "epoch": 2 },
+                "purpose": purpose,
+            });
+            request_at(vta_sdk::trust_tasks::TASK_ROOMS_KEYS_OPEN_0_3, payload)
+        };
+
+        let out = body(handle_open_v0_3(&state, &auth, open3("analytics")).await);
+        assert_eq!(
+            out["payload"]["code"], "rooms/keys/open:purposeNotGranted",
+            "{out}"
+        );
+        assert_eq!(
+            out["payload"]["details"],
+            serde_json::json!({ "purposeNamed": true, "purpose": "analytics" })
+        );
+
+        // Granted, so it goes on to the decryption, which this ciphertext fails.
+        let out = body(handle_open_v0_3(&state, &auth, open3("taskExecution")).await);
+        assert_ne!(
+            out["payload"]["code"], "rooms/keys/open:purposeNotGranted",
+            "{out}"
+        );
+
+        let out = open_at_epoch(&state, 2).await;
+        assert_eq!(
+            out["payload"]["code"], "taskFailed",
+            "0.2 names none: {out}"
+        );
+        assert_eq!(
+            out["payload"]["details"],
+            serde_json::json!({ "purposeNamed": false })
+        );
+    }
+
+    /// `rooms/keys/file-key/0.3`: a key to open a file is held to the caller's purposes;
+    /// a sealing key is not, since sealing discloses nothing.
+    #[tokio::test]
+    async fn file_key_0_3_holds_an_opening_key_to_its_purpose_and_not_a_sealing_one() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        hold_room_at_epoch_2(&state).await;
+        narrow(&state, &["personalisation"]).await;
+        let auth = crate::test_support::super_admin_claims();
+        let ask3 = |payload: Value| {
+            request_at(vta_sdk::trust_tasks::TASK_ROOMS_KEYS_FILE_KEY_0_3, payload)
+        };
+
+        let out = body(
+            handle_file_key_v0_3(
+                &state,
+                &auth,
+                ask3(serde_json::json!({
+                    "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 2,
+                    "purposeOfUse": "analytics",
+                })),
+            )
+            .await,
+        );
+        assert_eq!(
+            out["payload"]["code"], "rooms/keys/file-key:purposeNotGranted",
+            "{out}"
+        );
+
+        let out = body(
+            handle_file_key_v0_3(
+                &state,
+                &auth,
+                ask3(serde_json::json!({
+                    "roomId": ROOM, "fileId": FILE_ID, "purpose": "seal",
+                    "purposeOfUse": "analytics",
+                })),
+            )
+            .await,
+        );
+        assert!(
+            out["payload"]["key"].is_string(),
+            "a sealing key is not purpose-bound: {out}"
+        );
+
+        let out = body(
+            handle_file_key_v0_3(
+                &state,
+                &auth,
+                ask3(serde_json::json!({
+                    "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 2,
+                })),
+            )
+            .await,
+        );
+        assert!(
+            out["payload"]["key"].is_string(),
+            "the one listed purpose applies: {out}"
+        );
+    }
+
+    /// `rooms/keys/file-key/0.2` oracle item 4: a file sealed at or after the member's
+    /// removal is `removed`, with `removedAtEpoch` — never `notDelivered`, whose remedy
+    /// (catch up) cannot work.
+    #[tokio::test]
+    async fn file_key_says_removed_never_not_delivered_after_a_removal() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let member = hold_room_at_epoch_2(&state).await;
+        room_groups::record_removal_for_test(&state.room_groups_ks, &member, 3)
+            .await
+            .unwrap();
+        let open =
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 3 });
+
+        let doc = ask(&state, open).await;
+        assert_eq!(
+            doc["payload"]["code"], "rooms/keys/file-key:unknownEpoch",
+            "{doc}"
+        );
+        let details = &doc["payload"]["details"];
+        assert_eq!(details["reason"], "removed", "{doc}");
+        assert_eq!(details["removedAtEpoch"], 3, "{doc}");
+        vti_specs::rooms::keys::file_key::v0_2::error_codes::UNKNOWN_EPOCH
+            .check_details(details)
+            .unwrap_or_else(|e| panic!("0.2 detailsSchema: {e}: {details}"));
+    }
+
+    /// An epoch before the removal is not `removed`: the removal says nothing about it.
+    #[tokio::test]
+    async fn file_key_0_2_before_the_removal_is_not_removed() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let member = hold_room_at_epoch_2(&state).await;
+        room_groups::record_removal_for_test(&state.room_groups_ks, &member, 5)
+            .await
+            .unwrap();
+        let doc = ask(
+            &state,
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 4 }),
+        )
+        .await;
+        assert_eq!(doc["payload"]["details"]["reason"], "notDelivered", "{doc}");
+        let doc = ask(
+            &state,
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 1 }),
+        )
+        .await;
+        assert_eq!(doc["payload"]["details"]["reason"], "beyondChain", "{doc}");
+        vti_specs::rooms::keys::file_key::v0_2::error_codes::UNKNOWN_EPOCH
+            .check_details(&doc["payload"]["details"])
+            .unwrap();
+    }
+
+    /// `rooms/keys/open/0.2`: an older epoch the retained chain does not reach is
+    /// `unknownEpoch` reason `beyondChain`, with `earliestEpoch`.
+    #[tokio::test]
+    async fn open_0_2_says_beyond_chain_for_an_epoch_the_chain_does_not_reach() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        hold_room_at_epoch_2(&state).await;
+
+        let doc = open_at_epoch(&state, 1).await;
+        assert_eq!(
+            doc["payload"]["code"], "rooms/keys/open:unknownEpoch",
+            "{doc}"
+        );
+        let details = &doc["payload"]["details"];
+        assert_eq!(details["reason"], "beyondChain", "{doc}");
+        assert_eq!(details["earliestEpoch"], 2, "{doc}");
+        vti_specs::rooms::keys::open::v0_2::error_codes::UNKNOWN_EPOCH
+            .check_details(details)
+            .unwrap_or_else(|e| panic!("0.2 detailsSchema: {e}: {details}"));
+    }
+
+    /// `rooms/keys/open/0.2`: `notDelivered` and `removed` carry the declared details.
+    #[tokio::test]
+    async fn open_0_2_reasons_match_the_declared_details_schema() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let member = hold_room_at_epoch_2(&state).await;
+        let check = |doc: &Value, reason: &str| {
+            assert_eq!(
+                doc["payload"]["code"], "rooms/keys/open:unknownEpoch",
+                "{doc}"
+            );
+            assert_eq!(doc["payload"]["details"]["reason"], reason, "{doc}");
+            vti_specs::rooms::keys::open::v0_2::error_codes::UNKNOWN_EPOCH
+                .check_details(&doc["payload"]["details"])
+                .unwrap_or_else(|e| panic!("0.2 detailsSchema: {e}: {doc}"));
+        };
+        let doc = open_at_epoch(&state, 4).await;
+        check(&doc, "notDelivered");
+
+        room_groups::record_removal_for_test(&state.room_groups_ks, &member, 3)
+            .await
+            .unwrap();
+        let doc = open_at_epoch(&state, 4).await;
+        check(&doc, "removed");
+        assert_eq!(doc["payload"]["details"]["removedAtEpoch"], 3, "{doc}");
+    }
+
+    fn assert_unknown_epoch(doc: &Value, reason: &str) {
+        assert_eq!(
+            doc["payload"]["code"], "rooms/keys/file-key:unknownEpoch",
+            "{doc}"
+        );
+        let details = &doc["payload"]["details"];
+        assert_eq!(details["reason"], reason, "{doc}");
+        // Checked against the schema the specification declares, carried by the
+        // generated code, rather than a copy of it kept here.
+        vti_specs::rooms::keys::file_key::v0_2::error_codes::UNKNOWN_EPOCH
+            .check_details(details)
+            .unwrap_or_else(|e| {
+                panic!("details must match the declared detailsSchema: {e}: {details}")
+            });
+    }
+
+    #[tokio::test]
+    async fn no_group_is_the_declared_no_group_code() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let doc = ask(
+            &state,
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "seal" }),
+        )
+        .await;
+        assert_eq!(
+            doc["payload"]["code"], "rooms/keys/file-key:noGroup",
+            "{doc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_epoch_not_yet_delivered_says_so_and_names_the_held_epoch() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        hold_room_at_epoch_2(&state).await;
+        let doc = ask(
+            &state,
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 3 }),
+        )
+        .await;
+        assert_unknown_epoch(&doc, "notDelivered");
+        assert_eq!(doc["payload"]["details"]["heldEpoch"], 2, "{doc}");
+    }
+
+    #[tokio::test]
+    async fn an_epoch_beyond_the_chain_names_the_earliest_reachable() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        hold_room_at_epoch_2(&state).await;
+        let doc = ask(
+            &state,
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 1 }),
+        )
+        .await;
+        assert_unknown_epoch(&doc, "beyondChain");
+        assert_eq!(doc["payload"]["details"]["earliestEpoch"], 2, "{doc}");
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)] // file-key 0.2 is still served, and this names no purpose of use
+    async fn a_held_room_releases_a_sealing_key_under_its_current_epoch() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        hold_room_at_epoch_2(&state).await;
+        let doc = ask(
+            &state,
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "seal" }),
+        )
+        .await;
+        let response: vti_specs::rooms::keys::file_key::v0_2::Response =
+            serde_json::from_value(doc["payload"].clone()).expect("a typed response");
+        assert_eq!(response.epoch.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_epoch_with_seal_or_without_it_on_open_is_malformed() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        hold_room_at_epoch_2(&state).await;
+        for payload in [
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "seal", "epoch": 2 }),
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "open" }),
+            serde_json::json!({ "roomId": ROOM, "fileId": FILE_ID, "purpose": "open", "epoch": 4_294_967_296u64 }),
+        ] {
+            let doc = ask(&state, payload).await;
+            assert_eq!(doc["payload"]["code"], "malformedRequest", "{doc}");
+        }
+    }
+}
+
+/// `rooms/keys/{key-package,welcome}`: the member is the persona the invitation names.
+///
+/// The invitation names its subject, and the subject is the member's identity in the room —
+/// the DID their leaf carries and their credentials name. So it is a persona this VTA holds
+/// for the person, and the caller must be able to act as it. The caller's own DID — an
+/// interface client's key — is never the member merely because it is the caller.
+#[cfg(test)]
+mod persona_invitation_tests {
+    use super::*;
+    use crate::operations::persona::test_fixture::{self as personas, Persona};
+    use chrono::{Duration as Span, Utc};
+    use dtg_credentials::DTGCredential;
+    use trust_tasks_rs::TypeUri;
+    use vti_rooms_dtg::test_support::Party;
+
+    const HOST: &str = "did:webvh:QmHost:host.example";
+
+    fn request(uri: &str, payload: Value) -> TrustTask<Value> {
+        let uri: TypeUri = uri.parse().unwrap();
+        TrustTask::new(format!("urn:uuid:{}", uuid::Uuid::new_v4()), uri, payload)
+    }
+
+    fn body(outcome: TrustTaskOutcome) -> Value {
+        serde_json::from_slice(&outcome.body).expect("the outcome is a document")
+    }
+
+    async fn state_with_two_contexts() -> (AppState, tempfile::TempDir) {
+        let (state, dir) = crate::test_support::build_signing_test_app_state().await;
+        for (id, name) in [("alice", "Alice"), ("bob", "Bob")] {
+            crate::contexts::create_context(&state.contexts_ks, id, name)
+                .await
+                .expect("create context");
+        }
+        (state, dir)
+    }
+
+    async fn did_key_persona(state: &AppState, context: &str, key_id: &str) -> Persona {
+        personas::did_key_persona(
+            &state.keys_ks,
+            &state.internal_ks,
+            &state.contexts_ks,
+            &state.acl_ks,
+            &state.seed_store,
+            &state.audit_sink,
+            context,
+            key_id,
+        )
+        .await
+    }
+
+    #[cfg(feature = "webvh")]
+    async fn webvh_persona(state: &AppState, context: &str, key_id: &str) -> Persona {
+        personas::webvh_persona(
+            &state.keys_ks,
+            &state.internal_ks,
+            &state.contexts_ks,
+            &state.acl_ks,
+            &state.webvh_ks,
+            &state.seed_store,
+            &state.audit_sink,
+            context,
+            key_id,
+        )
+        .await
+    }
+
+    /// The room's invitation to `subject`, as JSON text.
+    async fn invitation(room: &Party, subject: &str) -> String {
+        let now = Utc::now();
+        let mut vic = DTGCredential::new_vic(
+            room.did.clone(),
+            dtg_credentials::IssuerScope::Public,
+            subject.to_string(),
+            now - Span::minutes(1),
+            Some(now + Span::hours(1)),
+        )
+        .with_id(format!("urn:uuid:{}", uuid::Uuid::new_v4()));
+        vic.sign(&room.secret, None)
+            .await
+            .expect("sign the invitation");
+        serde_json::to_string(vic.credential()).expect("serialise")
+    }
+
+    async fn key_package(state: &AppState, auth: &AuthClaims, room: &str, vic: &str) -> Value {
+        body(
+            handle_key_package_v0_2(
+                state,
+                auth,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_KEY_PACKAGE_0_2,
+                    serde_json::json!({ "roomId": room, "invitation": vic }),
+                ),
+            )
+            .await,
+        )
+    }
+
+    fn reason(doc: &Value) -> String {
+        doc["payload"]["message"]
+            .as_str()
+            .or_else(|| doc["payload"]["reason"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// An owner's group for `room`, to test what a KeyPackage's leaf identifies the way an
+    /// owner's key holder does: it admits the KeyPackage only for the member its leaf names.
+    async fn owner_group(room: &str) -> (AppState, tempfile::TempDir) {
+        let (owner, dir) = crate::test_support::build_signing_test_app_state().await;
+        room_groups::create_group(&owner.room_groups_ks, &owner_member(room), 0)
+            .await
+            .expect("an owner's group");
+        (owner, dir)
+    }
+
+    fn owner_member(room: &str) -> room_groups::Member {
+        room_groups::Member::new(room, "did:key:zOwner").unwrap()
+    }
+
+    fn decode(kp: &Value) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(kp.as_str().expect("a KeyPackage"))
+            .expect("base64url")
+    }
+
+    /// **A `did:webvh` persona joins, end to end.** The invitation names alice's persona,
+    /// a caller acting in alice's context asks, and the KeyPackage's leaf identifies the
+    /// persona — an owner admits it as the persona and refuses it as the caller. Then the
+    /// Welcome lands, the invitation is spent, and the group this VTA holds is the persona's.
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn a_persona_named_by_the_invitation_joins_as_itself() {
+        let (state, _dir) = state_with_two_contexts().await;
+        let alice = webvh_persona(&state, "alice", "alice-persona").await;
+        let room = Party::new();
+        let caller = crate::test_support::admin_claims_for_context("alice");
+        let vic = invitation(&room, &alice.did).await;
+
+        let minted = key_package(&state, &caller, &room.did, &vic).await;
+        let kp = decode(&minted["payload"]["keyPackage"]);
+
+        let (owner, _odir) = owner_group(&room.did).await;
+        assert!(
+            matches!(
+                room_groups::prepare_add(
+                    &owner.room_groups_ks,
+                    &owner_member(&room.did),
+                    HOST,
+                    &caller.did,
+                    &kp,
+                    0
+                )
+                .await,
+                Err(room_groups::PrepareAddError::KeyPackageInvalid(_))
+            ),
+            "the leaf must not identify the client that asked"
+        );
+        let pending = room_groups::prepare_add(
+            &owner.room_groups_ks,
+            &owner_member(&room.did),
+            HOST,
+            &alice.did,
+            &kp,
+            0,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the leaf identifies the persona"));
+
+        let joined = body(
+            handle_welcome(
+                &state,
+                &caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_WELCOME_0_1,
+                    serde_json::json!({
+                        "roomId": room.did, "welcome": pending.welcome, "invitation": vic,
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert!(joined["payload"]["epoch"].is_u64(), "{joined}");
+        let held = room_groups::load(
+            &state.room_groups_ks,
+            &room_groups::Member::new(&room.did, &alice.did).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("the group");
+        let group = vti_rooms::mls::RoomGroup::restore(&held.snapshot).unwrap();
+        assert!(group.leaf_of(&alice.did).is_some(), "the persona's leaf");
+
+        // Spent: keyed on the invitation, whoever delivers it next.
+        let again = key_package(&state, &caller, &room.did, &vic).await;
+        assert!(reason(&again).contains("already been used"), "{again}");
+    }
+
+    /// A held `did:key` persona in the caller's context is a member like any other.
+    #[tokio::test]
+    async fn a_held_did_key_persona_is_invited() {
+        let (state, _dir) = state_with_two_contexts().await;
+        let alice = did_key_persona(&state, "alice", "alice-key").await;
+        let room = Party::new();
+        let vic = invitation(&room, &alice.did).await;
+        let minted = key_package(
+            &state,
+            &crate::test_support::admin_claims_for_context("alice"),
+            &room.did,
+            &vic,
+        )
+        .await;
+        let kp = decode(&minted["payload"]["keyPackage"]);
+        let (owner, _odir) = owner_group(&room.did).await;
+        room_groups::prepare_add(
+            &owner.room_groups_ks,
+            &owner_member(&room.did),
+            HOST,
+            &alice.did,
+            &kp,
+            0,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the leaf identifies the persona"));
+    }
+
+    /// **The privilege boundary.** An invitation naming bob's persona, delivered by a caller
+    /// acting in alice's context, is refused — in the same words as an invitation naming a
+    /// DID this VTA holds nothing for, so the refusal does not tell alice's caller that bob's
+    /// persona is held here.
+    #[tokio::test]
+    async fn another_contexts_persona_is_refused_like_an_unknown_one() {
+        let (state, _dir) = state_with_two_contexts().await;
+        let bob = did_key_persona(&state, "bob", "bob-key").await;
+        let nobody = Party::new().did;
+        let room = Party::new();
+        let caller = crate::test_support::admin_claims_for_context("alice");
+
+        let to_bob = key_package(
+            &state,
+            &caller,
+            &room.did,
+            &invitation(&room, &bob.did).await,
+        )
+        .await;
+        let to_nobody = key_package(
+            &state,
+            &caller,
+            &room.did,
+            &invitation(&room, &nobody).await,
+        )
+        .await;
+        assert!(to_bob["payload"]["keyPackage"].is_null(), "{to_bob}");
+        assert!(
+            reason(&to_bob).contains("not a persona you may act as"),
+            "{to_bob}"
+        );
+        assert_eq!(
+            reason(&to_bob),
+            reason(&to_nobody).replace(&nobody, &bob.did),
+            "held-for-someone-else and held-for-nobody read the same"
+        );
+
+        // Bob's own caller is served.
+        let ok = key_package(
+            &state,
+            &crate::test_support::admin_claims_for_context("bob"),
+            &room.did,
+            &invitation(&room, &bob.did).await,
+        )
+        .await;
+        assert!(ok["payload"]["keyPackage"].is_string(), "{ok}");
+    }
+
+    /// An invitation naming the caller's own client key — which is what every invitation had
+    /// to name before — is refused: a key that lives in the client cannot be a member.
+    #[tokio::test]
+    async fn an_invitation_to_the_client_key_is_refused() {
+        let (state, _dir) = state_with_two_contexts().await;
+        let room = Party::new();
+        let caller = crate::test_support::admin_claims_for_context("alice");
+        let out = key_package(
+            &state,
+            &caller,
+            &room.did,
+            &invitation(&room, &caller.did).await,
+        )
+        .await;
+        assert!(out["payload"]["keyPackage"].is_null(), "{out}");
+        assert!(
+            reason(&out).contains("not a persona you may act as"),
+            "{out}"
+        );
+
+        // Nor a Welcome under one: nothing joins.
+        let welcome = body(
+            handle_welcome(
+                &state,
+                &caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_WELCOME_0_1,
+                    serde_json::json!({
+                        "roomId": room.did, "welcome": "AAAA",
+                        "invitation": invitation(&room, &caller.did).await,
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert!(
+            reason(&welcome).contains("not a persona you may act as"),
+            "{welcome}"
+        );
+        assert!(
+            room_groups::holders(&state.room_groups_ks, &room.did)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+/// One VTA, several members of one room: group state is the **member's** — per (room,
+/// persona) — never the VTA's per room. A family on one VTA, or a team on a company one, can
+/// all be in the same room, each reading and writing as themselves, and none reaching
+/// another's group.
+#[cfg(test)]
+mod per_member_tests {
+    use super::*;
+    use crate::operations::persona::test_fixture::{self as personas, Persona};
+    use crate::operations::room_groups::Member;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use chrono::{Duration as Span, Utc};
+    use dtg_credentials::DTGCredential;
+    use trust_tasks_rs::TypeUri;
+    use vti_rooms::mls::RoomGroup;
+    use vti_rooms::sealed::SealedRoom;
+    use vti_rooms::wire::SealedContent;
+    use vti_rooms_dtg::test_support::Party;
+
+    const HOST: &str = "did:webvh:QmHost:host.example";
+    const OWNER: &str = "did:key:zOwner";
+
+    fn request(uri: &str, payload: Value) -> TrustTask<Value> {
+        let uri: TypeUri = uri.parse().unwrap();
+        TrustTask::new(format!("urn:uuid:{}", uuid::Uuid::new_v4()), uri, payload)
+    }
+
+    fn body(outcome: TrustTaskOutcome) -> Value {
+        serde_json::from_slice(&outcome.body).expect("the outcome is a document")
+    }
+
+    fn alice_caller() -> AuthClaims {
+        crate::test_support::admin_claims_for_context("alice")
+    }
+
+    fn bob_caller() -> AuthClaims {
+        crate::test_support::admin_claims_for_context("bob")
+    }
+
+    /// One VTA serving two principals, alice and bob, each with a persona in their own
+    /// context.
+    async fn shared_vta() -> (AppState, tempfile::TempDir, Persona, Persona) {
+        let (state, dir) = crate::test_support::build_signing_test_app_state().await;
+        for (id, name) in [("alice", "Alice"), ("bob", "Bob")] {
+            crate::contexts::create_context(&state.contexts_ks, id, name)
+                .await
+                .expect("create context");
+        }
+        let persona = |context: &'static str, key: &'static str| {
+            let state = &state;
+            async move {
+                personas::did_key_persona(
+                    &state.keys_ks,
+                    &state.internal_ks,
+                    &state.contexts_ks,
+                    &state.acl_ks,
+                    &state.seed_store,
+                    &state.audit_sink,
+                    context,
+                    key,
+                )
+                .await
+            }
+        };
+        let alice = persona("alice", "alice-key").await;
+        let bob = persona("bob", "bob-key").await;
+        (state, dir, alice, bob)
+    }
+
+    /// The room's owner, on a VTA of their own: the group, founded.
+    async fn owner(room: &str) -> (AppState, tempfile::TempDir, Member) {
+        let (state, dir) = crate::test_support::build_signing_test_app_state().await;
+        let owner = Member::new(room, OWNER).unwrap();
+        room_groups::create_group(&state.room_groups_ks, &owner, 0)
+            .await
+            .expect("an owner's group");
+        (state, dir, owner)
+    }
+
+    async fn invitation(room: &Party, subject: &str) -> String {
+        let now = Utc::now();
+        let mut vic = DTGCredential::new_vic(
+            room.did.clone(),
+            dtg_credentials::IssuerScope::Public,
+            subject.to_string(),
+            now - Span::minutes(1),
+            Some(now + Span::hours(1)),
+        )
+        .with_id(format!("urn:uuid:{}", uuid::Uuid::new_v4()));
+        vic.sign(&room.secret, None).await.expect("sign");
+        serde_json::to_string(vic.credential()).expect("serialise")
+    }
+
+    /// `persona` joins `room` through this VTA, as `caller` would drive it: a KeyPackage,
+    /// the owner's admission (accepted at its host), the Welcome. Returns the admission.
+    async fn join(
+        state: &AppState,
+        caller: &AuthClaims,
+        room: &Party,
+        persona: &str,
+        owner_state: &AppState,
+        owner: &Member,
+    ) -> (room_groups::PendingAdvance, Value) {
+        let vic = invitation(room, persona).await;
+        let minted = body(
+            handle_key_package_v0_2(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_KEY_PACKAGE_0_2,
+                    serde_json::json!({ "roomId": room.did, "invitation": vic }),
+                ),
+            )
+            .await,
+        );
+        let kp = B64
+            .decode(minted["payload"]["keyPackage"].as_str().expect("{minted}"))
+            .unwrap();
+        let admission =
+            room_groups::prepare_add(&owner_state.room_groups_ks, owner, HOST, persona, &kp, 0)
+                .await
+                .unwrap_or_else(|e| panic!("the owner admits {persona}: {e:?}"));
+        room_groups::promote_pending_advance(&owner_state.room_groups_ks, owner, &admission, 0)
+            .await
+            .unwrap();
+        let welcomed = body(
+            handle_welcome(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_WELCOME_0_1,
+                    serde_json::json!({
+                        "roomId": room.did, "welcome": admission.welcome, "invitation": vic,
+                    }),
+                ),
+            )
+            .await,
+        );
+        (admission, welcomed)
+    }
+
+    async fn open(state: &AppState, caller: &AuthClaims, room: &str, rec: &SealedContent) -> Value {
+        body(
+            handle_open_v0_2(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_OPEN_0_2,
+                    serde_json::json!({
+                        "roomId": room, "key": "notes/1", "version": 1,
+                        "sealed": {
+                            "ciphertext": rec.ciphertext, "nonce": rec.nonce, "epoch": rec.epoch,
+                        },
+                    }),
+                ),
+            )
+            .await,
+        )
+    }
+
+    async fn seal(state: &AppState, caller: &AuthClaims, room: &str, text: &str) -> Value {
+        body(
+            crate::trust_tasks::room_act::handle_seal_v0_2(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_SEAL_0_2,
+                    serde_json::json!({
+                        "roomId": room, "key": "notes/1", "version": 1,
+                        "plaintext": B64.encode(text),
+                    }),
+                ),
+            )
+            .await,
+        )
+    }
+
+    async fn commit(
+        state: &AppState,
+        caller: &AuthClaims,
+        room: &str,
+        advance: &room_groups::PendingAdvance,
+    ) -> Value {
+        body(
+            handle_commit(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_COMMIT_0_1,
+                    // The MLS epoch the commit produces, one below the room's.
+                    serde_json::json!({
+                        "roomId": room, "commit": advance.commit, "epoch": advance.epoch - 1,
+                    }),
+                ),
+            )
+            .await,
+        )
+    }
+
+    async fn list(state: &AppState, caller: &AuthClaims) -> Value {
+        body(
+            crate::trust_tasks::room_label::handle_list_v0_2(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_LIST_0_2,
+                    serde_json::json!({}),
+                ),
+            )
+            .await,
+        )
+    }
+
+    fn plaintext(doc: &Value) -> Vec<u8> {
+        B64.decode(
+            doc["payload"]["plaintext"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{doc}")),
+        )
+        .unwrap()
+    }
+
+    fn sealed(doc: &Value) -> SealedContent {
+        serde_json::from_value(doc["payload"]["sealed"].clone())
+            .unwrap_or_else(|e| panic!("{e}: {doc}"))
+    }
+
+    /// **The defect, end to end.** Alice and Bob share one VTA, each in their own context.
+    /// Both are admitted to one room; Bob's Welcome — refused before, as "this VTA already
+    /// holds group state" — joins; each reads what the owner seals and writes what the owner
+    /// reads, through their own caller; each sees the room once in their own list.
+    #[tokio::test]
+    async fn two_personas_in_two_contexts_on_one_vta_both_join_one_room() {
+        let (state, _d, alice, bob) = shared_vta().await;
+        let room = Party::new();
+        let (owner_state, _od, owner) = owner(&room.did).await;
+
+        let (_, joined) = join(
+            &state,
+            &alice_caller(),
+            &room,
+            &alice.did,
+            &owner_state,
+            &owner,
+        )
+        .await;
+        assert!(joined["payload"]["epoch"].is_u64(), "alice joins: {joined}");
+        let (to_bob, joined) =
+            join(&state, &bob_caller(), &room, &bob.did, &owner_state, &owner).await;
+        assert!(
+            joined["payload"]["epoch"].is_u64(),
+            "bob joins the room alice is already in, on the same VTA: {joined}"
+        );
+
+        // Alice follows Bob's admission in her own group; Bob's is untouched by it.
+        let followed = commit(&state, &alice_caller(), &room.did, &to_bob).await;
+        assert_eq!(followed["payload"]["epoch"], 2, "{followed}");
+
+        let from_owner =
+            room_groups::seal_record(&owner_state.room_groups_ks, &owner, "notes/1", 1, b"to all")
+                .await
+                .unwrap();
+        for (who, caller) in [("alice", alice_caller()), ("bob", bob_caller())] {
+            let opened = open(&state, &caller, &room.did, &from_owner).await;
+            assert_eq!(plaintext(&opened), b"to all", "{who} reads: {opened}");
+
+            let written = seal(&state, &caller, &room.did, who).await;
+            let read_back = room_groups::open_record(
+                &owner_state.room_groups_ks,
+                &owner,
+                "notes/1",
+                1,
+                &sealed(&written).ciphertext,
+                &sealed(&written).nonce,
+                sealed(&written).epoch,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the owner reads what {who} sealed: {e}"));
+            assert_eq!(read_back, who.as_bytes());
+
+            let listed = list(&state, &caller).await;
+            let rooms = listed["payload"]["rooms"].as_array().expect("{listed}");
+            assert_eq!(rooms.len(), 1, "{who} holds the room once: {listed}");
+            assert_eq!(rooms[0]["roomId"], room.did);
+        }
+
+        // Two groups, two leaves, both on this VTA.
+        let held = room_groups::holders(&state.room_groups_ks, &room.did)
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 2, "{held:?}");
+    }
+
+    async fn key_package_v0_2(
+        state: &AppState,
+        caller: &AuthClaims,
+        room: &str,
+        vic: &str,
+    ) -> Value {
+        body(
+            handle_key_package_v0_2(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_KEY_PACKAGE_0_2,
+                    serde_json::json!({ "roomId": room, "invitation": vic }),
+                ),
+            )
+            .await,
+        )
+    }
+
+    /// `rooms/keys/key-package/0.2`, end to end: an acceptance one surface began — it
+    /// obtained the KeyPackage, the owner admitted it, and the surface stopped before the
+    /// Welcome — is finished by another. The second surface is given the same KeyPackage
+    /// (item 3), the Welcome sealed to it joins, and the first surface's late Welcome is
+    /// `alreadyJoined`, which a surface reads as success.
+    #[tokio::test]
+    async fn an_acceptance_begun_on_one_surface_is_finished_on_another() {
+        let (state, _d, alice, _bob) = shared_vta().await;
+        let room = Party::new();
+        let (owner_state, _od, owner) = owner(&room.did).await;
+        let vic = invitation(&room, &alice.did).await;
+
+        let portal = key_package_v0_2(&state, &alice_caller(), &room.did, &vic).await;
+        assert_eq!(portal["payload"]["alreadyMinted"], false, "{portal}");
+        let terminal = key_package_v0_2(&state, &alice_caller(), &room.did, &vic).await;
+        assert_eq!(terminal["payload"]["alreadyMinted"], true, "{terminal}");
+        assert_eq!(
+            terminal["payload"]["keyPackage"], portal["payload"]["keyPackage"],
+            "the same KeyPackage, so the community answers with the Welcome it kept"
+        );
+        assert_eq!(
+            terminal["payload"]["expiresAt"], portal["payload"]["expiresAt"],
+            "returning it again does not extend it"
+        );
+        // It outlives the week the community keeps the Welcome from the admission.
+        let expires =
+            chrono::DateTime::parse_from_rfc3339(portal["payload"]["expiresAt"].as_str().unwrap())
+                .unwrap();
+        assert!(expires > Utc::now() + Span::days(13), "{portal}");
+
+        let kp = B64
+            .decode(portal["payload"]["keyPackage"].as_str().unwrap())
+            .unwrap();
+        let admission = room_groups::prepare_add(
+            &owner_state.room_groups_ks,
+            &owner,
+            HOST,
+            &alice.did,
+            &kp,
+            0,
+        )
+        .await
+        .unwrap();
+        room_groups::promote_pending_advance(&owner_state.room_groups_ks, &owner, &admission, 0)
+            .await
+            .unwrap();
+
+        let welcome = |state: &AppState| {
+            let request = request(
+                vta_sdk::trust_tasks::TASK_ROOMS_KEYS_WELCOME_0_1,
+                serde_json::json!({
+                    "roomId": room.did, "welcome": admission.welcome, "invitation": vic,
+                }),
+            );
+            let state = state.clone();
+            async move { body(handle_welcome(&state, &alice_caller(), request).await) }
+        };
+        let joined = welcome(&state).await;
+        assert!(joined["payload"]["epoch"].is_u64(), "{joined}");
+        let late = welcome(&state).await;
+        assert_eq!(
+            late["payload"]["code"], "rooms/keys/welcome:alreadyJoined",
+            "{late}"
+        );
+        let listed = list(&state, &alice_caller()).await;
+        assert_eq!(
+            listed["payload"]["rooms"][0]["roomId"], room.did,
+            "{listed}"
+        );
+    }
+
+    /// Item 6: a different invitation for the same room and member — after a removal and
+    /// re-admission — is given a different KeyPackage; and one minted with no invitation
+    /// recorded is never returned. Item 7: requests arriving together
+    /// are given the same one.
+    #[tokio::test]
+    async fn only_the_same_invitation_is_given_the_held_key_package() {
+        let (state, _d, alice, _bob) = shared_vta().await;
+        let room = Party::new();
+        let caller = alice_caller();
+
+        // A KeyPackage minted with no invitation recorded — as `key-package/0.1` minted
+        // them, and as a VTA upgraded from one may still hold.
+        let legacy = room_groups::mint_key_package(
+            &state.room_groups_ks,
+            &Member::new(&room.did, &alice.did).unwrap(),
+            3600,
+            now(),
+        )
+        .await
+        .unwrap();
+        let first_vic = invitation(&room, &alice.did).await;
+        let first = key_package_v0_2(&state, &caller, &room.did, &first_vic).await;
+        assert_eq!(first["payload"]["alreadyMinted"], false, "{first}");
+        assert_ne!(
+            first["payload"]["keyPackage"].as_str(),
+            Some(legacy.key_package.as_str())
+        );
+
+        let second_vic = invitation(&room, &alice.did).await;
+        let second = key_package_v0_2(&state, &caller, &room.did, &second_vic).await;
+        assert_eq!(second["payload"]["alreadyMinted"], false, "{second}");
+        assert_ne!(
+            second["payload"]["keyPackage"],
+            first["payload"]["keyPackage"]
+        );
+
+        let (a, b) = tokio::join!(
+            key_package_v0_2(&state, &caller, &room.did, &second_vic),
+            key_package_v0_2(&state, &caller, &room.did, &second_vic),
+        );
+        assert_eq!(a["payload"]["keyPackage"], second["payload"]["keyPackage"]);
+        assert_eq!(b["payload"]["keyPackage"], second["payload"]["keyPackage"]);
+    }
+
+    /// The same member twice is still `alreadyJoined` — the spec's rule, asked of the member.
+    #[tokio::test]
+    async fn the_same_persona_welcomed_twice_is_already_joined() {
+        let (state, _d, alice, _bob) = shared_vta().await;
+        let room = Party::new();
+        let (owner_state, _od, owner) = owner(&room.did).await;
+        join(
+            &state,
+            &alice_caller(),
+            &room,
+            &alice.did,
+            &owner_state,
+            &owner,
+        )
+        .await;
+
+        // A second invitation and package for the same persona: the group it would make
+        // collides with the one held.
+        let groups = &state.room_groups_ks;
+        let member = Member::new(&room.did, &alice.did).unwrap();
+        room_groups::mint_key_package(groups, &member, 3600, 0)
+            .await
+            .unwrap();
+        let again = body(
+            handle_welcome(
+                &state,
+                &alice_caller(),
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_WELCOME_0_1,
+                    serde_json::json!({
+                        "roomId": room.did, "welcome": "AAAA",
+                        "invitation": invitation(&room, &alice.did).await,
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            again["payload"]["code"], "rooms/keys/welcome:alreadyJoined",
+            "{again}"
+        );
+    }
+
+    /// A Welcome sealed to a KeyPackage past its expiry is refused `welcomeInvalid`, as
+    /// `rooms/keys/act/0.3`'s `holds_key_package` already treats that package as not held —
+    /// and the expired private half is discarded rather than used
+    /// (`rooms/keys/key-package/0.2` *The private half is retained*). Nothing is joined, and the invitation is
+    /// not spent, so a fresh package can still be added under it.
+    #[tokio::test]
+    async fn a_welcome_to_an_expired_key_package_is_refused_and_the_package_discarded() {
+        use base64::Engine as _;
+        let (state, _d, alice, _bob) = shared_vta().await;
+        let room = Party::new();
+        let groups = &state.room_groups_ks;
+        let member = Member::new(&room.did, &alice.did).unwrap();
+        // Minted at the epoch's start with a one-second life: long expired by now.
+        let pending = room_groups::mint_key_package(groups, &member, 1, 0)
+            .await
+            .unwrap();
+        let mut owner = vti_rooms::mls::RoomGroup::create("did:example:owner").unwrap();
+        let change = owner
+            .add_member_from_bytes(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&pending.key_package)
+                    .unwrap(),
+            )
+            .unwrap();
+        let welcome =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(change.welcome.unwrap());
+
+        let refused = body(
+            handle_welcome(
+                &state,
+                &alice_caller(),
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_WELCOME_0_1,
+                    serde_json::json!({
+                        "roomId": room.did, "welcome": welcome,
+                        "invitation": invitation(&room, &alice.did).await,
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            refused["payload"]["code"],
+            vti_specs::rooms::keys::welcome::v0_1::error_codes::WELCOME_INVALID.code,
+            "{refused}"
+        );
+        assert!(
+            room_groups::load(groups, &member).await.unwrap().is_none(),
+            "nothing joined"
+        );
+        assert!(
+            !room_groups::holds_key_package(
+                groups,
+                &member,
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&pending.key_package)
+                    .unwrap(),
+                0,
+            )
+            .await
+            .unwrap(),
+            "the expired private half is gone, whatever the clock says"
+        );
+    }
+
+    /// **Context isolation.** A room only Bob holds is, to a caller in Alice's context, a
+    /// room nobody here holds: open, seal, commit and list all answer as they would for an
+    /// unknown room, and Bob's group does not move.
+    #[tokio::test]
+    async fn a_caller_in_one_context_cannot_touch_another_contexts_group() {
+        let (state, _d, _alice, bob) = shared_vta().await;
+        let room = Party::new();
+        let (owner_state, _od, owner) = owner(&room.did).await;
+        join(&state, &bob_caller(), &room, &bob.did, &owner_state, &owner).await;
+        let bobs = Member::new(&room.did, &bob.did).unwrap();
+        let before = room_groups::load(&state.room_groups_ks, &bobs)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+
+        let unknown = Party::new().did;
+        let from_owner =
+            room_groups::seal_record(&owner_state.room_groups_ks, &owner, "notes/1", 1, b"x")
+                .await
+                .unwrap();
+        let opened = open(&state, &alice_caller(), &room.did, &from_owner).await;
+        let opened_unknown = open(&state, &alice_caller(), &unknown, &from_owner).await;
+        assert!(opened["payload"]["plaintext"].is_null(), "{opened}");
+        assert_eq!(
+            opened["payload"]["message"]
+                .as_str()
+                .map(|m| m.replace(&room.did, "R")),
+            opened_unknown["payload"]["message"]
+                .as_str()
+                .map(|m| m.replace(&unknown, "R")),
+            "bob's room reads to alice's caller as a room nobody holds"
+        );
+        let sealed_by_alice = seal(&state, &alice_caller(), &room.did, "x").await;
+        assert!(
+            sealed_by_alice["payload"]["sealed"].is_null(),
+            "{sealed_by_alice}"
+        );
+
+        // A commit alice's caller delivers advances nothing of bob's.
+        let (to_carol, _) = {
+            let carol = crate::operations::persona::test_fixture::did_key_persona(
+                &state.keys_ks,
+                &state.internal_ks,
+                &state.contexts_ks,
+                &state.acl_ks,
+                &state.seed_store,
+                &state.audit_sink,
+                "alice",
+                "carol-key",
+            )
+            .await;
+            join(
+                &state,
+                &alice_caller(),
+                &room,
+                &carol.did,
+                &owner_state,
+                &owner,
+            )
+            .await
+        };
+        // Carol, in alice's context, now holds the room too — so alice's caller's commit
+        // lands on carol's group, never bob's.
+        let delivered = commit(&state, &alice_caller(), &room.did, &to_carol).await;
+        assert!(delivered["payload"]["epoch"].is_u64(), "{delivered}");
+        let after = room_groups::load(&state.room_groups_ks, &bobs)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.updated_at, before, "bob's group did not move");
+        assert_eq!(
+            SealedRoom::new(&room.did, RoomGroup::restore(&after.snapshot).unwrap()).room_epoch(),
+            2,
+            "bob is still where his own deliveries left him"
+        );
+
+        let listed = list(&state, &alice_caller()).await;
+        let rooms = listed["payload"]["rooms"].as_array().expect("{listed}");
+        assert_eq!(
+            rooms.len(),
+            1,
+            "carol's membership only, never bob's: {listed}"
+        );
+    }
+
+    /// A caller who may act as several personas is answered without ambiguity where only
+    /// one of them holds the room — and asked to choose where both do.
+    #[tokio::test]
+    async fn one_holder_resolves_and_two_ask_the_caller_to_choose() {
+        let (state, _d, alice, bob) = shared_vta().await;
+        let room = Party::new();
+        let (owner_state, _od, owner) = owner(&room.did).await;
+        let everywhere = crate::test_support::super_admin_claims();
+        join(
+            &state,
+            &alice_caller(),
+            &room,
+            &alice.did,
+            &owner_state,
+            &owner,
+        )
+        .await;
+
+        let from_owner =
+            room_groups::seal_record(&owner_state.room_groups_ks, &owner, "notes/1", 1, b"one")
+                .await
+                .unwrap();
+        let opened = open(&state, &everywhere, &room.did, &from_owner).await;
+        assert_eq!(
+            plaintext(&opened),
+            b"one",
+            "only alice holds the room, so it is hers: {opened}"
+        );
+
+        join(&state, &bob_caller(), &room, &bob.did, &owner_state, &owner).await;
+        let ambiguous = open(&state, &everywhere, &room.did, &from_owner).await;
+        assert!(
+            ambiguous["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("act from the context of the one you mean"),
+            "{ambiguous}"
+        );
+        // Acting from one context resolves it.
+        assert_eq!(
+            plaintext(&open(&state, &alice_caller(), &room.did, &from_owner).await),
+            b"one"
+        );
+    }
+
+    async fn open_as(
+        state: &AppState,
+        caller: &AuthClaims,
+        room: &str,
+        rec: &SealedContent,
+        member: &str,
+    ) -> Value {
+        body(
+            handle_open_v0_2(
+                state,
+                caller,
+                request(
+                    vta_sdk::trust_tasks::TASK_ROOMS_KEYS_OPEN_0_2,
+                    serde_json::json!({
+                        "roomId": room, "key": "notes/1", "version": 1,
+                        "sealed": {
+                            "ciphertext": rec.ciphertext, "nonce": rec.nonce, "epoch": rec.epoch,
+                        },
+                        "ext": { "org.openvtc.rooms": { "member": member } },
+                    }),
+                ),
+            )
+            .await,
+        )
+    }
+
+    /// A caller who may act as two members of one room — an administrator whose VTA also
+    /// holds the community's own place in it — is listed the room once per member, each
+    /// entry saying whose it is, and names the one it means in
+    /// `ext["org.openvtc.rooms"].member` instead of being refused.
+    #[tokio::test]
+    async fn two_members_of_one_room_are_listed_apart_and_named_to_act() {
+        let (state, _d, alice, bob) = shared_vta().await;
+        let room = Party::new();
+        let (owner_state, _od, owner) = owner(&room.did).await;
+        let everywhere = crate::test_support::super_admin_claims();
+        join(
+            &state,
+            &alice_caller(),
+            &room,
+            &alice.did,
+            &owner_state,
+            &owner,
+        )
+        .await;
+        let (to_bob, _) = join(&state, &bob_caller(), &room, &bob.did, &owner_state, &owner).await;
+        commit(&state, &alice_caller(), &room.did, &to_bob).await;
+
+        let listed = list(&state, &everywhere).await;
+        let rooms = listed["payload"]["rooms"].as_array().expect("rooms");
+        let held = listed["payload"]["ext"]["org.openvtc.rooms"]["held"]
+            .as_array()
+            .unwrap_or_else(|| panic!("whose each entry is: {listed}"));
+        assert_eq!(rooms.len(), 2, "one entry per member: {listed}");
+        assert_eq!(held.len(), rooms.len(), "index for index: {listed}");
+        let mut members: Vec<&str> = held.iter().map(|h| h["member"].as_str().unwrap()).collect();
+        members.sort_unstable();
+        let mut want = vec![alice.did.as_str(), bob.did.as_str()];
+        want.sort_unstable();
+        assert_eq!(members, want, "{listed}");
+        assert!(rooms.iter().all(|r| r["roomId"] == room.did));
+        assert!(
+            held.iter().all(|h| h["context"].is_string()),
+            "each member's context: {listed}"
+        );
+
+        // A caller in one context is listed only its own member.
+        let mine = list(&state, &alice_caller()).await;
+        let held = mine["payload"]["ext"]["org.openvtc.rooms"]["held"]
+            .as_array()
+            .expect("held");
+        assert_eq!(held.len(), 1, "{mine}");
+        assert_eq!(held[0]["member"], alice.did);
+
+        let from_owner =
+            room_groups::seal_record(&owner_state.room_groups_ks, &owner, "notes/1", 1, b"one")
+                .await
+                .unwrap();
+        for persona in [&alice.did, &bob.did] {
+            let opened = open_as(&state, &everywhere, &room.did, &from_owner, persona).await;
+            assert_eq!(plaintext(&opened), b"one", "as {persona}: {opened}");
+        }
+        // Naming only narrows: a member the caller may not act as is not one it gets.
+        let refused = open_as(&state, &alice_caller(), &room.did, &from_owner, &bob.did).await;
+        assert!(
+            refused["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no group state"),
+            "{refused}"
+        );
+        // A member that is not a DID is malformed, never ignored.
+        let malformed = open_as(&state, &everywhere, &room.did, &from_owner, "alice").await;
+        assert!(
+            malformed["payload"]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("malformed"),
+            "{malformed}"
+        );
+    }
+
+    /// **An upgraded store.** A group the per-room build wrote at `room-group:<room>` still
+    /// opens after the upgrade, for the persona its own leaf identifies — and is moved under
+    /// that persona on the first touch. A caller in another context touching the room
+    /// neither opens it nor moves it.
+    #[tokio::test]
+    async fn a_group_from_the_per_room_build_still_opens_and_is_moved() {
+        let (state, _d, alice, _bob) = shared_vta().await;
+        let room = Party::new();
+        let group = RoomGroup::create(&alice.did).unwrap();
+        let record = room_groups::RoomGroupRecord {
+            snapshot: group.snapshot().unwrap(),
+            member_did: alice.did.clone(),
+            links: Vec::new(),
+            updated_at: 0,
+        };
+        let sealed_before = SealedRoom::new(&room.did, group)
+            .seal_record("notes/1", 1, b"from before the upgrade")
+            .unwrap();
+        let groups = &state.room_groups_ks;
+        room_groups::legacy_for_test::store_group(groups, &room.did, &record).await;
+
+        // Bob's caller is not alice's: nothing opens, nothing moves.
+        let refused = open(&state, &bob_caller(), &room.did, &sealed_before).await;
+        assert!(refused["payload"]["plaintext"].is_null(), "{refused}");
+        assert_eq!(
+            room_groups::legacy_rooms(groups).await.unwrap(),
+            vec![room.did.clone()]
+        );
+
+        let opened = open(&state, &alice_caller(), &room.did, &sealed_before).await;
+        assert_eq!(plaintext(&opened), b"from before the upgrade", "{opened}");
+        assert!(room_groups::legacy_rooms(groups).await.unwrap().is_empty());
+        assert!(
+            room_groups::load(groups, &Member::new(&room.did, &alice.did).unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "now kept under the persona"
+        );
+    }
+}

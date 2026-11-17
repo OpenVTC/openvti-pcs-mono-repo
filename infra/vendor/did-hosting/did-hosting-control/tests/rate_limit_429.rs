@@ -1,0 +1,351 @@
+//! The control plane's own limiters answer with the ecosystem 429 contract:
+//! status `429`, `x-rate-limit-source: did-host`, a `Retry-After` in seconds,
+//! and a JSON body naming the limiter. Before this, both refused with `400`
+//! (`AppError::Validation`), which no client can tell apart from a malformed
+//! request — so nothing backed off, and an operator could not see which service
+//! had refused.
+//!
+//! Driven through the real router (`tower::ServiceExt::oneshot`), because the
+//! contract is the HTTP response, not the error value.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use did_hosting_common::server::config::AuthConfig;
+use did_hosting_control::pending_challenges::PendingChallengeTracker;
+use did_hosting_control::rate_limit::{MAX_PER_WINDOW, WINDOW_SECS};
+use did_hosting_control::test_support::TestServer;
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+fn challenge_request(did: &str) -> Request<Body> {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/challenge")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "did": did })).unwrap(),
+        ))
+        .unwrap();
+    // `oneshot` does not populate `ConnectInfo`; the per-IP limiter needs it.
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [203, 0, 113, 7],
+            40000,
+        ))));
+    req
+}
+
+/// Assert the full 429 contract and return the body for limiter-specific checks.
+async fn assert_rate_limited(response: Response, limiter: &str) -> Value {
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["x-rate-limit-source"], "did-host");
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let retry_after: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After is delta-seconds");
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "rate_limited");
+    assert_eq!(body["limiter"], limiter);
+    assert!(body["message"].as_str().is_some_and(|m| !m.is_empty()));
+    assert_eq!(body["retryAfterSecs"], retry_after, "header and body agree");
+    body
+}
+
+#[tokio::test]
+async fn per_ip_challenge_limit_answers_429_with_retry_after_to_the_next_request() {
+    let ts = TestServer::start().await;
+    let app = ts.router();
+
+    // Distinct DIDs, so the per-DID pending cap never bites first. Sent until
+    // the first refusal rather than exactly `MAX_PER_WINDOW + 1` times: the
+    // allowance refills one challenge every `WINDOW_SECS / MAX_PER_WINDOW`
+    // seconds, so on a slow runner a request or two may land in what refilled
+    // while the burst ran. Every request of the allowance is admitted, and no
+    // more than refilled on top of it.
+    let refill = Duration::from_secs(WINDOW_SECS) / MAX_PER_WINDOW as u32;
+    let started = Instant::now();
+    let mut admitted = 0u64;
+    let response = loop {
+        let response = app
+            .clone()
+            .oneshot(challenge_request(&format!("did:example:ip-{admitted}")))
+            .await
+            .unwrap();
+        if response.status() != StatusCode::OK {
+            break response;
+        }
+        admitted += 1;
+        let refilled = (started.elapsed().as_nanos() / refill.as_nanos()) as u64 + 1;
+        assert!(
+            admitted <= MAX_PER_WINDOW + refilled,
+            "{admitted} admitted, allowance {MAX_PER_WINDOW}, {refilled} refilled"
+        );
+    };
+    assert!(
+        admitted >= MAX_PER_WINDOW,
+        "only {admitted} of the {MAX_PER_WINDOW}-request allowance admitted"
+    );
+    let body = assert_rate_limited(response, "auth-challenge-per-ip").await;
+    // The allowance refills one challenge every `WINDOW_SECS / MAX_PER_WINDOW`
+    // seconds, so the hint is the wait for the next one, rounded up: not the
+    // rest of a window.
+    let retry = body["retryAfterSecs"].as_u64().unwrap();
+    let refill_secs = WINDOW_SECS.div_ceil(MAX_PER_WINDOW);
+    assert!(
+        (1..=refill_secs).contains(&retry),
+        "retry {retry}, refill {refill_secs}"
+    );
+}
+
+/// At the per-DID cap the oldest challenge is evicted, not the new one
+/// refused: asking for challenges in a DID's name cannot lock its owner out.
+/// The evicted challenge's row goes with it, so it cannot be redeemed outside
+/// the cap (VTI-SES-005).
+#[tokio::test]
+async fn per_did_pending_challenge_cap_evicts_the_oldest() {
+    use did_hosting_common::server::acl::Role;
+    use did_hosting_common::server::auth::session::get_session;
+
+    let ts = TestServer::start().await;
+    // Enrolled, so the canonical handler persists a row per challenge.
+    let did = "did:example:pending";
+    ts.add_acl(did, Role::Owner).await;
+    let app = ts.router();
+
+    // `MAX_PENDING_CHALLENGES_PER_DID` in `routes::auth` is 10.
+    let mut session_ids = Vec::new();
+    for i in 0..=10 {
+        let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        session_ids.push(body["sessionId"].as_str().unwrap().to_string());
+    }
+
+    assert_eq!(ts.state.pending_challenges.count_for(did), 10);
+    let gone = get_session(&ts.state.sessions_ks, &session_ids[0])
+        .await
+        .unwrap();
+    assert!(
+        gone.is_none(),
+        "the evicted challenge can no longer be redeemed"
+    );
+    let kept = get_session(&ts.state.sessions_ks, &session_ids[10])
+        .await
+        .unwrap();
+    assert!(kept.is_some(), "the new challenge was issued");
+}
+
+/// A tracker whose clock the test moves, installed on `ts` before routing.
+fn install_manual_clock(ts: &mut TestServer, global_cap: usize) -> Arc<Mutex<Instant>> {
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock = now.clone();
+    ts.state.pending_challenges = Arc::new(PendingChallengeTracker::with_clock(
+        Duration::from_secs(AuthConfig::default().challenge_ttl),
+        global_cap,
+        Arc::new(move || *clock.lock().unwrap()),
+    ));
+    now
+}
+
+async fn retry_after_of(response: Response, limiter: &str) -> u64 {
+    assert_rate_limited(response, limiter).await["retryAfterSecs"]
+        .as_u64()
+        .unwrap()
+}
+
+/// The per-DID cap still refuses when nothing can be evicted — every slot is
+/// a challenge still being minted, with no row to claim — and the 429 names
+/// the limiter and when the oldest slot frees.
+#[tokio::test]
+async fn per_did_cap_answers_429_when_nothing_can_be_evicted() {
+    let mut ts = TestServer::start().await;
+    let now = install_manual_clock(&mut ts, 10_000);
+    let app = ts.router();
+    let did = "did:example:minting";
+
+    // `MAX_PENDING_CHALLENGES_PER_DID` in `routes::auth` is 10.
+    let in_flight: Vec<_> = (0..10)
+        .map(|_| ts.state.pending_challenges.try_issue(did, 10).unwrap())
+        .collect();
+    *now.lock().unwrap() += Duration::from_secs(5);
+
+    let response = app.oneshot(challenge_request(did)).await.unwrap();
+    let retry = retry_after_of(response, "auth-challenge-pending-per-did").await;
+    assert_eq!(retry, AuthConfig::default().challenge_ttl - 5);
+    for r in in_flight {
+        ts.state.pending_challenges.cancel(r);
+    }
+}
+
+/// Presenting an evicted challenge through the canonical authenticate handler
+/// is refused, and the refusal leaves the count where eviction put it.
+#[tokio::test]
+async fn an_evicted_challenge_cannot_authenticate() {
+    use did_hosting_common::server::acl::Role;
+    use vti_common::auth::{AudienceBinding, AuthenticateInput, handlers::handle_authenticate};
+
+    let ts = TestServer::start().await;
+    let did = "did:example:evicted";
+    ts.add_acl(did, Role::Owner).await;
+    let app = ts.router();
+
+    let mut issued = Vec::new();
+    for i in 0..=10 {
+        let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        issued.push((
+            body["sessionId"].as_str().unwrap().to_string(),
+            body["challenge"].as_str().unwrap().to_string(),
+        ));
+    }
+
+    let backend =
+        did_hosting_control::auth::DidHostingControlAuthBackend::from_state(&ts.state).unwrap();
+    let (session_id, challenge) = issued[0].clone();
+    let refused = handle_authenticate(
+        &backend,
+        AuthenticateInput {
+            session_id,
+            challenge,
+            signer_did: did.to_string(),
+            created_time: None,
+            session_pubkey_b58btc: None,
+            audience: AudienceBinding::Transport,
+        },
+    )
+    .await;
+    assert!(refused.is_err(), "the evicted challenge was redeemed");
+    assert_eq!(ts.state.pending_challenges.count_for(did), 10);
+}
+
+/// Regression: challenges nobody redeems must give their slots back when they
+/// expire. The tracker used to free a slot only when its challenge
+/// authenticated, so ten abandoned challenges locked the DID out until
+/// restart. Eviction now keeps the DID answerable at the cap, but expiry must
+/// still empty the count — or every new challenge would evict a live one.
+#[tokio::test]
+async fn abandoned_challenges_leave_the_per_did_count_on_expiry() {
+    let mut ts = TestServer::start().await;
+    let now = install_manual_clock(&mut ts, 10_000);
+    let app = ts.router();
+    let did = "did:example:abandoned";
+
+    for i in 0..10 {
+        let response = app.clone().oneshot(challenge_request(did)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+    }
+    assert_eq!(ts.state.pending_challenges.count_for(did), 10);
+
+    *now.lock().unwrap() += Duration::from_secs(AuthConfig::default().challenge_ttl + 1);
+    assert_eq!(ts.state.pending_challenges.count_for(did), 0);
+    let response = app.oneshot(challenge_request(did)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(ts.state.pending_challenges.count_for(did), 1);
+}
+
+/// The same for the global cap — the case that took the whole control plane
+/// down: enough abandoned challenges across distinct DIDs refused every DID's
+/// login until restart.
+#[tokio::test]
+async fn abandoned_challenges_free_the_global_cap_on_expiry() {
+    let mut ts = TestServer::start().await;
+    let now = install_manual_clock(&mut ts, 5);
+    let app = ts.router();
+
+    for i in 0..5 {
+        let response = app
+            .clone()
+            .oneshot(challenge_request(&format!("did:example:sweep-{i}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "challenge {i}");
+    }
+    let response = app
+        .clone()
+        .oneshot(challenge_request("did:example:victim"))
+        .await
+        .unwrap();
+    let retry = retry_after_of(response, "auth-challenge-pending-global").await;
+    assert_eq!(retry, AuthConfig::default().challenge_ttl);
+
+    *now.lock().unwrap() += Duration::from_secs(retry);
+    let response = app
+        .oneshot(challenge_request("did:example:victim"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// A trusted proxy's unreadable `X-Forwarded-For` leaves a request with no
+/// client to charge. The challenge endpoint refuses it with the same `400` the
+/// resolution limit sends; `POST /api/trust-tasks` refuses it as it refuses
+/// everything, with a `trust-task-error` document.
+#[tokio::test]
+async fn an_unreadable_forwarded_chain_is_refused_in_each_routes_own_shape() {
+    let mut ts = TestServer::start().await;
+    // The router's mock peer is 127.0.0.1: make it a trusted proxy.
+    ts.state.client_ips =
+        did_hosting_common::server::rate_limit::ClientIps::new(&["127.0.0.1/32".parse().unwrap()])
+            .unwrap();
+    let app = ts.router();
+
+    let mut challenge = challenge_request("did:example:proxied");
+    challenge
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))));
+    challenge
+        .headers_mut()
+        .insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+    let response = app.clone().oneshot(challenge).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["x-rate-limit-source"], "did-host");
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"], "invalid_forwarded_for");
+    assert_eq!(body["limiter"], "auth-challenge-per-ip");
+
+    let task = Request::builder()
+        .method("POST")
+        .uri("/api/trust-tasks")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", "not-an-ip")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "id": "urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
+                "type": "https://trusttasks.org/spec/server/info/0.1",
+                "payload": {},
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(task).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        body["type"],
+        did_hosting_common::server::trust_tasks::framework_error_type_uri().to_string(),
+        "{body}"
+    );
+    assert_eq!(body["payload"]["code"], "malformedRequest", "{body}");
+    assert_eq!(
+        body["threadId"], "urn:uuid:5b3c5e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
+        "routed to the refused document: {body}"
+    );
+}

@@ -1,0 +1,43 @@
+//! Per-subcommand dispatchers for the `pnm` CLI.
+//!
+//! Each module owns the dispatch table for one top-level (or nested)
+//! `Commands::*` arm. `main.rs` is intentionally a thin router: parse
+//! → dispatch into one of these modules → exit.
+//!
+//! Authentication routing lives in [`crate::cli::requires_auth`]; the
+//! modules below assume the caller already built (or skipped building)
+//! a `VtaClient` per that decision.
+
+pub(crate) mod acl;
+pub(crate) mod agent_names;
+pub(crate) mod approvals;
+pub(crate) mod audit;
+pub(crate) mod auth;
+pub(crate) mod auth_credential;
+pub(crate) mod backup;
+pub(crate) mod boards;
+pub(crate) mod bootstrap;
+pub(crate) mod collection;
+pub(crate) mod config;
+pub(crate) mod consent;
+pub(crate) mod contexts;
+pub(crate) mod cred_vault;
+pub(crate) mod device;
+pub(crate) mod did_templates;
+pub(crate) mod elections;
+pub(crate) mod external;
+pub(crate) mod health;
+pub(crate) mod keys;
+pub(crate) mod memory;
+pub(crate) mod messaging;
+pub(crate) mod mnemonic;
+pub(crate) mod notifications;
+pub(crate) mod persona;
+pub(crate) mod policy;
+pub(crate) mod rooms;
+pub(crate) mod services;
+pub(crate) mod setup;
+pub(crate) mod vault;
+pub(crate) mod vta;
+pub(crate) mod webs;
+pub(crate) mod webvh;

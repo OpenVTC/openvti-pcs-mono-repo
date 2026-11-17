@@ -1,0 +1,886 @@
+//! `pnm services …` command implementations — unified CLI surface.
+//!
+//! Spec: `docs/05-design-notes/runtime-service-management.md` §5.1.
+//!
+//! Twelve commands across two transport kinds plus a top-level
+//! list/report. Each function calls the matching `vta-sdk` client
+//! method; the typed `VtaError` variants are surfaced via the
+//! existing CLI error renderer (`render::print_cli_error`) which
+//! attaches operator-actionable suggested-fix strings per
+//! CLAUDE.md.
+//!
+//! The retired `pnm mediator …` subcommand surface is replaced by
+//! `pnm services didcomm {update,rollback,drain {list,cancel}}` —
+//! see the migration cue in pnm-cli/cnm-cli for the
+//! retired-command UX.
+
+use vta_sdk::client::VtaClient;
+use vta_sdk::error::VtaError;
+use vta_sdk::protocol::services::{
+    DisableRestRequest, DisableTspRequest, EnableRestRequest, EnableTspRequest,
+    RollbackDidcommRequest, RollbackRestRequest, RollbackTspRequest, UpdateRestRequest,
+    UpdateTspRequest,
+};
+use vta_sdk::protocol::{DisableDidcommRequest, EnableDidcommRequest, UpdateDidcommRequest};
+
+use crate::display::{NAME_HEADER, NameBook, UNNAMED, book_from_acl, inline, shorten_did};
+
+const DIDCOMM_RESTART_WAIT_SECS: u64 = 300;
+
+// ── services list ──────────────────────────────────────────────────
+
+/// `pnm services list` — show current REST + DIDComm advertisements.
+pub async fn cmd_services_list(client: &VtaClient) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client.list_services().await?;
+
+    if crate::render::is_json_output() {
+        crate::render::print_json(&response)?;
+        return Ok(());
+    }
+
+    println!("Services advertised on this VTA's DID document:");
+    println!();
+    for state in &response.services {
+        match state {
+            vta_sdk::protocol::services::ServiceState::Tsp {
+                enabled,
+                mediator_did,
+            } => {
+                let on = if *enabled { "on" } else { "off" };
+                println!("  TSP:      {on}");
+                if let Some(m) = mediator_did {
+                    println!("    Mediator:     {m}");
+                }
+            }
+            vta_sdk::protocol::services::ServiceState::Didcomm {
+                enabled,
+                mediator_did,
+                routing_keys,
+            } => {
+                let on = if *enabled { "on" } else { "off" };
+                println!("  DIDComm:  {on}");
+                if let Some(m) = mediator_did {
+                    println!("    Mediator:     {m}");
+                }
+                if !routing_keys.is_empty() {
+                    println!("    Routing keys: {}", routing_keys.join(", "));
+                }
+            }
+            vta_sdk::protocol::services::ServiceState::Rest { enabled, url } => {
+                let on = if *enabled { "on" } else { "off" };
+                println!("  REST:     {on}");
+                if let Some(u) = url {
+                    println!("    URL:          {u}");
+                }
+            }
+            vta_sdk::protocol::services::ServiceState::Webauthn { enabled, url } => {
+                let on = if *enabled { "on" } else { "off" };
+                println!("  WebAuthn: {on}");
+                if let Some(u) = url {
+                    println!("    URL:          {u}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── services rest {enable, update, disable, rollback} ─────────────
+
+pub async fn cmd_services_rest_enable(
+    client: &VtaClient,
+    url: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = EnableRestRequest::new(url);
+    let resp = client.enable_rest(req).await?;
+    println!("REST enabled.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_rest_update(
+    client: &VtaClient,
+    url: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = UpdateRestRequest::new(url);
+    let resp = client.update_rest(req).await?;
+    println!("REST URL updated.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_rest_disable(
+    client: &VtaClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.disable_rest(DisableRestRequest::default()).await?;
+    println!("REST disabled.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_rest_rollback(
+    client: &VtaClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.rollback_rest(RollbackRestRequest::default()).await?;
+    print_rollback_result("REST", &resp);
+    Ok(())
+}
+
+// ── services tsp {enable, update, disable, rollback} ──────────────
+//
+// TSP advertises a **mediator DID** (the VTA's TSP VID), not a URL —
+// so these mirror the REST commands with `mediator_did` in place of
+// `url`. Responses reuse the same `ServiceMutationResponse` /
+// `RollbackResponse` shapes, so the rendering is identical.
+
+pub async fn cmd_services_tsp_enable(
+    client: &VtaClient,
+    mediator_did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = EnableTspRequest::new(mediator_did);
+    let resp = client.enable_tsp(req).await?;
+    println!("TSP enabled.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_tsp_update(
+    client: &VtaClient,
+    mediator_did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = UpdateTspRequest::new(mediator_did);
+    let resp = client.update_tsp(req).await?;
+    println!("TSP mediator DID updated.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_tsp_disable(
+    client: &VtaClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.disable_tsp(DisableTspRequest::default()).await?;
+    println!("TSP disabled.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_tsp_rollback(
+    client: &VtaClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.rollback_tsp(RollbackTspRequest::default()).await?;
+    print_rollback_result("TSP", &resp);
+    Ok(())
+}
+
+// ── services webauthn {enable, update, disable, rollback} ─────────
+
+pub async fn cmd_services_webauthn_enable(
+    client: &VtaClient,
+    url: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = vta_sdk::protocol::services::EnableWebauthnRequest::new(url);
+    let resp = client.enable_webauthn(req).await?;
+    println!("WebAuthn enabled.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_webauthn_update(
+    client: &VtaClient,
+    url: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = vta_sdk::protocol::services::UpdateWebauthnRequest::new(url);
+    let resp = client.update_webauthn(req).await?;
+    println!("WebAuthn URL updated.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_webauthn_disable(
+    client: &VtaClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!(
+        "WARNING: disabling WebAuthn will also REMOVE passkey verificationMethods from every DID \
+         this VTA controls. Any operator currently using passkey login will need to re-enrol \
+         after the next `services webauthn enable`."
+    );
+    let resp = client
+        .disable_webauthn(vta_sdk::protocol::services::DisableWebauthnRequest::default())
+        .await?;
+    println!("WebAuthn disabled.");
+    println!("  New version ID: {}", resp.log_entry_version_id);
+    println!("  Effective at:   {}", resp.effective_at);
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_webauthn_rollback(
+    client: &VtaClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client
+        .rollback_webauthn(vta_sdk::protocol::services::RollbackWebauthnRequest::default())
+        .await?;
+    print_rollback_result("WebAuthn", &resp);
+    Ok(())
+}
+
+// ── services didcomm {enable, update, disable, rollback} ──────────
+
+pub async fn cmd_services_didcomm_enable(
+    client: &VtaClient,
+    mediator_did: String,
+    setup_acl: bool,
+    force: bool,
+    handshake_timeout_secs: Option<u64>,
+    wait_secs: Option<u64>,
+    no_wait: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut req = EnableDidcommRequest::new(&mediator_did);
+    req.setup_acl = setup_acl;
+    req.force = force;
+    req.handshake_timeout_secs = handshake_timeout_secs;
+    let resp = match client.enable_didcomm(req).await {
+        Ok(resp) => resp,
+        // The task answers an already-enabled DIDComm as a conflict whose
+        // message names the command to run instead; enabling twice is not a
+        // failure worth an error, so say so and stop.
+        Err(VtaError::Conflict(body)) if body.contains("DIDComm is already enabled") => {
+            println!("DIDComm already enabled.");
+            println!("  To change the mediator: pnm services didcomm update --mediator-did <did>");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    println!("DIDComm enabled.");
+    println!("  Mediator DID:   {}", resp.mediator_did);
+    if !resp.mediator_endpoint.is_empty() {
+        println!("  Mediator URL:   {}", resp.mediator_endpoint);
+    }
+    println!("  New version ID: {}", resp.new_version_id);
+    if force {
+        println!();
+        println!("  Note: --force was set; mediator handshake steps 2-5 were bypassed.");
+    }
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    if resp.restarting {
+        if no_wait {
+            println!("  The VTA is restarting; readiness polling was disabled.");
+        } else {
+            wait_for_didcomm_restart(
+                client,
+                &mediator_did,
+                wait_secs.unwrap_or(DIDCOMM_RESTART_WAIT_SECS),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_didcomm_restart(
+    client: &VtaClient,
+    mediator_did: &str,
+    wait_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    // One session for the whole wait, as `pnm health` does. It opens this
+    // client's own mediator account once — `--setup-acl` opens the VTA's, and
+    // the pong comes back forwarded — and keeps the ~4s TDK/ATM/websocket setup
+    // out of every probe window. Opened inside a probe rather than before the
+    // poll: the enable has already succeeded, so a session that will not open
+    // (the mediator busy while the VTA reconnects) is one more thing to wait
+    // out, not a reason to report the enable as failed.
+    let session = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let probe_session = std::sync::Arc::clone(&session);
+
+    let result = wait_for_didcomm_restart_with_probe(
+        move |probe_window| {
+            let session = std::sync::Arc::clone(&probe_session);
+            async move {
+                let probe = async {
+                    let mut session = session.lock().await;
+                    if session.is_none() {
+                        *session = Some(client.open_vta_ping_session(mediator_did, "pnm").await?);
+                    }
+                    let (session, vta_did) = session.as_ref().expect("opened above");
+                    session.ping(Some(vta_did)).await
+                };
+                tokio::time::timeout(probe_window, probe)
+                    .await
+                    .unwrap_or_else(|_| Err("trust-ping timed out".into()))
+            }
+        },
+        Duration::from_secs(wait_secs),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    if let Some((session, _)) = session.lock().await.take() {
+        session.shutdown().await;
+    }
+    result
+}
+
+async fn wait_for_didcomm_restart_with_probe<Probe, ProbeFuture>(
+    mut probe: Probe,
+    timeout: std::time::Duration,
+    probe_window: std::time::Duration,
+    retry_delay: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    Probe: FnMut(std::time::Duration) -> ProbeFuture,
+    ProbeFuture: std::future::Future<Output = Result<u128, Box<dyn std::error::Error>>>,
+{
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    println!(
+        "  Waiting for the restarted DIDComm listener (up to {}s)...",
+        timeout.as_secs()
+    );
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Ok(latency) = probe(probe_window.min(remaining)).await {
+            println!("  Trust-ping:     pong ({latency}ms)");
+            return Ok(());
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(retry_delay.min(remaining)).await;
+    }
+
+    Err(format!(
+        "DIDComm is enabled, but its listener did not answer within {}s; the VTA's mediator self-DID readiness gate may still be waiting for the VTA DID to resolve, or the mediator may be dropping the pong because this client's own account refuses forwarded delivery",
+        timeout.as_secs()
+    )
+    .into())
+}
+
+pub async fn cmd_services_didcomm_update(
+    client: &VtaClient,
+    new_mediator_did: String,
+    drain_ttl_secs: u64,
+    setup_acl: bool,
+    force: bool,
+    handshake_timeout_secs: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut req = UpdateDidcommRequest::new(&new_mediator_did, drain_ttl_secs);
+    req.setup_acl = setup_acl;
+    req.force = force;
+    req.handshake_timeout_secs = handshake_timeout_secs;
+    let resp = client.update_didcomm(req).await?;
+    println!("DIDComm mediator updated.");
+    println!("  Prior mediator:  {}", resp.prior_mediator_did);
+    println!("  Active mediator: {}", resp.active_mediator_did);
+    if !resp.active_mediator_endpoint.is_empty() {
+        println!("  Active endpoint: {}", resp.active_mediator_endpoint);
+    }
+    println!("  New version ID:  {}", resp.new_version_id);
+    println!(
+        "  Drain deadline:  {} (prior listener stays up until then)",
+        resp.drains_until
+    );
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_didcomm_disable(
+    client: &VtaClient,
+    drain_ttl_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = DisableDidcommRequest::new(drain_ttl_secs);
+    let resp = client.disable_didcomm(req).await?;
+    println!("DIDComm disabled.");
+    println!("  Prior mediator: {}", resp.prior_mediator_did);
+    println!("  New version ID: {}", resp.new_version_id);
+    match resp.drains_until {
+        Some(deadline) => {
+            println!("  Drain deadline: {deadline}");
+            println!();
+            println!("  The listener stays up until the deadline so in-flight messages can drain.");
+            println!(
+                "  Cancel early with `pnm services didcomm drain cancel --mediator-did <did>`."
+            );
+        }
+        None => println!("  Listener torn down immediately (drain TTL was 0)."),
+    }
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+    Ok(())
+}
+
+pub async fn cmd_services_didcomm_rollback(
+    client: &VtaClient,
+    drain_ttl_secs: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = RollbackDidcommRequest { drain_ttl_secs };
+    let resp = client.rollback_didcomm(req).await?;
+    print_rollback_result("DIDComm", &resp);
+    Ok(())
+}
+
+/// Best-effort names for mediator / peer DIDs.
+///
+/// Neither the drain set nor the telemetry report carries a label, so the only
+/// local source is the ACL — which does cover mediators an operator has
+/// granted an entry to. Peer *senders* are not in our ACL and stay bare until
+/// agent names exist; they are the clearest case for that feature.
+///
+/// Failure is ignored on purpose. Naming is decoration, and an operator who
+/// can read the drain set but not the ACL must still get their table.
+async fn mediator_name_book(client: &VtaClient) -> NameBook {
+    let mut book = NameBook::new();
+    if let Ok(acl) = client.list_acl(None).await {
+        book_from_acl(&mut book, &acl.entries);
+    }
+    book
+}
+
+// ── services didcomm drain {list, cancel} ─────────────────────────
+
+pub async fn cmd_services_didcomm_drain_list(
+    client: &VtaClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.list_drain().await?;
+    // JSON under --json or off a terminal, like every read (#2588).
+    if crate::render::is_json_output() {
+        crate::render::print_json(&resp)?;
+        return Ok(());
+    }
+    if resp.entries.is_empty() {
+        println!("No mediators currently in drain.");
+        return Ok(());
+    }
+    println!("Drain set ({} mediator(s)):", resp.entries.len());
+    println!();
+
+    let book = mediator_name_book(client).await;
+    let show_names = book.names_any(resp.entries.iter().map(|e| e.mediator_did.as_str()));
+
+    let header_did = "MEDIATOR DID";
+    let header_until = "DRAIN UNTIL";
+    if show_names {
+        println!("  {:<24}  {header_did:<46}  {header_until}", NAME_HEADER);
+    } else {
+        println!("  {header_did:<46}  {header_until}");
+    }
+    for e in &resp.entries {
+        let did = shorten_did(&e.mediator_did);
+        if show_names {
+            let name = book
+                .name_of(&e.mediator_did)
+                .unwrap_or_else(|| UNNAMED.into());
+            println!("  {:<24}  {:<46}  {}", name, did, e.drains_until);
+        } else {
+            println!("  {:<46}  {}", did, e.drains_until);
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_services_didcomm_drain_cancel(
+    client: &VtaClient,
+    mediator_did: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = vta_sdk::protocol::DrainCancelRequest { mediator_did };
+    let resp = client.drain_cancel(req).await?;
+    println!("Drain cancelled for {}.", resp.mediator_did);
+    println!("  Listener was torn down immediately.");
+    Ok(())
+}
+
+// ── services report ───────────────────────────────────────────────
+
+pub async fn cmd_services_report(
+    client: &VtaClient,
+    since: Option<String>,
+    until: Option<String>,
+    format: ReportFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = client
+        .mediator_report(since.as_deref(), until.as_deref())
+        .await?;
+
+    // `--format table` is the default, so JSON under --json or off a terminal
+    // wins over it (#2588); an explicit `--format json` is JSON anywhere.
+    let format = if crate::render::is_json_output() {
+        ReportFormat::Json
+    } else {
+        format
+    };
+    match format {
+        ReportFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        ReportFormat::Table => {
+            println!("Service-management report");
+            if let Some(ref s) = report.since {
+                println!("  Window: {s} → {}", report.until);
+            } else {
+                println!("  Window: (all time) → {}", report.until);
+            }
+            println!();
+            // Peer sender DIDs have no label anywhere in our store, so most
+            // will stay bare until agent names land — which is exactly the
+            // surface they are for.
+            let book = mediator_name_book(client).await;
+
+            if report.mediators.is_empty() {
+                println!("  No inbound DIDComm messages recorded.");
+            } else {
+                println!("  Per-mediator inbound counts (most recent first):");
+                let show_names =
+                    book.names_any(report.mediators.iter().map(|m| m.mediator_did.as_str()));
+                let header_did = "MEDIATOR DID";
+                let header_count = "INBOUND";
+                if show_names {
+                    println!(
+                        "    {:<24}  {header_did:<46}  {header_count:>10}  LAST SEEN",
+                        NAME_HEADER
+                    );
+                } else {
+                    println!("    {header_did:<46}  {header_count:>10}  LAST SEEN");
+                }
+                for m in &report.mediators {
+                    let did = shorten_did(&m.mediator_did);
+                    if show_names {
+                        let name = book
+                            .name_of(&m.mediator_did)
+                            .unwrap_or_else(|| UNNAMED.into());
+                        println!(
+                            "    {:<24}  {:<46}  {:>10}  {}",
+                            name, did, m.inbound_count, m.last_seen
+                        );
+                    } else {
+                        println!("    {:<46}  {:>10}  {}", did, m.inbound_count, m.last_seen);
+                    }
+                }
+            }
+            if !report.senders.is_empty() {
+                println!();
+                println!("  Senders by last-seen mediator:");
+                for s in &report.senders {
+                    // Prose, not a fixed-width column, so both sides carry
+                    // their DID alongside the name.
+                    println!(
+                        "    {} → {} (at {})",
+                        inline(&book, &s.sender_did),
+                        inline(&book, &s.last_seen_mediator),
+                        s.last_seen_at
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── shared helpers ────────────────────────────────────────────────
+
+fn print_rollback_result(kind: &str, resp: &vta_sdk::protocol::services::RollbackResponse) {
+    if resp.kind == "no_op" {
+        println!("{kind} rollback: no change required.");
+        println!("  Snapshot matches current state — nothing to do.");
+        return;
+    }
+    println!("{kind} rolled back.");
+    println!("  Action:         {}", resp.kind);
+    if !resp.log_entry_version_id.is_empty() {
+        println!("  New version ID: {}", resp.log_entry_version_id);
+    }
+    println!("  Effective at:   {}", resp.effective_at);
+    if let Some(ref drain_until) = resp.drain_until {
+        println!("  Drain deadline: {drain_until}");
+    }
+    if let Some(ref draining) = resp.draining_mediator {
+        println!("  Draining:       {draining}");
+    }
+    print_serverless_hint(resp.serverless, &resp.vta_did);
+}
+
+/// Tell the operator where the new log entry went, after a mutation of the
+/// VTA's **own** DID on a running VTA.
+///
+/// Silent when `serverless` is false (the VTA published to a did-hosting
+/// server as part of the call) and when `vta_did` is empty (no LogEntry was
+/// written, e.g. a no-op rollback).
+///
+/// A self-hosted ("serverless") VTA serves its own `did.jsonl` from its store
+/// at the DID's canonical path, read per request — so the entry just written is
+/// already being served, and there is nothing to redeploy. Advising a redeploy
+/// here sent operators to copy a log to the host that was already serving it
+/// (Keyring VTI-36). The one case that still needs a copy is a log the operator
+/// *also* publishes somewhere else, which is said last.
+pub fn print_serverless_hint(serverless: bool, vta_did: &str) {
+    if !serverless || vta_did.is_empty() {
+        return;
+    }
+    print_self_hosted_notice(vta_did, "now serves");
+}
+
+/// [`print_serverless_hint`] for the offline `vta services …` surface, which
+/// runs with the daemon stopped: the entry is served once the VTA starts.
+pub fn print_serverless_hint_offline(serverless: bool, vta_did: &str) {
+    if !serverless || vta_did.is_empty() {
+        return;
+    }
+    print_self_hosted_notice(vta_did, "will serve, once it is running again,");
+}
+
+fn print_self_hosted_notice(vta_did: &str, serves: &str) {
+    println!();
+    match webvh_log_url(vta_did) {
+        Some(url) => {
+            println!("  This VTA hosts its own DID, and {serves} the updated log at");
+            println!("    {url}");
+        }
+        None => println!("  This VTA hosts its own DID, and {serves} the updated log itself."),
+    }
+    println!("  Nothing to redeploy. Resolvers pick up the new version as their cache");
+    println!("  expires (60 s for this VTA's own responses, up to 5 min in a caching resolver).");
+    println!("  Only a copy you also publish elsewhere needs replacing:");
+    println!("    pnm did-mgmt dids get-log {vta_did} --out did.jsonl");
+}
+
+/// After a mutation of a DID this VTA does **not** serve itself — a
+/// self-hosted DID it manages for someone else, such as a community's. The
+/// new entry exists only in the VTA's store until it is delivered to wherever
+/// that DID's log is served.
+pub fn print_redeploy_hint(serverless: bool, did: &str) {
+    if !serverless || did.is_empty() {
+        return;
+    }
+    println!();
+    println!("  This DID is self-hosted, and not by this VTA. Fetch the updated log:");
+    println!("    pnm did-mgmt dids get-log {did} --out did.jsonl");
+    match webvh_log_url(did) {
+        Some(url) => println!("  then install it where {url} is served from."),
+        None => println!("  then install it where the DID's log is served from."),
+    }
+    println!("  For a community that self-hosts its DID, that is:");
+    println!("    cnm did-log install --file did.jsonl");
+    println!("  Until you do, resolvers will keep returning the prior version.");
+}
+
+/// The HTTPS URL a `did:webvh` DID's log is resolved from (did:webvh v1.0,
+/// DID-to-HTTPS transformation): `did:webvh:<scid>:<host>[:<path>…]` becomes
+/// `https://<host>/<path…>/did.jsonl`, or `/.well-known/did.jsonl` with no
+/// path. `%3A` in the host is a port separator. A `did:scid:vh:1` DID URL is
+/// the log its `src` names (VTI-KEY-160). `None` for anything else.
+fn webvh_log_url(did: &str) -> Option<String> {
+    let log_did = vta_sdk::did_scid::webvh_did(did);
+    let did = log_did.as_deref().unwrap_or(did);
+    let rest = did.strip_prefix("did:webvh:")?;
+    let mut parts = rest.split(':');
+    let _scid = parts.next().filter(|s| !s.is_empty())?;
+    let host = parts.next().filter(|s| !s.is_empty())?;
+    let host = host.replace("%3A", ":").replace("%3a", ":");
+    let path: Vec<&str> = parts.collect();
+    if path.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    Some(if path.is_empty() {
+        format!("https://{host}/.well-known/did.jsonl")
+    } else {
+        format!("https://{host}/{}/did.jsonl", path.join("/"))
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ReportFormat {
+    Json,
+    Table,
+}
+
+impl std::str::FromStr for ReportFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "json" => Ok(Self::Json),
+            "table" => Ok(Self::Table),
+            other => Err(format!("unknown format `{other}` — use `json` or `table`")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Keyring VTI-36: the hint names the URL the log is resolved from.
+    #[test]
+    fn webvh_log_url_follows_the_did_to_https_transform() {
+        use super::webvh_log_url;
+        assert_eq!(
+            webvh_log_url("did:webvh:QmScid:vta.example.com").as_deref(),
+            Some("https://vta.example.com/.well-known/did.jsonl")
+        );
+        assert_eq!(
+            webvh_log_url("did:webvh:QmScid:example.com%3A8100:dids:vta").as_deref(),
+            Some("https://example.com:8100/dids/vta/did.jsonl")
+        );
+        assert_eq!(webvh_log_url("did:key:z6Mk"), None);
+        assert_eq!(webvh_log_url("did:webvh:QmScid"), None);
+    }
+
+    #[tokio::test]
+    async fn readiness_poll_retries_until_a_pong_arrives() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let attempts = Arc::new(Mutex::new(0u32));
+        let attempts_for_probe = Arc::clone(&attempts);
+        let result = super::wait_for_didcomm_restart_with_probe(
+            move |_| {
+                let attempt = {
+                    let mut attempts = attempts_for_probe.lock().unwrap();
+                    *attempts += 1;
+                    *attempts
+                };
+                async move {
+                    if attempt < 3 {
+                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "not ready").into())
+                    } else {
+                        Ok(12)
+                    }
+                }
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*attempts.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn readiness_poll_names_the_gate_when_deadline_expires() {
+        use std::time::Duration;
+
+        let result = super::wait_for_didcomm_restart_with_probe(
+            |_| async {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "not ready").into())
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        let error = result.expect_err("poll should time out").to_string();
+        assert!(error.contains("self-DID readiness gate"), "{error}");
+        // The other cause, and the one an operator cannot guess from the symptom.
+        assert!(error.contains("forwarded delivery"), "{error}");
+    }
+
+    /// A pong ends the wait. The retry delay is long enough that sleeping
+    /// before returning would stall this test rather than let it pass slowly.
+    #[tokio::test]
+    async fn readiness_poll_stops_after_the_first_pong() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let attempts = Arc::new(Mutex::new(0u32));
+        let counter = Arc::clone(&attempts);
+        let started = Instant::now();
+        let result = super::wait_for_didcomm_restart_with_probe(
+            move |_| {
+                *counter.lock().unwrap() += 1;
+                async { Ok::<u128, Box<dyn std::error::Error>>(7) }
+            },
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a pong must return immediately, not after the retry delay: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `--wait-secs` is the operator's deadline, so no single probe may be
+    /// handed more time than is left of it. Unclamped, the 10s window below
+    /// would overrun a 50ms budget by two orders of magnitude.
+    #[tokio::test]
+    async fn readiness_poll_never_hands_a_probe_more_time_than_remains() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let windows = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&windows);
+        let budget = Duration::from_millis(50);
+
+        let result = super::wait_for_didcomm_restart_with_probe(
+            move |window| {
+                seen.lock().unwrap().push(window);
+                async { Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "not ready").into()) }
+            },
+            budget,
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let windows = windows.lock().unwrap();
+        assert!(!windows.is_empty(), "the poll must probe at least once");
+        assert!(
+            windows.iter().all(|w| *w <= budget),
+            "a probe was given more than the {budget:?} budget: {windows:?}"
+        );
+    }
+
+    /// The gap between attempts is clamped the same way — an unclamped 10s
+    /// retry would leave the CLI sitting there long after the deadline passed.
+    #[tokio::test]
+    async fn readiness_poll_clamps_its_retry_delay_to_the_deadline() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let result = super::wait_for_didcomm_restart_with_probe(
+            |_| async {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "not ready").into())
+            },
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the poll slept past its own deadline: {:?}",
+            started.elapsed()
+        );
+    }
+}

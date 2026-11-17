@@ -1,0 +1,807 @@
+//! Sender-bound Trust Task documents: the one rule every privileged inbound
+//! document is held to, and the signing half that produces documents meeting
+//! it.
+//!
+//! ## The rule
+//!
+//! A privileged document — anything that changes state or discloses more than
+//! public data — is acted on only when **the document itself** proves who sent
+//! it. [`verify_sender_bound`] requires, in this order:
+//!
+//! 1. a `proof` member;
+//! 2. an in-band `issuer`, and, when the caller knows who the peer must be,
+//!    `issuer == expected` exactly;
+//! 3. when the transport reported a sender, that it names the same DID as the
+//!    issuer (a mismatch is refused rather than resolved in either's favour);
+//! 4. an in-band `recipient` equal to this service's DID, so a document signed
+//!    for another service cannot be replayed here;
+//! 5. an `issuedAt` inside the freshness window, and no passed `expiresAt`;
+//! 6. a proof with `proofPurpose: authentication`, whose `verificationMethod`
+//!    is controlled by the issuer and listed under its `authentication`
+//!    relationship, and whose signature verifies
+//!    ([`TransportBoundVerifier::verify_operational`]). These are a service's
+//!    own operational messages, not attestations; `assertionMethod` is
+//!    reserved for credentials and is refused.
+//!
+//! The returned DID is the **proven** signer. Callers authorise on it and key
+//! their replay cache on `(it, doc.id)` — never on the transport's report of
+//! who sent the message, which is at most a routing hint.
+//!
+//! ## Why the transport's sender is not enough
+//!
+//! A messaging transport reports a sender, and the service used to authorise on
+//! that report alone. But a report is only as strong as the unpacking code that
+//! produced it, and that code lives in another crate with its own release
+//! cycle. A signature over the document does not depend on any of it: it is
+//! checked here, against keys resolved from the issuer's own DID document.
+
+use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
+use serde_json::Value;
+use trust_tasks_rs::{RejectReason, TrustTask, VerificationError};
+
+use super::verifier::{TransportBoundVerifier, VerifyFailure, VerifyFailureKind, controller_did};
+use crate::scid::same_reference;
+use crate::server::didcomm_unpack::{FRESHNESS_WINDOW_SECS, FUTURE_SKEW_SECS};
+
+/// Why a document failed [`verify_sender_bound`].
+#[derive(Debug, thiserror::Error)]
+pub enum BoundError {
+    #[error("document carries no proof; a signed document is required")]
+    MissingProof,
+    #[error("document carries no in-band issuer")]
+    MissingIssuer,
+    #[error("document issuer {issuer} is not the expected peer {expected}")]
+    UnexpectedIssuer { issuer: String, expected: String },
+    #[error("document issuer {issuer} does not match the transport sender {sender}")]
+    SenderMismatch { issuer: String, sender: String },
+    #[error("document carries no in-band recipient")]
+    MissingRecipient,
+    #[error("document is addressed to {recipient}, not {expected}")]
+    WrongRecipient { recipient: String, expected: String },
+    #[error("document carries no issuedAt")]
+    MissingIssuedAt,
+    #[error("document issuedAt is outside the freshness window")]
+    Stale,
+    #[error("document expired at {0}")]
+    Expired(DateTime<Utc>),
+    #[error("proof verification failed: {0}")]
+    Proof(#[from] VerificationError),
+    /// The signer's DID could not be resolved, or its status read, so the
+    /// proof could not be checked. May clear on its own.
+    #[error("proof could not be checked: {0}")]
+    Unreachable(VerificationError),
+}
+
+/// A verification failure keeps the kind the verifier decided: an
+/// unreachable signer is [`BoundError::Unreachable`], anything else a final
+/// [`BoundError::Proof`].
+impl From<VerifyFailure> for BoundError {
+    fn from(failure: VerifyFailure) -> Self {
+        match failure.kind {
+            VerifyFailureKind::Unreachable => BoundError::Unreachable(failure.error),
+            _ => BoundError::Proof(failure.error),
+        }
+    }
+}
+
+impl BoundError {
+    /// A [`BoundError::Unreachable`] for a caller that gave up waiting on the
+    /// signer's DID: `detail` says why.
+    pub fn unreachable(detail: impl std::fmt::Display) -> Self {
+        BoundError::Unreachable(VerificationError::Other(format!(
+            "signer DID unreachable: {detail}"
+        )))
+    }
+
+    /// Whether the failure may clear on its own — the signer's DID could not be
+    /// resolved, or its status read — so the same document is worth re-sending.
+    /// Decided by the variant, never by an error message.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, BoundError::Unreachable(_))
+    }
+
+    /// The framework rejection this failure is reported as on the wire. A
+    /// transient failure ([`Self::is_transient`]) is `unavailable` (retryable);
+    /// every other one is final.
+    pub fn reject_reason(&self) -> RejectReason {
+        if self.is_transient() {
+            return RejectReason::Unavailable { retry_after: None };
+        }
+        match self {
+            BoundError::MissingProof => RejectReason::ProofRequired,
+            BoundError::MissingIssuer
+            | BoundError::MissingRecipient
+            | BoundError::MissingIssuedAt => RejectReason::MalformedRequest {
+                reason: self.to_string(),
+            },
+            BoundError::WrongRecipient {
+                recipient,
+                expected,
+            } => RejectReason::WrongRecipient {
+                in_band: recipient.clone(),
+                expected: expected.clone(),
+            },
+            BoundError::Expired(at) => RejectReason::Expired { expires_at: *at },
+            BoundError::Stale => RejectReason::MalformedRequest {
+                reason: self.to_string(),
+            },
+            BoundError::UnexpectedIssuer { .. } | BoundError::SenderMismatch { .. } => {
+                RejectReason::PermissionDenied {
+                    reason: self.to_string(),
+                }
+            }
+            BoundError::Proof(e) => RejectReason::ProofInvalid {
+                reason: proof_failure_reason(e).into(),
+            },
+            BoundError::Unreachable(_) => RejectReason::Unavailable { retry_after: None },
+        }
+    }
+}
+
+/// Verify that `doc` is signed by its issuer, addressed to `my_vid`, fresh, and
+/// — when `expected_issuer` is given — issued by exactly that DID. Returns the
+/// proven issuer. See the module docs for the full rule.
+///
+/// `transport_sender` is whatever the carrying transport reported (DIDComm
+/// sender, TSP sender VID, bearer-token subject). It is never trusted on its
+/// own; it is only required to agree with the proof.
+pub async fn verify_sender_bound<P>(
+    doc: &TrustTask<P>,
+    expected_issuer: Option<&str>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    verifier: &TransportBoundVerifier,
+) -> Result<String, BoundError>
+where
+    P: Serialize + Send + Sync,
+{
+    verify_sender_bound_at(
+        doc,
+        expected_issuer,
+        transport_sender,
+        my_vid,
+        verifier,
+        Utc::now(),
+    )
+    .await
+}
+
+/// [`verify_sender_bound`] for a human approver's decision: every binding
+/// check is the same, but the proof must carry `proofPurpose: assertionMethod`
+/// with its key listed under the approver's `assertionMethod` relationship,
+/// and the signer must not have deactivated its DID
+/// ([`TransportBoundVerifier::verify_approval`]). A decision is an
+/// attestation, not an operational message, and an `authentication` proof is
+/// refused for one exactly as an `assertionMethod` proof is refused for an
+/// operational request.
+pub async fn verify_sender_bound_approval<P>(
+    doc: &TrustTask<P>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    verifier: &TransportBoundVerifier,
+) -> Result<String, BoundError>
+where
+    P: Serialize + Send + Sync,
+{
+    verify_bound(
+        doc,
+        None,
+        transport_sender,
+        my_vid,
+        verifier,
+        Utc::now(),
+        Relationship::AssertionMethod,
+    )
+    .await
+}
+
+/// Which verification relationship a sender-bound proof must use.
+#[derive(Clone, Copy)]
+enum Relationship {
+    Authentication,
+    AssertionMethod,
+}
+
+/// [`verify_sender_bound`] against an explicit clock, for tests.
+pub async fn verify_sender_bound_at<P>(
+    doc: &TrustTask<P>,
+    expected_issuer: Option<&str>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    verifier: &TransportBoundVerifier,
+    now: DateTime<Utc>,
+) -> Result<String, BoundError>
+where
+    P: Serialize + Send + Sync,
+{
+    verify_bound(
+        doc,
+        expected_issuer,
+        transport_sender,
+        my_vid,
+        verifier,
+        now,
+        Relationship::Authentication,
+    )
+    .await
+}
+
+async fn verify_bound<P>(
+    doc: &TrustTask<P>,
+    expected_issuer: Option<&str>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    verifier: &TransportBoundVerifier,
+    now: DateTime<Utc>,
+    relationship: Relationship,
+) -> Result<String, BoundError>
+where
+    P: Serialize + Send + Sync,
+{
+    precheck_sender_bound(doc, expected_issuer, transport_sender, my_vid, now)?;
+    match relationship {
+        Relationship::Authentication => verifier.check_operational(doc).await?,
+        Relationship::AssertionMethod => verifier.check_approval(doc).await?,
+    }
+    // The identity, not the reference: a did:scid issuer may carry the `src`
+    // its recipient needed to resolve it, which is not part of who it is.
+    Ok(crate::scid::identity(issuer_of(doc)?))
+}
+
+fn issuer_of<P>(doc: &TrustTask<P>) -> Result<&str, BoundError> {
+    doc.issuer.as_deref().ok_or(BoundError::MissingIssuer)
+}
+
+/// The checks of [`verify_sender_bound`] that need no key: steps 1–5 of the
+/// rule (proof present, issuer, transport sender, recipient, freshness and
+/// expiry), with nothing resolved. A caller that must spend a scarce
+/// resource on the proof itself — a DID resolution for a signer it has no
+/// standing relationship with — runs this first, so a document that would be
+/// refused anyway costs nothing. [`verify_sender_bound`] runs it again.
+pub fn precheck_sender_bound<P>(
+    doc: &TrustTask<P>,
+    expected_issuer: Option<&str>,
+    transport_sender: Option<&str>,
+    my_vid: &str,
+    now: DateTime<Utc>,
+) -> Result<(), BoundError> {
+    if doc.proof.is_none() {
+        return Err(BoundError::MissingProof);
+    }
+    let issuer = issuer_of(doc)?;
+    if let Some(expected) = expected_issuer
+        && !same_reference(issuer, expected)
+    {
+        return Err(BoundError::UnexpectedIssuer {
+            issuer: issuer.to_string(),
+            expected: expected.to_string(),
+        });
+    }
+    if let Some(sender) = transport_sender
+        && !same_reference(controller_did(sender), issuer)
+    {
+        return Err(BoundError::SenderMismatch {
+            issuer: issuer.to_string(),
+            sender: sender.to_string(),
+        });
+    }
+    let recipient = doc
+        .recipient
+        .as_deref()
+        .ok_or(BoundError::MissingRecipient)?;
+    if !same_reference(recipient, my_vid) {
+        return Err(BoundError::WrongRecipient {
+            recipient: recipient.to_string(),
+            expected: my_vid.to_string(),
+        });
+    }
+    let issued_at = doc.issued_at.ok_or(BoundError::MissingIssuedAt)?;
+    if issued_at < now - Duration::seconds(FRESHNESS_WINDOW_SECS as i64)
+        || issued_at > now + Duration::seconds(FUTURE_SKEW_SECS as i64)
+    {
+        return Err(BoundError::Stale);
+    }
+    if let Some(expires_at) = doc.expires_at
+        && expires_at <= now
+    {
+        return Err(BoundError::Expired(expires_at));
+    }
+    Ok(())
+}
+
+/// Why a document failed [`verify_bound_key`].
+#[derive(Debug, thiserror::Error)]
+pub enum BoundKeyError {
+    /// The issuer is not an Ed25519 `did:key`. Decided from the identifier
+    /// alone, before any proof work.
+    #[error("the issuer must be an Ed25519 did:key")]
+    KeyUnsupported,
+    #[error("document carries no proof; a signed document is required")]
+    MissingProof,
+    /// The proof names a key other than the one the issuer string encodes.
+    #[error("the proof's verificationMethod is not the issuer's own key")]
+    NotIssuerKey,
+    #[error("proofPurpose {0} is not one this task accepts")]
+    Purpose(String),
+    #[error("proof verification failed: {0}")]
+    Proof(#[from] VerificationError),
+}
+
+impl BoundKeyError {
+    /// The framework rejection this failure is reported as, for a caller with
+    /// no family code of its own to map it onto.
+    pub fn reject_reason(&self) -> RejectReason {
+        match self {
+            BoundKeyError::MissingProof => RejectReason::ProofRequired,
+            BoundKeyError::KeyUnsupported => RejectReason::PermissionDenied {
+                reason: self.to_string(),
+            },
+            BoundKeyError::Proof(e) => RejectReason::ProofInvalid {
+                reason: proof_failure_reason(e).into(),
+            },
+            _ => RejectReason::ProofInvalid {
+                reason: self.to_string(),
+            },
+        }
+    }
+}
+
+/// What a sender is told about a proof that did not verify: the kind of
+/// failure, never the verifier's own text. That text can carry a resolver's
+/// or a cryptosuite library's detail about this service's lookups; it is
+/// logged here instead.
+pub fn proof_failure_reason(e: &VerificationError) -> &'static str {
+    tracing::debug!(error = %e, "proof did not verify");
+    match e {
+        VerificationError::UnsupportedCryptosuite(_) => "unsupported cryptosuite",
+        VerificationError::MalformedProof(_) => {
+            "malformed proof, or a proof purpose or verification relationship this task does \
+             not accept"
+        }
+        VerificationError::IssuerMismatch(_) => {
+            "the proof's verification method is not controlled by the document's issuer"
+        }
+        VerificationError::SignatureInvalid => "signature verification failed",
+        VerificationError::Other(_) => "proof verification failed",
+    }
+}
+
+/// The verifier for [`verify_bound_key`]: keys come from the `did:key`
+/// identifier itself, so nothing is resolved and nothing leaves the process.
+fn did_key_verifier() -> &'static TransportBoundVerifier {
+    static VERIFIER: std::sync::OnceLock<TransportBoundVerifier> = std::sync::OnceLock::new();
+    VERIFIER.get_or_init(|| {
+        TransportBoundVerifier::with_resolver(std::sync::Arc::new(
+            affinidi_data_integrity::DidKeyResolver,
+        ))
+    })
+}
+
+/// Verify a document signed by a fresh key its exchange binds, rather than by
+/// a DID the service knows (`ProofRule::BoundKey`). Returns the issuer.
+///
+/// In this order, all decided locally with no DID resolution and no I/O:
+///
+/// 1. the in-band `issuer` is an Ed25519 `did:key` (anything else is
+///    [`BoundKeyError::KeyUnsupported`], from the identifier alone);
+/// 2. there is a proof, and its `verificationMethod` is exactly
+///    `{issuer}#{multikey}` — the key the issuer string encodes;
+/// 3. its `proofPurpose` is one of `purposes`;
+/// 4. the signature verifies, bound to that purpose.
+///
+/// What this does not decide is whether the key is *the* key: that is the
+/// exchange's own record (a sign-in request's starter or lock key), which
+/// only the task's handler holds. Recipient, freshness and replay are the
+/// handler's too, for the same reason — see `ProofRule::BoundKey`.
+pub async fn verify_bound_key<P>(
+    doc: &TrustTask<P>,
+    purposes: &[&str],
+) -> Result<String, BoundKeyError>
+where
+    P: Serialize + Send + Sync,
+{
+    let issuer = doc.issuer.as_deref().unwrap_or_default();
+    let multikey = issuer
+        .strip_prefix("did:key:")
+        .filter(|mk| crate::server::auth::session::is_ed25519_multikey(mk))
+        .ok_or(BoundKeyError::KeyUnsupported)?;
+    let proof = doc.proof.as_ref().ok_or(BoundKeyError::MissingProof)?;
+    if proof.verification_method != format!("{issuer}#{multikey}") {
+        return Err(BoundKeyError::NotIssuerKey);
+    }
+    if !purposes.contains(&proof.proof_purpose.as_str()) {
+        return Err(BoundKeyError::Purpose(proof.proof_purpose.clone()));
+    }
+    trust_tasks_rs::ProofVerifier::verify(did_key_verifier(), doc).await?;
+    Ok(issuer.to_string())
+}
+
+/// Sign an unsigned document (no `proof`) with `signer`, returning it with the
+/// proof attached. `eddsa-jcs-2022`, `proofPurpose: authentication` — the
+/// operational purpose [`verify_sender_bound`] requires. `signer` must be one
+/// of the issuer's `authentication` keys.
+///
+/// The document's `issuer` must be the DID of `signer`'s verification method;
+/// the signing call refuses otherwise, so a document that could never verify
+/// is never produced.
+pub async fn sign_document(
+    doc: &TrustTask<Value>,
+    signer: &affinidi_tdk::secrets_resolver::secrets::Secret,
+) -> Result<TrustTask<Value>, SignError> {
+    use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
+
+    let unsigned = serde_json::to_value(doc).map_err(|e| SignError(e.to_string()))?;
+    let signed = sign_trust_task(
+        &unsigned,
+        signer,
+        SignOptions::new()
+            .with_proof_purpose(super::verifier::OPERATIONAL_PROOF_PURPOSE)
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+    )
+    .await
+    .map_err(|e| SignError(e.to_string()))?;
+    serde_json::from_value(signed).map_err(|e| SignError(e.to_string()))
+}
+
+/// A document could not be signed.
+#[derive(Debug, thiserror::Error)]
+#[error("sign trust task document: {0}")]
+pub struct SignError(pub String);
+
+/// This service's current operational (`authentication`) key as a signing secret, named by the kid
+/// its published DID document lists.
+///
+/// `expected_did` is the configured service DID; a current identity
+/// generation for a different DID means config and identity store disagree,
+/// and a proof signed with either would fail the issuer binding at the peer.
+pub fn identity_signing_secret(
+    identity: &crate::server::identity::ServiceIdentity,
+    expected_did: &str,
+) -> Result<affinidi_tdk::secrets_resolver::secrets::Secret, SignError> {
+    let generation = identity.current();
+    if generation.did != expected_did {
+        return Err(SignError(format!(
+            "current identity generation DID {} does not match the configured service DID \
+             {expected_did}",
+            generation.did
+        )));
+    }
+    identity.secret(&generation.signing_kid).ok_or_else(|| {
+        SignError(format!(
+            "no signing secret loaded for {}",
+            generation.signing_kid
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use affinidi_data_integrity::DidKeyResolver;
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use serde_json::json;
+
+    use super::*;
+    use crate::server::trust_tasks::send::build_request;
+
+    const TYPE: &str = "https://trusttasks.org/spec/webvh/sync/delete/0.1";
+    const ME: &str = "did:example:edge";
+
+    fn signer(seed: u8) -> (String, Secret) {
+        let secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+        let pk = secret.get_public_keymultibase().unwrap();
+        let did = format!("did:key:{pk}");
+        let mut s = secret;
+        s.id = format!("{did}#{pk}");
+        (did, s)
+    }
+
+    fn verifier() -> TransportBoundVerifier {
+        TransportBoundVerifier::with_resolver(Arc::new(DidKeyResolver))
+    }
+
+    async fn signed_by(seed: u8, to: &str) -> (String, TrustTask<Value>) {
+        let (did, secret) = signer(seed);
+        let doc = build_request(TYPE, &did, to, json!({ "mnemonic": "alice" })).unwrap();
+        (did.clone(), sign_document(&doc, &secret).await.unwrap())
+    }
+
+    const PURPOSES: &[&str] = &["authentication", "assertionMethod"];
+
+    /// A proof failure tells the sender its kind, not the verifier's text.
+    #[test]
+    fn a_proof_failure_is_reported_by_kind_only() {
+        let detail = "resolver https://internal.example/1.2.3 said: connection refused";
+        for e in [
+            VerificationError::MalformedProof(detail.into()),
+            VerificationError::IssuerMismatch(detail.into()),
+            VerificationError::UnsupportedCryptosuite(detail.into()),
+            VerificationError::Other(detail.into()),
+        ] {
+            let RejectReason::ProofInvalid { reason } = BoundError::Proof(e).reject_reason() else {
+                panic!("not proofInvalid");
+            };
+            assert!(!reason.contains("internal.example"), "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_document_verifies_locally_to_its_issuer() {
+        let (did, doc) = signed_by(3, ME).await;
+        assert_eq!(verify_bound_key(&doc, PURPOSES).await.unwrap(), did);
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_document_is_refused_for_a_purpose_its_task_does_not_list() {
+        let (_, doc) = signed_by(3, ME).await;
+        assert!(matches!(
+            verify_bound_key(&doc, &["assertionMethod"]).await,
+            Err(BoundKeyError::Purpose(p)) if p == "authentication"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_document_must_be_signed_by_the_key_its_issuer_names() {
+        // Not a did:key: refused from the identifier, before any proof work.
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.issuer = Some("did:web:example.com".into());
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::KeyUnsupported)
+        ));
+        // Another did:key's proof on this issuer.
+        let (other, _) = signed_by(4, ME).await;
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.issuer = Some(other);
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::NotIssuerKey)
+        ));
+        // Tampered after signing.
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.id = "urn:uuid:tampered".into();
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::Proof(_))
+        ));
+        // No proof.
+        let (_, mut doc) = signed_by(3, ME).await;
+        doc.proof = None;
+        assert!(matches!(
+            verify_bound_key(&doc, PURPOSES).await,
+            Err(BoundKeyError::MissingProof)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_signed_fresh_addressed_document_verifies_to_its_issuer() {
+        let (did, doc) = signed_by(1, ME).await;
+        let proven = verify_sender_bound(&doc, Some(&did), Some(&did), ME, &verifier())
+            .await
+            .expect("verifies");
+        assert_eq!(proven, did);
+    }
+
+    /// A service presenting a did:scid identity is addressed by it, with or
+    /// without the `src` locator a sender used to resolve it.
+    #[tokio::test]
+    async fn a_did_scid_recipient_matches_with_or_without_src() {
+        const ME_SCID: &str = "did:scid:vh:1:QmService";
+        let (did, doc) = signed_by(1, "did:scid:vh:1:QmService?src=hosting.example").await;
+        let proven = verify_sender_bound(&doc, None, Some(&did), ME_SCID, &verifier())
+            .await
+            .expect("the locator is not part of the recipient's identity");
+        assert_eq!(proven, did);
+        // Another SCID is another recipient.
+        let (_, doc) = signed_by(1, "did:scid:vh:1:QmOther?src=hosting.example").await;
+        assert!(matches!(
+            verify_sender_bound(&doc, None, None, ME_SCID, &verifier()).await,
+            Err(BoundError::WrongRecipient { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_document_is_refused() {
+        let (did, _) = signer(1);
+        let doc = build_request(TYPE, &did, ME, json!({})).unwrap();
+        let err = verify_sender_bound(&doc, None, Some(&did), ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BoundError::MissingProof));
+    }
+
+    /// The case sender-only authorisation could not catch: the transport says
+    /// the message came from the expected peer, and the document is validly
+    /// signed — by somebody else.
+    #[tokio::test]
+    async fn a_valid_proof_from_another_signer_is_refused_whatever_the_transport_says() {
+        let (control, _) = signer(9);
+        let (_attacker, doc) = signed_by(2, ME).await;
+        let err = verify_sender_bound(&doc, Some(&control), Some(&control), ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BoundError::UnexpectedIssuer { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The same attack without an expected peer (DID ops, where the ACL decides
+    /// afterwards): the proof's issuer and the transport's sender disagree.
+    #[tokio::test]
+    async fn an_issuer_that_disagrees_with_the_transport_sender_is_refused() {
+        let (admin, _) = signer(9);
+        let (_attacker, doc) = signed_by(2, ME).await;
+        let err = verify_sender_bound(&doc, None, Some(&admin), ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BoundError::SenderMismatch { .. }), "{err:?}");
+    }
+
+    /// Claiming the victim's DID as `issuer` while signing with one's own key.
+    #[tokio::test]
+    async fn an_issuer_the_proof_does_not_bind_to_is_refused() {
+        let (victim, _) = signer(9);
+        let (_attacker, secret) = signer(2);
+        let mut doc = build_request(TYPE, &victim, ME, json!({})).unwrap();
+        // `sign_trust_task` refuses to sign a mismatched issuer, so sign under
+        // the attacker's DID and swap the issuer afterwards.
+        doc.issuer = Some(secret.id.split('#').next().unwrap().to_string());
+        let mut signed = sign_document(&doc, &secret).await.unwrap();
+        signed.issuer = Some(victim.clone());
+        let err = verify_sender_bound(&signed, Some(&victim), Some(&victim), ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BoundError::Proof(VerificationError::IssuerMismatch(_))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_for_another_recipient_is_refused() {
+        let (did, doc) = signed_by(1, "did:example:other-edge").await;
+        let err = verify_sender_bound(&doc, Some(&did), None, ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BoundError::WrongRecipient { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_or_future_document_is_refused() {
+        let (did, doc) = signed_by(1, ME).await;
+        let issued = doc.issued_at.unwrap();
+        for now in [
+            issued + Duration::seconds(FRESHNESS_WINDOW_SECS as i64 + 1),
+            issued - Duration::seconds(FUTURE_SKEW_SECS as i64 + 1),
+        ] {
+            let err = verify_sender_bound_at(&doc, Some(&did), None, ME, &verifier(), now)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, BoundError::Stale), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tampered_payload_is_refused() {
+        let (did, mut doc) = signed_by(1, ME).await;
+        doc.payload = json!({ "mnemonic": "bob" });
+        let err = verify_sender_bound(&doc, Some(&did), None, ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BoundError::Proof(_)), "{err:?}");
+    }
+
+    /// An attestation-purpose proof is not an operational one: refused even
+    /// though it is validly signed by the right DID.
+    #[tokio::test]
+    async fn an_assertion_method_proof_is_refused() {
+        use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
+        let (did, secret) = signer(1);
+        let doc = build_request(TYPE, &did, ME, json!({})).unwrap();
+        let signed = sign_trust_task(
+            &serde_json::to_value(&doc).unwrap(),
+            &secret,
+            SignOptions::new()
+                .with_proof_purpose("assertionMethod")
+                .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+        )
+        .await
+        .unwrap();
+        let doc: TrustTask<Value> = serde_json::from_value(signed).unwrap();
+        let err = verify_sender_bound(&doc, Some(&did), Some(&did), ME, &verifier())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BoundError::Proof(VerificationError::MalformedProof(ref m)) if m.contains("authentication")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn documents_are_signed_for_authentication() {
+        let (_, doc) = signed_by(1, ME).await;
+        assert_eq!(doc.proof.unwrap().proof_purpose, "authentication");
+    }
+
+    /// A signer that cannot be resolved is a retryable condition, not a bad
+    /// proof: a DID with no reachable log fails with an error that says so.
+    #[tokio::test]
+    async fn an_unresolvable_signer_is_reported_as_retryable() {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        // `.invalid` never resolves (RFC 6761), and the default host policy
+        // refuses it before any request is made.
+        let did = "did:web:control.invalid";
+        let (_, secret) = signer(3);
+        let mut doc = build_request(TYPE, did, ME, json!({})).unwrap();
+        doc.issuer = Some(secret.id.split('#').next().unwrap().to_string());
+        let mut signed = sign_document(&doc, &secret).await.unwrap();
+        signed.issuer = Some(did.to_string());
+        let mut proof = signed.proof.take().unwrap();
+        proof.verification_method = format!("{did}#key-1");
+        signed.proof = Some(proof);
+        let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let err = verify_sender_bound(
+            &signed,
+            Some(did),
+            None,
+            ME,
+            &TransportBoundVerifier::with_did_cache(client),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_transient(), "{err:?}");
+        assert!(err.to_string().contains("control.invalid"), "{err}");
+        assert!(matches!(
+            err.reject_reason(),
+            RejectReason::Unavailable { .. }
+        ));
+    }
+
+    /// Whether a failure is retryable follows the kind the verifier decided,
+    /// never the message: a message that reads like an unreachable signer is
+    /// still final, and an unreachable signer is retryable whatever its text.
+    #[test]
+    fn transience_follows_the_verifier_kind_not_the_message() {
+        let lookalike = BoundError::from(VerifyFailure {
+            kind: VerifyFailureKind::Invalid,
+            error: VerificationError::Other(
+                "signer DID unreachable: did:example:x is deactivated".into(),
+            ),
+        });
+        assert!(!lookalike.is_transient(), "{lookalike:?}");
+        assert!(matches!(
+            lookalike.reject_reason(),
+            RejectReason::ProofInvalid { .. }
+        ));
+
+        let deactivated = BoundError::from(VerifyFailure {
+            kind: VerifyFailureKind::Deactivated,
+            error: VerificationError::Other("signer DID unreachable".into()),
+        });
+        assert!(!deactivated.is_transient(), "{deactivated:?}");
+
+        let unreachable = BoundError::from(VerifyFailure {
+            kind: VerifyFailureKind::Unreachable,
+            error: VerificationError::SignatureInvalid,
+        });
+        assert!(unreachable.is_transient(), "{unreachable:?}");
+        assert!(matches!(
+            unreachable.reject_reason(),
+            RejectReason::Unavailable { .. }
+        ));
+        assert!(BoundError::unreachable("gave up waiting").is_transient());
+    }
+
+    #[test]
+    fn missing_proof_is_reported_as_proof_required() {
+        assert_eq!(
+            BoundError::MissingProof.reject_reason(),
+            RejectReason::ProofRequired
+        );
+    }
+}

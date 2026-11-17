@@ -1,0 +1,434 @@
+//! VTA setup flows — split into focused submodules:
+//!
+//! - [`interactive`]: prompt-driven `vta setup` wizard.
+//! - [`from_toml`]: non-interactive `vta setup --from <file>` loading a
+//!   [`WizardInputs`] TOML schema.
+//!
+//! This file retains the small helpers both paths share (seed-context
+//! bootstrap, webvh-URL prompt, silent mnemonic generation) and
+//! re-exports the public entry points so callers keep importing from
+//! `crate::setup::*` — `main.rs` and `did_webvh.rs` don't need to know
+//! the internal layout.
+
+use std::path::{Path, PathBuf};
+
+use bip39::Mnemonic;
+use dialoguer::{Confirm, Input};
+use didwebvh_rs::url::WebVHURL;
+use rand::Rng;
+use serde_json::Value as JsonValue;
+use url::Url;
+
+use crate::contexts::{self, ContextRecord};
+use crate::store::KeyspaceHandle;
+
+mod from_toml;
+mod interactive;
+
+/// UI seam between the shared setup engine ([`apply_inputs`]) and the two
+/// front-ends that drive it: the interactive `vta setup` wizard (real prompts)
+/// and the non-interactive `vta setup --from <file>` path ([`SilentUi`]).
+///
+/// The engine owns all the *work* (mint keys, create DIDs, write the store,
+/// seal); the few places where the interactive wizard needs operator input
+/// that the TOML file can't express — confirming the displayed mnemonic, and
+/// choosing where to write a freshly-minted DID's `did.jsonl` — are funnelled
+/// through this trait so a single engine serves both front-ends (P1.2).
+pub trait SetupUi {
+    /// Called once, right after the master mnemonic is generated.
+    ///
+    /// The interactive wizard displays the phrase and requires the operator to
+    /// confirm they've recorded it (returning an error aborts setup); the
+    /// silent impl is a no-op — the `--from` path never displays the mnemonic,
+    /// and the operator captures it via `pnm backup export` after the first
+    /// admin connects.
+    fn confirm_mnemonic(&self, mnemonic: &Mnemonic) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Resolve where a freshly-created DID's `did.jsonl` log should be written,
+    /// or `None` to skip writing it.
+    ///
+    /// `default` is the canonical in-store location
+    /// (`<data_dir>/did-logs/<label>-did.jsonl`). The silent impl returns
+    /// `Some(default)` — `--from` has always written the log to that canonical
+    /// path. The interactive wizard prompts for a path (offering its own
+    /// default) so the operator can place it wherever the hosting tool expects.
+    fn did_log_path(&self, label: &str, default: &Path) -> Option<PathBuf>;
+}
+
+/// Non-interactive [`SetupUi`] for `vta setup --from <file>`: never displays
+/// the mnemonic, always writes `did.jsonl` to the canonical in-store path.
+/// Preserves the exact behaviour the `--from` path had before the engine was
+/// shared with the interactive wizard.
+pub struct SilentUi;
+
+impl SetupUi for SilentUi {
+    fn confirm_mnemonic(&self, _mnemonic: &Mnemonic) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    fn did_log_path(&self, _label: &str, default: &Path) -> Option<PathBuf> {
+        Some(default.to_path_buf())
+    }
+}
+
+// Submodules are private — external callers reach the entry points via
+// the re-exports below. Allowed-unused because `WizardInputs` and its
+// nested enums are referenced from doc-string links (including in
+// `main.rs`) rather than imported directly; making them pub-use keeps
+// the `vta_service::setup::WizardInputs` path in the published docs.
+#[allow(unused_imports)]
+pub use from_toml::{
+    ExistingDataDirPolicy, MessagingInput, SecretsBackendInput, VtaDidInput, WizardInputs,
+    apply_inputs, run_setup_from_file,
+};
+pub use interactive::run_setup_wizard;
+
+/// Create a seed application context and store it. Shared by both the
+/// interactive wizard and the non-interactive `--from <file>` path.
+pub(crate) async fn create_seed_context(
+    contexts_ks: &KeyspaceHandle,
+    id: &str,
+    name: &str,
+) -> Result<ContextRecord, Box<dyn std::error::Error>> {
+    contexts::create_context(contexts_ks, id, name).await
+}
+
+/// Generate a fresh 24-word BIP-39 mnemonic without displaying or
+/// confirming it. Used by the non-interactive `--from <file>` path —
+/// the operator captures the seed later via `pnm backup export` once
+/// the first admin has connected.
+///
+/// The interactive wizard wraps this in a display+confirm prompt
+/// (`interactive::generate_mnemonic_with_confirmation`) so the operator
+/// must explicitly acknowledge they've recorded it before setup
+/// continues.
+pub(crate) fn generate_mnemonic_silent() -> Result<Mnemonic, Box<dyn std::error::Error>> {
+    let mut entropy = [0u8; 32];
+    rand::rng().fill_bytes(&mut entropy);
+    Ok(Mnemonic::from_entropy(&entropy)?)
+}
+
+/// Re-exported from the library, where the TEE first boot reads it too
+/// (`vta_service::tee_webs`): one rule for every path that mints the VTA's
+/// own document.
+pub(crate) use crate::operations::protocol::document::vta_additional_services as build_vta_additional_services;
+
+/// Derive the mediator's WebSocket endpoint from its HTTP endpoint by
+/// swapping the scheme (`http`→`ws`, `https`→`wss`), trimming any
+/// trailing slash, and appending `/ws`.
+///
+/// Returns `None` when `http_url` is not an `http(s)://` URL — callers
+/// decide whether that's a hard error (the `--from <file>` path, which
+/// has no operator to re-prompt) or merely "no default offered" (the
+/// interactive wizard, which lets the operator type the WS URL anyway).
+///
+/// Mirrors the canonical convention in
+/// `affinidi-messaging-mediator/tools/mediator-setup`
+/// (`generators/did_peer.rs::websocket_service_uri`): the mediator
+/// serves HTTP DIDComm at `{base}/` and the WebSocket upgrade at
+/// `{base}/ws`. The `didcomm-mediator` template advertises both in a
+/// single `#service` block, so a freshly-minted mediator's DID document
+/// 404s on every WS upgrade without the `/ws` suffix.
+///
+/// Single source of truth shared by [`interactive`] and [`from_toml`]
+/// so the two derivations cannot drift (PR #339 introduced two copies).
+pub(crate) fn derive_ws_url(http_url: &str) -> Option<String> {
+    let scheme_swapped = if let Some(rest) = http_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else {
+        // `?` yields `None` for any scheme that is neither https:// nor
+        // http://, matching the previous explicit `return None`.
+        let rest = http_url.strip_prefix("http://")?;
+        format!("ws://{rest}")
+    };
+    Some(format!("{}/ws", scheme_swapped.trim_end_matches('/')))
+}
+
+/// Prompt the user for a URL (e.g. `https://example.com/dids/vta`) and
+/// convert it to a [`WebVHURL`]. Re-prompts on invalid input.
+///
+/// Shared between the interactive wizard (for the VTA DID / mediator
+/// DID URL) and `did_webvh.rs`'s standalone `vta create-did-webvh`
+/// CLI. Kept at the module root (not inside `interactive`) because the
+/// CLI is not conceptually part of the wizard flow.
+pub(crate) fn prompt_webvh_url(label: &str) -> Result<WebVHURL, Box<dyn std::error::Error>> {
+    eprintln!();
+    eprintln!("  Enter the URL where the {label} DID document will be hosted.");
+    eprintln!("  Examples:");
+    eprintln!("    https://example.com                -> did:webvh:{{SCID}}:example.com");
+    eprintln!("    https://example.com/dids/vta       -> did:webvh:{{SCID}}:example.com:dids:vta");
+    eprintln!("    http://localhost:8000               -> did:webvh:{{SCID}}:localhost%3A8000");
+    eprintln!();
+
+    loop {
+        let raw: String = Input::new()
+            .with_prompt(format!("{label} DID URL"))
+            .default("http://localhost:8000/".into())
+            .interact_text()?;
+
+        let parsed = match Url::parse(&raw) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("\x1b[31mInvalid URL: {e} — please try again.\x1b[0m");
+                continue;
+            }
+        };
+
+        match WebVHURL::parse_url(&parsed) {
+            Ok(webvh_url) => {
+                let did_display = webvh_url.to_string();
+                let http_url = webvh_url.get_http_url(None).map_err(|e| format!("{e}"))?;
+
+                eprintln!("  DID:  {did_display}");
+                eprintln!("  URL:  {http_url}");
+
+                if Confirm::new()
+                    .with_prompt("Is this correct?")
+                    .default(true)
+                    .interact()?
+                {
+                    return Ok(webvh_url);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "\x1b[31mCould not convert to a webvh DID: {e} — please try again.\x1b[0m"
+                );
+            }
+        }
+    }
+}
+
+/// What resolving an operator-supplied mediator told us about TSP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MediatorTsp {
+    /// Its DID document advertises a `TSPTransport` service.
+    Carried,
+    /// It resolved, and advertises no `TSPTransport` service.
+    NotCarried,
+    /// It did not resolve, so nothing is known. Carries the reason.
+    Unknown(String),
+}
+
+/// Whether an existing mediator carries TSP, read from its own DID document.
+///
+/// TSP is on by default, and `#tsp` in the VTA's document names the mediator,
+/// so a VTA that advertises TSP through a mediator that does not route it sends
+/// every TSP-preferring peer into nothing (Keyring VTI-33). A mediator setup
+/// mints is minted with `#tsp` when the VTA speaks it; one the operator brings is
+/// checked here instead. Matched on the service `type`, through the same matcher
+/// every transport choice uses, never on the `#id`.
+pub(crate) async fn existing_mediator_tsp(did: &str, resolver_url: Option<&str>) -> MediatorTsp {
+    let resolver = match vta_sdk::resolver::shared_did_resolver(resolver_url).await {
+        Ok(r) => r,
+        Err(e) => return MediatorTsp::Unknown(format!("could not build a DID resolver: {e}")),
+    };
+    let resolved = match resolver.resolve(did).await {
+        Ok(r) => r,
+        Err(e) => return MediatorTsp::Unknown(format!("could not resolve {did}: {e}")),
+    };
+    match serde_json::to_value(&resolved.doc) {
+        Ok(doc) => mediator_tsp_from_document(&doc),
+        Err(e) => MediatorTsp::Unknown(format!("could not read {did}'s DID document: {e}")),
+    }
+}
+
+/// The pure half of [`existing_mediator_tsp`].
+pub(crate) fn mediator_tsp_from_document(doc: &JsonValue) -> MediatorTsp {
+    if vta_sdk::protocol::matching::ServiceCapabilities::from_did_document(doc)
+        .tsp
+        .is_some()
+    {
+        MediatorTsp::Carried
+    } else {
+        MediatorTsp::NotCarried
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServicesConfig;
+    use serde_json::json;
+
+    /// Keyring VTI-33: a mediator is judged by the `type` of its services.
+    #[test]
+    fn a_mediator_carries_tsp_only_when_its_document_says_so() {
+        let with = json!({ "id": "did:web:m", "service": [
+            { "id": "did:web:m#didcomm", "type": "DIDCommMessaging",
+              "serviceEndpoint": { "uri": "https://m.example/inbound" } },
+            { "id": "did:web:m#whatever", "type": "TSPTransport",
+              "serviceEndpoint": "https://m.example/inbound" },
+        ]});
+        assert_eq!(mediator_tsp_from_document(&with), MediatorTsp::Carried);
+
+        let without = json!({ "id": "did:web:m", "service": [
+            { "id": "did:web:m#tsp", "type": "DIDCommMessaging",
+              "serviceEndpoint": { "uri": "https://m.example/inbound" } },
+        ]});
+        // `#tsp` as an id means nothing: only the type counts.
+        assert_eq!(
+            mediator_tsp_from_document(&without),
+            MediatorTsp::NotCarried
+        );
+        assert_eq!(
+            mediator_tsp_from_document(&json!({ "id": "did:web:m" })),
+            MediatorTsp::NotCarried
+        );
+    }
+
+    /// Matrix coverage for the VTA DID document's `additional_services`
+    /// array — the bug-prone surface that originally let a REST-only
+    /// VTA ship a DID document with no service entries.
+    ///
+    /// Inputs sweep `(services.rest, public_url)`; `services.didcomm`
+    /// is irrelevant to this helper (the DIDComm service is added by
+    /// `create_simple_webvh_did` itself via the `add_mediator_service`
+    /// flag, not via the `additional_services` Vec).
+    #[test]
+    fn build_vta_additional_services_matrix() {
+        let url = Some("https://vta.example.com");
+
+        // 1. REST + URL → exactly one VTARest entry pointing at the URL.
+        let services = ServicesConfig {
+            rest: true,
+            didcomm: false,
+            webauthn: false,
+            tsp: false,
+        };
+        let out = build_vta_additional_services(&services, url, None)
+            .expect("REST + URL must emit a service entry");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "VTARest");
+        assert_eq!(out[0]["serviceEndpoint"], "https://vta.example.com");
+        assert_eq!(out[0]["id"], "{DID}#vta-rest");
+
+        // 2. REST + URL with surrounding whitespace → trimmed in the entry.
+        let out =
+            build_vta_additional_services(&services, Some("  https://vta.example.com  "), None)
+                .expect("whitespace-padded URL must still emit");
+        assert_eq!(out[0]["serviceEndpoint"], "https://vta.example.com");
+
+        // 3. REST + None → empty (validate_inputs rejects this combo
+        //    upstream, but the helper still must not produce a bogus
+        //    entry if it ever sees it).
+        assert!(build_vta_additional_services(&services, None, None).is_none());
+
+        // 4. REST + empty string → empty (treated like None).
+        assert!(build_vta_additional_services(&services, Some(""), None).is_none());
+        assert!(build_vta_additional_services(&services, Some("   "), None).is_none());
+
+        // 5. REST disabled, URL set → no VTARest entry. The URL is
+        //    still in `AppConfig.public_url` for other uses, but it
+        //    must NOT be advertised as a service the VTA doesn't run.
+        let services = ServicesConfig {
+            rest: false,
+            didcomm: true,
+            webauthn: false,
+            tsp: false,
+        };
+        assert!(
+            build_vta_additional_services(&services, url, None).is_none(),
+            "URL must not be published as a service when REST is disabled"
+        );
+
+        // 6. Both off, no URL → empty. (Edge case; a VTA with no
+        //    services is degenerate but the helper must stay total.)
+        let services = ServicesConfig {
+            rest: false,
+            didcomm: false,
+            webauthn: false,
+            tsp: false,
+        };
+        assert!(build_vta_additional_services(&services, None, None).is_none());
+    }
+
+    /// The `#tsp` half of the same helper: swept over
+    /// `(services.tsp, mediator_did)`.
+    ///
+    /// TSP advertises the DIDComm mediator's **DID** (mediator
+    /// indirection — the transport URL lives in the mediator's own
+    /// document), so with no mediator resolved there is nothing to
+    /// point at and the entry must not be emitted.
+    #[test]
+    fn build_vta_additional_services_tsp_matrix() {
+        let mediator = Some("did:webvh:mediator.example.com:mediator");
+        let tsp_only = ServicesConfig {
+            rest: false,
+            didcomm: true,
+            webauthn: false,
+            tsp: true,
+        };
+
+        // 1. TSP + mediator → one TSPTransport entry, endpoint = the
+        //    mediator DID as a plain string (not an object, not a URL).
+        let out = build_vta_additional_services(&tsp_only, None, mediator)
+            .expect("TSP + mediator must emit a service entry");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "TSPTransport");
+        assert_eq!(out[0]["id"], "{DID}#tsp");
+        assert_eq!(
+            out[0]["serviceEndpoint"],
+            "did:webvh:mediator.example.com:mediator"
+        );
+
+        // 2. TSP without a mediator (messaging skipped) → nothing. An
+        //    endpoint-less `#tsp` would advertise a route to nowhere.
+        assert!(build_vta_additional_services(&tsp_only, None, None).is_none());
+        assert!(build_vta_additional_services(&tsp_only, None, Some("")).is_none());
+        assert!(build_vta_additional_services(&tsp_only, None, Some("   ")).is_none());
+
+        // 3. TSP off + mediator present → no `#tsp`. A VTA running
+        //    DIDComm through a TSP-capable mediator still doesn't claim
+        //    TSP unless the operator asked for it.
+        let no_tsp = ServicesConfig {
+            tsp: false,
+            ..tsp_only
+        };
+        assert!(build_vta_additional_services(&no_tsp, None, mediator).is_none());
+
+        // 4. REST + TSP → both entries. Their order in this Vec is not
+        //    the published order: `build_did_document_inner` sorts
+        //    `service[]` canonically after appending.
+        let both = ServicesConfig {
+            rest: true,
+            ..tsp_only
+        };
+        let out = build_vta_additional_services(&both, Some("https://vta.example.com"), mediator)
+            .expect("REST + TSP must emit both entries");
+        assert_eq!(out.len(), 2);
+        let types: Vec<&str> = out.iter().map(|s| s["type"].as_str().unwrap()).collect();
+        assert!(types.contains(&"TSPTransport") && types.contains(&"VTARest"));
+    }
+
+    /// `derive_ws_url` is the single source of truth for the mediator's
+    /// WebSocket endpoint default — both setup paths derive through it.
+    #[test]
+    fn derive_ws_url_swaps_scheme_trims_and_appends_ws() {
+        // https → wss, plain host.
+        assert_eq!(
+            derive_ws_url("https://mediator.example.com").as_deref(),
+            Some("wss://mediator.example.com/ws")
+        );
+        // http → ws.
+        assert_eq!(
+            derive_ws_url("http://localhost:8000").as_deref(),
+            Some("ws://localhost:8000/ws")
+        );
+        // Trailing slash is trimmed before the suffix (no `//ws`).
+        assert_eq!(
+            derive_ws_url("https://mediator.example.com/").as_deref(),
+            Some("wss://mediator.example.com/ws")
+        );
+        // Path is preserved; suffix appended once.
+        assert_eq!(
+            derive_ws_url("https://example.com/mediator/v1/").as_deref(),
+            Some("wss://example.com/mediator/v1/ws")
+        );
+        // Non-http(s) schemes (and bare hosts) yield None — caller decides
+        // whether that's fatal or just "offer no default".
+        assert_eq!(derive_ws_url("wss://already.ws/ws"), None);
+        assert_eq!(derive_ws_url("mediator.example.com"), None);
+        assert_eq!(derive_ws_url(""), None);
+    }
+}

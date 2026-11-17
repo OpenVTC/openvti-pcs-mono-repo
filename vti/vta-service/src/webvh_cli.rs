@@ -1,0 +1,986 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use vta_sdk::protocols::did_management::create::WebvhPathMode;
+
+use crate::auth::AuthClaims;
+use crate::cli_store::CliStore;
+use crate::config::AppConfig;
+use crate::didcomm_bridge::DIDCommBridge;
+use crate::keys::seed_store::create_seed_store;
+use crate::operations;
+
+/// Format a UTC `DateTime` as a readable local-timezone string with ISO offset.
+///
+/// The service stores timestamps in UTC internally (wire format, storage);
+/// operator-facing CLI output converts to the local timezone for readability.
+fn format_local_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+
+/// Create a synthetic super-admin AuthClaims for CLI operations.
+///
+/// Thin wrapper over the workspace-level
+/// [`AuthClaims::unsafe_local_cli_super_admin`] factory so the
+/// trust-boundary documentation lives in one place. Callers should
+/// prefer the factory directly in new code.
+pub(crate) fn cli_super_admin() -> AuthClaims {
+    AuthClaims::unsafe_local_cli_super_admin("webvh")
+}
+
+/// [`DIDCommBridge::signing_only`] for the offline commands: a bridge that
+/// signs as this VTA, so they can reach a DID hosting server at all.
+///
+/// A signing key that will not load is a warning, not an error, so that a
+/// local-only delete, which signs nothing, still works as a break-glass.
+/// Anything that does sign then fails as it did before.
+async fn offline_signing_bridge(
+    config: &AppConfig,
+    keys_ks: &crate::store::KeyspaceHandle,
+    imported_ks: &crate::store::KeyspaceHandle,
+    contexts_ks: &crate::store::KeyspaceHandle,
+    webvh_ks: &crate::store::KeyspaceHandle,
+    webs_ks: Option<&crate::store::KeyspaceHandle>,
+    seed_store: &dyn crate::keys::seed_store::SeedStore,
+    audit: &vta_audit::SharedAuditSink,
+) -> Arc<DIDCommBridge> {
+    match DIDCommBridge::signing_only(
+        config.vta_did.as_deref(),
+        keys_ks,
+        imported_ks,
+        contexts_ks,
+        Some(webvh_ks),
+        webs_ks,
+        seed_store,
+        audit,
+    )
+    .await
+    {
+        Ok(bridge) => Arc::new(bridge),
+        Err(e) => {
+            eprintln!(
+                "warning: could not load this VTA's signing key ({e}); nothing sent to a DID \
+                 hosting server can be signed"
+            );
+            Arc::new(DIDCommBridge::placeholder())
+        }
+    }
+}
+
+pub async fn run_add_server(
+    config_path: Option<PathBuf>,
+    id: String,
+    did: String,
+    label: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+    let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await?;
+
+    let auth = cli_super_admin();
+    let result = operations::did_webvh::register_webvh_server(
+        &webvh_ks,
+        &auth,
+        &id,
+        Some(&did),
+        label,
+        Some(&did_resolver),
+        "cli",
+    )
+    .await?;
+    cs.persist().await?;
+
+    eprintln!("WebVH server added:");
+    eprintln!("  ID:  {}", result.id);
+    eprintln!("  DID: {}", result.did);
+    if let Some(label) = &result.label {
+        eprintln!("  Label: {label}");
+    }
+    Ok(())
+}
+
+pub async fn run_list_servers(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+
+    let auth = cli_super_admin();
+    let result = operations::did_webvh::list_webvh_servers(&webvh_ks, &auth, "cli").await?;
+
+    if result.servers.is_empty() {
+        eprintln!("No WebVH servers configured.");
+        return Ok(());
+    }
+
+    eprintln!("{} WebVH server(s):\n", result.servers.len());
+    for server in &result.servers {
+        eprintln!("  ID:      {}", server.id);
+        eprintln!("  DID:     {}", server.did);
+        if let Some(label) = &server.label {
+            eprintln!("  Label:   {label}");
+        }
+        eprintln!("  Created: {}", format_local_datetime(server.created_at));
+        eprintln!();
+    }
+    Ok(())
+}
+
+pub async fn run_update_server(
+    config_path: Option<PathBuf>,
+    id: String,
+    label: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+
+    let auth = cli_super_admin();
+    // `did: None` — label-only, so an unknown id is NotFound rather
+    // than a silent registration, and no resolver is needed.
+    let result = operations::did_webvh::register_webvh_server(
+        &webvh_ks, &auth, &id, None, label, None, "cli",
+    )
+    .await?;
+    cs.persist().await?;
+
+    eprintln!("WebVH server updated:");
+    eprintln!("  ID:  {}", result.id);
+    eprintln!("  DID: {}", result.did);
+    if let Some(label) = &result.label {
+        eprintln!("  Label: {label}");
+    }
+    Ok(())
+}
+
+pub async fn run_remove_server(
+    config_path: Option<PathBuf>,
+    id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+
+    // Read before the row goes: DIDs still naming this server, and the
+    // server's own DID for the re-add command in the notice below. Deleting
+    // the registry row does not refuse in that case — it is what the
+    // operation does over the wire too — but it is not a complete delete of
+    // what the operator may think they are deleting, so say what remains.
+    let dependents: Vec<String> = crate::webvh_store::list_dids(&webvh_ks)
+        .await?
+        .into_iter()
+        .filter(|d| d.server_id == id)
+        .map(|d| d.did)
+        .collect();
+    let server_did = crate::webvh_store::get_server(&webvh_ks, &id)
+        .await?
+        .map(|s| s.did);
+
+    let auth = cli_super_admin();
+    operations::did_webvh::remove_webvh_server(&webvh_ks, &auth, &id, "cli").await?;
+    cs.persist().await?;
+
+    eprintln!("WebVH server deleted: {id}");
+    if !dependents.is_empty() {
+        eprintln!(
+            "Warning: only the registry entry was deleted. {} DID(s) are still registered \
+             against server '{id}', and their logs are still hosted on it:",
+            dependents.len()
+        );
+        for did in &dependents {
+            eprintln!("    {did}");
+        }
+        eprintln!(
+            "  While the id is unregistered, `vta did-mgmt dids delete` removes only the local \
+             record and leaves the hosted log behind. To delete those DIDs completely, re-add \
+             the server and delete them first:\n    \
+             vta did-mgmt servers add --id {id} --did {}\n    \
+             vta did-mgmt dids delete <did>",
+            server_did.as_deref().unwrap_or("<server-did>")
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_create_did(
+    config_path: Option<PathBuf>,
+    context_id: String,
+    server_id: String,
+    path: Option<String>,
+    label: Option<String>,
+    portable: bool,
+    mediator_service: bool,
+    services_json: Option<String>,
+    pre_rotation: Option<u32>,
+    print_mnemonic: bool,
+    did_method: Option<vta_sdk::did_scid::DidMethod>,
+    scid_also_known_as: Option<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path.clone())?;
+    let cs = CliStore::open(&config).await?;
+    let keys_ks = cs.keyspace(crate::keyspaces::KEYS)?;
+    let imported_ks = cs.keyspace(crate::keyspaces::IMPORTED_SECRETS)?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+    let audit_ks = cs.keyspace(crate::keyspaces::AUDIT)?;
+    let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+    let did_templates_ks = cs.keyspace(crate::keyspaces::DID_TEMPLATES)?;
+    let seed_store: Arc<dyn crate::keys::seed_store::SeedStore> =
+        Arc::from(create_seed_store(&config)?);
+
+    let additional_services: Option<Vec<serde_json::Value>> = match services_json {
+        Some(json) => Some(serde_json::from_str(&json)?),
+        None => None,
+    };
+
+    let auth = cli_super_admin();
+    let params = operations::did_webvh::CreateDidWebvhParams {
+        context_id: context_id.clone(),
+        server_id: Some(server_id),
+        url: None,
+        // `--path <p>` → explicit; `--path .well-known` → root; absent
+        // → server auto-assigns.
+        path_mode: WebvhPathMode::from(path),
+        // CLI-driven flow: no per-DID domain selection here. Wired
+        // via `--domain` in pnm-cli's surface.
+        domain: None,
+        label,
+        portable,
+        add_mediator_service: mediator_service,
+        add_tsp_service: Some(false),
+        additional_services,
+        pre_rotation_count: pre_rotation.unwrap_or(0),
+        did_document: None,
+        did_log: None,
+        set_primary: true,
+        // Online CLI: no local preview to keep in step with.
+        pre_derived: None,
+        signing_key_id: None,
+        ka_key_id: None,
+        template: None,
+        template_context: None,
+        template_vars: std::collections::HashMap::new(),
+        // `pnm did-mgmt dids create` is a runtime integration-DID CLI; it
+        // never mints the VTA's own identity (setup wizard does that).
+        is_vta_identity: false,
+        did_method,
+        scid_also_known_as,
+    };
+
+    let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await?;
+    let signing_bridge = offline_signing_bridge(
+        &config,
+        &keys_ks,
+        &imported_ks,
+        &contexts_ks,
+        &webvh_ks,
+        cs.keyspace(crate::keyspaces::WEBS).ok().as_ref(),
+        &*seed_store,
+        &audit,
+    )
+    .await;
+    let deps = operations::did_webvh::CreateDidWebvhDeps {
+        keys_ks: &keys_ks,
+        imported_ks: &imported_ks,
+        contexts_ks: &contexts_ks,
+        webvh_ks: &webvh_ks,
+        did_templates_ks: &did_templates_ks,
+        audit: &audit,
+        seed_store: &*seed_store,
+        config: &config,
+        did_resolver: &did_resolver,
+        didcomm_bridge: &signing_bridge,
+        acl_ks: None,
+        // Offline: no mediator session to lend, so the seam cannot choose
+        // TSP or DIDComm and is left with REST.
+        #[cfg(feature = "tsp")]
+        tsp: None,
+    };
+    let result = operations::did_webvh::create_did_webvh(&deps, &auth, params, "cli").await?;
+    cs.persist().await?;
+
+    eprintln!("\x1b[1;32mCreated DID:\x1b[0m {}", result.did);
+    eprintln!("  Context:    {}", result.context_id);
+    if let Some(ref server_id) = result.server_id {
+        eprintln!("  Server:     {}", server_id);
+    }
+    eprintln!("  SCID:       {}", result.scid);
+    if let Some(ref webvh_did) = result.webvh_did
+        && *webvh_did != result.did
+    {
+        eprintln!("  Log:        {webvh_did}");
+    }
+    if result.scid_also_known_as == Some(true)
+        && let Some(ref url) = result.scid_did_url
+    {
+        eprintln!("  did:scid:   {url}");
+    }
+    if let Some(ref mnemonic) = result.mnemonic {
+        if print_mnemonic {
+            eprintln!("  Mnemonic:   {mnemonic}");
+        } else {
+            eprintln!(
+                "  Mnemonic:   <redacted — re-run with `--print-mnemonic` if you really need it on stderr>"
+            );
+        }
+    }
+    eprintln!("  Portable:   {}", result.portable);
+    eprintln!("  Signing:    {}", result.signing_key_id);
+    eprintln!("  KA:         {}", result.ka_key_id);
+    if result.pre_rotation_key_count > 0 {
+        eprintln!("  Pre-rot:    {} keys", result.pre_rotation_key_count);
+    }
+    Ok(())
+}
+
+pub async fn run_list_dids(
+    config_path: Option<PathBuf>,
+    context_id: Option<String>,
+    server_id: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+
+    let auth = cli_super_admin();
+    let result = operations::did_webvh::list_dids_webvh(
+        &webvh_ks,
+        &auth,
+        context_id.as_deref(),
+        server_id.as_deref(),
+        "cli",
+    )
+    .await?;
+
+    if result.dids.is_empty() {
+        eprintln!("No WebVH DIDs found.");
+        return Ok(());
+    }
+
+    eprintln!("{} WebVH DID(s):\n", result.dids.len());
+    for d in &result.dids {
+        eprintln!("  DID:      {}", d.did);
+        eprintln!("  Context:  {}", d.context_id);
+        eprintln!("  Server:   {}", d.server_id);
+        eprintln!("  SCID:     {}", d.scid);
+        eprintln!("  Portable: {}", d.portable);
+        eprintln!("  Created:  {}", format_local_datetime(d.created_at));
+        eprintln!();
+    }
+    Ok(())
+}
+
+/// Print what deleting a DID would destroy and revoke.
+///
+/// Credentials are listed by id rather than counted. An operator deciding
+/// whether to proceed is deciding about *those* credentials, and "3 will be
+/// revoked" cannot be checked against what they expected — which is the only
+/// question a confirmation prompt is actually asking.
+fn render_did_deletion_plan(
+    did: &str,
+    plan: &operations::did_webvh::DidDeletionPlan,
+    local_only: bool,
+) {
+    println!("Deleting {did} would:");
+    if plan.has_acl_entry {
+        println!("  - remove its ACL entry (its authorization at this VTA)");
+    }
+    if plan.sessions_to_revoke > 0 {
+        println!("  - end {} live session(s)", plan.sessions_to_revoke);
+    }
+    if plan.credentials_to_revoke.is_empty() {
+        println!("  - revoke no credentials");
+    } else {
+        println!(
+            "  - REVOKE {} credential(s) issued to it — copies held by others stop being \
+             valid, and this cannot be undone:",
+            plan.credentials_to_revoke.len()
+        );
+        for id in &plan.credentials_to_revoke {
+            println!("      {id}");
+        }
+    }
+    if local_only {
+        println!("  - delete its keys and its local record");
+        println!("  - LEAVE its published log on the hosting server, where it may still resolve");
+    } else {
+        println!("  - delete its keys, its local record and its published log");
+    }
+    if !plan.blockers.is_empty() {
+        println!("\nIt will be refused until these are resolved:");
+        for blocker in &plan.blockers {
+            println!("  - {blocker}");
+        }
+    }
+    println!();
+}
+
+pub async fn run_delete_did(
+    config_path: Option<PathBuf>,
+    did: String,
+    local_only: bool,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let options = if local_only {
+        operations::did_webvh::DeleteDidOptions::local_only()
+    } else {
+        operations::did_webvh::DeleteDidOptions::default()
+    };
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let keys_ks = cs.keyspace(crate::keyspaces::KEYS)?;
+    let imported_ks = cs.keyspace(crate::keyspaces::IMPORTED_SECRETS)?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+    let audit_ks = cs.keyspace(crate::keyspaces::AUDIT)?;
+    let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+    // The offline delete cascades exactly as the online one does. An operator
+    // reaching for the break-glass CLI is the *last* person who should be left
+    // with a half-deleted DID.
+    let acl_ks = cs.keyspace(crate::keyspaces::ACL)?;
+    let sessions_ks = cs.keyspace(crate::keyspaces::SESSIONS)?;
+    let issued_credentials_ks = cs.keyspace(crate::keyspaces::ISSUED_CREDENTIALS)?;
+    let seed_store: Arc<dyn crate::keys::seed_store::SeedStore> =
+        Arc::from(create_seed_store(&config)?);
+
+    let auth = cli_super_admin();
+    let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await?;
+    let signing_bridge = offline_signing_bridge(
+        &config,
+        &keys_ks,
+        &imported_ks,
+        &contexts_ks,
+        &webvh_ks,
+        cs.keyspace(crate::keyspaces::WEBS).ok().as_ref(),
+        &*seed_store,
+        &audit,
+    )
+    .await;
+    let deps = operations::did_webvh::WebvhDeps {
+        delete_cascade: Some(crate::operations::did_webvh::DeleteCascadeDeps {
+            acl_ks: &acl_ks,
+            sessions_ks: &sessions_ks,
+            issued_credentials_ks: &issued_credentials_ks,
+        }),
+        keys_ks: &keys_ks,
+        imported_ks: &imported_ks,
+        contexts_ks: &contexts_ks,
+        webvh_ks: &webvh_ks,
+        // Never compares a host's listing.
+        webs_ks: None,
+        audit: &audit,
+        seed_store: &*seed_store,
+        did_resolver: &did_resolver,
+        didcomm_bridge: &signing_bridge,
+        // Offline: no mediator session to lend, so the seam cannot choose
+        // TSP or DIDComm and is left with REST.
+        #[cfg(feature = "tsp")]
+        tsp: None,
+    };
+    // Show what this would do before doing it.
+    //
+    // Deleting a DID is irreversible and now also *revokes* — credentials in
+    // other people's wallets stop being good, and no undo puts them back. The
+    // same plan the deletion acts on is rendered here, so the preview cannot
+    // under-report what is about to happen.
+    let plan = operations::did_webvh::plan_did_deletion_with(
+        &deps,
+        &auth,
+        &did,
+        config.vta_did.as_deref(),
+        options,
+    )
+    .await?;
+    render_did_deletion_plan(&did, &plan, local_only);
+    // `--yes` skips the *prompt*, not the blockers — those are refused by
+    // `delete_did_webvh` regardless, and deliberately have no escape hatch.
+    if plan.touches_anything_else()
+        && !yes
+        && !vta_cli_common::commands::contexts::confirm_destructive("Proceed with deletion?")?
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    let result = operations::did_webvh::delete_did_webvh_with(
+        &deps,
+        &auth,
+        &did,
+        config.vta_did.as_deref(),
+        "cli",
+        options,
+    )
+    .await?;
+    cs.persist().await?;
+
+    eprintln!("WebVH DID deleted: {did}");
+    // The spec's partial success: the record is gone but the host copy was not
+    // confirmed deleted, so the DID may still resolve. Said, never swallowed.
+    if let Some(reason) = &result.daemon_cleanup_error {
+        eprintln!("warning: {reason}");
+    }
+    Ok(())
+}
+
+/// `vta did-mgmt dids get-log` — print the raw `did.jsonl` log for a DID the
+/// VTA knows (provisioning-time snapshot).
+pub async fn run_did_log(
+    config_path: Option<PathBuf>,
+    did: String,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+
+    let log = crate::webvh_store::get_did_log(&webvh_ks, &did)
+        .await?
+        .ok_or_else(|| format!("webvh DID log not found: {did}"))?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(&path, log.as_bytes())
+                .map_err(|e| format!("write {}: {e}", path.display()))?;
+            eprintln!(
+                "DID log written to {} ({} bytes)",
+                path.display(),
+                log.len()
+            );
+        }
+        None => {
+            // Raw to stdout so it can be piped to a webvh server or
+            // saved to `.well-known/did.jsonl` directly.
+            print!("{log}");
+        }
+    }
+    Ok(())
+}
+
+/// Offline equivalent of `pnm did-mgmt dids edit` — edit a WebVH
+/// DID document and publish a new LogEntry. Operates directly on
+/// the local fjall keystore. The VTA daemon must be stopped
+/// (fjall holds an exclusive lock when the daemon is running).
+///
+/// Same flag surface as the online command:
+/// - No flags → interactive mode (opens `$EDITOR`, asks about
+///   webvh parameters, confirms).
+/// - `--document <file>` / `--options-file <file>` plus per-field
+///   flags → non-interactive mode.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_edit_did(
+    config_path: Option<PathBuf>,
+    did: String,
+    document: Option<PathBuf>,
+    options_file: Option<PathBuf>,
+    pre_rotation: Option<u32>,
+    ttl: Option<u32>,
+    watchers: Vec<String>,
+    no_watchers: bool,
+    label: Option<String>,
+    no_confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use vta_cli_common::commands::webvh_edit::{
+        EditFlags, assert_did_id_unchanged, build_options_from_flags, confirm_publish,
+        diff_summary, document_id, extract_current_document, launch_editor, prompt_webvh_params,
+    };
+    use vta_sdk::protocols::did_management::update::UpdateDidWebvhBody;
+
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+    let keys_ks = cs.keyspace(crate::keyspaces::KEYS)?;
+    let imported_ks = cs.keyspace(crate::keyspaces::IMPORTED_SECRETS)?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+    let audit_ks = cs.keyspace(crate::keyspaces::AUDIT)?;
+    let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+    let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await?;
+    let seed_store: Arc<dyn crate::keys::seed_store::SeedStore> =
+        Arc::from(create_seed_store(&config)?);
+    let didcomm_bridge = offline_signing_bridge(
+        &config,
+        &keys_ks,
+        &imported_ks,
+        &contexts_ks,
+        &webvh_ks,
+        cs.keyspace(crate::keyspaces::WEBS).ok().as_ref(),
+        &*seed_store,
+        &audit,
+    )
+    .await;
+
+    // Look up the DID record for scid (update_did_webvh keys off it).
+    let record = crate::webvh_store::get_did(&webvh_ks, &did)
+        .await?
+        .ok_or_else(|| format!("DID `{did}` not found on this VTA"))?;
+    let scid = record.scid.clone();
+
+    let any_flag_set = document.is_some()
+        || options_file.is_some()
+        || pre_rotation.is_some()
+        || ttl.is_some()
+        || !watchers.is_empty()
+        || no_watchers
+        || label.is_some();
+
+    let body: UpdateDidWebvhBody = if any_flag_set {
+        let flags = EditFlags {
+            document_file: document,
+            options_file,
+            pre_rotation,
+            ttl,
+            watchers,
+            no_watchers,
+            label,
+        };
+        let body = build_options_from_flags(&flags)?;
+        if let Some(edited) = &body.document {
+            let log = crate::webvh_store::get_did_log(&webvh_ks, &did)
+                .await?
+                .ok_or_else(|| format!("DID `{did}` has no log on disk"))?;
+            let prior = extract_current_document(&log)?;
+            assert_did_id_unchanged(&prior, edited)?;
+        }
+        body
+    } else {
+        let log = crate::webvh_store::get_did_log(&webvh_ks, &did)
+            .await?
+            .ok_or_else(|| format!("DID `{did}` has no log on disk"))?;
+        let prior = extract_current_document(&log)?;
+        let prior_id = document_id(&prior)?.to_string();
+        let pre_rotation_status =
+            vta_cli_common::commands::webvh_edit::extract_pre_rotation_status(&log);
+        eprintln!("Editing DID document for {prior_id}.");
+        eprintln!("Opening $EDITOR — save and exit to continue, or quit without saving to abort.");
+
+        let edited = match launch_editor(&prior)? {
+            Some(doc) => {
+                let summary = diff_summary(&prior, &doc);
+                eprintln!();
+                eprintln!("Document diff:");
+                for line in summary.lines() {
+                    eprintln!("  {line}");
+                }
+                eprintln!();
+                Some(doc)
+            }
+            None => {
+                eprintln!("Editor cancelled. No changes will be published.");
+                return Ok(());
+            }
+        };
+        prompt_webvh_params(edited, Some(&pre_rotation_status))?
+    };
+
+    // `confirm_publish` needs the body, but building `opts` below moves out of
+    // it — and the confirmation has to come after the plan, since the plan is
+    // what the operator is confirming.
+    let body_for_confirm = body.clone();
+
+    // Convert the wire body into the op-layer options shape. The
+    // SDK type carries `witnesses` as opaque JSON to stay
+    // didwebvh-rs-free; we deserialise into the typed enum at
+    // intake (matching the REST handler's behaviour).
+    let witnesses = match body.witnesses {
+        Some(value) => Some(
+            serde_json::from_value(value)
+                .map_err(|e| format!("invalid witnesses JSON in options-file: {e}"))?,
+        ),
+        None => None,
+    };
+    let opts = crate::operations::did_webvh::UpdateDidWebvhOptions {
+        document: body.document,
+        pre_rotation_count: body.pre_rotation_count,
+        witnesses,
+        watchers: body.watchers,
+        ttl: body.ttl,
+        label: body.label,
+        expected_version_id: body.expected_version_id,
+        scid_also_known_as: body.scid_also_known_as,
+    };
+
+    let auth = cli_super_admin();
+    let vta_did = config.vta_did.clone();
+    let deps = crate::operations::did_webvh::WebvhDeps {
+        // `update` publishes a new log entry; it deletes nothing.
+        delete_cascade: None,
+        keys_ks: &keys_ks,
+        imported_ks: &imported_ks,
+        contexts_ks: &contexts_ks,
+        webvh_ks: &webvh_ks,
+        // Never compares a host's listing.
+        webs_ks: None,
+        audit: &audit,
+        seed_store: &*seed_store,
+        did_resolver: &did_resolver,
+        didcomm_bridge: &didcomm_bridge,
+        // Offline: no mediator session to lend, so the seam cannot choose
+        // TSP or DIDComm and is left with REST.
+        #[cfg(feature = "tsp")]
+        tsp: None,
+    };
+    // Dry-run the real update and show the operator what it will actually do.
+    //
+    // The document diff shown during editing cannot answer this. It is computed
+    // from the document alone, so it can say "you changed `service`" but it has
+    // no way to know that changing *anything* rotates this DID's update key —
+    // that consequence lives in the update handler's semantics, not in the
+    // document's shape. An operator confirming on the strength of the diff is
+    // being asked to approve a key rotation they were never shown.
+    //
+    // So the confirmation is driven by a plan produced by the update code
+    // itself, run up to (and not through) its first write.
+    let plan =
+        crate::operations::did_webvh::plan_did_webvh_update(&deps, &auth, &scid, opts.clone())
+            .await?;
+
+    eprintln!("\nPlanned changes to {}:", plan.did);
+    eprintln!(
+        "  Version: {} → {}",
+        plan.prior_version_id, plan.new_version_id
+    );
+    eprintln!();
+    for effect in plan.to_effects() {
+        eprintln!("  • {}", effect.summary);
+    }
+    if plan.to_effects().is_empty() {
+        eprintln!("  (no effects — this update would change nothing)");
+    }
+    eprintln!();
+
+    confirm_publish(&body_for_confirm, no_confirm)?;
+
+    let result = match crate::operations::did_webvh::update_did_webvh_reporting_commit(
+        &deps,
+        &auth,
+        &scid,
+        opts,
+        vta_did.as_deref(),
+        "vta-cli-offline",
+    )
+    .await
+    {
+        Ok(result) => result,
+        // A publish can fail on either side of the commit point: re-publishing
+        // an unconfirmed head comes before it, publishing the new entry after.
+        // The running VTA re-publishes an unconfirmed head before its next
+        // update of the DID, so a committed entry is kept, as the success path
+        // keeps it. Say which happened and what the operator can do about the
+        // publish from here, which offline is less than it looks: this process
+        // holds no mediator session.
+        Err((
+            e @ (operations::did_webvh::UpdateDidWebvhError::Publish(_)
+            | operations::did_webvh::UpdateDidWebvhError::NoMatchingProtocol { .. }),
+            commit,
+        )) => {
+            cs.persist().await?;
+            return Err(offline_publish_failure(&plan.did, &e, commit).into());
+        }
+        Err((e, _)) => return Err(e.into()),
+    };
+    cs.persist().await?;
+
+    eprintln!("WebVH DID updated.");
+    eprintln!("  DID:             {}", result.did);
+    eprintln!("  New version ID:  {}", result.new_version_id);
+    eprintln!("  New SCID:        {}", result.new_scid);
+    eprintln!("  Update keys:     {}", result.update_keys_count);
+    eprintln!("  Pre-rotation:    {}", result.pre_rotation_key_count);
+    Ok(())
+}
+
+/// What to tell the operator when the offline edit wrote the new entry but the
+/// hosting server did not receive it.
+///
+/// The transport case — the typed
+/// [`operations::did_webvh::UpdateDidWebvhError::NoMatchingProtocol`] — gets
+/// its own explanation. Offline, the seam has no
+/// mediator session, so it can initiate REST and nothing else
+/// (`Outbound::initiable_for`); a host whose document carries only
+/// `TSPTransport` / `DIDCommMessaging` is reached by the running VTA alone.
+/// The operator's real intent maps to `pnm did-mgmt dids edit`, so that is
+/// printed verbatim.
+fn offline_publish_failure(
+    did: &str,
+    publish_error: &operations::did_webvh::UpdateDidWebvhError,
+    commit: operations::did_webvh::Commit,
+) -> String {
+    let mut text = format!("{publish_error}\n\n");
+    text.push_str(match commit {
+        operations::did_webvh::Commit::Committed => {
+            "The new log entry is written to this VTA's store, but the hosting server has not \
+             received it. The running VTA publishes a pending entry before its next update of \
+             this DID."
+        }
+        operations::did_webvh::Commit::NotCommitted => {
+            "Nothing new is written. This DID already has a log entry the hosting server has \
+             not received, and an update publishes that one before it builds another. The \
+             running VTA publishes it before its next update of this DID."
+        }
+    });
+    if matches!(
+        publish_error,
+        operations::did_webvh::UpdateDidWebvhError::NoMatchingProtocol { .. }
+    ) {
+        text.push_str(
+            "\n\nThis offline command holds no mediator session, so it reaches a hosting \
+             server over HTTPS only: the server's DID document has to advertise \
+             `TrustTaskHTTPS`, or `WebVHHosting` at an https:// origin. A server that \
+             advertises TSP or DIDComm alone is reached by the running VTA, which holds the \
+             mediator session.",
+        );
+    }
+    text.push_str(&format!(
+        "\n\nStart the VTA and make the change there instead; the pending entry goes first, \
+         then this one:\n  pnm did-mgmt dids edit --did {did} --document <file> --no-confirm"
+    ));
+    text
+}
+
+/// Offline equivalent of `pnm did-mgmt dids register` — promote a
+/// serverless WebVH DID to a server-managed one. Operates directly
+/// on the local fjall keystore. The VTA daemon must be stopped
+/// (fjall holds an exclusive lock when the daemon is running).
+pub async fn run_register_did(
+    config_path: Option<PathBuf>,
+    did: String,
+    server: String,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&config).await?;
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+    let keys_ks = cs.keyspace(crate::keyspaces::KEYS)?;
+    let imported_ks = cs.keyspace(crate::keyspaces::IMPORTED_SECRETS)?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+    let audit_ks = cs.keyspace(crate::keyspaces::AUDIT)?;
+    let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+    let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await?;
+    let seed_store: Arc<dyn crate::keys::seed_store::SeedStore> =
+        Arc::from(create_seed_store(&config)?);
+    let didcomm_bridge = offline_signing_bridge(
+        &config,
+        &keys_ks,
+        &imported_ks,
+        &contexts_ks,
+        &webvh_ks,
+        cs.keyspace(crate::keyspaces::WEBS).ok().as_ref(),
+        &*seed_store,
+        &audit,
+    )
+    .await;
+
+    let auth = cli_super_admin();
+    let deps = operations::did_webvh::WebvhDeps {
+        // This surface publishes; it deletes nothing.
+        delete_cascade: None,
+        keys_ks: &keys_ks,
+        imported_ks: &imported_ks,
+        contexts_ks: &contexts_ks,
+        webvh_ks: &webvh_ks,
+        // Never compares a host's listing.
+        webs_ks: None,
+        audit: &audit,
+        seed_store: &*seed_store,
+        did_resolver: &did_resolver,
+        didcomm_bridge: &didcomm_bridge,
+        // Offline: no mediator session to lend, so the seam cannot choose
+        // TSP or DIDComm and is left with REST.
+        #[cfg(feature = "tsp")]
+        tsp: None,
+    };
+    let result = operations::did_webvh::register_did_with_server(
+        &deps,
+        &auth,
+        operations::did_webvh::RegisterDidWithServerParams {
+            did,
+            server_id: server,
+            force,
+            domain: None,
+        },
+        config.vta_did.as_deref(),
+        "vta-cli-offline",
+    )
+    .await?;
+    cs.persist().await?;
+
+    eprintln!("DID registered with WebVH server.");
+    eprintln!("  DID:         {}", result.did);
+    eprintln!("  Server:      {}", result.server_id);
+    eprintln!("  Log entries: {}", result.log_entry_count);
+    eprintln!();
+    eprintln!(
+        "Future `pnm services …` mutations will auto-publish to `{}`.",
+        result.server_id
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use operations::did_webvh::UpdateDidWebvhError;
+    use vta_sdk::protocol::matching::Protocol;
+    use vti_common::error::NoMatchingProtocol;
+
+    fn no_transport(step: &'static str) -> UpdateDidWebvhError {
+        UpdateDidWebvhError::NoMatchingProtocol {
+            step,
+            refusal: Box::new(NoMatchingProtocol {
+                peer: "did:webvh:QmHost:dids.example".into(),
+                ours: vec![Protocol::Rest],
+                theirs: vec![Protocol::Tsp, Protocol::Didcomm],
+                note: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_no_transport_publish_failure_explains_offline_and_names_the_online_command() {
+        let text = offline_publish_failure(
+            "did:webvh:QmVtc:dids.example:vtc",
+            &no_transport("publish_did"),
+            operations::did_webvh::Commit::Committed,
+        );
+        assert!(text.starts_with("publish error: publish_did: no transport in common"));
+        assert!(text.contains("holds no mediator session"));
+        assert!(text.contains("`TrustTaskHTTPS`, or `WebVHHosting` at an https:// origin"));
+        assert!(text.contains(
+            "pnm did-mgmt dids edit --did did:webvh:QmVtc:dids.example:vtc --document <file> --no-confirm"
+        ));
+    }
+
+    /// The hint follows the type, not the words: a string publish error that
+    /// happens to say "no transport in common" does not get it.
+    #[test]
+    fn any_other_publish_failure_still_says_the_entry_is_pending() {
+        let text = offline_publish_failure(
+            "did:webvh:QmVtc:dids.example:vtc",
+            &UpdateDidWebvhError::Publish("publish_did: no transport in common (text only)".into()),
+            operations::did_webvh::Commit::Committed,
+        );
+        assert!(!text.contains("holds no mediator session"));
+        assert!(text.contains("written to this VTA's store"));
+        assert!(text.contains("pnm did-mgmt dids edit --did did:webvh:QmVtc:dids.example:vtc"));
+    }
+
+    /// The second offline attempt: the first left an unconfirmed head, and
+    /// re-publishing it fails before the commit point, so nothing new exists.
+    #[test]
+    fn a_failed_reconcile_does_not_claim_a_new_entry() {
+        let text = offline_publish_failure(
+            "did:webvh:QmVtc:dids.example:vtc",
+            &no_transport("reconcile publish_did"),
+            operations::did_webvh::Commit::NotCommitted,
+        );
+        assert!(text.starts_with("publish error: reconcile publish_did: no transport in common"));
+        assert!(!text.contains("written to this VTA's store"));
+        assert!(text.contains("Nothing new is written"));
+        assert!(text.contains("holds no mediator session"));
+        assert!(text.contains("pnm did-mgmt dids edit --did did:webvh:QmVtc:dids.example:vtc"));
+    }
+}

@@ -1,0 +1,94 @@
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter } from "react-router-dom";
+
+import App from "@/App";
+import { ConfirmDialogProvider } from "@/components/ConfirmDialog";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { loadThirdPartyPlugins } from "@/lib/plugin-loader";
+import { ThemePreviewBar } from "@/components/ThemePreviewBar";
+import { applyStoredCommunityTheme } from "@/lib/community-theme";
+import { applyStoredTheme } from "@/lib/theme";
+import { isThemePreview, startThemePreview } from "@/lib/theme-preview";
+import { ToastProvider } from "@/lib/toast";
+import { registerBuiltinPlugins } from "@/plugins";
+// Self-hosted type: IBM Plex Sans (body and headings) and IBM Plex Mono
+// (data and labels), the same faces as the home page and the member portal.
+// Self-hosted rather than CDN so the console stays offline-capable and leaks
+// no font request to a third party.
+import "@fontsource/ibm-plex-sans/400.css";
+import "@fontsource/ibm-plex-sans/500.css";
+import "@fontsource/ibm-plex-sans/600.css";
+import "@fontsource/ibm-plex-sans/700.css";
+import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/ibm-plex-mono/500.css";
+import "@fontsource/ibm-plex-mono/600.css";
+// The console's stylesheets: the tokens shared with the home page and the
+// member portal first, then the console's own rules (`styles/index.css`).
+import "@/styles/index.css";
+
+// Apply the persisted theme before first paint so the cascade picks
+// the right `color-scheme` without a flash.
+applyStoredTheme();
+// A theme-preview tab draws the editor's candidate and sends reads only
+// (`lib/theme-preview.ts`).
+startThemePreview();
+// Anywhere else, the community's stored theme (`lib/community-theme.ts`).
+if (!isThemePreview()) void applyStoredCommunityTheme();
+
+// Single QueryClient instance per page load. Sane defaults: short
+// stale time so the operator's view stays fresh, no automatic
+// refetch on window focus (annoying for an admin tool that often
+// sits open in a background tab).
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5_000,
+      refetchOnWindowFocus: false,
+      retry: 1,
+    },
+  },
+});
+
+// Plugin discovery happens in two waves:
+//
+// 1. **Built-ins** (`src/plugins/*`) register synchronously at
+//    module load via `registerBuiltinPlugins()`. They ride along
+//    with the shell bundle.
+// 2. **Third-party plugins** are listed in `/admin/plugins.json`
+//    and dynamically `import()`-ed before render. Loading them
+//    before mount means the nav has the full plugin set by first
+//    paint — no flash of "missing tabs."
+//
+// Both paths converge on `window.VtcPluginApi.registerPlugin` /
+// the local `registerPlugin` import, so the shell renders from a
+// unified registry regardless of source.
+registerBuiltinPlugins();
+
+// Avoid top-level await (esbuild's default target doesn't permit
+// it). Mount after the loader resolves; the registry is fully
+// populated by first paint either way.
+//
+// A theme preview loads no third-party plugin: a plugin is code with the
+// page's own reach, so it could send a write without passing the preview's
+// guard in `lib/api.ts`. The preview shows the built-ins only.
+(isThemePreview() ? Promise.resolve() : loadThirdPartyPlugins()).finally(() => {
+  createRoot(document.getElementById("root")!).render(
+    <StrictMode>
+      {/* The last resort: each screen has its own boundary (`PluginHost`). */}
+      <ErrorBoundary what="The console">
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <ConfirmDialogProvider>
+              <BrowserRouter basename="/admin">
+                {isThemePreview() && <ThemePreviewBar />}
+                <App />
+              </BrowserRouter>
+            </ConfirmDialogProvider>
+          </ToastProvider>
+        </QueryClientProvider>
+      </ErrorBoundary>
+    </StrictMode>,
+  );
+});

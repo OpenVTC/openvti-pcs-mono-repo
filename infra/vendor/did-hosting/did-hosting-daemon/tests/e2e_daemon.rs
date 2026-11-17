@@ -1,0 +1,918 @@
+//! Daemon-mode end-to-end smoke: the real `did-hosting-daemon` binary,
+//! spawned as a subprocess and driven entirely over its public HTTPS Trust
+//! Task API — no in-process `AppState` construction, unlike
+//! `tests/e2e_distributed.rs`.
+//!
+//! Setup is the real, non-interactive setup path
+//! (`did-hosting-daemon setup --from <recipe> --non-interactive`): self-managed
+//! identity (no VTA), `[admin] mode = "did"` seeds the ACL, and
+//! `[secrets] backend = "plaintext"` (with `confirm_plaintext = true`) so the
+//! daemon needs no keyring. The daemon then runs on a free loopback port and
+//! is driven exactly as an operator's tooling would drive it:
+//! `POST /api/trust-tasks` for domain/DID management, `POST
+//! /witness/api/trust-tasks` for the embedded witness (its own store —
+//! `[witness_store]`, separate from `[store]` — but the *same* DID as the
+//! control plane and server; see `CLAUDE.md`'s "did-hosting-daemon" section),
+//! and a plain `GET` for resolution. Because the witness's store is separate,
+//! `[admin] mode = "did"` (which seeds only the main store's ACL) doesn't
+//! reach it either — this test seeds that ACL entry directly, the same way
+//! it would for a standalone witness.
+//!
+//! **DIDComm/TSP are not covered here.** Driving them would need the daemon's
+//! mediator-facing identity registered with the test mediator *before* the
+//! daemon starts, but a self-managed daemon mints that identity itself at
+//! setup time from a freshly generated signing key — there is no test seam to
+//! predict the resulting `did:webvh` (or inject a known one) ahead of spawning
+//! the process. `tests/e2e_distributed.rs` covers TSP and DIDComm instead,
+//! against an in-process control plane whose identity this test suite *does*
+//! control. HTTPS is covered fully here.
+//!
+//! Same known gap as `e2e_distributed.rs`: a webvh log naming an active
+//! witness can never pass `did/register`'s validation (no proof can exist for
+//! a not-yet-published version) — see that file's comment for the full
+//! explanation. This test registers an unwitnessed DID and separately proves
+//! the embedded witness's own `key/create` + `sign` operations work.
+
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use did_hosting_common::tasks::did_management::did;
+use serde_json::json;
+use trust_tasks_rs::Payload;
+
+use vta_sdk::provision_client::EphemeralSetupKey;
+
+use did_hosting_common::WitnessClient;
+use did_hosting_common::did_ops::extract_did_id;
+use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+use did_hosting_common::server::trust_tasks::send::{
+    build_signed_request, post_trust_task_https_verified,
+};
+
+#[path = "support/mod.rs"]
+mod support;
+use support::{build_did_log, did_key_signer, ok, wait_until};
+
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn reserve_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    port
+}
+
+/// Everything needed to talk to a running daemon over HTTPS: its base URL,
+/// its own DID (shared by the control plane, the embedded server and the
+/// embedded witness — one identity, per `CLAUDE.md`), and an admin requester.
+struct Daemon {
+    base_url: String,
+    daemon_did: String,
+    admin_did: String,
+    admin_signer: affinidi_tdk::secrets_resolver::secrets::Secret,
+    did_resolver: DIDCacheClient,
+    /// The written `config.toml` — carries `server_did` + bind address, which
+    /// the `fetch-metrics` subcommand reads to find the daemon.
+    config_path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+    child: tokio::process::Child,
+}
+
+impl Daemon {
+    /// Non-interactively set up a self-managed daemon in a fresh temp dir,
+    /// then spawn it and wait until it serves its own root DID.
+    async fn spawn() -> Self {
+        Self::spawn_with_acl(&[]).await
+    }
+
+    /// Like [`Self::spawn`], but also seeds `extra_main_acl` (DID + role) into
+    /// the main store's ACL before the daemon starts — the same window and
+    /// mechanism the witness-ACL seed below uses, since the service routes no
+    /// online `acl/grant` task. Used to grant a MetricsReader whose did:key is
+    /// minted by the test.
+    async fn spawn_with_acl(
+        extra_main_acl: &[(String, did_hosting_common::server::acl::Role)],
+    ) -> Self {
+        Self::spawn_with(extra_main_acl, &[], false).await
+    }
+
+    /// Like [`Self::spawn_with_acl`], with `env` set on the daemon process and
+    /// the embedded watcher (`/watcher`) on when `watcher` is set.
+    async fn spawn_with(
+        extra_main_acl: &[(String, did_hosting_common::server::acl::Role)],
+        env: &[(&str, &str)],
+        watcher: bool,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let port = reserve_port().await;
+        // `localhost`, not `127.0.0.1`: first-boot domain seeding refuses an
+        // IP-literal host ("domain names must be DNS hostnames"), and
+        // `localhost` resolves to the loopback interface the server binds to
+        // just as well.
+        let base_url = format!("http://localhost:{port}");
+        let config_path = dir.path().join("config.toml");
+        let data_dir = dir.path().join("data");
+        let (admin_did, admin_signer) = did_key_signer(200);
+
+        let recipe_path = dir.path().join("recipe.toml");
+        let recipe = format!(
+            r#"
+[deployment]
+service = "daemon"
+vta_mode = "self-managed"
+
+[output]
+config_path = {config_path:?}
+
+[server]
+host = "127.0.0.1"
+port = {port}
+data_dir = {data_dir:?}
+
+[identity]
+public_url = "{base_url}"
+
+[secrets]
+backend = "plaintext"
+confirm_plaintext = true
+
+[admin]
+mode = "did"
+did = "{admin_did}"
+
+[daemon]
+enable_watcher = {watcher}
+"#,
+        );
+        std::fs::write(&recipe_path, recipe).expect("write recipe");
+
+        let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+        let status = tokio::process::Command::new(bin)
+            .args(["setup", "--from"])
+            .arg(&recipe_path)
+            .arg("--non-interactive")
+            .kill_on_drop(true)
+            .status()
+            .await
+            .expect("run did-hosting-daemon setup");
+        assert!(
+            status.success(),
+            "did-hosting-daemon setup --from {recipe_path:?} failed"
+        );
+
+        // The witness runs on its own store (`[witness_store]`, separate
+        // from `[store]` — see `DaemonConfig`), so `[admin] mode = "did"`
+        // (which seeds only the main store's ACL, the same ground
+        // `did-hosting-daemon add-acl` covers) never reaches it. There is no
+        // CLI/recipe path that does, so this seeds it directly, the same way
+        // `tests/e2e_distributed.rs` seeds a standalone witness's ACL.
+        {
+            use did_hosting_common::server::acl::{AclEntry, Role, store_acl_entry};
+            use did_hosting_common::server::config::StoreConfig;
+            use did_hosting_common::server::domain::DomainScope;
+            use did_hosting_common::server::store::{KS_ACL, Store};
+
+            let witness_store_config = StoreConfig {
+                data_dir: data_dir.join("witness"),
+                ..StoreConfig::default()
+            };
+            let witness_store = Store::open(&witness_store_config)
+                .await
+                .expect("open witness store");
+            store_acl_entry(
+                &witness_store
+                    .keyspace(KS_ACL)
+                    .expect("witness acl keyspace"),
+                &AclEntry {
+                    did: admin_did.clone(),
+                    role: Role::Admin,
+                    label: Some("e2e admin".into()),
+                    created_at: 1,
+                    max_total_size: None,
+                    max_did_count: None,
+                    domains: DomainScope::All,
+                },
+            )
+            .await
+            .expect("seed witness ACL");
+            // Dropped before the daemon starts: fjall locks the directory,
+            // and the daemon must be the only opener of it.
+        }
+
+        // Seed any caller-supplied entries into the *main* store's ACL, in the
+        // same post-setup / pre-spawn window (the store is unlocked once the
+        // setup subprocess exits, and must be dropped before the daemon opens
+        // it). There is no online `acl/grant` task to do this over the wire.
+        if !extra_main_acl.is_empty() {
+            use did_hosting_common::server::acl::{AclEntry, store_acl_entry};
+            use did_hosting_common::server::config::StoreConfig;
+            use did_hosting_common::server::domain::DomainScope;
+            use did_hosting_common::server::store::{KS_ACL, Store};
+
+            // Setup roots the main store at `<server.data_dir>/store` (and the
+            // witness at `<server.data_dir>/witness`); seed the former.
+            let main_store = Store::open(&StoreConfig {
+                data_dir: data_dir.join("store"),
+                ..StoreConfig::default()
+            })
+            .await
+            .expect("open main store");
+            let acl_ks = main_store.keyspace(KS_ACL).expect("main acl keyspace");
+            for (did, role) in extra_main_acl {
+                store_acl_entry(
+                    &acl_ks,
+                    &AclEntry {
+                        did: did.clone(),
+                        role: role.clone(),
+                        label: Some("e2e extra".into()),
+                        created_at: 1,
+                        max_total_size: None,
+                        max_did_count: None,
+                        domains: DomainScope::All,
+                    },
+                )
+                .await
+                .expect("seed main ACL entry");
+            }
+        }
+
+        let child = tokio::process::Command::new(bin)
+            .arg("--config")
+            .arg(&config_path)
+            .env("RUST_LOG", "warn")
+            .envs(env.iter().copied())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn did-hosting-daemon");
+
+        // `AllowPrivate`: the daemon's own DID really is hosted on `localhost`
+        // here, which the resolver's default `PublicOnly` policy refuses as
+        // an SSRF guard a same-machine test has no use for.
+        let did_resolver = DIDCacheClient::new(
+            DIDCacheConfigBuilder::default()
+                .with_host_policy(affinidi_did_web::HostPolicy::AllowPrivate)
+                .build(),
+        )
+        .await
+        .expect("did resolver");
+        let http = reqwest::Client::new();
+
+        wait_until(
+            || async {
+                http.get(format!("{base_url}/api/health"))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
+            },
+            SETTLE_TIMEOUT,
+            "the daemon answers its own health check",
+        )
+        .await;
+
+        // The root DID is servable the moment the daemon is up — self-managed
+        // setup imports its log directly, no further runtime bootstrap step —
+        // and no domain exists yet, so the resolve-side host check is still
+        // permissive (see `did_hosting_common::server::domain::safety`).
+        let root_log = wait_until_ok(&http, &format!("{base_url}/.well-known/did.jsonl")).await;
+        let daemon_did = extract_did_id(&root_log).expect("root DID log has a state.id");
+
+        Self {
+            base_url,
+            daemon_did,
+            admin_did,
+            admin_signer,
+            did_resolver,
+            config_path,
+            _dir: dir,
+            child,
+        }
+    }
+
+    async fn call(
+        &self,
+        type_uri: &str,
+        payload: serde_json::Value,
+    ) -> trust_tasks_rs::TrustTask<serde_json::Value> {
+        let doc = build_signed_request(
+            type_uri,
+            &self.admin_did,
+            &self.daemon_did,
+            payload,
+            &self.admin_signer,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("build request {type_uri}: {e}"));
+        let url = format!("{}/api/trust-tasks", self.base_url);
+        // The daemon's reply is signed by its `localhost` did:webvh, so the
+        // deactivation check needs the resolver's `AllowPrivate` too.
+        let verifier = TransportBoundVerifier::with_did_cache_and_host_policy(
+            self.did_resolver.clone(),
+            didwebvh_rs::host_policy::HostPolicy::AllowPrivate,
+        );
+        post_trust_task_https_verified(&self.admin_did, &self.daemon_did, &url, &doc, &verifier)
+            .await
+            .unwrap_or_else(|e| panic!("https send {type_uri}: {e}"))
+    }
+
+    async fn get_log(&self, mnemonic: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{}/{mnemonic}/did.jsonl", self.base_url))
+            .send()
+            .await
+            .expect("GET the daemon")
+    }
+
+    async fn teardown(mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+}
+
+/// Poll `url` until it answers 200, returning the body.
+async fn wait_until_ok(http: &reqwest::Client, url: &str) -> String {
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        if let Ok(resp) = http.get(url).send().await
+            && resp.status().is_success()
+        {
+            return resp.text().await.expect("body");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {url} to answer 200");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The full lifecycle over HTTPS against a real daemon process: register a
+/// DID, confirm it serves, disable it and confirm it refuses, then delete it
+/// — plus a standalone proof that the embedded witness signs correctly (see
+/// this file's module docs for why it isn't threaded through `did/register`).
+#[tokio::test]
+async fn daemon_lifecycle_over_https() {
+    let daemon = Daemon::spawn().await;
+    let mnemonic = "e2e-daemon";
+
+    // The daemon mounts the control plane's public sign-in self-check that
+    // the login page reads; before or without a check it answers a state,
+    // never an error.
+    let readiness: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/api/sign-in/readiness", daemon.base_url))
+        .send()
+        .await
+        .expect("GET /api/sign-in/readiness")
+        .json()
+        .await
+        .expect("readiness is JSON");
+    assert!(
+        matches!(
+            readiness["walletSignIn"].as_str(),
+            Some("ready" | "unknown" | "not-set-up")
+        ),
+        "unexpected readiness {readiness}"
+    );
+    let (_did_signer_did, did_signer) = did_key_signer(210);
+
+    // The daemon's own encoded host — the same string `did/register`
+    // validates the log's identifier against (`did_hosting_url`, which the
+    // recipe set equal to `public_url`).
+    let host = did_hosting_common::did::encode_host(&daemon.base_url).expect("encode host");
+
+    // did/register — a plain (unwitnessed) webvh log.
+    let (jsonl, _version_id) = build_did_log(&host, mnemonic, &did_signer, None, &[]).await;
+    let reply = daemon
+        .call(
+            did::register::v0_1::Payload::TYPE_URI,
+            json!({ "path": mnemonic, "method": "webvh", "didData": jsonl }),
+        )
+        .await;
+    ok(&reply, did::register::v0_1::Payload::TYPE_URI);
+
+    // The daemon serves what was registered.
+    wait_until(
+        || async { daemon.get_log(mnemonic).await.status().is_success() },
+        SETTLE_TIMEOUT,
+        "the daemon serves the freshly registered DID",
+    )
+    .await;
+    let served = daemon.get_log(mnemonic).await.text().await.expect("body");
+    assert_eq!(
+        served.trim(),
+        jsonl.trim(),
+        "the daemon serves exactly what was registered"
+    );
+
+    // The embedded witness — same shared identity, `/witness/api/trust-tasks`
+    // — signs a (separate, unregistered) witnessed log correctly.
+    let witness_client = WitnessClient::new(
+        &format!("{}/witness", daemon.base_url),
+        &daemon.daemon_did,
+        &daemon.admin_did,
+        daemon.admin_signer.clone(),
+        daemon.did_resolver.clone(),
+    )
+    .with_host_policy(didwebvh_rs::host_policy::HostPolicy::AllowPrivate);
+    let key = witness_client
+        .create_key(Some("e2e"))
+        .await
+        .unwrap_or_else(|e| panic!("witness key/create: {e}"));
+    let witness_key_did = key.key.did.to_string();
+    let witness_id = key.key.witness_id.to_string();
+    let (witnessed_jsonl, witnessed_version_id) = build_did_log(
+        &host,
+        &format!("{mnemonic}-witnessed"),
+        &did_signer,
+        Some(&witness_key_did),
+        &[],
+    )
+    .await;
+    let signed = witness_client
+        .sign(&witness_id, &witnessed_version_id, &witnessed_jsonl)
+        .await
+        .unwrap_or_else(|e| panic!("witness sign: {e}"));
+    assert_eq!(signed.version_id.to_string(), witnessed_version_id);
+
+    // did/set-state suspended — the daemon refuses resolution.
+    let reply = daemon
+        .call(
+            did::set_state::v0_1::Payload::TYPE_URI,
+            json!({ "mnemonic": mnemonic, "state": "suspended" }),
+        )
+        .await;
+    ok(&reply, did::set_state::v0_1::Payload::TYPE_URI);
+    wait_until(
+        || async { daemon.get_log(mnemonic).await.status() == reqwest::StatusCode::NOT_FOUND },
+        SETTLE_TIMEOUT,
+        "the daemon refuses a disabled DID",
+    )
+    .await;
+
+    // did/delete — the daemon refuses resolution at once, with no
+    // cache-staleness window. `serve_content` used to check the
+    // disabled/deleted flag only when a record existed; `did/delete` removes
+    // the record outright (unlike `disable`, which only flips a flag on it),
+    // so that check was skipped entirely and a request fell straight through
+    // to the still-warm `AppState::did_cache` entry from the `get_log` calls
+    // above — a DID that was ever successfully resolved kept serving its
+    // last content for up to the cache's TTL after being deleted. Fixed by
+    // having `serve_content` treat a missing record as not found before ever
+    // consulting the cache, so this `get_log` needs no `wait_until`: the
+    // refusal is immediate, proven against a deliberately warm cache.
+    let reply = daemon
+        .call(
+            did::delete::v0_1::Payload::TYPE_URI,
+            json!({ "mnemonic": mnemonic }),
+        )
+        .await;
+    ok(&reply, did::delete::v0_1::Payload::TYPE_URI);
+    assert_eq!(
+        daemon.get_log(mnemonic).await.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a deleted DID must stop resolving immediately, not after the cache's TTL"
+    );
+
+    daemon.teardown().await;
+}
+
+/// `fetch-metrics` with a key that is not in the ACL must fail with the ACL
+/// refusal (`permissionDenied`), not an empty successful scrape and not a
+/// signature/proof error.
+///
+/// The refusal is an *unsigned* framework `trust-task-error`, so this drives the
+/// whole chain the maintainer asked after: the daemon's `Cx::metrics_read` ACL
+/// gate, the unsigned-error recognition in `post_trust_task_https_verified`, and
+/// the subcommand surfacing that code rather than exiting 0 with `[]`. Runs the
+/// real `did-hosting-daemon fetch-metrics` subprocess against the live daemon,
+/// signing with a freshly minted did:key that was never granted.
+#[tokio::test]
+async fn fetch_metrics_denied_for_an_ungranted_key() {
+    let daemon = Daemon::spawn().await;
+
+    // A did:key the daemon has never seen, persisted in the same key-file format
+    // `setup --setup-key-out` writes and `fetch-metrics --key` reads.
+    let key_dir = tempfile::tempdir().expect("key temp dir");
+    let key_path = key_dir.path().join("ungranted-key.json");
+    EphemeralSetupKey::generate()
+        .expect("generate an ungranted did:key")
+        .persist_to(&key_path)
+        .expect("persist the ungranted key");
+
+    let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+    let out = tokio::process::Command::new(bin)
+        .args(["fetch-metrics", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .output()
+        .await
+        .expect("run did-hosting-daemon fetch-metrics");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an ungranted key must be refused, not a successful scrape. stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("permissionDenied"),
+        "the operator should see the ACL refusal code, not a signature/proof error. stderr={stderr:?}"
+    );
+
+    daemon.teardown().await;
+}
+
+/// `fetch-metrics` with a key granted `MetricsReader` succeeds: it signs,
+/// verifies the daemon's signed reply, confirms the reply is the metrics
+/// `#response`, and prints the counters as a JSON array (exit 0).
+///
+/// Counters are only populated when the daemon is built with the `metrics`
+/// feature; without it the snapshot's `counters` array is present but empty.
+/// So this asserts the whole success path — valid output, clean exit — rather
+/// than a specific counter value: stdout must parse as a JSON array.
+#[tokio::test]
+async fn fetch_metrics_succeeds_for_a_granted_key() {
+    // Mint the MetricsReader did:key first so its DID can be granted before the
+    // daemon starts, and persist it in the format `fetch-metrics --key` reads.
+    let key_dir = tempfile::tempdir().expect("key temp dir");
+    let key_path = key_dir.path().join("metrics-reader-key.json");
+    let key = EphemeralSetupKey::generate().expect("generate a MetricsReader did:key");
+    let reader_did = key.did.clone();
+    key.persist_to(&key_path)
+        .expect("persist the MetricsReader key");
+
+    let daemon = Daemon::spawn_with_acl(&[(
+        reader_did,
+        did_hosting_common::server::acl::Role::MetricsReader,
+    )])
+    .await;
+
+    let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+    let out = tokio::process::Command::new(bin)
+        .args(["fetch-metrics", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .output()
+        .await
+        .expect("run did-hosting-daemon fetch-metrics");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a granted MetricsReader key must scrape successfully. stdout={stdout:?} stderr={stderr:?}"
+    );
+    // The last stdout line is the counters JSON (the daemon prints a banner to
+    // stderr, not stdout). It must be a JSON array — possibly empty when the
+    // daemon was built without the `metrics` feature.
+    let last = stdout.lines().last().unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(last)
+        .unwrap_or_else(|e| panic!("counters output is not JSON: {e}; stdout={stdout:?}"));
+    assert!(
+        parsed.is_array(),
+        "counters output must be a JSON array, got {parsed:?}"
+    );
+
+    daemon.teardown().await;
+}
+
+/// `DAEMON_SERVER_RESOLVE_RATE_LIMIT_*` reaches a running daemon: its
+/// `.well-known` routes and its root fallback share one per-address budget,
+/// a refusal is `429` with `Retry-After`, and neither the health check nor
+/// the Trust Task listener is counted.
+#[tokio::test]
+async fn resolution_is_rate_limited_per_address() {
+    const LIMIT: usize = 20;
+    let daemon = Daemon::spawn_with(
+        &[],
+        &[
+            ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_MAX_PER_WINDOW", "20"),
+            ("DAEMON_SERVER_RESOLVE_RATE_LIMIT_WINDOW_SECS", "3600"),
+        ],
+        true,
+    )
+    .await;
+    let http = reqwest::Client::new();
+    let get = |path: &str| http.get(format!("{}{path}", daemon.base_url)).send();
+
+    // Spawning already resolved the root DID at least once, so the budget
+    // runs out within LIMIT requests, cycling through the server's routes,
+    // the root fallback and the nested watcher's.
+    const PATHS: [&str; 3] = [
+        "/.well-known/did.jsonl",
+        "/ghost/did.jsonl",
+        "/watcher/ghost/did.jsonl",
+    ];
+    let mut refused_at = None;
+    for i in 0..LIMIT {
+        let path = PATHS[i % PATHS.len()];
+        let resp = get(path).await.expect("GET the daemon");
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            assert!(resp.headers().contains_key("retry-after"));
+            refused_at = Some(i);
+            break;
+        }
+    }
+    let refused_at = refused_at.expect("the resolution budget runs out");
+    assert!(
+        refused_at >= PATHS.len(),
+        "every route kind was served before the limit"
+    );
+    for path in PATHS {
+        assert_eq!(
+            get(path).await.expect("GET the daemon").status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{path} shares the budget"
+        );
+    }
+
+    assert!(
+        get("/api/health")
+            .await
+            .expect("GET health")
+            .status()
+            .is_success()
+    );
+    let trust_task = http
+        .post(format!("{}/api/trust-tasks", daemon.base_url))
+        .body("{}")
+        .send()
+        .await
+        .expect("POST the daemon");
+    assert_ne!(trust_task.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    daemon.teardown().await;
+}
+
+/// Every surface the daemon serves carries the same response headers the
+/// standalone services set: the console, the Trust Task listener, the embedded
+/// witness and watcher, and DID resolution. Resolution keeps the cacheable
+/// `Cache-Control` its handlers choose; everything else defaults to
+/// `no-store`.
+#[tokio::test]
+async fn every_daemon_surface_carries_the_response_headers() {
+    let daemon = Daemon::spawn_with(&[], &[], true).await;
+    let http = reqwest::Client::new();
+
+    fn assert_common(path: &str, headers: &reqwest::header::HeaderMap) {
+        let csp = headers
+            .get("content-security-policy")
+            .unwrap_or_else(|| panic!("{path}: no Content-Security-Policy"))
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"), "{path}: CSP {csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{path}: CSP {csp}");
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
+        assert_eq!(headers["x-frame-options"], "DENY", "{path}");
+        assert_eq!(headers["referrer-policy"], "no-referrer", "{path}");
+        assert!(
+            headers.contains_key("strict-transport-security"),
+            "{path}: no HSTS"
+        );
+    }
+
+    // The console (or its 404 when the bundle was not built) and a client-side
+    // route the SPA fallback answers.
+    for path in ["/", "/dids"] {
+        let resp = http
+            .get(format!("{}{path}", daemon.base_url))
+            .send()
+            .await
+            .expect("GET the console");
+        assert_common(path, resp.headers());
+        assert_eq!(resp.headers()["cache-control"], "no-store", "{path}");
+    }
+
+    // The Trust Task listener, answering a document it cannot parse.
+    let resp = http
+        .post(format!("{}/api/trust-tasks", daemon.base_url))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("POST trust-tasks");
+    assert_common("/api/trust-tasks", resp.headers());
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+
+    // The embedded witness's and watcher's listeners.
+    for path in ["/witness/api/trust-tasks", "/watcher/ghost/did.jsonl"] {
+        let resp = if path.starts_with("/witness") {
+            http.post(format!("{}{path}", daemon.base_url))
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await
+        } else {
+            http.get(format!("{}{path}", daemon.base_url)).send().await
+        }
+        .expect("request the daemon");
+        assert_common(path, resp.headers());
+    }
+
+    // Resolution: the headers are there, and its own caching is kept.
+    let resp = http
+        .get(format!("{}/.well-known/did.jsonl", daemon.base_url))
+        .send()
+        .await
+        .expect("GET the root DID");
+    assert!(resp.status().is_success());
+    assert_common("/.well-known/did.jsonl", resp.headers());
+    let cache = resp.headers()["cache-control"].to_str().unwrap();
+    assert_ne!(cache, "no-store", "resolution keeps its own Cache-Control");
+    // And browser resolvers can still read it cross-origin.
+    assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+
+    daemon.teardown().await;
+}
+
+/// The paths the daemon's README and `docs/configuration.md` document are the
+/// paths it serves: the daemon's own `/health` and the control plane's
+/// `/api/health`, `/api/sign-in/readiness`, `/api/auth/challenge` and
+/// `/api/trust-tasks` at the root; public resolution (`.well-known`, the
+/// agent-name namespace) at the root; the embedded witness's listener under
+/// `/witness` and the embedded watcher's resolution under `/watcher`. The
+/// nested witness and watcher have no health route of their own — the
+/// standalone binaries add `/api/health` themselves — so neither
+/// `/witness/api/health` nor `/watcher/api/health` answers as one.
+#[tokio::test]
+async fn documented_daemon_routes_are_served() {
+    let daemon = Daemon::spawn_with(&[], &[], true).await;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let url = |path: &str| format!("{}{path}", daemon.base_url);
+
+    let health: serde_json::Value = http
+        .get(url("/health"))
+        .send()
+        .await
+        .expect("GET /health")
+        .json()
+        .await
+        .expect("/health is JSON");
+    assert_eq!(health["service"], "did-hosting-daemon");
+
+    for path in [
+        "/api/health",
+        "/api/sign-in/readiness",
+        "/.well-known/did.jsonl",
+    ] {
+        let resp = http.get(url(path)).send().await.expect("GET the daemon");
+        assert!(resp.status().is_success(), "{path}: {}", resp.status());
+    }
+
+    // The embedded watcher's resolution answers under `/watcher` (an unknown
+    // slot is its 404, not the console).
+    assert_eq!(
+        http.get(url("/watcher/ghost/did.jsonl"))
+            .send()
+            .await
+            .expect("GET the watcher")
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // It reads the daemon's one store, so it serves the daemon's own root
+    // log — the hosting service's record, not a `WatcherRecord`, which once
+    // failed this request with a 500.
+    let resp = http
+        .get(url("/watcher/.well-known/did.jsonl"))
+        .send()
+        .await
+        .expect("GET the watcher's root log");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let watcher_root = resp.text().await.expect("root log body");
+    let root = http
+        .get(url("/.well-known/did.jsonl"))
+        .send()
+        .await
+        .expect("GET the root log")
+        .text()
+        .await
+        .expect("root log body");
+    assert_eq!(watcher_root, root);
+
+    // The did:web route is the resolver's, not the console's fallback,
+    // whatever it makes of a loopback root DID.
+    let resp = http
+        .get(url("/.well-known/did.json"))
+        .send()
+        .await
+        .expect("GET the daemon");
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !content_type.starts_with("text/html"),
+        "/.well-known/did.json fell through to the console"
+    );
+
+    // Routed, whatever they make of an empty body.
+    for path in [
+        "/api/trust-tasks",
+        "/api/auth/challenge",
+        "/witness/api/trust-tasks",
+    ] {
+        let status = http
+            .post(url(path))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("POST the daemon")
+            .status();
+        assert_ne!(status, reqwest::StatusCode::NOT_FOUND, "{path}");
+        assert_ne!(status, reqwest::StatusCode::METHOD_NOT_ALLOWED, "{path}");
+    }
+
+    // The agent-name namespace is served (no names are bound, so 404 — from
+    // the redirect handler, not the console's fallback).
+    for path in ["/@", "/@nobody"] {
+        let resp = http.get(url(path)).send().await.expect("GET a name");
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+
+    // No nested health routes.
+    for path in ["/witness/api/health", "/watcher/api/health"] {
+        let resp = http.get(url(path)).send().await.expect("GET the daemon");
+        let is_json = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/json"));
+        assert!(
+            !(resp.status().is_success() && is_json),
+            "{path} answered as a health route"
+        );
+    }
+
+    daemon.teardown().await;
+}
+
+/// `send-trust-task` with an admin key: signs `identity/list/0.1`, verifies the
+/// daemon's signed reply, and prints the response payload as JSON (exit 0).
+/// The same key sending a type this workspace does not speak is refused
+/// before anything is sent.
+#[tokio::test]
+async fn send_trust_task_lists_identity_generations() {
+    let key_dir = tempfile::tempdir().expect("key temp dir");
+    let key_path = key_dir.path().join("admin-key.json");
+    let key = EphemeralSetupKey::generate().expect("generate an admin did:key");
+    let admin_did = key.did.clone();
+    key.persist_to(&key_path).expect("persist the admin key");
+
+    let daemon =
+        Daemon::spawn_with_acl(&[(admin_did, did_hosting_common::server::acl::Role::Admin)]).await;
+    let bin = env!("CARGO_BIN_EXE_did-hosting-daemon");
+
+    let out = tokio::process::Command::new(bin)
+        .args(["send-trust-task", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--type", "identity/list/0.1"])
+        .output()
+        .await
+        .expect("run did-hosting-daemon send-trust-task");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "an admin key must be answered. stdout={stdout:?} stderr={stderr:?}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("output is not JSON: {e}; stdout={stdout:?}"));
+    let generations = parsed["generations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no generations array: {parsed}"));
+    assert_eq!(
+        generations
+            .iter()
+            .filter(|g| g["current"].as_bool() == Some(true))
+            .count(),
+        1,
+        "exactly one current generation: {parsed}"
+    );
+
+    let unknown = tokio::process::Command::new(bin)
+        .args(["send-trust-task", "--config"])
+        .arg(&daemon.config_path)
+        .arg("--key")
+        .arg(&key_path)
+        .args(["--type", "identity/list/9.9"])
+        .output()
+        .await
+        .expect("run did-hosting-daemon send-trust-task");
+    assert!(
+        !unknown.status.success(),
+        "an unknown version must be refused"
+    );
+
+    daemon.teardown().await;
+}

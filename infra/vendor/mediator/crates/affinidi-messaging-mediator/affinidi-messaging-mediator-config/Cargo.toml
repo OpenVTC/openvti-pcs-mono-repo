@@ -1,0 +1,49 @@
+[package]
+name = "affinidi-messaging-mediator-config"
+version.workspace = true
+description = "Raw TOML configuration schema for the Affinidi Messaging Mediator (shared by the mediator and its setup tool)"
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+publish.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Schema + config loading + validation. Still lean — no runtime/server stack.
+serde = { workspace = true, features = ["derive"] }
+# TOML parsing for `read_config_file`.
+toml.workspace = true
+# Records every key the schema does not recognise (typo'd, removed, or filed
+# under the wrong `[table]`) so the mediator can warn instead of dropping it.
+serde_ignored = "0.1"
+# CIDR validation for trusted reverse-proxy client attribution.
+ipnet = { workspace = true, features = ["serde"] }
+# Lean error type for config loading (`ConfigError`).
+thiserror.workspace = true
+# Structured logging in the file-reading helpers, matching the mediator; its
+# `LevelFilter` is what `settings::log_level` reads `log_level` into.
+tracing.workspace = true
+# `[secrets] cache_ttl` durations (`settings::secrets_cache_ttl`).
+humantime.workspace = true
+# The lean ACL types used by validation (`types::acls`). Taken directly rather
+# than through mediator-common, which depends on this crate.
+affinidi-messaging-mediator-types.workspace = true
+# `did_identity`: the account a DID names (a did:scid DID URL's `src` locator is
+# not part of the identity) and its SHA-256 hash. Re-exported by mediator-common.
+affinidi-did-common.workspace = true
+sha256.workspace = true
+
+[dev-dependencies]
+# `check_tls` test writes temp cert/key files.
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "tracing_unstable"]
+rustc-args = ["--cfg", "tracing_unstable"]

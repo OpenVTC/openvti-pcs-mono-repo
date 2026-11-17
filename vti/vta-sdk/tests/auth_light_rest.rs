@@ -1,0 +1,1072 @@
+//! Coverage harness for `vta_sdk::auth_light` and the auth-touching
+//! paths in `vta_sdk::client::VtaClient` (`from_credential`,
+//! `ensure_token_valid` refresh-on-expiry, full re-auth fallback).
+//!
+//! All tests run against a `wiremock` server. The holder `did:key` +
+//! private key are derived from a fixed seed via `ed25519_dalek` + the
+//! SDK's own multibase helpers — no private key material leaves the test
+//! process. The holder must be a real key pair because the auth request
+//! is now a DI-signed Trust Task (`auth_di`), not an anoncrypt envelope.
+
+#![cfg(feature = "client")]
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ed25519_dalek::SigningKey;
+use serde_json::json;
+use vta_sdk::auth_light::{
+    authenticate_with_credential, challenge_response_light, refresh_token_light,
+};
+use vta_sdk::client::VtaClient;
+use vta_sdk::credentials::CredentialBundle;
+use vta_sdk::did_key::ed25519_multibase_pubkey;
+use vta_sdk::error::VtaError;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+// ── Test fixtures ───────────────────────────────────────────────────
+
+/// A challenge shaped like the real thing. The canonical handler issues
+/// hex-encoded 32 random bytes and the spec payload type enforces
+/// `minLength: 16`, so a short toy nonce is not a valid fixture — the typed
+/// builder in `auth_di` rejects it before it reaches the wire.
+const CHALLENGE: &str = "a3f1c09b7e2d4856a3f1c09b7e2d4856";
+
+/// Build a deterministic `did:key` + matching multibase private-key
+/// string from a seed byte. The client DID must be a valid `did:key`
+/// (the server's DI-proof resolver accepts nothing else); the VTA DID is
+/// only an addressee, so tests may use any method for it.
+fn did_key_from_seed(seed_byte: u8) -> (String, String) {
+    let seed = [seed_byte; 32];
+    let sk = SigningKey::from_bytes(&seed);
+    let pk = sk.verifying_key().to_bytes();
+    let did = format!("did:key:{}", ed25519_multibase_pubkey(&pk));
+    // Multicodec Ed25519 private-key prefix (0x1300 → varint 0x80 0x26)
+    // followed by the 32-byte seed, base58btc multibase encoded.
+    let mut buf = vec![0x80, 0x26];
+    buf.extend_from_slice(&seed);
+    let priv_mb = multibase::encode(multibase::Base::Base58Btc, &buf);
+    (did, priv_mb)
+}
+
+/// A `config/show` `#response` signed as `vta_did`, the way a real VTA answers.
+///
+/// The three token-refresh tests below care about the *order* of the auth calls
+/// and not about the reply, so their fixture used to be a placeholder:
+/// `urn:test:response`, unsigned. Since #1341 that is two separate refusals —
+/// `urn:` is not a Trust-Task type URI, and an unsigned reply from a client that
+/// holds an identity is rejected on principle. Both are the client being right,
+/// so the mock has to answer the way the thing it is standing in for does.
+async fn signed_config_reply(vta_did: &str, vta_priv: &str) -> serde_json::Value {
+    let mut doc: trust_tasks_rs::TrustTask<serde_json::Value> = serde_json::from_value(json!({
+        "id": "urn:uuid:00000000-0000-4000-8000-000000000000",
+        "type": "https://trusttasks.org/spec/config/show/0.1#response",
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": {"fields": []}
+    }))
+    .expect("a well-formed Trust-Task document");
+    vta_sdk::trust_task_sign::sign_in_place(&mut doc, vta_did, vta_priv)
+        .await
+        .expect("sign the mock VTA's reply");
+    serde_json::to_value(doc).expect("serialise the signed reply")
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+async fn mount_challenge(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "challenge": CHALLENGE,
+            "sessionId": "sess-test",
+            "expiresAt": "2026-12-31T23:59:59Z"
+        })))
+        .mount(server)
+        .await;
+}
+
+// ── Rate limiting ───────────────────────────────────────────────────
+//
+// The unauthenticated auth endpoints are the ones behind the VTA's limiter, so
+// they are where an operator meets a 429 first. It must arrive typed and
+// attributed: as a flat string it read as a fault, and through the boxed
+// session path as "authentication failed".
+
+#[tokio::test]
+async fn challenge_endpoint_429_from_the_vta_is_rate_limited_and_attributed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-rate-limit-source", "vta")
+                .insert_header("retry-after", "7")
+                .set_body_json(json!({ "error": "rate limited", "limiter": "auth" })),
+        )
+        .mount(&server)
+        .await;
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let err = challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+        .await
+        .unwrap_err();
+    match err {
+        VtaError::RateLimited {
+            limited_by,
+            retry_after,
+            limiter,
+            url,
+        } => {
+            assert_eq!(limited_by, vta_sdk::rate_limit::RateLimitSource::Vta);
+            assert!(retry_after.is_some(), "Retry-After must survive");
+            assert_eq!(limiter.as_deref(), Some("auth"));
+            assert_eq!(url, Some(format!("{}/trust-tasks", server.uri())));
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn authenticate_endpoint_429_without_a_source_header_is_upstream() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-ratelimit-after", "4")
+                .set_body_string("Too Many Requests! Wait for 4s"),
+        )
+        .mount(&server)
+        .await;
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let err = challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            VtaError::RateLimited {
+                limited_by: vta_sdk::rate_limit::RateLimitSource::Upstream,
+                retry_after: Some(_),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+/// The boxed-error session path formats every other refusal into a string; a
+/// 429 must stay downcastable so the CLI renders it as a rate limit rather
+/// than an authentication failure.
+#[cfg(feature = "session")]
+#[tokio::test]
+async fn session_challenge_response_keeps_a_429_typed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(ResponseTemplate::new(429).insert_header("x-rate-limit-source", "vta"))
+        .mount(&server)
+        .await;
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let err =
+        vta_sdk::session::challenge_response(&server.uri(), &client_did, &client_priv, &vta_did)
+            .await
+            .unwrap_err();
+    let typed = err
+        .downcast_ref::<VtaError>()
+        .unwrap_or_else(|| panic!("429 must stay a VtaError, got {err}"));
+    assert!(typed.is_rate_limited(), "got {typed:?}");
+}
+
+/// `idempotent` is the single retry owner, so it is where a rate limit is
+/// retried: a refusal whose wait fits the cap is re-attempted, and the second
+/// attempt's result is returned.
+#[tokio::test]
+async fn idempotent_retries_a_rate_limit_that_fits_the_cap() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let client = VtaClient::new("http://127.0.0.1:1");
+    let attempts = AtomicUsize::new(0);
+    let result = client
+        .idempotent(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(VtaError::RateLimited {
+                    limited_by: vta_sdk::rate_limit::RateLimitSource::Vta,
+                    retry_after: Some(chrono::Utc::now()),
+                    limiter: None,
+                    url: None,
+                })
+            } else {
+                Ok("done")
+            }
+        })
+        .await;
+    assert_eq!(result.unwrap(), "done");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+/// ...and one asking for longer than the cap surfaces on the first attempt,
+/// rather than sleeping the cap only to be refused again.
+#[tokio::test]
+async fn idempotent_surfaces_a_rate_limit_longer_than_the_cap_at_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let client = VtaClient::new("http://127.0.0.1:1");
+    let attempts = AtomicUsize::new(0);
+    let result: Result<(), _> = client
+        .idempotent(|| async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(VtaError::RateLimited {
+                limited_by: vta_sdk::rate_limit::RateLimitSource::Vta,
+                retry_after: Some(chrono::Utc::now() + chrono::Duration::minutes(10)),
+                limiter: None,
+                url: None,
+            })
+        })
+        .await;
+    assert!(result.unwrap_err().is_rate_limited());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+/// Mount the canonical `authenticate` response shape. The `expires_at`
+/// argument is the absolute Unix-second value the client should
+/// observe after parsing. We anchor `issuedAt` at the Unix epoch so
+/// `issuedAt + expiresIn == expires_at` arithmetic falls out
+/// trivially without parsing nuance.
+async fn mount_authenticate(server: &MockServer, expires_at: u64) {
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess-test",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "access-jwt",
+                "tokenType": "Bearer",
+                "expiresIn": expires_at,
+                "refreshToken": "refresh-tok",
+                "refreshExpiresIn": expires_at + 3600
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+// ── challenge_response_light ────────────────────────────────────────
+
+/// A login behind a busy IP: authenticate is refused by the VTA's limiter.
+/// The client must wait and redeem the challenge it holds — asking for a new
+/// one would spend the token its authenticate needed, and leave the old
+/// challenge pending against the DID's cap.
+#[tokio::test]
+async fn a_rate_limited_authenticate_is_retried_with_the_same_challenge() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "challenge": CHALLENGE,
+            "sessionId": "sess-test",
+            "expiresAt": "2099-12-31T23:59:59Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-rate-limit-source", "vta")
+                .insert_header("x-rate-limit-scope", "auth-authenticate")
+                .insert_header("retry-after", "1"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_authenticate(&server, now_secs() + 900).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let result =
+        challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+            .await
+            .expect("the login completes after waiting out the limit");
+    assert_eq!(result.access_token, "access-jwt");
+    // `.expect(1)` on the challenge mock is verified when `server` drops.
+}
+
+#[tokio::test]
+async fn challenge_response_success_returns_tokens() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    mount_authenticate(&server, 1_700_001_000).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+
+    let result =
+        challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+            .await
+            .unwrap();
+
+    assert_eq!(result.access_token, "access-jwt");
+    assert_eq!(result.access_expires_at, 1_700_001_000);
+    assert_eq!(result.refresh_token.as_deref(), Some("refresh-tok"));
+    assert_eq!(result.refresh_expires_at, Some(1_700_001_000 + 3600));
+}
+
+#[tokio::test]
+async fn challenge_endpoint_401_maps_to_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(ResponseTemplate::new(401).set_body_string("not authorized"))
+        .mount(&server)
+        .await;
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let err = challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VtaError::Auth(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn challenge_endpoint_500_maps_to_server() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let err = challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+        .await
+        .unwrap_err();
+    match err {
+        VtaError::Server { status, .. } => assert_eq!(status, 500),
+        other => panic!("expected Server, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn authenticate_endpoint_401_maps_to_auth() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(401).set_body_string("bad challenge"))
+        .mount(&server)
+        .await;
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let err = challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VtaError::Auth(_)), "got {err:?}");
+}
+
+/// The VTA verifies the holder's DI proof with a `did:key`-only resolver
+/// (`vti-common/src/auth/di_proof.rs`), so a non-`did:key` holder is refused
+/// locally as `Validation` rather than after a round trip.
+#[tokio::test]
+async fn non_did_key_holder_maps_to_validation() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    let (_, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let err = challenge_response_light(
+        &http,
+        &server.uri(),
+        "did:web:example.com",
+        &client_priv,
+        &vta_did,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, VtaError::Validation(_)), "got {err:?}");
+}
+
+/// The VTA's DID is only an addressee on the signed document, never resolved
+/// by the client — so a DID method the old anoncrypt packer couldn't resolve
+/// (it needed the VTA's `keyAgreement` key) now authenticates fine.
+#[tokio::test]
+async fn non_key_vta_did_still_authenticates() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    mount_authenticate(&server, 1_700_001_000).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let http = reqwest::Client::new();
+    let result = challenge_response_light(
+        &http,
+        &server.uri(),
+        &client_did,
+        &client_priv,
+        "did:web:not-a-key",
+    )
+    .await
+    .expect("the VTA DID is not resolved on this path");
+    assert_eq!(result.access_token, "access-jwt");
+}
+
+/// The request body must be a DI-signed `auth/authenticate/0.3` Trust Task —
+/// **not** an anoncrypt DIDComm envelope, which the VTA rejects outright since
+/// it began requiring an authenticated sender (VTI #771).
+#[tokio::test]
+async fn authenticate_body_is_a_signed_trust_task() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    mount_authenticate(&server, 1_700_001_000).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+        .await
+        .unwrap();
+
+    let req = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| {
+            r.url.path() == "/trust-tasks" && {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap_or_default();
+                body["type"] == vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3
+            }
+        })
+        .expect("an authenticate /trust-tasks request was made");
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body is JSON");
+
+    assert_eq!(
+        body["type"], "https://trusttasks.org/spec/auth/authenticate/0.3",
+        "body must be an authenticate Trust Task"
+    );
+    assert_eq!(body["payload"]["challenge"], CHALLENGE);
+    assert_eq!(body["payload"]["sessionId"], "sess-test");
+    assert_eq!(body["issuer"], client_did);
+    assert_eq!(body["proof"]["cryptosuite"], "eddsa-jcs-2022");
+    assert!(body.get("protected").is_none(), "must not be a JWE");
+}
+
+/// The VTA answers a Trust-Task request with a Trust-Task `#response`
+/// document; the client must unwrap it, not just handle flat JSON.
+#[tokio::test]
+async fn trust_task_wrapped_response_is_unwrapped() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "urn:uuid:resp-1",
+            "type": "https://trusttasks.org/spec/auth/authenticate/0.3#response",
+            "threadId": "urn:uuid:req-1",
+            "payload": {
+                "session": {
+                    "id": "sess-test",
+                    "subject": "did:example:caller",
+                    "issuedAt": "1970-01-01T00:00:00Z",
+                    "expiresAt": "2099-12-31T23:59:59Z",
+                    "amr": ["did"],
+                    "acr": "aal1"
+                },
+                "tokens": {
+                    "accessToken": "wrapped-access",
+                    "tokenType": "Bearer",
+                    "expiresIn": 1_700_001_000_u64,
+                    "refreshToken": "wrapped-refresh",
+                    "refreshExpiresIn": 1_700_004_600_u64
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let result =
+        challenge_response_light(&http, &server.uri(), &client_did, &client_priv, &vta_did)
+            .await
+            .unwrap();
+    assert_eq!(result.access_token, "wrapped-access");
+    assert_eq!(result.refresh_token.as_deref(), Some("wrapped-refresh"));
+}
+
+// ── refresh_token_light ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn refresh_token_success_rotates_tokens() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_REFRESH_0_2,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess-test",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "new-access",
+                "tokenType": "Bearer",
+                "expiresIn": 2_000_000_000_u64,
+                "refreshToken": "new-refresh",
+                "refreshExpiresIn": 2_000_003_600_u64
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let (client_did, _) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let result = refresh_token_light(&http, &server.uri(), &client_did, &vta_did, "old-refresh")
+        .await
+        .unwrap();
+    assert_eq!(result.access_token, "new-access");
+    assert_eq!(result.refresh_token.as_deref(), Some("new-refresh"));
+}
+
+#[tokio::test]
+async fn refresh_token_401_maps_to_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_REFRESH_0_2,
+        ))
+        .respond_with(ResponseTemplate::new(401).set_body_string("refresh token not found"))
+        .mount(&server)
+        .await;
+    let (client_did, _) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let http = reqwest::Client::new();
+    let err = refresh_token_light(&http, &server.uri(), &client_did, &vta_did, "old")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, VtaError::Auth(_)));
+}
+
+/// Refresh posts an **unsigned** `auth/refresh/0.2` Trust Task: the opaque
+/// token is the credential (RFC 6749 §10.4), so the VTA verifies the token
+/// rather than a signer — and neither DID is resolved.
+#[tokio::test]
+async fn refresh_body_is_an_unsigned_trust_task() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_REFRESH_0_2,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess-test",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "a",
+                "tokenType": "Bearer",
+                "expiresIn": 2_000_000_000_u64
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let (client_did, _) = did_key_from_seed(0x11);
+    let http = reqwest::Client::new();
+    // A `did:web` VTA is fine here — nothing resolves it.
+    refresh_token_light(
+        &http,
+        &server.uri(),
+        &client_did,
+        "did:web:not-a-key",
+        "old-refresh",
+    )
+    .await
+    .expect("refresh needs no DID resolution");
+
+    let req = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/trust-tasks")
+        .expect("a refresh request was made");
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body is JSON");
+    assert_eq!(body["type"], "https://trusttasks.org/spec/auth/refresh/0.2");
+    assert_eq!(body["payload"]["refreshToken"], "old-refresh");
+    assert!(body.get("proof").is_none(), "refresh must not be signed");
+}
+
+// ── authenticate_with_credential ────────────────────────────────────
+
+#[tokio::test]
+async fn authenticate_with_credential_uses_url_override() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    mount_authenticate(&server, 1_700_001_000).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    // Bundle has no URL — override drives the call.
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did);
+    let (result, returned_cred, _http) = authenticate_with_credential(&cred, Some(&server.uri()))
+        .await
+        .unwrap();
+    assert_eq!(result.access_token, "access-jwt");
+    // Bundle echoed back unchanged.
+    assert_eq!(returned_cred.did, cred.did);
+}
+
+#[tokio::test]
+async fn authenticate_with_credential_uses_bundle_url() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    mount_authenticate(&server, 1_700_001_000).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did).vta_url(server.uri());
+    let (result, _, _) = authenticate_with_credential(&cred, None).await.unwrap();
+    assert_eq!(result.access_token, "access-jwt");
+}
+
+#[tokio::test]
+async fn authenticate_with_credential_no_url_anywhere_fails() {
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did);
+    let err = authenticate_with_credential(&cred, None).await.unwrap_err();
+    match err {
+        VtaError::Validation(msg) => assert!(msg.contains("no VTA URL")),
+        other => panic!("expected Validation, got {other:?}"),
+    }
+}
+
+// ── VtaClient::from_credential + token-refresh integration ──────────
+
+#[tokio::test]
+async fn from_credential_authenticates_and_exposes_token() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    mount_authenticate(&server, 1_700_001_000).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did).vta_url(server.uri());
+
+    let client = VtaClient::from_credential(&cred, None).await.unwrap();
+    assert_eq!(client.token_expires_at().await, Some(1_700_001_000));
+    assert_eq!(client.rest_url(), Some(server.uri().trim_end_matches('/')));
+}
+
+#[tokio::test]
+async fn from_credential_url_override_wins_over_bundle() {
+    let server = MockServer::start().await;
+    mount_challenge(&server).await;
+    mount_authenticate(&server, 1_700_001_000).await;
+
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, _) = did_key_from_seed(0x22);
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did)
+        .vta_url("https://stale.example.com");
+    let client = VtaClient::from_credential(&cred, Some(&server.uri()))
+        .await
+        .unwrap();
+    assert_eq!(client.rest_url(), Some(server.uri().trim_end_matches('/')));
+}
+
+/// Exercise `client::ensure_token_valid`'s refresh-on-expiry path:
+/// the initial auth returns an already-expired access token plus a
+/// still-valid refresh token. The next authenticated call must hit
+/// `/auth/refresh` first, then proceed with the new access token.
+#[tokio::test]
+async fn ensure_token_valid_refreshes_expired_access_token() {
+    let server = MockServer::start().await;
+    // Hoisted above the mocks: one of them now signs as this VTA, so the key has
+    // to exist before it is mounted — and its private half is no longer discarded.
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, vta_priv) = did_key_from_seed(0x22);
+    mount_challenge(&server).await;
+
+    // Initial auth: access already expired, refresh still good.
+    // `issuedAt: 1970-01-01T00:00:00Z` makes expiresIn = absolute epoch.
+    let future = now_secs() + 3600;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "expired-access",
+                "tokenType": "Bearer",
+                "expiresIn": 100_u64,
+                "refreshToken": "live-refresh",
+                "refreshExpiresIn": future
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Refresh: returns a fresh access token (future expiry).
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_REFRESH_0_2,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "fresh-access",
+                "tokenType": "Bearer",
+                "expiresIn": future,
+                "refreshToken": "newer-refresh",
+                "refreshExpiresIn": future + 3600
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Downstream call must carry the *refreshed* token, not the expired one.
+    // `get_config` is the probe for "an authenticated call"; it now rides the
+    // Trust Tasks HTTPS binding like every other typed operation.
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer fresh-access",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(signed_config_reply(&vta_did, &vta_priv).await),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did).vta_url(server.uri());
+    let client = VtaClient::from_credential(&cred, None).await.unwrap();
+
+    // Trigger an authenticated call → ensure_token_valid sees expired
+    // access, calls refresh, then proceeds. wiremock's expect counters
+    // verify the order of calls.
+    client.get_config().await.unwrap();
+    assert_eq!(client.token_expires_at().await, Some(future));
+}
+
+/// When the refresh token is itself expired, `ensure_token_valid` falls
+/// through to a full re-authentication via `challenge_response_light`.
+#[tokio::test]
+async fn ensure_token_valid_full_reauth_when_refresh_expired() {
+    let server = MockServer::start().await;
+    // Hoisted above the mocks: one of them now signs as this VTA, so the key has
+    // to exist before it is mounted — and its private half is no longer discarded.
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, vta_priv) = did_key_from_seed(0x22);
+
+    // Two sequential challenge calls expected (initial + re-auth).
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "challenge": CHALLENGE,
+            "sessionId": "sess",
+            "expiresAt": "2099-12-31T23:59:59Z"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let future = now_secs() + 3600;
+    // wiremock matches mocks in registration order until each
+    // `up_to_n_times` budget is exhausted. So the first /auth/ call
+    // hits the "stale tokens" mock; the second hits the "reauth" mock.
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "stale-access",
+                "tokenType": "Bearer",
+                "expiresIn": 100_u64,
+                "refreshToken": "stale-refresh",
+                "refreshExpiresIn": 100_u64
+            }
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "reauth-access",
+                "tokenType": "Bearer",
+                "expiresIn": future,
+                "refreshToken": "reauth-refresh",
+                "refreshExpiresIn": future + 3600
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // `get_config` is the probe for "an authenticated call"; it now rides the
+    // Trust Tasks HTTPS binding like every other typed operation.
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer reauth-access",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(signed_config_reply(&vta_did, &vta_priv).await),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did).vta_url(server.uri());
+    let client = VtaClient::from_credential(&cred, None).await.unwrap();
+    client.get_config().await.unwrap();
+}
+
+/// If the refresh endpoint itself fails, `ensure_token_valid` must fall
+/// through to a full re-auth instead of bubbling the refresh error.
+#[tokio::test]
+async fn ensure_token_valid_falls_through_when_refresh_fails() {
+    let server = MockServer::start().await;
+    // Hoisted above the mocks: one of them now signs as this VTA, so the key has
+    // to exist before it is mounted — and its private half is no longer discarded.
+    let (client_did, client_priv) = did_key_from_seed(0x11);
+    let (vta_did, vta_priv) = did_key_from_seed(0x22);
+
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_CHALLENGE_0_1,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "challenge": CHALLENGE,
+            "sessionId": "sess",
+            "expiresAt": "2099-12-31T23:59:59Z"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let future = now_secs() + 3600;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "expired",
+                "tokenType": "Bearer",
+                "expiresIn": 100_u64,
+                "refreshToken": "live-but-server-rejects",
+                "refreshExpiresIn": future
+            }
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_AUTHENTICATE_0_3,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session": {
+                "id": "sess",
+                "subject": "did:example:caller",
+                "issuedAt": "1970-01-01T00:00:00Z",
+                "expiresAt": "2099-12-31T23:59:59Z",
+                "amr": ["did"],
+                "acr": "aal1"
+            },
+            "tokens": {
+                "accessToken": "fallback-access",
+                "tokenType": "Bearer",
+                "expiresIn": future,
+                "refreshToken": "fallback-refresh",
+                "refreshExpiresIn": future + 3600
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Refresh returns 401: invalid → should be tolerated, full re-auth runs.
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(header(
+            "Trust-Task",
+            vta_sdk::trust_tasks::TASK_AUTH_REFRESH_0_2,
+        ))
+        .respond_with(ResponseTemplate::new(401).set_body_string("token reuse detected"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // `get_config` is the probe for "an authenticated call"; it now rides the
+    // Trust Tasks HTTPS binding like every other typed operation.
+    Mock::given(method("POST"))
+        .and(path("/trust-tasks"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer fallback-access",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(signed_config_reply(&vta_did, &vta_priv).await),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cred = CredentialBundle::new(client_did, client_priv, vta_did).vta_url(server.uri());
+    let client = VtaClient::from_credential(&cred, None).await.unwrap();
+    client.get_config().await.unwrap();
+}

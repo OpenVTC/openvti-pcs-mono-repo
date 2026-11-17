@@ -1,0 +1,596 @@
+use super::Database;
+use crate::error_codes;
+use crate::errors::MediatorError;
+use crate::store::{AccessListUpdate, AccessListUpdateOutcome, DeliveryDecision, ops};
+use crate::types::{
+    acls::{AccessListModeType, MediatorACLSet},
+    acls_handler::{
+        MediatorACLExpanded, MediatorACLGetResponse, MediatorAccessListAddResponse,
+        MediatorAccessListGetResponse, MediatorAccessListListResponse,
+    },
+};
+use redis::{Cmd, Pipeline, Value, from_redis_value};
+use tracing::{Instrument, Level, debug, span, warn};
+
+// Redis-backend implementation behind `RedisStore`.
+impl Database {
+    /// Replace the ACL for a given DID
+    /// Assumes that the checks on can you change the ACL have already been done
+    pub(crate) async fn set_did_acl(
+        &self,
+        did_hash: &str,
+        acls: &MediatorACLSet,
+    ) -> Result<MediatorACLSet, MediatorError> {
+        let _span = span!(Level::DEBUG, "set_acl");
+
+        async move {
+            debug!("Setting ACL for ({}) DID in mediator", did_hash);
+
+            let mut con = self.get_connection().await?;
+
+            redis::Cmd::hset(self.keys().did(did_hash), "ACLS", acls.to_hex_string())
+                .exec_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".to_string(),
+                        &err,
+                        format!("set_acl failed. Reason: {err}"),
+                    )
+                })?;
+
+            Ok(acls.to_owned())
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Get ACL for a given DID
+    /// Returns the ACL for the given DID, or None if DID isn't found
+    pub(crate) async fn get_did_acl(
+        &self,
+        did_hash: &str,
+    ) -> Result<Option<MediatorACLSet>, MediatorError> {
+        let _span = span!(Level::DEBUG, "get_did_acl");
+
+        async move {
+            debug!("Requesting ACL for ({}) DID from mediator", did_hash);
+
+            let mut con = self.get_connection().await?;
+
+            let acl: Option<String> = redis::Cmd::hget(self.keys().did(did_hash), "ACLS")
+                .query_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".to_string(),
+                        &err,
+                        format!("get_did_acls failed. Reason: {err}"),
+                    )
+                })?;
+
+            if let Some(acl) = acl {
+                Ok(Some(MediatorACLSet::from_hex_string(&acl).map_err(
+                    |e| {
+                        MediatorError::InternalError(
+                            error_codes::ACL_PARSE_ERROR,
+                            did_hash.into(),
+                            e.to_string(),
+                        )
+                    },
+                )?))
+            } else {
+                Ok(None)
+            }
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Retrieves a list of ACLs for given DIDS
+    /// - `dids` - List of DIDs (hashes) to retrieve ACLs for (limit 100)
+    /// - Returns a list of ACLs for the given DIDs
+    pub(crate) async fn get_did_acls(
+        &self,
+        dids: &[String],
+        mediator_acl_mode: AccessListModeType,
+    ) -> Result<MediatorACLGetResponse, MediatorError> {
+        let _span = span!(Level::DEBUG, "get_did_acls");
+
+        async move {
+            debug!("Requesting ACLs for ({}) DIDs from mediator", dids.len());
+            if dids.len() > 100 {
+                return Err(MediatorError::DatabaseError(
+                    error_codes::ACL_GET_DIDS_LIMIT,
+                    "NA".to_string(),
+                    "# of DIDs cannot exceed 100".to_string(),
+                ));
+            }
+
+            let mut con = self.get_connection().await?;
+
+            let mut query = Pipeline::new();
+            query.atomic();
+
+            for did in dids {
+                query.add_command(Cmd::hget(self.keys().did(did), "ACLS"));
+            }
+
+            let result: Vec<Value> = self.query_each(&mut con, query).await.map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".to_string(),
+                    &err,
+                    format!("get_did_acls failed. Reason: {err}"),
+                )
+            })?;
+
+            let mut acl_response: MediatorACLGetResponse = MediatorACLGetResponse {
+                acl_response: vec![],
+                mediator_acl_mode,
+            };
+            for (index, item) in result.iter().enumerate() {
+                if let Ok(acls_hex) = from_redis_value::<String>(item.clone()) {
+                    let acls = MediatorACLSet::from_hex_string(&acls_hex).map_err(|e| {
+                        MediatorError::InternalError(
+                            error_codes::ACL_PARSE_ERROR,
+                            dids[index].clone(),
+                            e.to_string(),
+                        )
+                    })?;
+                    acl_response.acl_response.push(MediatorACLExpanded {
+                        did_hash: dids[index].clone(),
+                        acl_value: acls.to_hex_string(),
+                        acls,
+                    });
+                }
+            }
+            Ok(acl_response)
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Checks if the `check_hash` is allowed in the access list for the given `key_hash`
+    /// - `to_hash` - Hash of the DID we are checking against (typically the TO address)
+    /// - `from_hash` - Hash of the DID we are checking for (typically the FROM address)
+    ///
+    /// Returns true if it exists, false otherwise
+    ///
+    /// Expressed in terms of `Self::delivery_decision` so the mode
+    /// interpretation lives in exactly one place. Preserves the fail-closed
+    /// contract: a missing account or a backend error is `false`.
+    pub async fn access_list_allowed(&self, to_hash: &str, from_hash: Option<&str>) -> bool {
+        match self.delivery_decision(to_hash, from_hash).await {
+            Ok(Some(decision)) => decision.access_list_allows,
+            Ok(None) => {
+                debug!("ACL not found for DID: {}", to_hash);
+                false
+            }
+            Err(err) => {
+                warn!("access_list_allowed failed. Reason: {}", err);
+                false
+            }
+        }
+    }
+
+    /// Recipient-side delivery inputs in a single round trip.
+    ///
+    /// For a known sender this is one pipelined `SISMEMBER` + `HGET`: the
+    /// access-list membership probe and the recipient's ACL bitmask come back
+    /// together, and the mode is then applied in-process by
+    /// [`ops::access_list_allowed`]. Callers that also need existence and a
+    /// capability check get them from the same result rather than issuing
+    /// `account_exists` and `get_did_acl` of their own.
+    pub(crate) async fn delivery_decision(
+        &self,
+        to_hash: &str,
+        from_hash: Option<&str>,
+    ) -> Result<Option<DeliveryDecision>, MediatorError> {
+        let mut con = self.get_connection().await?;
+
+        let (acl, sender) = if let Some(from_hash) = from_hash {
+            let (on_access_list, acl): (bool, Option<String>) = redis::pipe()
+                .atomic()
+                .cmd("SISMEMBER")
+                .arg(self.keys().access_list(to_hash))
+                .arg(from_hash)
+                .cmd("HGET")
+                .arg(self.keys().did(to_hash))
+                .arg("ACLS")
+                .query_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".to_string(),
+                        &err,
+                        format!("delivery_decision failed. Reason: {err}"),
+                    )
+                })?;
+
+            (acl, ops::Sender::Known { on_access_list })
+        } else {
+            // Anonymous sender: the access list is irrelevant, only the
+            // recipient's anon_receive bit matters — so skip the membership
+            // probe and read the ACL alone.
+            let acl: Option<String> = Cmd::hget(self.keys().did(to_hash), "ACLS")
+                .query_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".to_string(),
+                        &err,
+                        format!("delivery_decision failed. Reason: {err}"),
+                    )
+                })?;
+
+            (acl, ops::Sender::Anonymous)
+        };
+
+        let Some(acl) = acl else {
+            return Ok(None);
+        };
+        let acls = MediatorACLSet::from_hex_string(&acl).map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::ACL_PARSE_ERROR,
+                to_hash.into(),
+                e.to_string(),
+            )
+        })?;
+        let access_list_allows = ops::access_list_allowed(&acls, sender);
+
+        debug!(
+            to_hash,
+            access_list_allows, "delivery_decision resolved for recipient"
+        );
+
+        Ok(Some(DeliveryDecision {
+            acls,
+            access_list_allows,
+        }))
+    }
+
+    /// Retrieves DID hashes from the Access List
+    /// - `did_hash` - DID Hash to retrieve the Access List for
+    /// - `cursor` - Cursor for pagination ("0" for beginning )
+    ///
+    /// - Returns a list of ACLs for the given DID
+    pub(crate) async fn access_list_list(
+        &self,
+        did_hash: &str,
+        cursor: u64,
+    ) -> Result<MediatorAccessListListResponse, MediatorError> {
+        let _span = span!(
+            Level::DEBUG,
+            "access_list_list",
+            did_hash = did_hash,
+            cursor = cursor
+        );
+
+        async move {
+            debug!("Requesting Access List");
+
+            let mut con = self.get_connection().await?;
+            let (new_cursor, hashes): (u64, Vec<String>) = redis::cmd("SSCAN")
+                .arg(self.keys().access_list(did_hash))
+                .arg(cursor)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".to_string(),
+                        &err,
+                        format!("access_list_list failed. Reason: {err}"),
+                    )
+                })?;
+
+            Ok(MediatorAccessListListResponse {
+                cursor: Some(new_cursor),
+                did_hashes: hashes,
+            })
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Adds a number of DID hashes to the Access List, up to
+    /// `access_list_limit` entries in total. When the request does not fit,
+    /// the first `limit - current` hashes are added and `truncated` is set,
+    /// as on the other backends.
+    /// - `did_hash` - DID Hash to add to
+    /// - `hashes` - Hashes to add
+    ///
+    /// - Whether the list was truncated and a list of hashes added
+    pub(crate) async fn access_list_add(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<MediatorAccessListAddResponse, MediatorError> {
+        let _span = span!(
+            Level::DEBUG,
+            "access_list_add",
+            did_hash = did_hash,
+            add_count = hashes.len()
+        );
+
+        async move {
+            debug!("Adding to Access List");
+
+            if hashes.is_empty() {
+                return Ok(MediatorAccessListAddResponse {
+                    did_hashes: Vec::new(),
+                    truncated: false,
+                });
+            }
+
+            // The script never adds more than `access_list_limit` hashes, so
+            // only that many are sent to it: a request larger than the limit
+            // costs no more than one at the limit, and is reported truncated.
+            let over_limit = hashes.len() > access_list_limit;
+            let hashes = &hashes[..hashes.len().min(access_list_limit)];
+
+            // Count, truncate and add in one step, so concurrent adds cannot
+            // each see room that only one of them has.
+            let mut con = self.get_connection().await?;
+            let (truncated, hashes): (i64, Vec<String>) = ACCESS_LIST_ADD
+                .key(self.keys().access_list(did_hash))
+                .arg(access_list_limit)
+                .arg(hashes)
+                .invoke_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".to_string(),
+                        &err,
+                        format!("access_list_add failed. Reason: {err}"),
+                    )
+                })?;
+            let truncated = over_limit || truncated != 0;
+
+            Ok(MediatorAccessListAddResponse {
+                did_hashes: hashes,
+                truncated,
+            })
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Removes a number of DID hashes from the Access List
+    /// - `did_hash` - DID Hash to remove from
+    /// - `hashes` - Hashes to be removed
+    ///
+    /// - Returns count of hashes removed
+    pub(crate) async fn access_list_remove(
+        &self,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<usize, MediatorError> {
+        let _span = span!(
+            Level::DEBUG,
+            "access_list_remove",
+            did_hash = did_hash,
+            remove_count = hashes.len()
+        );
+
+        async move {
+            debug!("Removing from Access List");
+
+            let mut con = self.get_connection().await?;
+            let mut query = redis::cmd("SREM");
+            let mut query = query.arg(self.keys().access_list(did_hash));
+
+            for hash in hashes {
+                query = query.arg(hash);
+            }
+
+            query.query_async(&mut con).await.map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".to_string(),
+                    &err,
+                    format!("access_list_remove failed. Reason: {err}"),
+                )
+            })
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Clears the Access List for a given DID
+    /// - `did_hash` - DID Hash to clear
+    ///
+    /// - Returns success (nothing) or Error
+    pub(crate) async fn access_list_clear(&self, did_hash: &str) -> Result<(), MediatorError> {
+        let _span = span!(Level::DEBUG, "access_list_clear", did_hash = did_hash,);
+
+        async move {
+            debug!("Clearing Access List");
+
+            let mut con = self.get_connection().await?;
+            redis::cmd("DEL")
+                .arg(self.keys().access_list(did_hash))
+                .exec_async(&mut con)
+                .await
+                .map_err(|err| {
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".to_string(),
+                        &err,
+                        format!("access_list_clear failed. Reason: {err}"),
+                    )
+                })
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Check if a number of DID hashes exist in an Access List
+    /// - `did_hash` - DID Hash to get from
+    /// - `hashes` - Hashes to be checked
+    ///
+    /// - Returns array of Hashes that exist in the Access List
+    pub(crate) async fn access_list_get(
+        &self,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<MediatorAccessListGetResponse, MediatorError> {
+        let _span = span!(
+            Level::DEBUG,
+            "access_list_get",
+            did_hash = did_hash,
+            get_count = hashes.len()
+        );
+
+        async move {
+            debug!("Getting from Access List");
+
+            let mut con = self.get_connection().await?;
+            let mut query = redis::cmd("SMISMEMBER");
+            let mut query = query.arg(self.keys().access_list(did_hash));
+
+            for hash in hashes {
+                query = query.arg(hash);
+            }
+
+            let results: Vec<u8> = query.query_async(&mut con).await.map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    "NA".to_string(),
+                    &err,
+                    format!("access_list_get failed. Reason: {err}"),
+                )
+            })?;
+
+            Ok(MediatorAccessListGetResponse {
+                did_hashes: hashes
+                    .iter()
+                    .zip(results.iter())
+                    .filter_map(|(hash, result)| {
+                        if *result == 1 {
+                            Some(hash.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            })
+        }
+        .instrument(_span)
+        .await
+    }
+}
+
+/// Add ARGV[2..] to the set KEYS[1] while it holds fewer than ARGV[1]
+/// members: when they do not all fit, only the first `limit - SCARD` are
+/// added. Returns `{truncated (0/1), added}`.
+static ACCESS_LIST_ADD: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"
+local limit = tonumber(ARGV[1])
+local count = redis.call('SCARD', KEYS[1])
+local n = #ARGV - 1
+local take = n
+local truncated = 0
+if count + n > limit then
+  truncated = 1
+  take = limit - count
+  if take < 0 then take = 0 end
+end
+local added = {}
+for i = 2, take + 1 do added[#added + 1] = ARGV[i] end
+for i = 1, #added, 500 do
+  redis.call('SADD', KEYS[1], unpack(added, i, math.min(i + 499, #added)))
+end
+return {truncated, added}
+"#,
+    )
+});
+
+/// One `access-list/update` on the set KEYS[1]: `clear`, then `add` up to
+/// the limit, then `remove`, in one step.
+///
+/// ARGV: limit, clear (`1`/`0`), the number of hashes to add `n`, then the
+/// `n` hashes to add, then the hashes to remove. Returns `{truncated (0/1),
+/// added, removed, count}`, following `ops::plan_access_list_update`.
+///
+/// The shebang makes Redis refuse the whole script up front when it is out of
+/// memory, so a `clear` is never applied without the `add` that follows it.
+static ACCESS_LIST_UPDATE: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+    redis::Script::new(
+        r#"#!lua
+local limit = tonumber(ARGV[1])
+local n = tonumber(ARGV[3])
+if ARGV[2] == '1' then redis.call('DEL', KEYS[1]) end
+local count = redis.call('SCARD', KEYS[1])
+local take = n
+local truncated = 0
+if count + n > limit then
+  truncated = 1
+  take = limit - count
+  if take < 0 then take = 0 end
+end
+local added = {}
+for i = 4, take + 3 do added[#added + 1] = ARGV[i] end
+for i = 1, #added, 500 do
+  redis.call('SADD', KEYS[1], unpack(added, i, math.min(i + 499, #added)))
+end
+local removed = {}
+for i = n + 4, #ARGV do
+  if redis.call('SREM', KEYS[1], ARGV[i]) == 1 then removed[#removed + 1] = ARGV[i] end
+end
+return { truncated, added, removed, redis.call('SCARD', KEYS[1]) }
+"#,
+    )
+});
+
+impl Database {
+    /// [`AclStore::access_list_update`](crate::store::AclStore::access_list_update):
+    /// one script on the access list's key.
+    pub(crate) async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        // The script never adds more than the limit, so no more are sent: a
+        // request past the limit costs no more than one at it, and reports
+        // truncated.
+        let over_limit = update.add.len() > access_list_limit;
+        let add = &update.add[..update.add.len().min(access_list_limit)];
+
+        let mut con = self.get_connection().await?;
+        let mut invocation = ACCESS_LIST_UPDATE.prepare_invoke();
+        invocation
+            .key(self.keys().access_list(did_hash))
+            .arg(access_list_limit)
+            .arg(if update.clear { "1" } else { "0" })
+            .arg(add.len())
+            .arg(add)
+            .arg(&update.remove);
+        let (truncated, added, removed, count): (i64, Vec<String>, Vec<String>, usize) =
+            invocation.invoke_async(&mut con).await.map_err(|err| {
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    did_hash.into(),
+                    &err,
+                    format!("access_list_update failed. Reason: {err}"),
+                )
+            })?;
+        Ok(AccessListUpdateOutcome {
+            added,
+            truncated: over_limit || truncated != 0,
+            removed,
+            count,
+        })
+    }
+}

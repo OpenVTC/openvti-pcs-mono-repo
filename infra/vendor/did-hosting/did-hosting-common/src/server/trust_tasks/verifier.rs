@@ -1,0 +1,1025 @@
+//! [`TransportBoundVerifier`] — a [`ProofVerifier`] that binds every proof to
+//! the document's in-band `issuer`.
+//!
+//! ## The rule
+//!
+//! A proof-bearing document is accepted only when:
+//!
+//! 1. it carries an in-band `issuer` — **always**; a document that names no
+//!    issuer is refused, whatever transport carried it; and
+//! 2. the proof's `verificationMethod` is controlled by that issuer
+//!    (`vm_DID == issuer`, exact string match per SPEC.md §4.8), **or** the
+//!    verifier was built for one bearer session with
+//!    [`TransportBoundVerifier::with_session_delegate`] and the proof is signed
+//!    by exactly that session's key on behalf of exactly that session's
+//!    principal; and
+//! 3. the signature verifies over the document.
+//!
+//! The issuer is therefore always something the proof establishes, never
+//! something the transport asserted. Callers authorise on
+//! `ResolvedParties::issuer`, and with this verifier in front of them that value
+//! is the proven signer on every binding.
+//!
+//! ## Why the issuer is required, not merely checked when present
+//!
+//! An issuer-less document verifies as a bare possession check: *someone* holds
+//! the key named by `verificationMethod`. The framework then fills the issuer
+//! from the transport's reported sender (SPEC §4.8.1) and every handler
+//! authorises on that. So the only thing binding the signer to the identity the
+//! handler acts for is the transport's report of who sent the message — and a
+//! transport's report is not a proof. Any signer could pair its own valid proof
+//! with somebody else's name on the envelope. Requiring the issuer in-band, and
+//! binding it to the key, makes the document itself say who it is from.
+//!
+//! ## The passkey session delegate
+//!
+//! A passkey can't produce an `eddsa-jcs-2022` proof, so the Web UI signs with
+//! an ephemeral session key generated at login. That key's `did:key` is
+//! deliberately not the user's DID; the bearer JWT's `sub` is, and the login
+//! flow binds the session public key into the JWT. For that one case the HTTPS
+//! route builds a per-request verifier with
+//! [`TransportBoundVerifier::with_session_delegate`]`(jwt.sub, session_vm)`, and
+//! a document is then accepted when its `issuer` is the JWT subject and its
+//! proof is signed by exactly the JWT-bound session key. The delegate is never
+//! configured on a shared verifier, so no other transport can use it.
+//!
+//! **Invariants under test:** an issuer-less document is rejected; an
+//! issuer-present-but-`vm`-mismatched document is rejected; a delegate accepts
+//! only its own key for only its own principal. See `tests`.
+
+//! ## Operational proofs
+//!
+//! [`TransportBoundVerifier::verify_operational`] is the stricter check the
+//! sender-bound gate uses for a service's own messages (control ↔ edge ops,
+//! DID-management requests, session-signed UI envelopes). Per the VTI key-roles
+//! rules these are *operational*, not attestations, so the proof must carry
+//! `proofPurpose: authentication` and its `verificationMethod` must be listed
+//! under the signer's `authentication` relationship. `assertionMethod` is
+//! reserved for attestation artefacts (credentials) and is refused here.
+//!
+//! ## Approver decisions
+//!
+//! [`TransportBoundVerifier::verify_approval`] is the counterpart for a human
+//! approver's decision (a consent decision, a step-up approval): the one
+//! document that is an attestation, so it must carry `proofPurpose:
+//! assertionMethod` with the key listed under the signer's `assertionMethod`.
+//!
+//! ## Deactivated signers
+//!
+//! A `did:webvh` signer whose DID is deactivated is refused on the operational
+//! and approval paths, whatever its last document lists (see
+//! `DeactivationCache`). The verdict is remembered for the DID cache TTL, in a
+//! bounded map, and is re-read whenever the DID cache re-resolves the document.
+//!
+//! ## Unreachable signers
+//!
+//! A signer whose DID cannot be resolved (its log is unreachable, or its status
+//! cannot be read) is refused as [`VerifyFailureKind::Unreachable`]; callers
+//! report it as retryable, since the same document may verify once the DID is
+//! reachable again. The kind is a typed value carried from the resolver that
+//! decided it ([`VerifyFailure`]), never read back out of an error message:
+//! the messages name the signer's DID, which the document's sender chooses.
+//!
+//! ## Key rotation and the DID cache
+//!
+//! Keys are resolved through the DID cache, whose TTL is bounded
+//! ([`crate::server::identity::DID_CACHE_TTL_SECS`]). A peer that has just
+//! rotated signs with a key its cached document does not list yet, so a proof
+//! that fails against a cached document is retried **once** against a freshly
+//! resolved one before it is refused. The forced refresh is rate-limited per
+//! DID ([`FORCED_REFRESH_INTERVAL`]) so a stream of bad proofs cannot turn into
+//! a stream of outbound resolutions.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use affinidi_data_integrity::{DataIntegrityError, ResolvedKey, SignatureFailure, VerifyOptions};
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use async_trait::async_trait;
+use didwebvh_rs::host_policy::HostPolicy;
+use didwebvh_rs::resolve::ResolveOptions;
+use serde::Serialize;
+use trust_tasks_proof::affinidi::{
+    CachedDidResolver, ProofPurpose, ProofPurposeResolver, PurposeBound,
+};
+use trust_tasks_rs::{ProofVerifier, TrustTask, VerificationError};
+
+/// The only `proofPurpose` an operational (sender-bound) proof may carry.
+pub const OPERATIONAL_PROOF_PURPOSE: &str = "authentication";
+
+/// The only `proofPurpose` a human approver's decision may carry.
+pub const APPROVAL_PROOF_PURPOSE: &str = "assertionMethod";
+
+/// Opens the message of a failure to resolve a signer's DID, for people
+/// reading it. The failure's kind is [`VerifyFailureKind::Unreachable`]; this
+/// text is never used to decide it.
+const UNREACHABLE: &str = "signer DID unreachable";
+
+/// Ends the message of a refusal because the signer deactivated its DID. The
+/// failure's kind is [`VerifyFailureKind::Deactivated`]; this text is never
+/// used to decide it.
+const DEACTIVATED: &str = "is deactivated; its keys are no longer valid";
+
+/// Most DIDs whose deactivation verdict is remembered at once.
+const DEACTIVATION_CACHE_CAPACITY: usize = 4096;
+
+/// What kind of failure a proof verification was: whether it may clear on its
+/// own, and whether a fresh resolution of the signer could change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VerifyFailureKind {
+    /// The signer's DID could not be resolved, or its status read. May clear:
+    /// the same document is worth sending again.
+    Unreachable,
+    /// The signer has deactivated its DID. Final; no fresh resolution is
+    /// tried, since a `did:webvh` deactivation cannot be undone.
+    Deactivated,
+    /// Anything else: the proof itself is wrong for this signer. Final.
+    Invalid,
+}
+
+/// A failed proof verification: the framework's [`VerificationError`], for the
+/// wire and the logs, and the [`VerifyFailureKind`] the verifier decided,
+/// which is what callers act on.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct VerifyFailure {
+    pub kind: VerifyFailureKind,
+    pub error: VerificationError,
+}
+
+impl VerifyFailure {
+    /// Whether the signer's DID could not be resolved — a condition that may
+    /// clear, unlike a bad proof.
+    pub fn is_unreachable(&self) -> bool {
+        self.kind == VerifyFailureKind::Unreachable
+    }
+}
+
+/// A failure the verifier did not classify further is a bad proof.
+impl From<VerificationError> for VerifyFailure {
+    fn from(error: VerificationError) -> Self {
+        Self {
+            kind: VerifyFailureKind::Invalid,
+            error,
+        }
+    }
+}
+
+impl From<VerifyFailure> for VerificationError {
+    fn from(failure: VerifyFailure) -> Self {
+        failure.error
+    }
+}
+
+/// A signer-key resolution failure and its kind.
+struct ResolveFailure {
+    kind: VerifyFailureKind,
+    error: DataIntegrityError,
+}
+
+impl ResolveFailure {
+    fn new(kind: VerifyFailureKind, error: DataIntegrityError) -> Self {
+        Self { kind, error }
+    }
+}
+
+/// Resolves a signer's key for a proof purpose and says what kind of failure
+/// a refusal is.
+#[async_trait]
+trait SignerResolve: Send + Sync {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure>;
+}
+
+/// A caller-supplied resolver, which cannot say what kind a failure is: every
+/// refusal from it is [`VerifyFailureKind::Invalid`].
+struct Unclassified<R>(R);
+
+#[async_trait]
+impl<R: ProofPurposeResolver> SignerResolve for Unclassified<R> {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure> {
+        self.0
+            .resolve_vm_for_purpose(vm, purpose)
+            .await
+            .map_err(|e| ResolveFailure::new(VerifyFailureKind::Invalid, e))
+    }
+}
+
+/// A caller-supplied resolver whose every refusal is an unreachable signer:
+/// the test seam [`TransportBoundVerifier::with_unreachable_resolver`].
+#[cfg(any(test, feature = "test-support"))]
+struct AllUnreachable<R>(R);
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl<R: ProofPurposeResolver> SignerResolve for AllUnreachable<R> {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure> {
+        self.0
+            .resolve_vm_for_purpose(vm, purpose)
+            .await
+            .map_err(|e| ResolveFailure::new(VerifyFailureKind::Unreachable, e))
+    }
+}
+
+/// One verification attempt's view of a [`SignerResolve`]: the library's
+/// resolver interface, remembering the kind of the failure the library will
+/// report, which its error type has no room for. Built per attempt, so
+/// concurrent verifications never see each other's failures.
+struct Recording<'a> {
+    inner: &'a dyn SignerResolve,
+    kind: Mutex<Option<VerifyFailureKind>>,
+}
+
+impl<'a> Recording<'a> {
+    fn new(inner: &'a dyn SignerResolve) -> Self {
+        Self {
+            inner,
+            kind: Mutex::new(None),
+        }
+    }
+
+    /// The kind of the last resolution failure, if a resolution failed.
+    fn failure_kind(&self) -> Option<VerifyFailureKind> {
+        *self.kind.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[async_trait]
+impl ProofPurposeResolver for Recording<'_> {
+    async fn resolve_vm_for_purpose(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, DataIntegrityError> {
+        self.inner
+            .resolve_signer(vm, purpose)
+            .await
+            .map_err(|failure| {
+                *self.kind.lock().unwrap_or_else(|p| p.into_inner()) = Some(failure.kind);
+                failure.error
+            })
+    }
+}
+
+/// Minimum spacing between forced re-resolutions of one DID.
+pub const FORCED_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Most DIDs the forced-refresh limiter tracks at once. Past it, a DID it is
+/// not already tracking gets no forced refresh until older entries age out of
+/// [`FORCED_REFRESH_INTERVAL`] (the proof is then refused as it stands).
+pub const FORCED_REFRESH_CAPACITY: usize = 4096;
+
+/// Longest DID the forced-refresh limiter tracks; a longer one gets no forced
+/// refresh.
+pub const FORCED_REFRESH_MAX_DID_LEN: usize = 2048;
+
+/// One bearer session's signing delegate: the only key, and the only
+/// principal, a delegated proof may name.
+#[derive(Clone, Debug)]
+struct SessionDelegate {
+    principal: String,
+    verification_method: String,
+}
+
+/// Forces the next lookup of a DID to resolve it fresh. Returns whether it did,
+/// i.e. whether a retry could see a different document.
+#[async_trait]
+trait StaleKeyRefresh: Send + Sync {
+    async fn refresh(&self, did: &str) -> bool;
+}
+
+/// Allows one forced refresh per DID per [`FORCED_REFRESH_INTERVAL`].
+///
+/// Keyed on the canonical DID ([`canonical_did`]: no path, query or
+/// fragment), so every variant of one DID that a `verificationMethod` can name
+/// — a `did:scid`'s `?src=`, with or without further parameters, a version
+/// query, a fragment — shares a single allowance. Holds at most
+/// [`FORCED_REFRESH_CAPACITY`] DIDs, each at most
+/// [`FORCED_REFRESH_MAX_DID_LEN`] bytes; when full it refuses rather than
+/// forgets, so a stream of distinct DIDs cannot reset another DID's spacing.
+#[derive(Default)]
+struct RefreshLimiter {
+    last: Mutex<HashMap<String, Instant>>,
+}
+
+impl RefreshLimiter {
+    fn allow(&self, did: &str, now: Instant) -> bool {
+        if did.len() > FORCED_REFRESH_MAX_DID_LEN {
+            return false;
+        }
+        let key = canonical_did(did).to_owned();
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        if last
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < FORCED_REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        last.retain(|_, t| now.duration_since(*t) < FORCED_REFRESH_INTERVAL);
+        if last.len() >= FORCED_REFRESH_CAPACITY {
+            return false;
+        }
+        last.insert(key, now);
+        true
+    }
+}
+
+/// Evicts a DID from the shared DID cache (and its deactivation verdict),
+/// rate-limited per DID.
+struct CacheRefresher {
+    client: DIDCacheClient,
+    limiter: RefreshLimiter,
+    deactivation: Arc<DeactivationCache>,
+}
+
+#[async_trait]
+impl StaleKeyRefresh for CacheRefresher {
+    async fn refresh(&self, did: &str) -> bool {
+        if !self.limiter.allow(did, Instant::now()) {
+            return false;
+        }
+        self.client.remove(did).await;
+        self.deactivation.forget(canonical_did(did));
+        true
+    }
+}
+
+/// Whether a `did:webvh` signer has deactivated its DID, remembered for the
+/// DID cache TTL.
+///
+/// The DID cache keeps only the document and drops resolution metadata. Before
+/// `affinidi-did-resolver-cache-sdk` 0.8.39 a deactivated webvh DID still
+/// resolved to its last document — keys included — and a document cached
+/// before the deactivation still does. So deactivation is read from the DID's
+/// own log (`didwebvh-rs` resolution metadata), both after a resolution and
+/// when one fails: 0.8.39 refuses to resolve a deactivated did:webvh at all,
+/// and that refusal must read as final, not as an unreachable signer. A DID whose deactivation cannot be established is refused: an
+/// unreadable log proves nothing about the key.
+///
+/// The verdict follows the DID cache: it is reused while the cache serves the
+/// same document and younger than the cache TTL, and re-read when the cache
+/// resolved the document afresh (or the verdict aged out). The map is bounded
+/// ([`DEACTIVATION_CACHE_CAPACITY`]); expired verdicts are dropped first.
+///
+/// The log is fetched under `host_policy`, which must be the policy the DID
+/// cache resolves with: a signer whose document the cache may fetch has to
+/// have a log this check may fetch too, or every proof from it is refused as
+/// unreachable.
+#[derive(Default)]
+struct DeactivationCache {
+    verdicts: Mutex<HashMap<String, (Instant, bool)>>,
+    host_policy: HostPolicy,
+}
+
+impl DeactivationCache {
+    fn ttl() -> Duration {
+        Duration::from_secs(u64::from(crate::server::identity::DID_CACHE_TTL_SECS))
+    }
+
+    fn forget(&self, did: &str) {
+        self.verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(did);
+    }
+
+    /// The remembered verdict, when one is fresh and the DID cache served the
+    /// document it was read alongside.
+    fn cached(&self, did: &str, document_cached: bool) -> Option<bool> {
+        if !document_cached {
+            return None;
+        }
+        self.verdicts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(did)
+            .filter(|(at, _)| at.elapsed() < Self::ttl())
+            .map(|(_, v)| *v)
+    }
+
+    fn remember(&self, did: &str, deactivated: bool) {
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(|p| p.into_inner());
+        if verdicts.len() >= DEACTIVATION_CACHE_CAPACITY && !verdicts.contains_key(did) {
+            let ttl = Self::ttl();
+            verdicts.retain(|_, (at, _)| at.elapsed() < ttl);
+            if verdicts.len() >= DEACTIVATION_CACHE_CAPACITY
+                && let Some(oldest) = verdicts
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(k, _)| k.clone())
+            {
+                verdicts.remove(&oldest);
+            }
+        }
+        verdicts.insert(did.to_string(), (Instant::now(), deactivated));
+    }
+
+    async fn is_deactivated(
+        &self,
+        did: &str,
+        document_cached: bool,
+    ) -> Result<bool, DataIntegrityError> {
+        if let Some(verdict) = self.cached(did, document_cached) {
+            return Ok(verdict);
+        }
+        let mut state = didwebvh_rs::DIDWebVHState::default();
+        let options = ResolveOptions::default().with_host_policy(self.host_policy);
+        let deactivated = state
+            .resolve(did, options)
+            .await
+            .map(|(_, meta)| meta.deactivated)
+            .map_err(|e| {
+                DataIntegrityError::Resolver(format!(
+                    "{UNREACHABLE}: cannot read the DID log of {did} to establish whether it is \
+                     deactivated ({e})"
+                ))
+            })?;
+        self.remember(did, deactivated);
+        Ok(deactivated)
+    }
+}
+
+/// Resolves a verification method for a proof purpose through the library's
+/// relationship check ([`CachedDidResolver`]: the key must be listed under the
+/// relationship the purpose names, and controlled by the DID naming it), after
+/// telling an unreachable signer apart from a bad proof, and refusing a
+/// deactivated `did:webvh` signer, or a `did:scid` one whose log is.
+struct SignerKeyResolver {
+    client: DIDCacheClient,
+    decode: CachedDidResolver,
+    /// `None` only in tests that resolve from documents placed in the cache.
+    deactivation: Option<Arc<DeactivationCache>>,
+}
+
+#[async_trait]
+impl SignerResolve for SignerKeyResolver {
+    async fn resolve_signer(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, ResolveFailure> {
+        use VerifyFailureKind::{Deactivated, Invalid, Unreachable};
+        // A did:scid reference may carry the `src` its recipient needs to
+        // resolve it (VTI-KEY-163): resolve through it, so the source is known,
+        // then dereference by DID and fragment, as the document lists its keys.
+        let did = controller_did(vm);
+        let resolved = match self.client.resolve(did).await {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                // The cache SDK (0.8.39+) refuses to resolve a deactivated
+                // did:webvh (and did:scid). That is final, not an unreachable
+                // signer: ask the DID's own log, so it is not retried as if it
+                // might come back.
+                if let Some(log_did) = crate::scid::webvh_log_did(did, None)
+                    && let Some(deactivation) = &self.deactivation
+                    && let Ok(true) = deactivation.is_deactivated(&log_did, false).await
+                {
+                    return Err(ResolveFailure::new(
+                        Deactivated,
+                        DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")),
+                    ));
+                }
+                return Err(ResolveFailure::new(
+                    Unreachable,
+                    DataIntegrityError::Resolver(format!(
+                        "{UNREACHABLE}: cannot resolve {did} (is its DID document reachable \
+                         from this service?): {e}"
+                    )),
+                ));
+            }
+        };
+        // The relationship check (and key decoding) is the library's.
+        let key = self
+            .decode
+            .resolve_vm_for_purpose(&crate::scid::strip_scid_src(vm), purpose)
+            .await
+            .map_err(|e| ResolveFailure::new(Invalid, e))?;
+        // A deactivated DID's keys sign nothing — a did:scid's no more than
+        // the did:webvh log that verifies it.
+        let document = serde_json::to_value(&resolved.doc).ok();
+        if let Some(log_did) = crate::scid::webvh_log_did(did, document.as_ref())
+            && let Some(deactivation) = &self.deactivation
+            && deactivation
+                .is_deactivated(&log_did, resolved.cache_hit)
+                .await
+                .map_err(|e| ResolveFailure::new(Unreachable, e))?
+        {
+            return Err(ResolveFailure::new(
+                Deactivated,
+                DataIntegrityError::Resolver(format!("{did} {DEACTIVATED}")),
+            ));
+        }
+        Ok(key)
+    }
+}
+
+/// A [`ProofVerifier`] that requires an in-band `issuer` and binds the proof's
+/// `verificationMethod` to it. See the module docs for the security rationale.
+#[derive(Clone)]
+pub struct TransportBoundVerifier {
+    /// Resolves keys for [`ProofVerifier::verify`].
+    resolver: Arc<dyn ProofPurposeResolver>,
+    /// Resolves keys for the operational and approval checks, which also
+    /// refuse a deactivated signer, and says what kind a refusal is.
+    signer_resolver: Arc<dyn SignerResolve>,
+    refresher: Option<Arc<dyn StaleKeyRefresh>>,
+    options: VerifyOptions,
+    delegate: Option<SessionDelegate>,
+    /// The deactivation verdicts `signer_resolver` consults; `None` for a
+    /// caller-supplied resolver. Reachable only through the `test-support`
+    /// seam [`Self::record_deactivation_verdict`].
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    deactivation: Option<Arc<DeactivationCache>>,
+    /// The forced-refresh allowance [`Self::for_replies`] uses: the same DID
+    /// cache, with a limiter of its own, so documents arriving unasked cannot
+    /// spend the allowance a reply to this service's own send relies on.
+    reply_refresher: Option<Arc<dyn StaleKeyRefresh>>,
+}
+
+/// Build the proof verifier a service checks inbound Trust Task documents with,
+/// over its configured DID cache: [`TransportBoundVerifier::with_did_cache`],
+/// so a deactivated `did:webvh` signer is refused, an unreachable signer is
+/// reported as retryable ([`VerifyFailure::is_unreachable`]), and a proof failing against a
+/// cached document is retried once against a fresh one (at most one forced
+/// re-resolution per DID per [`FORCED_REFRESH_INTERVAL`]).
+///
+/// Every service (control plane, server, and each half of the daemon) builds
+/// its verifier here, so they cannot drift apart. Build it once, at startup,
+/// and keep it: the verifier remembers DID-status verdicts for the DID cache
+/// TTL and rate-limits forced re-resolutions, and a verifier built per message
+/// would remember nothing and limit nothing. `None` when no resolver is
+/// configured, in which case no signed document can be accepted.
+pub fn build_verifier(
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<Arc<TransportBoundVerifier>> {
+    did_resolver
+        .cloned()
+        .map(|client| Arc::new(TransportBoundVerifier::with_did_cache(client)))
+}
+
+impl TransportBoundVerifier {
+    /// Construct a verifier over a caller-supplied `resolver`, used for both
+    /// general and operational checks. For resolvers whose documents cannot
+    /// separate relationships (the local `did:key` resolver, where the one key
+    /// is by construction an authentication key). Production code uses
+    /// [`Self::with_did_cache`].
+    pub fn with_resolver(resolver: Arc<dyn ProofPurposeResolver>) -> Self {
+        Self {
+            signer_resolver: Arc::new(Unclassified(resolver.clone())),
+            resolver,
+            refresher: None,
+            options: VerifyOptions::default(),
+            delegate: None,
+            deactivation: None,
+            reply_refresher: None,
+        }
+    }
+
+    /// [`Self::with_resolver`], but the operational and approval checks report
+    /// every refusal from `resolver` as an unreachable signer
+    /// ([`VerifyFailureKind::Unreachable`]), so a test can stand in for a
+    /// signer DID that cannot be resolved without a network.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_unreachable_resolver(resolver: Arc<dyn ProofPurposeResolver>) -> Self {
+        Self {
+            signer_resolver: Arc::new(AllUnreachable(resolver.clone())),
+            ..Self::with_resolver(resolver)
+        }
+    }
+
+    /// Construct a verifier over a configured DID cache client: operational
+    /// proofs must use an `authentication` key, and a proof failing against a
+    /// cached document is retried once against a fresh one.
+    ///
+    /// A `did:webvh` signer's log is read under [`HostPolicy::PublicOnly`], the
+    /// DID cache's own default; a client built with another policy needs
+    /// [`Self::with_did_cache_and_host_policy`].
+    pub fn with_did_cache(client: DIDCacheClient) -> Self {
+        Self::with_did_cache_and_host_policy(client, HostPolicy::PublicOnly)
+    }
+
+    /// [`Self::with_did_cache`] for a client built with `host_policy` — pass
+    /// the same policy given to its `DIDCacheConfigBuilder::with_host_policy`.
+    ///
+    /// The key-decoding resolver screens a signer's host itself (since
+    /// `trust-tasks-proof` 0.38), independently of the client's policy, so it
+    /// is given the same one: under [`HostPolicy::AllowPrivate`] a signer on a
+    /// loopback or private host would otherwise resolve and then be refused
+    /// at decode.
+    pub fn with_did_cache_and_host_policy(client: DIDCacheClient, host_policy: HostPolicy) -> Self {
+        let decode = CachedDidResolver::new(Arc::new(client.clone()))
+            .allow_private_hosts(matches!(host_policy, HostPolicy::AllowPrivate));
+        let deactivation = Arc::new(DeactivationCache {
+            host_policy,
+            ..DeactivationCache::default()
+        });
+        Self {
+            resolver: Arc::new(decode.clone()),
+            signer_resolver: Arc::new(SignerKeyResolver {
+                client: client.clone(),
+                decode,
+                deactivation: Some(deactivation.clone()),
+            }),
+            refresher: Some(Arc::new(CacheRefresher {
+                client: client.clone(),
+                limiter: RefreshLimiter::default(),
+                deactivation: deactivation.clone(),
+            })),
+            reply_refresher: Some(Arc::new(CacheRefresher {
+                client,
+                limiter: RefreshLimiter::default(),
+                deactivation: deactivation.clone(),
+            })),
+            options: VerifyOptions::default(),
+            delegate: None,
+            deactivation: Some(deactivation),
+        }
+    }
+
+    /// Record whether `did` is deactivated, as if its DID log had just been
+    /// read, so a test can exercise the deactivation refusal of a
+    /// [`Self::with_did_cache`] verifier without serving a `did:webvh` log.
+    /// The verdict is used only while the DID cache serves its document from
+    /// cache, exactly like one read from the log. A no-op on a verifier over a
+    /// caller-supplied resolver.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_deactivation_verdict(&self, did: &str, deactivated: bool) {
+        if let Some(deactivation) = &self.deactivation {
+            deactivation.remember(did, deactivated);
+        }
+    }
+
+    /// This verifier without the forced re-resolution retry: a proof that
+    /// fails against the cached document is refused as it stands. For a
+    /// signer this service has no standing relationship with (no ACL entry),
+    /// where a retry would only double the outbound resolutions a stranger
+    /// can cause; a known peer that has just rotated is what the retry is
+    /// for.
+    pub fn without_forced_refresh(&self) -> Self {
+        Self {
+            refresher: None,
+            ..self.clone()
+        }
+    }
+
+    /// Override the [`VerifyOptions`] (expected proof purpose, domain /
+    /// challenge, …). Defaults match `VerifyOptions::default()`.
+    pub fn with_options(mut self, options: VerifyOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Additionally accept documents whose `issuer` is `principal` and whose
+    /// proof is signed by exactly `verification_method` — a bearer session's
+    /// JWT-bound signing key acting for the JWT subject.
+    ///
+    /// Build this per request, from an already-verified bearer token, and never
+    /// on a verifier shared across callers.
+    pub fn with_session_delegate(
+        mut self,
+        principal: impl Into<String>,
+        verification_method: impl Into<String>,
+    ) -> Self {
+        self.delegate = Some(SessionDelegate {
+            principal: principal.into(),
+            verification_method: verification_method.into(),
+        });
+        self
+    }
+
+    /// This verifier, for a reply to a document this service sent: the same
+    /// DID cache and DID-status verdicts, but a forced-refresh allowance of
+    /// its own. Inbound documents anyone can send (a bad proof claiming some
+    /// peer's DID, say) spend the inbound allowance; they cannot use up the
+    /// one re-resolution a peer that has just rotated needs for its reply to
+    /// verify. Still one forced refresh per DID per
+    /// [`FORCED_REFRESH_INTERVAL`], and only for the peers this service
+    /// addresses. Cheap: clones `Arc`s.
+    pub fn for_replies(&self) -> Self {
+        Self {
+            refresher: self.reply_refresher.clone(),
+            ..self.clone()
+        }
+    }
+
+    /// Verify an operational proof: everything [`ProofVerifier::verify`]
+    /// checks, plus `proofPurpose: authentication` and a `verificationMethod`
+    /// listed under the signer's `authentication` relationship.
+    pub async fn verify_operational<P>(&self, doc: &TrustTask<P>) -> Result<(), VerificationError>
+    where
+        P: Serialize + Send + Sync,
+    {
+        self.check_operational(doc).await.map_err(Into::into)
+    }
+
+    /// [`Self::verify_operational`], reporting what kind of failure a refusal
+    /// is ([`VerifyFailure`]): whether the signer was unreachable (retryable),
+    /// deactivated, or the proof is wrong.
+    pub async fn check_operational<P>(&self, doc: &TrustTask<P>) -> Result<(), VerifyFailure>
+    where
+        P: Serialize + Send + Sync,
+    {
+        if let Some(proof) = &doc.proof
+            && proof.proof_purpose != OPERATIONAL_PROOF_PURPOSE
+        {
+            return Err(VerificationError::MalformedProof(format!(
+                "proofPurpose must be `{OPERATIONAL_PROOF_PURPOSE}` for this message, not `{}`",
+                proof.proof_purpose
+            ))
+            .into());
+        }
+        self.verify_with(
+            doc,
+            &*self.signer_resolver,
+            ProofPurpose::Authentication,
+            Delegation::Allowed,
+        )
+        .await
+    }
+
+    /// Verify a human approver's decision (consent decision, step-up
+    /// approval): everything [`ProofVerifier::verify`] checks, plus
+    /// `proofPurpose: assertionMethod`, a `verificationMethod` listed under the
+    /// signer's `assertionMethod` relationship, and — for `did:webvh` — a signer
+    /// that has not deactivated its DID.
+    ///
+    /// **Never by a session delegate.** A session key stands in for its
+    /// subject on ordinary requests only (`auth/authenticate/0.3` Conformance
+    /// item 13). An approval must be signed by a key under the approver's *own*
+    /// `assertionMethod` relationship. A `did:key` document lists its one key
+    /// under every relationship, so without this refusal a session key could
+    /// approve its own session's step-up.
+    pub async fn verify_approval<P>(&self, doc: &TrustTask<P>) -> Result<(), VerificationError>
+    where
+        P: Serialize + Send + Sync,
+    {
+        self.check_approval(doc).await.map_err(Into::into)
+    }
+
+    /// [`Self::verify_approval`], reporting what kind of failure a refusal is
+    /// ([`VerifyFailure`]).
+    pub async fn check_approval<P>(&self, doc: &TrustTask<P>) -> Result<(), VerifyFailure>
+    where
+        P: Serialize + Send + Sync,
+    {
+        if let Some(proof) = &doc.proof
+            && proof.proof_purpose != APPROVAL_PROOF_PURPOSE
+        {
+            return Err(VerificationError::MalformedProof(format!(
+                "proofPurpose must be `{APPROVAL_PROOF_PURPOSE}` for an approver's decision, not `{}`",
+                proof.proof_purpose
+            ))
+            .into());
+        }
+        self.verify_with(
+            doc,
+            &*self.signer_resolver,
+            ProofPurpose::AssertionMethod,
+            Delegation::Refused,
+        )
+        .await
+    }
+
+    /// Verify `doc` with its key resolved for `purpose`: the key must be listed
+    /// under the relationship `purpose` names in the signer's DID document.
+    async fn verify_with<P>(
+        &self,
+        doc: &TrustTask<P>,
+        resolver: &dyn SignerResolve,
+        purpose: ProofPurpose,
+        delegation: Delegation,
+    ) -> Result<(), VerifyFailure>
+    where
+        P: Serialize + Send + Sync,
+    {
+        let (parsed_proof, doc_value) = self.prepare(doc, delegation)?;
+        let recording = Recording::new(resolver);
+        let attempt = parsed_proof
+            .verify(
+                &doc_value,
+                &PurposeBound::new(&recording, purpose),
+                self.options.clone(),
+            )
+            .await;
+        let err = match attempt {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        let kind = recording.failure_kind();
+        // Only a failure that a different document could cure is worth a fresh
+        // resolution: the key was not found, or the key found did not match.
+        // A deactivated signer is final — deactivation cannot be undone. A
+        // DID that could not be resolved at all had no cached document to
+        // replace, and is already reported as retryable to the caller, so it
+        // is not resolved a second time here. Decided on the kind the
+        // resolver reported, never on the message, which names the signer.
+        let retryable = match kind {
+            Some(VerifyFailureKind::Deactivated | VerifyFailureKind::Unreachable) => false,
+            _ => matches!(
+                err,
+                DataIntegrityError::Resolver(_) | DataIntegrityError::InvalidSignature { .. }
+            ),
+        };
+        let vm = doc
+            .proof
+            .as_ref()
+            .map(|p| p.verification_method.clone())
+            .unwrap_or_default();
+        if retryable
+            && let Some(refresher) = &self.refresher
+            && refresher.refresh(controller_did(&vm)).await
+        {
+            tracing::debug!(vm, error = %err, "proof failed against cached DID document; retrying fresh");
+            let recording = Recording::new(resolver);
+            return parsed_proof
+                .verify(
+                    &doc_value,
+                    &PurposeBound::new(&recording, purpose),
+                    self.options.clone(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|err| classified(err, recording.failure_kind()));
+        }
+        Err(classified(err, kind))
+    }
+
+    /// Steps shared by every verification: parse the proof, strip it from the
+    /// document, and enforce the issuer binding.
+    fn prepare<P>(
+        &self,
+        doc: &TrustTask<P>,
+        delegation: Delegation,
+    ) -> Result<
+        (
+            affinidi_data_integrity::DataIntegrityProof,
+            serde_json::Value,
+        ),
+        VerificationError,
+    >
+    where
+        P: Serialize + Send + Sync,
+    {
+        // ─── 1. Extract the proof.
+        let Some(proof) = &doc.proof else {
+            return Err(VerificationError::MalformedProof(
+                "document carries no proof member".to_string(),
+            ));
+        };
+
+        // ─── 2. Parse our typed Proof into the Affinidi DataIntegrityProof
+        //        via the crate's public helper (members-equivalent, just
+        //        different serde casing).
+        let proof_value = serde_json::to_value(proof)
+            .map_err(|e| VerificationError::MalformedProof(format!("serialise proof: {e}")))?;
+        let parsed_proof = trust_tasks_proof::affinidi::parse_data_integrity_proof(&proof_value)?;
+
+        // ─── 3. Serialise the document minus the proof member (W3C Data
+        //        Integrity canonicalises over the doc + proof config, not
+        //        the embedded proof object).
+        let mut doc_value = serde_json::to_value(doc).map_err(|e| {
+            VerificationError::Other(format!("serialise TrustTask for verification: {e}"))
+        })?;
+        if let Some(obj) = doc_value.as_object_mut() {
+            obj.remove("proof");
+        }
+
+        // ─── 3b. issuer↔verificationMethod binding — unconditional.
+        let Some(issuer) = doc_value.get("issuer").and_then(|v| v.as_str()) else {
+            return Err(VerificationError::IssuerMismatch(
+                "document carries a proof but no in-band issuer to bind it to".to_string(),
+            ));
+        };
+        let vm = proof.verification_method.as_str();
+        // By identity: a did:scid issuer or key reference may carry `src`.
+        let self_signed = crate::scid::same_reference(controller_did(vm), issuer);
+        let delegated = delegation == Delegation::Allowed
+            && self
+                .delegate
+                .as_ref()
+                .is_some_and(|d| d.verification_method == vm && d.principal == issuer);
+        if !self_signed && !delegated {
+            return Err(VerificationError::IssuerMismatch(format!(
+                "verificationMethod is controlled by {}, not the document issuer {issuer}",
+                controller_did(vm)
+            )));
+        }
+        Ok((parsed_proof, doc_value))
+    }
+}
+
+/// The DID that controls a verification method URL (the part before `#`).
+pub fn controller_did(verification_method: &str) -> &str {
+    verification_method
+        .split('#')
+        .next()
+        .unwrap_or(verification_method)
+}
+
+/// The DID a DID URL names, with any path, query and fragment removed:
+/// `did:scid:vh:1:Qm?src=a.example&x=1#key-1` is `did:scid:vh:1:Qm`, and
+/// `did:webvh:Qm:host.example?versionId=2` is `did:webvh:Qm:host.example`.
+///
+/// What limits keyed on a signer's DID count it as, so the many spellings of
+/// one DID cannot each claim an allowance of their own. A string that is not
+/// a DID URL is returned up to the same delimiters.
+pub fn canonical_did(did_url: &str) -> &str {
+    let end = did_url.find(['/', '?', '#']).unwrap_or(did_url.len());
+    &did_url[..end]
+}
+
+#[async_trait]
+impl ProofVerifier for TransportBoundVerifier {
+    async fn verify<P>(&self, doc: &TrustTask<P>) -> Result<(), VerificationError>
+    where
+        P: Serialize + Send + Sync,
+    {
+        // The key must be authorised for the purpose the proof declares.
+        let purpose = doc
+            .proof
+            .as_ref()
+            .map(|p| ProofPurpose::parse(&p.proof_purpose))
+            .transpose()
+            .map_err(map_error)?
+            .unwrap_or(ProofPurpose::Authentication);
+        // An `assertionMethod` proof is an attestation, and a session delegate
+        // never makes one. See `verify_approval`.
+        let delegation = if matches!(purpose, ProofPurpose::AssertionMethod) {
+            Delegation::Refused
+        } else {
+            Delegation::Allowed
+        };
+        self.verify_with(doc, &Unclassified(&*self.resolver), purpose, delegation)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+/// Whether a check may accept the per-request session delegate
+/// ([`TransportBoundVerifier::with_session_delegate`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delegation {
+    /// An ordinary request: the delegate may stand in for its principal.
+    Allowed,
+    /// An attestation: only the signer's own key counts.
+    Refused,
+}
+
+/// A library failure as a [`VerifyFailure`] of the kind the resolver reported
+/// (a bad proof when it reported none).
+fn classified(err: DataIntegrityError, kind: Option<VerifyFailureKind>) -> VerifyFailure {
+    VerifyFailure {
+        kind: kind.unwrap_or(VerifyFailureKind::Invalid),
+        error: map_error(err),
+    }
+}
+
+/// Map [`DataIntegrityError`] into the framework's [`VerificationError`]
+/// taxonomy. Mirrors `trust_tasks_proof::affinidi`'s private `map_error`
+/// (kept in sync with the pinned crate version) so wire `proof_invalid`
+/// diagnostics match the stock verifier's.
+fn map_error(err: DataIntegrityError) -> VerificationError {
+    match err {
+        DataIntegrityError::UnsupportedCryptoSuite { name } => {
+            VerificationError::UnsupportedCryptosuite(name)
+        }
+        DataIntegrityError::KeyTypeMismatch {
+            expected,
+            actual,
+            suite,
+        } => VerificationError::IssuerMismatch(format!(
+            "key type {actual:?} does not match cryptosuite {suite:?} (expected {expected:?})"
+        )),
+        DataIntegrityError::InvalidSignature { reason, .. } => match reason {
+            SignatureFailure::Malformed | SignatureFailure::Invalid => {
+                VerificationError::SignatureInvalid
+            }
+            _ => VerificationError::SignatureInvalid,
+        },
+        DataIntegrityError::InvalidPublicKey { reason, .. } => {
+            VerificationError::MalformedProof(format!("public key: {reason}"))
+        }
+        DataIntegrityError::Canonicalization(reason) => {
+            VerificationError::Other(format!("canonicalisation: {reason}"))
+        }
+        DataIntegrityError::MalformedProof(reason) => VerificationError::MalformedProof(reason),
+        other => VerificationError::Other(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+#[path = "verifier_tests.rs"]
+mod tests;

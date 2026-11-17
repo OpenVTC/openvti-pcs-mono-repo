@@ -1,0 +1,1061 @@
+//! `persona …` operator commands — a person's own identity.
+//!
+//! # Two vocabularies, and which one goes where
+//!
+//! Commands and flags keep the spec's words, because that is what they address:
+//! `persona profile put --profile-id` names `persona/profile/put/1.1`, and a
+//! command that did not would be a second name for a task, drifting from the
+//! URI it sends and from every script already written against it.
+//!
+//! What an operator *reads* uses the words a person would
+//! (`design-docs/persona-vocabulary.md`): an attribute stays an **attribute**, a
+//! profile is a **face** — the set of attributes you show together — and a
+//! persona **wears** a face in a context. So `persona profile list` prints `Faces:` above JSON
+//! whose members are `profileId`. That pairing is deliberate: it is where an
+//! operator learns the mapping, once, in the one place both halves are on
+//! screen together.
+//!
+//! Thin wrappers over the `VtaClient::persona_*` methods, with one exception
+//! worth knowing about before reading further: [`cmd_disclosure_preview`]
+//! renders its response rather than dumping it, because that response is the
+//! only thing standing between an automated request and the holder's name
+//! leaving the machine. Everything else prints the payload.
+//!
+//! ## Scope, and the error an operator will actually hit
+//!
+//! Ten of these are holder-scoped — the attribute pool, profiles, correlation,
+//! and cross-context disclosure history — and the VTA requires *unrestricted*
+//! authority for them. An operator whose credential is scoped to one trust
+//! context gets `e.p.msg.forbidden`, and that is the boundary working: the pool
+//! sits above every context and is not any one context's to read. The
+//! context-scoped commands all take `--context`.
+//!
+//! `persona renderers` is on neither side. It lists the output formats this
+//! VTA ships and what each discards, which names nothing about the holder —
+//! and a context-scoped operator about to request a disclosure needs it, since
+//! `persona disclosure preview` takes a renderer by name.
+
+use std::num::NonZeroU64;
+
+use serde_json::Value;
+use vta_sdk::client::VtaClient;
+use vta_sdk::protocols::persona::{
+    ContactDocument, LocalProfileEntry, ProfileEntry, Provenance, ValueType,
+};
+use vti_specs::persona::world::delete::v1_0::{
+    ExpectedVersion as WorldDeleteExpectedVersion, Payload as WorldDeletePayload,
+    Ulid as WorldDeleteUlid,
+};
+use vti_specs::persona::world::list::v1_0::Payload as WorldListPayload;
+use vti_specs::persona::world::put::v1_1::{
+    ExpectedVersion as WorldPutExpectedVersion, Payload as WorldPutPayload,
+    PayloadIcon as WorldPutIcon, PayloadName as WorldPutName, Ulid as WorldUlid, WorldColour,
+};
+
+use crate::render::{BOLD, CYAN, DIM, RED, RESET, YELLOW, is_json_output, print_json};
+
+type CmdResult = Result<(), Box<dyn std::error::Error>>;
+
+fn print_result(label: &str, value: &Value) -> CmdResult {
+    if is_json_output() {
+        print_json(value)?;
+    } else {
+        println!("{label}");
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The pool
+// ---------------------------------------------------------------------------
+
+/// `persona attribute put` — store one attribute about the holder.
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_attribute_put(
+    client: &VtaClient,
+    claim_type: String,
+    value: Value,
+    value_type: ValueType,
+    provenance: Provenance,
+    label: Option<String>,
+    endorsements: Vec<String>,
+    attribute_id: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let result = client
+        .persona_attribute_put(
+            &claim_type,
+            value,
+            value_type,
+            provenance,
+            label.as_deref(),
+            endorsements,
+            attribute_id.as_deref(),
+            expected_version,
+        )
+        .await?;
+    print_result("Attribute:", &result)
+}
+
+/// `persona attribute list` — enumerate the pool.
+///
+/// Metadata-only unless `--values` is given. The default is not timidity: a
+/// listing that returns values is a read of the holder's identity, and the
+/// command that does it should be the one the operator typed on purpose.
+///
+/// `--sensitive` is the second half of that, and only widens the first: a card
+/// number or a passport number stays out of a `--values` listing until it is
+/// asked for by name.
+pub async fn cmd_attribute_list(
+    client: &VtaClient,
+    type_prefix: Option<String>,
+    include_values: bool,
+    include_sensitive: bool,
+    include_stale: Option<bool>,
+    limit: Option<std::num::NonZeroU64>,
+    cursor: Option<String>,
+) -> CmdResult {
+    let result = client
+        .persona_attribute_list(
+            type_prefix.as_deref(),
+            include_values,
+            include_sensitive,
+            include_stale,
+            limit,
+            cursor.as_deref(),
+        )
+        .await?;
+    if !is_json_output() {
+        // Said only where it is true, and said once. The agent withholds a
+        // sensitive value without saying so in the response — the row comes
+        // back with no `value`, which reads exactly like an attribute that never had
+        // one — so the person is told here or not at all.
+        if !include_values {
+            println!("{DIM}Names only — add --values to include the values themselves.{RESET}");
+        } else if !include_sensitive {
+            println!(
+                "{DIM}Sensitive values — cards, passports, phone numbers — are held back. \
+                 Add --sensitive to include them.{RESET}"
+            );
+        }
+    }
+    print_result("Your attributes:", &result)
+}
+
+/// `persona attribute delete` — remove one attribute.
+pub async fn cmd_attribute_delete(
+    client: &VtaClient,
+    attribute_id: String,
+    cascade: bool,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let result = client
+        .persona_attribute_delete(&attribute_id, cascade, expected_version)
+        .await?;
+    if !is_json_output() && cascade {
+        println!(
+            "{DIM}Cascaded: {attribute_id} was taken off every face that showed it. Nothing \
+             already shared is affected — that has left.{RESET}"
+        );
+    }
+    print_result("Result:", &result)
+}
+
+/// `persona attribute promote` — make a local face's values reusable. One-way.
+pub async fn cmd_attribute_promote(
+    client: &VtaClient,
+    context: String,
+    profile_id: String,
+    entries: Vec<u64>,
+    expected_version: u64,
+) -> CmdResult {
+    let out = client
+        .persona_attribute_promote(&context, &profile_id, &entries, expected_version)
+        .await?;
+    let result = serde_json::to_value(&out)?;
+    if !is_json_output() {
+        println!(
+            "{DIM}{profile_id} is now a face in your pool — same id, still worn by {} persona(s). \
+             The promoted values can be shown by your other faces; this cannot be undone.{RESET}",
+            out.rebound_persona_dids.len()
+        );
+    }
+    print_result("Promoted:", &result)
+}
+
+/// `persona attribute purge-version` — remove kept earlier values for good.
+pub async fn cmd_attribute_purge_version(
+    client: &VtaClient,
+    attribute_id: String,
+    versions: Vec<u64>,
+) -> CmdResult {
+    let out = client
+        .persona_attribute_purge_version(
+            &attribute_id,
+            (!versions.is_empty()).then_some(versions.as_slice()),
+        )
+        .await?;
+    let result = serde_json::to_value(&out)?;
+    if !is_json_output() {
+        let stale = out.stale_pins.len();
+        if out.purged.is_empty() {
+            println!("{DIM}Nothing to remove — no kept version of {attribute_id} matched.{RESET}");
+        } else if stale > 0 {
+            println!(
+                "{YELLOW}{stale} face(s) pinned what was removed, and now show nothing for it. \
+                 Repin or edit them if they should show something.{RESET}"
+            );
+        }
+        println!(
+            "{DIM}Removed from your agent. Anyone already shown the old value keeps it — \
+             `persona disclosure history` says who.{RESET}"
+        );
+    }
+    print_result("Result:", &result)
+}
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+/// `persona profile put` — create or update a projection over the pool.
+pub async fn cmd_profile_put(
+    client: &VtaClient,
+    name: String,
+    entries: Vec<ProfileEntry>,
+    credential_refs: Vec<String>,
+    reach: Option<vti_specs::persona::profile::put::v1_1::FaceReach>,
+    profile_id: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let result = client
+        .persona_profile_put(
+            &name,
+            entries,
+            credential_refs,
+            reach,
+            profile_id.as_deref(),
+            expected_version,
+        )
+        .await?;
+    print_result("Face:", &result)
+}
+
+/// `persona profile compose` — a face made for one context, and optionally
+/// worn there.
+pub async fn cmd_profile_compose(
+    client: &VtaClient,
+    context: String,
+    name: String,
+    claims: Vec<Value>,
+    persona_did: Option<String>,
+    wear: bool,
+    label: Option<String>,
+    until: Option<String>,
+) -> CmdResult {
+    let mut body = serde_json::json!({ "contextId": context, "name": name, "claims": claims });
+    if let Some(d) = persona_did {
+        body["personaDid"] = d.into();
+    }
+    if wear {
+        body["wear"] = true.into();
+    }
+    if let Some(l) = label {
+        body["label"] = l.into();
+    }
+    if let Some(u) = until {
+        body["until"] = u.into();
+    }
+    // Read into the generated payload here, so a malformed claim is reported
+    // against the published shape before anything is sent.
+    let payload: vti_specs::persona::profile::compose::v1_1::Payload =
+        serde_json::from_value(body).map_err(|e| format!("not a valid compose: {e}"))?;
+    let out = client.persona_profile_compose(&payload).await?;
+    let result = serde_json::to_value(&out)?;
+    if !is_json_output() {
+        let reused = out.pooled.iter().filter(|p| !p.was_created).count();
+        match out.scope.to_string().as_str() {
+            "local" => println!(
+                "{DIM}Kept in this context: nothing you typed is reusable elsewhere. `persona \
+                 attribute promote` makes a value reusable later.{RESET}"
+            ),
+            _ => println!(
+                "{DIM}A face in your pool, so it can be worn in other contexts too.{RESET}"
+            ),
+        }
+        if reused > 0 {
+            println!(
+                "{YELLOW}{reused} shared value(s) were already kept, so this face now draws on the \
+                 same fact as whatever else shows it — an edit changes both.{RESET}"
+            );
+        }
+    }
+    print_result("Face:", &result)
+}
+
+/// `persona profile get` — read one profile.
+pub async fn cmd_profile_get(client: &VtaClient, profile_id: String, resolve: bool) -> CmdResult {
+    let result = client.persona_profile_get(&profile_id, resolve).await?;
+    if !is_json_output() && !resolve {
+        println!(
+            "{DIM}Showing how the face is built — add --resolve to see the attributes it would \
+             show.{RESET}"
+        );
+    }
+    print_result("Face:", &result)
+}
+
+/// `persona profile list` — enumerate profiles.
+pub async fn cmd_profile_list(
+    client: &VtaClient,
+    limit: Option<std::num::NonZeroU64>,
+    cursor: Option<String>,
+    include_retired: bool,
+) -> CmdResult {
+    let result = client
+        .persona_profile_list(limit, cursor.as_deref(), include_retired)
+        .await?;
+    print_result("Faces:", &result)
+}
+
+/// `persona profile usage` — where a face is worn now.
+pub async fn cmd_profile_usage(
+    client: &VtaClient,
+    profile_id: String,
+    context: Option<String>,
+) -> CmdResult {
+    let out = client
+        .persona_profile_usage(&profile_id, context.as_deref())
+        .await?;
+    let result = serde_json::to_value(&out)?;
+    if !is_json_output() && out.usage.is_empty() {
+        println!("{DIM}Worn nowhere.{RESET}");
+    }
+    print_result("Worn in:", &result)
+}
+
+/// `persona profile timeline` — what a face has done, oldest first.
+pub async fn cmd_profile_timeline(
+    client: &VtaClient,
+    profile_id: String,
+    context: Option<String>,
+    since: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u64>,
+) -> CmdResult {
+    let out = client
+        .persona_profile_timeline(
+            &profile_id,
+            context.as_deref(),
+            since.as_deref(),
+            cursor.as_deref(),
+            limit,
+        )
+        .await?;
+    let result = serde_json::to_value(&out)?;
+    if !is_json_output() {
+        println!(
+            "{DIM}Types and parties only — a timeline never holds a value or a name you gave \
+             something.{RESET}"
+        );
+        if let Some(next) = &out.next_cursor {
+            println!("{DIM}More follows: --cursor {}{RESET}", next.as_str());
+        }
+    }
+    print_result("Timeline:", &result)
+}
+
+/// `persona profile retire` — stop wearing a face anywhere, and keep it.
+pub async fn cmd_profile_retire(
+    client: &VtaClient,
+    profile_id: String,
+    context: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let out = client
+        .persona_profile_retire(&profile_id, context.as_deref(), expected_version)
+        .await?;
+    let result = serde_json::to_value(&out)?;
+    if !is_json_output() {
+        println!(
+            "{DIM}Retired: taken off {} place(s) it was worn, and kept. `persona profile \
+             reinstate` makes it wearable again.{RESET}",
+            out.unbound.len()
+        );
+    }
+    print_result("Retired:", &result)
+}
+
+/// `persona profile reinstate` — make a retired face wearable again.
+pub async fn cmd_profile_reinstate(
+    client: &VtaClient,
+    profile_id: String,
+    context: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let out = client
+        .persona_profile_reinstate(&profile_id, context.as_deref(), expected_version)
+        .await?;
+    let result = serde_json::to_value(&out)?;
+    if !is_json_output() {
+        println!("{DIM}Wearable again, and worn nowhere until you wear it somewhere.{RESET}");
+    }
+    print_result("Reinstated:", &result)
+}
+
+/// `persona profile delete` — remove a profile.
+pub async fn cmd_profile_delete(
+    client: &VtaClient,
+    profile_id: String,
+    unbind: bool,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let result = client
+        .persona_profile_delete(&profile_id, unbind, expected_version)
+        .await?;
+    if !is_json_output() && unbind {
+        println!(
+            "{YELLOW}Taken off: every persona wearing {profile_id} now shows nothing until \
+             it wears another. Nothing already shared is affected — that has left.{RESET}"
+        );
+    }
+    if !is_json_output()
+        && let Some(parties) = result["disclosedTo"]["partyCount"].as_u64()
+        && parties > 0
+    {
+        println!(
+            "{YELLOW}This face disclosed to {parties} part{} across {} context(s). Deleting it \
+             does not un-tell them.{RESET}",
+            if parties == 1 { "y" } else { "ies" },
+            result["disclosedTo"]["contextCount"].as_u64().unwrap_or(0),
+        );
+    }
+    print_result("Result:", &result)
+}
+
+// ---------------------------------------------------------------------------
+// Bindings
+// ---------------------------------------------------------------------------
+
+/// `persona binding set` — decide what a context sees.
+pub async fn cmd_binding_set(
+    client: &VtaClient,
+    context_id: String,
+    persona_did: Option<String>,
+    profile_id: Option<String>,
+    public_entries: Vec<String>,
+    label: Option<String>,
+    until: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let clearing = profile_id.is_none();
+    let unlabelled = !clearing && label.is_none();
+    let result = client
+        .persona_binding_set(
+            &context_id,
+            persona_did.as_deref(),
+            profile_id.as_deref(),
+            public_entries,
+            label.as_deref(),
+            until.as_deref(),
+            expected_version,
+        )
+        .await?;
+    if !is_json_output() {
+        if clearing {
+            let who = result["personaDid"].as_str().unwrap_or("the persona");
+            println!("{DIM}Taken off — {who} now shows nothing in {context_id}.{RESET}");
+        } else {
+            println!(
+                "{DIM}A context only ever gets a copy: the face's values were written into \
+                 {context_id}. Editing an attribute refreshes it; copies go down, and nothing reads \
+                 up.{RESET}"
+            );
+            if unlabelled {
+                println!(
+                    "{DIM}No --label: {context_id} is given no name for this face. Your own name \
+                     for it stays yours.{RESET}"
+                );
+            }
+        }
+    }
+    print_result("Binding:", &result)
+}
+
+/// `persona binding get` — what one persona presents in one context.
+pub async fn cmd_binding_get(
+    client: &VtaClient,
+    context_id: String,
+    persona_did: String,
+) -> CmdResult {
+    let result = client
+        .persona_binding_get(&context_id, &persona_did)
+        .await?;
+    print_result("Binding:", &result)
+}
+
+/// `persona binding list` — every persona bound in one context.
+pub async fn cmd_binding_list(
+    client: &VtaClient,
+    context_id: String,
+    limit: Option<std::num::NonZeroU64>,
+    cursor: Option<String>,
+) -> CmdResult {
+    let result = client
+        .persona_binding_list(&context_id, limit, cursor.as_deref())
+        .await?;
+    print_result("Bindings:", &result)
+}
+
+// ---------------------------------------------------------------------------
+// Contacts
+// ---------------------------------------------------------------------------
+
+/// `persona contact put` — record what someone disclosed.
+pub async fn cmd_contact_put(
+    client: &VtaClient,
+    context_id: String,
+    subject_did: String,
+    known_by_persona: String,
+    document: ContactDocument,
+    credential_refs: Vec<String>,
+    notes: Option<String>,
+) -> CmdResult {
+    let result = client
+        .persona_contact_put(
+            &context_id,
+            &subject_did,
+            &known_by_persona,
+            document,
+            credential_refs,
+            notes.as_deref(),
+        )
+        .await?;
+    print_result("Contact:", &result)
+}
+
+/// `persona contact get` — read one contact.
+pub async fn cmd_contact_get(
+    client: &VtaClient,
+    context_id: String,
+    contact_id: String,
+    rev: Option<std::num::NonZeroU64>,
+    include_history: bool,
+) -> CmdResult {
+    let result = client
+        .persona_contact_get(&context_id, &contact_id, rev, include_history)
+        .await?;
+    print_result("Contact:", &result)
+}
+
+/// `persona contact list` — enumerate contacts.
+pub async fn cmd_contact_list(
+    client: &VtaClient,
+    context_id: String,
+    known_by_persona: Option<String>,
+    changed_since: Option<String>,
+    limit: Option<std::num::NonZeroU64>,
+    cursor: Option<String>,
+) -> CmdResult {
+    let result = client
+        .persona_contact_list(
+            &context_id,
+            known_by_persona.as_deref(),
+            changed_since.as_deref(),
+            limit,
+            cursor.as_deref(),
+        )
+        .await?;
+    print_result("Contacts:", &result)
+}
+
+/// `persona contact delete` — forget a contact.
+pub async fn cmd_contact_delete(
+    client: &VtaClient,
+    context_id: String,
+    contact_id: String,
+) -> CmdResult {
+    let result = client
+        .persona_contact_delete(&context_id, &contact_id)
+        .await?;
+    print_result("Result:", &result)
+}
+
+// ---------------------------------------------------------------------------
+// Disclosure
+// ---------------------------------------------------------------------------
+
+/// `persona disclosure preview` — what would this reveal, and to whom?
+///
+/// Signs nothing and sends nothing. This is the only place the holder sees
+/// what is about to leave, so the response is rendered rather than dumped —
+/// and rendered by *rank*, not as a flat list. A preview that shows fourteen
+/// fields with fourteen equal weights is a notice-and-consent dialog, which is
+/// the pattern that teaches people to click through.
+pub async fn cmd_disclosure_preview(
+    client: &VtaClient,
+    context_id: String,
+    persona_did: String,
+    verifier_did: String,
+    requested_claims: Vec<String>,
+    purpose: Option<String>,
+    renderer: Option<String>,
+) -> CmdResult {
+    let result = client
+        .persona_disclosure_preview(
+            &context_id,
+            &persona_did,
+            &verifier_did,
+            requested_claims,
+            purpose.as_deref(),
+            renderer.as_deref(),
+        )
+        .await?;
+
+    if is_json_output() {
+        print_json(&result)?;
+        return Ok(());
+    }
+    render_preview(&result, &context_id, &verifier_did, purpose.as_deref());
+    Ok(())
+}
+
+/// Render a preview for a human, falling back to the raw payload if the
+/// response is not the shape this function knows how to read.
+///
+/// The fallback is the point. A renderer that quietly showed an empty claim
+/// table on an unfamiliar response would tell the holder "nothing will be
+/// disclosed" about a disclosure that is about to happen — the one lie this
+/// screen must not tell. Better an ugly payload than a confident wrong
+/// summary.
+fn render_preview(result: &Value, context_id: &str, verifier_did: &str, purpose: Option<&str>) {
+    let (Some(preview_id), Some(claims)) = (
+        result.get("previewId").and_then(Value::as_str),
+        result.get("claims").and_then(Value::as_array),
+    ) else {
+        println!(
+            "{YELLOW}Preview response was not in the expected shape; showing it as received.{RESET}"
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(result).unwrap_or_else(|_| format!("{result:?}"))
+        );
+        return;
+    };
+
+    println!();
+    println!("{BOLD}Before anything leaves{RESET} — nothing has been sent.");
+    println!();
+    println!("  {DIM}To{RESET}         {verifier_did}");
+    println!("  {DIM}Context{RESET}    {context_id}");
+    if let Some(p) = purpose {
+        println!("  {DIM}Purpose{RESET}    {p}");
+    }
+    if let Some(subject) = result.get("subject").and_then(Value::as_str) {
+        println!("  {DIM}As{RESET}         {subject}");
+    }
+
+    // What the chosen renderer cannot carry. Declared, not discovered.
+    if let Some(r) = result.get("renderer") {
+        let id = r.get("id").and_then(Value::as_str).unwrap_or("?");
+        let drops: Vec<&str> = r
+            .get("drops")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if drops.is_empty() {
+            println!("  {DIM}Format{RESET}     {id} {DIM}(carries everything){RESET}");
+        } else {
+            println!(
+                "  {DIM}Format{RESET}     {id} {YELLOW}— discards: {}{RESET}",
+                drops.join(", ")
+            );
+        }
+    }
+
+    // Correlation. The inversion is easy to get backwards, so the reason the
+    // VTA supplies is printed rather than re-derived here.
+    if let Some(c) = result.get("correlation") {
+        let severity = c.get("severity").and_then(Value::as_str).unwrap_or("none");
+        let colour = match severity {
+            "high" => RED,
+            "low" => YELLOW,
+            _ => DIM,
+        };
+        let reason = c.get("reason").and_then(Value::as_str).unwrap_or("");
+        println!(
+            "  {DIM}Linked{RESET}     {colour}{}{RESET} {reason}",
+            severity.to_uppercase()
+        );
+    }
+
+    let anomalous: Vec<&str> = result
+        .get("anomalous")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    println!();
+    if claims.is_empty() {
+        println!("  {DIM}No attributes would leave.{RESET}");
+    }
+    for claim in claims {
+        let ty = claim.get("type").and_then(Value::as_str).unwrap_or("?");
+        let provenance = claim
+            .get("provenance")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let rung = claim.get("rung").and_then(Value::as_str).unwrap_or("");
+        let stale = claim.get("stale").and_then(Value::as_bool).unwrap_or(false);
+        let fresh = claim
+            .get("newToThisVerifier")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let odd = anomalous.contains(&ty);
+
+        // A predicate claim carries no value, and that absence is the whole
+        // point of the rung — never render it as missing data.
+        let shown = if let Some(p) = claim.get("predicate") {
+            let op = p.get("op").and_then(Value::as_str).unwrap_or("?");
+            let arg = p.get("arg").map(render_scalar).unwrap_or_default();
+            format!("{DIM}proves {op} {arg} — the value itself is not sent{RESET}")
+        } else if stale {
+            format!("{YELLOW}stale — will NOT be sent{RESET}")
+        } else {
+            claim.get("value").map(render_scalar).unwrap_or_default()
+        };
+
+        let mark = if odd || fresh {
+            format!("{RED}!{RESET}")
+        } else {
+            " ".into()
+        };
+        println!("  {mark} {CYAN}{ty}{RESET}");
+        println!("      {shown}");
+        let mut notes: Vec<String> = Vec::new();
+        if !provenance.is_empty() {
+            notes.push(provenance.to_string());
+        }
+        if !rung.is_empty() {
+            notes.push(rung.to_string());
+        }
+        if fresh {
+            notes.push("new to this verifier".into());
+        }
+        if odd {
+            notes.push("unusual for the stated purpose".into());
+        }
+        if !notes.is_empty() {
+            println!("      {DIM}{}{RESET}", notes.join(" · "));
+        }
+    }
+
+    println!();
+    if let Some(expiry) = result.get("expiresAt").and_then(Value::as_str) {
+        println!("  {DIM}This preview expires at {expiry} and can be used once.{RESET}");
+    }
+    println!(
+        "  Disclose with: {BOLD}persona disclosure present --context {context_id} \
+         --preview-id {preview_id}{RESET}"
+    );
+    println!();
+}
+
+/// Render a JSON scalar the way a person reads it — a string without its
+/// quotes, anything else as compact JSON.
+fn render_scalar(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `persona disclosure present` — hand over what the preview showed.
+pub async fn cmd_disclosure_present(
+    client: &VtaClient,
+    context_id: String,
+    preview_id: String,
+    challenge: Option<String>,
+    mint: Option<Value>,
+) -> CmdResult {
+    let result = client
+        .persona_disclosure_present(&context_id, &preview_id, challenge.as_deref(), mint)
+        .await?;
+
+    // The document the VTA returns is unsigned; signing belongs to the key
+    // custodian. Say so, rather than letting an operator hand a verifier
+    // something that looks presentable and is not.
+    if !is_json_output()
+        && result
+            .get("document")
+            .and_then(|d| d.get("unsigned"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        println!(
+            "{YELLOW}This document is UNSIGNED. Sign it with the persona's key \
+             (`keys derive-and-sign-document`) before sending it to a verifier.{RESET}"
+        );
+    }
+    print_result("What left:", &result)
+}
+
+/// `persona disclosure history` — what was disclosed, to whom, when.
+pub async fn cmd_disclosure_history(
+    client: &VtaClient,
+    context_id: Option<String>,
+    verifier_did: Option<String>,
+    attribute_type: Option<String>,
+    since: Option<String>,
+    limit: Option<std::num::NonZeroU64>,
+    cursor: Option<String>,
+) -> CmdResult {
+    let result = client
+        .persona_disclosure_history(
+            context_id.as_deref(),
+            verifier_did.as_deref(),
+            attribute_type.as_deref(),
+            since.as_deref(),
+            limit,
+            cursor.as_deref(),
+        )
+        .await?;
+    print_result("What has left:", &result)
+}
+
+// ---------------------------------------------------------------------------
+// Correlation and renderers
+// ---------------------------------------------------------------------------
+
+/// `persona correlate` — how linkable would this make the holder?
+pub async fn cmd_correlate(
+    client: &VtaClient,
+    attribute_id: Option<String>,
+    profile_id: Option<String>,
+    candidate: Option<Value>,
+) -> CmdResult {
+    let result = client
+        .persona_correlation_analyze(attribute_id.as_deref(), profile_id.as_deref(), candidate)
+        .await?;
+    print_result("Links:", &result)
+}
+
+/// `persona renderers` — the output formats, and what each one discards.
+pub async fn cmd_renderers(client: &VtaClient) -> CmdResult {
+    let result = client.persona_renderers_list().await?;
+    print_result("Renderers:", &result)
+}
+
+// ---------------------------------------------------------------------------
+// Worlds (facets) and the claim-type registry
+// ---------------------------------------------------------------------------
+
+/// `persona world list` — the parts of a life the holder has named.
+pub async fn cmd_world_list(
+    client: &VtaClient,
+    limit: Option<NonZeroU64>,
+    cursor: Option<String>,
+) -> CmdResult {
+    let mut payload = WorldListPayload::default();
+    if let Some(limit) = limit {
+        payload.limit = limit;
+    }
+    payload.cursor = cursor.map(|c| c.parse()).transpose().map_err(to_err)?;
+    let result = client.persona_world_list(payload).await?;
+    print_result("Worlds:", &serde_json::to_value(result)?)
+}
+
+/// `persona world put` — name a world, or replace one.
+///
+/// Both id lists replace what is stored. The CLI passes them through as given
+/// rather than merging with what is there: a merge would make emptying a world
+/// impossible, and the specification says so explicitly.
+#[allow(clippy::too_many_arguments)] // Flat CLI surface; one argument per flag.
+pub async fn cmd_world_put(
+    client: &VtaClient,
+    name: String,
+    colour: &str,
+    icon: Option<String>,
+    face_ids: Vec<String>,
+    attribute_ids: Vec<String>,
+    world_id: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let mut builder = WorldPutPayload::builder()
+        .name(name.parse::<WorldPutName>().map_err(to_err)?)
+        .colour(colour.parse::<WorldColour>().map_err(to_err)?)
+        .face_ids(ulids(face_ids)?)
+        .attribute_ids(ulids(attribute_ids)?);
+    if let Some(icon) = icon {
+        builder = builder.icon(Some(icon.parse::<WorldPutIcon>().map_err(to_err)?));
+    }
+    if let Some(id) = world_id {
+        builder = builder.world_id(Some(id.parse::<WorldUlid>().map_err(to_err)?));
+    }
+    if let Some(v) = expected_version {
+        builder = builder.expected_version(Some(WorldPutExpectedVersion(v)));
+    }
+    let payload: WorldPutPayload = builder.try_into().map_err(to_err)?;
+    let result = client.persona_world_put(payload).await?;
+    print_result("World:", &serde_json::to_value(result)?)
+}
+
+/// `persona world delete` — unname a world, leaving its members where they are.
+pub async fn cmd_world_delete(
+    client: &VtaClient,
+    world_id: String,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let mut builder = WorldDeletePayload::builder()
+        .world_id(world_id.parse::<WorldDeleteUlid>().map_err(to_err)?);
+    if let Some(v) = expected_version {
+        builder = builder.expected_version(Some(WorldDeleteExpectedVersion(v)));
+    }
+    let payload: WorldDeletePayload = builder.try_into().map_err(to_err)?;
+    let result = client.persona_world_delete(payload).await?;
+    print_result("Deleted:", &serde_json::to_value(result)?)
+}
+
+/// `persona claim-types` — the registry the VTA masks and gates against.
+pub async fn cmd_claim_types(client: &VtaClient) -> CmdResult {
+    let result = client.persona_claim_types_list().await?;
+    print_result("Claim types:", &serde_json::to_value(result)?)
+}
+
+/// Parse ULIDs the generated payloads take, naming the one that was wrong.
+///
+/// The generated newtype's error says only "does not match pattern", which is
+/// unhelpful when a flag was repeated six times.
+fn ulids(ids: Vec<String>) -> Result<Vec<WorldUlid>, Box<dyn std::error::Error>> {
+    ids.into_iter()
+        .map(|id| {
+            id.parse::<WorldUlid>()
+                .map_err(|e| format!("not an id: {id} ({e})").into())
+        })
+        .collect()
+}
+
+/// Render a generated type's conversion error as a CLI error.
+fn to_err(e: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    e.to_string().into()
+}
+
+// ---------------------------------------------------------------------------
+// Context-local profiles and bindings
+// ---------------------------------------------------------------------------
+
+/// `persona local profile put` — a profile that lives inside one context.
+pub async fn cmd_local_profile_put(
+    client: &VtaClient,
+    context_id: String,
+    name: String,
+    entries: Vec<LocalProfileEntry>,
+    profile_id: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let result = client
+        .persona_local_profile_put(
+            &context_id,
+            &name,
+            entries,
+            profile_id.as_deref(),
+            expected_version,
+        )
+        .await?;
+    print_result("Local profile:", &result)
+}
+
+/// `persona local profile get` — read one context-local profile.
+pub async fn cmd_local_profile_get(
+    client: &VtaClient,
+    context_id: String,
+    profile_id: String,
+) -> CmdResult {
+    let result = client
+        .persona_local_profile_get(&context_id, &profile_id)
+        .await?;
+    print_result("Local profile:", &result)
+}
+
+/// `persona local profile list` — enumerate a context's own profiles.
+pub async fn cmd_local_profile_list(
+    client: &VtaClient,
+    context_id: String,
+    limit: Option<std::num::NonZeroU64>,
+    cursor: Option<String>,
+) -> CmdResult {
+    let result = client
+        .persona_local_profile_list(&context_id, limit, cursor.as_deref())
+        .await?;
+    print_result("Local profiles:", &result)
+}
+
+/// `persona local profile delete` — remove a context-local profile.
+pub async fn cmd_local_profile_delete(
+    client: &VtaClient,
+    context_id: String,
+    profile_id: String,
+    unbind: bool,
+) -> CmdResult {
+    let result = client
+        .persona_local_profile_delete(&context_id, &profile_id, unbind)
+        .await?;
+    print_result("Result:", &result)
+}
+
+/// `persona local binding set` — bind a persona to a context-local profile.
+pub async fn cmd_local_binding_set(
+    client: &VtaClient,
+    context_id: String,
+    persona_did: String,
+    profile_id: Option<String>,
+    label: Option<String>,
+    until: Option<String>,
+    expected_version: Option<u64>,
+) -> CmdResult {
+    let result = client
+        .persona_local_binding_set(
+            &context_id,
+            &persona_did,
+            profile_id.as_deref(),
+            label.as_deref(),
+            until.as_deref(),
+            expected_version,
+        )
+        .await?;
+    print_result("Local binding:", &result)
+}
+
+#[cfg(test)]
+mod world_tests {
+    use super::WorldColour;
+
+    /// The other half of the guard in `pnm-cli`'s `world_colour_tests`: those
+    /// tokens are the ones this crate parses. Split across the two because
+    /// `pnm-cli` does not depend on the generated types and this crate does
+    /// not know the CLI's enum — together they pin the wire value end to end.
+    #[test]
+    fn the_spec_tokens_the_cli_offers_all_parse() {
+        for token in [
+            "slate", "indigo", "teal", "moss", "sand", "clay", "rose", "plum",
+        ] {
+            assert!(
+                token.parse::<WorldColour>().is_ok(),
+                "{token} is not a colour the specification names",
+            );
+        }
+    }
+
+    /// An id that is not a ULID is named, rather than reported as a pattern
+    /// failure against whichever of six repeated flags was wrong.
+    #[test]
+    fn a_bad_id_names_itself() {
+        let err = super::ulids(vec![
+            "01JB0X7K9ZQW2M4N6P8R1T3V5Y".into(),
+            "not-an-id".into(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("not-an-id"), "{err}");
+    }
+}

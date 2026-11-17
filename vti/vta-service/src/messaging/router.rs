@@ -1,0 +1,631 @@
+//! DIDComm message dispatch for the delivery-layer inbound loop.
+//!
+//! **D2 P2a cut-over**: this used to build an
+//! `affinidi-messaging-didcomm-service` `Router` (type-routed handler table +
+//! `MessagePolicy` middleware) wrapped in a `BridgeHandler`. That framework is
+//! gone. [`dispatch`] is now a plain `msg.typ` match: the Trust-Task binding
+//! envelope, plus plumbing (trust-ping, pickup status, problem-report). Every
+//! other type falls to `handle_unknown`. The handlers take
+//! `(HandlerContext, Message, Extension<T>)` from [`crate::messaging::shim`].
+//! The [`crate::server`] inbound loop drives it off
+//! [`affinidi_messaging_delivery::MessagingService::subscribe`].
+//!
+//! The `MessagePolicy` auth gate (`require_encrypted` + verified-sender-or-none)
+//! now lives in the inbound loop, which sets `Message::from` to the
+//! cryptographically-authenticated sender before calling [`dispatch`] (the
+//! `#620` anti-spoof guarantee). No handler here authorises on that sender:
+//! the only authorised surface is the Trust-Task envelope, whose document proof
+//! must be bound to it.
+
+use std::sync::Arc;
+
+use affinidi_messaging_didcomm::Message;
+use tokio::sync::RwLock;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+
+use crate::config::AppConfig;
+use crate::didcomm_bridge::DIDCommBridge;
+use crate::keys::seed_store::SeedStore;
+use crate::messaging::shim::{DIDCommResponse, DIDCommServiceError, HandlerContext, ProblemReport};
+#[cfg(feature = "didcomm")]
+use crate::messaging::shim::{Extension, ServiceProblemReport};
+use crate::server::AppState;
+use crate::store::KeyspaceHandle;
+
+#[cfg(feature = "didcomm")]
+use super::handlers;
+
+#[cfg(feature = "didcomm")]
+use vta_sdk::protocols;
+
+/// Trust-ping protocol identifiers (was the framework's `TRUST_PING_TYPE` /
+/// `TRUST_PONG_TYPE`). Re-declared locally now the framework is gone.
+#[cfg(feature = "didcomm")]
+const TRUST_PING_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping";
+#[cfg(feature = "didcomm")]
+const TRUST_PONG_TYPE: &str = "https://didcomm.org/trust-ping/2.0/ping-response";
+/// The high-frequency message-pickup status heartbeat (was the framework's
+/// `MESSAGE_PICKUP_STATUS_TYPE`, routed to `ignore_handler`). Dispatched as a
+/// silent no-op.
+pub(crate) const MESSAGE_PICKUP_STATUS_TYPE: &str = "https://didcomm.org/messagepickup/3.0/status";
+
+/// Shared state injected into all DIDComm handlers via `Extension<Arc<VtaState>>`.
+#[derive(Clone)]
+pub struct VtaState {
+    pub keys_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    /// Sessions keyspace — mirrored from `AppState` so intrinsic-sender
+    /// (DIDComm/TSP) auth can resolve + elevate the caller's canonical
+    /// DID-keyed session, exactly as the REST path does.
+    pub sessions_ks: KeyspaceHandle,
+    pub contexts_ks: KeyspaceHandle,
+    pub did_templates_ks: KeyspaceHandle,
+    pub audit_ks: KeyspaceHandle,
+    /// Shared with `AppState` — one audit sink across both transports, so a
+    /// deployment-installed backend covers DIDComm as well as REST. Cloned as
+    /// an `Arc`, not rebuilt, for the same reason the config `RwLock` is (P1.1):
+    /// two transports resolving audit differently is a gap you find in an
+    /// incident.
+    pub audit_sink: vta_audit::SharedAuditSink,
+    pub imported_ks: KeyspaceHandle,
+    /// Non-extractable internal signing keys, mirrored from `AppState` so the
+    /// DIDComm signing oracle reaches the same keys the REST one does.
+    pub internal_ks: KeyspaceHandle,
+    /// Persistent runtime state for service enable/disable
+    /// (`operations::protocol::runtime_state`). Mirrored from `AppState`.
+    pub service_state_ks: KeyspaceHandle,
+    #[cfg(feature = "webvh")]
+    pub webvh_ks: KeyspaceHandle,
+    /// `did:webs` records, mirrored from `AppState`: a did:webs VTA's own key
+    /// event log, which its keys by role, its trust bundle and its runtime
+    /// services are read from and written to.
+    pub webs_ks: KeyspaceHandle,
+    /// Credentials the VTA issued — needed so a DID deletion over this
+    /// transport can revoke them rather than orphan them.
+    pub issued_credentials_ks: KeyspaceHandle,
+    /// Anti-replay log for sealed-bootstrap `bundle_id`s — required by
+    /// the DIDComm provision-integration handler so it can drive the
+    /// same shared library function the REST handler does.
+    pub sealed_nonces_ks: KeyspaceHandle,
+    /// Persisted drain set for the protocol-management feature
+    /// (`docs/05-design-notes/didcomm-protocol-management.md`).
+    /// Accessible from DIDComm handlers so disable/migrate over
+    /// DIDComm transport land in the same drain bookkeeping as
+    /// the REST path.
+    #[cfg(feature = "webvh")]
+    pub drains_ks: KeyspaceHandle,
+    /// Per-kind previous-config snapshot store for fail-forward
+    /// rollback (spec §3.5a). Mirrored from `AppState` so REST and
+    /// DIDComm transport handlers feed the same snapshot.
+    #[cfg(feature = "webvh")]
+    pub snapshot_ks: KeyspaceHandle,
+    /// In-process registry of active + draining mediator listeners.
+    #[cfg(feature = "webvh")]
+    pub mediator_registry: Arc<crate::messaging::registry::MediatorListenerRegistry>,
+    /// Per-mediator TTL sweeper.
+    #[cfg(feature = "webvh")]
+    pub drain_sweeper: Arc<crate::messaging::drain_sweeper::DrainSweeper>,
+    /// Pluggable telemetry sink — driven by both REST and DIDComm
+    /// transport handlers so `mediator report` is consistent
+    /// regardless of which transport posted the inbound event.
+    pub telemetry: vti_common::telemetry::SharedTelemetrySink,
+    pub seed_store: Arc<dyn SeedStore>,
+    pub config: Arc<RwLock<AppConfig>>,
+    pub did_resolver: Option<DIDCacheClient>,
+    /// DIDComm bridge for outbound WebVH server communication.
+    pub didcomm_bridge: Arc<DIDCommBridge>,
+    /// Secrets resolver — present iff DIDComm is configured. Used
+    /// (alongside `signing_vm_id` / `ka_vm_id`) by service-management
+    /// rollback over DIDComm transport to assemble a live
+    /// `ListenerProver` for re-promotion handshakes.
+    #[cfg(feature = "didcomm")]
+    pub secrets_resolver: Option<Arc<affinidi_tdk::secrets_resolver::ThreadedSecretsResolver>>,
+    /// VM id of the VTA's signing key. Threaded through to the live
+    /// prover for service-management ops dispatched over DIDComm.
+    #[cfg(feature = "didcomm")]
+    pub signing_vm_id: Option<String>,
+    /// VM id of the VTA's key-agreement key.
+    #[cfg(feature = "didcomm")]
+    pub ka_vm_id: Option<String>,
+    #[cfg(feature = "tee")]
+    pub tee_state: Option<crate::tee::TeeState>,
+    /// Mirrored from `AppState` for backup and restore, which read every
+    /// keyspace and stage into the unencrypted `bootstrap` one.
+    pub store: vti_common::store::Store,
+    pub storage_encryption_key: Option<[u8; 32]>,
+    pub in_enclave: bool,
+}
+
+impl VtaState {
+    /// What a backup or a restore needs from this VTA.
+    pub fn backup_access(&self) -> crate::restore::BackupAccess<'_> {
+        crate::restore::BackupAccess {
+            store: &self.store,
+            storage_key: self.storage_encryption_key,
+            in_enclave: self.in_enclave,
+            seed_store: self.seed_store.as_ref(),
+            config: &self.config,
+        }
+    }
+}
+
+// Gated on `webvh`: provision-integration mints WebVH DIDs, so the op (and the
+// DIDComm handler/route that drive it, below) only exist in webvh builds —
+// matching the REST side (`routes::bootstrap`'s `#[cfg(feature = "webvh")] mod
+// provision`). Without this gate the impl had to fill the cfg-gated
+// `VtaState::webvh_ks` with a `panic!()` arm in non-webvh builds — a runtime
+// landmine inside a `From`. Gating the impl removes it: a non-webvh build
+// simply doesn't expose DIDComm provision-integration.
+#[cfg(feature = "webvh")]
+impl From<&VtaState> for crate::operations::provision_integration::ProvisionIntegrationDeps {
+    fn from(state: &VtaState) -> Self {
+        Self {
+            keys_ks: state.keys_ks.clone(),
+            acl_ks: state.acl_ks.clone(),
+            audit: std::sync::Arc::clone(&state.audit_sink),
+            contexts_ks: state.contexts_ks.clone(),
+            did_templates_ks: state.did_templates_ks.clone(),
+            imported_ks: state.imported_ks.clone(),
+            webvh_ks: state.webvh_ks.clone(),
+            webs_ks: state.webs_ks.clone(),
+            sealed_nonces_ks: state.sealed_nonces_ks.clone(),
+            seed_store: state.seed_store.clone(),
+            config: state.config.clone(),
+            did_resolver: state.did_resolver.clone(),
+            didcomm_bridge: state.didcomm_bridge.clone(),
+        }
+    }
+}
+
+/// Derive the DIDComm-transport view of shared state from the canonical
+/// [`AppState`].
+///
+/// `VtaState` is a strict subset of `AppState` — every field is a cheap clone
+/// of the corresponding `AppState` field (an `Arc` or a `KeyspaceHandle`).
+/// Building it this way is what guarantees the REST front-end and the DIDComm
+/// router share the *same* config `RwLock`, mediator registry, drain sweeper,
+/// and telemetry sink (P1.1): a `PATCH /config` on the REST side is visible to
+/// DIDComm handlers. Constructing `VtaState` with a freshly-wrapped config lock was a live divergence bug — don't reintroduce
+/// it; always derive from the canonical `AppState`.
+impl From<&AppState> for VtaState {
+    fn from(state: &AppState) -> Self {
+        Self {
+            keys_ks: state.keys_ks.clone(),
+            acl_ks: state.acl_ks.clone(),
+            sessions_ks: state.sessions_ks.clone(),
+            contexts_ks: state.contexts_ks.clone(),
+            did_templates_ks: state.did_templates_ks.clone(),
+            audit_ks: state.audit_ks.clone(),
+            audit_sink: std::sync::Arc::clone(&state.audit_sink),
+            imported_ks: state.imported_ks.clone(),
+            internal_ks: state.internal_ks.clone(),
+            service_state_ks: state.service_state_ks.clone(),
+            #[cfg(feature = "webvh")]
+            webvh_ks: state.webvh_ks.clone(),
+            webs_ks: state.webs_ks.clone(),
+            issued_credentials_ks: state.issued_credentials_ks.clone(),
+            sealed_nonces_ks: state.sealed_nonces_ks.clone(),
+            #[cfg(feature = "webvh")]
+            drains_ks: state.drains_ks.clone(),
+            #[cfg(feature = "webvh")]
+            snapshot_ks: state.snapshot_ks.clone(),
+            #[cfg(feature = "webvh")]
+            mediator_registry: Arc::clone(&state.mediator_registry),
+            #[cfg(feature = "webvh")]
+            drain_sweeper: Arc::clone(&state.drain_sweeper),
+            telemetry: Arc::clone(&state.telemetry),
+            seed_store: state.seed_store.clone(),
+            config: Arc::clone(&state.config),
+            did_resolver: state.did_resolver.clone(),
+            didcomm_bridge: Arc::clone(&state.didcomm_bridge),
+            #[cfg(feature = "didcomm")]
+            secrets_resolver: state.secrets_resolver.clone(),
+            #[cfg(feature = "didcomm")]
+            signing_vm_id: state.signing_vm_id.clone(),
+            #[cfg(feature = "didcomm")]
+            ka_vm_id: state.ka_vm_id.clone(),
+            #[cfg(feature = "tee")]
+            tee_state: state.tee.as_ref().map(|tc| tc.state.clone()),
+            store: state.store.clone(),
+            storage_encryption_key: state.storage_encryption_key,
+            in_enclave: state.tee.is_some(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type-routed dispatch (was the framework `Router` + `BridgeHandler`)
+// ---------------------------------------------------------------------------
+
+/// The handler return shape (unchanged from the framework): a reply, no reply,
+/// or a handler error the dispatch renders as an `internal-error`
+/// problem-report.
+#[cfg(feature = "didcomm")]
+type HandlerResult = Result<Option<DIDCommResponse>, DIDCommServiceError>;
+
+/// Fold a handler's `Result` into the reply the loop sends. A handler `Err`
+/// becomes a threaded `internal-error` problem-report (was the framework's
+/// `DefaultErrorHandler::on_error`).
+#[cfg(feature = "didcomm")]
+fn finish(result: HandlerResult) -> Option<DIDCommResponse> {
+    match result {
+        Ok(opt) => opt,
+        Err(e) => Some(DIDCommResponse::problem_report(
+            ProblemReport::internal_error(e.to_string()),
+        )),
+    }
+}
+
+/// Local trust-ping responder (was the framework `trust_ping_handler`). Replies
+/// a `trust-ping/2.0/ping-response` on the ping's thread unless the ping didn't
+/// request a response or has no authenticated sender to reply to.
+#[cfg(feature = "didcomm")]
+fn trust_ping_reply(msg: &Message, sender_did: Option<&str>) -> Option<DIDCommResponse> {
+    #[derive(serde::Deserialize)]
+    struct PingBody {
+        #[serde(default = "default_true")]
+        response_requested: bool,
+    }
+    fn default_true() -> bool {
+        true
+    }
+    let body: PingBody = serde_json::from_value(msg.body.clone()).unwrap_or(PingBody {
+        response_requested: true,
+    });
+    if !body.response_requested {
+        return None;
+    }
+    // Only pong an authenticated ping (no reply to a spoofed/anonymous sender).
+    sender_did?;
+    Some(DIDCommResponse::new(TRUST_PONG_TYPE, serde_json::Value::Null).thid(msg.id.clone()))
+}
+
+/// Route one inbound (authenticated-sender-stamped) DIDComm message to its
+/// handler, mirroring the framework route list (same URIs, same feature gates).
+///
+/// `ctx.sender_did` and `msg.from` are the cryptographically-authenticated
+/// sender (or `None`); handlers authorize on those, never on the raw wire
+/// `from`. The `_` arm is the fallback (`handle_unknown`).
+#[cfg(feature = "didcomm")]
+pub async fn dispatch(
+    msg: Message,
+    ctx: HandlerContext,
+    _vta_state: Arc<VtaState>,
+    app_state: AppState,
+) -> Option<DIDCommResponse> {
+    let t = msg.typ.clone();
+    let t = t.as_str();
+
+    // Message-pickup status heartbeat: silent no-op (was `ignore_handler`).
+    if t == MESSAGE_PICKUP_STATUS_TYPE {
+        return None;
+    }
+    // Trust-ping (was the built-in `trust_ping_handler`).
+    if t == TRUST_PING_TYPE {
+        return trust_ping_reply(&msg, ctx.sender_did.as_deref());
+    }
+
+    // ── Trust-Tasks envelope (AppState) ──────────────────────────────
+    if t == trust_tasks_didcomm::ENVELOPE_TYPE {
+        return finish(handlers::handle_trust_task(ctx, msg, Extension(app_state)).await);
+    }
+
+    // Every sender-authorised DIDComm protocol message (key, seed, context,
+    // ACL, audit, config, restart, backup, DID WebVH, protocol management,
+    // provision-integration typed as its task, step-up approve-request,
+    // credential query) was served here. None of them carried anything that
+    // proves who composed it beyond the DIDComm sender, so they are no longer
+    // served: every authorised operation over DIDComm is a Trust Task in the
+    // binding envelope above, whose document proof is bound to the sender.
+    // They fall through to `handle_unknown`.
+
+    if t == protocols::PROBLEM_REPORT_TYPE {
+        return finish(handlers::handle_problem_report(ctx, msg).await);
+    }
+
+    // Credential exchange (`offer`, `issue`, `query`) was the last family
+    // served typed as itself. It is a Trust Task on the spine now, reached
+    // through the envelope above like everything else; typed as itself it
+    // falls to `handle_unknown`, which refuses it naming the envelope.
+
+    // The TEE attestation reads were bare `firstperson.network/vta/1.0/
+    // attestation/*` messages here, which nothing sent. They are
+    // `vta/attestation/*` Trust Tasks on the spine now, reached through the
+    // envelope above.
+
+    // The `discovery/1.0/*` DIDComm protocol was routed here — unauthenticated
+    // — until #1043 retired it with the task behind it. Capability discovery is
+    // `trust-task-discovery/0.3` on the Trust-Task spine, which is authenticated
+    // like everything else there.
+
+    // ── Fallback ─────────────────────────────────────────────────────
+    finish(handlers::handle_unknown(ctx, msg).await)
+}
+
+/// Keyring VTI-42: the DIDComm binding envelope is the only carriage for a
+/// Trust Task (`bindings/didcomm/0.2` §2–§5).
+///
+/// Driven by the dispatcher's own list, so a verb added to the spine is
+/// covered without anybody remembering to add it here — the failure this
+/// router used to have on the VTC side.
+#[cfg(all(test, feature = "didcomm"))]
+mod envelope_only_carriage {
+    use super::*;
+    use serde_json::json;
+    use trust_tasks_didcomm::ENVELOPE_TYPE;
+
+    /// A sender the VTA has never heard of: the spine must still *answer* —
+    /// with a refusal — which is only reachable past the router.
+    const STRANGER: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    fn problem_comment(resp: &DIDCommResponse) -> Option<&str> {
+        (resp.type_ == vta_sdk::protocols::PROBLEM_REPORT_TYPE)
+            .then(|| resp.body.get("comment").and_then(|c| c.as_str()))
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn every_dispatched_uri_is_served_in_the_envelope_and_refused_typed_as_itself() {
+        let (mut app_state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let uris = crate::trust_tasks::dispatched_uris();
+        assert!(!uris.is_empty(), "the dispatcher serves nothing?");
+        // A stranger sending every verb outruns the default unauthenticated
+        // budget, past which a document gets no reply; the carriage, not the
+        // budget, is under test. Room for every verb at the heaviest weight.
+        let mut server = vta_config::ServerConfig::default();
+        server.operation_rate_limit_unauthenticated_per_sec =
+            Some(u32::try_from(uris.len() * 10).expect("a few hundred verbs"));
+        app_state.operation_budget = Arc::new(
+            crate::trust_tasks::operation_budget::OperationBudget::with_clock(
+                &server,
+                crate::trust_tasks::operation_budget::BudgetClock::manual(),
+            ),
+        );
+        let vta_state = Arc::new(VtaState::from(&app_state));
+        let mut typed_arm: Vec<&str> = Vec::new();
+
+        for uri in uris {
+            let doc = json!({
+                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                "type": uri,
+                "issuer": STRANGER,
+                "payload": {},
+            });
+
+            // Enveloped: reaches the spine, answered in the envelope.
+            let req_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+            let msg = Message::build(req_id.clone(), ENVELOPE_TYPE.to_string(), doc.clone())
+                .from(STRANGER.to_string())
+                .finalize();
+            let ctx = HandlerContext {
+                sender_did: Some(STRANGER.to_string()),
+            };
+            let resp = dispatch(msg, ctx, vta_state.clone(), app_state.clone())
+                .await
+                .unwrap_or_else(|| panic!("`{uri}` in the envelope got no reply at all"));
+            assert!(
+                !problem_comment(&resp).is_some_and(|c| c.contains("unsupported message type")),
+                "`{uri}` is dispatched, but the router refused its envelope: {:?}",
+                resp.body
+            );
+            assert_eq!(
+                resp.type_, ENVELOPE_TYPE,
+                "`{uri}`: a reply to an enveloped request rides the envelope (binding §5)"
+            );
+
+            // Typed as the task: refused at the DIDComm layer, naming the
+            // envelope, threaded to the request.
+            let req_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+            let msg = Message::build(req_id.clone(), uri.to_string(), doc)
+                .from(STRANGER.to_string())
+                .finalize();
+            let ctx = HandlerContext {
+                sender_did: Some(STRANGER.to_string()),
+            };
+            let resp = dispatch(msg, ctx, vta_state.clone(), app_state.clone())
+                .await
+                .unwrap_or_else(|| panic!("`{uri}` typed as itself got no reply at all"));
+            let refused = problem_comment(&resp).is_some_and(|c| c.contains(ENVELOPE_TYPE));
+            if !refused {
+                typed_arm.push(uri);
+                continue;
+            }
+            assert_eq!(
+                resp.thid.as_deref(),
+                Some(req_id.as_str()),
+                "`{uri}`: unthreaded"
+            );
+        }
+
+        // The binding makes the envelope the only carriage, and no served URI
+        // keeps a task-typed arm.
+        assert!(
+            typed_arm.is_empty(),
+            "served URIs the router answers typed as the task: {typed_arm:?} — carry them in \
+             the envelope instead"
+        );
+    }
+
+    /// Not every unknown type is a Trust Task, and those keep the plain answer.
+    #[test]
+    fn a_non_trust_task_type_is_not_told_about_the_envelope() {
+        assert!(
+            handlers::trust_task_needs_envelope("https://example.com/protocols/x/1.0/y").is_none()
+        );
+    }
+}
+
+/// Keyring VTI-09 and VTI-27, over the DIDComm binding.
+///
+/// - **VTI-09**: a bare payload as the envelope body is refused with the same
+///   `malformedRequest` the VTC gives (`body did not parse as a Trust Task
+///   document: missing field `id``) — the VTA is not the lenient one.
+/// - **VTI-27**: a sender the ACL does not accept is answered with a signed
+///   `trust-task-error` in the binding envelope, never a problem-report, so a
+///   client keyed on the envelope type cannot read the refusal as a success.
+#[cfg(all(test, feature = "didcomm"))]
+mod keyring_vti_09_27 {
+    use super::*;
+    use crate::acl::{AclEntry, Role, store_acl_entry};
+    use crate::auth::session::now_epoch;
+    use serde_json::{Value, json};
+    use trust_tasks_didcomm::ENVELOPE_TYPE;
+
+    const KEYS_LIST: &str = "https://trusttasks.org/spec/keys/list/0.2";
+
+    /// Send `body` as the DIDComm envelope body from `sender`, through the
+    /// router the inbound loop calls, and return the reply.
+    async fn send(app_state: &AppState, sender: &str, body: Value) -> DIDCommResponse {
+        let vta_state = Arc::new(VtaState::from(app_state));
+        let msg = Message::build(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            ENVELOPE_TYPE.to_string(),
+            body,
+        )
+        .from(sender.to_string())
+        .finalize();
+        let ctx = HandlerContext {
+            sender_did: Some(sender.to_string()),
+        };
+        dispatch(msg, ctx, vta_state, app_state.clone())
+            .await
+            .expect("an enveloped Trust Task is always answered")
+    }
+
+    /// A signed request document from the identity `seed` names.
+    fn signed_request(seed: u8, type_uri: &str) -> Value {
+        let (did, _) = crate::test_support::did_for_seed(seed);
+        // The SDK's own builder, as a producer builds one; the recipient is
+        // never reached, because the ACL refuses first.
+        let mut doc = vta_sdk::trust_task_sign::build_unsigned(
+            type_uri,
+            json!({}),
+            &did,
+            "did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD",
+        )
+        .expect("a well-formed document");
+        crate::test_support::sign_as(seed, &mut doc);
+        serde_json::to_value(doc).expect("serialise")
+    }
+
+    /// The reply is a `trust-task-error` (this service's one version of it)
+    /// carried in the binding envelope and signed by the VTA; returns its code
+    /// and message.
+    fn a_signed_trust_task_error(reply: &DIDCommResponse) -> (String, String) {
+        assert_eq!(
+            reply.type_, ENVELOPE_TYPE,
+            "a refusal of an enveloped Trust Task rides the envelope, not a problem-report: {:?}",
+            reply.body
+        );
+        let doc = &reply.body;
+        assert_eq!(
+            doc["type"].as_str(),
+            Some(
+                crate::trust_tasks::framework_error_type_uri()
+                    .to_string()
+                    .as_str()
+            ),
+            "{doc}"
+        );
+        assert!(doc.get("proof").is_some(), "the refusal is signed: {doc}");
+        (
+            doc["payload"]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            doc["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    /// VTI-09: a bare `keys/list` payload in the envelope is refused as
+    /// malformed — whether or not the sender holds an ACL entry, so it is the
+    /// document requirement refusing it, not the ACL.
+    #[tokio::test]
+    async fn vti_09_a_bare_payload_over_didcomm_is_refused_as_malformed() {
+        let (app_state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let (admin, _) = crate::test_support::did_for_seed(0x61);
+        store_acl_entry(
+            &app_state.acl_ks,
+            &AclEntry::new(&admin, Role::Admin, "test"),
+        )
+        .await
+        .unwrap();
+        let (stranger, _) = crate::test_support::did_for_seed(0x62);
+
+        for sender in [&admin, &stranger] {
+            let reply = send(&app_state, sender, json!({ "contextId": "ctx1" })).await;
+            let (code, message) = a_signed_trust_task_error(&reply);
+            assert_eq!(code, "malformedRequest", "{sender}: {message}");
+            assert!(
+                message.contains("missing field `id`"),
+                "{sender}: the refusal names what is missing, as the VTC's does: {message}"
+            );
+        }
+    }
+
+    /// VTI-27: a signed request from a DID with no ACL entry, and from one
+    /// whose grant has lapsed, is answered `permissionDenied` in a signed
+    /// `trust-task-error`, threaded to the request.
+    #[tokio::test]
+    async fn vti_27_an_acl_refusal_over_didcomm_is_a_signed_trust_task_error() {
+        let (app_state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let (lapsed, _) = crate::test_support::did_for_seed(0x64);
+        store_acl_entry(
+            &app_state.acl_ks,
+            &AclEntry::new(&lapsed, Role::Admin, "test")
+                .with_created_at(now_epoch().saturating_sub(7200))
+                .with_expires_at(Some(now_epoch().saturating_sub(60))),
+        )
+        .await
+        .unwrap();
+
+        for seed in [0x63u8, 0x64] {
+            let (sender, _) = crate::test_support::did_for_seed(seed);
+            let request = signed_request(seed, KEYS_LIST);
+            let reply = send(&app_state, &sender, request.clone()).await;
+            let (code, message) = a_signed_trust_task_error(&reply);
+            assert_eq!(code, "permissionDenied", "{sender}: {message}");
+            assert_eq!(
+                reply.body["threadId"], request["id"],
+                "{sender}: the refusal threads to the request it refuses"
+            );
+        }
+    }
+
+    /// VTI-27's other direction: an inbound `trust-task-error` is terminal and
+    /// gets no reply at all over DIDComm. The spine answers it with an empty
+    /// body, which the handler used to fail to parse — and `finish` turned that
+    /// into an `internal-error` problem-report sent back to the peer.
+    #[tokio::test]
+    async fn vti_27_an_inbound_trust_task_error_over_didcomm_is_not_answered() {
+        let (app_state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let vta_state = Arc::new(VtaState::from(&app_state));
+        let (peer, _) = crate::test_support::did_for_seed(0x65);
+        let error = json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "threadId": "urn:uuid:11111111-1111-1111-1111-111111111111",
+            "type": crate::trust_tasks::framework_error_type_uri().to_string(),
+            "payload": { "code": "permissionDenied", "message": "no" },
+        });
+        let msg = Message::build(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            ENVELOPE_TYPE.to_string(),
+            error,
+        )
+        .from(peer.clone())
+        .finalize();
+        let ctx = HandlerContext {
+            sender_did: Some(peer),
+        };
+        let reply = dispatch(msg, ctx, vta_state, app_state.clone()).await;
+        assert!(
+            reply.is_none(),
+            "an inbound error is never answered: {:?}",
+            reply.map(|r| (r.type_, r.body))
+        );
+    }
+}

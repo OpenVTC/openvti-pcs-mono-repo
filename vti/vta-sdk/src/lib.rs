@@ -1,0 +1,276 @@
+//! # `vta-sdk` — SDK for Verifiable Trust Agents
+//!
+//! A Verifiable Trust Agent (VTA) holds a BIP-39 master seed, derives keys
+//! via BIP-32, and exposes a REST + DIDComm API to operators and integrations.
+//! This crate is the typed client that lets a Rust service:
+//!
+//! * authenticate against a VTA over REST or DIDComm,
+//! * call into every management surface (keys, contexts, ACL, DID templates,
+//!   audit, backup, WebVH),
+//! * receive secret-bearing bundles via the `sealed_transfer` envelope
+//!   (HPKE + ASCII armor + producer assertion),
+//! * provision integrations (mediators, WebVH hosts, app identities) end-to-end
+//!   via VP-framed bootstrap requests + VC-issued admin authorization.
+//!
+//! ## Quick start
+//!
+//! Two-step pattern: import a credential, then call the typed client.
+//!
+//! ```rust,no_run,ignore
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! use vta_sdk::client::VtaClient;
+//! use vta_sdk::credentials::CredentialBundle;
+//!
+//! // The credential is what the operator hands you (a base64 blob the VTA
+//! // setup wizard printed, or the result of `pnm bootstrap connect`).
+//! let credential = CredentialBundle::decode("<base64-credential>")?;
+//! let client = VtaClient::from_credential(&credential, None).await?;
+//!
+//! // Typed REST surface — `?` returns a `VtaError` with HTTP-aware variants
+//! // (Conflict, Gone, Forbidden, NotFound, …) so callers can surface targeted
+//! // operator errors instead of stringifying generic failures.
+//! let contexts = client.list_contexts().await?;
+//! for ctx in contexts {
+//!     println!("{} — {}", ctx.id, ctx.label);
+//! }
+//! # Ok(()) }
+//! ```
+//!
+//! ## Sealed-transfer round-trip
+//!
+//! See [`sealed_transfer`] for the HPKE envelope used to move credentials,
+//! mediator secrets, and DID-secrets bundles between operator hosts:
+//!
+//! ```rust,ignore
+//! use vta_sdk::sealed_transfer::{seal_payload, open_bundle, generate_keypair, ...};
+//! ```
+//!
+//! ## Feature flags
+//!
+//! The crate is split into opt-in features so a thin types-only consumer
+//! doesn't pay the dependency cost of the full client. Pick the smallest
+//! set that compiles for your use case.
+//!
+//! | Feature | What it enables |
+//! |---|---|
+//! | `client` | Synchronous REST [`client::VtaClient`] (depends on reqwest, ed25519) |
+//! | `didcomm` | DIDComm transport types and message helpers |
+//! | `session` | Session storage + auth state machine. Needs a persistence backend (`keyring` or `config-session`). |
+//! | `keyring` | OS-native session storage via `keyring-core` (macOS Keychain / Windows Credential Manager / Linux Secret Service) |
+//! | `config-session` | Plaintext on-disk session storage (dev / non-sensitive contexts only) |
+//! | `azure-secrets` | Azure Key Vault session backend (requires `azure-secrets` env). Mutually exclusive with `keyring` at the SDK level. |
+//! | `sealed-transfer` | HPKE-sealed bundle envelope (seal, open, armor, producer assertions) |
+//! | `provision-integration` | VP-framed bootstrap requests + VC-issued admin authorization |
+//! | `provision-client` | Higher-level orchestration over `provision-integration` (TUI-agnostic) |
+//! | `attest-verify` | Full AWS Nitro attestation verification (cert chain to AWS root) |
+//! | `vp` | DCQL credential selection + holder-bound OID4VP `vp_token` assembly ([`vp`]) |
+//! | `integration` | Pull-bundle service-startup pattern (combines `client` + `session`) |
+//! | `test-support` | In-memory mocks (`SessionBackend`, fixtures) for downstream tests |
+//!
+//! ## Module map
+//!
+//! * [`client`] — synchronous REST client + typed request/response shapes
+//! * `agent_session` (feature `session`) — high-level personal-AI-agent runtime:
+//!   enroll + heartbeat + inbound-wake loop on top of the DIDComm client
+//! * [`didcomm_session`] / [`didcomm_light`] — DIDComm transport
+//! * [`session`] — credential storage, login, refresh-token rotation
+//! * [`sealed_transfer`] — HPKE envelope (seal/open/armor/verify)
+//! * [`provision_integration`] — VP/VC bootstrap flow + typestate verifier
+//! * `integration` (feature-gated) — service-startup pull pattern with offline-cache resilience
+//! * [`did_templates`] — render-side helpers for the VTA's template registry
+//! * [`error`] — [`error::VtaError`] (typed, HTTP-aware, DIDComm-aware)
+//! * [`specs`] — the generated Trust Task wire types, at the versions VTI pins
+
+pub mod error;
+/// The Trust Task wire types, generated at build time from the specification
+/// versions VTI pins (`trust-tasks-build`), at the module paths the deprecated
+/// prebuilt `trust_tasks_rs::specs` gave them: `trust_tasks_rs::specs::vtc::…`
+/// is `vta_sdk::specs::vtc::…`. [`specs::schema_index`] is the drop-in for
+/// `trust_tasks_rs::schema_index` over exactly those versions.
+pub use vti_specs as specs;
+pub mod hex;
+pub mod rate_limit;
+// Pure, dependency-light validators shared with clients so they apply the
+// VTA's canonical context-path / identifier rules without mirroring them.
+pub mod acl;
+pub mod context_path;
+pub mod identifier;
+// The declarative approvals model. Unconditional (no feature gate): the VTA,
+// the policy subsystem, and the CLI all derive the same Rego from it, and a
+// synthesizer that differed per feature set would break the byte-compare the
+// server relies on.
+pub mod approvals;
+
+#[cfg(feature = "acl-setup")]
+pub mod acl_setup;
+#[cfg(feature = "session")]
+pub mod agent_connect;
+#[cfg(feature = "session")]
+pub mod agent_session;
+#[cfg(feature = "attest-verify")]
+pub mod attestation;
+/// Wire type for `POST /attestation/config-report`. Always compiled (serde only)
+/// so any consumer — or the service — can (de)serialize it without the heavier
+/// `attest-verify` verifier deps. The `verify`/`authenticate` methods that need
+/// the Nitro verifier are added in the `attestation` module under `attest-verify`.
+pub mod attestation_report;
+#[cfg(feature = "client")]
+pub mod auth_di;
+#[cfg(feature = "client")]
+pub mod auth_light;
+#[cfg(feature = "client")]
+pub mod client;
+pub mod context_policy;
+pub mod context_provision;
+pub mod contexts;
+pub mod credentials;
+pub mod did_key;
+/// Forcing a fresh resolution of a DID a verification failed against — see
+/// the module docs.
+#[cfg(feature = "proof-verify")]
+pub mod did_refresh;
+pub mod did_scid;
+pub mod did_secrets;
+pub mod did_templates;
+/// Compact-JWS verification over a resolved key — EdDSA, ES256, ES256K.
+#[cfg(feature = "proof-verify")]
+pub mod jws;
+pub mod node_keys;
+/// Notifications (`notifications/*`, VTI-NTF-001 – 063): verifying a delivered notification
+/// and every relay around it.
+#[cfg(feature = "proof-verify")]
+pub mod notifications;
+/// Which identifier methods a party resolves (VTI-KEY-003, VTI-KEY-009).
+pub mod resolved_methods;
+/// Reading an IETF Token Status List for a credential, signed by its issuer.
+#[cfg(feature = "proof-verify")]
+pub mod token_status_list;
+/// Verifying a Trust-Task document's Data-Integrity proof. Moved down from
+/// `vti-common` when a *client* needed it too — see the module docs.
+#[cfg(feature = "proof-verify")]
+pub mod trust_task_proof;
+/// Credential issuers known by an X.509 certificate chain to a configured
+/// trust anchor, instead of a DID.
+#[cfg(feature = "x509-issuers")]
+pub mod x509_issuer;
+// DID → human-readable display name. The single seam every operator-facing
+// surface (PNM/CNM CLIs, VTC operator CLI, VTC admin UI) renders DIDs
+// through. Core is dependency-light and always compiled; the one source that
+// needs the network (a verified agent name) is behind `agent-names`.
+#[cfg(feature = "client")]
+pub mod didcomm_light;
+#[cfg(feature = "session")]
+pub mod didcomm_session;
+pub mod display_name;
+// Pins rustls to the aws-lc-rs backend; every binary calls this at startup.
+#[cfg(feature = "crypto-provider")]
+pub mod crypto_init;
+#[cfg(feature = "http")]
+pub mod http;
+#[cfg(feature = "keyring")]
+pub mod keyring_init;
+pub mod keys;
+// Which store holds a tool's secrets, and the one explanation every tool in the
+// workspace prints when that store cannot be opened. Always compiled — a
+// consumer that does not enable `keyring` still renders the same text and
+// honours the same `VTI_SECURE_STORE` override.
+pub mod secure_store;
+// Client-side idempotency: one key held across every attempt of one operation.
+// Needs the async runtime for its task-local + backoff, so it rides `client`.
+#[cfg(feature = "client")]
+pub mod idempotency;
+pub mod prelude;
+// What a lost reply costs each Trust Task. Always-on and dependency-free (it
+// classifies `trust_tasks`' URI catalog), so a retry layer can consult it
+// without pulling in the client machinery.
+pub mod retry_safety;
+// How long a caller must wait for a Trust Task, given what the VTA may do with
+// it on the way. Always-on and dependency-free for the same reason
+// `retry_safety` is: `vta-service` reads the shared timeout constant from here
+// rather than keeping a second copy that can drift.
+pub mod budget;
+// What an inbound Trust Task document is — request, response, or terminal
+// error — and what each permits. Always-on and dependency-free: a peer on the
+// other end of the wire needs the same answer, and two copies of it drift.
+pub mod inbound;
+// `resolver` wraps `affinidi-did-resolver-cache-sdk`. The cfg lists every
+// feature that adds that dependency, not just `didcomm`: this module now also
+// owns the loopback-host decision (`webvh_host_policy`), and each of these
+// features has a resolver-construction site that has to ask for it —
+// `didcomm_light` under `client` (which implies `proof-verify`),
+// `display_name::agent_name` under `agent-names`. Gating on `didcomm` alone
+// made those builds fail to find it.
+#[cfg(any(
+    feature = "proof-verify",
+    feature = "didcomm",
+    feature = "tsp",
+    feature = "agent-names",
+    feature = "session"
+))]
+pub mod resolver;
+// `protocol` itself is always-on (its `services` submodule holds pure
+// wire types + the shared `validate_service_url` validator that
+// vta-service uses without ever talking to a `VtaClient`). The
+// `impl VtaClient` blocks inside are individually `cfg(feature = "client")`-
+// gated, so disabling the `client` feature still drops the network
+// machinery — but consumers no longer need to flip the feature on
+// just to import `protocol::services::validate_service_url`.
+pub mod protocol;
+pub mod protocols;
+// OpenAPI schemas for the published Trust Task types a service serves over
+// REST, rendered from the schemas the generated types embed.
+#[cfg(feature = "openapi")]
+pub mod openapi;
+#[cfg(feature = "provision-client")]
+pub mod provision_client;
+#[cfg(feature = "provision-integration")]
+pub mod provision_integration;
+#[cfg(feature = "sealed-transfer")]
+pub mod sealed_transfer;
+#[cfg(feature = "session")]
+pub mod session;
+/// TEE first-boot claim wire (`POST /bootstrap/request`, version 2, #2066).
+#[cfg(feature = "sealed-transfer")]
+pub mod tee_bootstrap;
+// One TDK + one ATM per process, with a session per identity on it. Every
+// session type in this SDK runs on a hub; the legacy constructors just build a
+// private one (#830).
+/// Trust Task payload schemas compiled once per process, not per call (#2622).
+pub mod schema_cache;
+#[cfg(feature = "session")]
+pub mod session_hub;
+/// The approver's side of task consent: the match code, request verification,
+/// and the decision payload.
+pub mod task_consent;
+/// Holder-signing for Trust Task documents — the shared `eddsa-jcs-2022`
+/// primitive both services' holder surfaces verify against.
+#[cfg(feature = "client")]
+pub mod trust_task_sign;
+/// Canonical Trust-Task URLs for VTA operations. Mirrors
+/// `did-hosting-common::did_hosting_tasks` for the webvh-service side.
+pub mod trust_tasks;
+// How a Trust Task is carried in a TSP payload — the binding's wrapper, opened
+// and applied in one place for the whole workspace (`vta-service`'s receiver
+// uses this module too). Public because a peer implementing the binding needs
+// to name the envelope type.
+#[cfg(feature = "tsp")]
+pub mod tsp_binding;
+// Reply correlation for TSP, shared by `TspSession` and the `DIDCommSession`
+// TSP leg. Internal: consumers see the sessions, not the bookkeeping.
+#[cfg(all(feature = "session", feature = "tsp"))]
+mod tsp_demux;
+// DCQL credential selection + holder-bound OID4VP `vp_token` assembly. The
+// client-side counterpart to the `join-requests` / `credential-exchange`
+// protocol types: turns a verifier's `presentation_definition` + held
+// credentials into a signed `vp_token` the VTC's join verifier accepts.
+#[cfg(feature = "vp")]
+pub mod vp;
+// Peer identity vetting: building, signing and verifying the Vetting Card and
+// Vetting Statement, and counting statements against a community's
+// requirements. Shapes are in `protocols::vetting`.
+#[cfg(feature = "vetting")]
+pub mod vetting;
+pub mod webvh;
+
+#[cfg(feature = "integration")]
+pub mod integration;

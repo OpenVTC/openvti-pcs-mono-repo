@@ -1,0 +1,497 @@
+//! The canonical `AclEntry` — `acl/_shared/0.1/acl-entry`.
+//!
+//! Every `acl/*` task carries this one shape, which is what let the VTA's
+//! private `vta/acl/*` family fold onto the canonical one (#840 phase A).
+//!
+//! Three things differ from the pre-fold VTA wire form, and each is the
+//! canonical spelling rather than a rename for its own sake:
+//!
+//! - `did` → `subject`, `allowedContexts` → `scopes`. The canonical vocabulary
+//!   is deliberately generic: a scope is an opaque identifier, which is what
+//!   lets one ACL family serve a VTA's contexts, a hosting service's domains,
+//!   and anything else with a containment relation.
+//! - `expiresAt` is **RFC 3339**, not Unix epoch seconds. A timestamp that a
+//!   human can read in a signed document is worth the conversion; the internal
+//!   store keeps epoch seconds.
+//! - `stepUpApprover` / `stepUpRequire` and the approve-authority pair are
+//!   nested under [`StepUp`] and [`Approve`], grouping each per-entry
+//!   sub-concern instead of flattening five loosely-related members.
+
+use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::acl::ApproveScope;
+
+use super::create::CreateAclResultBody;
+use serde_json::Value;
+
+/// Where an entry's capability narrowing travels: the `ext` member
+/// `org.openvtc.capabilities`, holding the kebab-case capability names.
+///
+/// It rides `ext` rather than a member of its own because the published
+/// `acl/*` schemas are `additionalProperties: false` and declare an extension
+/// slot for exactly this — an ecosystem-local concept the framework has no
+/// vocabulary for. Same convention as `org.openvtc.vault-session` and the
+/// device binding's local capability list.
+pub const CAPABILITIES_EXT_MEMBER: &str = "org.openvtc.capabilities";
+
+/// The `ext` member that marks a new entry as a one-time hand-off
+/// (VTI-ACL-054): `true` on a grant asks the maintainer to set the marker, and
+/// on a read says the entry carries one that has not been exercised.
+///
+/// Only a grant may carry it. The maintainer refuses it on an update, and a
+/// rotation never carries it across.
+pub const HANDOFF_EXT_MEMBER: &str = "org.openvtc.handoff";
+
+/// Whether an `ext` object asks for (or reports) the hand-off marker.
+///
+/// Anything but a boolean is an error rather than a guess: this member widens
+/// what the subject may later do, so a malformed value must not read as `true`,
+/// and silently reading it as `false` would hide an operator's mistake.
+pub fn handoff_from_ext(ext: Option<&Value>) -> Result<bool, String> {
+    match ext.and_then(|e| e.get(HANDOFF_EXT_MEMBER)) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(v) => Err(format!(
+            "`{HANDOFF_EXT_MEMBER}` must be a boolean, found {v}"
+        )),
+    }
+}
+
+/// Put the hand-off marker into an `ext` object, preserving anything else
+/// already there. `false` leaves `ext` as it is.
+pub fn handoff_into_ext(ext: Option<Value>, handoff: bool) -> Option<Value> {
+    if !handoff {
+        return ext;
+    }
+    let mut base = match ext {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    base.insert(HANDOFF_EXT_MEMBER.to_string(), Value::Bool(true));
+    Some(Value::Object(base))
+}
+
+/// Read a capability narrowing out of an `ext` object.
+///
+/// `None` means the member is absent — leave whatever is stored alone. An empty
+/// vec means it was present and empty, which is the spelling for "clear the
+/// narrowing": the two are different intentions and a caller that conflated
+/// them would silently widen an entry it meant to leave untouched.
+///
+/// Unknown names are an error rather than a skip. A capability this build has
+/// never heard of is precisely the one that must not be quietly dropped: the
+/// operator would be told the narrowing succeeded while the entry kept an
+/// authority they had just tried to remove.
+pub fn capabilities_from_ext(ext: Option<&Value>) -> Result<Option<Vec<String>>, String> {
+    let Some(member) = ext.and_then(|e| e.get(CAPABILITIES_EXT_MEMBER)) else {
+        return Ok(None);
+    };
+    let Some(items) = member.as_array() else {
+        return Err(format!(
+            "`{CAPABILITIES_EXT_MEMBER}` must be an array of capability names"
+        ));
+    };
+    items
+        .iter()
+        .map(|v| {
+            v.as_str().map(str::to_string).ok_or_else(|| {
+                format!("`{CAPABILITIES_EXT_MEMBER}` must contain strings, found {v}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Put a capability narrowing into an `ext` object, preserving anything else
+/// already there.
+pub fn capabilities_into_ext(ext: Option<Value>, capabilities: &[String]) -> Option<Value> {
+    if capabilities.is_empty() {
+        // Nothing to say: an entry with no narrowing holds what its role
+        // implies, and an empty array here would read as "narrowed to nothing".
+        return ext;
+    }
+    let mut base = match ext {
+        Some(Value::Object(map)) => map,
+        // A non-object `ext` is not something to merge into — replace it rather
+        // than dropping the narrowing on the floor.
+        _ => serde_json::Map::new(),
+    };
+    base.insert(
+        CAPABILITIES_EXT_MEMBER.to_string(),
+        Value::Array(
+            capabilities
+                .iter()
+                .map(|c| Value::String(c.clone()))
+                .collect(),
+        ),
+    );
+    Some(Value::Object(base))
+}
+
+/// Per-entry step-up configuration — canonical `AclEntry.stepUp`.
+///
+/// **Additive only.** A per-entry setting may raise the assurance required of
+/// this subject above the maintainer's system-wide floor; it must never lower
+/// it. The effective requirement is the strictest of (floor, entry).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct StepUp {
+    /// VID that ratifies step-up for this subject. Absent → the subject is its
+    /// own approver, when it holds a usable authenticator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// Minimum step-up mode: `self` or `delegated`. Absent → the system floor
+    /// applies unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require: Option<String>,
+}
+
+impl StepUp {
+    fn is_empty(&self) -> bool {
+        self.approver.is_none() && self.require.is_none()
+    }
+}
+
+/// Approve-authority — canonical `AclEntry.approve`.
+///
+/// What the subject may **confer on others** by ratifying an approval, as
+/// distinct from `scopes`, which is what it may **exercise itself**. The two
+/// are independent, which is what expresses a least-privilege approver: a party
+/// that can authorize an operation in a scope it has no authority to perform.
+///
+/// Omission confers nothing — absent, `all: false` and an empty `scopes` all
+/// mean "may ratify nothing", so a consumer that ignores this member grants
+/// *less* than intended.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Approve {
+    /// May confer any scope. Takes precedence over `scopes`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+    /// Scopes the subject may confer. Empty confers nothing; not a wildcard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+impl Approve {
+    fn is_empty(&self) -> bool {
+        !self.all && self.scopes.is_empty()
+    }
+
+    /// The internal [`ApproveScope`] this wire form denotes.
+    pub fn to_scope(&self) -> ApproveScope {
+        if self.all {
+            ApproveScope::All
+        } else if self.scopes.is_empty() {
+            ApproveScope::None
+        } else {
+            ApproveScope::Contexts(self.scopes.clone())
+        }
+    }
+
+    /// The wire form of an internal [`ApproveScope`].
+    pub fn from_scope(scope: &ApproveScope) -> Self {
+        match scope {
+            ApproveScope::None => Self::default(),
+            ApproveScope::All => Self {
+                all: true,
+                scopes: Vec::new(),
+            },
+            ApproveScope::Contexts(cs) => Self {
+                all: false,
+                scopes: cs.clone(),
+            },
+        }
+    }
+}
+
+/// One access-control entry — canonical `acl/_shared/0.1/acl-entry#AclEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[non_exhaustive]
+pub struct AclEntry {
+    /// VID of the party in the ACL.
+    pub subject: String,
+    /// Role identifier, interpreted by the maintainer.
+    pub role: String,
+    /// Opaque scope identifiers. For a VTA these are trust contexts.
+    ///
+    /// **Never read emptiness as "unrestricted".** An empty list means
+    /// unrestricted only for an admin role and *authorized nowhere* for every
+    /// other, so a check that ignores the role gets one of the two backwards.
+    /// Resolve through the role, as `AclEntry::act_scope` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// Key ids the subject may invoke the signing oracle on (#818).
+    /// Intersects with — never widens — `scopes`.
+    ///
+    /// **`None` and `Some(∅)` are opposite grants.** Absent = every key the
+    /// entry's scopes reach (entries that pre-date the member); present-but-
+    /// empty = authorized on **no** keys. That is why the skip is
+    /// `Option::is_none`, *not* `Vec::is_empty`: `Some([])` must survive the
+    /// wire as `"allowedKeys": []` or the narrowest grant silently becomes
+    /// the widest. Mirrors `acl/_shared/0.1/acl-entry#allowedKeys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    /// When the entry stops being effective. RFC 3339 on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_up: Option<StepUp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approve: Option<Approve>,
+    /// Ecosystem-defined extension members (SPEC §4.5.1).
+    ///
+    /// Carried explicitly rather than swept up by relaxing
+    /// `deny_unknown_fields`: the published payload schemas declare an `ext`
+    /// slot, so a conforming producer may send one, and rejecting the whole
+    /// document over it would break interop with a peer doing exactly what the
+    /// spec allows. Keeping `deny_unknown_fields` alongside it means a *typo*
+    /// is still refused rather than silently ignored — which is the guard that
+    /// clause was there for.
+    ///
+    /// The VTA does not interpret the contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
+}
+
+impl AclEntry {
+    /// Build an entry from the three members that carry its authorization.
+    ///
+    /// `#[non_exhaustive]`, so it cannot be built with a struct literal from
+    /// outside this crate — the `ext` member added in #1231 broke every such
+    /// literal, and the next schema revision would do it again.
+    ///
+    /// **`scopes` is an argument rather than a default, and `allowed_keys` is
+    /// not one at all.** Both encode a grant whose empty case is not its
+    /// neutral case: empty `scopes` means *unrestricted* for an admin role and
+    /// *authorized nowhere* for every other, and on `allowed_keys` `None` and
+    /// `Some(vec![])` are opposite grants — absent reaches every key the scopes
+    /// reach, present-but-empty reaches none. A constructor that defaulted
+    /// either would be picking a grant on the caller's behalf, and picking the
+    /// wrong one silently. So the caller states `scopes`, and `allowed_keys`
+    /// starts absent — the same thing an entry predating the member means — and
+    /// must be set deliberately to narrow it.
+    pub fn new(subject: String, role: String, scopes: Vec<String>) -> Self {
+        Self {
+            subject,
+            role,
+            scopes,
+            allowed_keys: None,
+            label: None,
+            created_at: None,
+            created_by: None,
+            updated_at: None,
+            updated_by: None,
+            expires_at: None,
+            step_up: None,
+            approve: None,
+            ext: None,
+        }
+    }
+}
+
+/// Unix epoch seconds → RFC 3339, for the wire.
+fn to_rfc3339(epoch: u64) -> Option<DateTime<Utc>> {
+    i64::try_from(epoch)
+        .ok()
+        .and_then(|s| Utc.timestamp_opt(s, 0).single())
+}
+
+/// RFC 3339 → Unix epoch seconds, for the store. Pre-epoch instants clamp to
+/// 0 rather than wrapping, which for an `expiresAt` reads as "already expired"
+/// — the safe direction for a timestamp that gates authority.
+pub fn to_epoch(ts: DateTime<Utc>) -> u64 {
+    u64::try_from(ts.timestamp()).unwrap_or(0)
+}
+
+impl AclEntry {
+    /// Build the wire form from the internal result body.
+    pub fn from_result(r: &CreateAclResultBody) -> Self {
+        let step_up = StepUp {
+            approver: r.step_up_approver.clone(),
+            require: r.step_up_require.clone(),
+        };
+        let approve = Approve {
+            all: r.approve_all_contexts,
+            scopes: r.approve_contexts.clone(),
+        };
+        Self {
+            subject: r.did.clone(),
+            role: r.role.clone(),
+            scopes: r.allowed_contexts.clone(),
+            allowed_keys: r.allowed_keys.clone(),
+            label: r.label.clone(),
+            created_at: to_rfc3339(r.created_at),
+            created_by: Some(r.created_by.clone()),
+            updated_at: None,
+            updated_by: None,
+            expires_at: r.expires_at.and_then(to_rfc3339),
+            step_up: (!step_up.is_empty()).then_some(step_up),
+            approve: (!approve.is_empty()).then_some(approve),
+            // One extension member the VTA does author: the capability
+            // narrowing. The framework has no vocabulary for it, and an
+            // operator who cannot read a restriction back cannot verify it.
+            ext: handoff_into_ext(capabilities_into_ext(None, &r.capabilities), r.handoff),
+        }
+    }
+
+    /// The step-up approver this entry names, if any.
+    pub fn step_up_approver(&self) -> Option<String> {
+        self.step_up.as_ref().and_then(|s| s.approver.clone())
+    }
+
+    /// The per-entry step-up mode override, if any.
+    pub fn step_up_require(&self) -> Option<String> {
+        self.step_up.as_ref().and_then(|s| s.require.clone())
+    }
+
+    /// The approve-authority this entry carries. Absent → confers nothing.
+    pub fn approve_scope(&self) -> ApproveScope {
+        self.approve
+            .as_ref()
+            .map(Approve::to_scope)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_approve_and_step_up_are_omitted_not_emitted() {
+        let e = AclEntry {
+            subject: "did:key:z6MkA".into(),
+            role: "reader".into(),
+            scopes: vec![],
+            allowed_keys: None,
+            label: None,
+            created_at: None,
+            created_by: None,
+            updated_at: None,
+            updated_by: None,
+            expires_at: None,
+            step_up: None,
+            approve: None,
+            ext: None,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("approve").is_none(), "{v}");
+        assert!(v.get("stepUp").is_none(), "{v}");
+        assert!(v.get("scopes").is_none(), "empty scopes are omitted: {v}");
+    }
+
+    /// Omission and "confers nothing" must agree, so a consumer that drops the
+    /// member grants less rather than more.
+    #[test]
+    fn absent_approve_confers_nothing() {
+        let e: AclEntry =
+            serde_json::from_value(serde_json::json!({"subject": "did:key:zA", "role": "admin"}))
+                .unwrap();
+        assert_eq!(e.approve_scope(), ApproveScope::None);
+    }
+
+    #[test]
+    fn approve_all_takes_precedence_over_scopes() {
+        let a = Approve {
+            all: true,
+            scopes: vec!["ctx-a".into()],
+        };
+        assert_eq!(a.to_scope(), ApproveScope::All);
+    }
+
+    #[test]
+    fn approve_scope_round_trips() {
+        for s in [
+            ApproveScope::None,
+            ApproveScope::All,
+            ApproveScope::Contexts(vec!["a".into(), "b".into()]),
+        ] {
+            assert_eq!(Approve::from_scope(&s).to_scope(), s);
+        }
+    }
+
+    #[test]
+    fn expiry_round_trips_through_rfc3339() {
+        let epoch = 1_800_000_000u64;
+        let ts = to_rfc3339(epoch).expect("representable");
+        assert_eq!(to_epoch(ts), epoch);
+        assert_eq!(ts.to_rfc3339(), "2027-01-15T08:00:00+00:00");
+    }
+
+    /// `allowedKeys` (#818): absent and empty are opposite grants and both
+    /// must survive the wire. `Some([])` emits `"allowedKeys": []`; `None`
+    /// emits nothing — collapsing them would turn "may sign with no keys"
+    /// into "may sign with every key in scope".
+    #[test]
+    fn allowed_keys_empty_and_absent_both_survive_the_wire() {
+        let mut e: AclEntry =
+            serde_json::from_value(serde_json::json!({"subject": "did:key:zA", "role": "reader"}))
+                .unwrap();
+        assert_eq!(e.allowed_keys, None, "absent decodes to None (no filter)");
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(
+            v.get("allowedKeys").is_none(),
+            "no filter emits nothing: {v}"
+        );
+
+        e.allowed_keys = Some(vec![]);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            v.get("allowedKeys"),
+            Some(&serde_json::json!([])),
+            "the empty filter must be emitted, not skipped: {v}"
+        );
+        let back: AclEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.allowed_keys, Some(vec![]));
+
+        // And the wire casing is the canonical camelCase, pinned (#656/#658).
+        e.allowed_keys = Some(vec!["key-1".into()]);
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("allowedKeys").is_some(), "{v}");
+        assert!(v.get("allowed_keys").is_none(), "{v}");
+    }
+
+    /// The wire form is camelCase; the pre-fold snake_case names are gone.
+    #[test]
+    fn wire_form_is_camel_case() {
+        let e = AclEntry {
+            subject: "did:key:zA".into(),
+            role: "admin".into(),
+            scopes: vec!["ctx".into()],
+            allowed_keys: None,
+            label: None,
+            created_at: None,
+            created_by: None,
+            updated_at: None,
+            updated_by: None,
+            expires_at: to_rfc3339(1_800_000_000),
+            step_up: Some(StepUp {
+                approver: Some("did:key:zB".into()),
+                require: Some("delegated".into()),
+            }),
+            approve: None,
+            ext: None,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("expiresAt").is_some(), "{v}");
+        assert!(v.get("stepUp").is_some(), "{v}");
+        assert!(v.get("allowed_contexts").is_none(), "{v}");
+        assert!(v.get("did").is_none(), "subject, not did: {v}");
+    }
+}

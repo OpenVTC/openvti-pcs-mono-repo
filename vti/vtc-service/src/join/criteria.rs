@@ -1,0 +1,1244 @@
+//! Deciding a join submission against the community's published criteria
+//! (`vtc/join-requests/submit/0.3` §Deciding a submission).
+//!
+//! The criteria are the community's join rules, and this module adds none of
+//! its own. It answers three questions, in this order:
+//!
+//! 1. **Which criterion governs.** The one the submission names by its
+//!    `requirementsDigest` — at the version that digest names while that
+//!    version is within its `requirementsGrace` — or, when it names none, the
+//!    first criterion in published order that the submission meets, and when it
+//!    meets none, the first published. A community with no criteria accepts no
+//!    applications ([`CriterionRefusal::NotAccepting`]); a digest naming none of
+//!    them is [`CriterionRefusal::Unknown`].
+//! 2. **Whether the submission meets it** — every requirement it states, and
+//!    only those:
+//!    - *credentials*: the presentation carries credentials satisfying the DCQL
+//!      query, each verifying (signature, validity window, revocation), bound
+//!      to the applicant, and issued by a party `credentialIssuers` admits;
+//!    - *vetting*: the statements presented meet the `vetting` object, counted
+//!      by [`crate::vetting::vetting_facts`];
+//!    - *invitation*: when `invitationRequired`, a valid, unconsumed invitation
+//!      this community issued to the applicant.
+//! 3. **What that obliges** — carried to the decision as a
+//!    [`CriterionFact`], which the host invariant
+//!    ([`crate::ceremony::invariant`]) holds the policy to: a submission that
+//!    does not meet its criterion is never admitted, nor referred for an
+//!    administrator to admit; one meeting a `review` criterion is referred,
+//!    never admitted on the submission; one meeting an `automatic` criterion is
+//!    admitted unless the policy refuses or refers it on grounds of its own.
+//!
+//! Something presented that the governing criterion does not ask for — an
+//! invitation, a credential — does not help meet it.
+
+use std::collections::HashMap;
+
+use affinidi_openid4vp::dcql::{
+    CandidateCredential, TrustedAuthoritiesQuery, TrustedAuthorityType,
+};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
+use tracing::{debug, warn};
+use vti_common::error::AppError;
+
+use crate::ceremony::{CredentialStatus, Invitation, Presentation};
+use crate::join::ops::manifest::{ServedCriterion, manifest_criterion};
+use crate::schemas::accepts::{
+    AcceptsCriterion, Admission, CredentialIssuers, published_criteria, superseded_version,
+};
+use crate::server::AppState;
+use crate::vetting::VettingFacts;
+use crate::vetting::challenge_refusal::ChallengeRefusal;
+
+/// The DCQL `format` of a W3C Verifiable Credential secured with a Data
+/// Integrity proof — what a join presentation's `verifiableCredential` carries.
+pub const LDP_VC_FORMAT: &str = "ldp_vc";
+
+/// The DCQL `format` of an SD-JWT VC.
+pub const SD_JWT_VC_FORMAT: &str = "dc+sd-jwt";
+
+/// The need named when a criterion's credentials are not presented.
+pub const NEED_CREDENTIALS: &str = "credentials";
+
+/// The need named when a criterion requires an invitation and none valid was
+/// presented.
+pub const NEED_INVITATION: &str = "invitation";
+
+/// The generic need a policy returns for "whatever the criterion still
+/// lacks"; the host expands it into [`CriterionFact::needs`].
+pub const NEED_CRITERION: &str = "criterion";
+
+/// What the decision is told about the criterion a submission is decided
+/// under. Every member is a host verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CriterionFact {
+    /// The criterion's id.
+    pub id: String,
+    /// The `requirementsDigest` of the version that governed.
+    pub requirements_digest: String,
+    /// How a submission meeting it is decided.
+    pub admission: Admission,
+    /// The submission meets every requirement the criterion states.
+    pub met: bool,
+    /// What is still missing, when not met: [`NEED_CREDENTIALS`],
+    /// [`NEED_INVITATION`], or the vetting shortfall in the `vetting:*`
+    /// grammar. Never empty when `met` is false.
+    #[serde(default)]
+    pub needs: Vec<String>,
+    /// The submission named this criterion.
+    pub cited: bool,
+    /// The version that governed is not the current one: the submission cited
+    /// a superseded version still within its grace.
+    #[serde(default)]
+    pub superseded: bool,
+}
+
+/// The criterion a submission is decided under, and what it established.
+#[derive(Debug, Clone)]
+pub struct Governing {
+    /// The criterion, as served at the version that governed.
+    pub served: ServedCriterion,
+    /// The decision's view of it.
+    pub fact: CriterionFact,
+    /// The vetting count under it, when it requires vetting.
+    pub vetting: Option<VettingFacts>,
+}
+
+impl Governing {
+    /// The DCQL query the applicant still has to satisfy, for a `requestMore`.
+    pub fn presentation_definition(&self) -> Option<JsonValue> {
+        self.fact
+            .needs
+            .iter()
+            .any(|n| n == NEED_CREDENTIALS)
+            .then(|| self.served.stored.query.clone())
+            .flatten()
+    }
+}
+
+/// Why no criterion could govern.
+#[derive(Debug)]
+pub enum CriterionRefusal {
+    /// The community publishes no criteria (`submit:notAccepting`).
+    NotAccepting,
+    /// The cited digest names no criterion the community publishes, nor a
+    /// superseded version within its grace (`submit:criterionUnknown`).
+    Unknown(String),
+    /// The hidden-vetting challenge the submission's proof is bound to was refused
+    /// (`submit:challenge*` / `supplement:challenge*`).
+    Challenge(ChallengeRefusal),
+    /// Everything else.
+    Other(AppError),
+}
+
+impl From<AppError> for CriterionRefusal {
+    fn from(e: AppError) -> Self {
+        Self::Other(e)
+    }
+}
+
+impl From<crate::vetting::FactsError> for CriterionRefusal {
+    fn from(e: crate::vetting::FactsError) -> Self {
+        match e {
+            crate::vetting::FactsError::Challenge(r) => Self::Challenge(r),
+            crate::vetting::FactsError::App(e) => Self::Other(e),
+        }
+    }
+}
+
+/// A presented credential that verified and is the applicant's own, as a
+/// criterion's query reads it.
+#[derive(Debug, Clone)]
+pub struct PresentedCredential {
+    /// The DCQL formats it can be matched as.
+    pub formats: Vec<&'static str>,
+    /// The type names a query's `meta.vct_values` can select it by.
+    pub types: Vec<String>,
+    /// The tree a DCQL claim `path` walks.
+    pub claims: JsonValue,
+    /// Its issuer's DID.
+    pub issuer: String,
+    /// For an issuer known by an `x5c` chain, the key identifiers (base64url)
+    /// of the authorities certifying it — what a credential query's
+    /// `trusted_authorities` of type `aki` is matched against. Empty for a DID
+    /// issuer, which therefore meets no such query.
+    pub issuer_authority_key_ids: Vec<String>,
+    /// The `requirementsDigest` of the only criterion it counts toward, when
+    /// it came from a wallet session collected for one
+    /// (`wallet-session/start/0.1` consumer rule 11). `None`: any criterion.
+    pub only_for: Option<String>,
+}
+
+/// Everything a submission presented that a criterion can ask for, verified
+/// once and read by every criterion evaluated.
+#[derive(Debug, Clone, Default)]
+pub struct Presented {
+    /// Credentials that verified and are bound to the applicant.
+    pub credentials: Vec<PresentedCredential>,
+    /// The invitation, when one was presented and verified.
+    pub invitation: Option<Invitation>,
+    /// The raw presentation, for the vetting count. `None` on a path that
+    /// carries no vetting statements.
+    pub vp: Option<JsonValue>,
+    /// The submission's `extensions`, where a hidden-vetting proof rides.
+    pub extensions: JsonValue,
+}
+
+/// Decide which criterion governs a submission, and whether it meets it.
+///
+/// `cited` is the `requirementsDigest` the submission names as its
+/// `criterion`, if any.
+pub async fn govern(
+    state: &AppState,
+    applicant_did: &str,
+    presented: &Presented,
+    cited: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Governing, CriterionRefusal> {
+    let published = published_criteria(&state.schemas_ks).await?;
+    if published.is_empty() {
+        return Err(CriterionRefusal::NotAccepting);
+    }
+    let mut ctx = Evaluator::new(state, applicant_did, presented, now).await;
+
+    if let Some(digest) = cited {
+        for stored in &published {
+            let served = manifest_criterion(stored.clone())?;
+            if served.digest == digest {
+                return ctx.evaluate(served, true, false).await;
+            }
+        }
+        if let Some(version) = superseded_version(&state.schemas_ks, digest).await?
+            && version.within_grace(now)
+        {
+            let served = manifest_criterion(version.criterion)?;
+            return ctx.evaluate(served, true, true).await;
+        }
+        return Err(CriterionRefusal::Unknown(digest.to_string()));
+    }
+
+    let mut first = None;
+    for stored in published {
+        let served = manifest_criterion(stored)?;
+        let governing = ctx.evaluate(served, false, false).await?;
+        if governing.fact.met {
+            return Ok(governing);
+        }
+        first.get_or_insert(governing);
+    }
+    Ok(first.expect("published is not empty"))
+}
+
+/// The criterion version a `requirementsDigest` names: a published criterion,
+/// or a superseded version still within its `requirementsGrace` at `now`.
+/// `None` when the digest names neither.
+pub async fn served_by_digest(
+    state: &AppState,
+    digest: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<ServedCriterion>, AppError> {
+    for stored in published_criteria(&state.schemas_ks).await? {
+        let served = manifest_criterion(stored)?;
+        if served.digest == digest {
+            return Ok(Some(served));
+        }
+    }
+    match superseded_version(&state.schemas_ks, digest).await? {
+        Some(version) if version.within_grace(now) => {
+            Ok(Some(manifest_criterion(version.criterion)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether a criterion admitting `issuers` admits a credential from `issuer`:
+/// any issuer, this community only, or this community and the communities it
+/// recognises (asked of the trust registry).
+pub async fn issuer_admitted(
+    state: &AppState,
+    own_did: Option<&str>,
+    issuers: CredentialIssuers,
+    issuer: &str,
+) -> bool {
+    let own = own_did == Some(issuer);
+    match issuers {
+        CredentialIssuers::Any => true,
+        CredentialIssuers::Community => own,
+        CredentialIssuers::Recognised => {
+            if own
+                || crate::join::ops::present::issuer_trusted(
+                    state.registry_client.as_deref(),
+                    own_did,
+                    issuer,
+                )
+                .await
+            {
+                return true;
+            }
+            // An issuer the swiyu trust registry vouches for, when the
+            // community takes issuer trust from it.
+            let swiyu = state.config.read().await.oid4vp.swiyu_trust.clone();
+            match swiyu {
+                Some(swiyu) => {
+                    crate::oid4vp::swiyu_issuer::trusted(state, &swiyu, issuer, chrono::Utc::now())
+                        .await
+                }
+                None => false,
+            }
+        }
+    }
+}
+
+/// Decide a credential-exchange presentation under the criterion the query it
+/// answers was built from (`id`), or — for a challenge that names none — as a
+/// submission naming no criterion is decided.
+pub async fn govern_by_id(
+    state: &AppState,
+    applicant_did: &str,
+    presented: &Presented,
+    id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Governing, CriterionRefusal> {
+    let Some(id) = id else {
+        return govern(state, applicant_did, presented, None, now).await;
+    };
+    let Some(stored) = crate::schemas::accepts::get_accepts(&state.schemas_ks, id).await? else {
+        return Err(CriterionRefusal::Unknown(id.to_string()));
+    };
+    let served = manifest_criterion(stored)?;
+    let mut ctx = Evaluator::new(state, applicant_did, presented, now).await;
+    ctx.evaluate(served, true, false).await
+}
+
+/// Re-decide a request under the criterion it was first decided under — a
+/// supplement adds evidence to a request, it does not reopen the choice of
+/// criterion.
+///
+/// The version recorded governs while it is current, or superseded and within
+/// its grace; past that, the criterion's current version under the same id.
+/// A criterion since deleted, and past its grace, governs nothing.
+pub async fn govern_again(
+    state: &AppState,
+    applicant_did: &str,
+    presented: &Presented,
+    id: &str,
+    digest: &str,
+    now: DateTime<Utc>,
+) -> Result<Governing, CriterionRefusal> {
+    let mut ctx = Evaluator::new(state, applicant_did, presented, now).await;
+    let current = crate::schemas::accepts::get_accepts(&state.schemas_ks, id).await?;
+    if let Some(stored) = current.clone() {
+        let served = manifest_criterion(stored)?;
+        if served.digest == digest {
+            return ctx.evaluate(served, true, false).await;
+        }
+    }
+    if let Some(version) = superseded_version(&state.schemas_ks, digest).await?
+        && version.within_grace(now)
+    {
+        let served = manifest_criterion(version.criterion)?;
+        return ctx.evaluate(served, true, true).await;
+    }
+    match current {
+        Some(stored) => {
+            let served = manifest_criterion(stored)?;
+            ctx.evaluate(served, false, false).await
+        }
+        None => Err(CriterionRefusal::Unknown(digest.to_string())),
+    }
+}
+
+/// Evaluates criteria against one submission, holding what every criterion
+/// reads the same way: the community's DID and each issuer's recognition, which
+/// is asked once.
+struct Evaluator<'a> {
+    state: &'a AppState,
+    applicant_did: &'a str,
+    presented: &'a Presented,
+    now: DateTime<Utc>,
+    own_did: Option<String>,
+    recognised: HashMap<String, bool>,
+}
+
+impl<'a> Evaluator<'a> {
+    async fn new(
+        state: &'a AppState,
+        applicant_did: &'a str,
+        presented: &'a Presented,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let own_did = state.config.read().await.vtc_did.clone();
+        Self {
+            state,
+            applicant_did,
+            presented,
+            now,
+            own_did,
+            recognised: HashMap::new(),
+        }
+    }
+
+    async fn evaluate(
+        &mut self,
+        served: ServedCriterion,
+        cited: bool,
+        superseded: bool,
+    ) -> Result<Governing, CriterionRefusal> {
+        let stored = &served.stored;
+        let mut needs = Vec::new();
+
+        if let Some(query) = stored.dcql()?
+            && !self.credentials_meet(stored, &served.digest, &query).await
+        {
+            needs.push(NEED_CREDENTIALS.to_string());
+        }
+
+        let vetting = match &self.presented.vp {
+            Some(vp) => {
+                crate::vetting::vetting_facts(
+                    self.state,
+                    self.applicant_did,
+                    vp,
+                    &self.presented.extensions,
+                    &served,
+                    cited,
+                    self.now,
+                )
+                .await?
+            }
+            None => None,
+        };
+        if stored.vetting.is_some() {
+            match &vetting {
+                Some(facts) => needs.extend(vetting_shortfall(facts, self.vetting_invitation())),
+                // A path that carries no statements cannot meet a vetting
+                // requirement.
+                None => needs.push(crate::vetting::NEED_VETTING.to_string()),
+            }
+        }
+
+        if stored.invitation_required && !self.own_invitation() {
+            needs.push(NEED_INVITATION.to_string());
+        }
+
+        let fact = CriterionFact {
+            id: stored.id.clone(),
+            requirements_digest: served.digest.clone(),
+            admission: stored.admission,
+            met: needs.is_empty(),
+            needs,
+            cited,
+            superseded,
+        };
+        debug!(
+            criterion = %fact.id,
+            met = fact.met,
+            needs = ?fact.needs,
+            "join criterion evaluated"
+        );
+        Ok(Governing {
+            served,
+            fact,
+            vetting,
+        })
+    }
+
+    /// `invitationRequired`: a valid, unconsumed invitation **this community**
+    /// issued — an invitation from a recognised peer is not one.
+    fn own_invitation(&self) -> bool {
+        self.presented.invitation.as_ref().is_some_and(|inv| {
+            inv.verified && !inv.consumed && self.own_did.as_deref() == Some(inv.issuer.as_str())
+        })
+    }
+
+    /// The invitation a `vetting` object's own `invitation: required` asks for:
+    /// valid, unconsumed, and from an issuer the community trusts for
+    /// invitations — what that member has always meant.
+    fn vetting_invitation(&self) -> bool {
+        self.presented
+            .invitation
+            .as_ref()
+            .is_some_and(|inv| inv.verified && inv.issuer_trusted && !inv.consumed)
+    }
+
+    /// Whether the credentials presented, from issuers this criterion admits,
+    /// satisfy its query.
+    async fn credentials_meet(
+        &mut self,
+        stored: &AcceptsCriterion,
+        digest: &str,
+        query: &affinidi_openid4vp::DcqlQuery,
+    ) -> bool {
+        let issuers = stored
+            .credential_issuers
+            // Registration refuses a query without one; a row that has one
+            // anyway is read the restrictive way.
+            .unwrap_or(CredentialIssuers::Community);
+        let mut admitted = Vec::new();
+        for c in &self.presented.credentials {
+            // Wallet evidence counts only toward the criterion it was
+            // collected for.
+            if c.only_for.as_deref().is_some_and(|d| d != digest) {
+                continue;
+            }
+            if self.issuer_admitted(issuers, &c.issuer).await {
+                admitted.push(c);
+            }
+        }
+        query_met_by(query, &admitted)
+    }
+
+    async fn issuer_admitted(&mut self, issuers: CredentialIssuers, issuer: &str) -> bool {
+        if issuers != CredentialIssuers::Recognised {
+            return issuer_admitted(self.state, self.own_did.as_deref(), issuers, issuer).await;
+        }
+        if let Some(known) = self.recognised.get(issuer) {
+            return *known;
+        }
+        let known = issuer_admitted(self.state, self.own_did.as_deref(), issuers, issuer).await;
+        self.recognised.insert(issuer.to_string(), known);
+        known
+    }
+}
+
+/// Whether `credentials` — already limited to issuers the criterion admits —
+/// satisfy `query`.
+fn query_met_by(
+    query: &affinidi_openid4vp::DcqlQuery,
+    credentials: &[&PresentedCredential],
+) -> bool {
+    let (query, type_selectors) = with_type_values_as_keys(query);
+    let (query, authority_gates) = with_trusted_authorities_as_keys(&query);
+    let mut candidates = Vec::new();
+    for (n, c) in credentials.iter().enumerate() {
+        let selected_by = type_selectors
+            .iter()
+            .filter(|(_, alternatives)| {
+                alternatives
+                    .iter()
+                    .any(|all| all.iter().all(|t| c.types.contains(t)))
+            })
+            .map(|(key, _)| key.clone());
+        let mut keys: Vec<String> = c.types.iter().cloned().chain(selected_by).collect();
+        let gated: Vec<String> = authority_gates
+            .iter()
+            .filter(|(_, authorities)| {
+                meets_trusted_authorities(authorities, &c.issuer_authority_key_ids)
+            })
+            .flat_map(|(id, _)| {
+                std::iter::once(trusted_key(id, None))
+                    .chain(keys.iter().map(|k| trusted_key(id, Some(k))))
+            })
+            .collect();
+        keys.extend(gated);
+        for format in &c.formats {
+            for vct in &keys {
+                candidates.push(CandidateCredential {
+                    id: n.to_string(),
+                    format: (*format).to_string(),
+                    claims: c.claims.clone(),
+                    vct: Some(vct.clone()),
+                    doctype: None,
+                    // Every presented credential here is bound to the
+                    // applicant: its subject is the proven submitter.
+                    supports_holder_binding: true,
+                });
+            }
+        }
+    }
+    query.match_credentials(&candidates).is_ok()
+}
+
+/// DCQL selects a W3C credential by `meta.type_values` — alternatives, each a
+/// set of types the credential's `type` must all carry — and the matcher reads
+/// only `vct_values`. So each credential query selecting by `type_values` (and
+/// not also by `vct_values`) is rewritten to select by a key of its own, and a
+/// candidate whose types satisfy one of its alternatives is offered under that
+/// key. Returns the rewritten query and, per key, the alternatives it stands
+/// for. Without this a `type_values` query would match a credential of any
+/// type.
+fn with_type_values_as_keys(
+    query: &affinidi_openid4vp::DcqlQuery,
+) -> (
+    affinidi_openid4vp::DcqlQuery,
+    Vec<(String, Vec<Vec<String>>)>,
+) {
+    let mut query = query.clone();
+    let mut selectors = Vec::new();
+    for cq in &mut query.credentials {
+        let Some(meta) = cq.meta.as_mut() else {
+            continue;
+        };
+        if meta.contains_key("vct_values") {
+            continue;
+        }
+        let Some(type_values) = meta.remove("type_values") else {
+            continue;
+        };
+        let alternatives: Vec<Vec<String>> = type_values
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|alt| match alt {
+                // An array of types the credential must all carry.
+                JsonValue::Array(types) => types
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                // A bare type, read as the one-type set it means.
+                JsonValue::String(t) => vec![t.clone()],
+                _ => Vec::new(),
+            })
+            // An empty set would select everything; it selects nothing here.
+            .filter(|alt: &Vec<String>| !alt.is_empty())
+            .collect();
+        let key = format!("urn:vtc:dcql:type-values:{}", cq.id);
+        meta.insert("vct_values".into(), json!([key]));
+        selectors.push((key, alternatives));
+    }
+    (query, selectors)
+}
+
+/// The key a credential query gated by `trusted_authorities` selects by, in
+/// place of each of its type keys (`None`: it selected by no type).
+fn trusted_key(query_id: &str, type_key: Option<&str>) -> String {
+    match type_key {
+        Some(k) => format!("urn:vtc:dcql:trusted:{query_id}:{k}"),
+        None => format!("urn:vtc:dcql:trusted:{query_id}"),
+    }
+}
+
+/// The matcher does not read `trusted_authorities`, so each credential query
+/// carrying it is rewritten to select by keys of its own ([`trusted_key`]),
+/// offered only by a candidate whose issuer one of its entries names. Returns
+/// the rewritten query and, per query id, the entries it stands for. Without
+/// this the constraint would be published to the wallet and never held.
+fn with_trusted_authorities_as_keys(
+    query: &affinidi_openid4vp::DcqlQuery,
+) -> (
+    affinidi_openid4vp::DcqlQuery,
+    Vec<(String, Vec<TrustedAuthoritiesQuery>)>,
+) {
+    let mut query = query.clone();
+    let mut gates = Vec::new();
+    for cq in &mut query.credentials {
+        let Some(authorities) = cq.trusted_authorities.take() else {
+            continue;
+        };
+        let meta = cq.meta.get_or_insert_with(Default::default);
+        let keys: Vec<String> = match meta.get("vct_values").and_then(JsonValue::as_array) {
+            Some(types) => types
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(|t| trusted_key(&cq.id, Some(t)))
+                .collect(),
+            None => vec![trusted_key(&cq.id, None)],
+        };
+        meta.insert("vct_values".into(), json!(keys));
+        gates.push((cq.id.clone(), authorities));
+    }
+    (query, gates)
+}
+
+/// Whether an issuer certified by `authority_key_ids` (base64url) meets a
+/// credential query's `trusted_authorities` (OpenID4VP 1.0 §6.1.1): one of its
+/// entries names one of them. Only `aki` can be held here — an ETSI trusted
+/// list or an OpenID Federation would need resolving — so an entry of another
+/// type is met by nothing; registration refuses one
+/// ([`crate::schemas::accepts::validate_accepts_query`]).
+pub fn meets_trusted_authorities(
+    authorities: &[TrustedAuthoritiesQuery],
+    authority_key_ids: &[String],
+) -> bool {
+    let decode = |v: &str| URL_SAFE_NO_PAD.decode(v.trim_end_matches('=')).ok();
+    let held: Vec<Vec<u8>> = authority_key_ids.iter().filter_map(|v| decode(v)).collect();
+    authorities.iter().any(|entry| {
+        entry.authority_type == TrustedAuthorityType::Aki
+            && entry
+                .values
+                .iter()
+                .filter_map(|v| decode(v))
+                .any(|id| !id.is_empty() && held.contains(&id))
+    })
+}
+
+/// What a vetting count still lacks, in the `vetting:*` grammar. Never empty
+/// when the vetting requirement is unmet: a count that is complete but whose
+/// vetters disagree, or are not independent enough, names that.
+fn vetting_shortfall(facts: &VettingFacts, invitation_held: bool) -> Vec<String> {
+    let mut needs = Vec::new();
+    if !facts.commitments_consistent {
+        needs.push("vetting:consistency".to_string());
+    }
+    needs.extend(facts.needs.iter().cloned());
+    if facts.commitments_consistent && facts.needs.is_empty() && !facts.independence_ok {
+        needs.push("vetting:independence".to_string());
+    }
+    if !facts.satisfied && needs.is_empty() {
+        needs.push(crate::vetting::NEED_VETTING.to_string());
+    }
+    if facts.satisfied && facts.invitation_required && !invitation_held {
+        needs.push(crate::vetting::NEED_INVITATION.to_string());
+    }
+    needs
+}
+
+/// Replace a policy's generic [`NEED_CRITERION`] with what the criterion
+/// still lacks. Leaves `needs` untouched when there is nothing specific.
+pub fn expand_needs(needs: &mut Vec<String>, fact: Option<&CriterionFact>) {
+    let Some(fact) = fact else {
+        return;
+    };
+    if fact.needs.is_empty() {
+        return;
+    }
+    if let Some(pos) = needs.iter().position(|n| n == NEED_CRITERION) {
+        needs.splice(pos..=pos, fact.needs.iter().cloned());
+    }
+}
+
+/// Verify the credentials embedded in a join presentation that a criterion's
+/// query can read: each one's issuer proof set, its validity window and its
+/// revocation status, and that its subject is the applicant.
+///
+/// A credential that fails any of those is left out, not refused: a credential
+/// that does not verify meets no criterion, and the decision is made on what
+/// did. Each one left out is logged with its reason. Invitations are verified
+/// by their own path ([`crate::credentials::invitation_verify`]) and vetting
+/// statements by theirs, but a query naming either type can still be met by
+/// one here — whether it is, is the criterion's business.
+pub async fn verify_embedded_credentials(
+    state: &AppState,
+    applicant_did: &str,
+    vp: &JsonValue,
+    now: DateTime<Utc>,
+) -> Result<Vec<PresentedCredential>, AppError> {
+    let Some(vcs) = vp.get("verifiableCredential").and_then(JsonValue::as_array) else {
+        return Ok(Vec::new());
+    };
+    if vcs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolver = crate::credentials::vm_resolver::DidVmResolver::new(state.did_resolver.clone());
+    let fetcher = crate::join::ops::present::credential_status_fetcher(state);
+    let aliases = type_aliases(state).await?;
+    // A VWC counts toward a criterion only on the host's full verdict
+    // (`credentials::witness::assess`). The join submission has no carriage
+    // for a witnessing session's outcome evidence yet, so none travels here:
+    // a VWC from a trusted witness is `noOutcomeEvidence` (VTI-CMP-023), and
+    // one from any other witness `untrustedWitness`.
+    let trusted_witnesses = crate::credentials::trusted_witnesses::live_for(state).await;
+    let vm_resolver = state.trust_task_vm_resolver();
+    let witness_ctx = crate::credentials::witness::WitnessContext {
+        relationships_ks: &state.relationships_ks,
+        trusted: &trusted_witnesses,
+        evidence: &[],
+        resolver: &vm_resolver,
+    };
+
+    let mut out = Vec::new();
+    for vc in vcs.iter().filter(|v| v.is_object()) {
+        match verify_one_credential(vc, applicant_did, &resolver, &fetcher, now).await {
+            Ok((issuer, concrete)) if crate::credentials::witness::is_witness_statement(vc) => {
+                let verdict =
+                    crate::credentials::witness::assess_or_unresolved(&witness_ctx, &issuer, vc)
+                        .await;
+                if !verdict.is_bound() {
+                    warn!(
+                        applicant = %applicant_did,
+                        witness = %issuer,
+                        ?verdict,
+                        "presented witness credential does not count here — it meets no join \
+                         criterion"
+                    );
+                    continue;
+                }
+                out.push(presented_credential(vc, issuer, concrete, &aliases));
+            }
+            Ok((issuer, concrete)) => {
+                out.push(presented_credential(vc, issuer, concrete, &aliases))
+            }
+            Err(reason) => warn!(
+                applicant = %applicant_did,
+                credential = vc.get("id").and_then(JsonValue::as_str).unwrap_or("<no id>"),
+                %reason,
+                "presented credential did not verify — it meets no join criterion"
+            ),
+        }
+    }
+    Ok(out)
+}
+
+/// A verified embedded credential as a criterion's query reads it: its own
+/// `type` array, its concrete type, and the registered URIs that type is also
+/// known by.
+fn presented_credential(
+    vc: &JsonValue,
+    issuer: String,
+    concrete: String,
+    aliases: &HashMap<String, Vec<String>>,
+) -> PresentedCredential {
+    let mut types: Vec<String> = match vc.get("type") {
+        Some(JsonValue::Array(t)) => t
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(JsonValue::String(t)) => vec![t.clone()],
+        _ => Vec::new(),
+    };
+    if !types.contains(&concrete) {
+        types.push(concrete.clone());
+    }
+    if let Some(more) = aliases.get(&concrete) {
+        types.extend(more.iter().cloned());
+    }
+    PresentedCredential {
+        formats: vec![LDP_VC_FORMAT],
+        types,
+        claims: vc.clone(),
+        issuer,
+        issuer_authority_key_ids: Vec::new(),
+        only_for: None,
+    }
+}
+
+/// The registered type URIs each concrete DTG type is also known by, so a
+/// query naming a registered URI selects the credential carrying that type.
+async fn type_aliases(state: &AppState) -> Result<HashMap<String, Vec<String>>, AppError> {
+    let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in crate::schemas::list_schemas(&state.schemas_ks).await? {
+        if let Some(dtg) = entry.dtg_type
+            && dtg != entry.type_uri
+        {
+            aliases.entry(dtg).or_default().push(entry.type_uri);
+        }
+    }
+    Ok(aliases)
+}
+
+/// Verify one embedded credential. Returns its issuer and concrete type.
+async fn verify_one_credential(
+    vc: &JsonValue,
+    applicant_did: &str,
+    resolver: &dyn vti_common::auth::PurposeVmResolver,
+    fetcher: &dyn crate::recognition::StatusListFetcher,
+    now: DateTime<Utc>,
+) -> Result<(String, String), String> {
+    let issuer = match vc.get("issuer") {
+        Some(JsonValue::String(s)) => s.clone(),
+        Some(JsonValue::Object(o)) => o
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .ok_or("issuer has no id")?
+            .to_string(),
+        _ => return Err("no issuer".into()),
+    };
+    let subject = vc
+        .pointer("/credentialSubject/id")
+        .and_then(JsonValue::as_str)
+        .ok_or("no credentialSubject.id")?;
+    if subject.split('#').next().unwrap_or(subject) != applicant_did {
+        return Err(format!("its subject ({subject}) is not the applicant"));
+    }
+    let concrete = crate::credentials::ingress::concrete_type(vc).ok_or("no concrete type")?;
+    crate::credentials::ingress::check_validity_window(vc, now, "credential")
+        .map_err(|e| e.to_string())?;
+    crate::credentials::proof_set::verify_issued(vc, &issuer, resolver).await?;
+    match crate::join::ops::present::resolve_presented_status(
+        vc.get("credentialStatus"),
+        Some(&issuer),
+        fetcher,
+    )
+    .await
+    {
+        CredentialStatus::Valid => Ok((issuer, concrete)),
+        other => Err(format!("its status is {other:?}")),
+    }
+}
+
+/// The credentials a cryptographically verified `vp_token` carried, as a
+/// criterion's query reads them: those bound to the holder and valid now.
+///
+/// The SD-JWT path's claims are the credential's own; the Data Integrity
+/// path's are its `credentialSubject`, so as an `ldp_vc` they are read from
+/// under that member, where a W3C claim path starts.
+///
+/// `presentation` is the projection of `verified`, one credential per
+/// presentation in order; the certifying authorities are read from the
+/// latter. Were the two ever to disagree in length, no credential would carry
+/// any — a `trusted_authorities` query fails rather than reading another
+/// credential's chain.
+pub fn presented_from_verified(
+    presentation: &Presentation,
+    verified: &[crate::credentials::VerifiedPresentation],
+) -> Vec<PresentedCredential> {
+    let aligned = presentation.credentials.len() == verified.len();
+    presentation
+        .credentials
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.holder_bound && c.status == CredentialStatus::Valid)
+        // A VWC meets a criterion only on the host's full verdict: a trusted
+        // witness, its session shown complete, its digest bound to an edge
+        // held here. `None` is every credential that is not a VWC.
+        .filter(|(_, c)| {
+            c.witness_binding
+                .as_ref()
+                .is_none_or(crate::credentials::witness::WitnessBinding::is_bound)
+        })
+        .map(|(n, c)| PresentedCredential {
+            formats: vec![SD_JWT_VC_FORMAT, LDP_VC_FORMAT],
+            types: vec![c.credential_type.clone()],
+            claims: match c.claims.get("credentialSubject") {
+                Some(_) => c.claims.clone(),
+                None => {
+                    let mut flat = c.claims.clone();
+                    if let Some(map) = flat.as_object_mut() {
+                        map.insert("credentialSubject".into(), json!(c.claims));
+                    }
+                    flat
+                }
+            },
+            issuer: c.issuer.clone(),
+            issuer_authority_key_ids: verified
+                .get(n)
+                .filter(|_| aligned)
+                .map(|p| p.issuer_authority_key_ids.clone())
+                .unwrap_or_default(),
+            only_for: None,
+        })
+        .collect()
+}
+
+/// The credentials a wallet session's verified presentation carried, as a
+/// criterion's query reads them, each counting only toward the criterion the
+/// session was opened for (`requirements_digest`).
+///
+/// They are not bound to the applicant by a key — the wallet's holder key is
+/// not theirs (`wallet-session/start/0.1` consumer rule 10) — but by the
+/// session: the applicant opened it with a signed document, and nothing a
+/// wallet sends can re-bind it.
+pub fn presented_from_wallet(
+    requirements_digest: &str,
+    credentials: &[crate::oid4vp::session::EvidenceCredential],
+) -> Vec<PresentedCredential> {
+    credentials
+        .iter()
+        .filter_map(|c| {
+            let format = match c.format.as_str() {
+                SD_JWT_VC_FORMAT => SD_JWT_VC_FORMAT,
+                LDP_VC_FORMAT => LDP_VC_FORMAT,
+                _ => return None,
+            };
+            Some(PresentedCredential {
+                formats: vec![format],
+                types: c.vct.iter().cloned().collect(),
+                claims: c.claims.clone(),
+                issuer: c.issuer.clone(),
+                issuer_authority_key_ids: c.issuer_authority_key_ids.clone(),
+                only_for: Some(requirements_digest.to_string()),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vetting(
+        consistent: bool,
+        independent: bool,
+        needs: &[&str],
+        satisfied: bool,
+    ) -> VettingFacts {
+        VettingFacts {
+            criterion_id: "k".into(),
+            requirements_digest: "zK".into(),
+            applicant_digest_matches: true,
+            statements: vec![],
+            distinct_counted_vetters: 0,
+            by_method: Default::default(),
+            commitments_consistent: consistent,
+            independence_ok: independent,
+            invitation_required: false,
+            satisfied,
+            needs: needs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_unmet_vetting_requirement_always_names_what_is_missing() {
+        assert_eq!(
+            vetting_shortfall(
+                &vetting(true, true, &["vetting:statements:1"], false),
+                false
+            ),
+            ["vetting:statements:1"]
+        );
+        assert_eq!(
+            vetting_shortfall(&vetting(false, true, &[], false), false),
+            ["vetting:consistency"]
+        );
+        assert_eq!(
+            vetting_shortfall(&vetting(true, false, &[], false), false),
+            ["vetting:independence"]
+        );
+        assert!(vetting_shortfall(&vetting(true, true, &[], true), false).is_empty());
+    }
+
+    #[test]
+    fn a_vetting_invitation_requirement_is_part_of_the_vetting() {
+        let mut facts = vetting(true, true, &[], true);
+        facts.invitation_required = true;
+        assert_eq!(
+            vetting_shortfall(&facts, false),
+            [crate::vetting::NEED_INVITATION]
+        );
+        assert!(vetting_shortfall(&facts, true).is_empty());
+    }
+
+    fn ldp(types: &[&str], subject: serde_json::Value) -> PresentedCredential {
+        PresentedCredential {
+            formats: vec![LDP_VC_FORMAT],
+            types: types.iter().map(|t| t.to_string()).collect(),
+            claims: json!({ "type": types, "credentialSubject": subject }),
+            issuer: "did:web:issuer.example".into(),
+            issuer_authority_key_ids: Vec::new(),
+            only_for: None,
+        }
+    }
+
+    fn query(v: serde_json::Value) -> affinidi_openid4vp::DcqlQuery {
+        affinidi_openid4vp::DcqlQuery::from_json(&v).unwrap()
+    }
+
+    /// An SD-JWT VC whose issuer is certified by the authorities `akis`.
+    fn sd_jwt(vct: &str, akis: &[&str]) -> PresentedCredential {
+        PresentedCredential {
+            formats: vec![SD_JWT_VC_FORMAT],
+            types: vec![vct.to_string()],
+            claims: json!({ "vct": vct }),
+            issuer: "https://pid.example.org".into(),
+            issuer_authority_key_ids: akis.iter().map(|a| a.to_string()).collect(),
+            only_for: None,
+        }
+    }
+
+    const PID: &str = "urn:eudi:pid:1";
+    // base64url key identifiers.
+    const TRUSTED: &str = "s9tIpPmhxdiuNkHMEWNpYim8S8Y";
+    const OTHER: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQ";
+
+    /// `trusted_authorities` is a constraint the matcher does not read: without
+    /// the gate, a credential from any anchored issuer would meet the query.
+    #[test]
+    fn trusted_authorities_admits_only_an_issuer_a_named_authority_certifies() {
+        let q = query(json!({ "credentials": [{
+            "id": "pid",
+            "format": "dc+sd-jwt",
+            "meta": { "vct_values": [PID] },
+            "trusted_authorities": [{ "type": "aki", "values": [OTHER, TRUSTED] }]
+        }]}));
+        assert!(query_met_by(&q, &[&sd_jwt(PID, &[TRUSTED])]));
+        // Padding on the published value does not change the identifier.
+        assert!(query_met_by(
+            &q,
+            &[&sd_jwt(PID, &["s9tIpPmhxdiuNkHMEWNpYim8S8Y="])]
+        ));
+        assert!(!query_met_by(&q, &[&sd_jwt(PID, &["AAAA"])]));
+        // A DID issuer has no certifying authority.
+        assert!(!query_met_by(&q, &[&sd_jwt(PID, &[])]));
+        // The type still selects.
+        assert!(!query_met_by(&q, &[&sd_jwt("urn:other:1", &[TRUSTED])]));
+    }
+
+    /// The gate is per credential query: a second, ungated query is met by a
+    /// credential the first's authorities do not certify.
+    #[test]
+    fn trusted_authorities_gates_only_its_own_query() {
+        let q = query(json!({ "credentials": [
+            {
+                "id": "pid",
+                "format": "dc+sd-jwt",
+                "meta": { "vct_values": [PID] },
+                "trusted_authorities": [{ "type": "aki", "values": [TRUSTED] }]
+            },
+            { "id": "email", "format": "dc+sd-jwt", "meta": { "vct_values": ["urn:email:1"] } }
+        ]}));
+        let pid = sd_jwt(PID, &[TRUSTED]);
+        let email = sd_jwt("urn:email:1", &[]);
+        assert!(query_met_by(&q, &[&pid, &email]));
+        assert!(!query_met_by(&q, &[&sd_jwt(PID, &[OTHER]), &email]));
+    }
+
+    /// An entry this verifier cannot check is met by nothing — registration
+    /// refuses one, and a row that has one anyway is read the restrictive way.
+    #[test]
+    fn an_unchecked_trusted_authority_type_is_met_by_nothing() {
+        let entry = |t: &str| {
+            serde_json::from_value::<Vec<TrustedAuthoritiesQuery>>(
+                json!([{ "type": t, "values": [TRUSTED] }]),
+            )
+            .unwrap()
+        };
+        assert!(meets_trusted_authorities(&entry("aki"), &[TRUSTED.into()]));
+        assert!(!meets_trusted_authorities(
+            &entry("etsi_tl"),
+            &[TRUSTED.into()]
+        ));
+        assert!(!meets_trusted_authorities(
+            &entry("openid_federation"),
+            &[TRUSTED.into()]
+        ));
+    }
+
+    /// `type_values` selects by the credential's types. The matcher alone
+    /// ignores it, which would let a credential of any type meet the query.
+    #[test]
+    fn a_type_values_query_selects_only_credentials_of_that_type() {
+        let q = query(json!({ "credentials": [{
+            "id": "membership",
+            "format": "ldp_vc",
+            "meta": { "type_values": [["VerifiableCredential", "MembershipCredential"]] }
+        }]}));
+        let membership = ldp(&["VerifiableCredential", "MembershipCredential"], json!({}));
+        let other = ldp(&["VerifiableCredential", "EmailCredential"], json!({}));
+        assert!(query_met_by(&q, &[&membership]));
+        assert!(!query_met_by(&q, &[&other]));
+        assert!(!query_met_by(&q, &[]));
+    }
+
+    /// One alternative of `type_values` is enough; within it every type must
+    /// be carried.
+    #[test]
+    fn any_one_type_values_alternative_selects() {
+        let q = query(json!({ "credentials": [{
+            "id": "proof-of-employment",
+            "format": "ldp_vc",
+            "meta": { "type_values": [["EmployeeCredential"], ["ContractorCredential", "Vetted"]] }
+        }]}));
+        assert!(query_met_by(
+            &q,
+            &[&ldp(&["EmployeeCredential"], json!({}))]
+        ));
+        assert!(!query_met_by(
+            &q,
+            &[&ldp(&["ContractorCredential"], json!({}))]
+        ));
+        assert!(query_met_by(
+            &q,
+            &[&ldp(&["ContractorCredential", "Vetted"], json!({}))]
+        ));
+    }
+
+    #[test]
+    fn a_claims_constraint_reads_the_credential() {
+        let q = query(json!({ "credentials": [{
+            "id": "membership",
+            "format": "ldp_vc",
+            "meta": { "type_values": [["MembershipCredential"]] },
+            "claims": [{ "path": ["credentialSubject", "level"], "values": ["full"] }]
+        }]}));
+        let full = ldp(&["MembershipCredential"], json!({ "level": "full" }));
+        let associate = ldp(&["MembershipCredential"], json!({ "level": "associate" }));
+        assert!(query_met_by(&q, &[&full]));
+        assert!(!query_met_by(&q, &[&associate]));
+    }
+
+    /// The default `member-credential` criterion is met by a membership
+    /// credential and nothing else.
+    #[test]
+    fn the_default_credential_criterion_is_met_by_a_membership_credential() {
+        let defaults = crate::schemas::accepts::default_criteria(true);
+        let q = defaults[1].dcql().unwrap().expect("a query");
+        let vmc = ldp(
+            &[
+                "VerifiableCredential",
+                "DTGCredential",
+                "MembershipCredential",
+            ],
+            json!({}),
+        );
+        let vic = ldp(
+            &[
+                "VerifiableCredential",
+                "DTGCredential",
+                "InvitationCredential",
+            ],
+            json!({}),
+        );
+        assert!(query_met_by(&q, &[&vmc]));
+        assert!(!query_met_by(&q, &[&vic]));
+    }
+
+    #[test]
+    fn the_generic_need_becomes_what_the_criterion_lacks() {
+        let fact = CriterionFact {
+            id: "k".into(),
+            requirements_digest: "zK".into(),
+            admission: Admission::Automatic,
+            met: false,
+            needs: vec![NEED_INVITATION.into(), NEED_CREDENTIALS.into()],
+            cited: false,
+            superseded: false,
+        };
+        let mut needs = vec!["agreed:code-of-conduct".to_string(), NEED_CRITERION.into()];
+        expand_needs(&mut needs, Some(&fact));
+        assert_eq!(
+            needs,
+            ["agreed:code-of-conduct", NEED_INVITATION, NEED_CREDENTIALS]
+        );
+    }
+
+    /// A VWC meets a criterion only on the host's full verdict. Every other
+    /// state — an untrusted witness, no outcome evidence, a digest naming no
+    /// edge held here — leaves it out of what a query can be met by.
+    #[test]
+    fn a_witness_counts_toward_a_criterion_only_when_bound() {
+        use crate::ceremony::{Credential, CredentialStatus, Presentation};
+        use crate::credentials::witness::WitnessBinding;
+
+        let credential = |binding: Option<WitnessBinding>| Credential {
+            credential_type: "StatementCredential".into(),
+            predicate: binding
+                .as_ref()
+                .map(|_| dtg_credentials::WITNESSED_V1.into()),
+            issuer: "did:key:z6MkWitness".into(),
+            issuer_trusted: true,
+            status: CredentialStatus::Valid,
+            holder_bound: true,
+            claims: json!({ "credentialSubject": { "id": "did:key:zApplicant" } }),
+            valid_until: None,
+            witness_binding: binding,
+            task_context: None,
+        };
+        let bound = WitnessBinding::Bound {
+            relationship_id: uuid::Uuid::new_v4(),
+        };
+        for (binding, counts) in [
+            (None, true),
+            (Some(bound), true),
+            (Some(WitnessBinding::UntrustedWitness), false),
+            (Some(WitnessBinding::NoOutcomeEvidence), false),
+            (Some(WitnessBinding::OutcomeInvalid), false),
+            (Some(WitnessBinding::Unresolved), false),
+        ] {
+            let presentation = Presentation {
+                verified: true,
+                holder: "did:key:zApplicant".into(),
+                credentials: vec![credential(binding.clone())],
+            };
+            assert_eq!(
+                presented_from_verified(&presentation, &[]).len(),
+                usize::from(counts),
+                "{binding:?}"
+            );
+        }
+    }
+}

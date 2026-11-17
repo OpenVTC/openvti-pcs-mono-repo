@@ -1,0 +1,372 @@
+//! Dispatch for `pnm did-mgmt …` (the module keeps the retired `webvh` name).
+
+use vta_cli_common::commands::webvh;
+use vta_cli_common::confirm::confirm_or_cancel;
+use vta_sdk::client::VtaClient;
+
+use crate::cli::WebvhCommands;
+
+pub(crate) async fn run(
+    client: &VtaClient,
+    command: WebvhCommands,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        WebvhCommands::AddServer { id, did, label } => {
+            webvh::cmd_webvh_server_add(client, id, did, label).await
+        }
+        WebvhCommands::ListServers => webvh::cmd_webvh_server_list(client).await,
+        WebvhCommands::UpdateServer { id, label } => {
+            webvh::cmd_webvh_server_update(client, &id, label).await
+        }
+        WebvhCommands::DeleteServer { id, yes } => {
+            if !confirm_or_cancel(&format!("remove server `{id}` from the registry"), yes)? {
+                return Ok(());
+            }
+            webvh::cmd_webvh_server_remove(client, &id).await
+        }
+        WebvhCommands::CreateDid {
+            context,
+            server,
+            did_url,
+            path,
+            domain,
+            label,
+            portable,
+            mediator_service,
+            services,
+            pre_rotation,
+            did_document,
+            did_log,
+            no_primary,
+            signing_key,
+            ka_key,
+            template,
+            template_context,
+            vars,
+            did_method,
+            scid_also_known_as,
+        } => {
+            if server.is_none() && did_url.is_none() {
+                Err("either --server or --did-url is required".into())
+            } else if server.is_some() && did_url.is_some() {
+                Err("--server and --did-url are mutually exclusive".into())
+            } else {
+                // Default template lookup to the DID's own context so
+                // context-local overrides are found before the global
+                // fallback.
+                let template_context =
+                    template_context.or_else(|| template.as_ref().map(|_| context.clone()));
+                // Interactive domain prompt: when the caller picked a
+                // hosting server but didn't supply `--domain`, list
+                // the server's available domains and ask. Non-TTY
+                // invocations skip the prompt — the VTA's own
+                // resolver runs the caller-default → system-default
+                // chain server-side, so an unselected domain is
+                // harmless on a single-domain host.
+                let domain = if let (Some(srv_id), None) = (server.as_deref(), domain.as_ref()) {
+                    prompt_domain_if_interactive(client, srv_id).await?
+                } else {
+                    domain
+                };
+                webvh::cmd_webvh_did_create_with_files(
+                    client,
+                    context,
+                    server,
+                    did_url,
+                    path,
+                    domain,
+                    label,
+                    portable,
+                    mediator_service,
+                    services,
+                    pre_rotation,
+                    did_document,
+                    did_log,
+                    no_primary,
+                    signing_key,
+                    ka_key,
+                    template,
+                    template_context,
+                    vars,
+                    presentation(did_method, scid_also_known_as),
+                )
+                .await
+            }
+        }
+        WebvhCommands::EditDid {
+            did,
+            document,
+            options_file,
+            pre_rotation,
+            ttl,
+            watchers,
+            no_watchers,
+            label,
+            no_confirm,
+        } => {
+            let flags = vta_cli_common::commands::webvh_edit::EditFlags {
+                document_file: document,
+                options_file,
+                pre_rotation,
+                ttl,
+                watchers,
+                no_watchers,
+                label,
+            };
+            webvh::cmd_webvh_did_edit(client, &did, flags, no_confirm).await
+        }
+        WebvhCommands::ScidAliasDid {
+            did,
+            list,
+            remove,
+            label,
+            no_confirm,
+        } => {
+            // clap's `alias` group makes exactly one of the two present.
+            debug_assert!(list != remove);
+            webvh::cmd_webvh_did_scid_alias(client, &did, list, label, no_confirm).await
+        }
+        WebvhCommands::RegisterDid {
+            did,
+            server,
+            force,
+            domain,
+        } => {
+            let domain = match domain {
+                Some(d) => Some(d),
+                None => prompt_domain_if_interactive(client, &server).await?,
+            };
+            webvh::cmd_webvh_did_register_server(client, &did, &server, force, domain).await
+        }
+        WebvhCommands::ListDids {
+            context,
+            server,
+            methods,
+        } => {
+            vta_cli_common::commands::dids::cmd_dids_list(
+                client,
+                &vta_sdk::client::DidListFilter {
+                    context_id: context,
+                    server_id: server,
+                    methods: (!methods.is_empty()).then_some(methods),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+        WebvhCommands::DidMethods => {
+            vta_cli_common::commands::dids::cmd_dids_methods_list(client).await
+        }
+        WebvhCommands::GetDid { did } => {
+            vta_cli_common::commands::dids::cmd_dids_get(client, &did).await
+        }
+        WebvhCommands::DeleteDid { did, yes } => {
+            if !confirm_or_cancel(&format!("delete {did} and its keys"), yes)? {
+                return Ok(());
+            }
+            webvh::cmd_webvh_did_delete(client, &did).await
+        }
+        WebvhCommands::RealignDidKeys { did, dry_run } => {
+            webvh::cmd_webvh_did_realign_keys(client, &did, dry_run).await
+        }
+        WebvhCommands::DidLog { did, out } => webvh::cmd_webvh_did_log(client, &did, out).await,
+        WebvhCommands::ListDomains { server } => cmd_list_domains(client, &server).await,
+        WebvhCommands::Reconcile { server } => cmd_reconcile(client, &server).await,
+    }
+}
+
+/// Print the host/VTA diff for one hosting server.
+///
+/// The output is written to be read by someone who has just been told a DID
+/// they can see does not exist: it names the state, says what causes it, and
+/// gives the next command. A clean result says how many were checked rather
+/// than printing nothing — "no output" and "the listing failed" look identical
+/// otherwise, and this is a command people run precisely when they already
+/// distrust what they are seeing.
+async fn cmd_reconcile(
+    client: &VtaClient,
+    server_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = client.reconcile_webvh_server_dids(server_id).await?;
+
+    if report.host_only.is_empty() && report.agent_only.is_empty() {
+        println!(
+            "`{server_id}` and this VTA agree on all {} DID(s).",
+            report.in_both
+        );
+        return Ok(());
+    }
+
+    if !report.host_only.is_empty() {
+        println!(
+            "On the host but NOT in this VTA — {} orphan(s):",
+            report.host_only.len()
+        );
+        for e in &report.host_only {
+            let did = e.did.as_deref().unwrap_or("(slot never published)");
+            let domain = e
+                .domain
+                .as_deref()
+                .map(|d| format!("  [{d}]"))
+                .unwrap_or_default();
+            let disabled = if e.disabled { "  (disabled)" } else { "" };
+            println!("  {:<20} {did}{domain}{disabled}", e.slot_id);
+        }
+        println!(
+            "\n  This VTA holds no update key for these, so nothing can sign a new\n  \
+             version of them. That is what a delete leaves behind when the host\n  \
+             call fails. Remove them on the host, or re-create them here if the\n  \
+             DID is still wanted."
+        );
+    }
+
+    if !report.agent_only.is_empty() {
+        if !report.host_only.is_empty() {
+            println!();
+        }
+        println!(
+            "In this VTA but NOT on the host — {}:",
+            report.agent_only.len()
+        );
+        for e in &report.agent_only {
+            println!("  {:<20} {}  (context {})", e.slot_id, e.did, e.context_id);
+        }
+        println!(
+            "\n  Usually a create whose publish never reached the host. `pnm did-mgmt\n  \
+             dids register --did <did> --server {server_id}` re-publishes one."
+        );
+    }
+
+    println!("\nIn both: {}", report.in_both);
+    Ok(())
+}
+
+/// Fetch the server's `did-management/me/domains` view (through the VTA) and print it as a
+/// short table. Used by the dedicated `list-domains` subcommand.
+async fn cmd_list_domains(
+    client: &VtaClient,
+    server_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let domains = client.list_webvh_server_domains(server_id).await?;
+    if domains.domains.is_empty() {
+        println!(
+            "No hosting domains available to this VTA on `{server_id}`. \
+             Ask the server's admin to grant your VTA's DID an ACL entry \
+             scoped to the domain(s) you need."
+        );
+        return Ok(());
+    }
+    println!(
+        "Hosting domains on `{server_id}`:{}",
+        if let Some(d) = &domains.default {
+            format!(" (system default: {d})")
+        } else {
+            String::new()
+        }
+    );
+    for entry in &domains.domains {
+        let default = if entry.default_domain {
+            " (default)"
+        } else {
+            ""
+        };
+        let status = if entry.status == "disabled" {
+            " [disabled]"
+        } else {
+            ""
+        };
+        let label = entry
+            .label
+            .as_ref()
+            .map(|l| format!(" — {l}"))
+            .unwrap_or_default();
+        println!("  - {}{}{}{}", entry.name, default, status, label);
+    }
+    Ok(())
+}
+
+/// When the caller didn't pass `--domain` but is targeting a
+/// specific hosting server, interactively prompt them to pick one of
+/// the server's available domains. Returns `Ok(None)` when stdin is
+/// not a TTY (CI / scripted use) so the call proceeds with the
+/// server's own resolution chain. Network failures and empty domain
+/// lists also fall back to `Ok(None)` rather than blocking the
+/// operation — the server's `did-management:unknownDomain` error
+/// surfaces any real misconfiguration downstream.
+async fn prompt_domain_if_interactive(
+    client: &VtaClient,
+    server_id: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let domains = match client.list_webvh_server_domains(server_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "warning: could not list hosting domains on `{server_id}` ({e}); \
+                 falling back to the server's default domain."
+            );
+            return Ok(None);
+        }
+    };
+    if domains.domains.is_empty() {
+        return Ok(None);
+    }
+    if domains.domains.len() == 1 {
+        // Single-domain host — no point prompting.
+        return Ok(None);
+    }
+    println!("Available hosting domains on `{server_id}`:");
+    for (i, entry) in domains.domains.iter().enumerate() {
+        let default = if entry.default_domain {
+            " (default)"
+        } else {
+            ""
+        };
+        let status = if entry.status == "disabled" {
+            " [disabled]"
+        } else {
+            ""
+        };
+        println!("  [{}] {}{}{}", i + 1, entry.name, default, status);
+    }
+    println!("  [0] use server default");
+    eprint!(
+        "Pick a domain (1..={}, or 0 for default): ",
+        domains.domains.len()
+    );
+    use std::io::Write;
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(None);
+    }
+    let idx: usize = trimmed
+        .parse()
+        .map_err(|_| "invalid selection — enter a number from the list".to_string())?;
+    let entry = domains
+        .domains
+        .get(idx.saturating_sub(1))
+        .ok_or_else(|| "selection out of range".to_string())?;
+    Ok(Some(entry.name.clone()))
+}
+
+/// The `--did-method` / `--scid-also-known-as` flags as the create's 1.2
+/// members; neither stated keeps the create on 1.1.
+fn presentation(
+    did_method: Option<vta_sdk::did_scid::DidMethod>,
+    scid_also_known_as: Option<bool>,
+) -> vta_sdk::client::DidPresentation {
+    let mut p = vta_sdk::client::DidPresentation::default();
+    if let Some(m) = did_method {
+        p = p.did_method(m);
+    }
+    if let Some(a) = scid_also_known_as {
+        p = p.scid_also_known_as(a);
+    }
+    p
+}

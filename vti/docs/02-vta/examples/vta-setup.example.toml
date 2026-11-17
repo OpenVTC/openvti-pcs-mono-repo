@@ -1,0 +1,302 @@
+# vta-setup.example.toml — full reference for `vta setup --from <file>`.
+#
+# Copy, edit, then run:
+#   vta setup --from /path/to/your-setup.toml
+#
+# The schema is defined by `vta_service::setup::WizardInputs` in
+# vta-service/src/setup.rs. Field-level rustdoc on that struct is the
+# authoritative reference if anything here looks stale.
+#
+# Required fields are marked (required); everything else has a default.
+
+# ---------------------------------------------------------------------------
+# Top-level
+# ---------------------------------------------------------------------------
+
+# Where to write the produced config.toml. The wizard refuses to overwrite
+# an existing file — delete it first to re-run. (required)
+config_path = "/srv/vta/config.toml"
+
+# Where the on-disk fjall store lives. (required)
+data_dir    = "/srv/vta/data"
+
+# WebSocket URL of a remote DID resolver. Optional. Set this when the
+# VTA should resolve DIDs via a remote resolver-cache (e.g. shared
+# across multiple VTAs) or when running in TEE network mode where
+# DID resolution is bridged to a parent-side
+# `affinidi-did-resolver-cache-server` over vsock. That server keeps
+# its own DID-document cache, so a revoked key can keep verifying for
+# up to [did_cache] ttl_secs + the server's `expire`: keep both short.
+# resolver_url = "ws://resolver.example.com/did/v1/ws"
+
+# Optional human-readable name for this VTA. Surfaced in `vta config show`.
+vta_name    = "trust-prod-1"
+
+# Public URL the VTA will advertise. Used as the `VTARest` service endpoint
+# when `vta_did.kind = "create_webvh"` mints a DID. Optional — omit for
+# DIDComm-only or private-network deployments.
+public_url  = "https://trust.example.com"
+
+# What to do if `data_dir` already holds a store. Only consulted when a
+# store is actually present — an existing-but-empty directory (a mounted
+# Docker volume, a Kubernetes PVC, a path you created yourself) is
+# initialized into without complaint.
+#   "error"  (default) — refuse and exit
+#   "delete" — wipe the directory's *contents* and re-init (CI re-run
+#              pattern; keeps the directory itself, so it works on a
+#              mount point)
+#   "reuse"  — initialize into it, keeping whatever is already there
+data_dir_exists = "error"
+
+# Permit overwriting an existing `config_path`. The file is only written
+# once setup has otherwise succeeded, so a failed run leaves it intact.
+overwrite_config = false
+
+# Seed an initial super-admin and seal the VTA atomically with the rest of
+# setup. Equivalent to running `vta bootstrap-admin --did <X>` after
+# setup. Omit if you want to seed admin(s) later via the interactive
+# `pnm setup` flow. The DID must start with `did:`.
+admin_did   = "did:key:z6MkABCDEFGHIJKLMNOPQRSTUVWXYZ"
+admin_label = "ops-bootstrap"
+
+# ---------------------------------------------------------------------------
+# Services and server bind
+# ---------------------------------------------------------------------------
+
+[services]
+# Initial enable state at first boot. Both true by default; disable one if
+# you only need the other. Runtime changes go through
+# `pnm services {kind} {enable,disable}` and persist to a fjall keyspace —
+# this block is read ONCE on first boot to seed that state, and never again.
+# Hand-editing it later has no effect.
+rest    = true
+didcomm = true
+# TSP (ON by default here, even when this block omits it). Advertises `#tsp`
+# in the VTA DID document at mint, pointing at the same mediator as DIDComm.
+# Needs a mediator and a binary built with the `tsp` feature (on by default);
+# setup refuses `tsp = true` on a build without it. An existing mediator is
+# resolved and must advertise `TSPTransport`, or setup refuses — see
+# docs/02-vta/tsp.md. Set `tsp = false` to leave it out.
+# tsp = false
+
+[server]
+host = "0.0.0.0"
+port = 8100
+# Per-IP rate limits on unauthenticated routes. Intervals are SECONDS PER
+# TOKEN (lower is looser), not rates. Defaults shown; tunable at runtime with
+# `pnm config update`. See docs/02-vta/rate-limiting.md.
+# rate_limit_interval_secs = 5           # auth / bootstrap / attestation
+# rate_limit_burst = 10
+# did_log_rate_limit_interval_secs = 1   # public did.jsonl
+# did_log_rate_limit_burst = 60
+
+[log]
+level  = "info"   # "trace" | "debug" | "info" | "warn" | "error"
+format = "json"   # "text" | "json"
+
+# Audit-log retention. Default 28 days. Compliance-driven deployments
+# typically want 90 or 365.
+[audit]
+retention_days = 28
+
+# ---------------------------------------------------------------------------
+# Seed-store backend (required — there is no implicit default)
+#
+# The `backend` discriminator picks the variant; per-variant fields below.
+# ---------------------------------------------------------------------------
+
+# OS keyring (libsecret / Keychain / Credential Vault). Recommended for
+# single-host deployments where the host has a real user session.
+[secrets]
+backend = "keyring"
+service = "vta-prod"   # default "vta"; use a unique name per VTA on the same host
+
+# AWS Secrets Manager. Recommended for cloud / headless deployments.
+# [secrets]
+# backend     = "aws"
+# region      = "us-east-1"   # optional; falls back to SDK default chain
+# secret_name = "vta/prod/seed"
+
+# GCP Secret Manager.
+# [secrets]
+# backend     = "gcp"
+# project     = "my-gcp-project"
+# secret_name = "vta-prod-seed"
+
+# Azure Key Vault.
+# [secrets]
+# backend     = "azure"
+# vault_url   = "https://my-vault.vault.azure.net"
+# secret_name = "vta-prod-seed"
+
+# Hex-encoded seed inside config.toml. NOT recommended — the config file
+# becomes a secret. Compiled in only when the `config-seed` feature is
+# enabled.
+# [secrets]
+# backend = "config_seed"
+
+# AES-256-GCM encrypted file — the secure local option for a host with no
+# OS keyring. The key-encryption key comes from exactly one source, never from
+# this file or an environment variable:
+#   { source = "passphrase", file = "/etc/vta/seed-passphrase" }
+#   { source = "passphrase", credential = "vta-seed-passphrase" }  # $CREDENTIALS_DIRECTORY
+#   { source = "systemd_creds", credential = "vta-seed-kek" }      # 32-byte key
+#   { source = "tpm", pcrs = [7] }                                 # Linux, `tpm` feature
+# The KEK must be readable while setup runs (setup writes the seed).
+# [secrets]
+# backend = "encrypted_file"
+# path    = "/var/lib/vta/seed.enc"    # optional; default <data_dir>/seed.enc
+# kek     = { source = "systemd_creds", credential = "vta-seed-kek" }
+
+# Plaintext file under `data_dir`. Dev only. The wizard writes BOTH
+# `backend = "plaintext"` (which backend) and `allow_plaintext = true`
+# (yes, a cleartext master seed is acceptable) into the generated
+# config.toml — plaintext needs both, and is otherwise unreachable on a
+# build with the `keyring` feature compiled in.
+# [secrets]
+# backend = "plaintext"
+
+# HashiCorp Vault (KV v2). Compiled in only when the `vault-secrets`
+# feature is enabled. Authenticates via Kubernetes by default; switch
+# `auth_method` to `"token"` or `"approle"` for non-K8s deployments.
+# [secrets]
+# backend     = "vault"
+# addr        = "https://vault.example.com:8200"
+# secret_path = "vta/master-seed"   # under kv_mount; default mount is "secret"
+# kv_mount    = "secret"            # optional; default "secret"
+# secret_key  = "seed"              # optional; field within the KV entry. default "seed"
+# namespace   = "vta-prod"          # optional; Vault Enterprise namespace
+# auth_method = "kubernetes"        # "kubernetes" (default), "token", or "approle"
+# # auth_method = "kubernetes" — needs k8s_role; k8s_mount/k8s_jwt_path are optional
+# k8s_role     = "vta"
+# k8s_mount    = "kubernetes"
+# k8s_jwt_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+# # auth_method = "token" — provide token here, or set VAULT_TOKEN env
+# # token = "hvs.CAES…"
+# # auth_method = "approle" — provide role_id + secret_id
+# # approle_role_id   = "…"
+# # approle_secret_id = "…"
+# # approle_mount     = "approle"
+# # skip_verify = false   # dev/test only; never set true in production
+
+# ---------------------------------------------------------------------------
+# DIDComm mediator (optional; default = skip)
+# ---------------------------------------------------------------------------
+
+# Skip — no DIDComm mediator. The VTA will not participate in DIDComm flows.
+# [messaging]
+# kind = "skip"
+
+# Point at an existing mediator DID. ATM resolves the endpoint from the DID
+# document at runtime. `mediator_host` is the external hostname the VTA
+# should resolve when dialling — used in TEE network mode where outbound
+# traffic goes via a vsock proxy that needs the upstream hostname for SNI.
+# `setup_acl` provisions a per-DID allow-all ACL on the mediator after
+# connecting (required for mediators using ExplicitAllow mode; default false).
+# `protocols` (create_mediator only, for now) declares which transports the
+# minted mediator will serve, rendered into the mediator's own DID document.
+# Omit it — the normal case — and it follows `[services]`: DIDComm always,
+# plus TSP when `services.tsp = true`. Set it only to mint a mediator that
+# serves MORE than this VTA uses (a shared mediator carrying TSP for other
+# clients). Serving less is refused: the VTA's `#tsp` would point at a
+# mediator whose own document says it doesn't carry TSP. See
+# docs/05-design-notes/transport-neutral-mediator.md.
+#   protocols = ["didcomm", "tsp"]
+
+# [messaging]
+# kind          = "existing"
+# did           = "did:webvh:.../mediator"
+# mediator_host = "mediator.example.com"   # optional; TEE deployments only
+# setup_acl     = false                    # optional; default false
+
+# Mint a new mediator DID using the built-in `didcomm-mediator` template.
+#
+# `url` is the DIDComm service endpoint (where clients send messages —
+# becomes the `serviceEndpoint.uri` in the rendered DID document).
+#
+# `webvh_url` is where the mediator's `did.jsonl` is published — it
+# determines the `did:webvh:<scid>:host:path` identifier itself.
+# Optional; defaults to `url` for the common case where DIDComm and
+# DID hosting share a host. Set it explicitly when the mediator
+# endpoint and the DID document live on different hosts.
+#
+# `mediator_host` — see comment under `kind = "existing"`. TEE-only.
+#
+# `[messaging.template_vars]` is an escape hatch for the optional
+# `didcomm-mediator` template variables (`ROUTING_KEYS`, `ACCEPT`,
+# `WEBVH_SERVER`). `URL` and `WS_URL` are managed by the wizard from
+# `url` and cannot be overridden here.
+[messaging]
+kind      = "create_mediator"
+context   = "mediator"   # default "mediator"; trust context the mediator's keys live in
+url       = "https://mediator.example.com"
+# setup_acl     = false                    # optional; enable for ExplicitAllow mediators
+# webvh_url     = "https://trust.example.com/dids/mediator"
+# mediator_host = "mediator.example.com"
+
+# [messaging.template_vars]
+# ROUTING_KEYS = ["did:key:zUpstreamMediatorRoutingKey..."]
+# ACCEPT       = ["didcomm/v2"]
+
+# ---------------------------------------------------------------------------
+# VTA DID (optional; default = skip)
+# ---------------------------------------------------------------------------
+
+# Skip — VTA runs without its own DID. REST works; DIDComm and VC issuance
+# do not.
+# [vta_did]
+# kind = "skip"
+
+# Use a DID that already exists.
+# [vta_did]
+# kind = "existing"
+# did  = "did:webvh:.../vta"
+
+# Mint a new self-resolving `did:key`. No external hosting required —
+# the DID encodes the public key directly. Ideal for local development
+# or deployments that don't need webvh's portability/rotation.
+# [vta_did]
+# kind = "create_did_key"
+
+# Mint a new did:webvh for the VTA. Always uses the operations layer's
+# "simple mode" (VTA generates keys + document). Operators who need
+# advanced options (template-from-file, pre-signed log import,
+# user-specified key IDs) should use interactive setup instead.
+# Mint a new did:webs for the VTA (alpha): a key-role identity on a
+# did-hosting server, published at first boot by self-registration. Needs
+# `webs_enabled = true` under [dids]; see docs/02-vta/did-webs.md.
+# [vta_did]
+# kind       = "create_webs"
+# server_did = "did:webvh:QmHost…:did.example.com"
+# domain     = "did.example.com"
+# path       = "nodes"          # optional; under the host's self-registration prefixes
+
+[vta_did]
+kind               = "create_webvh"
+url                = "https://trust.example.com/dids/vta"
+portable           = true   # default true — DID can move to a different domain later
+pre_rotation_count = 2      # default 1; recommended 1–3
+
+# ---------------------------------------------------------------------------
+# Hardened non-TEE mode (optional; default = disabled)
+#
+# When enabled, closes two security gaps present in standard vta-service:
+#   1. Storage encryption — all 23 fjall keyspaces encrypted with AES-256-GCM
+#      (VAE1 format, same as TEE mode). Key derived from master seed via HKDF.
+#   2. JWT signing key — randomly generated on first boot, AES-GCM sealed in
+#      the `bootstrap` keyspace. Never written to config.toml.
+#
+# Requires the [secrets] backend to be a real secret store (OS keyring, cloud
+# SM, …). The plaintext file fallback defeats the protection.
+#
+# storage_key_salt: treat as a permanent constant per VTA instance. Changing
+# it after first boot invalidates all encrypted data. Set a unique value so
+# two VTAs with the same seed (e.g. disaster-recovery clone) have independent
+# storage keys.
+#
+# To rotate the JWT signing key without touching the seed:
+#   vta --config <path> hardened rotate-jwt   # daemon must be stopped
+# ---------------------------------------------------------------------------
+# [hardened]
+# enabled          = true
+# storage_key_salt = "choose-a-unique-string-per-vta"   # permanent — never change

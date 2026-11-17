@@ -1,0 +1,2369 @@
+//! Pushing a signed Trust Task to a peer, over whichever transport the peer
+//! speaks — TSP, then DIDComm, then REST — durably, with escalation.
+//!
+//! # Why
+//!
+//! The DID document is authoritative for which protocols a party speaks, and
+//! the protocol used is the highest-preference one present in both parties'
+//! documents, TSP over DIDComm over REST
+//! (`docs/05-design-notes/tsp-enablement.md`). This module is that rule for
+//! pushes a node originates — a removal notice, a consent request, a granted
+//! notice — shared by every node type so each does not re-derive it. The node
+//! supplies what is its own through a [`PushContext`]: where push records
+//! live, its outbox, its resolver, and its messaging handle.
+//!
+//! # How
+//!
+//! [`push_trust_task`] takes a **signed** Trust Task document and a delivery
+//! deadline, and:
+//!
+//! 1. **Selects** ([`plan`]): resolves the recipient's DID document and matches
+//!    on service `type` — `TSPTransport`, `DIDCommMessaging`, and for REST only
+//!    `TrustTaskHTTPS`, the one type that claims to accept Trust Task
+//!    documents (HTTPS binding 0.2 §6.2). A recipient advertising none of them
+//!    (a `did:key` wallet) is reached over DIDComm through the node's own
+//!    mediator. One that advertises only transports this node does not speak
+//!    is refused, never silently downgraded.
+//! 2. **Records** the push in [`PushContext::records`] — which the node
+//!    encrypts at rest under its storage key — with the document, the plan,
+//!    and the deadline.
+//! 3. **Queues** the first attempt on the delivery layer's durable outbox. A
+//!    DIDComm attempt is packed and queued as ciphertext, as before. A TSP or
+//!    REST attempt is queued as the push's **id only**, pinned to the
+//!    [`TspPushTransport`] or [`RestPushTransport`], which loads the document
+//!    from the encrypted record when it sends. So nothing in the outbox is
+//!    readable at rest, whichever transport it is for, and a TSP relationship
+//!    the peer lost is re-established on the next try.
+//!
+//! # Evidence and escalation (VTI-TRN-030, -040, -041, -042)
+//!
+//! A queued attempt is not a delivery. [`sweep`] watches each push:
+//!
+//! - **Delivered** by the outbox — the message was collected from the mediator
+//!   (class 3, both DIDComm and TSP when the recipient is on this node's
+//!   mediator) — records the push delivered and names the evidence.
+//! - **Sent over REST** — the recipient's own server answered 2xx, a protocol
+//!   reply (class 2) — confirms it the same way.
+//! - **Failed or unconfirmed** at the attempt's window — no evidence — re-resolves
+//!   the recipient and queues the next transport it offers. With none left, the
+//!   push is marked failed and logged for the operator.
+//! - **Receipted** — the recipient's delivery layer sent a
+//!   `messaging/receipt/0.1` for the attempt (class 1). Every DIDComm and TSP
+//!   attempt asks for one, under its outbox key (`delivery_id` header, TSP
+//!   envelope `deliveryId`; VTI-TRN-060), and the delivery layer settles the
+//!   entry `Delivered` only from the addressed party (VTI-TRN-062).
+//! - **Unconfirmable** — the attempt was relayed to the recipient's own
+//!   mediator, which this node's mediator cannot answer for, and the recipient
+//!   is not known to send receipts (`ReceiptReach`). No evidence class was ever
+//!   available on that path, so the push records `unconfirmable` and is not
+//!   escalated: re-sending over another transport would hand the recipient a
+//!   second copy of something it may have had for an hour (VTI-TRN-042 as
+//!   amended, VTI-TRN-064). A recipient known to send receipts is escalated as
+//!   below — for it, silence means something.
+//! - **Refused** — the attempt's hand-off has failed
+//!   [`FAILED_SENDS_BEFORE_ESCALATION`] times inside its window — moves to the
+//!   next transport the recipient offers at once. The window is for silence
+//!   (an accepted message not yet collected); a transport that keeps saying no
+//!   is not silent, and waiting out an hour of its refusals delays the push for
+//!   nothing.
+//!
+//! Each attempt but the last gets at most [`ATTEMPT_WINDOW`]; the last gets
+//! what remains of the deadline. The recipient may receive a document more than
+//! once across transports; it deduplicates by the document `id`, which every
+//! resend of one document carries unchanged (VTI-TRN-043).
+//!
+//! # Freshness: a push outlives the document it started with
+//!
+//! A push's deadline runs to hours or days — thirty for a removal notice — but
+//! a VTI consumer accepts a document only for
+//! [`VTI_ACCEPTANCE_WINDOW`]'s ten minutes after its
+//! `issuedAt`, plus its sixty seconds of skew tolerance (VTI-OPS-024), and refuses anything
+//! older as `expired`. An attempt queued after that — an escalation an hour
+//! in, an attempt re-queued after a crash, a hop the mediator refused for
+//! twenty minutes, or a copy the recipient collected on reconnecting the next
+//! morning — would deliver a document the recipient refuses, and nothing here
+//! would learn of it.
+//!
+//! Re-signing the same document under the same `id` is not the fix. SPEC §8.4
+//! defines a retry as the bit-for-bit identical document, and §7.2 item 11
+//! requires a consumer that already accepted an `id` to refuse different
+//! content under it with `idConflict` — a re-stamped `issuedAt` and a new proof
+//! are different content.
+//!
+//! What keeps most pushes inside the window is **a stated expiry**
+//! (VTI-TRN-048). A document stating an `expiresAt` is accepted until then, up
+//! to thirty days after its `issuedAt`, whatever the ten-minute maximum age
+//! (VTI-OPS-024, VTI-OPS-028). So a node signs a pushed document with
+//! [`state_delivery_expiry`] — an `expiresAt` at the push's deadline — and a
+//! copy a mediator holds while its recipient is offline is still acceptable
+//! when collected. The two predicates below place a document by that
+//! acceptance end, not by `issuedAt` alone.
+//!
+//! Where a document is still past its acceptance end — it states no expiry, or
+//! the deadline runs past the thirty-day horizon — the engine issues a **new
+//! attempt** (SPEC §8.4, last paragraph) whenever
+//! it would otherwise put a document past its acceptance window on the wire:
+//! a fresh `id`, a fresh `issuedAt`, the node's proof again
+//! ([`PushReissuer`]), and everything else unchanged. The attempt stays in the
+//! original's thread — its `threadId`, or the original's `id` where the
+//! original opened the thread — so a reply correlates as it would have, and an
+//! `idempotencyKey` the original carried rides every attempt (VTI-OPS-064), so a
+//! consumer that keys the task performs it once however many attempts reach
+//! it. A task without a key is one whose repeat is harmless (VTI-OPS-060); a
+//! task whose repeat leaves a second artefact must carry one.
+//!
+//! Where it happens:
+//!
+//! - **Queuing** any attempt — the first, an escalation, a re-queue — with a
+//!   document already past the window.
+//! - **An attempt still waiting to be handed off** when its document crosses
+//!   the window: it is superseded by a new attempt on the same transport,
+//!   inside the same attempt window.
+//! - **A copy collected after the window** (a recipient that was offline):
+//!   collection is evidence the recipient is online now, and not that it
+//!   accepted what it collected, so a new attempt follows on the same
+//!   transport.
+//!
+//! What it cannot reach: a copy held by a mediator is sealed and out of this
+//! node's hands until the recipient collects it, so a recipient offline past
+//! the window receives one refused copy before the new attempt.
+//! [`MAX_REISSUES`] bounds how many new attempts one push may make.
+//!
+//! # Which window (VTI-TRN-045)
+//!
+//! VTI-TRN-045 orders the window a sender assumes: the recipient's own, from
+//! its authenticated `trust-task-discovery/0.3` answer where it advertises one
+//! (a per-type entry over the response-level value); otherwise the window the
+//! task's specification states; otherwise a documented constant. The engine
+//! applies the last, [`VTI_ACCEPTANCE_WINDOW`] — the same value both VTI nodes
+//! apply as consumers and advertise as responders (VTI-TRN-047) — to every
+//! recipient.
+//!
+//! It does not ask. A lookup here would be a request/reply exchange with the
+//! recipient, and the engine has none: every push is one-way, and neither node
+//! lends it a correlated reply path. It would buy little, too:
+//!
+//! - The recipients are approvers' devices, members' wallets and requesters,
+//!   none of which serves `trust-task-discovery` today, so every lookup would
+//!   end in the fallback after a timeout.
+//! - The window matters only for a document the engine *holds* — a recipient
+//!   offline, a mediator refusing hops — which is exactly when a lookup cannot
+//!   be answered. A cached answer would have to have been learnt earlier.
+//! - The engine never sees an `expired` refusal (a REST attempt reports only
+//!   its HTTP status, and a DIDComm or TSP reply arrives at the node's inbound
+//!   router), so discovery 0.3's rule 7 — re-ask after an unexpected
+//!   refusal — would have no trigger.
+//!
+//! What remains open is recorded against VTI-TRN-045 in the specification's
+//! divergence register (Appendix F.3): the engine reads no advertised window.
+//! The day a recipient advertises one, the seam is the two predicates below,
+//! which already take the window from one value rather than two constants.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use affinidi_messaging_core::{
+    ConnState, DeliveryScope, Inbound, InboundAck, MessageTransport, MessagingError, SendReceipt,
+    TransportKind,
+};
+use affinidi_messaging_delivery::MessagingService;
+use affinidi_messaging_delivery::{Delivery, OutboxEntry, OutboxState, UnconfirmedReason};
+use affinidi_tdk::messaging::ATM;
+use chrono::{DateTime, SecondsFormat, Utc};
+use futures_util::stream::BoxStream;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::watch;
+use tracing::{debug, info, warn};
+use vta_sdk::protocol::matching::{
+    DIDCOMM_SERVICE_TYPE, Protocol, ServiceCapabilities, TRUST_TASK_HTTPS_SERVICE_TYPE,
+};
+
+use crate::capability_client::TRUST_TASK_ENVELOPE_TYPE;
+use crate::error::AppError;
+use crate::store::KeyspaceHandle;
+use crate::trust_task::acceptance::{EXPIRY_HORIZON, VTI_ACCEPTANCE_WINDOW};
+use crate::tsp_reach::TspReachability;
+
+/// What a node lends the push engine: the stores and handles that are its own.
+#[derive(Clone, Copy)]
+pub struct PushContext<'a> {
+    /// Where push records live. Encrypt it at rest: a record holds the
+    /// document until the push finishes.
+    pub records: &'a KeyspaceHandle,
+    /// The delivery layer's outbox keyspace, read for evidence.
+    pub outbox: &'a KeyspaceHandle,
+    /// Resolves the recipient's DID document. `None` treats every recipient
+    /// as advertising nothing, so it is reached over DIDComm.
+    pub resolver: Option<&'a DIDCacheClient>,
+    /// The node's messaging, when it is running. Without it only REST can be
+    /// attempted, and no attempt can be queued at all.
+    pub messaging: Option<PushMessaging<'a>>,
+    /// Whether this build and configuration can send over TSP.
+    pub tsp: bool,
+    /// Which peers were recently seen sending to this node over TSP. A
+    /// recipient whose document advertises no transport at all is reached
+    /// over TSP first when it is fresh here. `None` learns nothing.
+    pub learned_tsp: Option<&'a TspReachability>,
+    /// Signs the new attempts the engine issues when a push outlives its
+    /// document's acceptance window (see the module docs). `None` never
+    /// re-issues: a document past the window is still sent, and refused.
+    pub reissuer: Option<&'a dyn PushReissuer>,
+}
+
+/// A node's signature on a new attempt at a push (SPEC §8.4).
+///
+/// The engine builds the attempt ([`new_attempt`]); only the node holds the key
+/// that signed the original, so only the node can sign it again.
+#[async_trait::async_trait]
+pub trait PushReissuer: Send + Sync {
+    /// Attach this node's proof to `next`, a new attempt at `previous`.
+    /// `previous` still carries its own proof, so an implementation can sign
+    /// `next` the way `previous` was signed.
+    async fn sign_new_attempt(&self, previous: &Value, next: &mut Value) -> Result<(), AppError>;
+}
+
+/// The node's running messaging.
+#[derive(Clone, Copy)]
+pub struct PushMessaging<'a> {
+    /// The delivery layer every attempt is queued on.
+    pub service: &'a MessagingService,
+    /// Packs DIDComm attempts.
+    pub atm: &'a ATM,
+    /// The node's own DID, the sender of every push.
+    pub own_did: &'a str,
+}
+
+/// The longest any attempt but the last waits for evidence before the push
+/// moves to the next transport. Long enough for a device that checks in
+/// hourly; short enough that a transport the recipient stopped reading does
+/// not hold a removal notice for its whole thirty-day window.
+pub const ATTEMPT_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// How many failed hand-offs an attempt may have before the push moves to the
+/// next transport without waiting out [`ATTEMPT_WINDOW`].
+///
+/// The window exists for *silence*: an attempt the next hop accepted whose
+/// recipient has not collected it yet, which may simply be offline. A
+/// hand-off that **fails** — the transport's `send` returns an error, such as
+/// a TSP relay to a peer's mediator this node's mediator cannot reach — is not
+/// silence. It is the transport saying no, and the delivery layer retries it
+/// with backoff capped at a minute, so an hour's window is sixty refusals
+/// before the next transport is tried. Five failed sends span roughly fifteen
+/// to thirty seconds of the delivery layer's backoff (1 s, 2 s, 4 s, 8 s): long
+/// enough that a mediator restart or a dropped socket does not move a push off
+/// its preferred transport, short enough that a transport that cannot send at
+/// all does not hold it for the hour.
+///
+/// A destination queue-full refusal is back-pressure, not failure — the
+/// delivery layer does not count it in `attempts` — so it never triggers this.
+/// And the last transport a recipient offers keeps retrying to the deadline:
+/// there is nothing to move to, and the peer's advertisement is never
+/// downgraded past.
+pub const FAILED_SENDS_BEFORE_ESCALATION: u32 = 5;
+
+/// Whether an attempt has failed often enough to move on before its window
+/// closes ([`FAILED_SENDS_BEFORE_ESCALATION`]). Only a `Queued` attempt — one
+/// still being retried because its hand-off failed — qualifies: a `Sent` one is
+/// silence, which is the window's to judge, and a terminal one is handled on
+/// its own arm. `has_next` is whether the push has a transport left to try.
+fn failed_before_window(state: Option<OutboxState>, failed_sends: u32, has_next: bool) -> bool {
+    has_next
+        && matches!(state, Some(OutboxState::Queued))
+        && failed_sends >= FAILED_SENDS_BEFORE_ESCALATION
+}
+
+/// How long an attempt may be missing from the outbox before the sweep
+/// concludes it was never queued. The record is written before the entry, so a
+/// sweep landing between the two sees no entry — which means "not queued yet",
+/// never "delivered" or "failed".
+const ENQUEUE_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a finished push's record is kept, as the record of which evidence
+/// its delivery rests on (VTI-TRN-041), before the sweep removes it.
+const FINISHED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The most new attempts one push may issue (see the module docs). Each is a
+/// signature — a KMS decrypt on a TEE node — so a transport that refuses every
+/// hop for a thirty-day deadline must not re-sign every ten minutes for all of
+/// it. Enough for an hour of refused hops on two transports, and a late
+/// collection besides.
+pub const MAX_REISSUES: u32 = 12;
+
+/// Transport ids the TSP and REST transports are registered under.
+/// Kept at their original values so attempts queued before the move to
+/// `vti-common` still drain after an upgrade.
+pub const TSP_TRANSPORT_ID: &str = "member-push-tsp";
+pub const REST_TRANSPORT_ID: &str = "member-push-rest";
+
+const RECORD_PREFIX: &str = "push:";
+
+/// A push in flight or recently finished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PushRecord {
+    id: String,
+    recipient: String,
+    /// The signed Trust Task document every attempt sends: unchanged across
+    /// resends, and replaced only by a new attempt ([`new_attempt`]) once it is
+    /// past its acceptance window.
+    document: Value,
+    /// How many new attempts this push has issued ([`MAX_REISSUES`]).
+    #[serde(default)]
+    reissues: u32,
+    /// Transports still to try after the current one, in preference order.
+    remaining: Vec<Protocol>,
+    /// The transport of the attempt in flight.
+    current: Protocol,
+    /// The outbox key of the attempt in flight.
+    attempt_key: String,
+    attempt: u32,
+    /// The recipient's TSP mediator, when it advertises one.
+    #[serde(default)]
+    peer_tsp_mediator: Option<String>,
+    /// The recipient's Trust-Task HTTPS base, when it advertises one.
+    #[serde(default)]
+    rest_base: Option<String>,
+    /// Overall deadline, epoch milliseconds.
+    deadline_ms: u64,
+    /// When the attempt in flight was queued, epoch milliseconds.
+    #[serde(default)]
+    queued_at_ms: u64,
+    #[serde(default)]
+    outcome: Option<PushOutcome>,
+}
+
+/// How a push ended.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PushOutcome {
+    delivered: bool,
+    via: Protocol,
+    /// The class of evidence a delivery rests on (VTI-TRN-041): `collected`
+    /// (transport evidence the recipient collected it, or its delivery
+    /// layer's receipt) or `reply` (the recipient's own server acknowledged
+    /// it). `none` for a failure, and `unconfirmable` for an attempt relayed
+    /// where no evidence class was available at all (VTI-TRN-042 as amended):
+    /// not delivered as far as this node can know, and not a failure either.
+    evidence: String,
+    at_ms: u64,
+}
+
+fn record_key(id: &str) -> String {
+    format!("{RECORD_PREFIX}{id}")
+}
+
+fn now_ms() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
+
+// ─── freshness ───────────────────────────────────────────────────────────
+
+/// The document's `issuedAt`, when it carries a readable one.
+fn issued_at(doc: &Value) -> Option<DateTime<Utc>> {
+    doc.get("issuedAt")?.as_str()?.parse::<DateTime<Utc>>().ok()
+}
+
+/// The document's `expiresAt`, when it carries a readable one.
+fn expires_at(doc: &Value) -> Option<DateTime<Utc>> {
+    doc.get("expiresAt")?
+        .as_str()?
+        .parse::<DateTime<Utc>>()
+        .ok()
+}
+
+/// The document's **acceptance end** at a recipient applying
+/// [`VTI_ACCEPTANCE_WINDOW`] (VTI-TRN-044's definition, from VTI-OPS-024): its
+/// `expiresAt`, no later than the thirty-day horizon (VTI-OPS-028), where it
+/// states one; otherwise `issuedAt` plus the maximum age. `None` with no
+/// readable `issuedAt`: the document cannot be placed in any window.
+///
+/// The window is VTI-TRN-045's documented constant, its last tier, for every
+/// recipient; see the module docs (*Which window*) for why the engine reads no
+/// advertised one.
+fn acceptance_end(doc: &Value) -> Option<DateTime<Utc>> {
+    let issued = issued_at(doc)?;
+    Some(match expires_at(doc) {
+        Some(expiry) => issued
+            .checked_add_signed(EXPIRY_HORIZON)
+            .map_or(expiry, |horizon| expiry.min(horizon)),
+        None => issued
+            .checked_add_signed(VTI_ACCEPTANCE_WINDOW.max_age)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+    })
+}
+
+/// Whether the recipient has stopped accepting `doc` by `now`, before its skew
+/// tolerance: its acceptance end, past which the engine will not put it on the
+/// wire again (VTI-TRN-046's SHOULD NOT). A document with no readable
+/// `issuedAt` is never judged past one — it is sent as it is.
+fn past_acceptance(doc: &Value, now: DateTime<Utc>) -> bool {
+    acceptance_end(doc).is_some_and(|end| now >= end)
+}
+
+/// Whether the recipient refuses `doc` at `now`, skew tolerance included: at
+/// or past the end of its acceptance window (VTI-TRN-044), which is half-open
+/// as `trust-tasks-rs` applies it. A copy collected from this point was
+/// refused, whatever the collection evidence says.
+fn refused_when_collected(doc: &Value, now: DateTime<Utc>) -> bool {
+    acceptance_end(doc)
+        .and_then(|end| end.checked_add_signed(VTI_ACCEPTANCE_WINDOW.clock_skew))
+        .is_some_and(|edge| now >= edge)
+}
+
+/// State the push's deadline on an **unsigned** document as its `expiresAt`
+/// (**VTI-TRN-048**), before it is signed and handed to [`push_trust_task`]
+/// with the same `deliver_by`.
+///
+/// A document that states no expiry is acceptable for the recipient's maximum
+/// age — ten minutes — so a delivery lasting a day would depend on a chain of
+/// new attempts each reaching the recipient before it went stale. One stating
+/// the deadline is acceptable for as long as the push runs, up to the
+/// thirty-day horizon (VTI-OPS-028), so a copy a mediator holds while its
+/// recipient is offline is still acceptable when collected. Each new attempt
+/// carries it unchanged ([`new_attempt`]), and so the recipient's record of
+/// the idempotency key lasts as long as any of them can be accepted
+/// (VTI-OPS-066).
+///
+/// The expiry is the close of the delivery window and no later — a document
+/// stated to stand longer than its sender pursues it asks the recipient to
+/// remember it for nothing — counted from the document's `issuedAt` (or `now`
+/// without one) and rounded down to whole seconds. An `expiresAt` the
+/// document already states is kept where it is earlier: the task said the
+/// request lapses then. Refused on a signed document, whose proof the change
+/// would break.
+pub fn state_delivery_expiry(
+    doc: &mut Value,
+    deliver_by: Duration,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| AppError::Validation("a Trust Task document is a JSON object".into()))?;
+    if obj.contains_key("proof") {
+        return Err(AppError::Internal(
+            "the delivery expiry is stated before signing; this document is already signed".into(),
+        ));
+    }
+    let from = obj
+        .get("issuedAt")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .unwrap_or(now);
+    let deadline = chrono::TimeDelta::from_std(deliver_by)
+        .ok()
+        .and_then(|d| from.checked_add_signed(d))
+        .map(|t| chrono::SubsecRound::trunc_subsecs(t, 0))
+        .ok_or_else(|| AppError::Validation("the delivery window is out of range".into()))?;
+    let stated = obj
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    if stated.is_some_and(|t| t <= deadline) {
+        return Ok(());
+    }
+    obj.insert(
+        "expiresAt".into(),
+        Value::String(deadline.to_rfc3339_opts(SecondsFormat::Secs, true)),
+    );
+    Ok(())
+}
+
+/// A **new attempt** at `previous` (SPEC §8.4): a fresh `id`, a fresh
+/// `issuedAt`, no `proof` — sign it before sending — and every other member
+/// unchanged, including any `idempotencyKey`, which every attempt at one
+/// logical operation must carry (VTI-OPS-064).
+///
+/// The attempt stays in `previous`'s thread. Where `previous` carried a
+/// `threadId` it is kept; where `previous` opened the thread, SPEC §4.9 names
+/// that thread by `previous`'s `id`, so the attempt carries that `id` as its
+/// `threadId`. Without it a new attempt would open a new exchange, and an
+/// answer keyed to the original — a presentation challenge committed to the
+/// original `id`, a reply the sender waits on — would never correlate.
+///
+/// `issuedAt` is whole seconds (VTI-KEY-107). Refused when `previous` states an
+/// `expiresAt` that has passed: the producer said the request lapses then, and
+/// a new attempt would override it.
+pub fn new_attempt(previous: &Value, now: DateTime<Utc>) -> Result<Value, AppError> {
+    let obj = previous
+        .as_object()
+        .ok_or_else(|| AppError::Validation("a Trust Task document is a JSON object".into()))?;
+    let previous_id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| AppError::Validation("the document carries no id".into()))?;
+    if let Some(expires_at) = obj
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        && expires_at <= now
+    {
+        return Err(AppError::Validation(format!(
+            "{previous_id} lapsed at its own expiresAt ({expires_at}); a new attempt would \
+             outlive what its producer asked"
+        )));
+    }
+    let mut next = obj.clone();
+    if !next.contains_key("threadId") {
+        next.insert("threadId".into(), Value::String(previous_id.to_string()));
+    }
+    next.insert(
+        "id".into(),
+        Value::String(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
+    );
+    next.insert(
+        "issuedAt".into(),
+        Value::String(now.to_rfc3339_opts(SecondsFormat::Secs, true)),
+    );
+    next.remove("proof");
+    Ok(Value::Object(next))
+}
+
+/// Whether [`reissue`] could replace the push's document now — checked before a
+/// sweep sets out to, so a push that cannot re-issue (no signer, spent, or past
+/// its own `expiresAt`) waits quietly instead of warning every pass.
+fn may_reissue(ctx: &PushContext<'_>, record: &PushRecord, now: DateTime<Utc>) -> bool {
+    let lapsed = record
+        .document
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .is_some_and(|t| t <= now);
+    ctx.reissuer.is_some() && record.reissues < MAX_REISSUES && !lapsed
+}
+
+/// Replace the push's document with a signed new attempt at it. `false` — and
+/// the document unchanged — when this node cannot sign one, the push has spent
+/// [`MAX_REISSUES`], or the document may not be re-issued; the caller then
+/// carries on with what it has, which is what the engine did before it could
+/// re-issue at all.
+async fn reissue(ctx: &PushContext<'_>, record: &mut PushRecord) -> bool {
+    let Some(signer) = ctx.reissuer else {
+        warn!(
+            push = %record.id,
+            recipient = %record.recipient,
+            "push document is past its acceptance window and this node cannot re-issue it; \
+             the recipient will refuse it as expired"
+        );
+        return false;
+    };
+    if record.reissues >= MAX_REISSUES {
+        warn!(
+            push = %record.id,
+            recipient = %record.recipient,
+            reissues = record.reissues,
+            "push has issued as many new attempts as it may; sending the document it has"
+        );
+        return false;
+    }
+    let mut next = match new_attempt(&record.document, Utc::now()) {
+        Ok(next) => next,
+        Err(e) => {
+            warn!(push = %record.id, error = %e, "cannot issue a new attempt at the push");
+            return false;
+        }
+    };
+    if let Err(e) = signer.sign_new_attempt(&record.document, &mut next).await {
+        warn!(push = %record.id, error = %e, "could not sign a new attempt at the push");
+        return false;
+    }
+    let previous = record
+        .document
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let next_id = next
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    record.document = next;
+    record.reissues += 1;
+    info!(
+        push = %record.id,
+        recipient = %record.recipient,
+        previous = %previous,
+        next = %next_id,
+        "push outlived its document's acceptance window; issued a new attempt"
+    );
+    true
+}
+
+/// What the recipient's DID document says it can be reached over.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Reach {
+    tsp_mediator: Option<String>,
+    didcomm: bool,
+    rest_base: Option<String>,
+}
+
+impl Reach {
+    fn advertises_anything(&self) -> bool {
+        self.tsp_mediator.is_some() || self.didcomm || self.rest_base.is_some()
+    }
+
+    fn from_document(doc: &Value) -> Self {
+        let caps = ServiceCapabilities::from_did_document(doc);
+        Reach {
+            tsp_mediator: caps.tsp,
+            didcomm: caps.didcomm.is_some(),
+            rest_base: trust_task_https_base(doc),
+        }
+    }
+}
+
+/// The `TrustTaskHTTPS` service endpoint, if advertised. REST reaches a peer
+/// only through this type: it is the one that claims to accept Trust Task
+/// documents, and an application REST API advertised under another type never
+/// agreed to (HTTPS binding 0.2 §6.2).
+///
+/// An endpoint that is not `https://` (or `http://` to an exact loopback host
+/// — [`vta_sdk::protocol::matching::is_https_or_loopback`]) is refused and logged, the same
+/// rule [`ServiceCapabilities::from_did_document`] applies to a `VTARest`/
+/// `TrustTaskHTTPS` candidate: a peer advertising plain `http://` must not
+/// receive a signed Trust Task in the clear. The refusal makes this function
+/// report no REST endpoint at all — `plan`/`choose` then simply do not offer
+/// REST for this peer, and the push fails closed if no other transport is
+/// shared.
+fn trust_task_https_base(doc: &Value) -> Option<String> {
+    let uri = doc.get("service")?.as_array()?.iter().find_map(|svc| {
+        let typed = match svc.get("type")? {
+            Value::String(t) => t == TRUST_TASK_HTTPS_SERVICE_TYPE,
+            Value::Array(ts) => ts
+                .iter()
+                .any(|t| t.as_str() == Some(TRUST_TASK_HTTPS_SERVICE_TYPE)),
+            _ => false,
+        };
+        if !typed {
+            return None;
+        }
+        match svc.get("serviceEndpoint")? {
+            Value::String(uri) if !uri.is_empty() => Some(uri.clone()),
+            Value::Object(o) => o.get("uri").and_then(Value::as_str).map(str::to_string),
+            _ => None,
+        }
+    })?;
+    if vta_sdk::protocol::matching::is_https_or_loopback(&uri) {
+        Some(uri)
+    } else {
+        let did = doc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        warn!(
+            did,
+            endpoint = %uri,
+            "ignoring a plaintext http:// TrustTaskHTTPS endpoint advertised to a non-loopback host"
+        );
+        None
+    }
+}
+
+/// What this node can send over right now.
+struct Ours {
+    tsp: bool,
+    didcomm: bool,
+    rest: bool,
+}
+
+fn ours(ctx: &PushContext<'_>) -> Ours {
+    let messaging_up = ctx.messaging.is_some();
+    Ours {
+        tsp: messaging_up && ctx.tsp,
+        didcomm: messaging_up,
+        rest: true,
+    }
+}
+
+/// The transports to try, in order, for `recipient`: the ones both sides
+/// speak, TSP > DIDComm > REST.
+///
+/// A recipient that advertises no transport at all — a `did:key` wallet — is
+/// reached over DIDComm through the node's own mediator. One that advertises
+/// transports this node cannot use is refused: never a silent downgrade past
+/// what the peer said it speaks.
+async fn plan(ctx: &PushContext<'_>, recipient: &str) -> Result<(Vec<Protocol>, Reach), AppError> {
+    let reach = resolve_reach(ctx, recipient).await;
+    let ours = ours(ctx);
+    let learned_tsp = ctx.learned_tsp.is_some_and(|seen| seen.fresh(recipient));
+    let plan = choose(&reach, &ours, learned_tsp);
+    if plan.is_empty() {
+        return Err(AppError::Validation(format!(
+            "no matching protocol for {recipient}: it advertises {} and this node can \
+             send over {}",
+            describe_reach(&reach),
+            describe_ours(&ours)
+        )));
+    }
+    Ok((plan, reach))
+}
+
+/// The transports both sides speak, TSP > DIDComm > REST.
+///
+/// A recipient that advertises nothing is reached over DIDComm through this
+/// node's mediator — and over TSP first when it was recently seen sending
+/// here over TSP (`learned_tsp`). DIDComm stays behind TSP in that plan,
+/// because a peer that switched back to DIDComm since gives no error on TSP,
+/// only silence, and escalation is what recovers from silence.
+fn choose(reach: &Reach, ours: &Ours, learned_tsp: bool) -> Vec<Protocol> {
+    let mut plan = Vec::new();
+    for p in Protocol::PREFERENCE_ORDER {
+        let both = match p {
+            Protocol::Tsp => ours.tsp && reach.tsp_mediator.is_some(),
+            Protocol::Didcomm => ours.didcomm && reach.didcomm,
+            Protocol::Rest => ours.rest && reach.rest_base.is_some(),
+        };
+        if both {
+            plan.push(p);
+        }
+    }
+    if plan.is_empty() && !reach.advertises_anything() {
+        if ours.tsp && learned_tsp {
+            plan.push(Protocol::Tsp);
+        }
+        if ours.didcomm {
+            plan.push(Protocol::Didcomm);
+        }
+    }
+    plan
+}
+
+fn describe_reach(r: &Reach) -> String {
+    let mut v = Vec::new();
+    if r.tsp_mediator.is_some() {
+        v.push("tsp");
+    }
+    if r.didcomm {
+        v.push(DIDCOMM_SERVICE_TYPE);
+    }
+    if r.rest_base.is_some() {
+        v.push(TRUST_TASK_HTTPS_SERVICE_TYPE);
+    }
+    if v.is_empty() {
+        "nothing".into()
+    } else {
+        v.join(", ")
+    }
+}
+
+fn describe_ours(o: &Ours) -> String {
+    let mut v = Vec::new();
+    if o.tsp {
+        v.push("tsp");
+    }
+    if o.didcomm {
+        v.push("didcomm");
+    }
+    if o.rest {
+        v.push("rest");
+    }
+    v.join(", ")
+}
+
+/// Resolve the recipient's advertised transports. An unresolvable DID reads as
+/// advertising nothing — the same as a `did:key` — so a push to it still goes
+/// the way pushes always went, over the shared mediator. Bounded (VTI-TRN-050).
+async fn resolve_reach(ctx: &PushContext<'_>, recipient: &str) -> Reach {
+    let Some(resolver) = ctx.resolver else {
+        return Reach::default();
+    };
+    match tokio::time::timeout(Duration::from_secs(15), resolver.resolve(recipient)).await {
+        Ok(Ok(resolved)) => serde_json::to_value(&resolved.doc)
+            .map(|doc| Reach::from_document(&doc))
+            .unwrap_or_default(),
+        Ok(Err(e)) => {
+            debug!(recipient, error = %e, "could not resolve the push recipient; using the shared mediator");
+            Reach::default()
+        }
+        Err(_) => {
+            debug!(
+                recipient,
+                "resolving the push recipient timed out; using the shared mediator"
+            );
+            Reach::default()
+        }
+    }
+}
+
+/// Push a **signed** Trust Task document to `recipient`, over the best
+/// transport both sides speak, durably, with escalation to the next transport
+/// when an attempt produces no evidence of delivery.
+///
+/// `Ok` means the first attempt is durably queued (VTI-TRN-030) — not that it
+/// was delivered. The outcome is recorded by [`sweep`].
+pub async fn push_trust_task(
+    ctx: &PushContext<'_>,
+    recipient: &str,
+    document: Value,
+    deliver_by: Duration,
+) -> Result<String, AppError> {
+    let (plan, reach) = plan(ctx, recipient).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut remaining = plan;
+    let current = remaining.remove(0);
+    let mut record = PushRecord {
+        id: id.clone(),
+        recipient: recipient.to_string(),
+        document,
+        remaining,
+        current,
+        attempt_key: String::new(),
+        attempt: 0,
+        peer_tsp_mediator: reach.tsp_mediator,
+        rest_base: reach.rest_base,
+        deadline_ms: now_ms().saturating_add(deliver_by.as_millis() as u64),
+        queued_at_ms: 0,
+        outcome: None,
+        reissues: 0,
+    };
+    // An attempt that cannot even be queued moves straight on; only when no
+    // transport will take it is the push refused.
+    loop {
+        match queue_attempt(ctx, &mut record, None).await {
+            Ok(()) => break,
+            Err(e) if !record.remaining.is_empty() => {
+                warn!(
+                    recipient,
+                    via = %record.current,
+                    error = %e,
+                    "could not queue a push on its preferred transport; trying the next"
+                );
+                record.current = record.remaining.remove(0);
+                record.attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    info!(recipient, via = %record.current, push = %id, "trust-task push queued");
+    Ok(id)
+}
+
+/// How a push ended, once it has: `(delivered, via, evidence)`, where
+/// `evidence` is the class the delivery rests on (VTI-TRN-041). `None` while
+/// it is still in flight, or once its record has been swept.
+pub async fn outcome(
+    records: &KeyspaceHandle,
+    id: &str,
+) -> Result<Option<(bool, Protocol, String)>, AppError> {
+    Ok(load_record(records, id)
+        .await?
+        .and_then(|r| r.outcome)
+        .map(|o| (o.delivered, o.via, o.evidence)))
+}
+
+/// Queue the attempt `record.current`, and store the record.
+///
+/// `window_end_ms` pins when the attempt's window closes, for an attempt that
+/// supersedes one on the same transport: the transport keeps the window it was
+/// given, rather than a fresh one each time its document is renewed — which,
+/// for a transport refusing every hop, would hold the push on it forever.
+/// `None` gives the attempt its share of what is left of the deadline.
+///
+/// A document already past its acceptance window is replaced by a new attempt
+/// first (see the module docs): whatever the reason this attempt is late, the
+/// document it would carry is one every VTI consumer refuses.
+async fn queue_attempt(
+    ctx: &PushContext<'_>,
+    record: &mut PushRecord,
+    window_end_ms: Option<u64>,
+) -> Result<(), AppError> {
+    if past_acceptance(&record.document, Utc::now()) {
+        reissue(ctx, record).await;
+    }
+    let messaging = ctx.messaging;
+    let now = now_ms();
+    let remaining_ms = record.deadline_ms.saturating_sub(now).max(1_000);
+    // The last attempt gets whatever is left. Every other one gets its share
+    // of it, capped at `ATTEMPT_WINDOW`, so a short deadline still leaves room
+    // to escalate: a 15-minute consent request tries each of three transports
+    // for five minutes, where taking the whole deadline first would never
+    // reach the second.
+    let window_ms = if let Some(end) = window_end_ms {
+        end.saturating_sub(now).max(1_000)
+    } else if record.remaining.is_empty() {
+        remaining_ms
+    } else {
+        let share = remaining_ms / (record.remaining.len() as u64 + 1);
+        share.min(ATTEMPT_WINDOW.as_millis() as u64).max(1_000)
+    };
+    let window = Duration::from_millis(window_ms);
+    record.attempt_key = format!("{}:{}:{}", record.id, record.attempt, record.current);
+    record.queued_at_ms = now;
+    // The record is written before the attempt is queued, so a transport that
+    // drains the entry at once finds what it has to send.
+    store_record(ctx, record).await?;
+
+    let delivery = Delivery::Guaranteed {
+        idempotency_key: Some(record.attempt_key.clone()),
+        ordering_key: None,
+        deliver_by: window,
+    };
+    let messaging = messaging
+        .ok_or_else(|| AppError::Internal("messaging not running — cannot push".into()))?;
+    match record.current {
+        Protocol::Didcomm => {
+            let envelope = affinidi_tdk::didcomm::Message::build(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                TRUST_TASK_ENVELOPE_TYPE.to_string(),
+                record.document.clone(),
+            )
+            .from(messaging.own_did.to_string())
+            .to(record.recipient.clone())
+            .finalize();
+            // Ask the recipient's delivery layer for a receipt under the
+            // attempt's own outbox key, so the receipt settles this entry and
+            // no other (VTI-TRN-060). Not derived from the content, and every
+            // retry of the attempt carries the same id.
+            let envelope =
+                affinidi_tdk::messaging::delivery::request_receipt(envelope, &record.attempt_key)
+                    .map_err(|e| AppError::Internal(format!("ask for a receipt: {e}")))?;
+            let (packed, _) = messaging
+                .atm
+                .pack_encrypted(
+                    &envelope,
+                    &record.recipient,
+                    Some(messaging.own_did),
+                    Some(messaging.own_did),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("DIDComm pack for {} failed: {e}", record.recipient))
+                })?;
+            messaging
+                .service
+                .send(&record.recipient, packed.into_bytes(), delivery)
+                .await
+                .map_err(|e| AppError::Internal(format!("queue DIDComm push: {e}")))?;
+        }
+        Protocol::Tsp | Protocol::Rest => {
+            let transport = if record.current == Protocol::Tsp {
+                TSP_TRANSPORT_ID
+            } else {
+                REST_TRANSPORT_ID
+            };
+            // The id only: the transport reads the document from the encrypted
+            // record at send time, so the outbox holds nothing readable.
+            messaging
+                .service
+                .send_via(
+                    transport,
+                    &record.recipient,
+                    record.id.clone().into_bytes(),
+                    delivery,
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("queue {} push: {e}", record.current)))?;
+        }
+    }
+    Ok(())
+}
+
+async fn store_record(ctx: &PushContext<'_>, record: &PushRecord) -> Result<(), AppError> {
+    ctx.records.insert(record_key(&record.id), record).await
+}
+
+async fn load_record(ks: &KeyspaceHandle, id: &str) -> Result<Option<PushRecord>, AppError> {
+    ks.get(record_key(id)).await
+}
+
+/// One pass over every push: settle what has evidence, escalate what has none,
+/// and drop finished records past their retention. The retention sweeper runs
+/// it on a timer.
+pub async fn sweep(ctx: &PushContext<'_>) -> Result<(), AppError> {
+    use affinidi_messaging_delivery::OutboxStore as _;
+    let Some(messaging) = ctx.messaging else {
+        return Ok(());
+    };
+    let outbox = crate::outbox_store::VtiOutboxStore::new(ctx.outbox.clone());
+    let receipt_reach = messaging.service.receipt_reach();
+    let now = now_ms();
+    for (_, bytes) in ctx
+        .records
+        .prefix_iter_raw(RECORD_PREFIX.as_bytes().to_vec())
+        .await?
+    {
+        let Ok(mut record) = serde_json::from_slice::<PushRecord>(&bytes) else {
+            continue;
+        };
+        if let Some(outcome) = &record.outcome {
+            if now.saturating_sub(outcome.at_ms) > FINISHED_RETENTION.as_millis() as u64 {
+                ctx.records.remove(record_key(&record.id)).await?;
+            }
+            continue;
+        }
+        let entry = outbox
+            .get(&record.attempt_key)
+            .await
+            .map_err(|e| AppError::Internal(format!("read push delivery state: {e}")))?;
+        // An attempt still queued or sent at its own deadline has produced no
+        // evidence in its window. Treated here, rather than after the delivery
+        // layer's own settle pass, so escalation is not held for it.
+        let expired = entry.as_ref().is_some_and(|e| now >= e.deliver_by_ms);
+        let observed = entry.as_ref().is_some_and(|e| e.outbox_observed);
+        let window_end_ms = entry.as_ref().map(|e| e.deliver_by_ms);
+        let failed_sends = entry.as_ref().map_or(0, |e| e.attempts);
+        let no_evidence_path = entry
+            .as_ref()
+            .is_some_and(|e| no_evidence_path(e, &receipt_reach, now));
+        let entry_state = entry.map(|e| e.state);
+        let clock = Utc::now();
+        match entry_state {
+            // The transport keeps refusing the hand-off. That is a definitive
+            // answer, not silence, so the push moves on now rather than at the
+            // end of its window (`FAILED_SENDS_BEFORE_ESCALATION`). Ahead of the
+            // re-issue arm below: re-signing a document for a transport that
+            // cannot send it gains nothing, and the escalated attempt re-issues
+            // anyway if it has to.
+            state
+                if !expired
+                    && failed_before_window(state, failed_sends, !record.remaining.is_empty()) =>
+            {
+                escalate_after_failures(ctx, &outbox, &mut record, failed_sends).await?;
+            }
+            // Collected, but only after every VTI consumer had stopped
+            // accepting the document: the recipient was offline past the
+            // window, is online now, and refused what it collected. Collection
+            // is evidence of the first and not of acceptance, so a new attempt
+            // follows on the transport the recipient just proved it reads.
+            Some(OutboxState::Delivered)
+                if record.current != Protocol::Rest
+                    && now < record.deadline_ms
+                    && refused_when_collected(&record.document, clock)
+                    && may_reissue(ctx, &record, clock) =>
+            {
+                warn!(
+                    push = %record.id,
+                    recipient = %record.recipient,
+                    via = %record.current,
+                    "push collected after its acceptance window closed; the recipient refused \
+                     it as expired, so a new attempt follows"
+                );
+                if reissue(ctx, &mut record).await {
+                    record.attempt += 1;
+                    if let Err(e) = queue_attempt(ctx, &mut record, None).await {
+                        warn!(push = %record.id, error = %e, "could not queue the new attempt");
+                        escalate(ctx, &mut record).await?;
+                    }
+                } else {
+                    finish(ctx, &mut record, true, "collected").await?;
+                }
+            }
+            Some(OutboxState::Delivered) => {
+                finish(ctx, &mut record, true, "collected").await?;
+            }
+            // REST has no collection signal, and needs none: a 2xx is the
+            // recipient's own server acknowledging the document.
+            Some(OutboxState::Sent) if record.current == Protocol::Rest => {
+                let _ = messaging.service.confirm(&record.attempt_key).await;
+                finish(ctx, &mut record, true, "reply").await?;
+            }
+            // Still waiting to be handed off — the mediator or the recipient's
+            // server has refused every hop so far — and its document has now
+            // crossed the acceptance window, so the hop that finally succeeds
+            // would carry a refused document. Superseded by a new attempt on
+            // the same transport, inside the same window.
+            //
+            // Not a `Sent` attempt: that copy is sealed and held by a mediator,
+            // out of this node's reach, and a copy per window for an offline
+            // recipient would fill the mediator's queue for them. The arm above
+            // picks it up when it is collected.
+            Some(OutboxState::Queued)
+                if !expired
+                    && past_acceptance(&record.document, clock)
+                    && may_reissue(ctx, &record, clock) =>
+            {
+                if reissue(ctx, &mut record).await {
+                    record.attempt += 1;
+                    if let Err(e) = queue_attempt(ctx, &mut record, window_end_ms).await {
+                        warn!(push = %record.id, error = %e, "could not queue the new attempt");
+                        escalate(ctx, &mut record).await?;
+                    }
+                }
+            }
+            Some(OutboxState::Queued | OutboxState::Sent) if !expired => {}
+            // Not in the outbox. Just queued, and the entry is not written yet:
+            // wait. Long past that: the enqueue never happened (the process
+            // died between the record and the entry), so queue this same
+            // attempt again rather than give up on a transport never tried.
+            None if now.saturating_sub(record.queued_at_ms) < ENQUEUE_GRACE.as_millis() as u64 => {}
+            None => {
+                warn!(
+                    push = %record.id,
+                    attempt = %record.attempt_key,
+                    "push attempt was never queued; queuing it again"
+                );
+                if let Err(e) = queue_attempt(ctx, &mut record, None).await {
+                    warn!(push = %record.id, error = %e, "could not re-queue the push");
+                    escalate(ctx, &mut record).await?;
+                }
+            }
+            // Handed off, relayed to the recipient's own mediator, and the
+            // recipient is not known to send receipts: its window passed with
+            // no evidence class ever available. Recorded, not escalated
+            // (VTI-TRN-042 as amended, VTI-TRN-064).
+            Some(OutboxState::Sent | OutboxState::Unconfirmed) if no_evidence_path => {
+                finish(ctx, &mut record, false, UNCONFIRMABLE).await?;
+            }
+            Some(OutboxState::Queued | OutboxState::Sent)
+            | Some(OutboxState::Failed | OutboxState::Unconfirmed) => {
+                // Why this attempt is being given up on — the one fact needed
+                // to tell a lost message from a slow one afterwards.
+                debug!(
+                    push = %record.id,
+                    attempt = %record.attempt_key,
+                    state = ?entry_state,
+                    expired,
+                    observed,
+                    "push attempt ended without delivery evidence"
+                );
+                escalate(ctx, &mut record).await?;
+            }
+            // A state this build does not know yet: wait rather than escalate,
+            // which could send a second copy of something already delivered.
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// No evidence inside the attempt's window: re-resolve the recipient and try
+/// the next transport it offers (VTI-TRN-042). "A dead mediator is not a dead
+/// peer", so the re-resolution comes first.
+async fn escalate(ctx: &PushContext<'_>, record: &mut PushRecord) -> Result<(), AppError> {
+    if now_ms() >= record.deadline_ms {
+        return finish(ctx, record, false, "none").await;
+    }
+    // A recipient that now offers nothing we speak leaves nothing to escalate to.
+    let (next, reach) = next_transports(ctx, record).await;
+    record.peer_tsp_mediator = reach.tsp_mediator;
+    record.rest_base = reach.rest_base;
+    if next.is_empty() {
+        return finish(ctx, record, false, "none").await;
+    }
+    warn!(
+        recipient = %record.recipient,
+        from = %record.current,
+        to = %next[0],
+        "push produced no delivery evidence in its window; escalating"
+    );
+    move_to(ctx, record, next).await
+}
+
+/// The attempt in flight has failed [`FAILED_SENDS_BEFORE_ESCALATION`] hand-offs
+/// inside its window: move to the next transport the recipient still offers
+/// now, rather than when the window closes (VTI-TRN-042 — a transport that
+/// refuses is one that "yields no evidence", and there is no reason to wait for
+/// more refusals).
+///
+/// Unlike [`escalate`], running out of transports here does not finish the
+/// push: the attempt in flight is still being retried and still inside its
+/// window, so it is left to carry on, and the window decides as it always did.
+async fn escalate_after_failures(
+    ctx: &PushContext<'_>,
+    outbox: &crate::outbox_store::VtiOutboxStore,
+    record: &mut PushRecord,
+    failed_sends: u32,
+) -> Result<(), AppError> {
+    let (next, reach) = next_transports(ctx, record).await;
+    if next.is_empty() {
+        debug!(
+            push = %record.id,
+            via = %record.current,
+            failed_sends,
+            "push attempt keeps failing but the recipient offers no other transport; retrying it"
+        );
+        return Ok(());
+    }
+    // Stop the delivery layer retrying the attempt being left, so the push has
+    // one attempt in flight. A hand-off racing this can still land; the
+    // recipient deduplicates by document id (VTI-TRN-043), and that attempt's
+    // evidence is no longer read.
+    abandon_attempt(outbox, &record.attempt_key).await;
+    record.peer_tsp_mediator = reach.tsp_mediator;
+    record.rest_base = reach.rest_base;
+    warn!(
+        recipient = %record.recipient,
+        from = %record.current,
+        to = %next[0],
+        failed_sends,
+        "push attempt's hand-off keeps failing; escalating before its window closes"
+    );
+    move_to(ctx, record, next).await
+}
+
+/// What is left of the push's plan, kept only where the recipient — resolved
+/// again, since "a dead mediator is not a dead peer" — still offers it, and
+/// never the transport of the attempt in flight. With what it resolved to.
+async fn next_transports(ctx: &PushContext<'_>, record: &PushRecord) -> (Vec<Protocol>, Reach) {
+    let (fresh, reach) = plan(ctx, &record.recipient).await.unwrap_or_default();
+    let tried = record.current;
+    let next = record
+        .remaining
+        .iter()
+        .copied()
+        .filter(|p| *p != tried && fresh.contains(p))
+        .collect();
+    (next, reach)
+}
+
+/// Queue the first of `next` as the push's attempt in flight.
+async fn move_to(
+    ctx: &PushContext<'_>,
+    record: &mut PushRecord,
+    next: Vec<Protocol>,
+) -> Result<(), AppError> {
+    record.remaining = next;
+    record.current = record.remaining.remove(0);
+    record.attempt += 1;
+    if let Err(e) = queue_attempt(ctx, record, None).await {
+        warn!(recipient = %record.recipient, error = %e, "could not queue the escalated push");
+        return finish(ctx, record, false, "none").await;
+    }
+    Ok(())
+}
+
+/// Settle an attempt the push has moved on from, so the delivery layer stops
+/// retrying it. Only a `Queued` attempt is touched: one already handed off is
+/// the mediator's, and a terminal one is already settled. Best-effort — a
+/// failure leaves the attempt retrying until its own window closes, which is
+/// what happened before a push could move on early.
+async fn abandon_attempt(outbox: &crate::outbox_store::VtiOutboxStore, attempt_key: &str) {
+    use affinidi_messaging_delivery::OutboxStore as _;
+    match outbox.get(attempt_key).await {
+        Ok(Some(mut entry)) if entry.state == OutboxState::Queued => {
+            entry.state = OutboxState::Failed;
+            if let Err(e) = outbox.put(entry).await {
+                warn!(attempt = %attempt_key, error = %e, "could not settle the abandoned push attempt");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(attempt = %attempt_key, error = %e, "could not read the abandoned push attempt")
+        }
+    }
+}
+
+/// The [`PushOutcome::evidence`] of an attempt that had no evidence path.
+pub const UNCONFIRMABLE: &str = "unconfirmable";
+
+/// Whether `entry` had no class of delivery evidence available: relayed to its
+/// recipient's own mediator (which this node's mediator cannot answer for),
+/// and the recipient not known to send receipts — or already settled so by
+/// the delivery layer's own sweep.
+fn no_evidence_path(
+    entry: &OutboxEntry,
+    reach: &affinidi_messaging_delivery::ReceiptReach,
+    now_ms: u64,
+) -> bool {
+    entry.unconfirmed_reason == Some(UnconfirmedReason::NoEvidencePath)
+        || (entry.scope == DeliveryScope::Relayed && !reach.sends_receipts(&entry.dest_did, now_ms))
+}
+
+/// The id the recipient's mediator stores push `id`'s attempt in flight under,
+/// once that attempt has been handed off and the transport reported one — the
+/// hop id the delivery layer records. A sender asking the recipient's mediator
+/// to wake it names the queued message by this id (`messaging/wake/request`,
+/// VTI-TRN-070). `None` while the attempt is still queued, for a transport that
+/// reports no id (cross-mediator TSP, REST), or once the push is finished.
+pub async fn stored_message_id(
+    records: &KeyspaceHandle,
+    outbox: &KeyspaceHandle,
+    id: &str,
+) -> Result<Option<String>, AppError> {
+    use affinidi_messaging_delivery::OutboxStore as _;
+    let Some(record) = load_record(records, id).await? else {
+        return Ok(None);
+    };
+    if record.outcome.is_some() {
+        return Ok(None);
+    }
+    let entry = crate::outbox_store::VtiOutboxStore::new(outbox.clone())
+        .get(&record.attempt_key)
+        .await
+        .map_err(|e| AppError::Internal(format!("read push delivery state: {e}")))?;
+    Ok(entry
+        .filter(|e| e.state == OutboxState::Sent)
+        .and_then(|e| e.hop_id))
+}
+
+async fn finish(
+    ctx: &PushContext<'_>,
+    record: &mut PushRecord,
+    delivered: bool,
+    evidence: &str,
+) -> Result<(), AppError> {
+    record.outcome = Some(PushOutcome {
+        delivered,
+        via: record.current,
+        evidence: evidence.to_string(),
+        at_ms: now_ms(),
+    });
+    if delivered {
+        info!(
+            recipient = %record.recipient,
+            via = %record.current,
+            evidence,
+            "trust-task push delivered"
+        );
+    } else if evidence == UNCONFIRMABLE {
+        // Not a loss: the path offered no evidence to wait for.
+        info!(
+            recipient = %record.recipient,
+            via = %record.current,
+            "push unconfirmable: relayed to the recipient's own mediator, and the recipient \
+             is not known to send receipts; not escalated"
+        );
+    } else {
+        // Surfaced to the operator: every transport the recipient offers has
+        // been tried inside the deadline without evidence (VTI-TRN-042).
+        warn!(
+            recipient = %record.recipient,
+            last_via = %record.current,
+            "push could not be confirmed on any transport the recipient offers"
+        );
+    }
+    store_record(ctx, record).await
+}
+
+// ─── transports ──────────────────────────────────────────────────────────
+
+/// Loads the document a TSP/REST outbox entry names. The entry carries the
+/// push id only.
+async fn document_for(ks: &KeyspaceHandle, packed: &[u8]) -> Result<PushRecord, MessagingError> {
+    let id = std::str::from_utf8(packed)
+        .map_err(|_| MessagingError::Transport("push entry is not a push id".into()))?;
+    load_record(ks, id)
+        .await
+        .map_err(|e| MessagingError::Transport(format!("read push record: {e}")))?
+        .ok_or_else(|| MessagingError::Transport(format!("no push record {id}")))
+}
+
+/// Sends a push over TSP, sealed at send time from the encrypted push
+/// record, and reports the collection-evidence id the mediator will list.
+///
+/// A recipient on this node's mediator is sealed and routed through it, and
+/// the returned `hop_id` is the id the mediator lists the message under in
+/// this node's outbox — `sha256` of the stored (base64url) form of the
+/// inner message — so the delivery layer's existing outbox poll sees it
+/// collected. A recipient on another mediator is sent nested, for metadata
+/// privacy; no mediator reports collection for that, so it carries no
+/// `hop_id` and its entry is scoped [`DeliveryScope::Relayed`]: only the
+/// recipient's receipt is evidence for it.
+///
+/// Every send asks for a receipt: the TSP binding envelope carries the
+/// attempt's outbox key as `deliveryId` (VTI-TRN-060).
+#[cfg(feature = "tsp")]
+pub struct TspPushTransport {
+    atm: Arc<affinidi_tdk::messaging::ATM>,
+    profile: Arc<affinidi_tdk::messaging::profiles::ATMProfile>,
+    mediator_did: String,
+    pushes: KeyspaceHandle,
+    conn: watch::Receiver<ConnState>,
+    /// The scope of the last send to each recipient, taken by
+    /// [`MessageTransport::delivery_scope`], which the delivery layer asks right
+    /// after the send it describes. Only this transport knows it: it chose the
+    /// route from the push record.
+    scopes: std::sync::Mutex<std::collections::HashMap<String, DeliveryScope>>,
+}
+
+#[cfg(feature = "tsp")]
+impl TspPushTransport {
+    /// A transport sending pushes as `profile` through `mediator_did`, reading
+    /// each document from `pushes` ([`PushContext::records`]). `conn` is the
+    /// DIDComm socket's state: TSP sends go to the same mediator, so it is
+    /// reachable exactly when that socket is.
+    pub fn new(
+        atm: Arc<affinidi_tdk::messaging::ATM>,
+        profile: Arc<affinidi_tdk::messaging::profiles::ATMProfile>,
+        mediator_did: String,
+        pushes: KeyspaceHandle,
+        conn: watch::Receiver<ConnState>,
+    ) -> Self {
+        Self {
+            atm,
+            profile,
+            mediator_did,
+            pushes,
+            conn,
+            scopes: Default::default(),
+        }
+    }
+
+    fn remember_scope(&self, dest: &str, scope: DeliveryScope) {
+        self.scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dest.to_string(), scope);
+    }
+}
+
+#[cfg(feature = "tsp")]
+#[async_trait::async_trait]
+impl MessageTransport for TspPushTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Tsp
+    }
+
+    async fn send(&self, dest: &str, packed: Vec<u8>) -> Result<SendReceipt, MessagingError> {
+        use affinidi_tdk::messaging::protocols::tsp::{SendReadiness, invite_refusal_is_benign};
+
+        let record = document_for(&self.pushes, &packed).await?;
+        // The binding envelope, asking for a receipt under the attempt's outbox
+        // key (TSP binding 0.2 §2.1, VTI-TRN-060).
+        let body = affinidi_tdk::messaging::delivery::tsp_envelope(
+            &record.document,
+            Some(&record.attempt_key),
+        )
+        .map_err(|e| MessagingError::Transport(format!("TSP envelope: {e}")))?;
+        let tsp = self.atm.tsp();
+        let err = |e: affinidi_tdk::messaging::errors::ATMError| {
+            MessagingError::Transport(format!("TSP send to {dest}: {e}"))
+        };
+
+        // Re-establish a relationship the peer (or this node) lost, as
+        // `send_reestablishing` does — open-coded because that call seals
+        // internally and so gives no access to the bytes the evidence id is
+        // computed over.
+        if matches!(
+            tsp.send_readiness(&self.profile, dest).await.map_err(err)?,
+            SendReadiness::Reestablish
+        ) && let Err(e) = tsp.form_relationship_routed(&self.profile, dest).await
+        {
+            let after = tsp.send_readiness(&self.profile, dest).await.map_err(err)?;
+            if !invite_refusal_is_benign(after) {
+                return Err(err(e));
+            }
+        }
+
+        match record.peer_tsp_mediator.as_deref() {
+            Some(peer_mediator) if peer_mediator != self.mediator_did => {
+                tsp.send_nested_routed(
+                    &self.profile,
+                    &[self.mediator_did.clone(), peer_mediator.to_string()],
+                    dest,
+                    &body,
+                )
+                .await
+                .map_err(err)?;
+                // Relayed to the peer's own mediator: this node's mediator can
+                // never report on it, so the status poll is not asked
+                // (VTI-TRN-064 item 3) and only a receipt is evidence.
+                self.remember_scope(dest, DeliveryScope::Relayed);
+                Ok(SendReceipt {
+                    via: TransportKind::Tsp,
+                    hop_id: None,
+                })
+            }
+            _ => {
+                let inner = tsp.pack(&self.profile, dest, &body).await.map_err(err)?;
+                tsp.send_routed_opaque(
+                    &self.profile,
+                    &[self.mediator_did.clone(), dest.to_string()],
+                    &inner,
+                )
+                .await
+                .map_err(err)?;
+                self.remember_scope(dest, DeliveryScope::Local);
+                Ok(SendReceipt {
+                    via: TransportKind::Tsp,
+                    hop_id: Some(sha256_hex(tsp.encode(&inner).as_bytes())),
+                })
+            }
+        }
+    }
+
+    async fn delivery_scope(&self, dest: &str) -> DeliveryScope {
+        self.scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(dest)
+            .unwrap_or_default()
+    }
+
+    fn connection_state(&self) -> watch::Receiver<ConnState> {
+        self.conn.clone()
+    }
+
+    fn inbound(&self) -> BoxStream<'static, Inbound> {
+        // Inbound TSP already arrives on the DIDComm socket's frame stream.
+        Box::pin(futures_util::stream::empty())
+    }
+
+    async fn ack(&self, _ack: InboundAck) -> Result<(), MessagingError> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tsp")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Decides whether [`RestPushTransport`] may POST to a URL built from a
+/// recipient's advertised `TrustTaskHTTPS` endpoint. `Err` carries the reason.
+///
+/// The endpoint is written by whoever controls the recipient's DID document,
+/// so a node must not dial it from inside its own network unchecked. A VTA or
+/// VTC passes `vta_sdk::http::guard_peer_endpoint` under the same
+/// `EndpointPolicy` its HTTP client was built for; this crate takes it as a
+/// function so it does not carry the HTTP client stack itself.
+pub type RestEndpointGuard = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// Sends a push over the HTTPS binding: `POST {base}/trust-tasks` with
+/// the signed document as the body (HTTPS binding 0.2 §2, §6.1). No bearer
+/// token — this node holds none for the recipient's server — so the
+/// document's own proof is what authenticates it (§2 item 2).
+pub struct RestPushTransport {
+    http: reqwest::Client,
+    guard: RestEndpointGuard,
+    pushes: KeyspaceHandle,
+    // REST has no connection to lose: each send is its own request, and a
+    // failed one is an `Err` from `send`. Held so the receiver never reads a
+    // closed channel.
+    _conn_tx: watch::Sender<ConnState>,
+    conn: watch::Receiver<ConnState>,
+}
+
+impl RestPushTransport {
+    /// `http` fetches foreign URLs, so give it the node's foreign-fetch
+    /// profile (bounded timeouts, no redirects, a resolver that refuses
+    /// non-public answers). `guard` vets each URL before it is dialled: the
+    /// client's resolver never sees an IP-literal host, so the guard is what
+    /// keeps a recipient from pointing the node at a loopback or
+    /// private-network address. Build both from the same endpoint policy.
+    pub fn new(pushes: KeyspaceHandle, http: reqwest::Client, guard: RestEndpointGuard) -> Self {
+        let (tx, rx) = watch::channel(ConnState::Connected);
+        Self {
+            http,
+            guard,
+            pushes,
+            _conn_tx: tx,
+            conn: rx,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MessageTransport for RestPushTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Rest
+    }
+
+    async fn send(&self, dest: &str, packed: Vec<u8>) -> Result<SendReceipt, MessagingError> {
+        let record = document_for(&self.pushes, &packed).await?;
+        let base = record.rest_base.as_deref().ok_or_else(|| {
+            MessagingError::Transport(format!("{dest} advertises no TrustTaskHTTPS endpoint"))
+        })?;
+        let url = format!("{}/trust-tasks", base.trim_end_matches('/'));
+        if let Err(reason) = (self.guard)(&url) {
+            warn!(dest, endpoint = %base, %reason, "not dialling a recipient's REST endpoint");
+            return Err(MessagingError::NoEndpoint(format!(
+                "{dest}: its TrustTaskHTTPS endpoint is not one this node will dial: {reason}"
+            )));
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&record.document)
+            .send()
+            .await
+            .map_err(|e| MessagingError::Transport(format!("POST {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(MessagingError::Transport(format!(
+                "POST {url} answered {}",
+                resp.status()
+            )));
+        }
+        Ok(SendReceipt {
+            via: TransportKind::Rest,
+            hop_id: None,
+        })
+    }
+
+    fn connection_state(&self) -> watch::Receiver<ConnState> {
+        self.conn.clone()
+    }
+
+    fn inbound(&self) -> BoxStream<'static, Inbound> {
+        Box::pin(futures_util::stream::empty())
+    }
+
+    async fn ack(&self, _ack: InboundAck) -> Result<(), MessagingError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn doc(services: Value) -> Value {
+        json!({ "id": "did:example:peer", "service": services })
+    }
+
+    /// Selection is by service `type`, never by `#id`.
+    #[test]
+    fn reach_matches_on_service_type() {
+        let d = doc(json!([
+            { "id": "#whatever", "type": "TSPTransport", "serviceEndpoint": "did:example:med" },
+            { "id": "#x", "type": "DIDCommMessaging", "serviceEndpoint": { "uri": "did:example:med" } },
+            { "id": "#y", "type": "TrustTaskHTTPS", "serviceEndpoint": "https://peer.example/" },
+        ]));
+        let r = Reach::from_document(&d);
+        assert_eq!(r.tsp_mediator.as_deref(), Some("did:example:med"));
+        assert!(r.didcomm);
+        assert_eq!(r.rest_base.as_deref(), Some("https://peer.example/"));
+    }
+
+    /// An application REST API is not a Trust Task endpoint: only
+    /// `TrustTaskHTTPS` makes REST a candidate for a push.
+    #[test]
+    fn only_trust_task_https_counts_as_rest() {
+        let d = doc(json!([
+            { "id": "#rest", "type": "VTARest", "serviceEndpoint": "https://vta.example" },
+        ]));
+        let r = Reach::from_document(&d);
+        assert!(r.rest_base.is_none());
+        assert!(!r.advertises_anything());
+    }
+
+    /// A peer advertising `TrustTaskHTTPS` over plain `http://` is not
+    /// reachable over REST at all — a signed Trust Task is not encrypted, and
+    /// this node must not send one in the clear.
+    #[test]
+    fn a_plaintext_trust_task_https_endpoint_is_not_a_rest_candidate() {
+        let d = doc(json!([
+            { "id": "#tt", "type": "TrustTaskHTTPS", "serviceEndpoint": "http://peer.example/" },
+        ]));
+        let r = Reach::from_document(&d);
+        assert!(r.rest_base.is_none());
+        assert!(!r.advertises_anything());
+    }
+
+    /// Lookalike hosts are ordinary DNS names, not loopback, and are refused
+    /// exactly like any other plaintext endpoint.
+    #[test]
+    fn plaintext_lookalike_loopback_is_not_a_rest_candidate() {
+        for endpoint in ["http://127.0.0.1.evil.com/", "http://localhost.evil/"] {
+            let d = doc(json!([
+                { "id": "#tt", "type": "TrustTaskHTTPS", "serviceEndpoint": endpoint },
+            ]));
+            let r = Reach::from_document(&d);
+            assert!(r.rest_base.is_none(), "{endpoint}");
+        }
+    }
+
+    /// Plain `http://` to exact loopback is still a candidate, for local
+    /// development.
+    #[test]
+    fn plaintext_http_to_loopback_is_still_a_rest_candidate() {
+        let d = doc(json!([
+            { "id": "#tt", "type": "TrustTaskHTTPS", "serviceEndpoint": "http://127.0.0.1:8100/" },
+        ]));
+        let r = Reach::from_document(&d);
+        assert_eq!(r.rest_base.as_deref(), Some("http://127.0.0.1:8100/"));
+    }
+
+    fn ours_all() -> Ours {
+        Ours {
+            tsp: true,
+            didcomm: true,
+            rest: true,
+        }
+    }
+
+    /// A peer that advertises nothing but spoke TSP to this node recently is
+    /// tried over TSP first, with DIDComm behind it for escalation.
+    #[test]
+    fn a_silent_peer_seen_on_tsp_is_tried_over_tsp_then_didcomm() {
+        let silent = Reach::default();
+        assert_eq!(
+            choose(&silent, &ours_all(), true),
+            vec![Protocol::Tsp, Protocol::Didcomm]
+        );
+        assert_eq!(choose(&silent, &ours_all(), false), vec![Protocol::Didcomm]);
+    }
+
+    /// What a peer advertises wins over what was learned: learning only fills
+    /// in for a document that says nothing.
+    #[test]
+    fn learned_reach_never_overrides_an_advertised_document() {
+        let didcomm_only = Reach {
+            didcomm: true,
+            ..Reach::default()
+        };
+        assert_eq!(
+            choose(&didcomm_only, &ours_all(), true),
+            vec![Protocol::Didcomm]
+        );
+    }
+
+    #[test]
+    fn a_node_without_tsp_ignores_learned_reach() {
+        let ours = Ours {
+            tsp: false,
+            ..ours_all()
+        };
+        assert_eq!(
+            choose(&Reach::default(), &ours, true),
+            vec![Protocol::Didcomm]
+        );
+    }
+
+    fn signed_at(issued_at: DateTime<Utc>) -> Value {
+        json!({
+            "id": "urn:uuid:00000000-0000-0000-0000-000000000001",
+            "type": "https://trusttasks.org/spec/credential-exchange/issue/0.1",
+            "issuer": "did:example:vtc",
+            "recipient": "did:example:member",
+            "issuedAt": issued_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "idempotencyKey": "urn:uuid:00000000-0000-0000-0000-000000000001",
+            "payload": { "credential": "x" },
+            "proof": { "type": "DataIntegrityProof", "proofPurpose": "authentication" },
+        })
+    }
+
+    /// The engine stops putting a document on the wire at the consumer's
+    /// window, and judges a collected copy refused only once the consumer's
+    /// skew tolerance has passed too.
+    #[test]
+    fn a_document_is_past_acceptance_at_the_window_and_refused_after_the_skew() {
+        // Whole seconds, as `issuedAt` is on the wire.
+        let window = VTI_ACCEPTANCE_WINDOW;
+        let issued = chrono::SubsecRound::trunc_subsecs(Utc::now() - window.max_age, 0);
+        let doc = signed_at(issued);
+        let at_window = issued + window.max_age;
+        assert!(!past_acceptance(
+            &doc,
+            at_window - chrono::TimeDelta::seconds(1)
+        ));
+        assert!(past_acceptance(&doc, at_window));
+        assert!(!refused_when_collected(
+            &doc,
+            at_window + window.clock_skew - chrono::TimeDelta::seconds(1)
+        ));
+        assert!(refused_when_collected(&doc, at_window + window.clock_skew));
+    }
+
+    /// **VTI-TRN-048 / VTI-OPS-028.** A document stating an expiry is
+    /// acceptable until it, past the maximum age, and no later than the
+    /// horizon: the engine places it there, not at `issuedAt + max_age`.
+    #[test]
+    fn a_stated_expiry_moves_the_acceptance_end() {
+        let window = VTI_ACCEPTANCE_WINDOW;
+        let issued = chrono::SubsecRound::trunc_subsecs(Utc::now(), 0);
+        let mut doc = signed_at(issued);
+        let day = issued + chrono::TimeDelta::days(1);
+        doc["expiresAt"] = json!(day.to_rfc3339_opts(SecondsFormat::Secs, true));
+        assert!(!past_acceptance(&doc, issued + chrono::TimeDelta::hours(1)));
+        assert!(past_acceptance(&doc, day));
+        assert!(!refused_when_collected(
+            &doc,
+            day + window.clock_skew - chrono::TimeDelta::seconds(1)
+        ));
+        assert!(refused_when_collected(&doc, day + window.clock_skew));
+
+        let year = issued + chrono::TimeDelta::days(365);
+        doc["expiresAt"] = json!(year.to_rfc3339_opts(SecondsFormat::Secs, true));
+        assert_eq!(acceptance_end(&doc), Some(issued + EXPIRY_HORIZON));
+    }
+
+    /// **VTI-TRN-048.** The deadline is stated as the expiry, counted from
+    /// `issuedAt`, in whole seconds; an earlier expiry the task already states
+    /// is kept; and a signed document is refused rather than broken.
+    #[test]
+    fn the_delivery_deadline_is_stated_as_the_expiry() {
+        let issued = chrono::SubsecRound::trunc_subsecs(Utc::now(), 0);
+        let mut doc = signed_at(issued);
+        doc.as_object_mut().unwrap().remove("proof");
+        let mut stated = doc.clone();
+        state_delivery_expiry(&mut stated, Duration::from_secs(86_400), Utc::now()).unwrap();
+        assert_eq!(
+            expires_at(&stated),
+            Some(issued + chrono::TimeDelta::days(1))
+        );
+        assert!(
+            stated["expiresAt"].as_str().unwrap().ends_with('Z')
+                && !stated["expiresAt"].as_str().unwrap().contains('.'),
+            "whole seconds"
+        );
+
+        let soon = issued + chrono::TimeDelta::hours(1);
+        let mut earlier = doc.clone();
+        earlier["expiresAt"] = json!(soon.to_rfc3339_opts(SecondsFormat::Secs, true));
+        state_delivery_expiry(&mut earlier, Duration::from_secs(86_400), Utc::now()).unwrap();
+        assert_eq!(
+            expires_at(&earlier),
+            Some(soon),
+            "the earlier expiry stands"
+        );
+
+        let mut later = doc.clone();
+        later["expiresAt"] =
+            json!((issued + chrono::TimeDelta::days(9)).to_rfc3339_opts(SecondsFormat::Secs, true));
+        state_delivery_expiry(&mut later, Duration::from_secs(86_400), Utc::now()).unwrap();
+        assert_eq!(
+            expires_at(&later),
+            Some(issued + chrono::TimeDelta::days(1)),
+            "no later than the close of the delivery window"
+        );
+
+        let mut signed = signed_at(issued);
+        assert!(state_delivery_expiry(&mut signed, Duration::from_secs(60), Utc::now()).is_err());
+    }
+
+    /// A document with no `issuedAt` cannot be placed in any window, so it is
+    /// never replaced: the engine sends what it was given.
+    #[test]
+    fn a_document_without_an_issued_at_is_never_past_acceptance() {
+        let doc = json!({ "id": "urn:uuid:x", "type": "t", "payload": {} });
+        let far = Utc::now() + chrono::TimeDelta::days(365);
+        assert!(!past_acceptance(&doc, far));
+        assert!(!refused_when_collected(&doc, far));
+    }
+
+    /// SPEC §8.4: anything that changes the bytes is a new document and must
+    /// carry a fresh `id` — re-signing under the old one is the `idConflict`
+    /// case of §7.2 item 11. Everything else carries over, the key included
+    /// (VTI-OPS-064), and the proof is cleared for the node to sign again.
+    #[test]
+    fn a_new_attempt_has_a_fresh_id_and_issued_at_and_keeps_the_key_and_payload() {
+        let issued = Utc::now() - chrono::TimeDelta::hours(2);
+        let previous = signed_at(issued);
+        let now = Utc::now();
+        let next = new_attempt(&previous, now).expect("a new attempt");
+
+        assert_ne!(next["id"], previous["id"], "a fresh id");
+        assert!(next["id"].as_str().unwrap().starts_with("urn:uuid:"));
+        assert_eq!(
+            issued_at(&next).map(|t| t.timestamp()),
+            Some(now.timestamp()),
+            "a fresh issuedAt, in whole seconds"
+        );
+        assert!(!past_acceptance(&next, now));
+        assert!(
+            next.get("proof").is_none(),
+            "unsigned until the node signs it"
+        );
+        for member in ["type", "issuer", "recipient", "payload", "idempotencyKey"] {
+            assert_eq!(next[member], previous[member], "{member} carries over");
+        }
+    }
+
+    /// A new attempt stays in the original's thread: the original's own `id`
+    /// where it opened the thread, its `threadId` where it had one.
+    #[test]
+    fn a_new_attempt_stays_in_the_original_thread() {
+        let previous = signed_at(Utc::now() - chrono::TimeDelta::hours(1));
+        let next = new_attempt(&previous, Utc::now()).unwrap();
+        assert_eq!(next["threadId"], previous["id"]);
+
+        let again = new_attempt(&next, Utc::now()).unwrap();
+        assert_eq!(
+            again["threadId"], previous["id"],
+            "a second attempt stays in the same thread, not the first attempt's"
+        );
+    }
+
+    /// A producer that said its request lapses at `expiresAt` is not
+    /// overridden by a new attempt past it.
+    #[test]
+    fn a_document_past_its_own_expiry_is_not_re_issued() {
+        let now = Utc::now();
+        let mut previous = signed_at(now - chrono::TimeDelta::hours(1));
+        previous["expiresAt"] = json!((now - chrono::TimeDelta::minutes(1)).to_rfc3339());
+        assert!(new_attempt(&previous, now).is_err());
+    }
+
+    /// VTI-TRN-042: an attempt whose hand-off keeps failing moves on after
+    /// `FAILED_SENDS_BEFORE_ESCALATION` refusals, not at the end of its window.
+    #[test]
+    fn vti_trn_042_repeated_failed_hand_offs_escalate_before_the_window() {
+        let queued = Some(OutboxState::Queued);
+        assert!(!failed_before_window(
+            queued,
+            FAILED_SENDS_BEFORE_ESCALATION - 1,
+            true
+        ));
+        assert!(failed_before_window(
+            queued,
+            FAILED_SENDS_BEFORE_ESCALATION,
+            true
+        ));
+        assert!(failed_before_window(
+            queued,
+            FAILED_SENDS_BEFORE_ESCALATION + 10,
+            true
+        ));
+    }
+
+    /// The last transport a recipient offers is never abandoned early: there is
+    /// nothing to move to, and it keeps retrying to the deadline.
+    #[test]
+    fn the_last_transport_keeps_retrying_however_often_it_fails() {
+        assert!(!failed_before_window(
+            Some(OutboxState::Queued),
+            u32::MAX,
+            false
+        ));
+    }
+
+    /// Only a refused hand-off counts. An attempt the next hop accepted (`Sent`)
+    /// is silence, the window's to judge; a terminal one has its own arm; one
+    /// not in the outbox yet has no failures to count.
+    #[test]
+    fn only_a_queued_attempt_escalates_on_failures() {
+        for state in [
+            None,
+            Some(OutboxState::Sent),
+            Some(OutboxState::Delivered),
+            Some(OutboxState::Unconfirmed),
+            Some(OutboxState::Failed),
+        ] {
+            assert!(
+                !failed_before_window(state, u32::MAX, true),
+                "{state:?} must not escalate on its failure count"
+            );
+        }
+    }
+
+    /// The default leaves room for a mediator restart and stays well inside a
+    /// minute of the delivery layer's backoff (1 s, 2 s, 4 s, 8 s, …), far short of
+    /// `ATTEMPT_WINDOW`.
+    #[test]
+    fn the_failure_threshold_is_bounded_well_inside_the_window() {
+        let backoff_to_threshold: u64 = (1..FAILED_SENDS_BEFORE_ESCALATION)
+            .map(affinidi_messaging_delivery::drain::backoff_ms)
+            .sum();
+        const {
+            assert!(
+                FAILED_SENDS_BEFORE_ESCALATION >= 3,
+                "one blip must not escalate"
+            )
+        };
+        assert!(
+            backoff_to_threshold < 60_000,
+            "escalation after failures must not take a minute: {backoff_to_threshold} ms"
+        );
+        assert!(Duration::from_millis(backoff_to_threshold) < ATTEMPT_WINDOW / 60);
+    }
+
+    #[test]
+    fn a_document_without_services_advertises_nothing() {
+        assert!(!Reach::from_document(&json!({ "id": "did:key:z6Mk" })).advertises_anything());
+    }
+
+    /// The URL guard runs before anything is dialled: a refused endpoint is
+    /// reported as having no usable endpoint, not as a failed connection.
+    #[tokio::test]
+    async fn rest_push_refuses_an_endpoint_its_guard_refuses_before_dialling() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::store::test_fixture::open_with_keyspaces(dir.path(), &["pushes"]).unwrap();
+        let ks = store.keyspace("pushes").unwrap();
+        let record = PushRecord {
+            id: "p1".into(),
+            recipient: "did:example:peer".into(),
+            document: serde_json::json!({ "type": "x" }),
+            reissues: 0,
+            remaining: Vec::new(),
+            current: Protocol::Rest,
+            attempt_key: String::new(),
+            attempt: 0,
+            peer_tsp_mediator: None,
+            // Port 9 (discard) on loopback: nothing should ever connect.
+            rest_base: Some("http://127.0.0.1:9".into()),
+            deadline_ms: u64::MAX,
+            queued_at_ms: 0,
+            outcome: None,
+        };
+        ks.insert(record_key(&record.id), &record).await.unwrap();
+
+        let refusing = RestPushTransport::new(
+            ks.clone(),
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            Arc::new(|url: &str| Err(format!("{url} is loopback"))),
+        );
+        let err = refusing
+            .send("did:example:peer", b"p1".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessagingError::NoEndpoint(_)), "{err:?}");
+
+        // The same record with a guard that admits it is dialled (and fails to
+        // connect), so the refusal above came from the guard.
+        let admitting = RestPushTransport::new(
+            ks,
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            Arc::new(|_: &str| Ok(())),
+        );
+        let err = admitting
+            .send("did:example:peer", b"p1".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessagingError::Transport(_)), "{err:?}");
+    }
+}
+
+/// Receipts, delivery scope and the `unconfirmable` outcome (#2553;
+/// VTI-TRN-042 as amended, VTI-TRN-060 – 064).
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use affinidi_messaging_core::{OutboxStatus, ReceivedMessage};
+    use affinidi_messaging_delivery::{OutboxEntry, OutboxStore as _, RECEIPT_TASK_TYPE};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    const ALICE: &str = "did:example:alice";
+    const MALLORY: &str = "did:example:mallory";
+    const OWN: &str = "did:example:node";
+
+    /// A transport fed by the test: inbound from a channel, and a scripted
+    /// status answer for each hop id it is asked about.
+    struct Scripted {
+        conn: watch::Receiver<ConnState>,
+        inbound: Mutex<Option<mpsc::UnboundedReceiver<Inbound>>>,
+        status: HashMap<String, OutboxStatus>,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageTransport for Scripted {
+        fn kind(&self) -> TransportKind {
+            TransportKind::Didcomm
+        }
+        async fn send(&self, _dest: &str, _packed: Vec<u8>) -> Result<SendReceipt, MessagingError> {
+            Err(MessagingError::Transport("not in this test".into()))
+        }
+        fn connection_state(&self) -> watch::Receiver<ConnState> {
+            self.conn.clone()
+        }
+        fn inbound(&self) -> BoxStream<'static, Inbound> {
+            let rx = self.inbound.lock().unwrap().take();
+            match rx {
+                Some(rx) => Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                })),
+                None => Box::pin(futures_util::stream::empty()),
+            }
+        }
+        async fn ack(&self, _ack: InboundAck) -> Result<(), MessagingError> {
+            Ok(())
+        }
+        async fn outbox_status(
+            &self,
+            hop_ids: &[String],
+        ) -> Result<Option<HashMap<String, OutboxStatus>>, MessagingError> {
+            self.asked.lock().unwrap().extend(hop_ids.iter().cloned());
+            Ok(Some(
+                hop_ids
+                    .iter()
+                    .filter_map(|id| self.status.get(id).map(|s| (id.clone(), *s)))
+                    .collect(),
+            ))
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        records: KeyspaceHandle,
+        outbox_ks: KeyspaceHandle,
+        outbox: Arc<crate::outbox_store::VtiOutboxStore>,
+        service: MessagingService,
+        transport: Arc<Scripted>,
+        inbound: mpsc::UnboundedSender<Inbound>,
+        atm: ATM,
+        _conn: watch::Sender<ConnState>,
+    }
+
+    async fn fixture(status: HashMap<String, OutboxStatus>) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::store::test_fixture::open_with_keyspaces(dir.path(), &["pushes", "outbox"])
+                .unwrap();
+        let records = store.keyspace("pushes").unwrap();
+        let outbox_ks = store.keyspace("outbox").unwrap();
+        let outbox = Arc::new(crate::outbox_store::VtiOutboxStore::new(outbox_ks.clone()));
+        let (conn_tx, conn) = watch::channel(ConnState::Connected);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let transport = Arc::new(Scripted {
+            conn,
+            inbound: Mutex::new(Some(rx)),
+            status,
+            asked: Arc::default(),
+        });
+        let service = MessagingService::new(transport.clone(), outbox.clone());
+        let tdk = affinidi_tdk::common::TDKSharedState::new(
+            affinidi_tdk::common::config::TDKConfig::builder()
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let atm = ATM::new(
+            affinidi_tdk::messaging::config::ATMConfig::builder()
+                .build()
+                .unwrap(),
+            Arc::new(tdk),
+        )
+        .await
+        .unwrap();
+        Fixture {
+            _dir: dir,
+            records,
+            outbox_ks,
+            outbox,
+            service,
+            transport,
+            inbound: tx,
+            atm,
+            _conn: conn_tx,
+        }
+    }
+
+    impl Fixture {
+        fn ctx(&self) -> PushContext<'_> {
+            PushContext {
+                records: &self.records,
+                outbox: &self.outbox_ks,
+                resolver: None,
+                messaging: Some(PushMessaging {
+                    service: &self.service,
+                    atm: &self.atm,
+                    own_did: OWN,
+                }),
+                tsp: false,
+                learned_tsp: None,
+                reissuer: None,
+            }
+        }
+
+        /// A DIDComm push to `ALICE` whose one attempt `p1:0:didcomm` was
+        /// handed off, with `scope`, and whose window `expired` or not.
+        async fn sent_push(&self, scope: DeliveryScope, expired: bool) {
+            let key = "p1:0:didcomm";
+            let record = PushRecord {
+                id: "p1".into(),
+                recipient: ALICE.into(),
+                document: json!({ "id": "urn:uuid:doc", "type": "x" }),
+                reissues: 0,
+                remaining: Vec::new(),
+                current: Protocol::Didcomm,
+                attempt_key: key.into(),
+                attempt: 0,
+                peer_tsp_mediator: None,
+                rest_base: None,
+                deadline_ms: now_ms() + 3_600_000,
+                queued_at_ms: now_ms(),
+                outcome: None,
+            };
+            self.records
+                .insert(record_key(&record.id), &record)
+                .await
+                .unwrap();
+            let deliver_by = if expired {
+                now_ms() - 1_000
+            } else {
+                now_ms() + 600_000
+            };
+            let mut entry = OutboxEntry::new(key, ALICE, b"sealed".to_vec(), now_ms(), deliver_by)
+                .with_scope(scope);
+            entry.state = OutboxState::Sent;
+            entry.hop_id = Some("hop-1".into());
+            self.outbox.put(entry).await.unwrap();
+        }
+
+        async fn state(&self) -> OutboxState {
+            self.outbox
+                .get("p1:0:didcomm")
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+        }
+
+        async fn outcome(&self) -> Option<(bool, Protocol, String)> {
+            outcome(&self.records, "p1").await.unwrap()
+        }
+
+        /// A `messaging/receipt/0.1` for `confirms`, from `sender`, as the
+        /// transport delivers it: sender authenticated.
+        fn receipt_from(&self, sender: &str, confirms: &str) {
+            let payload = serde_json::to_vec(&json!({
+                "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                "type": RECEIPT_TASK_TYPE,
+                "payload": { "confirms": confirms },
+            }))
+            .unwrap();
+            let message = ReceivedMessage {
+                id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                sender: Some(sender.into()),
+                recipient: OWN.into(),
+                payload,
+                protocol: affinidi_messaging_core::Protocol::DIDComm,
+                verified: true,
+                encrypted: true,
+            };
+            self.inbound
+                .send(Inbound::new(message, None, InboundAck(sender.into())))
+                .unwrap();
+        }
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    /// VTI-TRN-062: a receipt settles a push's attempt `Delivered` only when
+    /// its authenticated sender is the party the attempt was addressed to.
+    #[tokio::test]
+    async fn vti_trn_062_a_receipt_settles_only_from_the_addressed_party() {
+        let f = fixture(HashMap::new()).await;
+        f.sent_push(DeliveryScope::Relayed, false).await;
+
+        f.receipt_from(MALLORY, "p1:0:didcomm");
+        settle().await;
+        assert_eq!(
+            f.state().await,
+            OutboxState::Sent,
+            "a stranger's receipt settles nothing"
+        );
+        assert!(!f.service.receipt_reach().sends_receipts(MALLORY, now_ms()));
+
+        f.receipt_from(ALICE, "p1:0:didcomm");
+        settle().await;
+        assert_eq!(f.state().await, OutboxState::Delivered);
+        assert!(
+            f.service.receipt_reach().sends_receipts(ALICE, now_ms()),
+            "the recipient is now known to send receipts"
+        );
+
+        sweep(&f.ctx()).await.unwrap();
+        let (delivered, via, _) = f.outcome().await.expect("finished");
+        assert!(delivered);
+        assert_eq!(via, Protocol::Didcomm);
+    }
+
+    /// VTI-TRN-042 as amended / VTI-TRN-064: relayed to the recipient's own
+    /// mediator, no receipt, and the recipient not known to send any: the
+    /// window passes with no evidence class ever available. Recorded
+    /// `unconfirmable`, and not escalated.
+    #[tokio::test]
+    async fn a_relayed_attempt_without_a_receipt_is_unconfirmable_not_escalated() {
+        let f = fixture(HashMap::new()).await;
+        f.sent_push(DeliveryScope::Relayed, true).await;
+        sweep(&f.ctx()).await.unwrap();
+        let (delivered, via, evidence) = f.outcome().await.expect("finished");
+        assert!(!delivered);
+        assert_eq!(via, Protocol::Didcomm, "never moved to another transport");
+        assert_eq!(evidence, UNCONFIRMABLE);
+    }
+
+    /// For a recipient known to send receipts, silence is silence: the expired
+    /// relayed attempt is escalated (here to nothing, so the push fails) as
+    /// VTI-TRN-042 requires.
+    #[tokio::test]
+    async fn a_relayed_attempt_to_a_known_receipt_sender_still_escalates() {
+        let f = fixture(HashMap::new()).await;
+        f.sent_push(DeliveryScope::Relayed, true).await;
+        f.service.receipt_reach().record(ALICE, now_ms());
+        sweep(&f.ctx()).await.unwrap();
+        let (delivered, _, evidence) = f.outcome().await.expect("finished");
+        assert!(!delivered);
+        assert_eq!(evidence, "none", "escalated, and nothing left to try");
+    }
+
+    /// The same-mediator path is unchanged: a `Local` attempt is asked about by
+    /// the status poll and settles on its mediator's `collected`; a `Relayed`
+    /// one is never asked (VTI-TRN-064 item 3).
+    #[tokio::test]
+    async fn a_local_attempt_is_still_confirmed_by_the_status_poll() {
+        let f = fixture(HashMap::from([(
+            "hop-1".to_string(),
+            OutboxStatus::Collected,
+        )]))
+        .await;
+        f.sent_push(DeliveryScope::Local, false).await;
+        affinidi_messaging_delivery::poll_outbox_drain(f.transport.as_ref(), f.outbox.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(f.state().await, OutboxState::Delivered);
+        sweep(&f.ctx()).await.unwrap();
+        assert_eq!(
+            f.outcome().await.map(|(d, _, e)| (d, e)),
+            Some((true, "collected".to_string()))
+        );
+
+        let g = fixture(HashMap::from([(
+            "hop-1".to_string(),
+            OutboxStatus::Collected,
+        )]))
+        .await;
+        g.sent_push(DeliveryScope::Relayed, false).await;
+        affinidi_messaging_delivery::poll_outbox_drain(g.transport.as_ref(), g.outbox.as_ref())
+            .await
+            .unwrap();
+        assert!(g.transport.asked.lock().unwrap().is_empty());
+        assert_eq!(g.state().await, OutboxState::Sent);
+    }
+
+    /// The stored id a wake request names is the handed-off attempt's hop id,
+    /// and only while the push is in flight.
+    #[tokio::test]
+    async fn the_stored_message_id_is_the_handed_off_attempts_hop_id() {
+        let f = fixture(HashMap::new()).await;
+        assert_eq!(
+            stored_message_id(&f.records, &f.outbox_ks, "p1")
+                .await
+                .unwrap(),
+            None
+        );
+        f.sent_push(DeliveryScope::Local, false).await;
+        assert_eq!(
+            stored_message_id(&f.records, &f.outbox_ks, "p1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("hop-1")
+        );
+    }
+
+    /// VTI-TRN-060: a DIDComm attempt asks for its receipt under its own outbox
+    /// key, and a TSP one under the same id in the binding envelope.
+    #[test]
+    fn an_attempt_asks_for_a_receipt_under_its_outbox_key() {
+        let message = affinidi_tdk::didcomm::Message::build(
+            "urn:uuid:m".to_string(),
+            TRUST_TASK_ENVELOPE_TYPE.to_string(),
+            json!({}),
+        )
+        .finalize();
+        let message =
+            affinidi_tdk::messaging::delivery::request_receipt(message, "p1:0:didcomm").unwrap();
+        assert_eq!(
+            affinidi_tdk::messaging::delivery::didcomm_delivery_id(&message).as_deref(),
+            Some("p1:0:didcomm")
+        );
+        let body = affinidi_tdk::messaging::delivery::tsp_envelope(
+            &json!({ "id": "x" }),
+            Some("p1:0:tsp"),
+        )
+        .unwrap();
+        assert_eq!(
+            affinidi_tdk::messaging::delivery::tsp_delivery_id(&body).as_deref(),
+            Some("p1:0:tsp")
+        );
+    }
+}

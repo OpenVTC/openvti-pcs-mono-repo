@@ -1,0 +1,451 @@
+//! In-process tests for agent-name redirect resolution.
+//!
+//! Exercises `GET /@{name}` against the assembled server router: the happy-path
+//! 302, and every way a name must *not* resolve — feature off, disabled name,
+//! disabled/deleted DID, wrong domain, reserved name, missing.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use did_hosting_common::did_ops::{
+    AgentNameEntry, DidRecord, agent_name_key, content_log_key, did_key,
+};
+use did_hosting_common::server::config::{
+    AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+};
+use did_hosting_common::server::store::KS_DIDS;
+use did_hosting_common::server::store::Store;
+use did_hosting_server::cache::ContentCache;
+use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
+use did_hosting_server::server::AppState;
+use tower::ServiceExt;
+
+const DOMAIN: &str = "server.example.com";
+const DID: &str = "did:webvh:QmScid:server.example.com:alice";
+
+async fn make_state(agent_names_enabled: bool) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_config = StoreConfig {
+        data_dir: PathBuf::from(dir.path()),
+        ..StoreConfig::default()
+    };
+    let store = Store::open(&store_config).await.expect("open store");
+    let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
+
+    let config = AppConfig {
+        features: FeaturesConfig {
+            agent_names: agent_names_enabled,
+            ..FeaturesConfig::default()
+        },
+        server_did: Some("did:webvh:test:server.example.com".into()),
+        mediator_did: None,
+        public_url: Some(format!("http://{DOMAIN}")),
+        server: ServerConfig::default(),
+        log: LogConfig::default(),
+        store: store_config.clone(),
+        fjall: Default::default(),
+        auth: AuthConfig::default(),
+        hosting: did_hosting_common::server::config::HostingConfig::default(),
+        secrets: SecretsConfig::default(),
+        limits: LimitsConfig::default(),
+        replication: Default::default(),
+        stats: StatsConfig::default(),
+        control_did: None,
+        vta: VtaConfig::default(),
+        identity: Default::default(),
+        replay: Default::default(),
+        config_path: PathBuf::new(),
+    };
+
+    let state = AppState {
+        store: store.clone(),
+        dids_ks,
+        config: Arc::new(config),
+        did_resolver: None,
+        trust_tasks_verifier: None,
+        secrets_resolver: None,
+        identity: None,
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
+        stats_collector: None,
+        did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate_cache: None,
+        trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
+        client_ips: Default::default(),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_locks: Default::default(),
+        replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
+    };
+    (state, dir)
+}
+
+/// Seed a DID with one agent name, and its index entry.
+async fn seed(state: &AppState, name: &str, enabled: bool, disabled_did: bool) {
+    let mnemonic = "alice-did";
+    let record = DidRecord {
+        owner: "did:example:owner".into(),
+        mnemonic: mnemonic.into(),
+        created_at: 0,
+        updated_at: 0,
+        version_count: 1,
+        did_id: Some(DID.into()),
+        content_size: 0,
+        disabled: disabled_did,
+        disabled_by_admin: false,
+        deleted_at: None,
+        method: "webvh".into(),
+        domain: DOMAIN.into(),
+        services: None,
+        agent_names: vec![AgentNameEntry {
+            name: name.into(),
+            enabled,
+            created_at: 0,
+        }],
+    };
+    // A blank log so the DID record is coherent.
+    state
+        .dids_ks
+        .insert_raw(
+            content_log_key(mnemonic).into_bytes(),
+            format!("{{\"versionId\":\"1\",\"state\":{{\"id\":\"{DID}\"}}}}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &record)
+        .await
+        .unwrap();
+    state
+        .dids_ks
+        .insert_raw(
+            agent_name_key(DOMAIN, name).into_bytes(),
+            mnemonic.as_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+}
+
+fn app(state: AppState) -> axum::Router {
+    did_hosting_server::routes::router(1024 * 1024).with_state(state)
+}
+
+async fn get(state: AppState, path: &str) -> (StatusCode, Option<String>) {
+    get_with_accept(state, path, None).await.0
+}
+
+/// Like [`get`] but lets a test set `Accept` (to exercise content negotiation)
+/// and also returns the `Vary` header.
+async fn get_with_accept(
+    state: AppState,
+    path: &str,
+    accept: Option<&str>,
+) -> ((StatusCode, Option<String>), Option<String>) {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", DOMAIN);
+    if let Some(a) = accept {
+        builder = builder.header("accept", a);
+    }
+    let response = app(state)
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    ((status, header("location")), header("vary"))
+}
+
+#[tokio::test]
+async fn resolves_an_enabled_name_to_its_did() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let (status, location) = get(state, "/@alice").await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(location.as_deref(), Some(DID));
+}
+
+/// The FAQ context path resolves to the same DID.
+#[tokio::test]
+async fn resolves_a_context_qualified_name() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let (status, location) = get(state, "/@alice/h2hsummit").await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(location.as_deref(), Some(DID));
+}
+
+/// A browser (`Accept: text/html`) can't follow a `did:` Location, so it is
+/// redirected to the DID's same-origin, loadable `did.jsonl` instead — and the
+/// response advertises `Vary: accept` so a shared cache keeps the two audiences
+/// apart.
+#[tokio::test]
+async fn a_browser_is_redirected_to_the_loadable_did_jsonl() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let ((status, location), vary) = get_with_accept(
+        state,
+        "/@alice",
+        Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    // Relative, so the browser resolves it against this origin; `alice-did` is
+    // the seeded mnemonic.
+    assert_eq!(location.as_deref(), Some("/alice-did/did.jsonl"));
+    assert_eq!(vary.as_deref(), Some("accept"));
+}
+
+/// A non-browser caller that happens to accept anything (`*/*`, curl's default)
+/// still gets the DID — the machine contract is unchanged.
+#[tokio::test]
+async fn a_wildcard_accept_still_gets_the_did() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let ((status, location), vary) = get_with_accept(state, "/@alice", Some("*/*")).await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(location.as_deref(), Some(DID));
+    assert_eq!(vary.as_deref(), Some("accept"));
+}
+
+/// Feature off -> the namespace is not served, even for a name that exists.
+#[tokio::test]
+async fn returns_404_when_feature_disabled() {
+    let (state, _dir) = make_state(false).await;
+    seed(&state, "alice", true, false).await;
+
+    let (status, _) = get(state, "/@alice").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A disabled name is parked, not resolvable — the reservation holds but the
+/// redirect does not.
+#[tokio::test]
+async fn a_disabled_name_does_not_resolve() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", false, false).await;
+
+    let (status, _) = get(state, "/@alice").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A disabled DID serves nothing, names included.
+#[tokio::test]
+async fn a_disabled_did_serves_no_names() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, true).await;
+
+    let (status, _) = get(state, "/@alice").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_unknown_name_is_404() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let (status, _) = get(state, "/@nobody").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A reserved name never resolves, even if somehow indexed.
+#[tokio::test]
+async fn a_reserved_name_is_refused() {
+    let (state, _dir) = make_state(true).await;
+    let (status, _) = get(state, "/@admin").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A request for the name on a different host must not resolve it — the index
+/// is domain-scoped.
+#[tokio::test]
+async fn a_name_does_not_resolve_on_the_wrong_host() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/@alice")
+                .header("host", "other.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// The community name — `GET /@`
+//
+// A name with an empty local part belongs to the verifiable trust community
+// that owns the domain, and resolves through the same index as every other
+// name. Nothing here special-cases the root slot: the control plane's
+// `validate_agent_name_binding` is what makes `.well-known` the only mnemonic
+// the empty name can be bound to, so by the time the edge sees an index entry
+// the question is already settled.
+// ---------------------------------------------------------------------------
+
+/// `/@` needs its own route: a path parameter does not match an empty segment,
+/// so without one this falls through to the DID-serving fallback and is read
+/// as a mnemonic.
+#[tokio::test]
+async fn resolves_the_community_name_to_its_did() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "", true, false).await;
+
+    let (status, location) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(location.as_deref(), Some(DID));
+}
+
+/// A domain that has not bound its community name serves nothing for `/@` —
+/// and says so the same way it would for any unbound name.
+#[tokio::test]
+async fn community_name_404s_when_unbound() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+
+    let (status, _) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Parking the community name stops it resolving, like any other name.
+#[tokio::test]
+async fn a_parked_community_name_does_not_resolve() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "", false, false).await;
+
+    let (status, _) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The community name takes no path, so `/@/anything` is not a context-
+/// qualified community name and must not redirect. `agent-names` rejects the
+/// spelling at parse time; the edge simply never routes it.
+#[tokio::test]
+async fn community_name_with_a_path_does_not_resolve() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "", true, false).await;
+
+    let (status, location) = get(state, "/@/context").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(location, None);
+}
+
+/// With the feature off the community name is as invisible as any other.
+#[tokio::test]
+async fn community_name_404s_when_the_feature_is_off() {
+    let (state, _dir) = make_state(false).await;
+    seed(&state, "", true, false).await;
+
+    let (status, _) = get(state, "/@").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A name on a disabled domain answers as the DID's own documents do (503),
+/// not with a redirect to a DID that domain no longer serves.
+#[tokio::test]
+async fn a_name_on_a_disabled_domain_does_not_redirect() {
+    use did_hosting_common::server::domain::{
+        DomainEntry, DomainStatus, DomainUrlScheme, create_domain,
+    };
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+    create_domain(
+        &state.store,
+        &DomainEntry {
+            name: DOMAIN.into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Disabled,
+            created_at: 0,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, location) = get(state.clone(), "/@alice").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(location, None);
+    // The same answer the DID's own log gets on that domain.
+    let (status, _) = get(state, "/alice-did/did.jsonl").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Resolution is read-only: any method but GET and HEAD is refused with 405
+/// before a lookup, and does not return the log.
+#[tokio::test]
+async fn resolution_refuses_methods_other_than_get_and_head() {
+    let (state, _dir) = make_state(true).await;
+    seed(&state, "alice", true, false).await;
+    for method in ["POST", "PUT", "DELETE", "PATCH"] {
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/alice-did/did.jsonl")
+                    .header("host", DOMAIN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+    }
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/alice-did/did.jsonl")
+                .header("host", DOMAIN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

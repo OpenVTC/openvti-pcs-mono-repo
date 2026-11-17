@@ -1,0 +1,419 @@
+//! Manifest and ballot rules, and the count, over the generated wire types.
+
+use serde_json::{Value, json};
+use vti_specs::voting::{ballot::cast::v0_1::Ballot, election::register::v0_4::Manifest};
+use vti_voting::{
+    rules::{RuleError, check_ballot, check_manifest, digest_multibase, manifest_digest},
+    tally::tally,
+};
+
+const BOX: &str = "did:webvh:QmVote:vote.example.net";
+
+fn manifest_json() -> Value {
+    json!({
+        "electionId": "agm-2027",
+        "community": "did:webvh:QmCommunity:vtc.example.org",
+        "title": "Annual general meeting 2027",
+        "questions": [
+            { "key": "budget", "type": "choice", "text": "Approve the 2027 budget?",
+              "options": [{ "key": "yes" }, { "key": "no" }, { "key": "abstain" }],
+              "minSelections": 1, "maxSelections": 1, "optional": false },
+            { "key": "workshop", "type": "choice",
+              "options": [{ "key": "kiln" }, { "key": "laser" }, { "key": "textile" }],
+              "minSelections": 0, "maxSelections": 2, "optional": false },
+            { "key": "formats", "type": "ranking",
+              "options": [{ "key": "evenings" }, { "key": "weekends" }, { "key": "online" }],
+              "partial": false, "optional": true },
+            { "key": "venue", "type": "score",
+              "options": [{ "key": "hall" }, { "key": "barn" }], "min": 1, "max": 5, "optional": true },
+            { "key": "improve", "type": "text", "maxLength": 40, "optional": true }
+        ],
+        "secrecy": "open",
+        "roll": { "rule": "members" },
+        "registrationOpensAt": "2026-11-01T00:00:00Z",
+        "votingOpensAt": "2026-11-03T00:00:00Z",
+        "votingClosesAt": "2026-11-07T18:00:00Z",
+        "revote": "replace",
+        "board": { "visibility": "private", "auditors": ["did:webvh:QmAudit:audit.example.com"] },
+        "ballotBox": BOX,
+        "binding": true,
+        "allowEarlyClose": false,
+        "resultsBeforeClose": false,
+        "textReleaseThreshold": 10
+    })
+}
+
+fn manifest(v: &Value) -> Manifest {
+    serde_json::from_value(v.clone()).expect("the example manifest parses")
+}
+
+fn ballot(digest: &[u8; 32], answers: Value) -> Ballot {
+    serde_json::from_value(json!({
+        "electionId": "agm-2027",
+        "manifestDigest": digest_multibase(digest),
+        "answers": answers,
+    }))
+    .expect("the ballot parses")
+}
+
+fn full_answers() -> Value {
+    json!([
+        { "question": "budget", "choice": ["yes"] },
+        { "question": "workshop", "choice": ["kiln", "textile"] },
+        { "question": "formats", "ranking": ["evenings", "weekends", "online"] },
+        { "question": "venue", "scores": { "hall": 4, "barn": 2 } },
+        { "question": "improve", "text": "Longer weekend hours" }
+    ])
+}
+
+#[test]
+fn vot_010_a_well_formed_manifest_passes() {
+    let v = manifest_json();
+    assert_eq!(check_manifest(&manifest(&v), Some(BOX)), Ok(()));
+}
+
+#[test]
+fn vot_010_manifest_rules_are_enforced() {
+    let cases: [(&str, Value); 6] = [
+        ("votingOpensAt", json!("2026-11-08T00:00:00Z")),
+        ("ballotBox", json!("did:webvh:QmOther:other.example.net")),
+        ("textReleaseThreshold", json!(10)), // control: still valid
+        ("roll", json!({ "rule": "listed" })),
+        ("secrecy", json!("sealed")),
+        (
+            "board",
+            json!({ "visibility": "public", "auditors": [BOX] }),
+        ),
+    ];
+    for (field, value) in cases {
+        let mut v = manifest_json();
+        v[field] = value;
+        let r = check_manifest(&manifest(&v), Some(BOX));
+        if field == "textReleaseThreshold" {
+            assert_eq!(r, Ok(()));
+        } else if field == "secrecy" {
+            // Sealed without trustees: served, and refused for its trustee rules.
+            assert!(matches!(r, Err(RuleError::InvalidManifest(_))), "{field}");
+        } else {
+            assert!(
+                matches!(r, Err(RuleError::InvalidManifest(_))),
+                "{field}: {r:?}"
+            );
+        }
+    }
+    let mut v = manifest_json();
+    v["questions"][1]["maxSelections"] = json!(4);
+    assert!(matches!(
+        check_manifest(&manifest(&v), None),
+        Err(RuleError::InvalidManifest(_))
+    ));
+    let mut v = manifest_json();
+    v["questions"][4]["key"] = json!("budget");
+    assert!(matches!(
+        check_manifest(&manifest(&v), None),
+        Err(RuleError::InvalidManifest(_))
+    ));
+}
+
+#[test]
+fn vot_062_trustee_rules_are_enforced_for_the_encrypted_levels() {
+    use vti_specs::voting::election::register::v0_4::SecrecyLevel;
+    use vti_voting::rules::check_manifest_serving;
+    const ALL: &[SecrecyLevel] = &[
+        SecrecyLevel::Open,
+        SecrecyLevel::Sealed,
+        SecrecyLevel::TalliedEncrypted,
+    ];
+    let trustees = json!({
+        "dids": ["did:webvh:QmT1:t1.example", "did:webvh:QmT2:t2.example", "did:webvh:QmT3:t3.example"],
+        "threshold": 2
+    });
+    let sealed = || {
+        let mut v = manifest_json();
+        v["secrecy"] = json!("sealed");
+        v["trustees"] = trustees.clone();
+        v
+    };
+    let check = |v: &Value| check_manifest_serving(&manifest(v), Some(BOX), ALL);
+    assert_eq!(check(&sealed()), Ok(()));
+    assert_eq!(check_manifest(&manifest(&sealed()), Some(BOX)), Ok(()));
+    // A service serving fewer levels refuses the others.
+    assert!(matches!(
+        check_manifest_serving(&manifest(&sealed()), Some(BOX), &[SecrecyLevel::Open]),
+        Err(RuleError::UnsupportedSecrecy(_))
+    ));
+
+    let mut broken: Vec<(&str, Value)> = Vec::new();
+    let mut v = sealed();
+    v.as_object_mut().unwrap().remove("trustees");
+    broken.push(("no trustees", v));
+    let mut v = sealed();
+    v["trustees"]["threshold"] = json!(4);
+    broken.push(("threshold above n", v));
+    let mut v = sealed();
+    v["trustees"]["dids"][1] = json!(BOX);
+    broken.push(("the ballot box as a trustee", v));
+    let mut v = sealed();
+    v["trustees"]["dids"][0] = v["community"].clone();
+    broken.push(("the community as a trustee", v));
+    let mut v = sealed();
+    v["resultsBeforeClose"] = json!(true);
+    broken.push(("running totals", v));
+    let mut v = sealed();
+    v["secrecy"] = json!("talliedEncrypted");
+    broken.push(("a tallied-encrypted ranking", v));
+    let mut v = manifest_json();
+    v["trustees"] = trustees.clone();
+    broken.push(("an open election with trustees", v));
+    for (why, v) in broken {
+        assert!(
+            matches!(check(&v), Err(RuleError::InvalidManifest(_))),
+            "{why}"
+        );
+    }
+
+    // Choice questions only: tallied-encrypted passes.
+    let mut v = sealed();
+    v["secrecy"] = json!("talliedEncrypted");
+    let choices: Vec<Value> = v["questions"].as_array().unwrap()[..2].to_vec();
+    v["questions"] = json!(choices);
+    assert_eq!(check(&v), Ok(()));
+}
+
+#[test]
+fn vot_011_the_digest_is_over_the_manifest_as_received() {
+    let v = manifest_json();
+    let d = manifest_digest(&v).unwrap();
+    // Key order does not change the JCS digest; content does.
+    let reordered: Value = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+    assert_eq!(manifest_digest(&reordered).unwrap(), d);
+    let mut changed = v.clone();
+    changed["title"] = json!("Another meeting");
+    assert_ne!(manifest_digest(&changed).unwrap(), d);
+    assert!(digest_multibase(&d).starts_with("zQm"));
+}
+
+#[test]
+fn vot_032_a_complete_ballot_passes() {
+    let v = manifest_json();
+    let (m, d) = (manifest(&v), manifest_digest(&v).unwrap());
+    assert_eq!(check_ballot(&m, &d, &ballot(&d, full_answers())), Ok(()));
+}
+
+#[test]
+fn vot_011_a_ballot_for_another_manifest_is_a_mismatch() {
+    let v = manifest_json();
+    let m = manifest(&v);
+    let d = manifest_digest(&v).unwrap();
+    let other = [9u8; 32];
+    assert_eq!(
+        check_ballot(&m, &d, &ballot(&other, full_answers())),
+        Err(RuleError::ManifestMismatch)
+    );
+}
+
+#[test]
+fn vot_032_ballot_rules_are_enforced() {
+    let v = manifest_json();
+    let (m, d) = (manifest(&v), manifest_digest(&v).unwrap());
+    let mutate = |i: usize, answer: Value| {
+        let mut a = full_answers();
+        a[i] = answer;
+        ballot(&d, a)
+    };
+    let bad = [
+        mutate(0, json!({ "question": "budget", "choice": ["yes", "no"] })),
+        mutate(0, json!({ "question": "budget", "abstain": true })),
+        mutate(
+            1,
+            json!({ "question": "workshop", "choice": ["kiln", "kiln"] }),
+        ),
+        mutate(1, json!({ "question": "workshop", "choice": ["pottery"] })),
+        mutate(2, json!({ "question": "formats", "ranking": ["evenings"] })),
+        mutate(
+            3,
+            json!({ "question": "venue", "scores": { "hall": 6, "barn": 2 } }),
+        ),
+        mutate(3, json!({ "question": "venue", "scores": { "hall": 3 } })),
+        mutate(4, json!({ "question": "improve", "text": "x".repeat(41) })),
+        mutate(4, json!({ "question": "budget", "choice": ["no"] })),
+        mutate(
+            0,
+            json!({ "question": "budget", "choice": ["yes"], "abstain": true }),
+        ),
+    ];
+    for (i, b) in bad.iter().enumerate() {
+        assert!(
+            matches!(check_ballot(&m, &d, b), Err(RuleError::BallotInvalid(_))),
+            "case {i}"
+        );
+    }
+    // An optional question is answered with abstain, never left out.
+    let mut a = full_answers();
+    a.as_array_mut().unwrap().pop();
+    assert!(matches!(
+        check_ballot(&m, &d, &ballot(&d, a)),
+        Err(RuleError::BallotInvalid(_))
+    ));
+    let ok = mutate(4, json!({ "question": "improve", "abstain": true }));
+    assert_eq!(check_ballot(&m, &d, &ok), Ok(()));
+}
+
+#[test]
+fn vot_070_the_count() {
+    let v = manifest_json();
+    let (m, d) = (manifest(&v), manifest_digest(&v).unwrap());
+    let mut ballots = Vec::new();
+    for i in 0..12 {
+        let mut a = full_answers();
+        if i % 3 == 0 {
+            a[0] = json!({ "question": "budget", "choice": ["no"] });
+            a[2] = json!({ "question": "formats", "abstain": true });
+        }
+        ballots.push(ballot(&d, a));
+    }
+    let (n, rows) = tally(&m, &ballots, false).unwrap();
+    assert_eq!(n, 12);
+    let rows: Vec<Value> = rows
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+    assert_eq!(
+        rows[0]["choice"],
+        json!({ "yes": 8, "no": 4, "abstain": 0 })
+    );
+    assert_eq!(
+        rows[1]["choice"],
+        json!({ "kiln": 12, "laser": 0, "textile": 12 })
+    );
+    assert_eq!(rows[2]["ranking"]["evenings"], json!([8, 0, 0]));
+    assert_eq!(rows[2]["abstained"], json!(4));
+    assert_eq!(rows[3]["score"]["hall"], json!({ "sum": 48, "count": 12 }));
+    assert_eq!(rows[4]["text"].as_array().unwrap().len(), 12);
+
+    // VTI-VOT-065: below the threshold, and in any provisional count, text is withheld.
+    let (_, few) = tally(&m, &ballots[..9], false).unwrap();
+    let few = serde_json::to_value(&few[4]).unwrap();
+    assert_eq!(few["withheld"], json!(true));
+    assert!(few.get("text").is_none());
+    let (_, early) = tally(&m, &ballots, true).unwrap();
+    assert_eq!(
+        serde_json::to_value(&early[4]).unwrap()["withheld"],
+        json!(true)
+    );
+}
+
+/// VTI-VOT-065: a threshold as low as 1 is a valid manifest — the ballot box must not refuse
+/// 1 – 9 — and 0 is no manifest at all (the generated type is non-zero, as the schema's
+/// `minimum` of 1).
+#[test]
+fn vti_vot_065_a_threshold_of_one_to_nine_is_valid_and_zero_is_not() {
+    for t in [1, 3, 9] {
+        let mut v = manifest_json();
+        v["textReleaseThreshold"] = json!(t);
+        assert_eq!(check_manifest(&manifest(&v), Some(BOX)), Ok(()), "{t}");
+    }
+    let mut v = manifest_json();
+    v["textReleaseThreshold"] = json!(0);
+    assert!(serde_json::from_value::<Manifest>(v).is_err());
+}
+
+/// VTI-VOT-065: at a threshold of 1, text is released from the first counted ballot — and still
+/// never in a provisional count.
+#[test]
+fn vti_vot_065_text_is_released_at_a_threshold_of_one() {
+    let mut v = manifest_json();
+    v["textReleaseThreshold"] = json!(1);
+    let (m, d) = (manifest(&v), manifest_digest(&v).unwrap());
+    let one = [ballot(&d, full_answers())];
+    let (_, rows) = tally(&m, &one, false).unwrap();
+    let text = serde_json::to_value(&rows[4]).unwrap();
+    assert_eq!(text["text"], json!(["Longer weekend hours"]));
+    let (_, early) = tally(&m, &one, true).unwrap();
+    assert_eq!(
+        serde_json::to_value(&early[4]).unwrap()["withheld"],
+        json!(true)
+    );
+    let (_, none) = tally(&m, &one[..0], false).unwrap();
+    assert_eq!(
+        serde_json::to_value(&none[4]).unwrap()["withheld"],
+        json!(true)
+    );
+}
+
+/// A manifest registered under `voting/election/register/0.1` (instants without `…At`) is
+/// refused by name, never re-read as 0.2: its digest binds the old member names.
+#[test]
+fn a_0_1_manifest_is_refused_by_name() {
+    let mut v = manifest_json();
+    vti_voting::rules::require_current_manifest(&v).expect("a 0.2 manifest is current");
+    let opens = v["votingOpensAt"].take();
+    v.as_object_mut().unwrap().remove("votingOpensAt");
+    v["votingOpens"] = opens;
+    let err = vti_voting::rules::require_current_manifest(&v)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("register/0.1"), "{err}");
+    assert!(err.contains("agm") || err.contains("election"), "{err}");
+}
+
+/// What a community checks of a manifest it is asked to create, needing only the manifest and
+/// the clock: the current shape, the rules, and voting not already closed.
+#[test]
+fn vot_010_a_new_manifest_is_checked_against_the_clock() {
+    use vti_voting::rules::check_new_manifest;
+    let v = manifest_json();
+    let before_close = "2026-11-07T17:59:59Z".parse().unwrap();
+    let at_close = "2026-11-07T18:00:00Z".parse().unwrap();
+    let m = check_new_manifest(&v, before_close).expect("open until votingClosesAt");
+    assert_eq!(m.election_id.as_str(), "agm-2027");
+    let err = check_new_manifest(&v, at_close).unwrap_err().to_string();
+    assert!(err.contains("votingClosesAt is already past"), "{err}");
+
+    let mut bad = v.clone();
+    bad["questions"][1]["maxSelections"] = json!(4);
+    let err = check_new_manifest(&bad, before_close)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("workshop"), "{err}");
+
+    let mut old = v.clone();
+    let closes = old["votingClosesAt"].take();
+    old.as_object_mut().unwrap().remove("votingClosesAt");
+    old["votingCloses"] = closes;
+    let err = check_new_manifest(&old, before_close)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("register/0.1"), "{err}");
+}
+
+/// VTI-VOT-025, VTI-VOT-026: a credential roll names exactly one DID in `memberOf` and lists
+/// nobody; no other rule names `memberOf`.
+#[test]
+fn vti_vot_025_a_credential_roll_names_one_did_and_lists_nobody() {
+    let group = "did:webvh:QmGroup:vtc.example.org:groups:g7";
+    let mut v = manifest_json();
+    v["roll"] = json!({ "rule": "credential", "memberOf": group });
+    assert_eq!(check_manifest(&manifest(&v), Some(BOX)), Ok(()));
+
+    for (roll, why) in [
+        (json!({ "rule": "credential" }), "memberOf"),
+        (
+            json!({ "rule": "credential", "memberOf": group, "listed": ["did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"] }),
+            "lists nobody",
+        ),
+        (json!({ "rule": "members", "memberOf": group }), "memberOf"),
+    ] {
+        let mut v = manifest_json();
+        v["roll"] = roll.clone();
+        // The schema refuses each; where the generated type still parses one, the rule does.
+        if let Ok(m) = serde_json::from_value::<Manifest>(v) {
+            match check_manifest(&m, Some(BOX)) {
+                Err(RuleError::InvalidManifest(reason)) => {
+                    assert!(reason.contains(why), "{roll}: {reason}")
+                }
+                other => panic!("{roll}: {other:?}"),
+            }
+        }
+    }
+}

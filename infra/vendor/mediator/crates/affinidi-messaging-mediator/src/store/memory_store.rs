@@ -1,0 +1,4200 @@
+//! In-memory [`MediatorStore`] implementation.
+//!
+//! All state lives behind a single `Arc<Mutex<MemoryState>>`. No disk
+//! I/O. Sub-millisecond startup makes this the default backend for
+//! `affinidi-messaging-test-mediator`.
+//!
+//! # Semantics matched against `RedisStore`
+//!
+//! - **Stream IDs**: `(timestamp_ms, sequence)` tuples internally,
+//!   formatted as `{ms}-{seq}` on the wire (matches Redis stream IDs
+//!   so SDK cursor handling is identical).
+//! - **TTL**: native (Redis) and lazy (here). Sessions and OOB invites
+//!   have an `expires_at` field; reads return `None` (or an error) for
+//!   expired entries and remove them on access. Reads keep the store
+//!   correct; `sweep_expired_sessions` reclaims what is never read again.
+//! - **Atomicity**: each method holds the inner mutex for its whole call,
+//!   so `store_message`, `delete_message_in`, `account_update` and
+//!   `access_list_update` are atomic. Methods built from other methods —
+//!   `account_remove`, `setup_admin_account`, the purges — take it once
+//!   per step and are not.
+//! - **Pub/sub**: in-process only via [`broadcast::channel`].
+//!   `streaming_publish_message` calls succeed even with no
+//!   subscribers — matching Redis' fire-and-forget `PUBLISH`.
+//! - **Forward queue consumer groups**: each group tracks pending
+//!   entries with claim timestamps so `forward_queue_autoclaim`
+//!   re-delivers messages whose owning consumer has gone idle.
+
+use crate::common::time::unix_timestamp_secs;
+use crate::error_codes;
+use affinidi_messaging_mediator_common::store::mux::{
+    MuxChangeRecord, MuxDidRecord, MuxIndexDelta,
+};
+use affinidi_messaging_mediator_common::store::{
+    AccessListUpdate, AccessListUpdateOutcome, AccountUpdate, StreamingClaim, StreamingKind,
+    StreamingWrite, single_process,
+};
+use affinidi_messaging_mediator_common::types::accounts::{
+    AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
+};
+use affinidi_messaging_mediator_common::{
+    errors::MediatorError,
+    store::{
+        DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageScope,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, PubSubRecord, RefreshRotation,
+        RemovedCopy, SentMessageState, Session, SessionState, SessionSweepReport, StatCounter,
+        StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim, acknowledged_until,
+        ops, prelude::*,
+    },
+    types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
+};
+use affinidi_messaging_sdk::{
+    messages::{
+        FetchDeletePolicy, Folder, GetMessagesResponse, MessageList, MessageListElement,
+        fetch::FetchOptions,
+    },
+    protocols::mediator::{
+        accounts::{Account, AccountType, MediatorAccountList},
+        acls::{AccessListModeType, MediatorACLSet},
+        acls_handler::{
+            MediatorACLExpanded, MediatorACLGetResponse, MediatorAccessListAddResponse,
+            MediatorAccessListGetResponse, MediatorAccessListListResponse,
+        },
+    },
+};
+use async_trait::async_trait;
+use sha256::digest;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{Mutex, Notify, broadcast};
+
+/// Fallback ring size when no tuning is supplied (tests, the embedded builder).
+/// Production derives this from `limits.pubsub_buffer / limits.message_size`.
+const PUBSUB_BROADCAST_CAPACITY: usize = 32;
+
+// ─── Internal types ─────────────────────────────────────────────────────────
+
+type StreamId = (u64, u64); // (timestamp_ms, sequence)
+
+/// `(msg_id, to_did_hash)`: one recipient's record of a message.
+type RecordKey = (String, String);
+
+/// Pending entries one autoclaim call examines per entry it may return, as
+/// on Redis.
+const AUTOCLAIM_SCAN_FACTOR: usize = 10;
+
+fn format_stream_id(id: StreamId) -> String {
+    format!("{}-{}", id.0, id.1)
+}
+
+fn parse_stream_id(s: &str) -> Option<StreamId> {
+    let (ms, seq) = s.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Debug)]
+struct MessageRecord {
+    body: String,
+    bytes: usize,
+    to_did_hash: String,
+    from_did_hash: Option<String>,
+    timestamp_ms: u128,
+    /// Stream ID assigned to the inbox entry. Always present after
+    /// `store_message`.
+    receive_id: StreamId,
+    /// Stream ID assigned to the sender's outbox, if non-anonymous.
+    send_id: Option<StreamId>,
+    /// Unix-seconds expiry; `0` means no expiry.
+    expires_at: u64,
+    /// Unix milliseconds when this message was first handed to its recipient.
+    first_delivered_at_ms: Option<u64>,
+    /// How many times it has been handed over. A lower bound — see
+    /// [`DeliveryState::attempts`].
+    delivery_attempts: u32,
+}
+
+#[derive(Clone, Debug)]
+struct StreamEntry {
+    msg_id: String,
+    bytes: usize,
+    /// For inbox entries: the sender DID hash (or "ANONYMOUS").
+    /// For outbox entries: the recipient DID hash.
+    peer_did: String,
+}
+
+#[derive(Clone, Debug)]
+struct AccountRecord {
+    role: AccountType,
+    acls: MediatorACLSet,
+    send_queue_count: u32,
+    send_queue_bytes: u64,
+    receive_queue_count: u32,
+    receive_queue_bytes: u64,
+    queue_send_limit: Option<i32>,
+    queue_receive_limit: Option<i32>,
+    /// Whether this record is an account. Storing a message for a party with
+    /// no account keeps its queue counters here too (as Redis keeps them in a
+    /// `DID:<hash>` hash with no `ACLS`), but that alone does not make it an
+    /// account: it is not admitted, listed, or given ACLs from this record.
+    is_account: bool,
+}
+
+impl Default for AccountRecord {
+    fn default() -> Self {
+        Self {
+            role: AccountType::Standard,
+            acls: MediatorACLSet::default(),
+            send_queue_count: 0,
+            send_queue_bytes: 0,
+            receive_queue_count: 0,
+            receive_queue_bytes: 0,
+            queue_send_limit: None,
+            queue_receive_limit: None,
+            is_account: false,
+        }
+    }
+}
+
+impl MemoryState {
+    /// The account record for `did_hash`, if it is an account (see
+    /// [`AccountRecord::is_account`]).
+    fn account(&self, did_hash: &str) -> Option<&AccountRecord> {
+        self.accounts.get(did_hash).filter(|r| r.is_account)
+    }
+}
+
+impl AccountRecord {
+    fn into_account(self, did_hash: String, access_list_count: u32) -> Account {
+        Account {
+            did_hash,
+            acls: self.acls.to_u64(),
+            _type: self.role,
+            access_list_count,
+            queue_send_limit: self.queue_send_limit,
+            queue_receive_limit: self.queue_receive_limit,
+            send_queue_count: self.send_queue_count,
+            send_queue_bytes: self.send_queue_bytes,
+            receive_queue_count: self.receive_queue_count,
+            receive_queue_bytes: self.receive_queue_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionRecord {
+    session: Session,
+    /// Wall-clock instant when the session expires. Compared on every
+    /// access; expired sessions are removed lazily.
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct OobInvite {
+    invite_b64: String,
+    did_hash: String,
+    /// Unix-seconds expiry. Reads compare against `unix_timestamp_secs`
+    /// and remove on expiry.
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingClaim {
+    consumer: String,
+    claimed_at: Instant,
+    delivery_count: u32,
+}
+
+#[derive(Default, Debug)]
+struct ConsumerGroupState {
+    pending: BTreeMap<StreamId, PendingClaim>,
+    /// Last stream ID delivered via `XREADGROUP >`. Reads with `>`
+    /// return entries strictly greater than this.
+    last_delivered: StreamId,
+}
+
+/// Internal state — guarded by [`MemoryStore`]'s outer `Mutex`.
+#[derive(Default)]
+struct MemoryState {
+    /// The `config/patch` overrides, a JSON object.
+    config_overrides: Option<String>,
+    /// Each account's recorded activity times.
+    activity: HashMap<String, AccountActivity>,
+    /// Each account's lifetime counters.
+    stats: HashMap<String, AccountStats>,
+
+    // ─── Messages ───────────────────────────────────────────────────
+    /// `(msg_id, to_did_hash) -> record`: one record per recipient of a body
+    /// (see `MessageRef`). Ordered so every record of one id is a range.
+    messages: BTreeMap<RecordKey, MessageRecord>,
+
+    // ─── Streams (inbox/outbox) ─────────────────────────────────────
+    inbox: HashMap<String, BTreeMap<StreamId, StreamEntry>>, // did_hash -> stream
+    outbox: HashMap<String, BTreeMap<StreamId, StreamEntry>>,
+
+    // ─── Expiry index ───────────────────────────────────────────────
+    /// `expires_at_secs -> set of records`. Drained by
+    /// `sweep_expired_messages`.
+    expiry: BTreeMap<u64, HashSet<RecordKey>>,
+
+    // ─── Outbox receipts ────────────────────────────────────────────
+    /// `(sender_hash, msg_id) -> recipient -> (receipt, expires_at_secs)`:
+    /// why each copy of a sent message left the queue, per recipient. Pruned
+    /// by `sweep_expired_messages`.
+    receipts: HashMap<(String, String), HashMap<String, (OutboxReceipt, u64)>>,
+    /// `(recipient_hash, msg_id) -> until_secs`: the recipient removed its own
+    /// copy itself. See `MessageStore::acknowledged`. Pruned by
+    /// `sweep_expired_messages`.
+    acknowledged: HashMap<(String, String), u64>,
+
+    // ─── Sessions ───────────────────────────────────────────────────
+    sessions: HashMap<String, SessionRecord>,
+
+    // ─── Accounts / ACLs / Admins / Access lists ────────────────────
+    accounts: HashMap<String, AccountRecord>,
+    /// `(from_hash, to_hash) -> messages queued for that one peer`. The entry
+    /// is removed when it reaches zero, so this holds only pairs with messages
+    /// actually in flight. Mirrors the fjall `peer_queue` partition.
+    peer_queue: HashMap<(String, String), u32>,
+    known_dids: Vec<String>, // ordered for cursor pagination
+    access_lists: HashMap<String, Vec<String>>, // ordered for cursor pagination
+    admins: HashSet<String>,
+
+    // ─── DIDComm v1 routing keys ────────────────────────────────────
+    /// base58 routing verkey → `(owning DID, its hash)`. A verkey binds to at
+    /// most one DID; see `V1RoutingKeyStore::v1_routing_key_bind`. Both forms are
+    /// kept because forward ingress needs the DID while account removal works
+    /// from the hash.
+    v1_routing_keys: HashMap<String, (String, String)>,
+
+    // ─── DID multiplexing ───────────────────────────────────────────
+    /// member DID hash → its mux record. See `store::mux`.
+    mux_records: HashMap<String, MuxDidRecord>,
+    /// principal hash → member DID hashes it holds grants on (ordered, for
+    /// cursor paging).
+    mux_principals: HashMap<String, BTreeSet<String>>,
+
+    // ─── Audit log ──────────────────────────────────────────────────
+    /// Privileged-change records, newest-first. Bounded ring capped at
+    /// `AUDIT_LOG_MAX_ENTRIES` — the oldest (back) entry is dropped once
+    /// full.
+    audit_log: VecDeque<AuditLogEntry>,
+
+    // ─── OOB invitations ────────────────────────────────────────────
+    oob_invites: HashMap<String, OobInvite>,
+
+    // ─── Trust Task duplicate-execution record ──────────────────────
+    /// key → (digest, retain_until unix secs).
+    trust_task_claims: HashMap<String, (String, u64)>,
+    /// did:scid account hash → serialised source record (VTI-KEY-162).
+    scid_sources: HashMap<String, String>,
+    /// account hash → serialised wake record (`messaging/wake/set`).
+    wake_handles: HashMap<String, String>,
+
+    // ─── Forward queue ──────────────────────────────────────────────
+    forward_queue: BTreeMap<StreamId, ForwardQueueEntry>,
+    forward_groups: HashMap<String, ConsumerGroupState>,
+
+    // ─── Stats ──────────────────────────────────────────────────────
+    counters: HashMap<&'static str, i64>,
+
+    // ─── Live streaming client state ───────────────────────────────
+    /// `did_hash -> (mediator_uuid, state)` — only one streaming
+    /// session per DID is tracked.
+    streaming_clients: HashMap<String, (String, StreamingClientState)>,
+
+    // ─── Stream ID generation ──────────────────────────────────────
+    last_stream_ms: u64,
+    next_stream_seq: u64,
+}
+
+impl MemoryState {
+    /// Allocate a fresh stream ID. Monotonic across calls; sequence
+    /// resets when the millisecond advances.
+    fn alloc_stream_id(&mut self) -> StreamId {
+        let now = now_ms();
+        if now > self.last_stream_ms {
+            self.last_stream_ms = now;
+            self.next_stream_seq = 0;
+        } else {
+            self.next_stream_seq += 1;
+        }
+        (self.last_stream_ms, self.next_stream_seq)
+    }
+
+    /// Record a record under its expiry timeslot. `expires_at = 0`
+    /// is a no-op (messages without TTL aren't tracked).
+    fn index_expiry(&mut self, expires_at: u64, key: &RecordKey) {
+        if expires_at == 0 {
+            return;
+        }
+        self.expiry
+            .entry(expires_at)
+            .or_default()
+            .insert(key.clone());
+    }
+
+    /// Remove a record from its expiry timeslot. Drops the
+    /// timeslot entry once empty.
+    fn unindex_expiry(&mut self, expires_at: u64, key: &RecordKey) {
+        if expires_at == 0 {
+            return;
+        }
+        if let Some(set) = self.expiry.get_mut(&expires_at) {
+            set.remove(key);
+            if set.is_empty() {
+                self.expiry.remove(&expires_at);
+            }
+        }
+    }
+
+    /// Every record of `msg_id`, one per recipient, in recipient order.
+    fn records_of(&self, msg_id: &str) -> Vec<(RecordKey, &MessageRecord)> {
+        self.messages
+            .range((msg_id.to_string(), String::new())..)
+            .take_while(|((id, _), _)| id == msg_id)
+            .map(|(key, record)| (key.clone(), record))
+            .collect()
+    }
+
+    /// The record of `msg_id` that `scope` and `by` select, as
+    /// [`ops::select_records`] decides.
+    fn select(
+        &self,
+        msg_id: &str,
+        scope: MessageScope<'_>,
+        by: &DeletionAuthority,
+    ) -> Result<Vec<RecordKey>, ops::SelectError> {
+        let records = self.records_of(msg_id);
+        let parties: Vec<ops::RecordParties<'_>> = records
+            .iter()
+            .map(|(_, record)| ops::RecordParties {
+                to_did_hash: &record.to_did_hash,
+                from_did_hash: record.from_did_hash.as_deref(),
+            })
+            .collect();
+        let chosen = ops::select_records(scope, by, &parties)?;
+        Ok(chosen.into_iter().map(|i| records[i].0.clone()).collect())
+    }
+
+    /// Remove one record with its stream entries, counters, expiry entry and
+    /// the sender's receipt. The caller has authorised it.
+    fn remove_record(&mut self, key: &RecordKey, by: &DeletionAuthority) {
+        let Some(record) = self.messages.remove(key) else {
+            return;
+        };
+        let message_hash = key.0.as_str();
+
+        // Stream entries
+        if let Some(stream) = self.inbox.get_mut(&record.to_did_hash) {
+            stream.remove(&record.receive_id);
+        }
+        if let (Some(from), Some(sid)) = (record.from_did_hash.as_ref(), record.send_id) {
+            if let Some(stream) = self.outbox.get_mut(from) {
+                stream.remove(&sid);
+            }
+            // Sender account counters
+            if let Some(sender) = self.accounts.get_mut(from) {
+                sender.send_queue_count = sender.send_queue_count.saturating_sub(1);
+                sender.send_queue_bytes =
+                    sender.send_queue_bytes.saturating_sub(record.bytes as u64);
+            }
+        }
+        // Per-relationship depth, dropped at zero so the map does not retain a
+        // row for every pair the sender has ever used.
+        if let Some(from) = record.from_did_hash.as_ref() {
+            let pair = (from.clone(), record.to_did_hash.clone());
+            if let Some(count) = self.peer_queue.get_mut(&pair) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.peer_queue.remove(&pair);
+                }
+            }
+        }
+
+        // Recipient account counters
+        if let Some(recv) = self.accounts.get_mut(&record.to_did_hash) {
+            recv.receive_queue_count = recv.receive_queue_count.saturating_sub(1);
+            recv.receive_queue_bytes = recv.receive_queue_bytes.saturating_sub(record.bytes as u64);
+        }
+
+        // Expiry index
+        self.unindex_expiry(record.expires_at, key);
+
+        // The sender's receipt, when the message sat in a sender's outbox.
+        if let (Some(from), Some(_)) = (record.from_did_hash.as_ref(), record.send_id)
+            && let Some(reason) = ops::removal_reason(by, &record.to_did_hash, Some(from.as_str()))
+        {
+            let receipt = OutboxReceipt {
+                reason,
+                at_ms: now_ms(),
+            };
+            let expires = unix_timestamp_secs() + OUTBOX_RECEIPT_TTL.as_secs();
+            self.receipts
+                .entry((from.clone(), message_hash.to_string()))
+                .or_default()
+                .insert(record.to_did_hash.clone(), (receipt, expires));
+        }
+
+        // The recipient removing its own copy is an acknowledgement.
+        if matches!(by, DeletionAuthority::Owner { did_hash } if *did_hash == record.to_did_hash) {
+            let now = unix_timestamp_secs();
+            self.acknowledged.insert(
+                (record.to_did_hash.clone(), message_hash.to_string()),
+                acknowledged_until(record.expires_at, now),
+            );
+        }
+
+        // Counters
+        self.incr_counter("DELETED_BYTES", record.bytes as i64);
+        self.incr_counter("DELETED_COUNT", 1);
+    }
+
+    /// Lazy session expiry — call before reading a session record.
+    /// Returns `None` and removes the session if it's expired.
+    fn get_session_record(&mut self, session_id: &str) -> Option<&mut SessionRecord> {
+        let expired = self
+            .sessions
+            .get(session_id)
+            .map(|r| r.expires_at <= Instant::now())
+            .unwrap_or(false);
+        if expired {
+            self.sessions.remove(session_id);
+            return None;
+        }
+        self.sessions.get_mut(session_id)
+    }
+
+    fn incr_counter(&mut self, key: &'static str, by: i64) {
+        *self.counters.entry(key).or_insert(0) += by;
+    }
+}
+
+// ─── Public type ────────────────────────────────────────────────────────────
+
+/// In-memory [`MediatorStore`]. Cheap to clone (`Arc` internally).
+pub struct MemoryStore {
+    state: Arc<Mutex<MemoryState>>,
+    broadcast_channels: Arc<Mutex<HashMap<String, broadcast::Sender<PubSubRecord>>>>,
+    forward_notify: Arc<Notify>,
+    /// Slots in the live-delivery broadcast ring. See `with_pubsub_capacity`.
+    pubsub_capacity: usize,
+    /// Test hook: delay range applied before each `store_message`. See `with_store_delay`.
+    store_delay: std::ops::RangeInclusive<std::time::Duration>,
+}
+
+impl MemoryStore {
+    /// Publish one live-streaming record into this instance's broadcast
+    /// channel. `verbatim` marks the body as the frame itself rather than a
+    /// notification to drain the stored inbox (see
+    /// `StreamingStore::streaming_publish_verbatim`).
+    async fn publish_record(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+        verbatim: bool,
+        stored: Option<StoredMessageRef>,
+    ) -> Result<(), MediatorError> {
+        let channels = self.broadcast_channels.lock().await;
+        if let Some(sender) = channels.get(mediator_uuid) {
+            let _ = sender.send(PubSubRecord {
+                did_hash: did_hash.to_string(),
+                message: message.to_string(),
+                force_delivery,
+                verbatim,
+                stored,
+            });
+        }
+        Ok(())
+    }
+    /// Construct an empty in-memory store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Size the live-delivery broadcast ring.
+    ///
+    /// `tokio::sync::broadcast` holds every one of its `capacity` slots for the
+    /// life of the channel — a slot is not freed when a subscriber reads it, only
+    /// when it is overwritten `capacity` sends later. So the ring is a *standing*
+    /// reservation of `capacity x message_size` bytes, not a transient queue, and
+    /// the capacity must be derived from a byte budget rather than picked by feel.
+    /// See `pubsub_capacity_for`.
+    pub fn with_pubsub_capacity(mut self, capacity: usize) -> Self {
+        self.pubsub_capacity = capacity.max(1);
+        self
+    }
+
+    /// Delay every `store_message` by a random duration in `delay`, to mimic a
+    /// networked store's latency and expose store-ordering races in tests.
+    ///
+    /// The delay runs before the store takes its lock, so concurrent stores
+    /// can commit out of submission order — as they can against Redis.
+    ///
+    /// # Panics
+    ///
+    /// If `delay` is inverted (start after end).
+    pub fn with_store_delay(
+        mut self,
+        delay: std::ops::RangeInclusive<std::time::Duration>,
+    ) -> Self {
+        assert!(
+            delay.start() <= delay.end(),
+            "with_store_delay: inverted range {delay:?}"
+        );
+        self.store_delay = delay;
+        self
+    }
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MemoryState::default())),
+            broadcast_channels: Arc::new(Mutex::new(HashMap::new())),
+            forward_notify: Arc::new(Notify::new()),
+            pubsub_capacity: PUBSUB_BROADCAST_CAPACITY,
+            store_delay: std::time::Duration::ZERO..=std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl Clone for MemoryStore {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            broadcast_channels: Arc::clone(&self.broadcast_channels),
+            forward_notify: Arc::clone(&self.forward_notify),
+            pubsub_capacity: self.pubsub_capacity,
+            store_delay: self.store_delay.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryStore").finish_non_exhaustive()
+    }
+}
+
+// ─── Counter name mapping (matches Redis GLOBAL field names) ────────────────
+
+fn counter_key(c: StatCounter) -> &'static str {
+    match c {
+        StatCounter::SentBytes => "SENT_BYTES",
+        StatCounter::SentCount => "SENT_COUNT",
+        StatCounter::WebsocketOpen => "WEBSOCKET_OPEN",
+        StatCounter::WebsocketClose => "WEBSOCKET_CLOSE",
+        StatCounter::SessionsCreated => "SESSIONS_CREATED",
+        StatCounter::SessionsSuccess => "SESSIONS_SUCCESS",
+        StatCounter::OobInvitesCreated => "OOB_INVITES_CREATED",
+        StatCounter::OobInvitesClaimed => "OOB_INVITES_CLAIMED",
+    }
+}
+
+// ─── MediatorStore impl ─────────────────────────────────────────────────────
+
+#[async_trait]
+impl StoreLifecycle for MemoryStore {
+    fn spans_processes(&self) -> bool {
+        false
+    }
+
+    /// No breaker: an in-memory store never fails fast.
+    fn circuit_breaker_state(&self) -> &'static str {
+        "closed"
+    }
+
+    async fn initialize(&self) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    async fn health(&self) -> StoreHealth {
+        StoreHealth::Healthy
+    }
+
+    async fn shutdown(&self) -> Result<(), MediatorError> {
+        self.broadcast_channels.lock().await.clear();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MessageStore for MemoryStore {
+    async fn store_message(
+        &self,
+        _session_id: &str,
+        message: &str,
+        to_did_hash: &str,
+        from_hash: Option<&str>,
+        expires_at: u64,
+        _queue_maxlen: usize,
+    ) -> Result<String, MediatorError> {
+        let (min, max) = (self.store_delay.start(), self.store_delay.end());
+        if !max.is_zero() {
+            use rand::RngExt;
+            let micros = rand::rng().random_range(min.as_micros()..=max.as_micros());
+            tokio::time::sleep(std::time::Duration::from_micros(micros as u64)).await;
+        }
+        let msg_id = digest(message.as_bytes());
+        let bytes = message.len();
+        let ts_ms = now_ms() as u128;
+        let from = from_hash
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ANONYMOUS")
+            .to_string();
+
+        let mut state = self.state.lock().await;
+
+        // Idempotent per recipient, as in the Fjall backend — see
+        // `FjallStore::store_message` for the leak a re-submitted message
+        // caused. The same bytes for another recipient get their own record.
+        let key: RecordKey = (msg_id.clone(), to_did_hash.to_string());
+        if state.messages.contains_key(&key) {
+            return Ok(msg_id);
+        }
+
+        // Allocate stream IDs first so we can record them on the
+        // MessageRecord below.
+        let receive_id = state.alloc_stream_id();
+        let send_id = if from != "ANONYMOUS" {
+            Some(state.alloc_stream_id())
+        } else {
+            None
+        };
+
+        // Inbox entry for the recipient.
+        state
+            .inbox
+            .entry(to_did_hash.to_string())
+            .or_default()
+            .insert(
+                receive_id,
+                StreamEntry {
+                    msg_id: msg_id.clone(),
+                    bytes,
+                    peer_did: from.clone(),
+                },
+            );
+
+        // Outbox entry for the sender (if non-anonymous).
+        if let Some(sid) = send_id {
+            state.outbox.entry(from.clone()).or_default().insert(
+                sid,
+                StreamEntry {
+                    msg_id: msg_id.clone(),
+                    bytes,
+                    peer_did: to_did_hash.to_string(),
+                },
+            );
+            // Sender's account counter
+            let sender = state.accounts.entry(from.clone()).or_default();
+            sender.send_queue_count = sender.send_queue_count.saturating_add(1);
+            sender.send_queue_bytes = sender.send_queue_bytes.saturating_add(bytes as u64);
+            // Per-relationship depth.
+            let pair = state
+                .peer_queue
+                .entry((from.clone(), to_did_hash.to_string()))
+                .or_insert(0);
+            *pair = pair.saturating_add(1);
+        }
+
+        // Recipient's account counter
+        let recv = state.accounts.entry(to_did_hash.to_string()).or_default();
+        recv.receive_queue_count = recv.receive_queue_count.saturating_add(1);
+        recv.receive_queue_bytes = recv.receive_queue_bytes.saturating_add(bytes as u64);
+
+        // Global received counters
+        state.incr_counter("RECEIVED_BYTES", bytes as i64);
+        state.incr_counter("RECEIVED_COUNT", 1);
+
+        // Expiry index
+        state.index_expiry(expires_at, &key);
+
+        // Body + metadata
+        state.messages.insert(
+            key,
+            MessageRecord {
+                body: message.to_string(),
+                bytes,
+                to_did_hash: to_did_hash.to_string(),
+                from_did_hash: if from == "ANONYMOUS" {
+                    None
+                } else {
+                    Some(from)
+                },
+                timestamp_ms: ts_ms,
+                receive_id,
+                send_id,
+                expires_at,
+                first_delivered_at_ms: None,
+                delivery_attempts: 0,
+            },
+        );
+
+        Ok(msg_id)
+    }
+
+    async fn delete_message_in(
+        &self,
+        message_hash: &str,
+        scope: MessageScope<'_>,
+        by: DeletionAuthority,
+    ) -> Result<Vec<RemovedCopy>, MediatorError> {
+        if !ops::is_message_id(message_hash) {
+            return Err(ops::delete_not_found(message_hash, None));
+        }
+        let mut state = self.state.lock().await;
+        // Authorisation and the choice of records are shared with the Fjall
+        // backend via `store::ops` so the two can't drift. Every chosen record
+        // goes under the one lock.
+        let chosen = state
+            .select(message_hash, scope, &by)
+            .map_err(|e| e.into_delete_error(message_hash))?;
+        let mut removed = Vec::with_capacity(chosen.len());
+        for key in &chosen {
+            if let Some(record) = state.messages.get(key) {
+                removed.push(RemovedCopy {
+                    to_did_hash: record.to_did_hash.clone(),
+                    from_did_hash: record.from_did_hash.clone(),
+                });
+            }
+            state.remove_record(key, &by);
+        }
+        Ok(removed)
+    }
+
+    async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError> {
+        let now = unix_timestamp_secs();
+        let state = self.state.lock().await;
+        Ok(state
+            .acknowledged
+            .get(&(to_did_hash.to_string(), msg_id.to_string()))
+            .is_some_and(|until| *until > now))
+    }
+
+    async fn outbox_receipts(
+        &self,
+        from_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        let now = unix_timestamp_secs();
+        let state = self.state.lock().await;
+        Ok(state
+            .receipts
+            .get(&(from_did_hash.to_string(), msg_id.to_string()))
+            .into_iter()
+            .flatten()
+            .filter(|(_, (_, expires))| *expires > now)
+            .map(|(to, (receipt, _))| (to.clone(), *receipt))
+            .collect())
+    }
+
+    async fn sent_message_states(
+        &self,
+        sender_did_hash: &str,
+        msg_ids: &[String],
+    ) -> Result<Vec<SentMessageState>, MediatorError> {
+        let now = unix_timestamp_secs();
+        let state = self.state.lock().await;
+        Ok(msg_ids
+            .iter()
+            .map(|id| {
+                let held: Vec<ops::HeldMessage<'_>> = state
+                    .records_of(id)
+                    .into_iter()
+                    .map(|(_, record)| ops::HeldMessage {
+                        to_did_hash: &record.to_did_hash,
+                        from_did_hash: record.from_did_hash.as_deref(),
+                        first_delivered_at_ms: record.first_delivered_at_ms,
+                    })
+                    .collect();
+                let receipts: Vec<(String, OutboxReceipt)> = state
+                    .receipts
+                    .get(&(sender_did_hash.to_string(), id.clone()))
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, (_, expires))| *expires > now)
+                    .map(|(to, (receipt, _))| (to.clone(), *receipt))
+                    .collect();
+                ops::sent_message_state(sender_did_hash, &held, &receipts)
+            })
+            .collect())
+    }
+
+    async fn mark_delivered(
+        &self,
+        recipient_did_hash: &str,
+        msg_ids: &[String],
+        now_ms: u64,
+        delivered_ttl_secs: u64,
+    ) -> Result<DeliveryMarkReport, MediatorError> {
+        let mut report = DeliveryMarkReport::default();
+        let mut state = self.state.lock().await;
+        for id in msg_ids {
+            // A message deleted between the read and this call is simply gone;
+            // there is nothing to stamp and nothing has gone wrong.
+            let key: RecordKey = (id.clone(), recipient_did_hash.to_string());
+            let Some(record) = state.messages.get_mut(&key) else {
+                continue;
+            };
+            let bytes = record.bytes;
+            let moved = ops::stamp_delivery(
+                ops::DeliveryFields {
+                    first_delivered_at_ms: &mut record.first_delivered_at_ms,
+                    attempts: &mut record.delivery_attempts,
+                    expires_at: &mut record.expires_at,
+                },
+                bytes,
+                now_ms,
+                delivered_ttl_secs,
+                &mut report,
+            );
+            if let Some(deadline) = moved {
+                state.index_expiry(deadline, &key);
+            }
+        }
+        Ok(report)
+    }
+
+    async fn delivery_state(
+        &self,
+        recipient_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<DeliveryState>, MediatorError> {
+        let state = self.state.lock().await;
+        let key: RecordKey = (msg_id.to_string(), recipient_did_hash.to_string());
+        Ok(state.messages.get(&key).map(|record| DeliveryState {
+            first_delivered_at_ms: record.first_delivered_at_ms,
+            attempts: record.delivery_attempts,
+        }))
+    }
+
+    async fn get_message(
+        &self,
+        did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<MessageListElement>, MediatorError> {
+        let state = self.state.lock().await;
+        // Its own inbox copy, else a copy it sent (`MessageScope::Party`).
+        let records = state.records_of(msg_id);
+        let Some((_, record)) = records
+            .iter()
+            .find(|(_, r)| r.to_did_hash == did_hash)
+            .or_else(|| {
+                records
+                    .iter()
+                    .find(|(_, r)| r.from_did_hash.as_deref() == Some(did_hash))
+            })
+        else {
+            return Ok(None);
+        };
+
+        // Owner check (timing-safe enough for in-memory).
+        let is_to = did_hash == record.to_did_hash;
+        let is_from = record
+            .from_did_hash
+            .as_deref()
+            .map(|f| f == did_hash)
+            .unwrap_or(false);
+        if !is_to && !is_from {
+            return Ok(None);
+        }
+
+        Ok(Some(MessageListElement {
+            msg_id: msg_id.to_string(),
+            send_id: record.send_id.map(format_stream_id),
+            receive_id: Some(format_stream_id(record.receive_id)),
+            size: record.bytes as u64,
+            timestamp: record.timestamp_ms as u64,
+            to_address: Some(record.to_did_hash.clone()),
+            from_address: record.from_did_hash.clone(),
+            msg: Some(record.body.clone()),
+            protocol: Some(
+                affinidi_messaging_mediator_common::types::messages::MessageProtocol::detect(
+                    &record.body,
+                ),
+            ),
+        }))
+    }
+
+    async fn get_message_metadata(
+        &self,
+        recipient_did_hash: &str,
+        message_hash: &str,
+    ) -> Result<MessageMetaData, MediatorError> {
+        let state = self.state.lock().await;
+        let key: RecordKey = (message_hash.to_string(), recipient_did_hash.to_string());
+        let record = state.messages.get(&key).ok_or_else(|| {
+            MediatorError::DatabaseError(
+                error_codes::DB_OPERATION_ERROR,
+                "NA".into(),
+                format!("Message metadata not found for {message_hash}"),
+            )
+        })?;
+        Ok(MessageMetaData {
+            bytes: record.bytes,
+            to_did_hash: record.to_did_hash.clone(),
+            from_did_hash: record.from_did_hash.clone(),
+            timestamp: record.timestamp_ms,
+        })
+    }
+
+    async fn list_messages(
+        &self,
+        did_hash: &str,
+        folder: Folder,
+        range: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<MessageList, MediatorError> {
+        let (start, end) = range.unwrap_or(("-", "+"));
+        let start_id = ops::parse_range_bound(start, false)?;
+        let end_id = ops::parse_range_bound(end, true)?;
+        if start_id > end_id {
+            return Ok(Vec::new());
+        }
+        let state = self.state.lock().await;
+        let stream = match folder {
+            Folder::Inbox => state.inbox.get(did_hash),
+            Folder::Outbox => state.outbox.get(did_hash),
+        };
+        let Some(stream) = stream else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        for (sid, entry) in stream.range(start_id..=end_id).take(limit as usize) {
+            let mut element = MessageListElement {
+                msg_id: entry.msg_id.clone(),
+                size: entry.bytes as u64,
+                timestamp: sid.0,
+                ..Default::default()
+            };
+            match folder {
+                Folder::Inbox => {
+                    element.receive_id = Some(format_stream_id(*sid));
+                    element.from_address = Some(entry.peer_did.clone());
+                }
+                Folder::Outbox => {
+                    element.send_id = Some(format_stream_id(*sid));
+                    element.to_address = Some(entry.peer_did.clone());
+                }
+            }
+            out.push(element);
+        }
+        Ok(out)
+    }
+
+    async fn fetch_messages(
+        &self,
+        session_id: &str,
+        did_hash: &str,
+        options: &FetchOptions,
+    ) -> Result<GetMessagesResponse, MediatorError> {
+        // List inbox entries past the cursor, then fetch bodies and
+        // (optionally) delete. Mirrors RedisStore + the `fetch_messages`
+        // Lua function.
+        let start = options
+            .start_id
+            .as_deref()
+            .and_then(|s| parse_stream_id(s).map(|id| (id.0, id.1)));
+        let limit = options.limit;
+        let optimistic_delete = matches!(options.delete_policy, FetchDeletePolicy::Optimistic);
+
+        let mut response = GetMessagesResponse::default();
+
+        // Snapshot the relevant entries under the lock, then operate
+        // outside it for the optional delete loop.
+        let entries: Vec<(StreamId, StreamEntry)> = {
+            let state = self.state.lock().await;
+            let Some(stream) = state.inbox.get(did_hash) else {
+                return Ok(response);
+            };
+            let lower = match start {
+                // Exclusive of start_id: skip entries equal to it.
+                Some(id) => std::ops::Bound::Excluded(id),
+                None => std::ops::Bound::Unbounded,
+            };
+            stream
+                .range((lower, std::ops::Bound::Unbounded))
+                .take(limit)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect()
+        };
+
+        for (sid, entry) in &entries {
+            let body = {
+                let state = self.state.lock().await;
+                state
+                    .messages
+                    .get(&(entry.msg_id.clone(), did_hash.to_string()))
+                    .map(|r| r.body.clone())
+            };
+            let element = MessageListElement {
+                msg_id: entry.msg_id.clone(),
+                receive_id: Some(format_stream_id(*sid)),
+                size: entry.bytes as u64,
+                timestamp: sid.0,
+                from_address: Some(entry.peer_did.clone()),
+                to_address: Some(did_hash.to_string()),
+                msg: body,
+                ..Default::default()
+            };
+
+            if optimistic_delete {
+                let result = self
+                    .delete_message_in(
+                        &entry.msg_id,
+                        MessageScope::Recipient(did_hash),
+                        DeletionAuthority::Owner {
+                            did_hash: did_hash.to_string(),
+                        },
+                    )
+                    .await;
+                // The message stays queued, and the client still gets it
+                // with the failed delete reported, as on Redis: at least
+                // once, never a body withheld while the message remains.
+                if let Err(e) = result {
+                    response
+                        .delete_errors
+                        .push((entry.msg_id.clone(), e.to_string()));
+                }
+            }
+            response.success.push(element);
+        }
+        let _ = session_id;
+        Ok(response)
+    }
+
+    async fn delete_folder_entries(
+        &self,
+        did_hash: &str,
+        folder: Folder,
+        stream_ids: &[String],
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let stream = match folder {
+            Folder::Inbox => state.inbox.get_mut(did_hash),
+            Folder::Outbox => state.outbox.get_mut(did_hash),
+        };
+        if let Some(stream) = stream {
+            for id in stream_ids {
+                if let Some(id) = parse_stream_id(id) {
+                    stream.remove(&id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_folder_stream(
+        &self,
+        _session_id: &str,
+        did_hash: &str,
+        folder: Folder,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        match folder {
+            Folder::Inbox => {
+                state.inbox.remove(did_hash);
+            }
+            Folder::Outbox => {
+                state.outbox.remove(did_hash);
+            }
+        }
+        Ok(())
+    }
+
+    async fn peer_queue_count(&self, from_hash: &str, to_hash: &str) -> Result<u32, MediatorError> {
+        let state = self.state.lock().await;
+        Ok(state
+            .peer_queue
+            .get(&(from_hash.to_string(), to_hash.to_string()))
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn inbox_status(&self, did_hash: &str) -> Result<InboxStatusReply, MediatorError> {
+        let state = self.state.lock().await;
+        let mut reply = InboxStatusReply {
+            recipient_did: did_hash.to_string(),
+            ..Default::default()
+        };
+        if let Some(stream) = state.inbox.get(did_hash) {
+            reply.queue_count = stream.len() as u64;
+            if let Some((first, _)) = stream.iter().next() {
+                reply.oldest_received = format_stream_id(*first);
+            }
+            if let Some((last, _)) = stream.iter().next_back() {
+                reply.newest_received = format_stream_id(*last);
+            }
+        }
+        if let Some(account) = state.accounts.get(did_hash) {
+            reply.message_count = account.receive_queue_count as u64;
+            reply.total_bytes = account.receive_queue_bytes;
+        }
+        if let Some((_, st)) = state.streaming_clients.get(did_hash) {
+            reply.live_delivery = matches!(st, StreamingClientState::Live);
+        }
+        Ok(reply)
+    }
+
+    async fn sweep_expired_messages(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+    ) -> Result<ExpiryReport, MediatorError> {
+        self.sweep_expired_messages_observed(now_secs, admin_did_hash, None)
+            .await
+    }
+
+    async fn sweep_expired_messages_observed(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+        on_expired: Option<OnExpired<'_>>,
+    ) -> Result<ExpiryReport, MediatorError> {
+        // Snapshot due timeslot keys + their records under the lock, then
+        // remove each record that is still due, under the lock.
+        let due: Vec<(u64, Vec<RecordKey>)> = {
+            let state = self.state.lock().await;
+            state
+                .expiry
+                .range(..=now_secs)
+                .map(|(ts, keys)| (*ts, keys.iter().cloned().collect()))
+                .collect()
+        };
+
+        let by = DeletionAuthority::Admin {
+            admin_did_hash: admin_did_hash.to_string(),
+        };
+        let mut report = ExpiryReport {
+            timeslots_swept: due.len() as u32,
+            ..Default::default()
+        };
+        for (ts, keys) in due {
+            for key in keys {
+                // Only an entry at or after the record's current expiry
+                // removes it. One left by a deadline the record no longer has
+                // (an earlier copy of the same bytes for the same recipient,
+                // or the original deadline of a delivered message) is dropped
+                // and the record kept.
+                let removed = {
+                    let mut state = self.state.lock().await;
+                    let meta = state
+                        .messages
+                        .get(&key)
+                        .filter(|record| ops::expiry_entry_is_due(record.expires_at, ts))
+                        .map(|record| MessageMetaData {
+                            bytes: record.bytes,
+                            to_did_hash: record.to_did_hash.clone(),
+                            from_did_hash: record.from_did_hash.clone(),
+                            timestamp: record.timestamp_ms,
+                        });
+                    if meta.is_some() {
+                        state.remove_record(&key, &by);
+                    }
+                    if let Some(set) = state.expiry.get_mut(&ts) {
+                        set.remove(&key);
+                        if set.is_empty() {
+                            state.expiry.remove(&ts);
+                        }
+                    }
+                    meta
+                };
+                match removed {
+                    Some(meta) => {
+                        report.expired += 1;
+                        if let Some(observe) = on_expired {
+                            observe(&key.0, &meta);
+                        }
+                    }
+                    None => report.already_deleted += 1,
+                }
+            }
+        }
+        self.state.lock().await.receipts.retain(|_, per_recipient| {
+            per_recipient.retain(|_, (_, expires)| *expires > now_secs);
+            !per_recipient.is_empty()
+        });
+        self.state
+            .lock()
+            .await
+            .acknowledged
+            .retain(|_, until| *until > now_secs);
+        Ok(report)
+    }
+}
+
+#[async_trait]
+impl SessionStore for MemoryStore {
+    async fn get_refresh_token_hash(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, MediatorError> {
+        let mut state = self.state.lock().await;
+        Ok(state
+            .get_session_record(session_id)
+            .and_then(|record| record.session.refresh_token_hash.clone()))
+    }
+
+    async fn put_session(&self, session: &Session, ttl: Duration) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        state.sessions.insert(
+            session.session_id.clone(),
+            SessionRecord {
+                session: session.clone(),
+                expires_at: Instant::now() + ttl,
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
+        let mut state = self.state.lock().await;
+        let record = state.get_session_record(session_id).ok_or_else(|| {
+            affinidi_messaging_mediator_common::store::session_not_found(session_id)
+        })?;
+        let mut session = record.session.clone();
+
+        // Join with account for ACLs/role (matches Redis path).
+        if !did.is_empty() {
+            let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
+            if let Some(account) = state.account(&did_hash) {
+                session.acls = account.acls.clone();
+                session.account_type = account.role;
+            } else if session.state != SessionState::ChallengeSent {
+                return Err(affinidi_messaging_mediator_common::store::account_gone(
+                    session_id,
+                ));
+            }
+        }
+        Ok(session)
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        state.sessions.remove(session_id);
+        Ok(())
+    }
+
+    /// Promote and rename under the store's single state lock: the challenge
+    /// session must exist, be unexpired and still be waiting for its answer,
+    /// so of two answers to one challenge only the first promotes it.
+    async fn update_session_authenticated(
+        &self,
+        old_session_id: &str,
+        new_session_id: &str,
+        did: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let Some(record) = state.get_session_record(old_session_id) else {
+            return Err(
+                affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                    old_session_id,
+                ),
+            );
+        };
+        if record.session.state != SessionState::ChallengeSent {
+            return Err(
+                affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                    old_session_id,
+                ),
+            );
+        }
+        let mut session = record.session.clone();
+        state.sessions.remove(old_session_id);
+
+        session.session_id = new_session_id.to_string();
+        if session.did.is_empty() {
+            session.did = did.to_string();
+            session.did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
+        }
+        session.state = SessionState::Authenticated;
+        session.authenticated = true;
+        session.refresh_token_hash = Some(refresh_token_hash.to_string());
+        state.sessions.insert(
+            new_session_id.to_string(),
+            SessionRecord {
+                session,
+                expires_at: Instant::now() + Duration::from_secs(86_400),
+            },
+        );
+        state.incr_counter("SESSIONS_SUCCESS", 1);
+        Ok(())
+    }
+
+    /// In place, keeping the session's expiry, as Redis and Fjall do: a
+    /// refresh-token update must not extend the session's life.
+    async fn update_refresh_token_hash(
+        &self,
+        session_id: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let record = state.get_session_record(session_id).ok_or_else(|| {
+            affinidi_messaging_mediator_common::store::session_not_found(session_id)
+        })?;
+        record.session.refresh_token_hash = Some(refresh_token_hash.to_string());
+        Ok(())
+    }
+
+    /// Compare-and-swap under the store's single state lock, so it cannot
+    /// interleave with another rotation or session write.
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        use subtle::ConstantTimeEq;
+        let mut state = self.state.lock().await;
+        let Some(record) = state.get_session_record(session_id) else {
+            return Ok(RefreshRotation::Missing);
+        };
+        let Some(stored) = record.session.refresh_token_hash.as_deref() else {
+            return Ok(RefreshRotation::Missing);
+        };
+        if !bool::from(stored.as_bytes().ct_eq(presented_hash.as_bytes())) {
+            return Ok(RefreshRotation::Mismatch);
+        }
+        record.session.refresh_token_hash = Some(new_hash.to_string());
+        Ok(RefreshRotation::Rotated)
+    }
+
+    async fn sweep_expired_sessions(
+        &self,
+        _now_secs: u64,
+    ) -> Result<SessionSweepReport, MediatorError> {
+        // Session TTLs are tracked as `Instant`s here, so the wall-clock
+        // `now_secs` argument is ignored in favour of `Instant::now()`,
+        // exactly matching the lazy-expiry check in `get_session_record`.
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let before = state.sessions.len();
+        state.sessions.retain(|_, record| record.expires_at > now);
+        let expired = (before - state.sessions.len()) as u32;
+        Ok(SessionSweepReport {
+            scanned: before as u32,
+            expired,
+        })
+    }
+}
+
+#[async_trait]
+impl AccountStore for MemoryStore {
+    /// Under the one lock, so every member lands together.
+    async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError> {
+        let mut state = self.state.lock().await;
+        let Some(record) = state
+            .accounts
+            .get_mut(did_hash)
+            .filter(|record| record.is_account)
+        else {
+            return Ok(false);
+        };
+        if let Some(acls) = &update.acls {
+            record.acls = acls.clone();
+        }
+        ops::apply_queue_limit(&mut record.queue_send_limit, update.send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, update.receive_queue_limit);
+        if let Some(role) = update.role {
+            record.role = role;
+            if role.is_admin() {
+                state.admins.insert(did_hash.to_string());
+            } else {
+                state.admins.remove(did_hash);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
+        Ok(self.state.lock().await.account(did_hash).is_some())
+    }
+
+    async fn account_get(&self, did_hash: &str) -> Result<Option<Account>, MediatorError> {
+        let state = self.state.lock().await;
+        let Some(record) = state.account(did_hash).cloned() else {
+            return Ok(None);
+        };
+        let access_list_count = state
+            .access_lists
+            .get(did_hash)
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+        Ok(Some(
+            record.into_account(did_hash.to_string(), access_list_count),
+        ))
+    }
+
+    async fn account_create(
+        &self,
+        did_hash: &str,
+        acls: &MediatorACLSet,
+        queue_limit: Option<u32>,
+    ) -> Result<Option<Account>, MediatorError> {
+        let mut state = self.state.lock().await;
+        if !state.known_dids.iter().any(|d| d == did_hash) {
+            state.known_dids.push(did_hash.to_string());
+        }
+        // Checked under the same lock as the insert, so an existing account is
+        // never replaced.
+        if state.account(did_hash).is_some() {
+            return Ok(None);
+        }
+        // A record holding only queue counters is completed, and its counters
+        // kept: they describe messages that are really queued.
+        let counters = state.accounts.get(did_hash).cloned().unwrap_or_default();
+        let mut record = AccountRecord {
+            acls: acls.clone(),
+            is_account: true,
+            ..counters
+        };
+        record.role = AccountType::Standard;
+        record.queue_send_limit = None;
+        record.queue_receive_limit = None;
+        if let Some(limit) = queue_limit {
+            record.queue_send_limit = Some(limit as i32);
+            record.queue_receive_limit = Some(limit as i32);
+        }
+        state.accounts.insert(did_hash.to_string(), record.clone());
+        // A fresh account starts with no activity and no counters.
+        state.activity.remove(did_hash);
+        state.stats.remove(did_hash);
+        Ok(Some(record.into_account(did_hash.to_string(), 0)))
+    }
+
+    async fn account_remove(
+        &self,
+        _session: &Session,
+        did_hash: &str,
+    ) -> Result<bool, MediatorError> {
+        // Block protected accounts up-front.
+        {
+            let state = self.state.lock().await;
+            if let Some(record) = state.accounts.get(did_hash)
+                && (record.role == AccountType::Mediator || record.role == AccountType::RootAdmin)
+            {
+                return Err(MediatorError::InternalError(
+                    error_codes::PROTECTED_ACCOUNT_ERROR,
+                    "memory".into(),
+                    "Cannot remove the mediator or root admin account".into(),
+                ));
+            }
+        }
+
+        // Block ACL.
+        let mut blocked = MediatorACLSet::default();
+        blocked.set_blocked(true);
+        self.set_did_acl(did_hash, &blocked).await?;
+
+        // Drop the outbox stream key (without purging downstream copies
+        // already delivered) and purge the inbox.
+        self.delete_folder_stream("", did_hash, Folder::Outbox)
+            .await?;
+        // As the mediator, not the owner: senders see these as `discarded`,
+        // not collected by a recipient who never read them.
+        let purged = self
+            .purge_folder_by(
+                "",
+                did_hash,
+                Folder::Inbox,
+                DeletionAuthority::Admin {
+                    admin_did_hash: did_hash.to_string(),
+                },
+            )
+            .await?;
+        affinidi_messaging_mediator_common::store::purge_left_messages(did_hash, &purged)?;
+        self.delete_folder_stream("", did_hash, Folder::Inbox)
+            .await?;
+
+        // Drop the account, admin set membership, and known-DIDs entry.
+        let mut state = self.state.lock().await;
+        state.accounts.remove(did_hash);
+        state.activity.remove(did_hash);
+        state.stats.remove(did_hash);
+        state.scid_sources.remove(did_hash);
+        state.wake_handles.remove(did_hash);
+        state.access_lists.remove(did_hash);
+        state.admins.remove(did_hash);
+        state.known_dids.retain(|d| d != did_hash);
+        // Drop the account's v1 routing keys too, or a removed account's
+        // verkeys keep resolving and its inbound v1 traffic keeps being
+        // accepted for a mailbox that no longer exists.
+        state
+            .v1_routing_keys
+            .retain(|_, (_, owner_hash)| owner_hash != did_hash);
+        Ok(true)
+    }
+
+    async fn account_list(
+        &self,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<MediatorAccountList, MediatorError> {
+        let limit = limit.min(100) as usize;
+        let state = self.state.lock().await;
+        let dids: Vec<String> = state
+            .known_dids
+            .iter()
+            .skip(cursor as usize)
+            .take(limit)
+            .cloned()
+            .collect();
+        let next_cursor = if cursor as usize + dids.len() >= state.known_dids.len() {
+            0
+        } else {
+            cursor + dids.len() as u32
+        };
+        let mut accounts = Vec::with_capacity(dids.len());
+        for did in &dids {
+            if let Some(record) = state.account(did) {
+                let count = state
+                    .access_lists
+                    .get(did)
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+                accounts.push(record.clone().into_account(did.clone(), count));
+            }
+        }
+        Ok(MediatorAccountList {
+            accounts,
+            cursor: next_cursor,
+        })
+    }
+
+    async fn account_set_role(
+        &self,
+        did_hash: &str,
+        account_type: &AccountType,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let record = state.accounts.entry(did_hash.to_string()).or_default();
+        record.role = *account_type;
+        // A role makes the record an account, as `ROLE_TYPE` does on Redis.
+        record.is_account = true;
+        if account_type.is_admin() {
+            state.admins.insert(did_hash.to_string());
+        } else {
+            state.admins.remove(did_hash);
+        }
+        Ok(())
+    }
+
+    async fn account_change_queue_limits(
+        &self,
+        did_hash: &str,
+        send_queue_limit: Option<i32>,
+        receive_queue_limit: Option<i32>,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let record = state.accounts.entry(did_hash.to_string()).or_default();
+        ops::apply_queue_limit(&mut record.queue_send_limit, send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, receive_queue_limit);
+        Ok(())
+    }
+
+    async fn setup_admin_account(
+        &self,
+        admin_did_hash: &str,
+        admin_type: AccountType,
+        acls: &MediatorACLSet,
+    ) -> Result<(), MediatorError> {
+        // Unconditional: a no-op for an existing account, and it completes a
+        // record that holds only queue counters, so the role below is never
+        // set on a record without ACLs.
+        self.account_create(admin_did_hash, acls, None).await?;
+        let mut state = self.state.lock().await;
+        if let Some(record) = state.accounts.get_mut(admin_did_hash) {
+            record.role = admin_type;
+        }
+        state.admins.insert(admin_did_hash.to_string());
+        Ok(())
+    }
+
+    async fn check_admin_account(&self, did_hash: &str) -> Result<bool, MediatorError> {
+        let state = self.state.lock().await;
+        if !state.admins.contains(did_hash) {
+            return Ok(false);
+        }
+        let role = state.accounts.get(did_hash).map(|r| r.role);
+        Ok(matches!(
+            role,
+            Some(AccountType::Admin) | Some(AccountType::RootAdmin)
+        ))
+    }
+
+    async fn account_activity_record(
+        &self,
+        did_hash: &str,
+        kind: ActivityKind,
+        at: u64,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        if state.account(did_hash).is_none() {
+            return Ok(());
+        }
+        let activity = state.activity.entry(did_hash.to_string()).or_default();
+        match kind {
+            ActivityKind::Received => activity.last_received = Some(at),
+            ActivityKind::Authenticated => activity.last_authenticated = Some(at),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn account_activity(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountActivity>, MediatorError> {
+        let state = self.state.lock().await;
+        Ok(did_hashes
+            .iter()
+            .map(|h| state.activity.get(h).copied().unwrap_or_default())
+            .collect())
+    }
+
+    async fn account_stats_bump(
+        &self,
+        did_hash: &str,
+        delta: AccountStatsDelta,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        if state.account(did_hash).is_none() {
+            return Ok(());
+        }
+        state
+            .stats
+            .entry(did_hash.to_string())
+            .or_default()
+            .apply(delta);
+        Ok(())
+    }
+
+    async fn account_stats(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountStats>, MediatorError> {
+        let state = self.state.lock().await;
+        Ok(did_hashes
+            .iter()
+            .map(|h| state.stats.get(h).copied().unwrap_or_default())
+            .collect())
+    }
+}
+
+#[async_trait]
+impl AclStore for MemoryStore {
+    /// Planned by `ops::plan_access_list_update` and applied under the one
+    /// lock.
+    async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        let mut state = self.state.lock().await;
+        let current = state.access_lists.remove(did_hash).unwrap_or_default();
+        let plan = ops::plan_access_list_update(&current, update, access_list_limit);
+        let dropped: HashSet<&String> = plan.delete.iter().collect();
+        let mut list: Vec<String> = current
+            .iter()
+            .filter(|h| !dropped.contains(h))
+            .cloned()
+            .collect();
+        list.extend(plan.insert.iter().cloned());
+        if !list.is_empty() {
+            state.access_lists.insert(did_hash.to_string(), list);
+        }
+        Ok(plan.outcome)
+    }
+
+    async fn set_did_acl(
+        &self,
+        did_hash: &str,
+        acls: &MediatorACLSet,
+    ) -> Result<MediatorACLSet, MediatorError> {
+        let mut state = self.state.lock().await;
+        let record = state.accounts.entry(did_hash.to_string()).or_default();
+        record.acls = acls.clone();
+        // ACLs make the record an account, as `ACLS` does on Redis.
+        record.is_account = true;
+        Ok(acls.clone())
+    }
+
+    async fn get_did_acl(&self, did_hash: &str) -> Result<Option<MediatorACLSet>, MediatorError> {
+        let state = self.state.lock().await;
+        Ok(state.account(did_hash).map(|r| r.acls.clone()))
+    }
+
+    async fn get_did_acls(
+        &self,
+        dids: &[String],
+        mediator_acl_mode: AccessListModeType,
+    ) -> Result<MediatorACLGetResponse, MediatorError> {
+        if dids.len() > 100 {
+            return Err(MediatorError::DatabaseError(
+                error_codes::ACL_GET_DIDS_LIMIT,
+                "memory".into(),
+                "# of DIDs cannot exceed 100".into(),
+            ));
+        }
+        let state = self.state.lock().await;
+        let mut response = MediatorACLGetResponse {
+            acl_response: Vec::with_capacity(dids.len()),
+            mediator_acl_mode,
+        };
+        for did in dids {
+            if let Some(record) = state.account(did) {
+                response.acl_response.push(MediatorACLExpanded {
+                    did_hash: did.clone(),
+                    acl_value: record.acls.to_hex_string(),
+                    acls: record.acls.clone(),
+                });
+            }
+        }
+        Ok(response)
+    }
+
+    async fn access_list_allowed(&self, to_hash: &str, from_hash: Option<&str>) -> bool {
+        matches!(
+            self.delivery_decision(to_hash, from_hash).await,
+            Ok(Some(decision)) if decision.access_list_allows
+        )
+    }
+
+    /// One lock acquisition serves the ACL set and the membership probe.
+    async fn delivery_decision(
+        &self,
+        to_hash: &str,
+        from_hash: Option<&str>,
+    ) -> Result<Option<DeliveryDecision>, MediatorError> {
+        let state = self.state.lock().await;
+        let Some(account) = state.account(to_hash) else {
+            return Ok(None);
+        };
+        let sender = match from_hash {
+            Some(from) => ops::Sender::Known {
+                on_access_list: state
+                    .access_lists
+                    .get(to_hash)
+                    .map(|v| v.iter().any(|d| d == from))
+                    .unwrap_or(false),
+            },
+            None => ops::Sender::Anonymous,
+        };
+        let access_list_allows = ops::access_list_allowed(&account.acls, sender);
+        Ok(Some(DeliveryDecision {
+            acls: account.acls.clone(),
+            access_list_allows,
+        }))
+    }
+
+    async fn access_list_list(
+        &self,
+        did_hash: &str,
+        cursor: u64,
+    ) -> Result<MediatorAccessListListResponse, MediatorError> {
+        let state = self.state.lock().await;
+        let list = state.access_lists.get(did_hash);
+        let entries: Vec<String> = list
+            .map(|v| v.iter().skip(cursor as usize).take(100).cloned().collect())
+            .unwrap_or_default();
+        let next = list
+            .map(|v| {
+                if (cursor as usize) + entries.len() >= v.len() {
+                    None
+                } else {
+                    Some(cursor + entries.len() as u64)
+                }
+            })
+            .unwrap_or(None);
+        Ok(MediatorAccessListListResponse {
+            cursor: next,
+            did_hashes: entries,
+        })
+    }
+
+    async fn access_list_add(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<MediatorAccessListAddResponse, MediatorError> {
+        let mut state = self.state.lock().await;
+        let list = state.access_lists.entry(did_hash.to_string()).or_default();
+        let (to_add, truncated) = ops::admit_to_access_list(list.len(), hashes, access_list_limit);
+        for h in &to_add {
+            if !list.iter().any(|d| d == h) {
+                list.push(h.clone());
+            }
+        }
+        Ok(MediatorAccessListAddResponse {
+            did_hashes: to_add,
+            truncated,
+        })
+    }
+
+    async fn access_list_remove(
+        &self,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<usize, MediatorError> {
+        let mut state = self.state.lock().await;
+        let Some(list) = state.access_lists.get_mut(did_hash) else {
+            return Ok(0);
+        };
+        let before = list.len();
+        list.retain(|d| !hashes.contains(d));
+        Ok(before - list.len())
+    }
+
+    async fn access_list_clear(&self, did_hash: &str) -> Result<(), MediatorError> {
+        self.state.lock().await.access_lists.remove(did_hash);
+        Ok(())
+    }
+
+    async fn access_list_get(
+        &self,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<MediatorAccessListGetResponse, MediatorError> {
+        let state = self.state.lock().await;
+        let list = state.access_lists.get(did_hash);
+        let did_hashes = match list {
+            Some(v) => hashes
+                .iter()
+                .filter(|h| v.iter().any(|d| &d == h))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok(MediatorAccessListGetResponse { did_hashes })
+    }
+}
+
+#[async_trait]
+impl StatsStore for MemoryStore {
+    async fn get_global_stats(&self) -> Result<MetadataStats, MediatorError> {
+        let state = self.state.lock().await;
+        let read = |key: &str| state.counters.get(key).copied().unwrap_or(0);
+        Ok(MetadataStats {
+            received_bytes: read("RECEIVED_BYTES"),
+            sent_bytes: read("SENT_BYTES"),
+            deleted_bytes: read("DELETED_BYTES"),
+            received_count: read("RECEIVED_COUNT"),
+            sent_count: read("SENT_COUNT"),
+            deleted_count: read("DELETED_COUNT"),
+            websocket_open: read("WEBSOCKET_OPEN"),
+            websocket_close: read("WEBSOCKET_CLOSE"),
+            sessions_created: read("SESSIONS_CREATED"),
+            sessions_success: read("SESSIONS_SUCCESS"),
+            oob_invites_created: read("OOB_INVITES_CREATED"),
+            oob_invites_claimed: read("OOB_INVITES_CLAIMED"),
+        })
+    }
+
+    async fn stats_increment(&self, counter: StatCounter, by: i64) -> Result<(), MediatorError> {
+        self.state
+            .lock()
+            .await
+            .incr_counter(counter_key(counter), by);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ForwardQueueStore for MemoryStore {
+    /// No consumer records are kept beyond the pending entries, so there is
+    /// nothing to prune.
+    async fn forward_queue_prune_consumers(
+        &self,
+        _group_name: &str,
+        _keep_consumer: &str,
+        _min_idle: Duration,
+    ) -> Result<usize, MediatorError> {
+        Ok(0)
+    }
+
+    /// Ack and delete under the one lock, so no entry is left acked but
+    /// stored.
+    async fn forward_queue_ack_and_delete(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        for id in stream_ids {
+            let Some(parsed) = parse_stream_id(id) else {
+                continue;
+            };
+            if let Some(group) = state.forward_groups.get_mut(group_name) {
+                group.pending.remove(&parsed);
+            }
+            state.forward_queue.remove(&parsed);
+        }
+        Ok(())
+    }
+
+    async fn forward_queue_enqueue(
+        &self,
+        entry: &ForwardQueueEntry,
+        max_len: usize,
+    ) -> Result<String, MediatorError> {
+        let mut state = self.state.lock().await;
+        let id = state.alloc_stream_id();
+        let mut entry = entry.clone();
+        entry.stream_id = format_stream_id(id);
+        state.forward_queue.insert(id, entry);
+
+        // Approximate max_len trim: drop oldest entries if over.
+        if max_len > 0 {
+            while state.forward_queue.len() > max_len {
+                let Some((&first, _)) = state.forward_queue.iter().next() else {
+                    break;
+                };
+                state.forward_queue.remove(&first);
+            }
+        }
+        let stream_id = format_stream_id(id);
+        drop(state);
+        self.forward_notify.notify_waiters();
+        Ok(stream_id)
+    }
+
+    async fn forward_queue_len(&self) -> Result<usize, MediatorError> {
+        Ok(self.state.lock().await.forward_queue.len())
+    }
+
+    async fn forward_queue_read(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        count: usize,
+        block: Duration,
+    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
+        // Inline read attempt: returns entries strictly greater than
+        // the group's `last_delivered`. If empty and `block > 0`, wait
+        // on `forward_notify` for a single notification (or timeout)
+        // and try again.
+        let try_read = || async {
+            let mut state = self.state.lock().await;
+            let group = state
+                .forward_groups
+                .entry(group_name.to_string())
+                .or_default();
+            let after = group.last_delivered;
+            let candidates: Vec<(StreamId, ForwardQueueEntry)> = state
+                .forward_queue
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .take(count)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let claimed_at = Instant::now();
+            for (id, _entry) in &candidates {
+                let group = state
+                    .forward_groups
+                    .entry(group_name.to_string())
+                    .or_default();
+                group.pending.insert(
+                    *id,
+                    PendingClaim {
+                        consumer: consumer_name.to_string(),
+                        claimed_at,
+                        delivery_count: 1,
+                    },
+                );
+                if *id > group.last_delivered {
+                    group.last_delivered = *id;
+                }
+            }
+            candidates
+                .into_iter()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>()
+        };
+
+        let initial = try_read().await;
+        if !initial.is_empty() || block.is_zero() {
+            return Ok(initial);
+        }
+
+        // Block for new entries (or timeout).
+        let _ = tokio::time::timeout(block, self.forward_notify.notified()).await;
+        Ok(try_read().await)
+    }
+
+    async fn forward_queue_ack(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        let Some(group) = state.forward_groups.get_mut(group_name) else {
+            return Ok(());
+        };
+        for id in stream_ids {
+            if let Some(parsed) = parse_stream_id(id) {
+                group.pending.remove(&parsed);
+            }
+        }
+        Ok(())
+    }
+
+    async fn forward_queue_delete(&self, stream_ids: &[&str]) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        for id in stream_ids {
+            if let Some(parsed) = parse_stream_id(id) {
+                state.forward_queue.remove(&parsed);
+            }
+        }
+        Ok(())
+    }
+
+    async fn forward_queue_autoclaim(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        min_idle: Duration,
+        count: usize,
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError> {
+        let now = Instant::now();
+        let start = parse_stream_id(cursor).unwrap_or((0, 0));
+        let mut state = self.state.lock().await;
+        // Examine a bounded stretch of the pending list per call, as Redis
+        // does, and say where to continue.
+        let scan_limit = count.max(1).saturating_mul(AUTOCLAIM_SCAN_FACTOR);
+        let mut stale_ids: Vec<StreamId> = Vec::new();
+        let mut next_cursor = None;
+        if let Some(group) = state.forward_groups.get(group_name) {
+            for (examined, (id, claim)) in group.pending.range(start..).enumerate() {
+                if examined >= scan_limit || stale_ids.len() >= count {
+                    next_cursor = Some(format_stream_id(*id));
+                    break;
+                }
+                if now.duration_since(claim.claimed_at) >= min_idle {
+                    stale_ids.push(*id);
+                }
+            }
+        }
+        let mut entries = Vec::with_capacity(stale_ids.len());
+        for id in stale_ids {
+            if !state.forward_queue.contains_key(&id) {
+                // Gone from the queue: drop the claim, as XAUTOCLAIM does.
+                if let Some(group) = state.forward_groups.get_mut(group_name) {
+                    group.pending.remove(&id);
+                }
+                continue;
+            }
+            if let Some(group) = state.forward_groups.get_mut(group_name)
+                && let Some(claim) = group.pending.get_mut(&id)
+            {
+                claim.consumer = consumer_name.to_string();
+                claim.claimed_at = now;
+                claim.delivery_count += 1;
+            }
+            if let Some(entry) = state.forward_queue.get(&id) {
+                entries.push(entry.clone());
+            }
+        }
+        Ok(ForwardQueueClaimPage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        let Some(id) = parse_stream_id(stream_id) else {
+            return Ok(false);
+        };
+        let mut state = self.state.lock().await;
+        let held = state
+            .forward_groups
+            .get(group_name)
+            .and_then(|group| group.pending.get(&id))
+            .is_some_and(|claim| claim.consumer == consumer_name);
+        if !held {
+            return Ok(false);
+        }
+        if let Some(entry) = requeue {
+            let new_id = state.alloc_stream_id();
+            let mut entry = entry.clone();
+            entry.stream_id = format_stream_id(new_id);
+            state.forward_queue.insert(new_id, entry);
+        }
+        if let Some(group) = state.forward_groups.get_mut(group_name) {
+            group.pending.remove(&id);
+        }
+        state.forward_queue.remove(&id);
+        drop(state);
+        if requeue.is_some() {
+            self.forward_notify.notify_waiters();
+        }
+        Ok(true)
+    }
+
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        let group = state.forward_groups.get_mut(group_name);
+        let mut lost = Vec::new();
+        let Some(group) = group else {
+            return Ok(stream_ids.iter().map(|id| id.to_string()).collect());
+        };
+        for id in stream_ids {
+            match parse_stream_id(id).and_then(|parsed| group.pending.get_mut(&parsed)) {
+                Some(claim) if claim.consumer == consumer_name => claim.claimed_at = now,
+                _ => lost.push(id.to_string()),
+            }
+        }
+        Ok(lost)
+    }
+}
+
+#[async_trait]
+impl StreamingStore for MemoryStore {
+    // One process: no other instance to coordinate with. These are the
+    // explicit single-process answers (`store::single_process`).
+
+    async fn streaming_claim(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        live: bool,
+        _kind: StreamingKind,
+        _write: StreamingWrite,
+    ) -> Result<StreamingClaim, MediatorError> {
+        single_process::streaming_claim(self, did_hash, mediator_uuid, live).await
+    }
+
+    async fn streaming_release(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        single_process::streaming_release(self, did_hash, mediator_uuid).await
+    }
+
+    async fn streaming_heartbeat(
+        &self,
+        _mediator_uuid: &str,
+        _lifetime: Duration,
+        _prune_after: Duration,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    async fn streaming_dead_instances(
+        &self,
+        mediator_uuids: &[String],
+    ) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; mediator_uuids.len()])
+    }
+
+    async fn streaming_evict(
+        &self,
+        _did_hash: &str,
+        _dead_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    async fn streaming_mux_owned(&self, did_hashes: &[String]) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; did_hashes.len()])
+    }
+
+    async fn monitor_fanout_publish(
+        &self,
+        _scope: &str,
+        _payload: &str,
+    ) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    async fn monitor_fanout_subscribe(
+        &self,
+        _scope: &str,
+    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
+        Ok(None)
+    }
+
+    async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        state
+            .streaming_clients
+            .retain(|_, (uuid, _)| uuid != mediator_uuid);
+        Ok(())
+    }
+
+    async fn streaming_set_state(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        state: StreamingClientState,
+    ) -> Result<(), MediatorError> {
+        let mut s = self.state.lock().await;
+        match state {
+            // Only the owner's leaving removes the entry: another instance
+            // may hold the DID now.
+            StreamingClientState::Deregistered => {
+                if s.streaming_clients
+                    .get(did_hash)
+                    .is_some_and(|(owner, _)| owner == mediator_uuid)
+                {
+                    s.streaming_clients.remove(did_hash);
+                }
+            }
+            other => {
+                s.streaming_clients
+                    .insert(did_hash.to_string(), (mediator_uuid.to_string(), other));
+            }
+        }
+        Ok(())
+    }
+
+    async fn streaming_is_client_live(
+        &self,
+        did_hash: &str,
+        force_delivery: bool,
+    ) -> Option<String> {
+        let state = self.state.lock().await;
+        let (uuid, current) = state.streaming_clients.get(did_hash)?;
+        match current {
+            StreamingClientState::Live => Some(uuid.clone()),
+            StreamingClientState::Registered if force_delivery => Some(uuid.clone()),
+            _ => None,
+        }
+    }
+
+    async fn streaming_publish_message(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+    ) -> Result<(), MediatorError> {
+        self.publish_record(
+            did_hash,
+            mediator_uuid,
+            message,
+            force_delivery,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn streaming_publish_stored(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+        stored: StoredMessageRef,
+    ) -> Result<(), MediatorError> {
+        self.publish_record(
+            did_hash,
+            mediator_uuid,
+            message,
+            force_delivery,
+            false,
+            Some(stored),
+        )
+        .await
+    }
+
+    async fn streaming_publish_verbatim(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+    ) -> Result<(), MediatorError> {
+        self.publish_record(did_hash, mediator_uuid, message, true, true, None)
+            .await
+    }
+
+    async fn streaming_subscribe(
+        &self,
+        mediator_uuid: &str,
+    ) -> Result<broadcast::Receiver<PubSubRecord>, MediatorError> {
+        let mut channels = self.broadcast_channels.lock().await;
+        if let Some(sender) = channels.get(mediator_uuid) {
+            return Ok(sender.subscribe());
+        }
+        let (sender, receiver) = broadcast::channel(self.pubsub_capacity);
+        channels.insert(mediator_uuid.to_string(), sender);
+        Ok(receiver)
+    }
+}
+
+#[async_trait]
+impl MuxStore for MemoryStore {
+    /// One process: no other instance to tell.
+    async fn mux_changes_publish(&self, _record: &MuxChangeRecord) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    /// One process: nothing to hear.
+    async fn mux_changes_subscribe(
+        &self,
+    ) -> Result<Option<broadcast::Receiver<MuxChangeRecord>>, MediatorError> {
+        Ok(None)
+    }
+
+    fn supports_mux(&self) -> bool {
+        true
+    }
+
+    async fn mux_record_get(&self, did_hash: &str) -> Result<Option<MuxDidRecord>, MediatorError> {
+        Ok(self.state.lock().await.mux_records.get(did_hash).cloned())
+    }
+
+    async fn mux_record_cas(
+        &self,
+        did_hash: &str,
+        expected_version: Option<u64>,
+        new: Option<&MuxDidRecord>,
+        index: &MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
+        let mut state = self.state.lock().await;
+        if state.mux_records.get(did_hash).map(|r| r.version) != expected_version {
+            return Ok(false);
+        }
+        match new {
+            Some(rec) => {
+                state.mux_records.insert(did_hash.to_string(), rec.clone());
+            }
+            None => {
+                state.mux_records.remove(did_hash);
+            }
+        }
+        for p in &index.add {
+            state
+                .mux_principals
+                .entry(p.clone())
+                .or_default()
+                .insert(did_hash.to_string());
+        }
+        for p in &index.remove {
+            if let Some(set) = state.mux_principals.get_mut(p) {
+                set.remove(did_hash);
+                if set.is_empty() {
+                    state.mux_principals.remove(p);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn mux_principal_dids(
+        &self,
+        principal_hash: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        let state = self.state.lock().await;
+        let Some(set) = state.mux_principals.get(principal_hash) else {
+            return Ok(Vec::new());
+        };
+        Ok(match after {
+            Some(a) => set
+                .range::<str, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
+                .take(limit)
+                .cloned()
+                .collect(),
+            None => set.iter().take(limit).cloned().collect(),
+        })
+    }
+
+    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .mux_principals
+            .get(principal_hash)
+            .map_or(0, BTreeSet::len))
+    }
+}
+
+#[async_trait]
+impl V1RoutingKeyStore for MemoryStore {
+    fn supports_v1_routing_keys(&self) -> bool {
+        true
+    }
+
+    async fn v1_routing_key_bind(&self, verkey: &str, did: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        match state.v1_routing_keys.get(verkey) {
+            // Idempotent re-bind by the same owner.
+            Some((owner, _)) if owner == did => Ok(()),
+            // Claiming another account's routing key would capture its inbound
+            // v1 traffic; see the trait's security note.
+            Some(_) => Err(MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                "routing verkey is already bound to a different account".into(),
+            )),
+            None => {
+                state.v1_routing_keys.insert(
+                    verkey.to_string(),
+                    (
+                        did.to_string(),
+                        affinidi_messaging_mediator_common::did_identity::did_hash(did),
+                    ),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn v1_routing_key_lookup(&self, verkey: &str) -> Result<Option<String>, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .v1_routing_keys
+            .get(verkey)
+            .map(|(did, _)| did.clone()))
+    }
+
+    async fn v1_routing_key_unbind(&self, verkey: &str) -> Result<bool, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .v1_routing_keys
+            .remove(verkey)
+            .is_some())
+    }
+
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        let mut state = self.state.lock().await;
+        if state
+            .v1_routing_keys
+            .get(verkey)
+            .is_some_and(|(owner, _)| owner == did)
+        {
+            state.v1_routing_keys.remove(verkey);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
+        let state = self.state.lock().await;
+        let mut keys: Vec<String> = state
+            .v1_routing_keys
+            .iter()
+            .filter(|(_, (_, owner_hash))| owner_hash == did_hash)
+            .map(|(verkey, _)| verkey.clone())
+            .collect();
+        // HashMap order is not stable; sort so callers (and tests) see a
+        // deterministic list.
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+#[async_trait]
+impl AuditStore for MemoryStore {
+    async fn audit_log_record(&self, entry: &AuditLogEntry) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        // Newest-first: push to the front, drop the oldest (back) past the cap.
+        state.audit_log.push_front(entry.clone());
+        while state.audit_log.len() > AUDIT_LOG_MAX_ENTRIES {
+            state.audit_log.pop_back();
+        }
+        Ok(())
+    }
+
+    async fn audit_log_list(
+        &self,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<MediatorAuditLogList, MediatorError> {
+        let limit = limit.min(100) as usize;
+        let state = self.state.lock().await;
+        // Already newest-first; page by offset.
+        let entries: Vec<AuditLogEntry> = state
+            .audit_log
+            .iter()
+            .skip(cursor as usize)
+            .take(limit)
+            .cloned()
+            .collect();
+        let next_cursor = if cursor as usize + entries.len() >= state.audit_log.len() {
+            0
+        } else {
+            cursor + entries.len() as u32
+        };
+        Ok(MediatorAuditLogList {
+            entries,
+            cursor: next_cursor,
+        })
+    }
+}
+
+#[async_trait]
+impl AuxiliaryStore for MemoryStore {
+    async fn trust_task_claim(
+        &self,
+        key: &str,
+        digest: &str,
+        retain_until: u64,
+        now: u64,
+    ) -> Result<TrustTaskClaim, MediatorError> {
+        let mut state = self.state.lock().await;
+        match state.trust_task_claims.get(key) {
+            Some((recorded, until)) if *until > now => Ok(if recorded == digest {
+                TrustTaskClaim::Duplicate
+            } else {
+                TrustTaskClaim::Conflict
+            }),
+            // Absent, or lapsed: this is a first sight.
+            _ => {
+                state
+                    .trust_task_claims
+                    .insert(key.to_string(), (digest.to_string(), retain_until));
+                Ok(TrustTaskClaim::Fresh)
+            }
+        }
+    }
+
+    async fn sweep_expired_trust_task_claims(&self, now: u64) -> Result<usize, MediatorError> {
+        let mut state = self.state.lock().await;
+        let before = state.trust_task_claims.len();
+        state.trust_task_claims.retain(|_, (_, until)| *until > now);
+        Ok(before - state.trust_task_claims.len())
+    }
+
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        state
+            .scid_sources
+            .insert(did_hash.to_string(), record.to_string());
+        Ok(())
+    }
+
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .scid_sources
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn wake_handle_set(
+        &self,
+        did_hash: &str,
+        record: Option<&str>,
+    ) -> Result<(), MediatorError> {
+        let mut state = self.state.lock().await;
+        match record {
+            Some(record) => {
+                state
+                    .wake_handles
+                    .insert(did_hash.to_string(), record.to_string());
+            }
+            None => {
+                state.wake_handles.remove(did_hash);
+            }
+        }
+        Ok(())
+    }
+
+    async fn wake_handle_get(&self, did_hash: &str) -> Result<Option<String>, MediatorError> {
+        Ok(self.state.lock().await.wake_handles.get(did_hash).cloned())
+    }
+
+    async fn oob_discovery_store(
+        &self,
+        did_hash: &str,
+        invite_b64: &str,
+        expires_at: u64,
+    ) -> Result<String, MediatorError> {
+        let invite_hash = digest(invite_b64);
+        let mut state = self.state.lock().await;
+        state.oob_invites.insert(
+            invite_hash.clone(),
+            OobInvite {
+                invite_b64: invite_b64.to_string(),
+                did_hash: did_hash.to_string(),
+                expires_at,
+            },
+        );
+        state.incr_counter("OOB_INVITES_CREATED", 1);
+        Ok(invite_hash)
+    }
+
+    async fn oob_discovery_get(
+        &self,
+        oob_id: &str,
+    ) -> Result<Option<(String, String)>, MediatorError> {
+        let now = unix_timestamp_secs();
+        let mut state = self.state.lock().await;
+        let invite = match state.oob_invites.get(oob_id) {
+            Some(i) if i.expires_at == 0 || i.expires_at > now => {
+                Some((i.invite_b64.clone(), i.did_hash.clone()))
+            }
+            Some(_) => {
+                // Expired — remove and return None.
+                state.oob_invites.remove(oob_id);
+                None
+            }
+            None => None,
+        };
+        if invite.is_some() {
+            state.incr_counter("OOB_INVITES_CLAIMED", 1);
+        }
+        Ok(invite)
+    }
+
+    async fn oob_discovery_delete(&self, oob_id: &str) -> Result<bool, MediatorError> {
+        Ok(self.state.lock().await.oob_invites.remove(oob_id).is_some())
+    }
+
+    async fn config_overrides_get(&self) -> Result<Option<String>, MediatorError> {
+        Ok(self.state.lock().await.config_overrides.clone())
+    }
+
+    async fn config_overrides_set(&self, overrides: &str) -> Result<(), MediatorError> {
+        self.state.lock().await.config_overrides = Some(overrides.to_string());
+        Ok(())
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use affinidi_messaging_mediator_common::store::{POISON_ATTEMPTS, SessionState};
+
+    /// Parity with `fjall_store`: the two backends must agree on per-relationship
+    /// accounting, or the gate built on it behaves differently depending on
+    /// which backend a deployment runs. Mirrors
+    /// `peer_queue_counts_are_per_relationship_not_per_sender` and the
+    /// drop-at-zero assertion there.
+    #[tokio::test]
+    async fn peer_queue_counts_are_per_relationship_and_drop_at_zero() {
+        let store = MemoryStore::new();
+        let community = sha256::digest("community");
+
+        // Fan-out: one message each to 250 members.
+        let mut ids = Vec::new();
+        for i in 0..250 {
+            let member = sha256::digest(format!("member-{i}"));
+            ids.push((
+                member.clone(),
+                store
+                    .store_message("s", &format!("card-{i}"), &member, Some(&community), 0, 0)
+                    .await
+                    .expect("store"),
+            ));
+        }
+        for (member, _) in &ids {
+            assert_eq!(
+                store
+                    .peer_queue_count(&community, member)
+                    .await
+                    .expect("peer count"),
+                1,
+                "fan-out must not accumulate against any one relationship"
+            );
+        }
+
+        // Collection drives the count back to zero and drops the entry.
+        for (member, id) in &ids {
+            store
+                .delete_message(
+                    id,
+                    DeletionAuthority::Owner {
+                        did_hash: member.clone(),
+                    },
+                )
+                .await
+                .expect("delete");
+        }
+        for (member, _) in &ids {
+            assert_eq!(
+                store
+                    .peer_queue_count(&community, member)
+                    .await
+                    .expect("peer count"),
+                0
+            );
+        }
+        assert!(
+            store.state.lock().await.peer_queue.is_empty(),
+            "entries must be removed at zero, not left as 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_round_trip() {
+        let store = MemoryStore::new();
+        store.initialize().await.expect("initialize");
+        assert!(matches!(store.health().await, StoreHealth::Healthy));
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_sessions_reclaims_orphans() {
+        let store = MemoryStore::new();
+
+        let expired = Session {
+            session_id: "sid-expired".into(),
+            ..Default::default()
+        };
+        let live = Session {
+            session_id: "sid-live".into(),
+            ..Default::default()
+        };
+        store
+            .put_session(&expired, Duration::from_secs(0))
+            .await
+            .expect("put expired");
+        store
+            .put_session(&live, Duration::from_secs(3600))
+            .await
+            .expect("put live");
+
+        // Let the monotonic clock advance past the 0s-TTL entry.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // `now_secs` is ignored by the in-memory backend (it expires on
+        // `Instant`), so any value is fine here.
+        let report = store.sweep_expired_sessions(0).await.expect("sweep");
+        assert_eq!(report.scanned, 2, "both sessions inspected");
+        assert_eq!(report.expired, 1, "only the expired session removed");
+
+        assert!(
+            store.get_session("sid-expired", "").await.is_err(),
+            "expired session gone"
+        );
+        assert!(
+            store.get_session("sid-live", "").await.is_ok(),
+            "live session retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_and_fetch_message_round_trip() {
+        let store = MemoryStore::new();
+        let to = "alice_hash";
+        let from = "bob_hash";
+
+        let msg_id = store
+            .store_message("session-1", "hello", to, Some(from), 0, 0)
+            .await
+            .expect("store");
+
+        // Owner can fetch.
+        let got = store
+            .get_message(to, &msg_id)
+            .await
+            .expect("get")
+            .expect("message present");
+        assert_eq!(got.msg.as_deref(), Some("hello"));
+        assert_eq!(got.to_address.as_deref(), Some(to));
+        assert_eq!(got.from_address.as_deref(), Some(from));
+
+        // Non-owner sees None (security).
+        let none = store
+            .get_message("eve_hash", &msg_id)
+            .await
+            .expect("get for non-owner");
+        assert!(none.is_none());
+
+        // Inbox listing returns the entry.
+        let list = store
+            .list_messages(to, Folder::Inbox, None, 100)
+            .await
+            .expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].msg_id, msg_id);
+        assert_eq!(list[0].from_address.as_deref(), Some(from));
+
+        // Delete by owner clears stream + body.
+        store
+            .delete_message(
+                &msg_id,
+                DeletionAuthority::Owner {
+                    did_hash: to.to_string(),
+                },
+            )
+            .await
+            .expect("delete");
+        let after_list = store
+            .list_messages(to, Folder::Inbox, None, 100)
+            .await
+            .expect("list after delete");
+        assert!(after_list.is_empty());
+    }
+
+    /// The mediator's message id is the SHA-256 hex digest of the exact stored
+    /// message body. The SDK relies on this when it deletes a *live-delivered*
+    /// frame by `sha256::digest(packed_msg)`: the live path carries no
+    /// attachment id, but the mediator streams the same bytes it stores, so the
+    /// SDK reconstructs this id from the received frame. If this derivation ever
+    /// changes, the SDK's live-delivery auto-delete silently stops matching.
+    #[tokio::test]
+    async fn message_id_is_sha256_of_body() {
+        let store = MemoryStore::new();
+        let body = r#"{"protected":"x","ciphertext":"y"}"#;
+        let msg_id = store
+            .store_message("s", body, "alice", Some("bob"), 0, 0)
+            .await
+            .expect("store");
+        assert_eq!(
+            msg_id,
+            digest(body.as_bytes()),
+            "the mediator message id must equal sha256(body) so the SDK can \
+             reconstruct it from a live-delivered frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_non_owner_non_admin() {
+        let store = MemoryStore::new();
+        let msg_id = store
+            .store_message("s", "hi", "alice", Some("bob"), 0, 0)
+            .await
+            .expect("store");
+        let err = store
+            .delete_message(
+                &msg_id,
+                DeletionAuthority::Owner {
+                    did_hash: "eve".into(),
+                },
+            )
+            .await
+            .expect_err("non-owner delete must fail");
+        // Nothing in eve's queues under that id: not found, the same answer
+        // as for an id that does not exist, so a non-party learns nothing
+        // about another account's messages. The message is untouched.
+        assert!(
+            format!("{err}").contains(ops::DELETE_NOT_FOUND),
+            "got: {err}"
+        );
+        assert!(
+            store
+                .get_message("alice", &msg_id)
+                .await
+                .expect("get_message")
+                .is_some(),
+            "the recipient's message is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_authority_bypasses_ownership() {
+        let store = MemoryStore::new();
+        let msg_id = store
+            .store_message("s", "hi", "alice", Some("bob"), 0, 0)
+            .await
+            .expect("store");
+        store
+            .delete_message(
+                &msg_id,
+                DeletionAuthority::Admin {
+                    admin_did_hash: "admin".into(),
+                },
+            )
+            .await
+            .expect("admin delete");
+    }
+
+    #[tokio::test]
+    async fn fetch_messages_with_optimistic_delete() {
+        let store = MemoryStore::new();
+        for i in 0..5 {
+            store
+                .store_message("s", &format!("msg-{i}"), "alice", Some("bob"), 0, 0)
+                .await
+                .expect("store");
+        }
+        let resp = store
+            .fetch_messages(
+                "s",
+                "alice",
+                &FetchOptions {
+                    limit: 100,
+                    delete_policy: FetchDeletePolicy::Optimistic,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(resp.success.len(), 5);
+        // Inbox should be empty after optimistic delete.
+        let after = store
+            .list_messages("alice", Folder::Inbox, None, 100)
+            .await
+            .expect("list");
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle() {
+        let store = MemoryStore::new();
+        let did = "did:peer:test";
+        let did_hash = digest(did);
+        let session = Session {
+            session_id: "sid-1".into(),
+            challenge: "abc".into(),
+            state: SessionState::ChallengeSent,
+            did: did.into(),
+            did_hash: did_hash.clone(),
+            ..Default::default()
+        };
+        store
+            .put_session(&session, Duration::from_secs(60))
+            .await
+            .expect("put");
+
+        let got = store.get_session("sid-1", did).await.expect("get");
+        assert_eq!(got.session_id, "sid-1");
+        assert_eq!(got.challenge, "abc");
+        // Regression guard: did/did_hash must round-trip. A backend that
+        // loses these fields silently misroutes WebSocket messages and
+        // breaks the JWT auth → handler hand-off.
+        assert_eq!(got.did, did, "did must round-trip through put/get");
+        assert_eq!(
+            got.did_hash, did_hash,
+            "did_hash must round-trip through put/get"
+        );
+
+        store.delete_session("sid-1").await.expect("delete");
+        let missing = store.get_session("sid-1", did).await;
+        assert!(missing.is_err(), "deleted session must error");
+    }
+
+    #[tokio::test]
+    async fn auth_session_flow_end_to_end() {
+        let store = MemoryStore::new();
+        crate::store::auth_flow_harness::run_auth_session_flow(&store).await;
+    }
+
+    #[tokio::test]
+    async fn account_stats() {
+        let store = MemoryStore::new();
+        crate::store::activity_harness::run_account_stats(&store).await;
+    }
+
+    #[tokio::test]
+    async fn account_activity() {
+        let store = MemoryStore::new();
+        crate::store::activity_harness::run_account_activity(&store).await;
+    }
+
+    #[tokio::test]
+    async fn session_auth_rename_preserves_did() {
+        // Full challenge → authenticated rename flow. Catches the bug
+        // where `update_session_authenticated` rewrites the session
+        // with an empty `did` because the trait default passed
+        // did_hash to get_session (which expects raw did) and the
+        // resulting "not found" error was swallowed by `unwrap_or_else`.
+        let store = MemoryStore::new();
+        let did = "did:peer:test-auth-rename";
+        let challenge_id = "challenge-sid";
+        let new_id = "authed-sid";
+
+        // Pre-create the account so get_session can join successfully.
+        store
+            .account_add("dummy", &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
+
+        // Step 1: challenge — write a ChallengeSent session with did set.
+        let challenge_session = Session {
+            session_id: challenge_id.into(),
+            challenge: "abc".into(),
+            state: SessionState::ChallengeSent,
+            did: did.into(),
+            did_hash: digest(did),
+            ..Default::default()
+        };
+        store
+            .put_session(&challenge_session, Duration::from_secs(900))
+            .await
+            .expect("put challenge session");
+
+        // Step 2: the DID gets its account, then the session is promoted
+        // to Authenticated under a new session_id.
+        store
+            .account_add(&digest(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
+        store
+            .update_session_authenticated(challenge_id, new_id, did, "refresh-hash-xyz")
+            .await
+            .expect("update_session_authenticated");
+
+        // Step 3: read the new session and assert did is preserved.
+        let got = store
+            .get_session(new_id, did)
+            .await
+            .expect("get authenticated session");
+        assert_eq!(got.session_id, new_id);
+        assert_eq!(
+            got.did, did,
+            "did must survive update_session_authenticated"
+        );
+        assert_eq!(
+            got.did_hash,
+            digest(did),
+            "did_hash must survive update_session_authenticated"
+        );
+        assert_eq!(got.state, SessionState::Authenticated);
+        assert_eq!(got.refresh_token_hash.as_deref(), Some("refresh-hash-xyz"));
+    }
+
+    #[tokio::test]
+    async fn refresh_token_rotation_preserves_did_and_state() {
+        // Catches the bug where `update_refresh_token_hash`'s trait
+        // default did `get_session(session_id, "")` (empty did →
+        // ROLE_TYPE missing on `DID:<sha256("")>`), the resulting
+        // Err was caught by `unwrap_or_else`, a default Session was
+        // substituted (state=Unknown, did=""), and `put_session`
+        // wrote that corrupt default back.
+        let store = MemoryStore::new();
+        let did = "did:peer:refresh-test";
+        let sid = "auth-sid-1";
+        store
+            .account_add(&digest(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
+
+        let session = Session {
+            session_id: sid.into(),
+            challenge: "abc".into(),
+            state: SessionState::Authenticated,
+            did: did.into(),
+            did_hash: digest(did),
+            authenticated: true,
+            refresh_token_hash: Some("hash-1".into()),
+            ..Default::default()
+        };
+        store
+            .put_session(&session, Duration::from_secs(86_400))
+            .await
+            .expect("put");
+
+        // Rotate the refresh-token hash. Must NOT corrupt did/state.
+        store
+            .update_refresh_token_hash(sid, "hash-2")
+            .await
+            .expect("update_refresh_token_hash");
+
+        let got = store.get_session(sid, did).await.expect("get");
+        assert_eq!(got.did, did, "did must survive refresh-hash rotation");
+        assert_eq!(
+            got.state,
+            SessionState::Authenticated,
+            "state must stay Authenticated"
+        );
+        assert_eq!(got.refresh_token_hash.as_deref(), Some("hash-2"));
+
+        // Reading the field directly must also work without spurious errors.
+        let read = store
+            .get_refresh_token_hash(sid)
+            .await
+            .expect("get_refresh_token_hash");
+        assert_eq!(read.as_deref(), Some("hash-2"));
+    }
+
+    #[tokio::test]
+    async fn session_expires_lazily() {
+        let store = MemoryStore::new();
+        let session = Session {
+            session_id: "sid-2".into(),
+            ..Default::default()
+        };
+        // Tiny TTL — already expired by the time we read.
+        store
+            .put_session(&session, Duration::from_millis(1))
+            .await
+            .expect("put");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let result = store.get_session("sid-2", "").await;
+        assert!(result.is_err(), "expired session must not return");
+    }
+
+    #[tokio::test]
+    async fn account_crud() {
+        let store = MemoryStore::new();
+        let acls = MediatorACLSet::default();
+        store
+            .account_add("did_hash_1", &acls, Some(50))
+            .await
+            .expect("add");
+        assert!(store.account_exists("did_hash_1").await.unwrap());
+        let got = store
+            .account_get("did_hash_1")
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(got.did_hash, "did_hash_1");
+
+        store
+            .account_set_role("did_hash_1", &AccountType::Admin)
+            .await
+            .expect("set_role");
+        assert!(store.check_admin_account("did_hash_1").await.unwrap());
+
+        let list = store.account_list(0, 10).await.expect("list");
+        assert_eq!(list.accounts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn access_list_round_trip() {
+        let store = MemoryStore::new();
+        store
+            .account_add("alice", &MediatorACLSet::default(), None)
+            .await
+            .expect("add");
+
+        let resp = store
+            .access_list_add(100, "alice", &["bob".into(), "charlie".into()])
+            .await
+            .expect("add");
+        assert_eq!(resp.did_hashes.len(), 2);
+        assert!(!resp.truncated);
+        assert_eq!(
+            store
+                .access_list_list("alice", 0)
+                .await
+                .unwrap()
+                .did_hashes
+                .len(),
+            2
+        );
+
+        let got = store
+            .access_list_get("alice", &["bob".into(), "eve".into()])
+            .await
+            .expect("get");
+        assert_eq!(got.did_hashes, vec!["bob"]);
+
+        let removed = store
+            .access_list_remove("alice", &["bob".into()])
+            .await
+            .expect("remove");
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store
+                .access_list_list("alice", 0)
+                .await
+                .unwrap()
+                .did_hashes
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_queue_enqueue_read_ack() {
+        let store = MemoryStore::new();
+        let entry = ForwardQueueEntry {
+            stream_id: String::new(),
+            message: "encrypted".into(),
+            to_did_hash: "to".into(),
+            from_did_hash: "from".into(),
+            from_did: "did:from".into(),
+            to_did: "did:to".into(),
+            endpoint_url: "http://example".into(),
+            received_at_ms: 0,
+            delay_milli: 0,
+            expires_at: 0,
+            retry_count: 0,
+            hop_count: 0,
+            not_before_ms: 0,
+        };
+        let id = store
+            .forward_queue_enqueue(&entry, 0)
+            .await
+            .expect("enqueue");
+        assert_eq!(store.forward_queue_len().await.unwrap(), 1);
+
+        let entries = store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].stream_id, id);
+
+        store.forward_queue_ack("g", &[&id]).await.expect("ack");
+        // After ack, the consumer group's `last_delivered` is past
+        // this entry, so a re-read returns nothing.
+        let again = store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read after ack");
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_publish_subscribe_round_trip() {
+        let store = MemoryStore::new();
+        let mut rx = store.streaming_subscribe("uuid").await.expect("subscribe");
+        store
+            .streaming_publish_message("did", "uuid", "payload", false)
+            .await
+            .expect("publish");
+        let msg = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv error");
+        assert_eq!(msg.message, "payload");
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_messages_drains_index() {
+        let store = MemoryStore::new();
+        let now = unix_timestamp_secs();
+        // Three messages, one expired, one current, one future.
+        store
+            .store_message("s", "old", "alice", Some("bob"), now - 10, 0)
+            .await
+            .expect("store");
+        store
+            .store_message("s", "expiring-now", "alice", Some("bob"), now, 0)
+            .await
+            .expect("store");
+        store
+            .store_message("s", "future", "alice", Some("bob"), now + 1000, 0)
+            .await
+            .expect("store");
+
+        let report = store
+            .sweep_expired_messages(now, "admin")
+            .await
+            .expect("sweep");
+        assert_eq!(report.expired, 2, "two messages should expire at <= now");
+        assert!(report.timeslots_swept >= 1);
+
+        // The remaining message is still fetchable.
+        let list = store
+            .list_messages("alice", Folder::Inbox, None, 100)
+            .await
+            .expect("list");
+        assert_eq!(list.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stats_increment_round_trip() {
+        let store = MemoryStore::new();
+        store
+            .stats_increment(StatCounter::WebsocketOpen, 1)
+            .await
+            .expect("incr");
+        store
+            .stats_increment(StatCounter::WebsocketOpen, 2)
+            .await
+            .expect("incr");
+        let stats = store.get_global_stats().await.expect("stats");
+        assert_eq!(stats.websocket_open, 3);
+    }
+
+    #[tokio::test]
+    async fn oob_invite_round_trip() {
+        let store = MemoryStore::new();
+        let now = unix_timestamp_secs();
+        let id = store
+            .oob_discovery_store("alice", "invite-data-base64", now + 60)
+            .await
+            .expect("store");
+        let got = store
+            .oob_discovery_get(&id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(got.0, "invite-data-base64");
+        assert_eq!(got.1, "alice");
+    }
+
+    /// End-to-end filtered purge against a real store, placed in this module
+    /// because the storage CI job runs `--lib "store::memory_store"` — a test
+    /// of backend behaviour anywhere else would compile in one job and run in
+    /// none.
+    #[tokio::test]
+    async fn a_filtered_purge_removes_only_the_named_peer() {
+        use affinidi_messaging_mediator_common::store::PurgeFilter;
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob", "carol"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        // alice -> bob twice, alice -> carol once.
+        for (n, to) in [("m1", "bob"), ("m2", "bob"), ("m3", "carol")] {
+            store
+                .store_message("s", n, to, Some("alice"), 0, 0)
+                .await
+                .expect("store");
+        }
+
+        let filter = PurgeFilter {
+            peer: Some("bob".into()),
+            ..Default::default()
+        };
+        let report = store
+            .purge_folder_filtered("alice", Folder::Outbox, &filter)
+            .await
+            .expect("purge");
+
+        assert_eq!(report.count, 2, "both messages for bob");
+        assert_eq!(report.scanned, 3, "carol's was examined and kept");
+        assert!(report.bytes > 0);
+
+        // Carol's message survives, in both directions.
+        let left = store
+            .list_messages("alice", Folder::Outbox, None, 100)
+            .await
+            .expect("list");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].to_address.as_deref(), Some("carol"));
+        assert_eq!(
+            store
+                .list_messages("carol", Folder::Inbox, None, 100)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "purging alice's outbox for bob must not touch carol's inbox"
+        );
+    }
+
+    /// A purge must never report a message as removed when the delete refused.
+    /// Telling an operator the queue is emptier than it is, while they are
+    /// reaching for this precisely because a full queue is causing an outage,
+    /// is the one lie a recovery tool must not tell.
+    #[tokio::test]
+    async fn a_refused_delete_is_reported_as_failed_not_purged() {
+        use affinidi_messaging_mediator_common::store::{
+            DeletionAuthority, PurgeFilter, PurgeReport,
+        };
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob", "carol"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let id = store
+            .store_message("s", "m1", "bob", Some("alice"), 0, 0)
+            .await
+            .expect("store");
+
+        // A message alice sent to bob. Carol owns neither end, so a delete by
+        // carol of bob's copy is refused rather than "already gone". (By id
+        // alone it would be not-found: nothing in carol's queues.)
+        let refused = store
+            .delete_message_in(
+                &id,
+                MessageScope::Recipient("bob"),
+                DeletionAuthority::Owner {
+                    did_hash: "carol".to_string(),
+                },
+            )
+            .await;
+        let err = refused.expect_err("carol may not delete alice's message");
+        assert!(
+            !ops::is_delete_not_found(&err),
+            "this must be a refusal, not an already-gone, or the test proves \
+             nothing about the failure path. Got: {err}"
+        );
+
+        // Carol's own outbox is empty, so nothing is touched either way — the
+        // point is that alice's message survives.
+        let report: PurgeReport = store
+            .purge_folder_filtered("carol", Folder::Outbox, &PurgeFilter::default())
+            .await
+            .expect("purge");
+        assert_eq!(report.count, 0);
+        assert_eq!(report.failed, 0);
+        assert!(
+            store
+                .list_messages("alice", Folder::Outbox, None, 10)
+                .await
+                .expect("list")
+                .len()
+                == 1,
+            "alice's message must survive carol's purge"
+        );
+    }
+
+    /// The already-gone case is NOT a failure: the caller asked for the message
+    /// to be absent and it is. The filtered purge tells it apart from a real
+    /// refusal by the problem report's descriptor, and clients read the same
+    /// descriptor out of the per-id error text `DELETE /messages` returns —
+    /// the SDK's deletion handler logs anything else as a refusal. So both are
+    /// pinned here, and must match what the Redis backend produces.
+    #[tokio::test]
+    async fn an_already_gone_message_reports_not_found() {
+        use affinidi_messaging_mediator_common::store::DeletionAuthority;
+
+        let store = MemoryStore::new();
+        let err = store
+            .delete_message(
+                "not-a-message",
+                DeletionAuthority::Owner {
+                    did_hash: "alice".to_string(),
+                },
+            )
+            .await
+            .expect_err("deleting an absent message reports not-found");
+        assert!(ops::is_delete_not_found(&err), "got: {err}");
+        assert!(
+            err.to_string().contains(ops::DELETE_NOT_FOUND),
+            "clients match the descriptor in the error text. Got: {err}"
+        );
+    }
+
+    /// A dry run is the difference between a recovery tool and a second
+    /// incident: it must report exactly what the real purge would remove, and
+    /// remove nothing.
+    #[tokio::test]
+    async fn a_dry_run_reports_without_removing() {
+        use affinidi_messaging_mediator_common::store::PurgeFilter;
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        for n in ["m1", "m2"] {
+            store
+                .store_message("s", n, "bob", Some("alice"), 0, 0)
+                .await
+                .expect("store");
+        }
+
+        let dry = PurgeFilter {
+            dry_run: true,
+            ..Default::default()
+        };
+        let report = store
+            .purge_folder_filtered("alice", Folder::Outbox, &dry)
+            .await
+            .expect("dry run");
+        assert_eq!(report.count, 2);
+        assert_eq!(
+            store
+                .list_messages("alice", Folder::Outbox, None, 100)
+                .await
+                .expect("list")
+                .len(),
+            2,
+            "a dry run must not remove anything"
+        );
+
+        // The same filter without dry_run removes exactly what was reported.
+        let wet = PurgeFilter::default();
+        let report2 = store
+            .purge_folder_filtered("alice", Folder::Outbox, &wet)
+            .await
+            .expect("purge");
+        assert_eq!(report2.count, report.count, "the dry run predicted this");
+        assert!(
+            store
+                .list_messages("alice", Folder::Outbox, None, 100)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    /// The walk must page past entries it does not match. With more messages
+    /// than one page and a filter that rejects most of them, restarting from
+    /// the beginning each round would never terminate.
+    #[tokio::test]
+    async fn a_narrow_filter_over_many_pages_terminates_and_keeps_the_rest() {
+        use affinidi_messaging_mediator_common::store::PurgeFilter;
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob", "carol"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        // 250 for carol (kept) and 3 for bob (purged), interleaved so the
+        // matches are not all on the first page.
+        for i in 0..250 {
+            store
+                .store_message("s", &format!("c{i}"), "carol", Some("alice"), 0, 0)
+                .await
+                .expect("store");
+            if i % 100 == 0 {
+                store
+                    .store_message("s", &format!("b{i}"), "bob", Some("alice"), 0, 0)
+                    .await
+                    .expect("store");
+            }
+        }
+
+        let filter = PurgeFilter {
+            peer: Some("bob".into()),
+            ..Default::default()
+        };
+        let report = store
+            .purge_folder_filtered("alice", Folder::Outbox, &filter)
+            .await
+            .expect("purge");
+
+        assert_eq!(report.count, 3);
+        assert_eq!(report.scanned, 253, "every entry was examined exactly once");
+        assert_eq!(
+            store
+                .list_messages("alice", Folder::Outbox, None, 1_000)
+                .await
+                .expect("list")
+                .len(),
+            250
+        );
+    }
+
+    /// The keystone this whole change exists for: the mediator can now tell a
+    /// message nobody has collected from one that has been collected and never
+    /// released. Before this the two were indistinguishable, which is why
+    /// "delivered but still queued against its sender" had no name.
+    #[tokio::test]
+    async fn delivery_is_recorded_and_the_first_stamp_is_kept() {
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let id = store
+            .store_message("s", "hello", "bob", Some("alice"), 0, 0)
+            .await
+            .expect("store");
+
+        // Never collected: known to be undelivered, which is a different claim
+        // from "delivered zero times ago".
+        let state = store
+            .delivery_state("bob", &id)
+            .await
+            .expect("state")
+            .expect("exists");
+        assert!(!state.delivered());
+        assert_eq!(state.attempts, 0);
+        assert_eq!(state.since_first_delivery_secs(10_000), None);
+
+        store
+            .mark_delivered("bob", std::slice::from_ref(&id), 1_000, 0)
+            .await
+            .expect("mark");
+        let state = store
+            .delivery_state("bob", &id)
+            .await
+            .expect("state")
+            .expect("exists");
+        assert!(state.delivered());
+        assert_eq!(state.first_delivered_at_ms, Some(1_000));
+        assert_eq!(state.attempts, 1);
+
+        // Redelivery bumps the count but must NOT move the first stamp —
+        // eviction and ageing key off when it was FIRST handed over, so a
+        // reconnecting client would otherwise keep resetting its own clock.
+        store
+            .mark_delivered("bob", std::slice::from_ref(&id), 5_000, 0)
+            .await
+            .expect("mark");
+        let state = store
+            .delivery_state("bob", &id)
+            .await
+            .expect("state")
+            .expect("exists");
+        assert_eq!(
+            state.first_delivered_at_ms,
+            Some(1_000),
+            "first stamp is sticky"
+        );
+        assert_eq!(state.attempts, 2);
+        assert_eq!(state.since_first_delivery_secs(61_000), Some(60));
+    }
+
+    /// Marking is best-effort by contract: a message deleted between the read
+    /// and the mark is simply gone, and that must not be an error — the pickup
+    /// it belonged to already succeeded.
+    #[tokio::test]
+    async fn marking_a_vanished_message_is_not_an_error() {
+        let store = MemoryStore::new();
+        store
+            .mark_delivered("bob", &["never-existed".to_string()], 1_000, 0)
+            .await
+            .expect("marking an absent message must not fail a delivery");
+        assert!(
+            store
+                .delivery_state("bob", "never-existed")
+                .await
+                .expect("state")
+                .is_none(),
+            "a message that does not exist has no delivery state, which is not the \
+             same as an undelivered one"
+        );
+    }
+
+    /// Item 1 + 3: a message the recipient has collected stops occupying its
+    /// sender's allowance for a week. The sweeper does the deleting — this just
+    /// brings the deadline forward — so the whole feature reuses the expiry
+    /// index and sweeper that already exist.
+    #[tokio::test]
+    async fn a_delivered_message_expires_on_the_shorter_clock() {
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        // Expires in a week.
+        let week = 7 * 24 * 60 * 60;
+        let id = store
+            .store_message("s", "hello", "bob", Some("alice"), week, 0)
+            .await
+            .expect("store");
+
+        // Delivered at t=0 with a one-hour delivered TTL.
+        let report = store
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 3_600)
+            .await
+            .expect("mark");
+        assert_eq!(report.first_delivered, 1);
+        assert_eq!(report.expiry_advanced, 1);
+
+        // Nothing is due before the shortened deadline...
+        let swept = store
+            .sweep_expired_messages(3_599, "admin")
+            .await
+            .expect("sweep");
+        assert_eq!(swept.expired, 0);
+        assert!(
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_some(),
+            "still held before its shortened deadline"
+        );
+
+        // ...and it goes at the shortened deadline, not in a week.
+        let swept = store
+            .sweep_expired_messages(3_600, "admin")
+            .await
+            .expect("sweep");
+        assert_eq!(swept.expired, 1);
+        assert!(
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_none()
+        );
+    }
+
+    /// Off by default. A deployment that does not opt in keeps the behaviour it
+    /// had, because shortening this is a real reduction in durability.
+    #[tokio::test]
+    async fn a_ttl_of_zero_leaves_the_deadline_alone() {
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let week = 7 * 24 * 60 * 60;
+        let id = store
+            .store_message("s", "hello", "bob", Some("alice"), week, 0)
+            .await
+            .expect("store");
+
+        let report = store
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 0)
+            .await
+            .expect("mark");
+        assert_eq!(report.expiry_advanced, 0);
+
+        let swept = store
+            .sweep_expired_messages(3_600, "admin")
+            .await
+            .expect("sweep");
+        assert_eq!(swept.expired, 0, "no shortening without the limit set");
+        assert!(
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_some()
+        );
+    }
+
+    /// **The bug this design exists to avoid.** A client that reconnects often
+    /// would otherwise keep pushing its sender's deadline out, pinning that
+    /// sender's allowance indefinitely — the mirror of the problem being
+    /// fixed. Only the first handover moves it.
+    #[tokio::test]
+    async fn a_redelivery_does_not_push_the_deadline_out() {
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let week = 7 * 24 * 60 * 60;
+        let id = store
+            .store_message("s", "hello", "bob", Some("alice"), week, 0)
+            .await
+            .expect("store");
+
+        store
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 3_600)
+            .await
+            .expect("first");
+        // Redelivered much later; must not move the deadline to t+3600 again.
+        let report = store
+            .mark_delivered("bob", std::slice::from_ref(&id), 3_000_000, 3_600)
+            .await
+            .expect("redelivery");
+        assert_eq!(report.first_delivered, 0);
+        assert_eq!(report.redelivered, 1);
+        assert_eq!(
+            report.expiry_advanced, 0,
+            "a redelivery must not re-arm the deadline"
+        );
+
+        let swept = store
+            .sweep_expired_messages(3_600, "admin")
+            .await
+            .expect("sweep");
+        assert_eq!(
+            swept.expired, 1,
+            "the ORIGINAL shortened deadline still holds"
+        );
+    }
+
+    /// A client-set expiry is a promise the mediator must not extend. If the
+    /// message already dies sooner than the delivered TTL would allow, it keeps
+    /// its own deadline.
+    #[tokio::test]
+    async fn a_sooner_expiry_is_never_extended() {
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        // Expires in 60s; the delivered TTL would put it at 3600s.
+        let id = store
+            .store_message("s", "hello", "bob", Some("alice"), 60, 0)
+            .await
+            .expect("store");
+
+        let report = store
+            .mark_delivered("bob", std::slice::from_ref(&id), 0, 3_600)
+            .await
+            .expect("mark");
+        assert_eq!(
+            report.expiry_advanced, 0,
+            "the message already expires sooner; nothing to bring forward"
+        );
+
+        let swept = store
+            .sweep_expired_messages(60, "admin")
+            .await
+            .expect("sweep");
+        assert_eq!(swept.expired, 1, "its own 60s deadline still applies");
+    }
+
+    /// Poison is **classified, not acted on**. `attempts` is recipient-driven,
+    /// so evicting on it would let a recipient destroy a sender's messages by
+    /// collecting them repeatedly. The counter rises; nothing else changes.
+    #[tokio::test]
+    async fn repeated_redelivery_is_reported_and_changes_nothing() {
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let week = 7 * 24 * 60 * 60;
+        let id = store
+            .store_message("s", "hello", "bob", Some("alice"), week, 0)
+            .await
+            .expect("store");
+
+        // Well past the poison threshold, with the shortening OFF so nothing
+        // else can be responsible for a change.
+        let mut suspected = 0;
+        for _ in 0..(POISON_ATTEMPTS + 3) {
+            suspected += store
+                .mark_delivered("bob", std::slice::from_ref(&id), 0, 0)
+                .await
+                .expect("mark")
+                .poison_suspected;
+        }
+        assert!(
+            suspected > 0,
+            "a repeatedly redelivered message is reported"
+        );
+
+        // And it is still there: classification does not evict.
+        let swept = store
+            .sweep_expired_messages(week - 1, "admin")
+            .await
+            .expect("sweep");
+        assert_eq!(swept.expired, 0);
+        let state = store
+            .delivery_state("bob", &id)
+            .await
+            .expect("state")
+            .expect("exists");
+        assert!(state.attempts >= POISON_ATTEMPTS);
+    }
+
+    /// End-to-end through a real store: a sender's backlog no longer hides the
+    /// sender behind it. Before this, a pickup of two returned alice's first
+    /// two and bob waited.
+    #[tokio::test]
+    async fn a_fair_pickup_reaches_past_one_senders_backlog() {
+        use affinidi_messaging_mediator_common::types::messages::FetchOptions;
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob", "carol"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        // alice queues four for carol, then bob queues one.
+        for n in ["a1", "a2", "a3", "a4"] {
+            store
+                .store_message("s", n, "carol", Some("alice"), 0, 0)
+                .await
+                .expect("store");
+        }
+        store
+            .store_message("s", "b1", "carol", Some("bob"), 0, 0)
+            .await
+            .expect("store");
+
+        let fetched = store
+            .fetch_messages_delivering(
+                "s",
+                "carol",
+                &FetchOptions {
+                    limit: 2,
+                    ..Default::default()
+                },
+                0,
+                0,
+                true,
+            )
+            .await
+            .expect("fetch");
+
+        let senders: Vec<Option<&str>> = fetched
+            .success
+            .iter()
+            .map(|m| m.from_address.as_deref())
+            .collect();
+        assert_eq!(
+            senders,
+            vec![Some("alice"), Some("bob")],
+            "bob must get a turn rather than queueing behind alice's backlog"
+        );
+    }
+
+    /// The same pickup with fairness off is strict arrival order — so the
+    /// escape hatch actually does something, and the difference is exactly
+    /// what it claims to be.
+    #[tokio::test]
+    async fn fairness_off_serves_the_queue_head_first() {
+        use affinidi_messaging_mediator_common::types::messages::FetchOptions;
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob", "carol"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        for n in ["a1", "a2"] {
+            store
+                .store_message("s", n, "carol", Some("alice"), 0, 0)
+                .await
+                .expect("store");
+        }
+        store
+            .store_message("s", "b1", "carol", Some("bob"), 0, 0)
+            .await
+            .expect("store");
+
+        let fetched = store
+            .fetch_messages_delivering(
+                "s",
+                "carol",
+                &FetchOptions {
+                    limit: 2,
+                    ..Default::default()
+                },
+                0,
+                0,
+                false,
+            )
+            .await
+            .expect("fetch");
+
+        let senders: Vec<Option<&str>> = fetched
+            .success
+            .iter()
+            .map(|m| m.from_address.as_deref())
+            .collect();
+        assert_eq!(senders, vec![Some("alice"), Some("alice")]);
+    }
+
+    /// A paging caller keeps stream order even with fairness on: a round-robin
+    /// result is not a contiguous range, so "continue after the last id" would
+    /// silently skip messages.
+    #[tokio::test]
+    async fn a_paging_fetch_keeps_stream_order() {
+        use affinidi_messaging_mediator_common::types::messages::FetchOptions;
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob", "carol"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        for n in ["a1", "a2"] {
+            store
+                .store_message("s", n, "carol", Some("alice"), 0, 0)
+                .await
+                .expect("store");
+        }
+        store
+            .store_message("s", "b1", "carol", Some("bob"), 0, 0)
+            .await
+            .expect("store");
+
+        // Page from the very beginning: still stream order, because start_id
+        // is set at all.
+        let fetched = store
+            .fetch_messages_delivering(
+                "s",
+                "carol",
+                &FetchOptions {
+                    limit: 2,
+                    start_id: Some("-".to_string()),
+                    ..Default::default()
+                },
+                0,
+                0,
+                true,
+            )
+            .await
+            .expect("fetch");
+        let senders: Vec<Option<&str>> = fetched
+            .success
+            .iter()
+            .map(|m| m.from_address.as_deref())
+            .collect();
+        assert_eq!(
+            senders,
+            vec![Some("alice"), Some("alice")],
+            "a paging caller must not get an interleaved, non-contiguous result"
+        );
+    }
+
+    /// An optimistic fetch deletes as it reads, so there is nothing left to
+    /// stamp — and on Redis stamping anyway would resurrect the message's
+    /// metadata hash as a permanent orphan, because `HSETNX` creates a missing
+    /// key. The skip lives in the shared wrapper, so this pins it for every
+    /// backend.
+    #[tokio::test]
+    async fn an_optimistic_fetch_records_nothing_because_nothing_remains() {
+        use affinidi_messaging_mediator_common::types::messages::{
+            FetchDeletePolicy, FetchOptions,
+        };
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let id = store
+            .store_message("s", "one", "bob", Some("alice"), 0, 0)
+            .await
+            .expect("store");
+
+        let fetched = store
+            .fetch_messages_delivering(
+                "s",
+                "bob",
+                &FetchOptions {
+                    limit: 10,
+                    delete_policy: FetchDeletePolicy::Optimistic,
+                    ..Default::default()
+                },
+                7_000,
+                0,
+                false,
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(fetched.success.len(), 1);
+
+        // The message is gone, so it has no delivery state — not a default
+        // one, and emphatically not a resurrected record.
+        assert!(
+            store
+                .delivery_state("bob", &id)
+                .await
+                .expect("state")
+                .is_none(),
+            "an optimistically fetched message is deleted; marking it would \
+             recreate metadata for a message that no longer exists"
+        );
+    }
+
+    /// The wrapper the five delivery paths call: fetching hands the messages
+    /// over, so fetching is what records the handover.
+    #[tokio::test]
+    async fn fetching_records_delivery_for_what_came_back() {
+        use affinidi_messaging_mediator_common::types::messages::FetchOptions;
+
+        let store = MemoryStore::new();
+        for did in ["alice", "bob"] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let a = store
+            .store_message("s", "one", "bob", Some("alice"), 0, 0)
+            .await
+            .expect("store");
+        let b = store
+            .store_message("s", "two", "bob", Some("alice"), 0, 0)
+            .await
+            .expect("store");
+
+        let fetched = store
+            .fetch_messages_delivering(
+                "s",
+                "bob",
+                &FetchOptions {
+                    limit: 10,
+                    ..Default::default()
+                },
+                7_000,
+                0,
+                false,
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(fetched.success.len(), 2);
+
+        for id in [&a, &b] {
+            let state = store
+                .delivery_state("bob", id)
+                .await
+                .expect("state")
+                .expect("exists");
+            assert_eq!(
+                state.first_delivered_at_ms,
+                Some(7_000),
+                "a fetched message has been handed over"
+            );
+            assert_eq!(state.attempts, 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod idempotent_store_tests {
+    use super::*;
+
+    /// Same regression as the Fjall backend's: a re-submitted message is
+    /// stored and counted once, so its one delete leaves nothing behind.
+    #[tokio::test]
+    async fn a_resubmitted_message_is_stored_and_counted_once() {
+        let store = MemoryStore::new();
+        let (to, from) = (digest("vta"), digest("control"));
+        let a = store
+            .store_message("s", "same-bytes", &to, Some(&from), 0, 0)
+            .await
+            .expect("first store");
+        store
+            .store_message("s", "same-bytes", &to, Some(&from), 0, 0)
+            .await
+            .expect("re-submitted store");
+        store
+            .delete_message(
+                &a,
+                DeletionAuthority::Owner {
+                    did_hash: to.clone(),
+                },
+            )
+            .await
+            .expect("delete");
+        let sender = store.account_get(&from).await.unwrap().unwrap_or_default();
+        assert_eq!(sender.send_queue_count, 0, "the sender count must not leak");
+        assert_eq!(store.peer_queue_count(&from, &to).await.unwrap(), 0);
+    }
+}

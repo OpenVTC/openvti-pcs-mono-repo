@@ -1,0 +1,806 @@
+use ratatui::{
+    layout::Constraint,
+    style::{Color, Modifier, Style},
+    widgets::{Block, Cell, Row, Table},
+};
+use vta_sdk::client::{AddWebvhServerRequest, CreateDidWebvhRequest, UpdateWebvhServerRequest};
+use vta_sdk::prelude::*;
+
+use crate::display::{
+    NAME_HEADER, NameBook, book_from_webvh_servers, did_cell, full_display_pairs, name_cell,
+};
+
+use crate::render::{
+    CYAN, DIM, GREEN, RESET, YELLOW, is_full_display, print_full_entry_owned,
+    print_full_list_title, print_widget,
+};
+
+pub async fn cmd_webvh_server_add(
+    client: &VtaClient,
+    id: String,
+    did: String,
+    label: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = AddWebvhServerRequest { id, did, label };
+    let record = client.add_webvh_server(req).await?;
+    println!("WebVH server added:");
+    println!("  ID:  {}", record.id);
+    println!("  DID: {}", record.did);
+    if let Some(label) = &record.label {
+        println!("  Label: {label}");
+    }
+    Ok(())
+}
+
+pub async fn cmd_webvh_server_list(client: &VtaClient) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.list_webvh_servers().await?;
+    // JSON under --json or off a terminal, like every read (#2588).
+    if crate::render::is_json_output() {
+        crate::render::print_json(&resp)?;
+        return Ok(());
+    }
+
+    if resp.servers.is_empty() {
+        println!("No WebVH servers configured.");
+        return Ok(());
+    }
+
+    // A hosting server's `label` is its name. Routing it through the book
+    // rather than printing it directly means a verified agent name will
+    // outrank it once these DIDs publish one.
+    let mut book = NameBook::new();
+    book_from_webvh_servers(&mut book, &resp.servers);
+
+    if is_full_display() {
+        print_full_list_title("WebVH Servers", resp.servers.len());
+        for s in &resp.servers {
+            let created = s
+                .created_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+                .to_string();
+            let mut fields = vec![("ID", s.id.clone())];
+            fields.extend(full_display_pairs(&book, &s.did));
+            fields.push(("Created", created));
+            print_full_entry_owned(&fields);
+        }
+        return Ok(());
+    }
+
+    let header_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let header = Row::new(vec!["ID", NAME_HEADER, "DID", "Created"])
+        .style(header_style)
+        .bottom_margin(1);
+
+    let rows: Vec<Row> = resp
+        .servers
+        .iter()
+        .map(|s| {
+            let created = s
+                .created_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
+
+            Row::new(vec![
+                Cell::from(s.id.clone()),
+                name_cell(&book, &s.did),
+                did_cell(&s.did),
+                Cell::from(created).style(Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
+
+    let title = format!(" WebVH Servers ({}) ", resp.servers.len());
+
+    // Column order is ID, Name, DID, Created — as the header and the rows
+    // above build it. The widths were written against a different order (their
+    // own comments still said "DID, Label"), so the name column was handed the
+    // DID's flexing `Min(40)` and the DID was squeezed into 16 characters:
+    // every row read as a wide name beside an unusable `did:webvh:Qm0M8Cr`.
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(16), // ID
+            Constraint::Min(16),    // Name
+            Constraint::Min(46),    // DID
+            Constraint::Length(16), // Created
+        ],
+    )
+    .header(header)
+    .column_spacing(2)
+    .block(
+        Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+
+    let height = resp.servers.len() as u16 + 4;
+    print_widget(table, height);
+
+    Ok(())
+}
+
+pub async fn cmd_webvh_server_update(
+    client: &VtaClient,
+    id: &str,
+    label: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = UpdateWebvhServerRequest { label };
+    let record = client.update_webvh_server(id, req).await?;
+    println!("WebVH server updated:");
+    println!("  ID:  {}", record.id);
+    println!("  DID: {}", record.did);
+    if let Some(label) = &record.label {
+        println!("  Label: {label}");
+    }
+    Ok(())
+}
+
+/// `did-mgmt servers delete <id>` — delete a server from the VTA's registry.
+///
+/// A complete delete of the registry row, and only of that: DID records that
+/// name the server keep naming it, and nothing hosted on the server is touched.
+/// The operation does not refuse in that case (refusing would change what the
+/// Trust Task does), so the command looks first and says what is left behind
+/// and how to clean it up. The look-up is best-effort — a caller allowed to
+/// delete a server but not to list DIDs still gets the delete.
+pub async fn cmd_webvh_server_remove(
+    client: &VtaClient,
+    id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Every method's DIDs on the server, not only did:webvh: a did:webs slot
+    // on it is left behind just the same.
+    let dependents: Option<Vec<String>> = client
+        .list_dids(&vta_sdk::client::DidListFilter {
+            server_id: Some(id.to_string()),
+            include_deactivated: true,
+            ..Default::default()
+        })
+        .await
+        .ok()
+        .map(|r| r.into_iter().map(|d| d.did.to_string()).collect());
+    // Captured before the row goes, so the notice can print the exact
+    // command that puts it back.
+    let server_did = match dependents.as_deref() {
+        Some(dids) if !dids.is_empty() => client
+            .list_webvh_servers()
+            .await
+            .ok()
+            .and_then(|r| r.servers.into_iter().find(|s| s.id == id))
+            .map(|s| s.did),
+        _ => None,
+    };
+
+    client.remove_webvh_server(id).await?;
+    println!("{GREEN}\u{2713}{RESET} WebVH server deleted: {CYAN}{id}{RESET}");
+
+    match dependents.as_deref() {
+        Some([]) => {}
+        Some(dids) => {
+            let server_did = server_did.as_deref().unwrap_or("<server-did>");
+            eprintln!(
+                "{YELLOW}\u{26a0}{RESET} Only the registry entry was deleted. {} DID(s) are still \
+                 registered against server '{id}', and their logs are still hosted on it:",
+                dids.len()
+            );
+            for did in dids {
+                eprintln!("    {did}");
+            }
+            eprintln!(
+                "  While the id is unregistered, `did-mgmt dids delete` removes only the local \
+                 record and leaves the hosted log behind. To delete those DIDs completely, \
+                 re-add the server and delete them first:\n    \
+                 did-mgmt servers add --id {id} --did {server_did}\n    \
+                 did-mgmt dids delete <did>"
+            );
+        }
+        None => eprintln!(
+            "{DIM}Could not check for DIDs still registered against '{id}'; \
+             `did-mgmt dids list --server {id}` shows any that remain.{RESET}"
+        ),
+    }
+    Ok(())
+}
+
+/// `pnm did-mgmt dids register --did <did> --server <id> [--force]` —
+/// promote a serverless WebVH DID to a server-managed one.
+///
+/// Pushes the local `did.jsonl` to the host atomically (single
+/// batched write — no resolver gap) and flips the local record's
+/// `server_id` so future `pnm services …` mutations auto-publish
+/// there. Refused if the DID is already server-managed
+/// (re-pointing a hosted DID is out of scope).
+///
+/// `--force` is honoured only when the VTA's DID authenticates to
+/// the host as an admin replacing a slot owned by a different DID.
+/// An owner re-registering their own slot is idempotent and always
+/// succeeds without `--force`.
+pub async fn cmd_webvh_did_register_server(
+    client: &VtaClient,
+    did: &str,
+    server_id: &str,
+    force: bool,
+    domain: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = client
+        .register_did_with_server(did, server_id, force, domain.as_deref())
+        .await?;
+    println!("DID registered with WebVH server.");
+    println!("  DID:        {}", result.did);
+    println!("  Server:     {}", result.server_id);
+    println!("  Log entries: {}", result.log_entry_count);
+    println!();
+    println!(
+        "Future `pnm services …` mutations will auto-publish to `{}`.",
+        result.server_id
+    );
+    Ok(())
+}
+
+/// `pnm did-mgmt dids edit --did <did>` — interactive or
+/// non-interactive update of an existing WebVH DID document.
+///
+/// **Interactive (no flags):** fetches the latest published DID
+/// document, opens it in `$EDITOR`, asks whether to change any of
+/// the webvh parameters (pre-rotation, watchers, TTL, label),
+/// confirms, then publishes a new LogEntry.
+///
+/// **Non-interactive:** supply `--document <file>` (and optionally
+/// the per-field flags) or `--options-file <file>` to skip prompts
+/// entirely. Useful for scripted flows.
+///
+/// Refuses to publish if the operator changed the DID's top-level
+/// `id` field — the WebVH method treats the DID id as a permanent
+/// commitment from the first LogEntry.
+pub async fn cmd_webvh_did_edit(
+    client: &VtaClient,
+    did: &str,
+    flags: super::webvh_edit::EditFlags,
+    no_confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use super::webvh_edit::{
+        build_options_from_flags, confirm_publish, diff_summary, document_id,
+        extract_current_document, extract_latest_version_id, extract_pre_rotation_status,
+        launch_editor, prompt_webvh_params,
+    };
+
+    // Confirm the DID is registered here before opening an editor on it — a
+    // clean 404 now beats a failed publish after the operator has typed a
+    // document. The record's `context_id`/`scid` are no longer needed: the
+    // canonical update task keys on the DID we already have.
+    let _ = client.get_did_webvh(did).await?;
+
+    // Decide between interactive and non-interactive paths. The
+    // non-interactive heuristic: any flag set → skip the editor
+    // and prompt chain. Interactive mode (no flags) opens $EDITOR
+    // and asks the parameter questions.
+    let any_flag_set = flags.document_file.is_some()
+        || flags.options_file.is_some()
+        || flags.pre_rotation.is_some()
+        || flags.ttl.is_some()
+        || !flags.watchers.is_empty()
+        || flags.no_watchers
+        || flags.label.is_some();
+
+    let mut body = if any_flag_set {
+        let body = build_options_from_flags(&flags)?;
+        // Validate the supplied document doesn't change the DID id.
+        if let Some(edited) = &body.document {
+            let log = client.get_did_webvh_log(did).await?;
+            let log_str = log.log.ok_or_else(|| -> Box<dyn std::error::Error> {
+                "DID has no published log on the VTA — nothing to edit".into()
+            })?;
+            let prior = extract_current_document(&log_str)?;
+            super::webvh_edit::assert_did_id_unchanged(&prior, edited)?;
+        }
+        body
+    } else {
+        // Interactive path: fetch the log, extract the latest doc,
+        // open in $EDITOR, then walk the parameter prompts. Capture
+        // the latest versionId so the save call can carry an
+        // optimistic-concurrency precondition (lost-update guard).
+        let log = client.get_did_webvh_log(did).await?;
+        let log_str = log.log.ok_or_else(|| -> Box<dyn std::error::Error> {
+            "DID has no published log on the VTA — nothing to edit".into()
+        })?;
+        let prior = extract_current_document(&log_str)?;
+        let prior_id = document_id(&prior)?.to_string();
+        let fetched_version_id = extract_latest_version_id(&log_str).ok();
+        let pre_rotation_status = extract_pre_rotation_status(&log_str);
+        eprintln!("Editing DID document for {prior_id}.");
+        if let Some(ref v) = fetched_version_id {
+            eprintln!("  Current versionId: {v}");
+        }
+        eprintln!("Opening $EDITOR — save and exit to continue, or quit without saving to abort.");
+
+        let edited = match launch_editor(&prior)? {
+            Some(doc) => {
+                let summary = diff_summary(&prior, &doc);
+                eprintln!();
+                eprintln!("Document diff:");
+                for line in summary.lines() {
+                    eprintln!("  {line}");
+                }
+                eprintln!();
+                Some(doc)
+            }
+            None => {
+                eprintln!("Editor cancelled. No changes will be published.");
+                return Ok(());
+            }
+        };
+
+        let mut body = prompt_webvh_params(edited, Some(&pre_rotation_status))?;
+        // Stamp the precondition so the VTA refuses the save if the
+        // DID was updated by another operator while we were editing.
+        body.expected_version_id = fetched_version_id;
+        body
+    };
+    // Suppress the unused_mut warning when the flag-driven branch
+    // doesn't mutate `body` after construction.
+    let _ = &mut body;
+
+    confirm_publish(&body, no_confirm)?;
+
+    // Cloned per attempt rather than moved: a consent grant is bound to a
+    // digest of the payload, so every retry must send the identical bytes or
+    // it raises a second, unanswerable question instead of consuming the
+    // approval already in flight.
+    let result = match crate::consent::with_consent(|| {
+        let body = body.clone();
+        async move { client.update_did_webvh_by_did(did, body).await }
+    })
+    .await?
+    {
+        Ok(result) => result,
+        Err(outcome) => {
+            match outcome {
+                crate::consent::ConsentOutcome::Resolved => {
+                    eprintln!(
+                        "Not approved — the request was denied or expired. Nothing was published."
+                    );
+                }
+                crate::consent::ConsentOutcome::TimedOut => {
+                    eprintln!(
+                        "Gave up waiting. The request is still pending, so approving on your \
+                         device and re-running this command will publish it."
+                    );
+                }
+            }
+            return Ok(());
+        }
+    };
+    println!("WebVH DID updated.");
+    println!("  DID:             {}", result.did);
+    println!("  New version ID:  {}", result.new_version_id);
+    println!("  New SCID:        {}", result.new_scid);
+    println!("  Update keys:     {}", result.update_keys_count);
+    println!("  Pre-rotation:    {}", result.pre_rotation_key_count);
+    // The VTA serves its own DID's log; any other self-hosted DID it manages —
+    // a community's, say — is served somewhere this VTA cannot write to.
+    if client.vta_did() == Some(result.did.as_str()) {
+        crate::commands::services::print_serverless_hint(result.serverless, &result.did);
+    } else {
+        crate::commands::services::print_redeploy_hint(result.serverless, &result.did);
+    }
+    Ok(())
+}
+
+/// List (`list == true`) or remove the did:scid alias of an existing did:webvh
+/// DID (`vta/webvh/dids/update/1.1`, `scidAlsoKnownAs`; VTI-KEY-164).
+///
+/// The VTA derives the `did:scid:vh:1:<scid>?src=<source>` DID URL itself, so
+/// the operator never writes it. The update is pinned to the version read here
+/// (`expectedVersionId`), so a concurrent edit is refused rather than
+/// overwritten. Like any document change it publishes an entry and **rotates
+/// the DID's update key** — the confirmation says so before anything is sent.
+pub async fn cmd_webvh_did_scid_alias(
+    client: &VtaClient,
+    did: &str,
+    list: bool,
+    label: Option<String>,
+    no_confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let log = client.get_did_webvh_log(did).await?;
+    let log_str = log.log.ok_or_else(|| -> Box<dyn std::error::Error> {
+        "DID has no published log on the VTA — nothing to update".into()
+    })?;
+    let expected_version_id = super::webvh_edit::extract_latest_version_id(&log_str).ok();
+
+    let verb = if list { "List" } else { "Remove" };
+    eprintln!("{verb} the did:scid alias of {did}.");
+    eprintln!(
+        "  This publishes a new log entry and ROTATES the DID's update key: the current \
+         update key stops being able to authorize further changes."
+    );
+    if !list {
+        eprintln!(
+            "  Without the alias the did:webvh and did:scid forms are no longer one subject \
+             (VTI-KEY-164). A DID this VTA presents as its did:scid is refused."
+        );
+    }
+    if !no_confirm {
+        let go = dialoguer::Confirm::new()
+            .with_prompt("Publish?")
+            .default(false)
+            .interact()?;
+        if !go {
+            eprintln!("Cancelled. Nothing was published.");
+            return Ok(());
+        }
+    }
+
+    let body = vta_sdk::protocols::did_management::update::UpdateDidWebvhBody {
+        scid_also_known_as: Some(list),
+        expected_version_id,
+        label: Some(label.unwrap_or_else(|| {
+            if list {
+                "list the did:scid alias".into()
+            } else {
+                "remove the did:scid alias".into()
+            }
+        })),
+        ..Default::default()
+    };
+    // The same payload on every attempt, so a consent grant (bound to its
+    // digest) is consumed rather than re-asked.
+    let result = match crate::consent::with_consent(|| {
+        let body = body.clone();
+        async move { client.update_did_webvh_by_did(did, body).await }
+    })
+    .await?
+    {
+        Ok(result) => result,
+        Err(crate::consent::ConsentOutcome::Resolved) => {
+            eprintln!("Not approved — the request was denied or expired. Nothing was published.");
+            return Ok(());
+        }
+        Err(crate::consent::ConsentOutcome::TimedOut) => {
+            eprintln!(
+                "Gave up waiting. The request is still pending, so approving on your device and \
+                 re-running this command will publish it."
+            );
+            return Ok(());
+        }
+    };
+    println!(
+        "did:scid alias {}.",
+        match result.scid_also_known_as {
+            Some(true) => "listed",
+            Some(false) => "removed",
+            None => "updated",
+        }
+    );
+    println!("  DID:             {}", result.did);
+    if let Some(url) = &result.scid_did_url {
+        println!("  did:scid DID:    {url}");
+    }
+    println!("  New version ID:  {}", result.new_version_id);
+    println!(
+        "  Update keys:     {} (rotated — the previous update key no longer authorizes changes)",
+        result.update_keys_count
+    );
+    println!("  Pre-rotation:    {}", result.pre_rotation_key_count);
+    if client.vta_did() == Some(result.did.as_str()) {
+        crate::commands::services::print_serverless_hint(result.serverless, &result.did);
+    } else {
+        crate::commands::services::print_redeploy_hint(result.serverless, &result.did);
+    }
+    Ok(())
+}
+
+// ── DID commands ────────────────────────────────────────────────────
+
+pub async fn cmd_webvh_did_create(
+    client: &VtaClient,
+    req: CreateDidWebvhRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    cmd_webvh_did_create_presented(client, req, Default::default()).await
+}
+
+/// [`cmd_webvh_did_create`], choosing how the DID is presented (VTI-VTA-036).
+pub async fn cmd_webvh_did_create_presented(
+    client: &VtaClient,
+    req: CreateDidWebvhRequest,
+    presentation: vta_sdk::client::DidPresentation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = client.create_did_webvh_presented(req, presentation).await?;
+    println!("WebVH DID created:");
+    println!("  DID:              {}", result.did);
+    if result.log_did() != result.did {
+        println!("  Log:              {}", result.log_did());
+    }
+    if result.scid_also_known_as == Some(true)
+        && let Some(ref url) = result.scid_did_url
+    {
+        println!("  did:scid:         {url}");
+    }
+    println!("  Context:          {}", result.context_id);
+    if let Some(ref server_id) = result.server_id {
+        println!("  Server:           {}", server_id);
+    }
+    // Stated by the VTA from create/1.1 (VTI-20), so the summary says it even
+    // when no log entry is printed below.
+    if result.is_serverless() {
+        println!("  Hosting:          serverless (you must serve did.jsonl)");
+    }
+    if let Some(ref mnemonic) = result.mnemonic {
+        println!("  Mnemonic:         {}", mnemonic);
+    }
+    println!("  SCID:             {}", result.scid);
+    println!("  Portable:         {}", result.portable);
+    println!("  Signing key:      {}", result.signing_key_id);
+    println!("  KA key:           {}", result.ka_key_id);
+    println!("  Pre-rotation keys: {}", result.pre_rotation_key_count);
+
+    if let Some(ref did_document) = result.did_document {
+        println!();
+        println!("DID Document:");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(did_document)
+                .unwrap_or_else(|_| format!("{did_document}"))
+        );
+    }
+    if let Some(ref log_entry) = result.log_entry {
+        println!();
+        println!("Log Entry (did.jsonl):");
+        println!("{}", log_entry);
+        println!();
+        for line in hosting_guidance(result.is_serverless(), result.server_id.as_deref()) {
+            println!("{line}");
+        }
+    }
+
+    Ok(())
+}
+
+/// What an operator must do with the log entry a mint just printed — which
+/// depends entirely on whether a hosting server took it.
+///
+/// Keyring's VTI-20. The log entry comes back for **both** kinds of mint, and
+/// the output used to say the same thing for both: "To self-host this DID,
+/// place the log entry…". That was wrong in each direction. For a serverless
+/// mint it read as an option, when it is the only way the DID will ever
+/// resolve — the VTA that minted it does not serve it, so its URL answers 404
+/// until someone publishes the file by hand. For a server-managed mint it told
+/// the operator to do something the server had already done.
+///
+/// `serverless` is the VTA's own statement (`create/1.1`), read through
+/// `CreateDidWebvhResultBody::is_serverless` so a 1.0-era answer still falls
+/// back to an absent `server_id`.
+fn hosting_guidance(serverless: bool, server_id: Option<&str>) -> Vec<String> {
+    match (serverless, server_id) {
+        (true, _) | (false, None) => vec![
+            "This DID is serverless: nothing is hosting it, and it will NOT resolve".to_string(),
+            "until you publish the log entry above yourself. Save it as `did.jsonl`".to_string(),
+            "at the location your DID encodes (the `--did-url` path, or".to_string(),
+            "`/.well-known/did.jsonl` for a bare domain). The VTA that minted it does".to_string(),
+            "not serve it — its URL answers 404 until you do.".to_string(),
+        ],
+        (false, Some(server)) => vec![format!(
+            "Hosted by server `{server}`, which is already serving this log. \
+             No action is needed; the entry is printed for your records."
+        )],
+    }
+}
+
+/// Helper that reads optional file inputs before building a `CreateDidWebvhRequest`./// Helper that reads optional file inputs before building a `CreateDidWebvhRequest`.
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_webvh_did_create_with_files(
+    client: &VtaClient,
+    context_id: String,
+    server_id: Option<String>,
+    url: Option<String>,
+    path: Option<String>,
+    domain: Option<String>,
+    label: Option<String>,
+    portable: bool,
+    add_mediator_service: bool,
+    services: Option<String>,
+    pre_rotation_count: u32,
+    did_document_path: Option<String>,
+    did_log_path: Option<String>,
+    no_primary: bool,
+    signing_key_id: Option<String>,
+    ka_key_id: Option<String>,
+    template: Option<String>,
+    template_context: Option<String>,
+    template_vars: Vec<(String, String)>,
+    presentation: vta_sdk::client::DidPresentation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let did_document = match did_document_path {
+        Some(p) => {
+            let content =
+                std::fs::read_to_string(&p).map_err(|e| format!("failed to read {p}: {e}"))?;
+            Some(
+                serde_json::from_str::<serde_json::Value>(&content)
+                    .map_err(|e| format!("invalid JSON in {p}: {e}"))?,
+            )
+        }
+        None => None,
+    };
+    if template.is_some() && (did_document.is_some() || did_log_path.is_some()) {
+        return Err("--template is mutually exclusive with --did-document and --did-log".into());
+    }
+    let did_log = match did_log_path {
+        Some(p) => {
+            Some(std::fs::read_to_string(&p).map_err(|e| format!("failed to read {p}: {e}"))?)
+        }
+        None => None,
+    };
+    let additional_services = services
+        .map(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s))
+        .transpose()
+        .map_err(|e| format!("invalid --services JSON: {e}"))?;
+
+    let template_vars: std::collections::HashMap<String, serde_json::Value> = template_vars
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+
+    let req = CreateDidWebvhRequest {
+        context_id,
+        server_id,
+        url,
+        path,
+        // The `--path` value travels in the legacy `path` field, which
+        // resolves to the right mode server-side (absent → auto-assign,
+        // `.well-known` → root, else explicit).
+        path_mode: None,
+        domain,
+        label,
+        portable,
+        add_mediator_service,
+        // No operator flag yet — the first consumer of the field is the SDK
+        // (a client minting a DID for a holder that reads TSP frames). Adding
+        // one here means another positional on an 18-argument helper plus a
+        // clap flag in both CLIs, which belongs in its own change.
+        add_tsp_service: false,
+        additional_services,
+        pre_rotation_count,
+        did_document,
+        did_log,
+        set_primary: !no_primary,
+        signing_key_id,
+        ka_key_id,
+        template,
+        template_context,
+        template_vars,
+    };
+    cmd_webvh_did_create_presented(client, req, presentation).await
+}
+
+pub async fn cmd_webvh_did_delete(
+    client: &VtaClient,
+    did: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let outcome = client.delete_did_webvh_with_outcome(did).await?;
+    println!("WebVH DID deleted: {did}");
+    // A partial success: the record is gone, but the host did not confirm
+    // deleting the published log, so the DID may still resolve. The spec says a
+    // consumer MUST surface it.
+    if let Some(reason) = &outcome.daemon_cleanup_error {
+        eprintln!("warning: {reason}");
+    }
+    Ok(())
+}
+
+/// `pnm did-mgmt dids realign-keys <did> [--dry-run]` — rename this DID's key
+/// records onto the verification-method ids its published document carries.
+///
+/// Prints the plan either way. A realign moves key custody records, so the
+/// operator should read `--dry-run` first — and the output names the public key
+/// behind every move so they can check it against the document themselves.
+pub async fn cmd_webvh_did_realign_keys(
+    client: &VtaClient,
+    did: &str,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = client.realign_did_webvh_keys(did, dry_run).await?;
+
+    if result.moved.is_empty() {
+        println!("Nothing to move — every key record already matches a verification method.");
+    } else {
+        println!(
+            "{} key record(s) {}:",
+            result.moved.len(),
+            if result.dry_run {
+                "would move"
+            } else {
+                "moved"
+            }
+        );
+        for key in &result.moved {
+            println!(
+                "  {}\n    → {}\n    key {}",
+                key.from, key.to, key.public_key
+            );
+        }
+    }
+    if !result.already_aligned.is_empty() {
+        println!("Already correct: {}", result.already_aligned.join(", "));
+    }
+    // Said out loud rather than omitted: a method with no record here is not
+    // "nothing to do", it is a key this agent does not hold.
+    if !result.unmatched.is_empty() {
+        println!(
+            "No key held for: {} — realign cannot name these.",
+            result.unmatched.join(", ")
+        );
+    }
+    println!(
+        "Next rotation allocates from #key-{}",
+        result.next_fragment_id
+    );
+    if result.dry_run {
+        println!("\nNothing was written. Re-run without --dry-run to apply.");
+    }
+    Ok(())
+}
+
+/// `pnm did-mgmt dids get-log <did> [--out <path>]` — fetch the raw
+/// `did.jsonl` log for a DID the VTA knows.
+///
+/// Goes through the authenticated, transport-agnostic client method so
+/// it works on both REST and DIDComm sessions. (The VTA also mirrors
+/// the log unauthenticated at `GET /did/{did}/log` for resolvers, but a
+/// DIDComm client has no HTTP base URL to build that request from.)
+pub async fn cmd_webvh_did_log(
+    client: &VtaClient,
+    did: &str,
+    out: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client.get_did_webvh_log(did).await?;
+    let log = resp
+        .log
+        .ok_or_else(|| format!("no did.jsonl log stored for {did}"))?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(&path, log.as_bytes())
+                .map_err(|e| format!("write {}: {e}", path.display()))?;
+            eprintln!(
+                "DID log written to {} ({} bytes)",
+                path.display(),
+                log.len()
+            );
+        }
+        None => {
+            // Raw to stdout — pipe to a file, to `curl --data-binary`,
+            // or to `.well-known/did.jsonl` directly.
+            print!("{log}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// VTI-20: a serverless mint must say the DID will not resolve until the
+    /// operator publishes it — not offer self-hosting as one option among
+    /// several, which is how the old text read.
+    #[test]
+    fn a_serverless_mint_says_the_operator_must_host_it() {
+        let text = hosting_guidance(true, None).join(" ");
+        assert!(text.contains("will NOT resolve"), "{text}");
+        assert!(text.contains("404"), "{text}");
+        assert!(text.contains("/.well-known/did.jsonl"), "{text}");
+    }
+
+    /// And a server-managed mint must not tell the operator to do what the
+    /// server already did.
+    #[test]
+    fn a_server_managed_mint_does_not_ask_the_operator_to_host_it() {
+        let text = hosting_guidance(false, Some("prod-host")).join(" ");
+        assert!(text.contains("prod-host"), "{text}");
+        assert!(text.contains("No action is needed"), "{text}");
+        assert!(!text.contains("will NOT resolve"), "{text}");
+        assert!(!text.to_lowercase().contains("self-host"), "{text}");
+    }
+}

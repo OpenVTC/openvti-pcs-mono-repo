@@ -1,0 +1,967 @@
+//! Non-interactive `vtc setup --from <file>` (P3.10).
+//!
+//! The interactive [`wizard`](super::wizard) gathers operator decisions
+//! via prompts and live VTA round-trips, then hands a fully-resolved
+//! [`WizardPlan`](super::wizard::WizardPlan) to the shared
+//! [`apply`](super::wizard::apply) effect driver. This module is the
+//! second front-end: it parses a TOML file into the *same* plan and
+//! feeds it to the *same* `apply`, so a CI image, an immutable build, or
+//! any unattended provisioner can stand up a VTC with no TTY.
+//!
+//! ## The ACL-grant seam
+//!
+//! Provisioning a VTC authenticates to the VTA with an ephemeral
+//! `did:key`, and that DID must already be ACL-authorised at the VTA.
+//! The interactive wizard generates the key and *pauses* for the
+//! operator to grant the ACL. A non-interactive run can't pause, so the
+//! key has to be authorised out of band first. The flow is two-phase:
+//!
+//! 1. Generate + persist an ephemeral setup key (e.g. via the
+//!    provision-client's `EphemeralSetupKey::persist_to`, the same file
+//!    `pnm` writes), then grant its DID an admin ACL at the VTA
+//!    (`pnm contexts create --admin-did <did>` / `pnm acl create`).
+//! 2. Run `vtc setup --from <toml>`, pointing `setup_key_file` at that
+//!    persisted key. `apply` loads it (`load_from`) and provisions — the
+//!    grant is already in place, so no prompt is needed.
+//!
+//! This mirrors the VTA's deferred-setup / `pnm setup continue` pattern;
+//! the `EphemeralSetupKey` persist/reload bridge was built for exactly
+//! this race between ACL provisioning and connection verification.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use vta_sdk::provision_client::EphemeralSetupKey;
+use vti_common::error::AppError;
+
+use crate::config::{MessagingConfig, SecretsConfig};
+
+use super::wizard::{
+    IdentityMethod, ProvisionTransport, SetupOutcome, Transport, WebvhTarget, WizardInputs,
+    WizardPlan, apply, normalize_registry_did, refuse_if_already_set_up,
+};
+
+/// The `[messaging]` table: the mediator, plus which transports the
+/// community's DID document advertises over it.
+///
+/// Flattens [`MessagingConfig`] — the runtime shape written to `config.toml`
+/// — and adds `transports`, which is **not** runtime config. It is consumed
+/// once, at mint, to render service entries into the DID document, and the
+/// document is authoritative thereafter. Persisting it would create a second
+/// source of truth that could drift from the document it produced.
+///
+/// `transports` is required rather than defaulted. The choice determines
+/// whether anyone can reach this community over a mediator, changing it after
+/// mint takes a VTA-side `dids edit` (and, self-hosted, `cnm did-log
+/// install`), and a silent default
+/// would be a guess about someone else's mediator — see
+/// [`super::wizard::prompt_transports`] for the same reasoning interactively.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingSetup {
+    #[serde(flatten)]
+    pub config: MessagingConfig,
+
+    /// Transports to advertise: `["tsp"]`, `["didcomm"]`, or both. Both is the
+    /// §12 Phase A shape and strands nobody.
+    ///
+    /// Every entry points at `mediator_did`. Advertising a transport that
+    /// mediator does not route makes this community unreachable on it —
+    /// conforming clients prefer it and fail — and nothing here can verify the
+    /// mediator's own services.
+    pub transports: Vec<Transport>,
+}
+
+/// TOML schema for `vtc setup --from <file>`.
+///
+/// `Serialize` is derived alongside `Deserialize` so the shipped example
+/// and round-trip tests can assert structural stability; production only
+/// ever deserializes. `deny_unknown_fields` makes a typo'd key a hard
+/// error rather than a silently-ignored setting.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VtcWizardInputs {
+    /// Output path for the generated `config.toml`. Setup refuses to
+    /// overwrite a config that already names a `vtc_did` — move it aside
+    /// to re-provision.
+    pub config_path: PathBuf,
+
+    /// The VTC daemon's public base URL (e.g. `https://vtc.example.com`),
+    /// no trailing slash and no `/v1`. All three surfaces (API, admin UX,
+    /// website) mount under it in the default path mode; it's stored as
+    /// `public_url` and passed as the `vtc-host` template's `URL` var. A
+    /// trailing slash is trimmed for you.
+    pub base_url: String,
+
+    /// DID of the VTA that mints this VTC's DID + key material (e.g.
+    /// `did:webvh:vta.example.com:abc`). Its transport endpoints are
+    /// resolved from the DID document — no separate VTA URL is needed.
+    pub vta_did: String,
+
+    /// Context name at the VTA this community provisions under. Defaults
+    /// to `default`.
+    #[serde(default = "default_context")]
+    pub context: String,
+
+    /// DID of the trust registry authoritative for this community, if it has
+    /// one (e.g. `did:webvh:abc:registry.example.com`). Publishes a
+    /// `TrustRegistry` referral in the VTC's DID document so a client holding
+    /// only the community's DID can resolve one hop to its registry rather
+    /// than being configured with both.
+    ///
+    /// Must be a DID, not a URL — a referral is distinguished from a registry
+    /// advertising its own endpoint by the `uri` carrying a `did:` prefix.
+    /// Omit (or leave blank) for a community with no registry; the service
+    /// entry is then pruned from the document.
+    ///
+    /// The VTC cannot change its own document, so changing this after mint is
+    /// VTA-side: for a did:webvh `pnm did-mgmt dids edit` — then, for a VTC
+    /// serving its own `did.jsonl`, `cnm did-log install` with the extended
+    /// log; for a did:webs `vta/webs/dids/update` with `services.additional`.
+    #[serde(default)]
+    pub registry_did: Option<String>,
+
+    /// A second unrestricted admin to install beside the first (VTI-APV-014).
+    /// Making anyone an unrestricted admin needs another unrestricted admin's
+    /// consent; with only one there is nobody to give it, and a second can
+    /// then only be added offline. Omit (or leave blank) to install one.
+    #[serde(default)]
+    pub co_admin_did: Option<String>,
+
+    /// Run the community in **single-administrator mode** (VTI-APV-022):
+    /// every administrator is one person, under as many identifiers as they
+    /// hold, so an operation that ordinarily needs another administrator's
+    /// consent is authorized by the requester's passkey gesture bound to it
+    /// instead, audited at `Critical`, whether or not other administrators'
+    /// entries exist. Writes `[acl] single_admin_mode = true` to the generated
+    /// `config.toml`; changeable afterwards only on the host. `vtc setup
+    /// --single-admin` sets it too. Default `false`.
+    #[serde(default)]
+    pub single_admin_mode: bool,
+
+    /// Force the transport setup provisions over: `"tsp"`, `"didcomm"` or
+    /// `"rest"`. Omit for the automatic TSP > DIDComm > REST, which moves on
+    /// only when a transport fails to connect. A reply lost after the VTA acted
+    /// is final — the setup DID's one-time hand-off is spent — so force one
+    /// here to avoid a mediator known to drop replies (OpenVTC #501). A
+    /// transport the VTA does not advertise is ignored, and the automatic
+    /// choice used.
+    #[serde(default)]
+    pub provision_transport: Option<ProvisionTransport>,
+
+    /// How the community's DID, and those it mints later, are presented:
+    /// `"webvh"` or `"scid"` (VTI-VTC-004). Omit for the VTA's `[dids]`.
+    #[serde(default)]
+    pub did_method: Option<vta_sdk::did_scid::DidMethod>,
+
+    /// Whether the community's logs list their did:scid alias. Omit for the
+    /// VTA's `[dids]`.
+    #[serde(default)]
+    pub scid_also_known_as: Option<bool>,
+
+    /// The method of the community's own DID: `"webvh"` (the default) or
+    /// `"webs"`, a level-1 did:webs (alpha; VTI-KEY-001) published by the VTA
+    /// at `[webvh] server_id`, which is then required — a did:webs has no
+    /// serverless mode. Minted from `vtc-host-classical`: one signing key, no
+    /// post-quantum key.
+    #[serde(default)]
+    pub identity_method: IdentityMethod,
+
+    /// Where the VTC's DID is published. For a did:webvh all fields are
+    /// optional; an empty `[webvh]` table (or omitting it) reproduces the
+    /// serverless default — the VTC self-hosts its `did.jsonl` at `base_url`.
+    /// A did:webs has no serverless mode and needs `server_id`; its `path` is
+    /// the slot before the AID, and omitting it publishes at the domain's top
+    /// level.
+    #[serde(default)]
+    pub webvh: WebvhTarget,
+
+    /// Mediator the VTC routes through, and which transports its DID
+    /// document advertises over that mediator. Omit the whole table for no
+    /// messaging (the daemon stays healthy on REST and logs a one-line
+    /// warning).
+    ///
+    /// `mediator_did` and `transports` are both required when the table is
+    /// present; `mediator_url` / `mediator_host` are optional (the endpoint is
+    /// resolved from the mediator's DID document).
+    #[serde(default)]
+    pub messaging: Option<MessagingSetup>,
+
+    /// Secret-store backend for the VTC's key bundle. Required — the
+    /// choice is security-sensitive and there is no safe implicit
+    /// default. Same shape as the `[secrets]` block in `config.toml`; the
+    /// backend's own factory validates feature availability at load.
+    pub secrets: SecretsConfig,
+
+    /// Path to a JSON file holding a previously-persisted ephemeral setup
+    /// key (`EphemeralSetupKey::persist_to` format) whose `did:key` has
+    /// *already* been ACL-authorised at the VTA. This is the two-phase
+    /// bridge that replaces the interactive ACL-grant pause — see the
+    /// module docs.
+    pub setup_key_file: PathBuf,
+}
+
+fn default_context() -> String {
+    "default".to_string()
+}
+
+/// Read + parse a setup TOML into a fully-resolved [`WizardPlan`]: the
+/// same plan the interactive collector produces, ready for [`apply`].
+/// Validates the inputs and loads (does not generate) the pre-authorised
+/// ephemeral setup key.
+///
+/// `single_admin` (`--single-admin`) turns single-administrator mode on
+/// whatever the file says.
+pub(crate) fn parse_from_toml(
+    file_path: &Path,
+    single_admin: bool,
+) -> Result<WizardPlan, AppError> {
+    let raw = std::fs::read_to_string(file_path)
+        .map_err(|e| AppError::Config(format!("read setup file {}: {e}", file_path.display())))?;
+    let inputs: VtcWizardInputs = toml::from_str(&raw)
+        .map_err(|e| AppError::Config(format!("parse setup file {}: {e}", file_path.display())))?;
+
+    validate(&inputs)?;
+
+    // Guard before touching the VTA or the setup key: a config that
+    // already names a vtc_did means this VTC is provisioned.
+    refuse_if_already_set_up(&inputs.config_path)?;
+
+    let setup_key = EphemeralSetupKey::load_from(&inputs.setup_key_file).map_err(|e| {
+        AppError::Config(format!(
+            "load setup key {}: {e}. Generate + persist an ephemeral setup key and grant its \
+             did:key an admin ACL at the VTA before running `vtc setup --from` (see the \
+             non-interactive setup docs).",
+            inputs.setup_key_file.display()
+        ))
+    })?;
+
+    // Already validated above; this trims and maps blank to "no registry" so
+    // both front-ends hand `apply` the same shape.
+    let registry_did = normalize_registry_did(inputs.registry_did.as_deref().unwrap_or(""))?;
+
+    // Split the `[messaging]` table: `transports` feeds the DID document being
+    // minted, the rest becomes the daemon's runtime messaging config. One
+    // operator decision, two destinations — and `transports` is deliberately
+    // not persisted, because the minted document is authoritative for it.
+    let (messaging, transports) = match inputs.messaging {
+        Some(m) => (Some(m.config), m.transports),
+        None => (None, Vec::new()),
+    };
+
+    Ok(WizardPlan {
+        config_path: inputs.config_path,
+        inputs: WizardInputs {
+            base_url: inputs.base_url.trim_end_matches('/').to_string(),
+            vta_did: inputs.vta_did,
+            context: inputs.context,
+            registry_did,
+            transports,
+            co_admin_did: super::wizard::normalize_co_admin_did(
+                inputs.co_admin_did.as_deref().unwrap_or(""),
+            )?,
+            single_admin_mode: inputs.single_admin_mode || single_admin,
+            provision_transport: inputs.provision_transport,
+            did_method: inputs.did_method,
+            scid_also_known_as: inputs.scid_also_known_as,
+            identity_method: inputs.identity_method,
+        },
+        webvh: inputs.webvh,
+        secrets: inputs.secrets,
+        messaging,
+        setup_key,
+    })
+}
+
+/// Cross-field validation, accumulating every problem so the operator
+/// fixes them in one pass rather than one-error-at-a-time.
+fn validate(inputs: &VtcWizardInputs) -> Result<(), AppError> {
+    let mut errors: Vec<String> = Vec::new();
+
+    let base = inputs.base_url.trim_end_matches('/');
+    if base.is_empty() {
+        errors.push("base_url must not be empty".into());
+    } else {
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            errors.push(format!(
+                "base_url must start with http:// or https:// (got {:?})",
+                inputs.base_url
+            ));
+        }
+        if base.ends_with("/v1") {
+            errors.push(
+                "base_url must be the host base, without the /v1 API prefix (the template \
+                 appends API paths itself)"
+                    .into(),
+            );
+        }
+    }
+
+    if !inputs.vta_did.starts_with("did:") {
+        errors.push(format!(
+            "vta_did must be a DID starting with `did:` (got {:?})",
+            inputs.vta_did
+        ));
+    }
+
+    if inputs.context.trim().is_empty() {
+        errors.push("context must not be empty".into());
+    }
+
+    // A did:webs is published by a did-hosting server, never self-hosted, at
+    // `did:webs:<domain>[:<path>]:<AID>`, and its key event log has no
+    // did:scid alias to list.
+    if inputs.identity_method == IdentityMethod::Webs {
+        if inputs
+            .webvh
+            .server_id
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            errors.push(
+                "identity_method = \"webs\" needs [webvh] server_id: a did:webs VTC is \
+                 published by one of the VTA's did-hosting servers (built with did:webs \
+                 hosting); it has no serverless mode"
+                    .into(),
+            );
+        }
+        if inputs.webvh.path.as_deref().map(str::trim) == Some(".well-known") {
+            errors.push(
+                "[webvh] path \".well-known\" names a did:webvh root DID; a did:webs is \
+                 did:webs:<domain>[:<path>]:<AID>. Omit path, or give a slot path"
+                    .into(),
+            );
+        }
+        if inputs.scid_also_known_as.is_some() {
+            errors.push(
+                "scid_also_known_as applies to a did:webvh log; omit it with \
+                 identity_method = \"webs\""
+                    .into(),
+            );
+        }
+    }
+
+    if let Some(co_admin) = inputs.co_admin_did.as_deref() {
+        let trimmed = co_admin.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("did:") {
+            errors.push(format!(
+                "co_admin_did must be a DID starting with `did:` (got {co_admin:?}). Omit it to \
+                 install a single admin."
+            ));
+        }
+    }
+
+    // A blank value is "no registry", same as omitting the key; a non-blank
+    // one has to be a DID. Caught here rather than at render time so the
+    // operator sees it alongside every other problem in the file, before the
+    // first VTA round-trip.
+    if let Some(registry_did) = inputs.registry_did.as_deref() {
+        let trimmed = registry_did.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("did:") {
+            errors.push(format!(
+                "registry_did must be a DID starting with `did:` (got {registry_did:?}) — the \
+                 referral names the registry by DID, not by URL. Omit it for a community with \
+                 no trust registry."
+            ));
+        }
+    }
+
+    if let Some(messaging) = inputs.messaging.as_ref() {
+        if messaging.config.mediator_did.trim().is_empty() {
+            errors.push(
+                "messaging.mediator_did must not be empty when [messaging] is present".into(),
+            );
+        }
+        // `transports = []` parses, so serde's required-field check does not
+        // catch it — and it is the one value that silently produces an
+        // unreachable community: connected to a mediator, advertising no way to
+        // reach it. Refuse it by name, with the fix.
+        if messaging.transports.is_empty() {
+            errors.push(
+                "messaging.transports must name at least one transport when [messaging] is \
+                 present — e.g. transports = [\"tsp\", \"didcomm\"]. An empty list connects this \
+                 VTC to the mediator while advertising no way to reach it, and correcting the \
+                 DID document afterwards takes a VTA-side edit. Omit the whole [messaging] table \
+                 for a REST-only community."
+                    .into(),
+            );
+        }
+        // Duplicates would render the same service entry twice, which is a
+        // malformed document rather than a stronger claim.
+        let mut seen = messaging.transports.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() != messaging.transports.len() {
+            errors.push("messaging.transports must not repeat a transport".into());
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "setup file has {} validation error(s):\n  - {}",
+            errors.len(),
+            errors.join("\n  - ")
+        )))
+    }
+}
+
+/// `vtc setup --from <file>`: parse → [`apply`] → terse summary. The
+/// non-interactive counterpart to [`run_setup_wizard`](super::wizard::run_setup_wizard).
+pub async fn run_setup_from_file(file_path: PathBuf, single_admin: bool) -> Result<(), AppError> {
+    eprintln!(
+        "Running non-interactive VTC setup from {} ...",
+        file_path.display()
+    );
+    let plan = parse_from_toml(&file_path, single_admin)?;
+    let outcome = apply(plan).await?;
+    print_setup_summary_terse(&outcome);
+    Ok(())
+}
+
+/// Print a terse, scrape-friendly completion block. Unlike the
+/// interactive summary this never prompts; like it, it never prints the
+/// admin private key, only the owner-only file holding it. The install URL
+/// + claim code are the actionable outputs.
+fn print_setup_summary_terse(outcome: &SetupOutcome) {
+    println!("VTC setup complete.");
+    println!("vtc_did={}", outcome.vtc_did);
+    println!("admin_did={}", outcome.admin_did);
+    println!("config_path={}", outcome.config_path.display());
+    println!("data_dir={}", outcome.data_dir.display());
+    println!("install_url={}", outcome.install_url);
+    println!("claim_code={}", outcome.claim_code);
+    println!("single_admin_mode={}", outcome.single_admin_mode);
+    // VTI-11: the ACL is empty until the install is claimed; this is the
+    // headless way to seed the admin (run with the daemon stopped).
+    println!(
+        "offline_admin_grant={}",
+        super::wizard::offline_acl_add_command(outcome)
+    );
+    // The key itself is never printed (#2703); only the owner-only file.
+    if let Some(key_file) = outcome.admin_key_file.as_deref() {
+        println!("admin_key_file={}", key_file.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal valid TOML (keyring backend, serverless DID, no
+    /// messaging) parses and applies defaults.
+    fn minimal_toml(config_path: &str, setup_key_file: &str) -> String {
+        format!(
+            r#"
+config_path = "{config_path}"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:webvh:vta.example.com:abc"
+setup_key_file = "{setup_key_file}"
+
+[secrets]
+keyring_service = "vtc-test"
+"#
+        )
+    }
+
+    /// Persist a fresh ephemeral key so `parse_from_toml` can load it,
+    /// returning (path, did).
+    fn persist_setup_key(dir: &Path) -> (PathBuf, String) {
+        let key = EphemeralSetupKey::generate().expect("generate setup key");
+        let did = key.did.clone();
+        let path = dir.join("setup-key.json");
+        key.persist_to(&path).expect("persist setup key");
+        (path, did)
+    }
+
+    #[test]
+    fn minimal_inputs_parse_and_default() {
+        let toml = minimal_toml("/srv/vtc/config.toml", "/tmp/key.json");
+        let inputs: VtcWizardInputs = toml::from_str(&toml).expect("parse");
+        assert_eq!(inputs.context, "default", "context defaults to `default`");
+        assert!(inputs.messaging.is_none());
+        assert!(inputs.webvh.server_id.is_none());
+        assert_eq!(inputs.secrets.keyring_service, "vtc-test");
+    }
+
+    /// VTI-KEY-001: `identity_method = "webs"` asks for a did:webs VTC, which
+    /// needs a hosting server and takes no did:scid alias; omitted, the VTC is
+    /// a did:webvh, as before.
+    #[test]
+    fn vti_key_001_a_did_webs_vtc_needs_a_hosting_server() {
+        let base = minimal_toml("/srv/vtc/config.toml", "/tmp/key.json");
+        let inputs: VtcWizardInputs = toml::from_str(&base).unwrap();
+        assert_eq!(inputs.identity_method, IdentityMethod::Webvh);
+
+        let webs = format!("identity_method = \"webs\"\n{base}");
+        let inputs: VtcWizardInputs = toml::from_str(&webs).unwrap();
+        assert_eq!(inputs.identity_method, IdentityMethod::Webs);
+        let err = validate(&inputs).unwrap_err().to_string();
+        assert!(err.contains("server_id"), "{err}");
+
+        let hosted = format!(
+            "identity_method = \"webs\"\nscid_also_known_as = true\n{base}\n\
+             [webvh]\nserver_id = \"host-1\"\npath = \".well-known\"\n"
+        );
+        let inputs: VtcWizardInputs = toml::from_str(&hosted).unwrap();
+        let err = validate(&inputs).unwrap_err().to_string();
+        assert!(
+            err.contains(".well-known") && err.contains("scid_also_known_as"),
+            "{err}"
+        );
+
+        let ok = format!(
+            "identity_method = \"webs\"\n{base}\n[webvh]\nserver_id = \"host-1\"\npath = \"communities\"\n"
+        );
+        validate(&toml::from_str(&ok).unwrap()).expect("valid");
+    }
+
+    #[test]
+    fn unknown_field_rejected() {
+        let toml = r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:web:vta.example.com"
+setup_key_file = "/tmp/key.json"
+bogus_field = true
+
+[secrets]
+"#;
+        let err = toml::from_str::<VtcWizardInputs>(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("bogus_field"),
+            "deny_unknown_fields should reject bogus_field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn full_inputs_parse() {
+        let toml = r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com/"
+vta_did     = "did:webvh:vta.example.com:abc"
+context     = "acme"
+setup_key_file = "/secrets/vtc-setup-key.json"
+
+[webvh]
+server_id = "host-1"
+domain    = "tenant.example.com"
+path      = "communities/acme"
+
+[messaging]
+mediator_did = "did:web:mediator.example.com"
+transports   = ["tsp", "didcomm"]
+
+[secrets]
+keyring_service = "vtc-acme"
+"#;
+        let inputs: VtcWizardInputs = toml::from_str(toml).expect("parse");
+        assert_eq!(inputs.context, "acme");
+        assert_eq!(inputs.webvh.server_id.as_deref(), Some("host-1"));
+        assert_eq!(inputs.webvh.domain.as_deref(), Some("tenant.example.com"));
+        assert_eq!(inputs.webvh.path.as_deref(), Some("communities/acme"));
+        let messaging = inputs.messaging.as_ref().unwrap();
+        assert_eq!(
+            messaging.config.mediator_did,
+            "did:web:mediator.example.com"
+        );
+        assert_eq!(
+            messaging.transports,
+            vec![Transport::Tsp, Transport::Didcomm]
+        );
+    }
+
+    /// `transports` is required, not defaulted. A `[messaging]` table without
+    /// it must fail loudly at parse rather than mint a community that connects
+    /// to a mediator and advertises no way to reach it — a state that only a
+    /// VTA-side `dids edit` (and a log install, self-hosted) can correct.
+    #[test]
+    fn messaging_without_transports_is_refused() {
+        let err = toml::from_str::<VtcWizardInputs>(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:web:vta.example.com"
+setup_key_file = "/tmp/key.json"
+
+[messaging]
+mediator_did = "did:web:mediator.example.com"
+
+[secrets]
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("transports"),
+            "must name the missing key: {err}"
+        );
+    }
+
+    /// An *empty* list parses (serde only checks presence), so validation has
+    /// to catch it — and it is the exact shape that produces an unreachable
+    /// community.
+    #[test]
+    fn validate_rejects_an_empty_transport_list() {
+        let inputs: VtcWizardInputs = toml::from_str(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:web:vta.example.com"
+setup_key_file = "/tmp/key.json"
+
+[messaging]
+mediator_did = "did:web:mediator.example.com"
+transports   = []
+
+[secrets]
+"#,
+        )
+        .expect("an empty list is valid TOML");
+        let err = validate(&inputs).unwrap_err().to_string();
+        assert!(err.contains("at least one transport"), "{err}");
+        assert!(
+            err.contains("Omit the whole [messaging] table"),
+            "must name the REST-only alternative: {err}"
+        );
+    }
+
+    /// A repeated transport would render the same service entry twice —
+    /// malformed, not emphatic.
+    #[test]
+    fn validate_rejects_duplicate_transports() {
+        let inputs: VtcWizardInputs = toml::from_str(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:web:vta.example.com"
+setup_key_file = "/tmp/key.json"
+
+[messaging]
+mediator_did = "did:web:mediator.example.com"
+transports   = ["tsp", "tsp"]
+
+[secrets]
+"#,
+        )
+        .expect("parse");
+        let err = validate(&inputs).unwrap_err().to_string();
+        assert!(err.contains("must not repeat"), "{err}");
+    }
+
+    /// Omitting `[messaging]` entirely stays valid — a REST-only community is
+    /// a supported shape, and this is the migration path for an existing setup
+    /// file that never configured messaging.
+    #[test]
+    fn no_messaging_table_needs_no_transports() {
+        let inputs: VtcWizardInputs = toml::from_str(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:web:vta.example.com"
+setup_key_file = "/tmp/key.json"
+
+[secrets]
+"#,
+        )
+        .expect("parse");
+        assert!(inputs.messaging.is_none());
+        validate(&inputs).expect("REST-only is valid");
+    }
+
+    /// One transport is legal — a community whose mediator routes only DIDComm.
+    #[test]
+    fn a_single_transport_is_accepted() {
+        let inputs: VtcWizardInputs = toml::from_str(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:web:vta.example.com"
+setup_key_file = "/tmp/key.json"
+
+[messaging]
+mediator_did = "did:web:mediator.example.com"
+transports   = ["didcomm"]
+
+[secrets]
+"#,
+        )
+        .expect("parse");
+        validate(&inputs).expect("didcomm-only is valid");
+        assert_eq!(
+            inputs.messaging.unwrap().transports,
+            vec![Transport::Didcomm]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_base_url_and_vta_did() {
+        let inputs: VtcWizardInputs = toml::from_str(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "vtc.example.com/v1"
+vta_did     = "not-a-did"
+setup_key_file = "/tmp/key.json"
+
+[secrets]
+"#,
+        )
+        .expect("parse");
+        let err = validate(&inputs).unwrap_err().to_string();
+        assert!(err.contains("base_url must start with http"), "{err}");
+        assert!(err.contains("/v1"), "{err}");
+        assert!(err.contains("vta_did must be a DID"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_mediator_did() {
+        let inputs: VtcWizardInputs = toml::from_str(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:web:vta.example.com"
+setup_key_file = "/tmp/key.json"
+
+[messaging]
+mediator_did = ""
+transports   = ["didcomm"]
+
+[secrets]
+"#,
+        )
+        .expect("parse");
+        let err = validate(&inputs).unwrap_err().to_string();
+        assert!(err.contains("messaging.mediator_did"), "{err}");
+    }
+
+    /// End-to-end of the *headless* half: a TOML pointing at a persisted,
+    /// pre-authorised setup key parses into a `WizardPlan` with no TTY —
+    /// up to the VTA network boundary `apply` would cross. This is the
+    /// "completes with no TTY" guarantee minus the live VTA.
+    #[test]
+    fn parse_from_toml_builds_plan_with_loaded_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (key_path, key_did) = persist_setup_key(dir.path());
+        // base_url carries a trailing slash to assert it's trimmed.
+        let toml = format!(
+            r#"
+config_path = "{cfg}"
+base_url    = "https://vtc.example.com/"
+vta_did     = "did:webvh:vta.example.com:abc"
+setup_key_file = "{key}"
+
+[secrets]
+keyring_service = "vtc-test"
+"#,
+            cfg = dir.path().join("config.toml").display(),
+            key = key_path.display(),
+        );
+        let toml_path = dir.path().join("setup.toml");
+        std::fs::write(&toml_path, toml).expect("write toml");
+
+        let plan = parse_from_toml(&toml_path, false).expect("parse_from_toml");
+        assert_eq!(
+            plan.setup_key.did, key_did,
+            "the plan must carry the pre-authorised key loaded from disk"
+        );
+        assert_eq!(
+            plan.inputs.base_url, "https://vtc.example.com",
+            "trailing slash trimmed"
+        );
+        assert_eq!(plan.inputs.context, "default");
+    }
+
+    #[test]
+    fn parse_from_toml_reports_missing_setup_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = minimal_toml(
+            dir.path().join("config.toml").to_str().unwrap(),
+            dir.path().join("does-not-exist.json").to_str().unwrap(),
+        );
+        let toml_path = dir.path().join("setup.toml");
+        std::fs::write(&toml_path, toml).expect("write toml");
+
+        // `WizardPlan` deliberately holds the setup key and isn't `Debug`,
+        // so match rather than `unwrap_err()` (which needs `T: Debug`).
+        let err = match parse_from_toml(&toml_path, false) {
+            Ok(_) => panic!("expected a missing-setup-key error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("load setup key"), "{err}");
+        assert!(err.contains("admin ACL"), "actionable hint present: {err}");
+    }
+
+    /// #501: `provision_transport` forces the transport setup provisions over;
+    /// omitted, the runner chooses; anything else is a hard error.
+    #[test]
+    fn provision_transport_from_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (key_path, _) = persist_setup_key(dir.path());
+        let parse = |extra: &str| {
+            let toml = format!(
+                "{extra}\n{}",
+                minimal_toml(
+                    dir.path().join("config.toml").to_str().unwrap(),
+                    key_path.to_str().unwrap(),
+                )
+            );
+            let path = dir.path().join("setup.toml");
+            std::fs::write(&path, toml).expect("write toml");
+            parse_from_toml(&path, false).map_err(|e| e.to_string())
+        };
+        assert_eq!(parse("").unwrap().inputs.provision_transport, None);
+        assert_eq!(
+            parse(r#"provision_transport = "rest""#)
+                .unwrap()
+                .inputs
+                .provision_transport,
+            Some(ProvisionTransport::Rest)
+        );
+        assert!(parse(r#"provision_transport = "carrier-pigeon""#).is_err());
+    }
+
+    // ── single-administrator mode (VTI-APV-022) ────────────────────
+
+    /// `single_admin_mode = true` in the setup file, or `--single-admin`,
+    /// sets it; neither leaves it off.
+    #[test]
+    fn vti_apv_022_single_admin_mode_from_the_file_or_the_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (key_path, _) = persist_setup_key(dir.path());
+        let write = |extra: &str| {
+            let toml = format!(
+                "{extra}\n{}",
+                minimal_toml(
+                    dir.path().join("config.toml").to_str().unwrap(),
+                    key_path.to_str().unwrap(),
+                )
+            );
+            let path = dir.path().join("setup.toml");
+            std::fs::write(&path, toml).expect("write toml");
+            path
+        };
+        let plain = write("");
+        let off = parse_from_toml(&plain, false)
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert!(!off.inputs.single_admin_mode, "off unless chosen");
+        let flagged = parse_from_toml(&plain, true)
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert!(flagged.inputs.single_admin_mode, "--single-admin sets it");
+        let in_file = write("single_admin_mode = true");
+        let on = parse_from_toml(&in_file, false)
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert!(on.inputs.single_admin_mode, "the file sets it");
+    }
+
+    // ── co-admin (VTI-APV-014) ──────────────────────────────────────
+
+    /// A second admin to install beside the first: optional, and a DID when
+    /// given.
+    #[test]
+    fn co_admin_did_is_optional_and_must_be_a_did() {
+        let none: VtcWizardInputs = toml::from_str(&minimal_toml_with("")).expect("parse");
+        assert!(none.co_admin_did.is_none());
+        validate(&none).expect("one admin is a valid install");
+
+        let some: VtcWizardInputs = toml::from_str(&minimal_toml_with(
+            r#"co_admin_did = "did:key:z6MkCoAdmin""#,
+        ))
+        .expect("parse");
+        validate(&some).expect("a DID-valued co-admin is valid");
+        assert_eq!(
+            super::super::wizard::normalize_co_admin_did(" did:key:z6MkCoAdmin ").unwrap(),
+            Some("did:key:z6MkCoAdmin".to_string())
+        );
+        assert!(
+            super::super::wizard::normalize_co_admin_did("  ")
+                .unwrap()
+                .is_none()
+        );
+
+        let bad: VtcWizardInputs =
+            toml::from_str(&minimal_toml_with(r#"co_admin_did = "alice@example.com""#))
+                .expect("parse");
+        let err = validate(&bad).unwrap_err().to_string();
+        assert!(err.contains("co_admin_did"), "{err}");
+    }
+
+    // ── trust-registry referral ─────────────────────────────────────
+
+    fn minimal_toml_with(extra: &str) -> String {
+        format!(
+            r#"
+config_path = "/srv/vtc/config.toml"
+base_url    = "https://vtc.example.com"
+vta_did     = "did:webvh:vta.example.com:abc"
+setup_key_file = "/secrets/vtc-setup-key.json"
+{extra}
+
+[secrets]
+keyring_service = "vtc"
+"#
+        )
+    }
+
+    #[test]
+    fn registry_did_parses_and_validates() {
+        let inputs: VtcWizardInputs = toml::from_str(&minimal_toml_with(
+            r#"registry_did = "did:webvh:xyz:registry""#,
+        ))
+        .expect("parse");
+        assert_eq!(
+            inputs.registry_did.as_deref(),
+            Some("did:webvh:xyz:registry")
+        );
+        validate(&inputs).expect("a DID-valued registry_did is valid");
+    }
+
+    /// Omitting the key is the no-registry case, and must stay valid — most
+    /// communities have no registry, and every setup file written before
+    /// this field existed omits it.
+    #[test]
+    fn registry_did_is_optional() {
+        let inputs: VtcWizardInputs = toml::from_str(&minimal_toml_with("")).expect("parse");
+        assert!(inputs.registry_did.is_none());
+        validate(&inputs).expect("no registry is a valid community");
+        assert!(normalize_registry_did("").unwrap().is_none());
+    }
+
+    /// A URL here would render an entry that reads as this community serving
+    /// TRQP itself rather than referring to a registry, so it is refused at
+    /// parse time rather than several VTA round-trips later.
+    #[test]
+    fn registry_did_rejects_a_url() {
+        let inputs: VtcWizardInputs = toml::from_str(&minimal_toml_with(
+            r#"registry_did = "https://registry.example.com""#,
+        ))
+        .expect("parse");
+        let err = validate(&inputs).expect_err("a URL is not a DID");
+        assert!(err.to_string().contains("registry_did"), "got: {err}");
+    }
+
+    /// A blank string reads as "no registry", the same as omitting the key —
+    /// templated deploys emit empty strings for unset values.
+    #[test]
+    fn blank_registry_did_reads_as_no_registry() {
+        let inputs: VtcWizardInputs =
+            toml::from_str(&minimal_toml_with(r#"registry_did = "   ""#)).expect("parse");
+        validate(&inputs).expect("blank is not an invalid DID, it is no registry");
+        assert!(normalize_registry_did("   ").unwrap().is_none());
+    }
+
+    /// The shipped example file must parse — keeps the docs honest.
+    #[test]
+    fn shipped_example_parses() {
+        let example = include_str!("../../../docs/03-vtc/examples/vtc-setup.example.toml");
+        let inputs: VtcWizardInputs = toml::from_str(example).expect("shipped example must parse");
+        // Sanity on a couple of fields so an accidental gut of the
+        // example is caught too.
+        assert!(inputs.base_url.starts_with("http"));
+        assert!(inputs.vta_did.starts_with("did:"));
+        validate(&inputs).expect("shipped example must validate");
+    }
+}

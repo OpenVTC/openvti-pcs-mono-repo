@@ -1,0 +1,232 @@
+// `/admin/step-up#request=…` — answering, in this browser, a passkey step-up a
+// signed document sent from a terminal was refused for.
+//
+// `cnm` cannot run a WebAuthn ceremony, so when the VTC refuses its document
+// with `details.stepUpRequest` (an operation-bound step-up,
+// `auth/step-up/approve-request/0.3` with `boundTo`), it prints this page's
+// URL with the request in the fragment — which the browser never sends to a
+// server — and waits. The operator reads here what they are consenting to,
+// answers with their passkey, and goes back to the terminal, where `cnm` sends
+// the *same* document again and the VTC spends the gesture on it.
+//
+// Nothing here trusts the fragment for anything but display and the WebAuthn
+// options: what the gesture authorizes is the VTC's own record of the refusal,
+// keyed by the challenge, never this page's copy of it.
+//
+// A console user approves here with their passkey, unsigned: the assertion is
+// the evidence (`auth/step-up/approve-response/0.7`, `evidence.kind =
+// webauthn`), and the console key — a delegation — signs nothing. One without
+// a console key — a member answering for `cnm` — runs the ceremony and shows
+// an **answer code** instead, which the member pastes back into `cnm` to be
+// signed into the answer with their own key.
+//
+// Declining is a statement only the subject's own DID can sign (0.7 producer
+// item 6), so it is offered only where the VTA wallet plugin can sign as the
+// subject; otherwise the operator declines by not answering.
+
+import { useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { Fingerprint } from "lucide-react";
+
+import { signingAvailable } from "@/lib/api";
+import {
+  acceptedKinds,
+  answerableHere,
+  noFactorGuidance,
+  answerCodeOf,
+  answerStepUp,
+  declinableHere,
+  declineStepUp,
+  decodeStepUpRequest,
+  runStepUpCeremony,
+} from "@/lib/bound-step-up";
+import { useViewerDid } from "@/lib/viewer";
+import { Protected } from "@/components/Protected";
+import { messageOf } from "@/lib/messages";
+
+function message(err: unknown): string {
+  return messageOf(err);
+}
+
+function StepUpPageSurface() {
+  const { hash } = useLocation();
+  const request = useMemo(() => decodeStepUpRequest(hash), [hash]);
+  const viewer = useViewerDid();
+  const [declined, setDeclined] = useState(false);
+
+  const canSign = useQuery({ queryKey: ["console-signing"], queryFn: signingAvailable });
+  const signing = canSign.data === true;
+  const approve = useMutation({ mutationFn: () => answerStepUp(request!) });
+  // No console key here: the gesture only, for `cnm` to sign.
+  const handOver = useMutation({
+    mutationFn: async () => answerCodeOf(await runStepUpCeremony(request!)),
+  });
+  // A refusal is proved by the subject's own DID, never the console key
+  // (approve-response 0.7 producer item 6): only the wallet plugin can.
+  const canDecline = declinableHere();
+  const decline = useMutation({
+    mutationFn: () => declineStepUp(request!),
+    onSuccess: () => setDeclined(true),
+  });
+
+  if (!request) {
+    return (
+      <section className="page">
+        <h2>Confirm with your passkey</h2>
+        <section className="card error">
+          <p>
+            This link carries no step-up request this console can read. Copy the whole
+            URL <code>cnm</code> printed, including everything after <code>#</code>.
+          </p>
+        </section>
+      </section>
+    );
+  }
+
+  const wrongPerson = !!viewer && viewer !== request.subject;
+  const done = approve.isSuccess || declined || handOver.isSuccess;
+  const pending = approve.isPending || decline.isPending || handOver.isPending;
+
+  return (
+    <section className="page">
+      <h2>Confirm with your passkey</h2>
+      <section className="card">
+        <p className="lead">A document you sent from a terminal is waiting for this.</p>
+        <dl className="gitns-parties">
+          <dt>It asks</dt>
+          <dd>
+            <q>{request.reason}</q>
+          </dd>
+          <dt>As</dt>
+          <dd>
+            <code className="gitns-party-did">{request.subject}</code>
+          </dd>
+          {request.boundTo && (
+            <>
+              <dt>Bound to</dt>
+              <dd>
+                <code className="gitns-party-did">{request.boundTo}</code>
+              </dd>
+            </>
+          )}
+          {request.ttlSeconds && (
+            <>
+              <dt>Expires</dt>
+              <dd>{Math.round(request.ttlSeconds / 60)} minutes after it was asked</dd>
+            </>
+          )}
+        </dl>
+        <p className="muted">
+          The gesture authorizes that one document and nothing else: no session is
+          elevated, and the VTC spends it when the terminal sends the document again.
+        </p>
+
+        {wrongPerson && (
+          <div className="finding warn" role="alert">
+            <strong>You are signed in as someone else</strong>
+            <span>
+              Only a passkey registered to <code>{request.subject}</code> can answer this.
+              This session is <code>{viewer}</code>.
+            </span>
+          </div>
+        )}
+        {!answerableHere(request) && (
+          <div className="finding error" role="alert">
+            <strong>This console cannot answer it</strong>
+            <span>
+              {acceptedKinds(request).includes("approverSigned")
+                ? "The VTC asked for your step-up approver, which answers in the console where the act was signed, not here. " +
+                  noFactorGuidance(request)
+                : "The VTC did not ask for a passkey."}
+            </span>
+          </div>
+        )}
+        {approve.isSuccess && (
+          <div className="finding ok" role="status">
+            <strong>Recorded</strong>
+            <span>
+              Go back to your terminal and continue: <code>cnm</code> sends the same
+              document again, and the VTC acts on it.
+            </span>
+          </div>
+        )}
+        {handOver.isSuccess && (
+          <div className="finding ok" role="status">
+            <strong>Paste this answer code into your terminal</strong>
+            <span>
+              <code>cnm</code> is waiting for it. It signs the answer with your own key and
+              sends the same document again. The code is good for this one request only,
+              and useless without your signature.
+            </span>
+            <textarea
+              className="answer-code"
+              readOnly
+              rows={4}
+              value={handOver.data}
+              aria-label="Answer code"
+              onFocus={(e) => e.currentTarget.select()}
+            />
+            <button className="secondary"
+              type="button"
+              onClick={() => void navigator.clipboard?.writeText(handOver.data)}
+            >
+              Copy
+            </button>
+          </div>
+        )}
+        {declined && (
+          <div className="finding ok" role="status">
+            <strong>Declined</strong>
+            <span>Nothing was authorized. If the document is sent again, the VTC asks again.</span>
+          </div>
+        )}
+        {(approve.isError || decline.isError || handOver.isError) && (
+          <div className="finding error" role="alert">
+            <strong>That did not go through</strong>
+            <span>{message(approve.error ?? decline.error ?? handOver.error)}</span>
+          </div>
+        )}
+
+        {!done && canSign.isSuccess && (
+          <div className="form-actions">
+            {canDecline ? (
+              <button
+                type="button"
+                className="secondary"
+                disabled={pending}
+                onClick={() => decline.mutate()}
+              >
+                Decline
+              </button>
+            ) : (
+              <p className="muted">
+                To decline, do not answer: the request lapses in a few minutes.
+              </p>
+            )}
+            <button
+              type="button"
+              className="primary"
+              disabled={!answerableHere(request) || pending}
+              onClick={() => (signing ? approve.mutate() : handOver.mutate())}
+            >
+              <Fingerprint aria-hidden="true" size={14} />{" "}
+              {approve.isPending || handOver.isPending
+                ? "Waiting for your passkey…"
+                : "Confirm with passkey"}
+            </button>
+          </div>
+        )}
+      </section>
+    </section>
+  );
+}
+
+/** StepUpPage, out of the community theme's reach (`vtc/community/theme/show/0.1`, client item 2). */
+export function StepUpPage() {
+  return (
+    <Protected ground="page">
+      <StepUpPageSurface />
+    </Protected>
+  );
+}

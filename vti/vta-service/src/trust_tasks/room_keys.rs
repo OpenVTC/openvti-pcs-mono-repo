@@ -1,0 +1,103 @@
+//! The room-oracle slice — `spec/rooms/keys/present/0.2`.
+//!
+//! An agent asks its principal's VTA to mint a presentation for one room operation. The
+//! orchestration is [`crate::operations::room_oracle`]; this is the dispatch surface.
+//!
+//! Three gates, in order, and the order matters:
+//!
+//! 1. **Capability.** [`Capability::RoomPresent`], registered upstream as `roomPresent`.
+//!    Deliberately not [`Capability::Sign`]: an agent that may ask for a scoped
+//!    presentation granted to itself is not thereby an agent that may sign *anything at all*
+//!    with its principal's key. Gating an oracle on the generic signing oracle would grant
+//!    strictly more than the task needs, which is the opposite of what an oracle is for.
+//! 2. **Persona**, inside [`room_oracle::principal`] — the credentials presented are those the
+//!    room issued to a persona the caller may act as (a DID this VTA holds for the person, in
+//!    a context the caller acts in), and the leaf is signed as that persona. That is the
+//!    privilege boundary a context exists to draw, and it is enforced where the persona is
+//!    resolved rather than re-derived here.
+//! 3. **Attenuation**, inside the credential library — a caller cannot obtain more than the
+//!    principal holds, because `attenuate` refuses to widen.
+//!
+//! # The presenter is the caller, always — and the member is not
+//!
+//! Two identities, kept apart. The **member** is the persona the room's credentials name;
+//! nothing here makes the caller one. The **presenter** is the agent the leaf is granted to,
+//! as the specification's *Presenter binding* requires: an attenuated delegate of the member,
+//! for one action and four hours, never a member of the room.
+//!
+//! The minted leaf grants to the DID the *transport* authenticated, never to one named in
+//! the payload. A caller cannot ask for a presentation made out to somebody else, which is
+//! what stops this becoming a credential-minting service for third parties: the far side's
+//! `authorize` refuses a chain whose leaf grants to anyone but the party that signed the
+//! request, so a presentation minted for A is worthless to B even if B obtains it.
+
+use serde_json::Value;
+use trust_tasks_rs::TrustTask;
+use vti_common::acl::Capability;
+
+use crate::audit;
+use crate::auth::AuthClaims;
+use crate::operations::room_oracle;
+use crate::server::AppState;
+
+use super::helpers::{
+    TRANSPORT_TRUST_TASK, TrustTaskOutcome, app_error_to_reject, parse_payload, success_response,
+};
+
+/// Refuse unless the caller holds `cap` — by role, and by whatever their ACL
+/// entry narrowed that to.
+async fn require_cap(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: &TrustTask<Value>,
+    cap: Capability,
+) -> Result<(), TrustTaskOutcome> {
+    super::helpers::require_capability(state, auth, doc, cap, "minting a room presentation").await
+}
+
+/// `rooms/keys/present/0.2`.
+pub(super) async fn handle_present(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(r) = require_cap(state, auth, &doc, Capability::RoomPresent).await {
+        return r;
+    }
+
+    let req: vti_specs::rooms::keys::present::v0_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // The action as its wire string. The generated enum is the spec's own vocabulary, so a
+    // value outside it never reaches here — one fewer thing to validate by hand.
+    let action = serde_json::to_value(req.action)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+
+    let minted = match room_oracle::present(state, auth, &auth.did, &req.room_id, &action).await {
+        Ok(m) => m,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    // Audited because it is consequential: a presentation was minted on the principal's
+    // behalf, and "which agent obtained what standing in which room, and when" is the
+    // sentence an incident review needs. The room is the resource; the agent is the actor.
+    if let Err(e) = audit::record(
+        &state.audit_sink,
+        "rooms.keys.present",
+        &auth.did,
+        Some(&req.room_id),
+        "success",
+        Some(TRANSPORT_TRUST_TASK),
+        None,
+    )
+    .await
+    {
+        tracing::error!(error = %e, "failed to record a room-oracle audit entry");
+    }
+
+    success_response(&doc, minted)
+}

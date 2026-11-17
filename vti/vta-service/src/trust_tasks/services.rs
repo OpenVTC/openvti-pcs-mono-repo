@@ -1,0 +1,1356 @@
+//! Services slice trust-task handlers — `vta/services/*`.
+//!
+//! The transports the agent advertises in its own did:webvh document. Every
+//! mutation here edits that document and republishes the signed log, so none of
+//! them is a runtime flag flip: **the log entry is the change**.
+//!
+//! ## One task per verb, not per transport
+//!
+//! `service` names the transport and `config` carries its settings, so these
+//! eight handlers cover what twenty `/services/*` REST routes did. The fan-out
+//! onto the per-transport operations happens here rather than on the wire,
+//! which is what keeps a fifth transport to a config variant instead of four
+//! new specs.
+//!
+//! The operations are untouched — `operations::protocol::*` already implements
+//! each transport, and this module is the parameterised door onto them.
+//!
+//! ## The state shape is mapped, not forwarded
+//!
+//! `vta_sdk::protocol::services::ServiceState` is an internally-tagged enum
+//! whose members serialize snake_case (`mediator_did`); the published schema is
+//! a flat object with camelCase members. They are close enough to look
+//! interchangeable and are not, so every response here is built explicitly
+//! against the generated type. Forwarding the SDK value would put
+//! `mediator_did` on the wire under a schema that says `mediatorDid`, and the
+//! dispatch spine's `validate_payload` would reject it on arrival.
+
+use super::helpers::{
+    TRANSPORT_TRUST_TASK, TrustTaskOutcome, app_error_to_reject, parse_payload, success_response,
+};
+use serde_json::Value;
+use trust_tasks_rs::TrustTask;
+use vti_specs::vta::services as spec;
+
+use crate::auth::AuthClaims;
+use crate::error::AppError;
+use crate::operations::protocol::list::ListServicesError;
+use crate::operations::protocol::{OpContext, ServiceOpDeps};
+use crate::server::AppState;
+
+use vta_sdk::protocol::services::ServiceState as SdkState;
+
+/// The DID resolver, or a refusal.
+///
+/// Every mutation needs it: publishing a log entry means resolving the agent's
+/// own DID first, and an agent that cannot do that must not claim it changed
+/// what the world can see.
+fn resolver(state: &AppState) -> Result<affinidi_did_resolver_cache_sdk::DIDCacheClient, AppError> {
+    state
+        .did_resolver
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| AppError::Internal("DID resolver not available".into()))
+}
+
+fn setup_acl_from_ext<T: serde::Serialize>(ext: Option<&T>) -> Result<bool, AppError> {
+    let Some(ext) = ext else { return Ok(false) };
+    let value = serde_json::to_value(ext)
+        .map_err(|e| AppError::Validation(format!("invalid service extension: {e}")))?;
+    match value
+        .get("org.openvtc")
+        .and_then(|namespace| namespace.get("setupAcl"))
+    {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err(AppError::Validation(
+            "ext.org.openvtc.setupAcl must be a boolean".into(),
+        )),
+    }
+}
+
+/// Assemble the live mediator prover for a DIDComm update when the VTA's
+/// running delivery layer is available. Trust Task service updates can arrive
+/// over REST, DIDComm, or TSP, but the DIDComm operation still needs the VTA's
+/// existing mediator session to prove the candidate before promotion.
+#[cfg(feature = "didcomm")]
+async fn live_didcomm_prover(
+    state: &AppState,
+) -> Option<crate::messaging::live_prover::DIDCommServiceProver> {
+    let vta_did = {
+        let config = state.config.read().await;
+        config.vta_did.clone()?
+    };
+    crate::messaging::live_prover::try_build_from_parts(
+        &state.didcomm_bridge,
+        &vta_did,
+        state.secrets_resolver.as_ref()?,
+        state.signing_vm_id.as_ref()?,
+        state.ka_vm_id.as_ref()?,
+    )
+    .await
+}
+
+#[cfg(feature = "didcomm")]
+async fn run_first_enable_handshake(
+    state: &AppState,
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    mediator_did: &str,
+    timeout: std::time::Duration,
+    setup_acl: bool,
+) -> Result<(), crate::messaging::handshake::HandshakeError> {
+    use crate::messaging::handshake::{HandshakeError, HandshakeOptions, HandshakeStage};
+    use crate::messaging::transient_handshake::{
+        TransientHandshakeContext, run_transient_handshake,
+    };
+    use affinidi_tdk::common::config::TDKConfig;
+    use affinidi_tdk::secrets_resolver::SecretsResolver;
+
+    let missing = |name: &str| HandshakeError::Failed {
+        stage: HandshakeStage::Connect,
+        cause: format!("first-enable handshake prerequisite missing: {name}"),
+    };
+    let secrets_resolver = state
+        .secrets_resolver
+        .as_ref()
+        .ok_or_else(|| missing("secrets resolver"))?;
+    let signing_vm_id = state
+        .signing_vm_id
+        .as_ref()
+        .ok_or_else(|| missing("signing verification method"))?;
+    let ka_vm_id = state
+        .ka_vm_id
+        .as_ref()
+        .ok_or_else(|| missing("key-agreement verification method"))?;
+    let vta_did = state
+        .config
+        .read()
+        .await
+        .vta_did
+        .clone()
+        .ok_or_else(|| missing("VTA DID"))?;
+
+    let mut secrets = Vec::with_capacity(2);
+    if let Some(secret) = secrets_resolver.get_secret(signing_vm_id).await {
+        secrets.push(secret);
+    }
+    if let Some(secret) = secrets_resolver.get_secret(ka_vm_id).await {
+        secrets.push(secret);
+    }
+    if secrets.is_empty() {
+        return Err(missing("VTA signing and key-agreement secrets"));
+    }
+
+    let mut resolver = resolver.clone();
+    crate::server::preload_self_did_document(
+        &mut resolver,
+        &vta_did,
+        Some(&state.webvh_ks),
+        Some(&state.webs_ks),
+    )
+    .await;
+
+    let tdk_config = TDKConfig::builder()
+        .with_did_resolver(resolver.clone())
+        .with_load_environment(false)
+        .build()
+        .map_err(|e| HandshakeError::Failed {
+            stage: HandshakeStage::Connect,
+            cause: format!("build resolver-backed TDK config: {e}"),
+        })?;
+
+    run_transient_handshake(
+        TransientHandshakeContext {
+            vta_did,
+            secrets,
+            tdk_config: Some(tdk_config),
+        },
+        &resolver,
+        &state.telemetry,
+        mediator_did,
+        HandshakeOptions {
+            timeout,
+            setup_acl,
+            channel: TRANSPORT_TRUST_TASK.to_string(),
+            force: false,
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Map one SDK state record onto the published shape.
+///
+/// `drains_until` has no SDK counterpart on the state record — a drain is
+/// reported by `vta/services/drain/list`, which reads a different store — so it
+/// is left absent here rather than guessed.
+fn state(s: &SdkState) -> spec::list::v1_1::ServiceState {
+    use spec::list::v1_1::{ServiceKind as K, ServiceState as Out};
+    let (kind, enabled, mediator_did, url) = match s {
+        SdkState::Tsp {
+            enabled,
+            mediator_did,
+        } => (K::Tsp, *enabled, mediator_did.clone(), None),
+        SdkState::Rest { enabled, url } => (K::Rest, *enabled, None, url.clone()),
+        SdkState::Didcomm {
+            enabled,
+            mediator_did,
+            ..
+        } => (K::Didcomm, *enabled, mediator_did.clone(), None),
+        SdkState::Webauthn { enabled, url } => (K::Webauthn, *enabled, None, url.clone()),
+    };
+    // `drainEndsAt` unset: a state snapshot says nothing about drains, which
+    // `services/drain/list` answers.
+    Out::builder()
+        .kind(kind)
+        .enabled(enabled)
+        .mediator_did(mediator_did)
+        .url(url)
+        .try_into()
+        .expect("every required member of the service state is set above")
+}
+
+/// Finish a generated response/component builder.
+///
+/// The generated types are `#[non_exhaustive]` as of trust-tasks-rs 0.17, so
+/// this crate cannot name their members in a struct literal — that is what lets
+/// the registry add an OPTIONAL member without breaking every consumer. The
+/// builder starts each REQUIRED member as `Err("no value supplied for …")`, so
+/// every call below sets its required members explicitly and lets the optional
+/// ones default.
+fn built<T, B>(builder: B) -> Result<T, AppError>
+where
+    B: TryInto<T>,
+    B::Error: std::fmt::Display,
+{
+    builder
+        .try_into()
+        .map_err(|e| AppError::Internal(format!("couldn't build a services response: {e}")))
+}
+
+fn kind_of(s: &SdkState) -> spec::list::v1_1::ServiceKind {
+    state(s).kind
+}
+
+/// Classify a listing failure the way the REST route does.
+///
+/// Mirrored rather than collapsed to `Internal`: an agent whose DID is not yet
+/// configured is a conflict the operator can fix, and telling them so is the
+/// difference between "run `vta setup`" and "something broke". A refusal is
+/// forbidden, not internal, for the same reason.
+fn list_error(e: ListServicesError) -> AppError {
+    match e {
+        ListServicesError::Auth(msg) => AppError::Forbidden(msg),
+        ListServicesError::VtaDidNotConfigured => {
+            AppError::Conflict("VTA DID is not configured — run `vta setup` first".into())
+        }
+        other => AppError::Internal(other.to_string()),
+    }
+}
+
+// ── list / get ──────────────────────────────────────────────────────
+
+pub(super) async fn handle_list(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let _req: spec::list::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // The operation enforces super-admin itself; letting it do so keeps one
+    // authorization decision rather than two that can drift apart.
+    match crate::operations::protocol::list::list_services(
+        &state_.config,
+        &state_.webvh_ks,
+        &state_.webs_ks,
+        auth,
+    )
+    .await
+    {
+        Ok(body) => match built::<spec::list::v1_1::Response, _>(
+            spec::list::v1_1::Response::builder()
+                .services(body.services.iter().map(state).collect::<Vec<_>>()),
+        ) {
+            Ok(r) => success_response(&doc, r),
+            Err(e) => app_error_to_reject(&doc, e),
+        },
+        Err(e) => app_error_to_reject(&doc, list_error(e)),
+    }
+}
+
+pub(super) async fn handle_get(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::get::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match crate::operations::protocol::list::list_services(
+        &state_.config,
+        &state_.webvh_ks,
+        &state_.webs_ks,
+        auth,
+    )
+    .await
+    {
+        Ok(body) => {
+            // `get` narrows `list` rather than having its own operation: the
+            // agent holds one state record per transport, so querying twice
+            // could disagree with itself.
+            let want = match req.service {
+                spec::get::v1_1::ServiceKind::Didcomm => spec::list::v1_1::ServiceKind::Didcomm,
+                spec::get::v1_1::ServiceKind::Rest => spec::list::v1_1::ServiceKind::Rest,
+                spec::get::v1_1::ServiceKind::Tsp => spec::list::v1_1::ServiceKind::Tsp,
+                spec::get::v1_1::ServiceKind::Webauthn => spec::list::v1_1::ServiceKind::Webauthn,
+                // The generated enum is `#[non_exhaustive]`: a caller on a
+                // newer registry can name a transport this build does not
+                // serve. Refuse rather than fall through to one of the four —
+                // `get` exists to distinguish "never configured" from
+                // "configured and disabled", and answering about the wrong
+                // transport would corrupt exactly that distinction.
+                _ => {
+                    return app_error_to_reject(
+                        &doc,
+                        AppError::Validation(
+                            "services/get: unrecognised service kind — this VTA does not serve \
+                             a transport added to the registry after it was built"
+                                .into(),
+                        ),
+                    );
+                }
+            };
+            match body.services.iter().find(|s| kind_of(s) == want) {
+                Some(found) => match built::<spec::get::v1_1::Response, _>(
+                    spec::get::v1_1::Response::builder().state(
+                        serde_json::from_value::<spec::get::v1_1::ServiceState>(
+                            serde_json::to_value(state(found)).unwrap_or(Value::Null),
+                        )
+                        .expect("the two generated ServiceState shapes are identical"),
+                    ),
+                ) {
+                    Ok(r) => success_response(&doc, r),
+                    Err(e) => app_error_to_reject(&doc, e),
+                },
+                // Absent means never configured — distinct from configured and
+                // disabled, which comes back with `enabled: false`. Answering
+                // an empty success here would erase that distinction, which is
+                // the only reason to call `get` over `list`.
+                None => app_error_to_reject(
+                    &doc,
+                    crate::error::AppError::NotFound(format!(
+                        "no {:?} transport is configured on this agent",
+                        req.service
+                    )),
+                ),
+            }
+        }
+        Err(e) => app_error_to_reject(&doc, list_error(e)),
+    }
+}
+
+// ── the mutating verbs ──────────────────────────────────────────────
+//
+// Each fans out on `service`. The three uniform transports take the same
+// `(deps, auth, params, ctx, channel)` shape; `didcomm` differs because it
+// carries a mediator handshake and a drain, which is the whole reason the
+// spec's `config` is a discriminated union rather than one flat object.
+
+use crate::operations::protocol::disable_didcomm::{
+    DisableDidcommParams, DisableTransport, disable_didcomm,
+};
+use crate::operations::protocol::disable_rest::{DisableRestParams, disable_rest};
+use crate::operations::protocol::disable_tsp::{DisableTspParams, disable_tsp};
+use crate::operations::protocol::disable_webauthn::{DisableWebauthnParams, disable_webauthn};
+use crate::operations::protocol::drain_cancel::{DrainCancelParams, drain_cancel};
+use crate::operations::protocol::enable_rest::{EnableRestParams, enable_rest};
+use crate::operations::protocol::enable_tsp::{EnableTspParams, enable_tsp};
+use crate::operations::protocol::enable_webauthn::{EnableWebauthnParams, enable_webauthn};
+use crate::operations::protocol::list_drain::list_drain;
+use crate::operations::protocol::rollback_rest::{RollbackRestParams, rollback_rest};
+use crate::operations::protocol::rollback_tsp::{RollbackTspParams, rollback_tsp};
+use crate::operations::protocol::rollback_webauthn::{RollbackWebauthnParams, rollback_webauthn};
+use crate::operations::protocol::update_rest::{UpdateRestParams, update_rest};
+use crate::operations::protocol::update_tsp::{UpdateTspParams, update_tsp};
+use crate::operations::protocol::update_webauthn::{UpdateWebauthnParams, update_webauthn};
+
+/// Which transport this task arrived over, for the drain guard.
+///
+/// The dispatch spine records confidentiality, not binding: DIDComm and TSP are
+/// both `EndToEnd`, and it cannot tell them apart. So `EndToEnd` maps to
+/// `Didcomm` here, which **over-applies** the 1-hour drain floor to a
+/// TSP-carried disable that does not strictly need it.
+///
+/// That asymmetry is deliberate. Under-applying the floor tears down the
+/// mediator a request arrived through and discards the reply to the very task
+/// asking for it; over-applying only delays a teardown the operator can repeat.
+/// A bounded delay is the cheaper mistake, so the ambiguous case takes it.
+fn arrival_transport() -> DisableTransport {
+    match super::transport::current() {
+        super::transport::TransportConfidentiality::EndToEnd => DisableTransport::Didcomm,
+        super::transport::TransportConfidentiality::HopByHop => DisableTransport::Rest,
+    }
+}
+
+/// `config.url`, or a validation refusal naming the member that is missing.
+fn need_url(url: Option<String>) -> Result<String, AppError> {
+    url.ok_or_else(|| AppError::Conflict("this service needs `config.url`; none was sent".into()))
+}
+
+fn need_mediator(mediator_did: Option<String>) -> Result<String, AppError> {
+    mediator_did.ok_or_else(|| {
+        AppError::Conflict("this service needs `config.mediatorDid`; none was sent".into())
+    })
+}
+
+fn restarting_ext() -> Result<spec::enable::v1_1::Ext, AppError> {
+    let key = "org.openvtc"
+        .parse()
+        .map_err(|e| AppError::Internal(format!("invalid restart extension namespace: {e}")))?;
+    Ok(spec::enable::v1_1::Ext(std::collections::HashMap::from([
+        (key, serde_json::json!({ "restarting": true })),
+    ])))
+}
+
+/// The shared success shape, stamped with the instant the change took effect.
+///
+/// The operations return the log-entry id but not the time; the REST routes
+/// stamp it at the boundary and so does this, so both surfaces agree.
+fn mutation(
+    log_entry_version_id: String,
+    vta_did: String,
+    serverless: bool,
+    drain_until: Option<chrono::DateTime<chrono::Utc>>,
+    draining_mediator: Option<String>,
+) -> Result<spec::enable::v1_1::ServiceMutationResult, AppError> {
+    built(
+        spec::enable::v1_1::ServiceMutationResult::builder()
+            .log_entry_version_id(
+                spec::enable::v1_1::ServiceMutationResultLogEntryVersionId::try_from(
+                    log_entry_version_id,
+                )
+                .map_err(|_| {
+                    AppError::Internal("operation returned an empty log entry id".into())
+                })?,
+            )
+            .effective_at(chrono::Utc::now())
+            .drain_ends_at(drain_until)
+            .draining_mediator(draining_mediator)
+            .vta_did((!vta_did.is_empty()).then_some(vta_did))
+            .serverless(serverless),
+    )
+}
+
+/// Re-type an identically-shaped generated value for a sibling family.
+///
+/// `enable`, `update` and `disable` each get their own `ServiceMutationResult`
+/// from codegen: same members, distinct types. Rather than hand-copy the
+/// members three times — and drift when one gains a field — go through the wire
+/// form, which is the representation all of them agree on by construction.
+fn retype<T: serde::de::DeserializeOwned>(v: impl serde::Serialize) -> Result<T, AppError> {
+    serde_json::to_value(v)
+        .and_then(serde_json::from_value)
+        .map_err(|e| AppError::Internal(format!("service result re-type: {e}")))
+}
+
+/// Await a service operation, mapping its error to a conflict rejection.
+///
+/// This used to `Box::pin` the operation future. These handlers fan out to four
+/// operations, each with a sizeable future, and before the dispatch seam was
+/// fixed the spine awaited the whole handler inline in a match that summed every
+/// task's state machine — so inlining these operations too grew that frame past
+/// the thread stack and aborted an unrelated mock_vta test with a stack overflow
+/// (which reads as, but is not, infinite recursion). That boxing now lives at
+/// the dispatch seam itself (`dispatch_typed` `Box::pin`s every arm), which
+/// heap-allocates each handler's whole future once; the per-operation box here
+/// was redundant on top of it and dropped.
+macro_rules! op {
+    ($doc:expr, $call:expr) => {
+        match $call.await {
+            Ok(r) => r,
+            Err(e) => return app_error_to_reject($doc, AppError::Conflict(e.to_string())),
+        }
+    };
+}
+
+pub(super) async fn handle_enable(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let req: spec::enable::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let resolver = match resolver(state_) {
+        Ok(r) => r,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let deps = ServiceOpDeps::from_app_state(state_, &resolver);
+    use spec::enable::v1_1::ServiceKind as K;
+    let setup_acl = match setup_acl_from_ext(req.ext.as_ref()) {
+        Ok(value) => value,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let restarting = matches!(req.service, K::Didcomm);
+
+    let result = match req.service {
+        K::Rest => {
+            let url = match need_url(req.config.url.clone().map(String::from)) {
+                Ok(u) => u,
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+            let r = op!(
+                &doc,
+                enable_rest(
+                    &deps,
+                    auth,
+                    EnableRestParams { url },
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Webauthn => {
+            let url = match need_url(req.config.url.clone().map(String::from)) {
+                Ok(u) => u,
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+            let r = op!(
+                &doc,
+                enable_webauthn(
+                    &deps,
+                    auth,
+                    EnableWebauthnParams { url },
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Tsp => {
+            let mediator_did =
+                match need_mediator(req.config.mediator_did.clone().map(String::from)) {
+                    Ok(m) => m,
+                    Err(e) => return app_error_to_reject(&doc, e),
+                };
+            let r = op!(
+                &doc,
+                enable_tsp(
+                    &deps,
+                    auth,
+                    EnableTspParams { mediator_did },
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Didcomm => {
+            // The transient handshake below proves the candidate before the
+            // operation's AlwaysOkProver avoids repeating that work.
+            let mediator_did =
+                match need_mediator(req.config.mediator_did.clone().map(String::from)) {
+                    Ok(m) => m,
+                    Err(e) => return app_error_to_reject(&doc, e),
+                };
+            let force = req.config.force.unwrap_or(false);
+            let handshake_timeout = std::time::Duration::from_secs(
+                req.config.handshake_timeout_seconds.map_or(10, u64::from),
+            );
+            #[cfg(feature = "didcomm")]
+            if !force
+                && let Err(error) = run_first_enable_handshake(
+                    state_,
+                    &resolver,
+                    &mediator_did,
+                    handshake_timeout,
+                    setup_acl,
+                )
+                .await
+            {
+                return app_error_to_reject(&doc, AppError::Conflict(error.to_string()));
+            }
+            let params = crate::operations::protocol::enable_didcomm::EnableDidcommParams {
+                mediator_did,
+                setup_acl,
+                force,
+                handshake_timeout,
+            };
+            let prover = crate::messaging::handshake::AlwaysOkProver;
+            let r = op!(
+                &doc,
+                crate::operations::protocol::enable_didcomm::enable_didcomm(
+                    &deps,
+                    &prover,
+                    auth,
+                    params,
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None).and_then(
+                |mut result| match restarting_ext() {
+                    Ok(ext) => {
+                        result.ext = Some(ext);
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                },
+            )
+        }
+        // `#[non_exhaustive]`: a caller on a newer registry can name a
+        // transport this build does not serve. Refusing is the only safe
+        // answer — every arm above mutates the DID document, and picking
+        // one for an unrecognised kind would write the wrong service.
+        _ => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Validation(
+                    "unrecognised service kind — this VTA does not serve a \
+                     transport added to the registry after it was built"
+                        .into(),
+                ),
+            );
+        }
+    };
+    match result {
+        Ok(result) => match built::<spec::enable::v1_1::Response, _>(
+            spec::enable::v1_1::Response::builder().result(result),
+        ) {
+            Ok(r) => {
+                let response = success_response(&doc, r);
+                if restarting {
+                    response.with_restart()
+                } else {
+                    response
+                }
+            }
+            Err(e) => app_error_to_reject(&doc, e),
+        },
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+pub(super) async fn handle_update(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    // 1.1 is 1.0 plus an optional `drainTtlSeconds`, so one parse serves both:
+    // a 1.0 document (validated against 1.0's schema on the spine) reads as a
+    // 1.1 payload with no drain requested.
+    let req: spec::update::v1_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    use spec::update::v1_2::ServiceKind as K;
+    // The drain belongs to the mediated transports; a member that does not
+    // apply to the named service makes the request malformed, not ignored.
+    if req.drain_ttl_seconds.is_some() && matches!(req.service, K::Rest | K::Webauthn) {
+        return app_error_to_reject(
+            &doc,
+            AppError::Validation(
+                "drainTtlSeconds applies only to a mediated transport (didcomm, tsp)".into(),
+            ),
+        );
+    }
+    let resolver = match resolver(state_) {
+        Ok(r) => r,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let deps = ServiceOpDeps::from_app_state(state_, &resolver);
+    let setup_acl = match setup_acl_from_ext(req.ext.as_ref()) {
+        Ok(value) => value,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    let result = match req.service {
+        K::Rest => {
+            let url = match need_url(req.config.url.clone().map(String::from)) {
+                Ok(u) => u,
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+            let r = op!(
+                &doc,
+                update_rest(
+                    &deps,
+                    auth,
+                    UpdateRestParams { url },
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Webauthn => {
+            let url = match need_url(req.config.url.clone().map(String::from)) {
+                Ok(u) => u,
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+            let r = op!(
+                &doc,
+                update_webauthn(
+                    &deps,
+                    auth,
+                    UpdateWebauthnParams { url },
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Tsp => {
+            let mediator_did =
+                match need_mediator(req.config.mediator_did.clone().map(String::from)) {
+                    Ok(m) => m,
+                    Err(e) => return app_error_to_reject(&doc, e),
+                };
+            let r = op!(
+                &doc,
+                update_tsp(
+                    &deps,
+                    auth,
+                    UpdateTspParams { mediator_did },
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Didcomm => {
+            // Replacing the mediator drains the old one, so this carries the
+            // same arrival-transport guard as `disable`: swapping the mediator
+            // a request arrived through must not cut its reply.
+            let mediator_did =
+                match need_mediator(req.config.mediator_did.clone().map(String::from)) {
+                    Ok(m) => m,
+                    Err(e) => return app_error_to_reject(&doc, e),
+                };
+            let force = req.config.force.unwrap_or(false);
+            #[cfg(feature = "didcomm")]
+            let live_prover = live_didcomm_prover(state_).await;
+            let always_ok = crate::messaging::handshake::AlwaysOkProver;
+            let prover: &(dyn crate::messaging::handshake::ListenerProver + Send + Sync) = {
+                #[cfg(feature = "didcomm")]
+                if force {
+                    &always_ok
+                } else if let Some(prover) = live_prover.as_ref() {
+                    prover
+                } else {
+                    return app_error_to_reject(
+                        &doc,
+                        AppError::ServiceError {
+                            status: axum::http::StatusCode::BAD_GATEWAY,
+                            message: "DIDComm messaging is not running; cannot prove the candidate mediator"
+                                .into(),
+                        },
+                    );
+                }
+                #[cfg(not(feature = "didcomm"))]
+                if force {
+                    &always_ok
+                } else {
+                    return app_error_to_reject(
+                        &doc,
+                        AppError::ServiceError {
+                            status: axum::http::StatusCode::BAD_GATEWAY,
+                            message: "DIDComm support is not compiled in; cannot prove the candidate mediator"
+                                .into(),
+                        },
+                    );
+                }
+            };
+            // `update/1.1`'s window when one is asked for, else the floor. Over
+            // a request that arrived through the mediator being replaced, a
+            // value below the floor is raised to it rather than refused — the
+            // spec's MUST — since cutting that mediator discards the reply.
+            let floor = crate::operations::protocol::disable_didcomm::MIN_DRAIN_TTL_OVER_DIDCOMM;
+            let transport = arrival_transport();
+            let drain_ttl = match req.drain_ttl_seconds {
+                None => floor,
+                Some(secs) => {
+                    let asked = std::time::Duration::from_secs(secs);
+                    match transport {
+                        crate::operations::protocol::disable_didcomm::DisableTransport::Didcomm => {
+                            asked.max(floor)
+                        }
+                        _ => asked,
+                    }
+                }
+            };
+            let params = crate::operations::protocol::update_didcomm::UpdateDidcommParams {
+                new_mediator_did: mediator_did,
+                drain_ttl,
+                setup_acl,
+                force,
+                handshake_timeout: std::time::Duration::from_secs(
+                    req.config.handshake_timeout_seconds.map_or(10, u64::from),
+                ),
+                audit_kind: crate::operations::protocol::update_didcomm::MigrateAuditKind::Forward,
+                transport,
+            };
+            let r = op!(
+                &doc,
+                crate::operations::protocol::update_didcomm::update_didcomm(
+                    &deps,
+                    prover,
+                    auth,
+                    params,
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(
+                r.new_version_id,
+                r.vta_did,
+                r.serverless,
+                Some(r.drains_until),
+                Some(r.prior_mediator_did),
+            )
+        }
+        // `#[non_exhaustive]`: a caller on a newer registry can name a
+        // transport this build does not serve. Refusing is the only safe
+        // answer — every arm above mutates the DID document, and picking
+        // one for an unrecognised kind would write the wrong service.
+        _ => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Validation(
+                    "unrecognised service kind — this VTA does not serve a \
+                     transport added to the registry after it was built"
+                        .into(),
+                ),
+            );
+        }
+    };
+    match result {
+        // Annotated: the target type used to be pinned by the response struct
+        // literal, and the builder's `TryInto` setter no longer pins it.
+        Ok(result) => match retype::<spec::update::v1_2::ServiceMutationResult>(result) {
+            Ok(result) => {
+                match built::<spec::update::v1_2::Response, _>(
+                    spec::update::v1_2::Response::builder().result(result),
+                ) {
+                    Ok(r) => success_response(&doc, r),
+                    Err(e) => app_error_to_reject(&doc, e),
+                }
+            }
+            Err(e) => app_error_to_reject(&doc, e),
+        },
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+pub(super) async fn handle_disable(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let req: spec::disable::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let resolver = match resolver(state_) {
+        Ok(r) => r,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let deps = ServiceOpDeps::from_app_state(state_, &resolver);
+    use spec::disable::v1_1::ServiceKind as K;
+
+    let result = match req.service {
+        K::Rest => {
+            let r = op!(
+                &doc,
+                disable_rest(
+                    &deps,
+                    auth,
+                    DisableRestParams,
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Webauthn => {
+            let r = op!(
+                &doc,
+                disable_webauthn(
+                    &deps,
+                    auth,
+                    DisableWebauthnParams {},
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Tsp => {
+            let r = op!(
+                &doc,
+                disable_tsp(
+                    &deps,
+                    auth,
+                    DisableTspParams,
+                    OpContext::Direct,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            mutation(r.new_version_id, r.vta_did, r.serverless, None, None)
+        }
+        K::Didcomm => {
+            // `drainTtlSeconds` is a REQUEST, not an instruction — the operation
+            // raises it to the 1h floor when `transport` says the task arrived
+            // end-to-end. The spec says so, and the result's `drainEndsAt` is
+            // what a caller must read to learn what actually happened.
+            let params = DisableDidcommParams {
+                drain_ttl: std::time::Duration::from_secs(req.drain_ttl_seconds.unwrap_or(0)),
+                transport: arrival_transport(),
+            };
+            let r = op!(
+                &doc,
+                disable_didcomm(&deps, auth, params, OpContext::Direct, TRANSPORT_TRUST_TASK)
+            );
+            let draining = r.drains_until.map(|_| r.prior_mediator_did.clone());
+            mutation(
+                r.new_version_id,
+                r.vta_did,
+                r.serverless,
+                r.drains_until,
+                draining,
+            )
+        }
+        // `#[non_exhaustive]`: a caller on a newer registry can name a
+        // transport this build does not serve. Refusing is the only safe
+        // answer — every arm above mutates the DID document, and picking
+        // one for an unrecognised kind would write the wrong service.
+        _ => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Validation(
+                    "unrecognised service kind — this VTA does not serve a \
+                     transport added to the registry after it was built"
+                        .into(),
+                ),
+            );
+        }
+    };
+    match result {
+        Ok(result) => match retype::<spec::disable::v1_1::ServiceMutationResult>(result) {
+            Ok(result) => {
+                match built::<spec::disable::v1_1::Response, _>(
+                    spec::disable::v1_1::Response::builder().result(result),
+                ) {
+                    Ok(r) => success_response(&doc, r),
+                    Err(e) => app_error_to_reject(&doc, e),
+                }
+            }
+            Err(e) => app_error_to_reject(&doc, e),
+        },
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// Map a forward-op rollback kind onto the published one.
+///
+/// Each transport's rollback module declares its own `RollbackKind` with the
+/// same four variants, so this takes the enum path rather than one type. They
+/// are parallel by convention, not by a shared definition, and a macro that
+/// names the variants keeps a divergence a compile error rather than a silent
+/// mismatch.
+macro_rules! rollback_kind {
+    ($m:ident, $k:expr) => {{
+        use crate::operations::protocol::$m::RollbackKind as K;
+        use spec::rollback::v1_2::RollbackResultKind as Out;
+        match $k {
+            K::Disabled => Out::Disabled,
+            K::Enabled => Out::Enabled,
+            K::Updated => Out::Updated,
+            K::NoOp => Out::NoOp,
+        }
+    }};
+}
+
+/// Build the rollback result.
+///
+/// `logEntryVersionId` is optional here and required on `ServiceMutationResult`,
+/// which is the whole reason rollback has its own shape: when the previous
+/// state already equals the current one nothing is written, and `kind: noOp`
+/// says so. That is a **success** — the requested state holds — so reporting it
+/// as a failure would be wrong, and inventing a log entry id would be worse.
+fn rollback_result(
+    kind: spec::rollback::v1_2::RollbackResultKind,
+    new_version_id: Option<String>,
+    vta_did: String,
+    serverless: bool,
+    draining_mediator: Option<String>,
+) -> spec::rollback::v1_2::RollbackResult {
+    let wrote_an_entry = new_version_id.is_some();
+    spec::rollback::v1_2::RollbackResult::builder()
+        .kind(kind)
+        .log_entry_version_id(new_version_id)
+        .effective_at(wrote_an_entry.then(chrono::Utc::now))
+        .draining_mediator(draining_mediator)
+        .vta_did((!vta_did.is_empty()).then_some(vta_did))
+        .serverless(serverless)
+        .try_into()
+        .expect("every required member of the rollback result is set above")
+}
+
+pub(super) async fn handle_rollback(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    // 1.1 is 1.0 plus an optional `drainTtlSeconds`, so one parse serves both: a
+    // 1.0 document (validated against 1.0's schema on the spine) reads as a 1.1
+    // payload with no drain requested.
+    let req: spec::rollback::v1_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    use spec::rollback::v1_2::ServiceKind as K;
+    // As `update/1.1`: the drain belongs to the mediated transports, and a
+    // member that cannot apply to the named service is malformed, not ignored.
+    if req.drain_ttl_seconds.is_some() && matches!(req.service, K::Rest | K::Webauthn) {
+        return app_error_to_reject(
+            &doc,
+            AppError::Validation(
+                "drainTtlSeconds applies only to a mediated transport (didcomm, tsp)".into(),
+            ),
+        );
+    }
+    let resolver = match resolver(state_) {
+        Ok(r) => r,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let deps = ServiceOpDeps::from_app_state(state_, &resolver);
+
+    let result = match req.service {
+        K::Rest => {
+            let r = op!(
+                &doc,
+                rollback_rest(&deps, auth, RollbackRestParams, TRANSPORT_TRUST_TASK)
+            );
+            rollback_result(
+                rollback_kind!(rollback_rest, r.kind),
+                r.new_version_id,
+                r.vta_did,
+                r.serverless,
+                None,
+            )
+        }
+        K::Webauthn => {
+            let r = op!(
+                &doc,
+                rollback_webauthn(&deps, auth, RollbackWebauthnParams, TRANSPORT_TRUST_TASK)
+            );
+            rollback_result(
+                rollback_kind!(rollback_webauthn, r.kind),
+                r.new_version_id,
+                r.vta_did,
+                r.serverless,
+                None,
+            )
+        }
+        K::Tsp => {
+            let r = op!(
+                &doc,
+                rollback_tsp(&deps, auth, RollbackTspParams, TRANSPORT_TRUST_TASK)
+            );
+            rollback_result(
+                rollback_kind!(rollback_tsp, r.kind),
+                r.new_version_id,
+                r.vta_did,
+                r.serverless,
+                None,
+            )
+        }
+        K::Didcomm => {
+            // Rolling DIDComm back can leave the superseded mediator draining,
+            // so it takes the same arrival guard as disable. `rollback/1.1`'s
+            // window when one is asked for, else the floor; over a request that
+            // arrived through the mediator being replaced, a shorter window is
+            // raised to the floor (the spec's MUST), since cutting that mediator
+            // discards the reply. A window on a rollback that leaves nothing
+            // draining is accepted and does nothing.
+            let floor = crate::operations::protocol::disable_didcomm::MIN_DRAIN_TTL_OVER_DIDCOMM;
+            let transport = arrival_transport();
+            let drain_ttl = match req.drain_ttl_seconds {
+                None => floor,
+                Some(secs) => {
+                    let asked = std::time::Duration::from_secs(secs);
+                    match transport {
+                        crate::operations::protocol::disable_didcomm::DisableTransport::Didcomm => {
+                            asked.max(floor)
+                        }
+                        _ => asked,
+                    }
+                }
+            };
+            let params = crate::operations::protocol::rollback_didcomm::RollbackDidcommParams {
+                drain_ttl,
+                transport,
+            };
+            // Rolling back re-runs the forward op, so it needs a prover for
+            // the same reason enable does — and `AlwaysOkProver` for the same
+            // reason: the restored mediator's handshake cannot depend on a
+            // DIDComm service that the rollback may itself be turning off.
+            let prover = crate::messaging::handshake::AlwaysOkProver;
+            let r = op!(
+                &doc,
+                crate::operations::protocol::rollback_didcomm::rollback_didcomm(
+                    &deps,
+                    &prover,
+                    auth,
+                    params,
+                    TRANSPORT_TRUST_TASK
+                )
+            );
+            let draining = r.draining_mediator.clone();
+            rollback_result(
+                rollback_kind!(rollback_didcomm, r.kind),
+                r.new_version_id,
+                r.vta_did,
+                r.serverless,
+                draining,
+            )
+        }
+        // `#[non_exhaustive]`: a caller on a newer registry can name a
+        // transport this build does not serve. Refusing is the only safe
+        // answer — every arm above mutates the DID document, and picking
+        // one for an unrecognised kind would write the wrong service.
+        _ => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Validation(
+                    "unrecognised service kind — this VTA does not serve a \
+                     transport added to the registry after it was built"
+                        .into(),
+                ),
+            );
+        }
+    };
+    match built::<spec::rollback::v1_2::Response, _>(
+        spec::rollback::v1_2::Response::builder().result(result),
+    ) {
+        Ok(r) => success_response(&doc, r),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+// ── drain ───────────────────────────────────────────────────────────
+
+pub(super) async fn handle_drain_list(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let _req: spec::drain::list::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match list_drain(&state_.config, &state_.drains_ks, auth).await {
+        Ok(body) => {
+            let entries = body
+                .entries
+                .into_iter()
+                .map(|e| {
+                    built(
+                        spec::drain::list::v1_1::DrainEntry::builder()
+                            .mediator_did(
+                                spec::drain::list::v1_1::DrainEntryMediatorDid::try_from(
+                                    e.mediator_did,
+                                )
+                                .map_err(|_| {
+                                    AppError::Internal(
+                                        "drain entry has an empty mediator did".into(),
+                                    )
+                                })?,
+                            )
+                            .endpoint(e.endpoint)
+                            .drain_ends_at(
+                                e.drains_until
+                                    .parse::<chrono::DateTime<chrono::Utc>>()
+                                    .map_err(|_| {
+                                        AppError::Internal(
+                                            "drain entry has an unparseable deadline".into(),
+                                        )
+                                    })?,
+                            ),
+                    )
+                })
+                .collect::<Result<Vec<_>, AppError>>();
+            match entries {
+                Ok(entries) => match built::<spec::drain::list::v1_1::Response, _>(
+                    spec::drain::list::v1_1::Response::builder().entries(entries),
+                ) {
+                    Ok(r) => success_response(&doc, r),
+                    Err(e) => app_error_to_reject(&doc, e),
+                },
+                Err(e) => app_error_to_reject(&doc, e),
+            }
+        }
+        Err(e) => app_error_to_reject(&doc, AppError::Conflict(e.to_string())),
+    }
+}
+
+pub(super) async fn handle_drain_cancel(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let req: spec::drain::cancel::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // Destructive: whatever is still in flight through that mediator is lost,
+    // which is exactly what the drain window existed to prevent. The operation
+    // refuses when the mediator is the active one, so an operator cannot strand
+    // the route the agent depends on by hand.
+    let params = DrainCancelParams {
+        mediator_did: req.mediator_did.to_string(),
+    };
+    match drain_cancel(
+        &state_.config,
+        &state_.drains_ks,
+        &state_.mediator_registry,
+        &state_.telemetry,
+        auth,
+        params,
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        // `mediatorDid` is a plain String in this family — no newtype to
+        // fall through, so there is nothing to validate here beyond what
+        // the operation already guaranteed.
+        Ok(r) => match built::<spec::drain::cancel::v1_0::Response, _>(
+            spec::drain::cancel::v1_0::Response::builder().mediator_did(r.mediator_did),
+        ) {
+            Ok(resp) => success_response(&doc, resp),
+            Err(e) => app_error_to_reject(&doc, e),
+        },
+        Err(e) => app_error_to_reject(&doc, AppError::Conflict(e.to_string())),
+    }
+}
+
+/// `vta/services/report/0.1` — per-mediator inbound counts and each sender's
+/// last-seen mediator over a window, from the telemetry sink. Super-admin: it
+/// is a contact log of other parties' DIDs. The sink attributes inbound by
+/// mediator, whichever mediated transport carried it, and does not record the
+/// transport, so `lastSeenTransport` is left absent rather than guessed.
+pub(super) async fn handle_report(
+    state_: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let req: spec::report::v0_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let (Some(since), Some(until)) = (req.since, req.until)
+        && since > until
+    {
+        return super::helpers::reject_declared(
+            &doc,
+            spec::report::v0_2::error_codes::INVALID_WINDOW,
+            "`since` is after `until`",
+        );
+    }
+    let report = match crate::operations::protocol::report::mediator_report(
+        &state_.telemetry,
+        auth,
+        crate::operations::protocol::report::ReportParams {
+            since: req.since,
+            until: req.until,
+        },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return app_error_to_reject(&doc, AppError::Internal(e.to_string())),
+    };
+    let ts =
+        |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let body = serde_json::json!({
+        "since": report.since.map(ts),
+        "until": ts(report.until),
+        "mediators": report.mediators.iter().map(|m| serde_json::json!({
+            "mediatorDid": m.mediator_did,
+            "inboundCount": m.inbound_count,
+            "firstSeenAt": ts(m.first_seen),
+            "lastSeenAt": ts(m.last_seen),
+        })).collect::<Vec<_>>(),
+        "senders": report.senders.iter().map(|s| serde_json::json!({
+            "senderDid": s.sender_did,
+            "lastSeenMediator": s.last_seen_mediator,
+            "lastSeenAt": ts(s.last_seen_at),
+        })).collect::<Vec<_>>(),
+    });
+    let mut body = body;
+    if report.since.is_none()
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.remove("since");
+    }
+    match serde_json::from_value::<spec::report::v0_2::Response>(body) {
+        Ok(r) => success_response(&doc, r),
+        Err(e) => app_error_to_reject(
+            &doc,
+            AppError::Internal(format!("report does not match its schema: {e}")),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod setup_acl_extension_tests {
+    use super::*;
+
+    #[test]
+    fn reads_setup_acl_from_the_openvtc_extension() {
+        let payload: spec::update::v1_2::Payload = serde_json::from_value(serde_json::json!({
+            "service": "didcomm",
+            "config": { "mediatorDid": "did:web:mediator.example" },
+            "ext": { "org.openvtc": { "setupAcl": true } }
+        }))
+        .unwrap();
+        assert!(setup_acl_from_ext(payload.ext.as_ref()).unwrap());
+    }
+
+    #[test]
+    fn rejects_a_non_boolean_setup_acl_extension() {
+        let payload: spec::update::v1_2::Payload = serde_json::from_value(serde_json::json!({
+            "service": "didcomm",
+            "config": { "mediatorDid": "did:web:mediator.example" },
+            "ext": { "org.openvtc": { "setupAcl": "yes" } }
+        }))
+        .unwrap();
+        assert!(setup_acl_from_ext(payload.ext.as_ref()).is_err());
+    }
+}

@@ -1,0 +1,349 @@
+// Vetting admin API — what the vetting panels, the join-request detail and the
+// dashboard read and write.
+//
+// Every read and write here is a signed document, sent from this browser's
+// console key: naming a vetter, the vetter listing, the join manifest,
+// resending a grant (`0.2`, which adds the `memberDid` an administrator names
+// to resend on a vetter's behalf — `0.1` alone, the vetter's own request,
+// names no one else), the endorsement-type writes, the grant listing
+// (`vtc/vetting/vetters/grants/list/0.1`), automatic grants
+// (`vtc/vetting/auto-grant/{show,update}/0.1`), withdrawal notices
+// (`vtc/vetting/revocations/list/0.1`) and community branding
+// (`vtc/community/branding/{show,update}/0.1`). A join request's vetting facts
+// (`vtc/join-requests/vetting/show/0.1`) are the one read still worth calling
+// out below, since nothing else on this page names its task.
+
+import { postSignedRead, postSignedTrustTask } from "@/lib/api";
+import { TASK_DISCOVERY } from "@/lib/hidden-vetting";
+import { postSignedWithStepUp, type ConfirmGesture } from "@/lib/signed-act";
+import type {
+  AcceptsCriterion,
+  AutoGrantConfig,
+  AutoGrantStatus,
+  CommunityBranding,
+  EndorsementType,
+  EndorsementTypeDeleted,
+  EndorsementTypeRegistered,
+  EndorsementTypesPage,
+  JoinManifest,
+  JoinRequestsPage,
+  ManifestCriterion,
+  JoinRequestVettingResponse,
+  MemberRow,
+  MembersPage,
+  RegisterAcceptsBody,
+  RegisterEndorsementTypeBody,
+  VetterGrantResponse,
+  VetterGrantRow,
+  VetterListBody,
+  VetterListResponse,
+  VetterResendResponse,
+  VettingRevocationRow,
+} from "@/lib/wire-types";
+
+const TASK_VETTER_GRANT =
+  "https://trusttasks.org/spec/vtc/vetting/vetters/grant/0.1";
+const TASK_VETTER_RESEND_0_2 =
+  "https://trusttasks.org/spec/vtc/vetting/vetters/resend/0.2";
+const TASK_VETTER_LIST =
+  "https://trusttasks.org/spec/vtc/vetting/vetters/list/0.1";
+const TASK_ENDORSEMENT_REVOKE =
+  "https://trusttasks.org/spec/vtc/endorsements/revoke/0.1";
+const TASK_MEMBERS_LIST = "https://trusttasks.org/spec/vtc/members/list/0.2";
+const TASK_ENDORSEMENT_TYPE_REGISTER =
+  "https://trusttasks.org/spec/vtc/endorsement-types/register/0.1";
+const TASK_ENDORSEMENT_TYPE_LIST =
+  "https://trusttasks.org/spec/vtc/endorsement-types/list/0.2";
+const TASK_ENDORSEMENT_TYPE_DELETE =
+  "https://trusttasks.org/spec/vtc/endorsement-types/delete/0.1";
+const TASK_JOIN_REQUESTS_LIST =
+  "https://trusttasks.org/spec/vtc/join-requests/list/0.2";
+const TASK_GRANTS_LIST = "https://trusttasks.org/spec/vtc/vetting/vetters/grants/list/0.1";
+const TASK_AUTO_GRANT_SHOW = "https://trusttasks.org/spec/vtc/vetting/auto-grant/show/0.1";
+const TASK_AUTO_GRANT_UPDATE = "https://trusttasks.org/spec/vtc/vetting/auto-grant/update/0.1";
+const TASK_REVOCATIONS_LIST = "https://trusttasks.org/spec/vtc/vetting/revocations/list/0.1";
+const TASK_JOIN_VETTING_SHOW = "https://trusttasks.org/spec/vtc/join-requests/vetting/show/0.1";
+const TASK_BRANDING_SHOW = "https://trusttasks.org/spec/vtc/community/branding/show/0.1";
+const TASK_BRANDING_UPDATE = "https://trusttasks.org/spec/vtc/community/branding/update/0.1";
+const TASK_ACCEPTS_LIST = "https://trusttasks.org/spec/vtc/schemas/accepts/list/0.2";
+const TASK_ACCEPTS_REGISTER = "https://trusttasks.org/spec/vtc/schemas/accepts/register/0.2";
+const TASK_ACCEPTS_DELETE = "https://trusttasks.org/spec/vtc/schemas/accepts/delete/0.1";
+
+/** How many pages of a signed listing the console reads before it stops. */
+const MAX_LIST_PAGES = 20;
+
+/**
+ * Page size for the listings whose specifications cap `limit` at 100 (vetter
+ * grants, revocations). A request above a listing's own maximum is refused as
+ * malformed, so each caller passes the bound its specification declares.
+ */
+const PAGE_SIZE_100 = 100;
+
+/** `vtc/schemas/accepts/list` (0.1 and 0.2) caps `limit` at 50. */
+export const ACCEPTS_PAGE_SIZE = 50;
+
+/** Every item of a paged signed listing (`{ items, nextCursor? }`). */
+async function allItems<T>(task: string, pageSize: number = PAGE_SIZE_100): Promise<T[]> {
+  const out: T[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    const body: { items: T[]; nextCursor?: string | null } = await postSignedRead(task, {
+      limit: pageSize,
+      ...(cursor ? { cursor } : {}),
+    });
+    out.push(...body.items);
+    cursor = body.nextCursor ?? null;
+    if (!cursor) break;
+  }
+  return out;
+}
+export const TASK_MANIFEST =
+  "https://trusttasks.org/spec/vtc/join-requests/manifest/0.4";
+
+/** Query keys. Everything under `["vetting"]` is refreshed after a change. */
+export const vettingKeys = {
+  grants: ["vetting", "grants"] as const,
+  autoGrant: ["vetting", "auto-grant"] as const,
+  revocations: ["vetting", "revocations"] as const,
+  manifest: ["vetting", "manifest"] as const,
+  criteria: ["vetting", "criteria"] as const,
+  endorsementTypes: ["vetting", "endorsement-types"] as const,
+  activeMembers: ["vetting", "active-members"] as const,
+  pendingWithVetting: ["vetting", "pending-with-vetting"] as const,
+  listing: (body: VetterListBody, cursor: string | null) =>
+    ["vetting", "listing", body, cursor] as const,
+  joinRequest: (id: string) => ["join-request-vetting", id] as const,
+  branding: ["community-branding"] as const,
+  pcsResetServed: ["vetting", "pcs-reset-served"] as const,
+};
+
+// ── Grants ──────────────────────────────────────────────────────────────
+
+export const fetchGrants = (): Promise<VetterGrantRow[]> =>
+  allItems<VetterGrantRow>(TASK_GRANTS_LIST);
+
+export const grantVetter = (args: {
+  memberDid: string;
+  validitySeconds: number;
+}): Promise<VetterGrantResponse> =>
+  postSignedTrustTask<VetterGrantResponse>(TASK_VETTER_GRANT, args);
+
+/** A grant is withdrawn like any endorsement. */
+export const revokeGrant = (endorsementId: string): Promise<unknown> =>
+  postSignedTrustTask<unknown>(TASK_ENDORSEMENT_REVOKE, { endorsementId });
+
+/** An administrator resending a named vetter's live grant credential
+ * (`vtc/vetting/vetters/resend/0.2`'s `memberDid` route — a vetter's own
+ * resend, `0.1`, carries no payload and names nobody else). */
+export const resendGrant = (memberDid: string): Promise<VetterResendResponse> =>
+  postSignedTrustTask<VetterResendResponse>(TASK_VETTER_RESEND_0_2, { memberDid });
+
+// ── Hidden-vetting key reset ────────────────────────────────────────────
+
+export const TASK_PCS_BINDING_RESET =
+  "https://trusttasks.org/spec/vtc/vetting/vetters/pcs-binding/reset/0.1";
+/** `vtc/vetting/vetters/pcs-binding/reset:notBound` — the member never enrolled. */
+export const PCS_BINDING_RESET_NOT_BOUND = "vtc/vetting/vetters/pcs-binding/reset:notBound";
+
+/** `vtc/vetting/vetters/pcs-binding/reset/0.1`'s answer. */
+export interface PcsBindingResetResponse {
+  memberDid: string;
+  resetAt: string;
+  /** The old identifier's labels still live: a new key is accepted once none is. */
+  waitingOn: string[];
+  open: boolean;
+}
+
+/** Whether this build serves the reset — a build without hidden vetting does not. */
+export async function fetchPcsBindingResetServed(): Promise<boolean> {
+  const res = await postSignedRead<{ supportedTypes?: unknown[] }>(TASK_DISCOVERY, {
+    patterns: ["vtc/vetting/vetters/pcs-binding/*"],
+  });
+  return (res.supportedTypes ?? []).includes(TASK_PCS_BINDING_RESET);
+}
+
+/** Reset a vetter's hidden-vetting identifier binding after their key was lost. */
+export const resetPcsBinding = (args: {
+  memberDid: string;
+  reason: string;
+}): Promise<PcsBindingResetResponse> =>
+  postSignedTrustTask<PcsBindingResetResponse>(TASK_PCS_BINDING_RESET, args);
+
+const MAX_MEMBER_PAGES = 10;
+
+/** Current members, for choosing whom to name a vetter. */
+export async function fetchActiveMembers(): Promise<MemberRow[]> {
+  const members: MemberRow[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < MAX_MEMBER_PAGES; page++) {
+    const body: MembersPage = await postSignedRead<MembersPage>(TASK_MEMBERS_LIST, {
+      limit: 200,
+      ...(cursor ? { cursor } : {}),
+    });
+    members.push(...body.items);
+    cursor = body.nextCursor ?? null;
+    if (!cursor) break;
+  }
+  return members;
+}
+
+// ── The public listing ──────────────────────────────────────────────────
+
+/** The listing an applicant sees: the same signed document they send. */
+export const fetchListing = (body: VetterListBody): Promise<VetterListResponse> =>
+  postSignedRead<VetterListResponse>(TASK_VETTER_LIST, body);
+
+// ── Automatic grants, withdrawals, join-request facts, branding ─────────
+
+export const fetchAutoGrant = async (): Promise<AutoGrantStatus> =>
+  (await postSignedRead<{ autoGrant: AutoGrantStatus }>(TASK_AUTO_GRANT_SHOW, {})).autoGrant;
+
+export const saveAutoGrant = async (config: AutoGrantConfig): Promise<AutoGrantStatus> =>
+  (await postSignedTrustTask<{ autoGrant: AutoGrantStatus }>(TASK_AUTO_GRANT_UPDATE, config))
+    .autoGrant;
+
+export const fetchRevocations = (): Promise<VettingRevocationRow[]> =>
+  allItems<VettingRevocationRow>(TASK_REVOCATIONS_LIST);
+
+export const fetchJoinRequestVetting = (id: string): Promise<JoinRequestVettingResponse> =>
+  postSignedRead<JoinRequestVettingResponse>(TASK_JOIN_VETTING_SHOW, { id });
+
+export const fetchBranding = async (): Promise<CommunityBranding> =>
+  (await postSignedRead<{ branding: CommunityBranding }>(TASK_BRANDING_SHOW, {})).branding;
+
+export const saveBranding = async (branding: CommunityBranding): Promise<CommunityBranding> =>
+  (await postSignedTrustTask<{ branding: CommunityBranding }>(TASK_BRANDING_UPDATE, { branding }))
+    .branding;
+
+export interface PendingWithVetting {
+  /** Pending join requests on the first page that carry vetting facts. */
+  count: number;
+  /** More pending requests exist than were checked. */
+  more: boolean;
+  /** Every pending join request, from the listing's `totalEstimate`; absent
+   *  when the VTC gave none. */
+  pending?: number;
+}
+
+/**
+ * Pending join requests that were decided on vetting facts and now wait for an
+ * admin. The request list does not say which carry facts, so the first page
+ * of pending requests is checked one by one — bounded at 50 reads.
+ *
+ * The page is of pending requests only: the VTC filters before paging, so its
+ * 50 rows are the first 50 pending — never a page of other statuses with the
+ * pending ones further on — and `totalEstimate` says how many are pending in
+ * all, which is what `more` is read from.
+ */
+export async function fetchPendingWithVetting(): Promise<PendingWithVetting> {
+  const page = await postSignedRead<JoinRequestsPage>(TASK_JOIN_REQUESTS_LIST, {
+    status: "pending",
+    limit: 50,
+  });
+  const withFacts = await Promise.all(
+    page.items.map((r) =>
+      fetchJoinRequestVetting(r.id).then(
+        (res) => Boolean(res.vetting),
+        () => false,
+      ),
+    ),
+  );
+  const pending = typeof page.totalEstimate === "number" ? page.totalEstimate : undefined;
+  return {
+    count: withFacts.filter(Boolean).length,
+    more: pending !== undefined ? pending > page.items.length : Boolean(page.nextCursor),
+    ...(pending !== undefined ? { pending } : {}),
+  };
+}
+
+// ── The join manifest ───────────────────────────────────────────────────
+
+export type { JoinManifest, ManifestCriterion };
+
+/**
+ * `join-requests/manifest/0.4` as applicants receive it — each criterion with
+ * its admission, its requirements and its `requirementsDigest`, in the order
+ * the community decides by — read as the same signed document an applicant
+ * sends. The shape is the manifest specification's own.
+ */
+export const fetchManifest = (): Promise<JoinManifest> =>
+  postSignedRead<JoinManifest>(TASK_MANIFEST, {});
+
+// ── Admission criteria ──────────────────────────────────────────────────
+//
+// The manifest above is what an applicant receives; these are the records
+// behind it. The schema store is one of the admin REST surfaces the daemon
+// mounts outside the Trust-Task router (`routes::mod`: "plain admin-gated CRUD
+// … exempt from the Trust-Task soft-gate"), so the exempt helpers are correct
+// here rather than a shortcut.
+
+export const fetchCriteria = (): Promise<AcceptsCriterion[]> =>
+  allItems<AcceptsCriterion>(TASK_ACCEPTS_LIST, ACCEPTS_PAGE_SIZE);
+
+/**
+ * Store a criterion. The task registers **or replaces** by id, so this is both
+ * "add" and "save"; a replaced criterion keeps its place in the decision order.
+ * The daemon checks the DCQL query, every credential type it references, the
+ * vetting requirements against the manifest schema, that the `statementType`
+ * is registered, and that it can evaluate every requirement stated.
+ */
+//
+// Adding, changing or removing a criterion decides who may become a member, so
+// it takes a passkey gesture bound to that one write and the approval of the
+// community's other `vtc.surface.admin` holders (VTI-APV-023):
+// `confirmGesture` answers the first, and for the second the write is parked
+// as an administrator action and thrown as a `ParkedAction` — a success that
+// applied nothing yet. Re-saving a criterion unchanged asks for neither.
+export const saveCriterion = async (
+  body: RegisterAcceptsBody,
+  confirmGesture: ConfirmGesture,
+): Promise<AcceptsCriterion> =>
+  (
+    await postSignedWithStepUp<{ criterion: AcceptsCriterion }>(
+      TASK_ACCEPTS_REGISTER,
+      body,
+      confirmGesture,
+    )
+  ).criterion;
+
+/** Remove a criterion — gated as [`saveCriterion`] is (VTI-APV-023). */
+export const deleteCriterion = (id: string, confirmGesture: ConfirmGesture): Promise<unknown> =>
+  postSignedWithStepUp<unknown>(TASK_ACCEPTS_DELETE, { id }, confirmGesture);
+
+// ── Endorsement types ───────────────────────────────────────────────────
+
+const MAX_TYPE_PAGES = 10;
+
+/** Every registered endorsement type, for choosing what a criterion counts. */
+export async function fetchEndorsementTypes(): Promise<EndorsementType[]> {
+  const types: EndorsementType[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < MAX_TYPE_PAGES; page++) {
+    const body: EndorsementTypesPage = await postSignedRead<EndorsementTypesPage>(
+      TASK_ENDORSEMENT_TYPE_LIST,
+      { limit: 200, ...(cursor ? { cursor } : {}) },
+    );
+    types.push(...body.items);
+    cursor = body.nextCursor ?? null;
+    if (!cursor) break;
+  }
+  return types;
+}
+
+/**
+ * Remove a registered type. The daemon refuses while anything still references
+ * it — a live endorsement of the type, or a criterion naming it as its
+ * `statementType` — and names both in the refusal, which is what the card
+ * renders.
+ *
+ * Both endorsement-type writes are signed documents.
+ */
+export const deleteEndorsementType = (
+  typeUri: string,
+): Promise<EndorsementTypeDeleted> =>
+  postSignedTrustTask<EndorsementTypeDeleted>(TASK_ENDORSEMENT_TYPE_DELETE, { typeUri });
+
+export const registerEndorsementType = (
+  body: RegisterEndorsementTypeBody,
+): Promise<EndorsementTypeRegistered> =>
+  postSignedTrustTask<EndorsementTypeRegistered>(TASK_ENDORSEMENT_TYPE_REGISTER, body);

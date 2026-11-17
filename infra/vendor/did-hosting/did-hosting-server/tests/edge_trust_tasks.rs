@@ -1,0 +1,1683 @@
+//! The edge's Trust Task listener, driven through each of its three transport
+//! entry points — the TSP frame handler, the DIDComm envelope handler and
+//! `POST /api/trust-tasks` — with documents signed as the control plane's
+//! outbox signs them.
+//!
+//! Covers the `did-management/replica/domain/*` directives, `webvh/sync/*`,
+//! the `stalePurge` freshness rule, and the refusal every one of these tasks
+//! makes: a document that does not verify — including one whose claimed
+//! issuer isn't even this edge's configured control plane — gets no signed
+//! reply at all.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Duration;
+
+use affinidi_data_integrity::DidKeyResolver;
+use affinidi_messaging_didcomm::Message;
+use affinidi_secrets_resolver::secrets::Secret;
+use did_hosting_common::did::{DidDocumentOptions, build_did_document};
+use did_hosting_common::did_ops::{DidRecord, did_key};
+use did_hosting_common::didcomm_types::*;
+use did_hosting_common::server::config::{
+    AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+};
+use did_hosting_common::server::identity::ServiceIdentity;
+use did_hosting_common::server::store::{KS_DIDS, Store};
+use did_hosting_common::server::trust_tasks::TransportBoundVerifier;
+use did_hosting_common::server::trust_tasks::send::build_request;
+use did_hosting_server::cache::ContentCache;
+use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
+use did_hosting_server::server::AppState;
+use serde_json::{Value, json};
+
+/// A fresh loopback address, distinct from every other call in this process.
+///
+/// `receive`'s per-address rate limiter would otherwise treat every HTTPS
+/// delivery in a test file that exercises many directives as one address —
+/// a test artifact, not the real-address-per-connection world the limiter
+/// defends. Each simulated "connection" here gets its own.
+fn fresh_https_addr() -> std::net::SocketAddr {
+    static NEXT: AtomicU16 = AtomicU16::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::net::SocketAddr::from(([127, 0, (n >> 8) as u8, n as u8], 0))
+}
+
+/// A `did:key` signer, so proofs verify with no I/O.
+fn signer(seed: u8) -> (String, Secret) {
+    let secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+    let pk = secret.get_public_keymultibase().unwrap();
+    let did = format!("did:key:{pk}");
+    let mut s = secret;
+    s.id = format!("{did}#{pk}");
+    (did, s)
+}
+
+fn control() -> (String, Secret) {
+    signer(90)
+}
+
+fn edge() -> (String, Secret) {
+    signer(92)
+}
+
+/// A transport a document can arrive on.
+#[derive(Debug, Clone, Copy)]
+enum Via {
+    Tsp,
+    Didcomm,
+    Https,
+}
+
+const VIAS: [Via; 3] = [Via::Tsp, Via::Didcomm, Via::Https];
+
+/// An edge with a signing identity, configured with `control()` as its one
+/// control plane.
+async fn edge_state() -> (AppState, tempfile::TempDir) {
+    let (control_did, _) = control();
+    let (edge_did, edge_key) = edge();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_config = StoreConfig {
+        data_dir: PathBuf::from(dir.path()),
+        ..StoreConfig::default()
+    };
+    let store = Store::open(&store_config).await.expect("open store");
+    let config = AppConfig {
+        fjall: Default::default(),
+        features: FeaturesConfig {
+            tsp: true,
+            ..Default::default()
+        },
+        server_did: Some(edge_did.clone()),
+        mediator_did: None,
+        public_url: Some("https://server.example.com".into()),
+        server: ServerConfig::default(),
+        log: LogConfig::default(),
+        store: store_config,
+        auth: AuthConfig::default(),
+        hosting: did_hosting_common::server::config::HostingConfig::default(),
+        secrets: SecretsConfig::default(),
+        limits: LimitsConfig::default(),
+        replication: Default::default(),
+        stats: StatsConfig::default(),
+        control_did: Some(control_did),
+        vta: VtaConfig::default(),
+        identity: Default::default(),
+        replay: Default::default(),
+        config_path: PathBuf::new(),
+    };
+    let state = AppState {
+        store: store.clone(),
+        dids_ks: store.keyspace(KS_DIDS).unwrap(),
+        config: Arc::new(config),
+        did_resolver: None,
+        trust_tasks_verifier: Some(Arc::new(TransportBoundVerifier::with_resolver(Arc::new(
+            DidKeyResolver,
+        )))),
+        secrets_resolver: None,
+        identity: Some(
+            ServiceIdentity::from_signing_secret(&edge_did, edge_key)
+                .await
+                .unwrap(),
+        ),
+        didcomm_service: Arc::new(std::sync::OnceLock::new()),
+        stats_collector: None,
+        did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate_cache: None,
+        trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
+        client_ips: Default::default(),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_locks: Default::default(),
+        replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
+    };
+    (state, dir)
+}
+
+/// A request from `from` to the edge, issued `age` ago, signed by `from`'s
+/// key — or left unsigned.
+async fn document(
+    type_uri: &str,
+    from: &(String, Secret),
+    payload: Value,
+    age: chrono::Duration,
+    sign: bool,
+) -> Value {
+    let mut doc = build_request(type_uri, &from.0, &edge().0, payload).unwrap();
+    doc.issued_at = Some(chrono::Utc::now() - age);
+    let doc = if sign {
+        did_hosting_common::server::trust_tasks::sign_document(&doc, &from.1)
+            .await
+            .unwrap()
+    } else {
+        doc
+    };
+    serde_json::to_value(doc).unwrap()
+}
+
+async fn signed(type_uri: &str, from: &(String, Secret), payload: Value) -> Value {
+    document(type_uri, from, payload, chrono::Duration::zero(), true).await
+}
+
+/// Deliver `doc` to the edge over `via`, reported as coming from `sender`,
+/// and return its reply — `None` when it answered nothing.
+async fn deliver(state: &AppState, via: Via, sender: &str, doc: Value) -> Option<Value> {
+    match via {
+        Via::Tsp => did_hosting_server::tsp::run_tsp_trust_task(
+            state,
+            sender,
+            &serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .expect("TSP entry point")
+        .map(|frame| serde_json::from_slice(&frame).expect("TSP reply is JSON")),
+        Via::Didcomm => {
+            let message = Message::build(
+                uuid::Uuid::new_v4().to_string(),
+                trust_tasks_didcomm::ENVELOPE_TYPE.to_string(),
+                doc,
+            )
+            .finalize();
+            did_hosting_server::messaging::run_trust_tasks_envelope(state, Some(sender), &message)
+                .await
+                .map(|(typ, body)| {
+                    assert_eq!(typ, trust_tasks_didcomm::ENVELOPE_TYPE);
+                    body
+                })
+        }
+        Via::Https => {
+            let (status, _, bytes) = post_https(state, &doc).await;
+            // A document that is not answered gets a bare `403`: no
+            // document at all, signed or unsigned.
+            if status == axum::http::StatusCode::FORBIDDEN {
+                assert!(
+                    bytes.is_empty(),
+                    "an unanswered document gets no body: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                None
+            } else {
+                assert_eq!(
+                    status,
+                    axum::http::StatusCode::OK,
+                    "{}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                Some(serde_json::from_slice(&bytes).expect("HTTPS reply is JSON"))
+            }
+        }
+    }
+}
+
+/// `POST` `doc` to the edge's HTTPS binding; its status, headers and body.
+async fn post_https(
+    state: &AppState,
+    doc: &Value,
+) -> (
+    axum::http::StatusCode,
+    axum::http::HeaderMap,
+    axum::body::Bytes,
+) {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    let response = did_hosting_server::routes::trust_tasks::receive(
+        axum::extract::State(state.clone()),
+        axum::extract::ConnectInfo(fresh_https_addr()),
+        axum::Extension(did_hosting_server::routes::trust_tasks::BodyLimit(
+            did_hosting_server::routes::TRUST_TASKS_BODY_LIMIT_BYTES,
+        )),
+        axum::http::HeaderMap::new(),
+        axum::body::Body::from(serde_json::to_vec(doc).unwrap()),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes)
+}
+
+/// The reply is the task's `#response`, signed by the edge and addressed to
+/// the control plane, and its payload validates against its schema.
+fn answered(reply: &Value, type_uri: &str) -> Value {
+    assert_eq!(reply["type"], format!("{type_uri}#response"), "{reply}");
+    signed_by_the_edge(reply);
+    conforms(reply);
+    reply["payload"].clone()
+}
+
+fn signed_by_the_edge(reply: &Value) {
+    assert!(reply.get("proof").is_some(), "the reply is signed: {reply}");
+    assert_eq!(reply["issuer"], edge().0, "{reply}");
+}
+
+fn conforms(reply: &Value) {
+    let type_uri = reply["type"].as_str().expect("reply has a type");
+    let schema = did_hosting_common::tasks::payload_schema(type_uri)
+        .unwrap_or_else(|| panic!("no schema is known for {type_uri}"));
+    if let Err(e) = trust_tasks_rs::validate::against_schema(schema, &reply["payload"]) {
+        panic!("{type_uri} reply does not match its schema: {e:?}\n{reply}");
+    }
+}
+
+/// The error code of a signed `trust-task-error` reply.
+fn refused(reply: &Value) -> String {
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|t| t.contains("/trust-task-error/")),
+        "expected an error, got {reply}"
+    );
+    signed_by_the_edge(reply);
+    reply["payload"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A valid one-entry `did.jsonl` for `mnemonic` on the edge's host.
+async fn valid_did_log(mnemonic: &str) -> (String, String) {
+    let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().expect("pubkey multibase");
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(
+        "server.example.com",
+        mnemonic,
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(
+            Some((chrono::Utc::now() - chrono::Duration::hours(1)).fixed_offset()),
+            &doc,
+            &params,
+            &signing,
+        )
+        .await
+        .expect("create webvh log entry");
+    let log = state
+        .log_entries()
+        .iter()
+        .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let did_id = did_hosting_common::did_ops::extract_did_id(&log).expect("log has a DID");
+    (did_id, log)
+}
+
+fn update_body(mnemonic: &str, did_id: &str, log: &str, disabled: bool) -> Value {
+    json!({
+        "mnemonic": mnemonic,
+        "didId": did_id,
+        "logContent": log,
+        "versionCount": log.lines().filter(|l| !l.trim().is_empty()).count(),
+        "disabled": disabled,
+    })
+}
+
+async fn stored(state: &AppState, mnemonic: &str) -> Option<DidRecord> {
+    state.dids_ks.get(did_key(mnemonic)).await.unwrap()
+}
+
+fn domain_entry(name: &str, status: &str) -> Value {
+    let mut entry = json!({
+        "name": name,
+        "status": status,
+        "createdAt": "2026-06-01T10:00:00Z",
+        "ext": { "vnd.affinidi.webvh": { "scheme": "https", "wellKnownEnabled": false } },
+    });
+    if status == "disabled" {
+        entry["disabledAt"] = json!("2026-09-27T09:00:00Z");
+        entry["purgeAt"] = json!("2026-10-04T09:00:00Z");
+    }
+    entry
+}
+
+// ---------------------------------------------------------------------------
+// Replication, on every transport
+// ---------------------------------------------------------------------------
+
+/// Every directive the control plane sends is applied on each transport and
+/// answered with its signed, schema-conformant `#response`.
+#[tokio::test]
+async fn every_directive_is_served_on_every_transport() {
+    use did_hosting_common::server::{assignment, domain, pending_purge};
+
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        let cp = control();
+
+        // replica/domain/upsert
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_REPLICA_DOMAIN_UPSERT,
+                &cp,
+                json!({ "entry": domain_entry("tenant.example", "active") }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        let body = answered(&reply, MSG_REPLICA_DOMAIN_UPSERT);
+        assert_eq!(
+            body,
+            json!({ "name": "tenant.example", "status": "applied" })
+        );
+        let held = domain::get_domain(&state.store, "tenant.example")
+            .await
+            .unwrap()
+            .expect("the entry is replicated");
+        assert!(held.status.is_active(), "{via:?}");
+
+        // replica/domain/assign
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_REPLICA_DOMAIN_ASSIGN,
+                &cp,
+                json!({ "domain": "tenant.example" }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+        assert!(
+            assignment::get(&state.store, "tenant.example")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // webvh/sync/update, then sync/batch, then sync/delete
+        let (did_id, log) = valid_did_log("alice").await;
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_SYNC_UPDATE,
+                &cp,
+                update_body("alice", &did_id, &log, false),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+        assert!(stored(&state, "alice").await.is_some());
+
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_SYNC_BATCH,
+                &cp,
+                json!({ "updates": [update_body("alice", &did_id, &log, true)] }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        answered(&reply, MSG_SYNC_BATCH);
+        assert!(stored(&state, "alice").await.unwrap().disabled, "{via:?}");
+
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(MSG_SYNC_DELETE, &cp, json!({ "mnemonic": "alice" })).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+        assert!(stored(&state, "alice").await.is_none());
+
+        // replica/domain/unassign: the answer states the schedule in force.
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_REPLICA_DOMAIN_UNASSIGN,
+                &cp,
+                json!({ "domain": "tenant.example" }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        let body = answered(&reply, MSG_REPLICA_DOMAIN_UNASSIGN);
+        assert_eq!(body["status"], "scheduled");
+        let scheduled = pending_purge::get(&state.store, "tenant.example")
+            .await
+            .unwrap()
+            .expect("a purge is scheduled");
+        let purge_at: chrono::DateTime<chrono::Utc> =
+            body["purgeAt"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            purge_at.timestamp() as u64,
+            scheduled.scheduled_at + scheduled.grace_seconds
+        );
+
+        // replica/domain/purge: nothing is assigned any more, so it runs.
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_REPLICA_DOMAIN_PURGE,
+                &cp,
+                json!({ "domain": "tenant.example" }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        let body = answered(&reply, MSG_REPLICA_DOMAIN_PURGE);
+        assert_eq!(body["status"], "purged");
+        assert!(
+            pending_purge::get(&state.store, "tenant.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "the immediate purge supersedes the scheduled one"
+        );
+    }
+}
+
+/// The purge an unassign schedules actually runs on a standalone edge: once
+/// its grace has elapsed, the edge's storage-thread sweep deletes the
+/// domain's DIDs and drops the warm content cache, so the DID stops
+/// resolving.
+#[tokio::test]
+async fn an_unassigned_domain_is_purged_by_the_edge_sweep_once_its_grace_elapses() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use did_hosting_common::server::pending_purge;
+    use tower::ServiceExt;
+
+    let (mut state, _dir) = edge_state().await;
+    let mut config = (*state.config).clone();
+    config.hosting.unassigned_purge_grace =
+        did_hosting_common::server::config::GracePeriod::parse("0s").unwrap();
+    state.config = Arc::new(config);
+    let cp = control();
+
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "server.example.com" }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+    let (did_id, log) = valid_did_log("doomed").await;
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_SYNC_UPDATE,
+            &cp,
+            update_body("doomed", &did_id, &log, false),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+    let resolve = || async {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/doomed/did.jsonl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    };
+    // Resolving warms the content cache the sweep must drop.
+    assert_eq!(resolve().await, StatusCode::OK);
+
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_REPLICA_DOMAIN_UNASSIGN,
+            &cp,
+            json!({ "domain": "server.example.com" }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered(&reply, MSG_REPLICA_DOMAIN_UNASSIGN)["status"],
+        "scheduled"
+    );
+
+    let sweep = did_hosting_server::purge_sweep::run_edge_sweep_tick(
+        &state.store,
+        None,
+        &state.did_cache,
+        state.gate_cache.as_deref(),
+        None,
+    )
+    .await;
+    assert_eq!(sweep.entries, 1, "{sweep:?}");
+    assert_eq!(sweep.purged_dids, vec!["doomed".to_string()]);
+    assert!(stored(&state, "doomed").await.is_none());
+    assert!(
+        pending_purge::get(&state.store, "server.example.com")
+            .await
+            .unwrap()
+            .is_none(),
+        "the schedule is settled"
+    );
+    assert_eq!(resolve().await, StatusCode::NOT_FOUND);
+}
+
+/// A disabled domain record schedules its purge at the carried `purgeAt`;
+/// re-enabling it cancels the schedule.
+#[tokio::test]
+async fn an_upserted_disable_schedules_the_purge_and_an_enable_cancels_it() {
+    use did_hosting_common::server::pending_purge;
+
+    let (state, _dir) = edge_state().await;
+    let cp = control();
+    for (status, scheduled) in [("disabled", true), ("active", false)] {
+        let reply = deliver(
+            &state,
+            Via::Tsp,
+            &cp.0,
+            signed(
+                MSG_REPLICA_DOMAIN_UPSERT,
+                &cp,
+                json!({ "entry": domain_entry("old.example", status) }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        answered(&reply, MSG_REPLICA_DOMAIN_UPSERT);
+        let purge = pending_purge::get(&state.store, "old.example")
+            .await
+            .unwrap();
+        assert_eq!(purge.is_some(), scheduled, "{status}");
+        if let Some(purge) = purge {
+            let purge_at: chrono::DateTime<chrono::Utc> = "2026-10-04T09:00:00Z".parse().unwrap();
+            assert_eq!(
+                purge.scheduled_at + purge.grace_seconds,
+                purge_at.timestamp() as u64
+            );
+        }
+    }
+}
+
+/// A domain name the control plane did not canonicalise is refused with the
+/// declared `nonCanonicalName`, and nothing is stored under either spelling.
+#[tokio::test]
+async fn an_upsert_with_a_non_canonical_name_is_refused() {
+    let (state, _dir) = edge_state().await;
+    let cp = control();
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &cp.0,
+        signed(
+            MSG_REPLICA_DOMAIN_UPSERT,
+            &cp,
+            json!({ "entry": domain_entry("Tenant.Example", "active") }),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        refused(&reply),
+        "did-management/replica/domain/upsert:nonCanonicalName"
+    );
+    assert!(
+        did_hosting_common::server::domain::get_domain(&state.store, "tenant.example")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// stalePurge
+// ---------------------------------------------------------------------------
+
+/// A purge issued before the domain was (re-)assigned here never wipes it:
+/// refused with `stalePurge`, on every transport, and the content survives.
+/// A purge issued after the assignment runs.
+#[tokio::test]
+async fn a_purge_issued_before_the_current_assignment_is_refused() {
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        let cp = control();
+
+        // The operator unassigned the domain; the purge was queued then and
+        // has waited in the outbox while the operator changed their mind.
+        let stale = document(
+            MSG_REPLICA_DOMAIN_PURGE,
+            &cp,
+            json!({ "domain": "server.example.com" }),
+            chrono::Duration::seconds(60),
+            true,
+        )
+        .await;
+
+        // Re-assigned, and a DID synced onto it.
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_REPLICA_DOMAIN_ASSIGN,
+                &cp,
+                json!({ "domain": "server.example.com" }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+        let (did_id, log) = valid_did_log("kept").await;
+        deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_SYNC_UPDATE,
+                &cp,
+                update_body("kept", &did_id, &log, false),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        assert!(stored(&state, "kept").await.is_some());
+
+        let reply = deliver(&state, via, &cp.0, stale).await.expect("answered");
+        assert_eq!(
+            refused(&reply),
+            "did-management/replica/domain/purge:stalePurge",
+            "{via:?}"
+        );
+        assert_eq!(reply["payload"]["retryable"], false, "{reply}");
+        assert!(
+            stored(&state, "kept").await.is_some(),
+            "nothing was deleted"
+        );
+
+        // A purge the control plane issues now is fresh, and runs.
+        let reply = deliver(
+            &state,
+            via,
+            &cp.0,
+            signed(
+                MSG_REPLICA_DOMAIN_PURGE,
+                &cp,
+                json!({ "domain": "server.example.com" }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(answered(&reply, MSG_REPLICA_DOMAIN_PURGE)["removed"], 1);
+        assert!(stored(&state, "kept").await.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unsigned and foreign-signer refusals
+// ---------------------------------------------------------------------------
+
+/// Every directive, on every transport: an unsigned document from the control
+/// plane gets no signed reply, and one signed by any other DID gets no reply
+/// either — the claimed-issuer pre-check in `verify_control_plane` refuses it
+/// before its proof (and DID) is ever resolved, exactly like a document that
+/// never verified. In both cases nothing is applied.
+#[tokio::test]
+async fn unsigned_and_foreign_signed_directives_are_refused() {
+    let (did_id, log) = valid_did_log("mallory").await;
+    let directives: Vec<(&str, Value)> = vec![
+        (
+            MSG_SYNC_UPDATE,
+            update_body("mallory", &did_id, &log, false),
+        ),
+        (
+            MSG_SYNC_BATCH,
+            json!({ "updates": [update_body("mallory", &did_id, &log, false)] }),
+        ),
+        (MSG_SYNC_DELETE, json!({ "mnemonic": "mallory" })),
+        (
+            MSG_REPLICA_DOMAIN_UPSERT,
+            json!({ "entry": domain_entry("evil.example", "active") }),
+        ),
+        (
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            json!({ "domain": "evil.example" }),
+        ),
+        (
+            MSG_REPLICA_DOMAIN_UNASSIGN,
+            json!({ "domain": "evil.example" }),
+        ),
+        (
+            MSG_REPLICA_DOMAIN_PURGE,
+            json!({ "domain": "server.example.com" }),
+        ),
+    ];
+
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        let cp = control();
+        let stranger = signer(66);
+        for (type_uri, payload) in &directives {
+            let unsigned = document(
+                type_uri,
+                &cp,
+                payload.clone(),
+                chrono::Duration::zero(),
+                false,
+            )
+            .await;
+            assert!(
+                deliver(&state, via, &cp.0, unsigned).await.is_none(),
+                "{via:?} {type_uri}: an unsigned directive is not answered"
+            );
+
+            let foreign = signed(type_uri, &stranger, payload.clone()).await;
+            assert!(
+                deliver(&state, via, &stranger.0, foreign).await.is_none(),
+                "{via:?} {type_uri}: a signer that is not the control plane is not answered"
+            );
+        }
+        assert!(stored(&state, "mallory").await.is_none(), "{via:?}");
+        assert!(
+            did_hosting_common::server::domain::get_domain(&state.store, "evil.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "evil.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+/// A document from the stranger, reported by the transport as coming from the
+/// control plane, does not verify at all: it gets no reply.
+#[tokio::test]
+async fn a_foreign_document_reported_as_the_control_planes_is_not_answered() {
+    let (state, _dir) = edge_state().await;
+    let cp = control();
+    let stranger = signer(66);
+    for via in [Via::Tsp, Via::Didcomm] {
+        let doc = signed(
+            MSG_REPLICA_DOMAIN_PURGE,
+            &stranger,
+            json!({ "domain": "server.example.com" }),
+        )
+        .await;
+        assert!(deliver(&state, via, &cp.0, doc).await.is_none(), "{via:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The staleness bound
+// ---------------------------------------------------------------------------
+
+async fn health_status(state: &AppState) -> axum::http::StatusCode {
+    did_hosting_server::routes::health::health(state.clone())
+        .await
+        .0
+}
+
+/// `/api/health` stays 200 while the edge is within the staleness bound —
+/// including a fresh start that has not had time to reconcile — and answers
+/// 503 once the last clean reconcile is older than the bound, so a load
+/// balancer drains it.
+#[tokio::test]
+async fn health_degrades_past_the_staleness_bound() {
+    use axum::http::StatusCode;
+    use did_hosting_common::server::auth::session::now_epoch;
+
+    let (state, _dir) = edge_state().await;
+    let bound = state.config.replication.staleness_bound_secs;
+    assert_eq!(bound, 300, "the documented default");
+
+    assert_eq!(health_status(&state).await, StatusCode::OK, "just started");
+
+    state.replication.mark_reconciled(now_epoch());
+    assert_eq!(
+        health_status(&state).await,
+        StatusCode::OK,
+        "just reconciled"
+    );
+
+    state
+        .replication
+        .set_last_reconciled_at(now_epoch() - bound + 5);
+    assert_eq!(
+        health_status(&state).await,
+        StatusCode::OK,
+        "within the bound"
+    );
+
+    state
+        .replication
+        .set_last_reconciled_at(now_epoch() - bound - 1);
+    assert_eq!(
+        health_status(&state).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "past the bound"
+    );
+
+    // A fresh start past the bound without ever reconciling is stale too.
+    let status = did_hosting_server::replication::ReplicationStatus::new(now_epoch() - bound - 1);
+    assert!(!status.is_fresh(now_epoch(), bound));
+}
+
+/// The bound must be longer than the reconcile interval.
+#[test]
+fn a_bound_the_interval_cannot_keep_is_refused() {
+    use did_hosting_server::config::ReplicationConfig;
+    assert!(ReplicationConfig::default().validate().is_ok());
+    for (bound, interval) in [(60, 60), (30, 60), (300, 0)] {
+        let config = ReplicationConfig {
+            staleness_bound_secs: bound,
+            reconcile_interval_secs: interval,
+        };
+        assert!(config.validate().is_err(), "{bound}/{interval}");
+    }
+}
+
+/// `server/metrics/0.1` answers the control plane with the reconcile age the
+/// bound is measured on, on every transport, and refuses anyone else.
+#[tokio::test]
+async fn metrics_report_replication_freshness_to_the_control_plane_only() {
+    const METRICS: &str = "https://trusttasks.org/spec/did-management/server/metrics/0.1";
+    let (state, _dir) = edge_state().await;
+    let cp = control();
+    for via in VIAS {
+        let reply = deliver(&state, via, &cp.0, signed(METRICS, &cp, json!({})).await)
+            .await
+            .expect("answered");
+        let body = answered(&reply, METRICS);
+        let gauges = body["snapshot"]["gauges"].as_array().unwrap();
+        for name in [
+            "did_hosting_replication_reconcile_age_seconds",
+            "did_hosting_replication_staleness_bound_seconds",
+            "did_hosting_replication_fresh",
+        ] {
+            assert!(
+                gauges.iter().any(|g| g["name"] == name),
+                "{via:?}: no {name}: {body}"
+            );
+        }
+
+        // A signer that is not the control plane is refused by the
+        // claimed-issuer pre-check before its proof is ever resolved — no
+        // reply, exactly like a document that never verified.
+        let stranger = signer(66);
+        let reply = deliver(
+            &state,
+            via,
+            &stranger.0,
+            signed(METRICS, &stranger, json!({})).await,
+        )
+        .await;
+        assert!(reply.is_none(), "{via:?}: {reply:?}");
+    }
+}
+
+/// The other ways a directive fails to verify — addressed to another server,
+/// stale, a replay of one already applied — get no reply on any transport,
+/// and a reply that is sent is threaded to the directive it answers.
+#[tokio::test]
+async fn misaddressed_stale_and_replayed_directives_are_not_answered() {
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        let cp = control();
+        let payload = json!({ "domain": "kept.example" });
+
+        let mut misaddressed = build_request(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp.0,
+            &signer(67).0,
+            payload.clone(),
+        )
+        .unwrap();
+        misaddressed.issued_at = Some(chrono::Utc::now());
+        let misaddressed =
+            did_hosting_common::server::trust_tasks::sign_document(&misaddressed, &cp.1)
+                .await
+                .unwrap();
+        assert!(
+            deliver(
+                &state,
+                via,
+                &cp.0,
+                serde_json::to_value(misaddressed).unwrap()
+            )
+            .await
+            .is_none(),
+            "{via:?}: a directive addressed to another server is not answered"
+        );
+
+        let stale = document(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            payload.clone(),
+            chrono::Duration::days(1),
+            true,
+        )
+        .await;
+        assert!(
+            deliver(&state, via, &cp.0, stale).await.is_none(),
+            "{via:?}: a stale directive is not answered"
+        );
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "kept.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "{via:?}: neither was applied"
+        );
+
+        let fresh = signed(MSG_REPLICA_DOMAIN_ASSIGN, &cp, payload.clone()).await;
+        let reply = deliver(&state, via, &cp.0, fresh.clone())
+            .await
+            .expect("answered");
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+        assert_eq!(reply["threadId"], fresh["id"], "{via:?}: threaded");
+        assert_eq!(reply["recipient"], cp.0, "{via:?}");
+        assert!(
+            deliver(&state, via, &cp.0, fresh).await.is_none(),
+            "{via:?}: a replay is not answered"
+        );
+    }
+}
+
+/// A directive that could not be checked just now — the control plane's DID
+/// could not be resolved — gets no answer on DIDComm or TSP, and `503` with
+/// `Retry-After` and no body on HTTPS, so the control plane keeps it queued.
+/// Nothing is applied, and the same directive is answered once it can be
+/// checked.
+#[tokio::test]
+async fn a_directive_that_cannot_be_checked_yet_is_deferred_on_every_transport() {
+    struct Unreachable;
+    #[async_trait::async_trait]
+    impl trust_tasks_proof::affinidi::ProofPurposeResolver for Unreachable {
+        async fn resolve_vm_for_purpose(
+            &self,
+            vm: &str,
+            _purpose: trust_tasks_proof::affinidi::ProofPurpose,
+        ) -> Result<affinidi_data_integrity::ResolvedKey, affinidi_data_integrity::DataIntegrityError>
+        {
+            // An unresolvable signer; the verifier is told every refusal from
+            // this resolver is one (`with_unreachable_resolver`).
+            Err(affinidi_data_integrity::DataIntegrityError::Resolver(
+                format!("signer DID unreachable: cannot resolve {vm}"),
+            ))
+        }
+    }
+
+    for via in VIAS {
+        let (mut state, _dir) = edge_state().await;
+        let resolvable = state.trust_tasks_verifier.take();
+        state.trust_tasks_verifier = Some(Arc::new(
+            TransportBoundVerifier::with_unreachable_resolver(Arc::new(Unreachable)),
+        ));
+        let cp = control();
+        let directive = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "later.example" }),
+        )
+        .await;
+        let ping = signed(MSG_HEALTH_PING, &cp, json!({})).await;
+        for doc in [&directive, &ping] {
+            match via {
+                Via::Https => {
+                    let (status, headers, body) = post_https(&state, doc).await;
+                    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                    let retry_after: u64 = headers
+                        .get(axum::http::header::RETRY_AFTER)
+                        .expect("Retry-After is set")
+                        .to_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert!(retry_after >= 1, "{retry_after}");
+                    assert!(
+                        body.is_empty(),
+                        "a deferred document gets no body: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                _ => assert!(
+                    deliver(&state, via, &cp.0, doc.clone()).await.is_none(),
+                    "{via:?}: a deferred document is not answered"
+                ),
+            }
+        }
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "later.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "{via:?}: nothing was applied"
+        );
+
+        // Once the signer resolves, the same directive is applied and answered:
+        // the deferral did not record it as seen.
+        state.trust_tasks_verifier = resolvable;
+        let reply = deliver(&state, via, &cp.0, directive.clone())
+            .await
+            .unwrap_or_else(|| panic!("{via:?}: answered once it can be checked"));
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+    }
+}
+
+/// A full replay cache defers a verified directive: `503` on HTTPS, with the
+/// replay cache's own `Retry-After`, and no reply on DIDComm or TSP. Nothing
+/// is applied.
+#[tokio::test]
+async fn a_full_replay_cache_defers_a_directive_on_every_transport() {
+    use did_hosting_common::server::config::ReplayConfig;
+    use did_hosting_common::server::replay::{
+        FULL_RETRY_AFTER_SECS, FULL_RETRY_JITTER_SECS, ReplayCache,
+    };
+    for via in VIAS {
+        let (mut state, _dir) = edge_state().await;
+        state.replay_cache = Arc::new(
+            ReplayCache::with_config(ReplayConfig {
+                max_entries: 1,
+                max_entries_per_signer: 1,
+            })
+            .unwrap(),
+        );
+        let cp = control();
+        let first = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "one.example" }),
+        )
+        .await;
+        let reply = deliver(&state, via, &cp.0, first)
+            .await
+            .unwrap_or_else(|| panic!("{via:?}: the first directive is answered"));
+        answered(&reply, MSG_REPLICA_DOMAIN_ASSIGN);
+
+        let second = signed(
+            MSG_REPLICA_DOMAIN_ASSIGN,
+            &cp,
+            json!({ "domain": "two.example" }),
+        )
+        .await;
+        match via {
+            Via::Https => {
+                let (status, headers, body) = post_https(&state, &second).await;
+                assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                let retry_after: u64 = headers
+                    .get(axum::http::header::RETRY_AFTER)
+                    .expect("Retry-After is set")
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    (FULL_RETRY_AFTER_SECS..=FULL_RETRY_AFTER_SECS + FULL_RETRY_JITTER_SECS)
+                        .contains(&retry_after),
+                    "the replay cache's own wait: {retry_after}"
+                );
+                assert!(body.is_empty(), "no document");
+            }
+            _ => assert!(
+                deliver(&state, via, &cp.0, second).await.is_none(),
+                "{via:?}: a deferred directive is not answered"
+            ),
+        }
+        assert!(
+            did_hosting_common::server::assignment::get(&state.store, "two.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "{via:?}: nothing was applied"
+        );
+    }
+}
+
+/// A health ping is answered to the control plane only: a stranger's gets no
+/// reply at all, not even a refusal.
+#[tokio::test]
+async fn a_strangers_health_ping_is_not_answered() {
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        let stranger = signer(68);
+        let ping = signed(MSG_HEALTH_PING, &stranger, json!({})).await;
+        assert!(
+            deliver(&state, via, &stranger.0, ping).await.is_none(),
+            "{via:?}"
+        );
+        let ping = signed(MSG_HEALTH_PING, &control(), json!({})).await;
+        let reply = deliver(&state, via, &control().0, ping.clone())
+            .await
+            .unwrap_or_else(|| panic!("{via:?}: the control plane's ping is answered"));
+        signed_by_the_edge(&reply);
+        assert_eq!(reply["threadId"], ping["id"], "{via:?}");
+    }
+}
+
+/// A ping is answered with the pinned `server/health/0.1` response, naming
+/// this edge's instance; a ping probing another instance, or one this edge
+/// does not read, is not answered. The empty ping a control plane sent before
+/// #449 is still answered (one release).
+#[tokio::test]
+async fn a_health_ping_is_answered_in_the_pinned_shape() {
+    use did_hosting_common::server::trust_tasks::infra;
+    let own = infra::instance_id_for(&edge().0);
+    for via in VIAS {
+        let (state, _dir) = edge_state().await;
+        for body in [infra::health_ping_body(&own).unwrap(), json!({})] {
+            let ping = signed(MSG_HEALTH_PING, &control(), body.clone()).await;
+            let reply = deliver(&state, via, &control().0, ping)
+                .await
+                .unwrap_or_else(|| panic!("{via:?}: {body} is answered"));
+            let pong = &reply["payload"];
+            assert_eq!(pong["instanceId"], json!(own), "{via:?}: {reply}");
+            assert_eq!(pong["ok"], true, "{via:?}: {reply}");
+            let read = infra::read_health_reply(pong).expect("a pinned health response");
+            assert_eq!(read.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        }
+        for body in [
+            infra::health_ping_body("did_example_elsewhere").unwrap(),
+            json!({ "instanceId": own, "extra": true }),
+        ] {
+            let ping = signed(MSG_HEALTH_PING, &control(), body.clone()).await;
+            assert!(
+                deliver(&state, via, &control().0, ping).await.is_none(),
+                "{via:?}: {body} is not answered"
+            );
+        }
+    }
+}
+
+/// The reconcile trusts only its control plane's signed, threaded answer: a
+/// listing signed by anyone else, left unsigned, or threaded to another
+/// request fails the reconcile and leaves the freshness mark where it was —
+/// so nobody but the control plane can reset the staleness bound.
+#[tokio::test]
+async fn a_listing_not_signed_by_the_control_plane_does_not_reconcile() {
+    use did_hosting_server::replication::reconcile_once;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Forgery {
+        Stranger,
+        Unsigned,
+        OtherThread,
+    }
+    let (state, _dir) = edge_state().await;
+    let empty = json!({ "records": [] });
+    for forgery in [Forgery::Stranger, Forgery::Unsigned, Forgery::OtherThread] {
+        let outcome = reconcile_once(&state, |request| {
+            let empty = empty.clone();
+            async move {
+                let mut reply =
+                    request.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), empty);
+                let key = match forgery {
+                    Forgery::Stranger => {
+                        let stranger = signer(69);
+                        reply.issuer = Some(stranger.0.clone());
+                        Some(stranger.1)
+                    }
+                    Forgery::Unsigned => None,
+                    Forgery::OtherThread => {
+                        reply.thread_id = Some("urn:uuid:another-request".into());
+                        Some(control().1)
+                    }
+                };
+                Ok(match key {
+                    Some(key) => {
+                        did_hosting_common::server::trust_tasks::sign_document(&reply, &key)
+                            .await
+                            .unwrap()
+                    }
+                    None => reply,
+                })
+            }
+        })
+        .await;
+        assert!(outcome.is_err(), "{forgery:?}: {outcome:?}");
+        assert!(
+            state.replication.last_reconciled_at().is_none(),
+            "{forgery:?}: the freshness mark did not move"
+        );
+    }
+
+    // The control plane's own signed answer does reconcile.
+    let report = reconcile_once(&state, |request| {
+        let empty = empty.clone();
+        async move {
+            let reply = request.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), empty);
+            Ok(
+                did_hosting_common::server::trust_tasks::sign_document(&reply, &control().1)
+                    .await
+                    .unwrap(),
+            )
+        }
+    })
+    .await
+    .expect("the control plane's listing reconciles");
+    assert!(report.is_clean());
+    assert!(state.replication.last_reconciled_at().is_some());
+}
+
+/// A trusted proxy's unreadable `X-Forwarded-For` is refused with 400 before
+/// the document is read, rather than charged to the proxy's address; a
+/// readable one from the same proxy reaches the document check.
+#[tokio::test]
+async fn an_unreadable_forwarded_chain_from_a_trusted_proxy_is_refused() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = edge_state().await;
+    let mut config = (*state.config).clone();
+    config.server.trusted_proxies = vec!["10.0.0.5".parse().unwrap()];
+    let state = AppState {
+        client_ips: did_hosting_common::server::rate_limit::ClientIps::new(
+            &config.server.trusted_proxies,
+        )
+        .unwrap(),
+        config: Arc::new(config),
+        ..state
+    };
+    let receive = |chain: &'static str| {
+        let state = state.clone();
+        async move {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-forwarded-for", chain.parse().unwrap());
+            let response = did_hosting_server::routes::trust_tasks::receive(
+                axum::extract::State(state),
+                axum::extract::ConnectInfo("10.0.0.5:443".parse().unwrap()),
+                axum::Extension(did_hosting_server::routes::trust_tasks::BodyLimit(
+                    did_hosting_server::routes::TRUST_TASKS_BODY_LIMIT_BYTES,
+                )),
+                headers,
+                axum::body::Body::from(&b"not a document"[..]),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, body)
+        }
+    };
+
+    let (status, body) = receive("not-an-address").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_ne!(
+        body["error"], "malformed_request",
+        "refused before the document: {body}"
+    );
+
+    let (_, body) = receive("198.51.100.7").await;
+    assert_eq!(
+        body["error"], "malformed_request",
+        "a readable chain reaches the document check: {body}"
+    );
+}
+
+/// The HTTPS binding reads the body itself, after the rate limit, and
+/// refuses one larger than the route's limit with `413` before parsing it.
+#[tokio::test]
+async fn an_oversized_body_is_refused_unread() {
+    use axum::response::IntoResponse;
+    let (state, _dir) = edge_state().await;
+    let response = did_hosting_server::routes::trust_tasks::receive(
+        axum::extract::State(state),
+        axum::extract::ConnectInfo(fresh_https_addr()),
+        axum::Extension(did_hosting_server::routes::trust_tasks::BodyLimit(16)),
+        axum::http::HeaderMap::new(),
+        axum::body::Body::from(vec![b'{'; 64]),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ---------------------------------------------------------------------------
+// Agent-name index integrity (a name moving between DIDs)
+// ---------------------------------------------------------------------------
+
+/// The cumulative `did.jsonl` of `mnemonic` on the edge's host after each of
+/// `versions`, where each version names the agent names its document claims.
+async fn named_did_logs(seed: u8, mnemonic: &str, versions: &[&[&str]]) -> (String, Vec<String>) {
+    let secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+    let pk_mb = secret.get_public_keymultibase().expect("pubkey multibase");
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let base = build_did_document(
+        "server.example.com",
+        mnemonic,
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let with_names = |doc: &Value, names: &[&str]| {
+        let mut doc = doc.clone();
+        let aka: Vec<String> = names
+            .iter()
+            .map(|n| format!("https://server.example.com/@{n}"))
+            .collect();
+        doc["alsoKnownAs"] = json!(aka);
+        doc
+    };
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(
+            Some((chrono::Utc::now() - chrono::Duration::hours(1)).fixed_offset()),
+            &with_names(&base, versions[0]),
+            &params,
+            &signing,
+        )
+        .await
+        .expect("create webvh log entry");
+    let scid = state.scid().to_string();
+    let base: Value = serde_json::from_str(
+        &serde_json::to_string(&base)
+            .unwrap()
+            .replace("{SCID}", &scid),
+    )
+    .unwrap();
+    let to_jsonl = |state: &didwebvh_rs::DIDWebVHState| {
+        state
+            .log_entries()
+            .iter()
+            .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut logs = vec![to_jsonl(&state)];
+    for names in &versions[1..] {
+        state
+            .update_document(with_names(&base, names), &signing)
+            .await
+            .expect("update webvh log");
+        logs.push(to_jsonl(&state));
+    }
+    let did_id = did_hosting_common::did_ops::extract_did_id(&logs[0]).expect("log has a DID");
+    (did_id, logs)
+}
+
+async fn sync(state: &AppState, mnemonic: &str, did_id: &str, log: &str) -> Value {
+    let cp = control();
+    let reply = deliver(
+        state,
+        Via::Tsp,
+        &cp.0,
+        signed(
+            MSG_SYNC_UPDATE,
+            &cp,
+            update_body(mnemonic, did_id, log, false),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE)
+}
+
+async fn name_index(state: &AppState, name: &str) -> Option<String> {
+    state
+        .dids_ks
+        .get_raw(did_hosting_common::did_ops::agent_name_key(
+            "server.example.com",
+            name,
+        ))
+        .await
+        .unwrap()
+        .map(|v| String::from_utf8(v).unwrap())
+}
+
+/// A name moving from DID A to DID B, with the edge applying B's update
+/// before A's: A's later update (which drops the name) must not delete the
+/// index entry that now points at B, nor must A's deletion. And a re-sync of
+/// B's unchanged log repairs an index entry lost any other way.
+#[tokio::test]
+async fn a_name_moved_between_dids_survives_updates_applied_out_of_order() {
+    let (state, _dir) = edge_state().await;
+    let (a_did, a_logs) = named_did_logs(11, "alpha", &[&["shared"], &[]]).await;
+    let (b_did, b_logs) = named_did_logs(12, "bravo", &[&["shared"]]).await;
+
+    sync(&state, "alpha", &a_did, &a_logs[0]).await;
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("alpha"));
+
+    // B's claim lands first …
+    sync(&state, "bravo", &b_did, &b_logs[0]).await;
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("bravo"));
+
+    // … then A's release, which must leave B's entry alone.
+    assert_eq!(
+        sync(&state, "alpha", &a_did, &a_logs[1]).await["status"],
+        "applied"
+    );
+    assert_eq!(
+        name_index(&state, "shared").await.as_deref(),
+        Some("bravo"),
+        "A's stale removal must not take B's name"
+    );
+
+    // An entry lost some other way comes back on a re-sync of B's unchanged
+    // log.
+    state
+        .dids_ks
+        .remove(did_hosting_common::did_ops::agent_name_key(
+            "server.example.com",
+            "shared",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        sync(&state, "bravo", &b_did, &b_logs[0]).await["status"],
+        "unchanged"
+    );
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("bravo"));
+}
+
+/// The same race resolved by a `sync/delete`: deleting A, whose record still
+/// claims the name, must not delete the entry B has taken over.
+#[tokio::test]
+async fn deleting_a_did_leaves_a_name_its_new_holder_took_over() {
+    let (state, _dir) = edge_state().await;
+    let cp = control();
+    let (a_did, a_logs) = named_did_logs(13, "alpha", &[&["shared"]]).await;
+    let (b_did, b_logs) = named_did_logs(14, "bravo", &[&["shared"]]).await;
+    sync(&state, "alpha", &a_did, &a_logs[0]).await;
+    sync(&state, "bravo", &b_did, &b_logs[0]).await;
+
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(MSG_SYNC_DELETE, &cp, json!({ "mnemonic": "alpha" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+    assert_eq!(name_index(&state, "shared").await.as_deref(), Some("bravo"));
+
+    // Deleting B, the holder, does release it.
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &cp.0,
+        signed(MSG_SYNC_DELETE, &cp, json!({ "mnemonic": "bravo" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+    assert_eq!(name_index(&state, "shared").await, None);
+}
+
+// ---------------------------------------------------------------------------
+// A self-hosted did:webvh edge's own DID
+// ---------------------------------------------------------------------------
+
+/// An edge whose own identifier is a `did:webvh` it hosts itself, imported at
+/// its slot as setup does. Documents from the control plane are addressed to
+/// that DID.
+async fn self_hosted_edge() -> (AppState, tempfile::TempDir, String) {
+    let (state, dir) = edge_state().await;
+    let (own_did, own_log) = valid_did_log("edge").await;
+    did_hosting_server::bootstrap::import_own_did(&state.store, &state.dids_ks, "edge", &own_log)
+        .await
+        .expect("import own DID");
+    let mut config = (*state.config).clone();
+    config.server_did = Some(own_did.clone());
+    // `valid_did_log` signs with the seed-7 key; the edge signs as its DID.
+    let mut key = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+    key.id = format!("{own_did}#key-0");
+    let state = AppState {
+        config: Arc::new(config),
+        identity: Some(
+            ServiceIdentity::from_signing_secret(&own_did, key)
+                .await
+                .unwrap(),
+        ),
+        ..state
+    };
+    (state, dir, own_did)
+}
+
+/// A request to the self-hosted edge, signed by the control plane.
+async fn signed_to(recipient: &str, type_uri: &str, payload: Value) -> Value {
+    let cp = control();
+    let doc = build_request(type_uri, &cp.0, recipient, payload).unwrap();
+    serde_json::to_value(
+        did_hosting_common::server::trust_tasks::sign_document(&doc, &cp.1)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// The edge's own DID is local state the control plane never published: it
+/// is not reported at registration, a listing that lacks it leaves the edge
+/// clean rather than stale, and a `sync/delete` of it is refused.
+#[tokio::test]
+async fn a_self_hosted_edge_keeps_its_own_did_out_of_the_control_planes_reach() {
+    use did_hosting_server::replication::reconcile_once;
+
+    let (state, _dir, own_did) = self_hosted_edge().await;
+    assert_eq!(
+        did_hosting_server::control_register::own_did_mnemonic(&state).as_deref(),
+        Some("edge"),
+        "{own_did}"
+    );
+
+    // With nothing else held, a listing that lacks the edge's own DID
+    // reconciles clean: the edge is not "stale" for keeping it.
+    let report = reconcile_once(&state, |request| async move {
+        let reply = request.respond_with(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            json!({ "records": [] }),
+        );
+        Ok(
+            did_hosting_common::server::trust_tasks::sign_document(&reply, &control().1)
+                .await
+                .unwrap(),
+        )
+    })
+    .await
+    .expect("the control plane's listing reconciles");
+    assert!(report.is_clean(), "{report:?}");
+
+    // A tenant DID alongside it, synced from the control plane.
+    let (did_id, log) = valid_did_log("tenant").await;
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &control().0,
+        signed_to(
+            &own_did,
+            MSG_SYNC_UPDATE,
+            update_body("tenant", &did_id, &log, false),
+        )
+        .await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(reply["payload"]["status"], "applied", "{reply}");
+
+    // Registration reports the tenant's slot, not the edge's own.
+    let preloaded = did_hosting_server::control_register::preloaded_dids(&state).await;
+    let reported: Vec<&str> = preloaded
+        .iter()
+        .filter_map(|p| p["mnemonic"].as_str())
+        .collect();
+    assert_eq!(reported, vec!["tenant"]);
+
+    // A sync/delete of the edge's own slot is refused and deletes nothing.
+    let reply = deliver(
+        &state,
+        Via::Tsp,
+        &control().0,
+        signed_to(&own_did, MSG_SYNC_DELETE, json!({ "mnemonic": "edge" })).await,
+    )
+    .await
+    .expect("answered");
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|t| t.contains("/trust-task-error/")),
+        "expected a refusal, got {reply}"
+    );
+    assert_eq!(reply["issuer"], own_did, "{reply}");
+    assert_eq!(reply["payload"]["retryable"], false, "{reply}");
+    assert!(stored(&state, "edge").await.is_some());
+}

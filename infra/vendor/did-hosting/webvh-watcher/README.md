@@ -1,0 +1,243 @@
+# Affinidi WebVH Watcher
+
+The WebVH Watcher is a read-only DID mirror. The control planes it is
+configured to mirror push it signed `webvh/sync/*` Trust Tasks, and it serves
+what they push publicly. It provides redundancy and geographic distribution
+for DID resolution without managing DIDs.
+
+The watcher has its own DID, with keys in a VTA context, like every other
+service here. It verifies every log it mirrors exactly as a hosting server
+does, and it applies a sync only when its source signed it.
+
+> **IMPORTANT:**
+> did-hosting-service crates are provided "as is" without any
+> warranties or guarantees, and by using this framework, users
+> agree to assume all risks associated with its deployment and
+> use including implementing security, and privacy measures in
+> their applications. Affinidi assumes no liability for any
+> issues arising from the use or modification of the project.
+
+## Getting Started
+
+### Prerequisites
+
+- Rust: the workspace MSRV is `rust-version` in the root
+  [`Cargo.toml`](../Cargo.toml) (2024 edition).
+
+### 1. Build
+
+```bash
+cargo build --locked -p webvh-watcher --release
+```
+
+The binary is produced at `target/release/webvh-watcher`.
+
+### 2. Set up
+
+`webvh-watcher setup` provisions the watcher's DID from a VTA context
+(interactive, online), or `webvh-watcher setup --from <recipe.toml>` for any
+VTA mode — see `examples/webvh-watcher-build.toml`. It writes `config.toml`,
+stores the DID's keys in the secrets backend, and writes `watcher-did.jsonl`
+for you to publish on a hosting server. The part of `config.toml` that says
+whom it mirrors:
+
+```toml
+[sync]
+# Only a webvh/sync/* Trust Task signed by one of these DIDs is applied.
+source_dids = ["did:webvh:control.example.com"]
+```
+
+A source can also be listed with the hosts it may sync DIDs for. A DID on
+any other host is refused `notAuthorized`. Hosts are compared with the DID's
+host (`host:port` when the DID names a port), ignoring case. A source with no
+`domains` may sync any host, as one in `source_dids` does:
+
+```toml
+[[sync.sources]]
+did = "did:webvh:…:control-b.example.com"
+domains = ["b.example.com"]
+```
+
+### 3. Configure the control plane
+
+On each control plane the watcher mirrors, map the watcher's URL to its DID:
+
+```toml
+[[registry.watchers]]
+url = "https://watcher1.example.com"
+did = "did:webvh:…:watcher1.example.com"
+```
+
+A DID whose log names `https://watcher1.example.com` in its `watchers`
+parameter is then pushed there through the control plane's outbox — the same
+delivery, retry and acknowledgement as its edges — over the transport the
+watcher's DID advertises (TSP, DIDComm, or HTTPS).
+
+### 4. Start the watcher
+
+```bash
+webvh-watcher --config config.toml
+```
+
+## How It Works
+
+```
+control plane ──(signed webvh/sync/update|delete|batch, TSP · DIDComm · HTTPS)──► webvh-watcher
+
+Clients ──(GET /{mnemonic}/did.jsonl)──► webvh-watcher
+```
+
+1. A DID is published at the control plane.
+2. The control plane queues a signed `webvh/sync/update/0.2` for every
+   configured watcher the log names.
+3. The watcher verifies the document's proof (`proofPurpose:
+   authentication`, bound to its issuer, addressed to the watcher, fresh, not
+   a replay) and that the issuer is one of `sync.source_dids`; then it
+   verifies the log — its chain and witness proofs, the slot it names, and
+   that it strictly extends anything already mirrored for that DID — and
+   answers with a signed `#response`, which settles the outbox entry.
+4. Clients resolve DIDs from any watcher.
+
+A document that does not verify gets no reply. Neither does one whose issuer
+is not a source: it is dropped before its proof is checked, and is not
+recorded.
+
+### Which source holds a slot
+
+A slot belongs to the source that first synced it, until that source deletes
+it. An update from any other configured source, whether it extends the log,
+re-sends it or only changes `disabled`, is refused `notAuthorized`. A delete
+from another source leaves the slot in place and is answered `absent`. Both
+are logged as warnings. Once the holding source deletes a slot, any
+configured source may sync it next, still held to the DID's high-water log.
+
+**The first sync wins.** A DID's log is public, so any configured source can
+sync it before the DID's own control plane does, and then hold its slot. A
+watcher with one source is not affected. With more than one source:
+
+- Give each source the hosts it publishes for, so it cannot sync DIDs on any
+  other (see `[[sync.sources]]` below).
+- Check which source holds each DID: the `sourceDid` field of the slot's
+  `did:{mnemonic}` record in the watcher's store, and the `holder` in each
+  refusal's warning. After upgrading from a release without this rule, check
+  slots that more than one source syncs. A slot stored by an earlier release belongs to the
+  source its record names, which is the source that last wrote it.
+- To move a slot to another source, remove the holder from `source_dids` and
+  `[[sync.sources]]` and restart. A slot whose holder is no longer configured
+  is released: the next configured source to sync it holds it (still held to
+  the high-water log), and the release is logged with the old holder.
+
+**One watcher process per store.** The check that a source holds a slot and
+the write that follows are serialised within one process. The store has no
+conditional write, so two watcher processes sharing one store (Redis,
+DynamoDB, Firestore, Cosmos DB) could both pass the check. Run one watcher
+process per store.
+
+## Configuration
+
+The watcher is configured via a TOML file: `config.toml` in the working
+directory unless `--config` or `WATCHER_CONFIG_PATH` names another. Every key
+and variable is in [docs/configuration.md](../docs/configuration.md); unknown
+keys and tables are refused at load. Keep the `[server]` and `[store]`
+tables setup writes (port 8533, `data/webvh-watcher`): a config without them
+falls back to the edge server's defaults.
+
+### Environment variable overrides
+
+Every setting has a `WATCHER_`-prefixed variable (`WATCHER_SERVER_PORT`,
+`WATCHER_SOURCE_DIDS` as a comma-separated list, `WATCHER_REPLAY_MAX_ENTRIES`,
+…); the full list is in [docs/configuration.md](../docs/configuration.md).
+Every sync document is signed by a source control plane, so the per-signer
+replay bound caps how fast the watcher follows DID changes (about 600 a
+second at the default). The resolution limit
+(`[server.resolve_rate_limit]`, off by default) is explained in the edge
+server's README ("Resolution rate limit").
+
+### Connection limits and a reverse proxy
+
+The HTTP listener applies its own limits: at most 256 connections are
+served at once (more wait for a free slot), at most 32 of them from one
+IPv4 address or IPv6 /64 (more are closed at once; addresses in
+`server.trusted_proxies` are exempt); a request's headers must arrive
+within 20 seconds of its first byte; a connection waiting for its next
+request, or not reading its response, is closed after 60 seconds; and a
+`POST /api/trust-tasks` body is read only after the sender's address passes
+its rate limit, at most 1 MiB and within 30 seconds (`413` / `408`
+otherwise). These are a backstop. The listener binds `0.0.0.0` by default;
+put a reverse proxy in front of it for TLS and its own limits, and list the
+proxy in `server.trusted_proxies` so per-address limits apply to clients
+rather than to the proxy.
+
+## CLI Commands
+
+Every subcommand, with its full `--help`, is in
+[`docs/cli-reference.md`](../docs/cli-reference.md), generated from the CLI
+(a test keeps it current). Below is a summary. `health` exits non-zero when a
+check fails (`--strict`: also when one warns).
+
+```
+webvh-watcher                                  # Run watcher (default)
+webvh-watcher setup                            # Interactive online VTA setup
+webvh-watcher setup --setup-key-out <path>     # Mint a setup key for a headless online setup
+webvh-watcher setup --from <recipe.toml> [--setup-key-file <path>]
+webvh-watcher health                           # Diagnostics
+```
+
+## API Endpoints
+
+### Public (unauthenticated)
+
+| Method | Path                            | Description         |
+| ------ | ------------------------------- | ------------------- |
+| `GET`  | `/api/health`                   | Health check (standalone only; the daemon's embedded watcher has none) |
+| `GET`  | `/{mnemonic}/did.jsonl`         | Resolve DID log     |
+| `GET`  | `/{mnemonic}/did-witness.json`  | Resolve witness     |
+| `GET`  | `/.well-known/did.jsonl`        | Root DID log        |
+| `GET`  | `/.well-known/did-witness.json` | Root witness        |
+
+### Trust Tasks
+
+| Method | Path               | Description |
+| ------ | ------------------ | ----------- |
+| `POST` | `/api/trust-tasks` | The HTTPS binding of `webvh/sync/update/0.2`, `webvh/sync/delete/0.2`, `webvh/sync/batch/0.1` |
+
+The same documents are accepted over TSP and DIDComm on the watcher's
+mediator connection.
+
+## Library Usage
+
+The webvh-watcher crate can be used as a library (e.g., by the
+[did-hosting-daemon](../did-hosting-daemon/)). It exposes:
+
+- `webvh_watcher::config::AppConfig` — configuration
+- `webvh_watcher::server::AppState` — application state
+- `webvh_watcher::routes::router()` — Axum router
+- `webvh_watcher::server::run()` — standalone entry point
+
+## Support & feedback
+
+If you face any issues or have suggestions, please don't
+hesitate to contact us using
+[this link](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v).
+
+### Reporting technical issues
+
+If you have a technical issue with the Affinidi DID Hosting Service
+codebase, you can also create an issue directly in GitHub.
+
+1. Ensure the bug was not already reported by searching on
+   GitHub under
+   [Issues](https://github.com/affinidi/affinidi-webvh-service/issues).
+
+2. If you're unable to find an open issue addressing the
+   problem,
+   [open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new).
+   Be sure to include a **title and clear description**, as
+   much relevant information as possible, and a **code sample**
+   or an **executable test case** demonstrating the expected
+   behaviour that is not occurring.
+
+## Contributing
+
+Want to contribute? Head over to our
+[CONTRIBUTING](../CONTRIBUTING.md) guidelines.

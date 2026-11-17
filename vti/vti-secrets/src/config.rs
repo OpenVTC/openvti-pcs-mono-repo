@@ -1,0 +1,392 @@
+//! Secret-store configuration.
+//!
+//! `SecretsConfig` selects which [`SeedStore`](crate::SeedStore) backend
+//! [`create_seed_store`](crate::create_seed_store) builds, plus the
+//! per-backend connection parameters. It is deserialised from the
+//! `[secrets]` table of a service's config file; `vta-service` re-exports
+//! this type so its `AppConfig` keeps a `secrets: SecretsConfig` field.
+
+use serde::{Deserialize, Serialize};
+
+/// Which seed-store backend to build, stated explicitly.
+///
+/// Mirrors `vtc_service::config::SecretBackend` and the wizard's
+/// `SecretsBackendInput` discriminator, so operators meet one vocabulary
+/// across the setup TOML, the generated `config.toml`, and the VTC.
+///
+/// `#[non_exhaustive]` since `EncryptedFile` (#1820): adding that variant was
+/// a breaking change, and marking the enum at the same time makes the next
+/// backend an additive one. Match it with a wildcard arm outside this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SecretBackend {
+    /// OS keyring (libsecret / Keychain / Credential Manager).
+    Keyring,
+    /// Hex-encoded seed inlined in `[secrets] seed` (config-seed feature).
+    ConfigSeed,
+    /// AWS Secrets Manager.
+    Aws,
+    /// GCP Secret Manager.
+    Gcp,
+    /// Azure Key Vault.
+    Azure,
+    /// HashiCorp Vault (KV v2).
+    Vault,
+    /// Kubernetes `Secret`.
+    Kubernetes,
+    /// Plaintext file under the data dir — NOT secure, dev/test only.
+    Plaintext,
+    /// AEAD-encrypted file under the data dir, keyed by an explicitly
+    /// configured key-encryption key (`[secrets.encrypted_file]`). Never
+    /// chosen implicitly. See
+    /// [`EncryptedFileSeedStore`](crate::seed_store::EncryptedFileSeedStore).
+    EncryptedFile,
+}
+
+/// `[secrets.encrypted_file]`: where the encrypted envelope lives and where its
+/// key-encryption key (KEK) comes from.
+///
+/// ```toml
+/// [secrets]
+/// backend = "encrypted_file"
+///
+/// [secrets.encrypted_file]
+/// # Optional. Default: `<data_dir>/seed.enc` (VTA), `<data_dir>/secret.enc` (VTC).
+/// path = "/var/lib/vta/seed.enc"
+/// # Exactly one KEK source:
+/// kek = { source = "passphrase", file = "/etc/vta/seed-passphrase" }
+/// # kek = { source = "passphrase", credential = "vta-seed-passphrase" }
+/// # kek = { source = "systemd_creds", credential = "vta-seed-kek" }
+/// # kek = { source = "tpm", pcrs = [7] }
+/// ```
+///
+/// Holds only locations and names, never key material, so the derived `Debug`
+/// is safe.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct EncryptedFileConfig {
+    /// Envelope location. When unset the consuming service picks a file name
+    /// under its data directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<std::path::PathBuf>,
+    /// Where the key-encryption key comes from. Required: there is no default
+    /// source, because each one makes a different promise about who can
+    /// decrypt the file.
+    pub kek: KekSource,
+}
+
+impl EncryptedFileConfig {
+    /// An `encrypted_file` table with the default path and the given source.
+    pub fn new(kek: KekSource) -> Self {
+        Self { path: None, kek }
+    }
+}
+
+/// The key-encryption key source for the `encrypted_file` backend, selected by
+/// `source = "…"`.
+///
+/// A secret never appears in the config itself: a passphrase is read from a
+/// file or a systemd credential, never from an environment variable or an
+/// inline value, and a KEK from a systemd credential or the TPM.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum KekSource {
+    /// A passphrase stretched with Argon2id (m = 64 MiB, t = 3, p = 4; the
+    /// salt and parameters are stored in the file header). Set exactly one of
+    /// `file` and `credential`.
+    Passphrase {
+        /// A file holding the passphrase. One trailing newline is ignored.
+        /// Should be readable by the service user only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<std::path::PathBuf>,
+        /// A systemd credential name, read from
+        /// `$CREDENTIALS_DIRECTORY/<credential>` (`LoadCredential=` /
+        /// `LoadCredentialEncrypted=`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<String>,
+    },
+    /// A 32-byte KEK delivered by systemd from
+    /// `$CREDENTIALS_DIRECTORY/<credential>`; systemd seals it to the TPM
+    /// and/or the host key (`systemd-creds encrypt`). The credential holds 32
+    /// raw bytes or 64 hex characters (a trailing newline is ignored).
+    SystemdCreds {
+        /// The credential name.
+        credential: String,
+    },
+    /// A random KEK sealed by the TPM 2.0 (under the owner hierarchy) and
+    /// stored, sealed, in the file header; optionally bound to SHA-256 PCRs.
+    /// Needs the `tpm` feature, on Linux.
+    Tpm {
+        /// SHA-256 PCR indexes (0–23) the KEK is bound to. Empty: not bound to
+        /// PCRs (any process that can use the TPM as this host can unseal).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pcrs: Vec<u8>,
+        /// The TCTI to reach the TPM, e.g. `device:/dev/tpmrm0` (the default)
+        /// or `swtpm:host=localhost,port=2321`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tcti: Option<String>,
+    },
+}
+
+/// `#[non_exhaustive]`: this struct has grown a field per backend since it was
+/// introduced and will keep growing. Marking it here makes a future field an
+/// additive change rather than a breaking one — at the cost of forbidding
+/// struct-literal (and functional-update) construction outside this crate.
+/// Build one with [`SecretsConfig::default`] and assign the fields you need.
+#[derive(Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct SecretsConfig {
+    /// Explicit backend selector. When set it wins outright:
+    /// [`create_seed_store`](crate::create_seed_store) builds exactly this
+    /// backend and validates its required fields, rather than inferring the
+    /// backend from whichever selector field happens to be populated.
+    ///
+    /// Omit to keep the legacy implicit priority chain. Setting it is the
+    /// only way to reach a backend that sits *below* a compiled-in one in
+    /// that chain — `plaintext` in particular is unreachable implicitly on
+    /// any build with `keyring` compiled in (the default), because the
+    /// keyring arm matches unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SecretBackend>,
+    /// Hex-encoded BIP-32 seed (config-seed feature)
+    pub seed: Option<String>,
+    /// AWS Secrets Manager secret name (aws-secrets feature)
+    pub aws_secret_name: Option<String>,
+    /// AWS region override (aws-secrets feature)
+    pub aws_region: Option<String>,
+    /// GCP project ID (gcp-secrets feature)
+    pub gcp_project: Option<String>,
+    /// GCP secret name (gcp-secrets feature)
+    pub gcp_secret_name: Option<String>,
+    /// Azure Key Vault URL (azure-secrets feature)
+    pub azure_vault_url: Option<String>,
+    /// Azure Key Vault secret name (azure-secrets feature)
+    pub azure_secret_name: Option<String>,
+    /// OS keyring service name (keyring feature).
+    /// Change this to run multiple VTA instances on the same machine.
+    #[serde(default = "default_keyring_service")]
+    pub keyring_service: String,
+    /// HashiCorp Vault server URL (vault-secrets feature). Setting this
+    /// activates the Vault backend.
+    pub vault_addr: Option<String>,
+    /// KV v2 mount path (vault-secrets feature). Default `secret`.
+    #[serde(default = "default_vault_kv_mount")]
+    pub vault_kv_mount: String,
+    /// KV v2 secret path under the mount, e.g. `vta/master-seed`
+    /// (vault-secrets feature).
+    pub vault_secret_path: Option<String>,
+    /// Field name within the KV v2 secret that holds the hex-encoded
+    /// seed (vault-secrets feature). Default `seed`.
+    #[serde(default = "default_vault_secret_key")]
+    pub vault_secret_key: String,
+    /// Vault Enterprise namespace, if any (vault-secrets feature).
+    pub vault_namespace: Option<String>,
+    /// Auth method: `kubernetes` (default), `token`, or `approle`
+    /// (vault-secrets feature).
+    #[serde(default = "default_vault_auth_method")]
+    pub vault_auth_method: String,
+    /// Kubernetes auth role name (vault-secrets feature, kubernetes
+    /// auth method).
+    pub vault_k8s_role: Option<String>,
+    /// Kubernetes auth mount path (vault-secrets feature). Default
+    /// `kubernetes`.
+    #[serde(default = "default_vault_k8s_mount")]
+    pub vault_k8s_mount: String,
+    /// File holding the ServiceAccount JWT presented to Vault
+    /// (vault-secrets feature, kubernetes auth method). Default is the
+    /// kubelet-mounted projected volume path.
+    #[serde(default = "default_vault_k8s_jwt_path")]
+    pub vault_k8s_jwt_path: String,
+    /// Static token (vault-secrets feature, token auth method). Prefer
+    /// the `VAULT_TOKEN` env var over hard-coding here.
+    pub vault_token: Option<String>,
+    /// AppRole role_id (vault-secrets feature, approle auth method).
+    pub vault_approle_role_id: Option<String>,
+    /// AppRole secret_id (vault-secrets feature, approle auth method).
+    pub vault_approle_secret_id: Option<String>,
+    /// AppRole mount path (vault-secrets feature). Default `approle`.
+    #[serde(default = "default_vault_approle_mount")]
+    pub vault_approle_mount: String,
+    /// Skip TLS certificate verification — dev/test only
+    /// (vault-secrets feature).
+    #[serde(default)]
+    pub vault_skip_verify: bool,
+    /// Kubernetes `Secret` name holding the hex-encoded seed
+    /// (k8s-secrets feature). Setting this activates the Kubernetes
+    /// backend.
+    pub k8s_secret_name: Option<String>,
+    /// Kubernetes namespace the `Secret` lives in (k8s-secrets feature).
+    /// When unset, the in-cluster ServiceAccount namespace (or the
+    /// kubeconfig context namespace) is used, falling back to `default`.
+    pub k8s_namespace: Option<String>,
+    /// Key within the `Secret`'s `data` map that holds the hex-encoded
+    /// seed (k8s-secrets feature). Default `seed`.
+    #[serde(default = "default_k8s_secret_key")]
+    pub k8s_secret_key: String,
+    /// Opt in to the **plaintext file** seed-store fallback. Off by
+    /// default: when no secure backend (keyring / cloud / Vault /
+    /// config-seed) is compiled-in *and* configured, `create_seed_store`
+    /// errors rather than silently writing the BIP-32 master seed to a
+    /// file in clear. Set `true` only for dev/test where that is
+    /// acceptable. (P0.9 — closes the "one wrong TOML key → master seed
+    /// on disk in cleartext" footgun.)
+    #[serde(default)]
+    pub allow_plaintext: bool,
+    /// How long a successfully-read seed may be reused from memory before the
+    /// backend is consulted again, in seconds. `0` disables caching entirely —
+    /// every read hits the backend, which is how this crate behaved before the
+    /// cache existed.
+    ///
+    /// Why this exists: the seed is read on **every** key-touching request
+    /// (`load_seed_bytes`, ~25 call sites, including every signature), and on
+    /// the cloud backends each read is a remote call — for AWS one
+    /// `GetSecretValue`, which is in turn one billed KMS `Decrypt`. Uncached,
+    /// KMS request volume scales with request volume; cached, it scales with
+    /// wall-clock time.
+    ///
+    /// Why a bounded TTL rather than load-once: the seed for a generation is
+    /// immutable, and the only writer is in-process rotation (which invalidates
+    /// the cache explicitly), so a stale read is already near-impossible. The
+    /// TTL is the outer bound for anything that gets past that, and it caps how
+    /// long the master seed sits resident in process memory (P0.7).
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// `[secrets.encrypted_file]`: the encrypted-at-rest file backend's
+    /// location and key-encryption key source. Read only when
+    /// `backend = "encrypted_file"`; it never selects the backend by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_file: Option<EncryptedFileConfig>,
+}
+
+/// Written by hand so the seed and Vault credentials never reach a log: a derived `Debug` would print them.
+impl std::fmt::Debug for SecretsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretsConfig")
+            .field("backend", &self.backend)
+            .field("seed", &self.seed.as_ref().map(|_| "<redacted>"))
+            .field("aws_secret_name", &self.aws_secret_name)
+            .field("aws_region", &self.aws_region)
+            .field("gcp_project", &self.gcp_project)
+            .field("gcp_secret_name", &self.gcp_secret_name)
+            .field("azure_vault_url", &self.azure_vault_url)
+            .field("azure_secret_name", &self.azure_secret_name)
+            .field("keyring_service", &self.keyring_service)
+            .field("vault_addr", &self.vault_addr)
+            .field("vault_kv_mount", &self.vault_kv_mount)
+            .field("vault_secret_path", &self.vault_secret_path)
+            .field("vault_secret_key", &self.vault_secret_key)
+            .field("vault_namespace", &self.vault_namespace)
+            .field("vault_auth_method", &self.vault_auth_method)
+            .field("vault_k8s_role", &self.vault_k8s_role)
+            .field("vault_k8s_mount", &self.vault_k8s_mount)
+            .field("vault_k8s_jwt_path", &self.vault_k8s_jwt_path)
+            .field(
+                "vault_token",
+                &self.vault_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("vault_approle_role_id", &self.vault_approle_role_id)
+            .field(
+                "vault_approle_secret_id",
+                &self.vault_approle_secret_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("vault_approle_mount", &self.vault_approle_mount)
+            .field("vault_skip_verify", &self.vault_skip_verify)
+            .field("k8s_secret_name", &self.k8s_secret_name)
+            .field("k8s_namespace", &self.k8s_namespace)
+            .field("k8s_secret_key", &self.k8s_secret_key)
+            .field("allow_plaintext", &self.allow_plaintext)
+            .field("cache_ttl_secs", &self.cache_ttl_secs)
+            .field("encrypted_file", &self.encrypted_file)
+            .finish()
+    }
+}
+
+/// Default seed cache TTL. Short enough that an out-of-band seed change is
+/// picked up within a minute, long enough that a VTA under load makes one
+/// backend read per minute instead of one per request.
+fn default_cache_ttl_secs() -> u64 {
+    60
+}
+
+// The serde defaults of [`SecretsConfig`], public so a service's own secrets
+// configuration (the VTA setup wizard's input, the VTC's `[secrets]`) takes
+// the same values rather than a copy that drifts (#2572).
+
+/// Default OS-keyring service name.
+pub fn default_keyring_service() -> String {
+    "vta".to_string()
+}
+
+/// Default Vault KV mount.
+pub fn default_vault_kv_mount() -> String {
+    "secret".to_string()
+}
+
+/// Default key inside the Vault secret.
+pub fn default_vault_secret_key() -> String {
+    "seed".to_string()
+}
+
+/// Default Vault auth method.
+pub fn default_vault_auth_method() -> String {
+    "kubernetes".to_string()
+}
+
+/// Default Vault Kubernetes auth mount.
+pub fn default_vault_k8s_mount() -> String {
+    "kubernetes".to_string()
+}
+
+/// Default service-account token path for Vault Kubernetes auth.
+pub fn default_vault_k8s_jwt_path() -> String {
+    "/var/run/secrets/kubernetes.io/serviceaccount/token".to_string()
+}
+
+/// Default data key inside the Kubernetes `Secret`.
+pub fn default_k8s_secret_key() -> String {
+    "seed".to_string()
+}
+
+/// Default Vault AppRole auth mount.
+pub fn default_vault_approle_mount() -> String {
+    "approle".to_string()
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            seed: None,
+            aws_secret_name: None,
+            aws_region: None,
+            gcp_project: None,
+            gcp_secret_name: None,
+            azure_vault_url: None,
+            azure_secret_name: None,
+            keyring_service: default_keyring_service(),
+            vault_addr: None,
+            vault_kv_mount: default_vault_kv_mount(),
+            vault_secret_path: None,
+            vault_secret_key: default_vault_secret_key(),
+            vault_namespace: None,
+            vault_auth_method: default_vault_auth_method(),
+            vault_k8s_role: None,
+            vault_k8s_mount: default_vault_k8s_mount(),
+            vault_k8s_jwt_path: default_vault_k8s_jwt_path(),
+            vault_token: None,
+            vault_approle_role_id: None,
+            vault_approle_secret_id: None,
+            vault_approle_mount: default_vault_approle_mount(),
+            vault_skip_verify: false,
+            k8s_secret_name: None,
+            k8s_namespace: None,
+            k8s_secret_key: default_k8s_secret_key(),
+            allow_plaintext: false,
+            cache_ttl_secs: default_cache_ttl_secs(),
+            encrypted_file: None,
+        }
+    }
+}

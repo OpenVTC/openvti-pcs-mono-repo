@@ -1,0 +1,1325 @@
+//! The canonical `acl/*` family on the signed-document spine:
+//! `acl/{grant,change-role,show,update,revoke}/0.2` and `acl/list/0.3`.
+//!
+//! These carry AclEntry 0.2 — role-based administration with every axis stated
+//! (`docs/05-design-notes/vtc-admin-roles.md`). 0.1 (and `acl/list/0.2`) are
+//! no longer served. The **community** role moves with
+//! `vtc/members/role/set/0.1` ([`super::member_role_tasks`]).
+//!
+//! Every handler is the same shape: authority from the **verified signer's ACL
+//! row**, read now ([`super::admin_signer`]); the payload held to its
+//! published schema ([`super::parse_spec_payload`]); then the one shared
+//! operation in [`crate::acl::ops`]. Writing an entry takes
+//! `vtc.roles.assign` and is bounded by the writer's own entry
+//! ([`crate::acl::granting`], §6.3). Reading the ACL takes any administrative
+//! role. The ACL has no REST route: this is the only door, on every transport.
+//!
+//! A passkey gesture is one **bound to this document's payload**
+//! ([`settle_signed_gate`]), never a session's; granting an
+//! authority-conferring capability also parks for its other holders' consent
+//! (**VTI-APV-018**).
+
+// The community serves `acl/*` at 0.2 (`acl/list` at 0.3), now superseded by
+// the 0.3 family's `purposes`. Purposes bind a node that serves a purpose-bound
+// operation (VTI-ACL-102: reads of a principal's agent memory, a VTA opening a
+// room record for its principal); a community serves none, so it stays on the
+// versions it speaks until it moves for another reason.
+#![allow(deprecated)]
+
+use serde_json::{Value, json};
+use trust_tasks_rs::{RejectReason, StandardCode, TrustTask, TrustTaskCode};
+use vti_specs::acl::{
+    change_role::v0_2 as acl_change_role, grant::v0_2 as acl_grant, list::v0_3 as acl_list,
+    revoke::v0_2 as acl_revoke, show::v0_2 as acl_show, update::v0_2 as acl_update,
+};
+
+use super::helpers::{
+    TrustTaskOutcome, app_error_to_reject, extended_code, reject_with, reject_with_code,
+    success_response, task_error_to_reject,
+};
+use super::routing::{Routes, on};
+use super::{JoinAuthCtx, admin_signer, parse_spec_payload};
+use crate::acl::capability::CeilingError;
+use crate::acl::granting::GrantRefusal;
+use crate::acl::ops::{self as ops, EntryParseError, WriteError};
+use crate::error::{AppError, TaskError};
+use crate::server::AppState;
+
+/// Register every task this family serves (#2579).
+#[allow(deprecated)] // the community serves acl/* 0.2 (list 0.3)
+pub(super) fn register(routes: Routes) -> Routes {
+    let routes = on!(routes, vti_specs::acl::grant::v0_2::Payload => handle_grant);
+    let routes = on!(routes, vti_specs::acl::change_role::v0_2::Payload => handle_change_role);
+    let routes = on!(routes, vti_specs::acl::show::v0_2::Payload => handle_show);
+    let routes = on!(routes, vti_specs::acl::list::v0_3::Payload => handle_list);
+    let routes = on!(routes, vti_specs::acl::update::v0_2::Payload => handle_update);
+    let routes = on!(routes, vti_specs::acl::revoke::v0_2::Payload => handle_revoke);
+    on!(routes, vti_specs::acl::swap_key::v0_1::Payload => handle_swap_key)
+}
+
+// ─── reading ─────────────────────────────────────────────────────────────
+
+/// `acl/show/0.2` — one entry with every axis stated, or `entry: null`.
+pub(super) async fn handle_show(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let actor = match admin_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    let checked: acl_show::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let rendered = ops::show_entry(state, &actor.did, checked.subject.as_str())
+        .await
+        .and_then(ops::conform::<acl_show::Response>);
+    match rendered {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+/// `acl/list/0.3` — every entry the filters match. The filters include
+/// `capability` and `resource` (with `direction`), the questions role-based
+/// administration asks: who holds `git.repo.manage` inside a namespace, who can
+/// assign roles.
+pub(super) async fn handle_list(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let actor = match admin_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    let query: acl_list::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let rendered = ops::list_entries(state, &actor.did, &query)
+        .await
+        .and_then(ops::conform::<acl_list::Response>);
+    match rendered {
+        Ok(response) => success_response(&doc, response),
+        Err(AppError::InvalidCursor) => reject_with_code(
+            &doc,
+            extended_code(acl_list::error_codes::CURSOR_MISMATCH.code),
+            "the cursor was minted under other filters, or by another node",
+            None,
+        ),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+// ─── writing ────────────────────────────────────────────────────────
+
+/// The declared codes of the 0.2 write task being answered: each `None` where
+/// the task declares no such code, which then answers `permissionDenied` or
+/// `malformedRequest` (CONVENTIONS §3: never borrow a code another slug
+/// declares).
+#[derive(Clone, Copy)]
+struct V02Codes {
+    role_not_recognized: Option<&'static str>,
+    invalid_act_scope: Option<&'static str>,
+    unknown_capability: Option<&'static str>,
+    capability_outside_ceiling: Option<&'static str>,
+    additive_within_ceiling: Option<&'static str>,
+    additive_requires_unrestricted: Option<&'static str>,
+    approve_wider_than_granter: Option<&'static str>,
+    delegation_exceeds_granter: Option<&'static str>,
+}
+
+const GRANT_V0_2: V02Codes = {
+    use acl_grant::error_codes as c;
+    V02Codes {
+        role_not_recognized: Some(c::ROLE_NOT_RECOGNIZED.code),
+        invalid_act_scope: Some(c::INVALID_ACT_SCOPE.code),
+        unknown_capability: Some(c::UNKNOWN_CAPABILITY.code),
+        capability_outside_ceiling: Some(c::CAPABILITY_OUTSIDE_CEILING.code),
+        additive_within_ceiling: Some(c::ADDITIVE_WITHIN_CEILING.code),
+        additive_requires_unrestricted: Some(c::ADDITIVE_REQUIRES_UNRESTRICTED.code),
+        approve_wider_than_granter: Some(c::APPROVE_WIDER_THAN_GRANTER.code),
+        delegation_exceeds_granter: Some(c::DELEGATION_EXCEEDS_GRANTER.code),
+    }
+};
+
+const UPDATE_V0_2: V02Codes = {
+    use acl_update::error_codes as c;
+    V02Codes {
+        role_not_recognized: None,
+        invalid_act_scope: Some(c::INVALID_ACT_SCOPE.code),
+        unknown_capability: Some(c::UNKNOWN_CAPABILITY.code),
+        capability_outside_ceiling: Some(c::CAPABILITY_OUTSIDE_CEILING.code),
+        additive_within_ceiling: Some(c::ADDITIVE_WITHIN_CEILING.code),
+        additive_requires_unrestricted: Some(c::ADDITIVE_REQUIRES_UNRESTRICTED.code),
+        approve_wider_than_granter: Some(c::APPROVE_WIDER_THAN_GRANTER.code),
+        delegation_exceeds_granter: Some(c::DELEGATION_EXCEEDS_GRANTER.code),
+    }
+};
+
+const CHANGE_ROLE_V0_2: V02Codes = {
+    use acl_change_role::error_codes as c;
+    V02Codes {
+        role_not_recognized: Some(c::ROLE_NOT_RECOGNIZED.code),
+        invalid_act_scope: None,
+        unknown_capability: None,
+        capability_outside_ceiling: Some(c::CAPABILITY_OUTSIDE_CEILING.code),
+        additive_within_ceiling: Some(c::ADDITIVE_WITHIN_CEILING.code),
+        additive_requires_unrestricted: None,
+        approve_wider_than_granter: None,
+        delegation_exceeds_granter: Some(c::DELEGATION_EXCEEDS_GRANTER.code),
+    }
+};
+
+fn coded(
+    doc: &TrustTask<Value>,
+    code: Option<&'static str>,
+    message: String,
+    details: Option<Value>,
+) -> TrustTaskOutcome {
+    match code {
+        Some(code) => reject_with_code(doc, extended_code(code), message, details),
+        None => reject_with_code(
+            doc,
+            TrustTaskCode::Standard(StandardCode::PermissionDenied),
+            message,
+            None,
+        ),
+    }
+}
+
+fn malformed(doc: &TrustTask<Value>, reason: String) -> TrustTaskOutcome {
+    reject_with(doc, RejectReason::MalformedRequest { reason })
+}
+
+/// Render a parse refusal in the codes of the task answered.
+fn refuse_parse(doc: &TrustTask<Value>, e: EntryParseError, codes: V02Codes) -> TrustTaskOutcome {
+    match e {
+        EntryParseError::RoleNotRecognized(r) => coded(
+            doc,
+            codes.role_not_recognized,
+            format!("'{r}' is not a role this community can grant"),
+            Some(json!({
+                "offendingRole": r,
+                "knownRoles": std::iter::once(ops::NO_ADMIN_ROLE.to_string())
+                    .chain(crate::acl::AdminRole::BUILT_IN.iter().map(|r| r.to_string()))
+                    .collect::<Vec<_>>(),
+            })),
+        ),
+        EntryParseError::InvalidActScope(member, contexts) => match codes.invalid_act_scope {
+            Some(code) => reject_with_code(
+                doc,
+                extended_code(code),
+                format!(
+                    "a community holds no contexts (VTI-VTC-010): `{member}` is `all` or `none`"
+                ),
+                Some(json!({ "member": member, "offendingContexts": contexts })),
+            ),
+            None => malformed(
+                doc,
+                format!("`{member}` names contexts a community does not hold"),
+            ),
+        },
+        EntryParseError::UnknownCapability(caps) => match codes.unknown_capability {
+            Some(code) => reject_with_code(
+                doc,
+                extended_code(code),
+                format!(
+                    "{} {} not in this community's capability registry (VTI-ACL-032)",
+                    caps.join(", "),
+                    if caps.len() == 1 { "is" } else { "are" }
+                ),
+                Some(json!({ "capabilities": caps })),
+            ),
+            None => malformed(doc, format!("unknown capabilities: {}", caps.join(", "))),
+        },
+        EntryParseError::Malformed(m) => malformed(doc, m),
+    }
+}
+
+/// Render a write refusal in the codes of the task answered.
+fn refuse_write(
+    doc: &TrustTask<Value>,
+    e: WriteError,
+    codes: V02Codes,
+    role: &str,
+) -> TrustTaskOutcome {
+    let r = match e {
+        WriteError::Task(t) => return task_error_to_reject(doc, &t),
+        WriteError::Refused(r) => r,
+    };
+    let message = r.to_string();
+    match r {
+        GrantRefusal::PermissionDenied(m) => app_error_to_reject(doc, &AppError::Forbidden(m)),
+        GrantRefusal::DelegationExceedsGranter { axes, .. } => coded(
+            doc,
+            codes.delegation_exceeds_granter,
+            message,
+            Some(json!({ "axes": axes })),
+        ),
+        GrantRefusal::ApproveWiderThanGranter(_) => {
+            coded(doc, codes.approve_wider_than_granter, message, None)
+        }
+        GrantRefusal::AdditiveRequiresUnrestricted => {
+            coded(doc, codes.additive_requires_unrestricted, message, None)
+        }
+        GrantRefusal::Ceiling(CeilingError::RoleNotRecognized(r)) => {
+            refuse_parse(doc, EntryParseError::RoleNotRecognized(r), codes)
+        }
+        GrantRefusal::Ceiling(CeilingError::OutsideCeiling(caps)) => coded(
+            doc,
+            codes.capability_outside_ceiling,
+            message,
+            Some(json!({ "role": role, "capabilities": caps })),
+        ),
+        GrantRefusal::Ceiling(CeilingError::AdditiveWithinCeiling(caps)) => coded(
+            doc,
+            codes.additive_within_ceiling,
+            message,
+            Some(json!({ "capabilities": caps })),
+        ),
+        GrantRefusal::Ceiling(CeilingError::BadQualifier(_) | CeilingError::NeedsQualifiers(_)) => {
+            malformed(doc, message)
+        }
+    }
+}
+
+/// `acl/grant/0.2` — the entry the maintainer should hold, every axis stated.
+pub(super) async fn handle_grant(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let actor = match admin_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    // Unknown capabilities are named under their own code (VTI-ACL-032), so
+    // they are read before the schema's generic refusal could fire.
+    if let Some(e) = doc.payload.get("entry") {
+        for member in ["capabilities", "approveCapabilities"] {
+            if let Some(v) = e.get(member)
+                && let Err(err @ EntryParseError::UnknownCapability(_)) = ops::parse_capabilities(v)
+            {
+                return refuse_parse(&doc, err, GRANT_V0_2);
+            }
+        }
+    }
+    let _checked: acl_grant::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let next = match ops::entry_from_v0_2(&doc.payload["entry"]) {
+        Ok(n) => n,
+        Err(e) => return refuse_parse(&doc, e, GRANT_V0_2),
+    };
+    let role = ops::role_string(&next);
+    let reason = doc.payload["reason"].as_str().map(str::to_string);
+    let plan = match ops::plan_grant_v0_2(state, &actor.did, next, reason).await {
+        Ok(p) => p,
+        Err(e) => return refuse_write(&doc, e, GRANT_V0_2, &role),
+    };
+    let reduced = match settle_signed_gate(state, &actor, &doc, &plan).await {
+        Ok(u) => u,
+        Err(refusal) => return refusal,
+    };
+    commit_settled(state, &actor, &doc, plan, reduced, Render::Grant).await
+}
+
+/// `acl/update/0.2` — replace axes of an existing entry. Narrowing `act` is a
+/// revocation (`narrowingNotPermitted`); every other axis may narrow here, as
+/// a privilege reduction applied at the subject's next decision.
+pub(super) async fn handle_update(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use acl_update::error_codes;
+    let actor = match admin_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    if doc.payload.get("role").is_some() {
+        return task_error_to_reject(
+            &doc,
+            &TaskError::declared(
+                error_codes::ROLE_CHANGE_NOT_PERMITTED.code,
+                AppError::Validation(
+                    "acl/update does not change a role — use acl/change-role/0.2".into(),
+                ),
+            ),
+        );
+    }
+    for member in ["capabilities", "approveCapabilities"] {
+        if let Some(v) = doc.payload.get(member)
+            && let Err(err @ EntryParseError::UnknownCapability(_)) = ops::parse_capabilities(v)
+        {
+            return refuse_parse(&doc, err, UPDATE_V0_2);
+        }
+    }
+    let _checked: acl_update::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let plan = match ops::plan_update_v0_2(state, &actor.did, &doc.payload).await {
+        Ok(p) => p,
+        Err(ops::UpdateV03Error::Parse(e)) => return refuse_parse(&doc, e, UPDATE_V0_2),
+        Err(ops::UpdateV03Error::NarrowingNotPermitted) => {
+            return task_error_to_reject(
+                &doc,
+                &TaskError::declared(
+                    error_codes::NARROWING_NOT_PERMITTED.code,
+                    AppError::Validation(
+                        "narrowing the act scope is a revocation: use acl/revoke/0.2 with \
+                         {\"kind\": \"act\", \"act\": {\"scope\": \"none\"}}"
+                            .into(),
+                    ),
+                ),
+            );
+        }
+        Err(ops::UpdateV03Error::Write(e)) => {
+            let role = doc.payload["subject"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            return refuse_write(&doc, e, UPDATE_V0_2, &role);
+        }
+    };
+    let reduced = match settle_signed_gate(state, &actor, &doc, &plan).await {
+        Ok(u) => u,
+        Err(refusal) => return refusal,
+    };
+    commit_settled(state, &actor, &doc, plan, reduced, Render::Update).await
+}
+
+/// `acl/change-role/0.2` — move the **administrative** role, compare-and-swap
+/// on `fromRole`. Every other axis is carried over and re-checked against the
+/// new role's ceiling; the community role is unchanged.
+pub(super) async fn handle_change_role(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use acl_change_role::error_codes;
+    let actor = match admin_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    let checked: acl_change_role::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let to = match ops::parse_admin_role(checked.to_role.as_str()) {
+        Ok(r) => r,
+        Err(e) => return refuse_parse(&doc, e, CHANGE_ROLE_V0_2),
+    };
+    if let Err(e) = ops::parse_admin_role(checked.from_role.as_str()) {
+        return refuse_parse(&doc, e, CHANGE_ROLE_V0_2);
+    }
+    let plan = match ops::plan_change_role_v0_2(
+        state,
+        &actor.did,
+        checked.subject.as_str(),
+        checked.from_role.as_str(),
+        to,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(ops::ChangeRoleV03Error::StateMismatch(current)) => {
+            return reject_with_code(
+                &doc,
+                extended_code(error_codes::STATE_MISMATCH.code),
+                format!(
+                    "state mismatch: {} currently holds role {current}, not {}",
+                    checked.subject.as_str(),
+                    checked.from_role.as_str()
+                ),
+                Some(json!({ "currentRole": current })),
+            );
+        }
+        Err(ops::ChangeRoleV03Error::Write(e)) => {
+            return refuse_write(&doc, e, CHANGE_ROLE_V0_2, checked.to_role.as_str());
+        }
+    };
+    let reduced = match settle_signed_gate(state, &actor, &doc, &plan).await {
+        Ok(u) => u,
+        Err(refusal) => return refusal,
+    };
+    commit_settled(state, &actor, &doc, plan, reduced, Render::ChangeRole).await
+}
+
+/// `acl/revoke/0.2` — `{kind: entry}` removes the entry; `{kind: act}` narrows
+/// its act scope (at a community node, `all` → `none`).
+pub(super) async fn handle_revoke(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use acl_revoke::error_codes;
+    let actor = match admin_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    let checked: acl_revoke::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let subject = checked.subject.to_string();
+    let revocation = &doc.payload["revocation"];
+    let op = crate::acl::admin_consent::Operation {
+        type_uri: super::ACL_REVOKE_TYPE,
+        payload: &doc.payload,
+    };
+    if revocation["kind"] == "entry" {
+        let reason = doc.payload["reason"].as_str();
+        return match ops::remove_entry(
+            state,
+            &actor.did,
+            &subject,
+            reason,
+            op,
+            error_codes::SUBJECT_NOT_PRESENT.code,
+            error_codes::LAST_AUTHORITY_PROTECTED.code,
+        )
+        .await
+        {
+            Ok(()) => success_response(&doc, json!({ "entry": null })),
+            Err(e) => task_error_to_reject(&doc, &e),
+        };
+    }
+    let act = match ops::parse_scope(&revocation["act"], "act") {
+        Ok(a) => a,
+        Err(EntryParseError::InvalidActScope(_, contexts)) => {
+            return reject_with_code(
+                &doc,
+                extended_code(error_codes::INVALID_ACT_SCOPE.code),
+                "a community holds no contexts (VTI-VTC-010): narrow `act` to `none`",
+                Some(json!({ "offendingContexts": contexts })),
+            );
+        }
+        Err(_) => return malformed(&doc, "revocation.act is not an explicit scope".into()),
+    };
+    let plan = match ops::plan_narrow_act(state, &actor.did, &subject, act).await {
+        Ok(p) => p,
+        Err(ops::NarrowActError::NotPresent) => {
+            return task_error_to_reject(
+                &doc,
+                &TaskError::declared(
+                    error_codes::SUBJECT_NOT_PRESENT.code,
+                    AppError::NotFound(format!("ACL entry not found for DID: {subject}")),
+                ),
+            );
+        }
+        Err(ops::NarrowActError::NotNarrowing) => {
+            return reject_with_code(
+                &doc,
+                extended_code(error_codes::NOT_NARROWING.code),
+                "the stated act scope is not strictly narrower than the entry's",
+                None,
+            );
+        }
+        Err(ops::NarrowActError::Write(e)) => {
+            return match e {
+                WriteError::Task(t) => task_error_to_reject(&doc, &t),
+                WriteError::Refused(r) => {
+                    app_error_to_reject(&doc, &AppError::Forbidden(r.to_string()))
+                }
+            };
+        }
+    };
+    let reduced = match settle_signed_gate(state, &actor, &doc, &plan).await {
+        Ok(u) => u,
+        Err(refusal) => return refusal,
+    };
+    commit_settled(state, &actor, &doc, plan, reduced, Render::Revoke).await
+}
+
+// ─── rolling one's own entry to a new key ────────────────────────────────
+
+/// `acl/swap-key/0.1` — the subject rolls its own entry to a new key, its
+/// authority exactly as it was (**VTI-CLT-025 – 032**, VTI-ACL-052).
+///
+/// Signed by the subject itself — never a console key acting for it — and
+/// carrying a link proof signed by the new key ([`ops::swap_key`]). No
+/// gesture and no consent: nothing is granted, so there is nothing for anyone
+/// else to agree to (VTI-APV-018 is about authority that did not exist before).
+pub(super) async fn handle_swap_key(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use swap::error_codes as c;
+    use vti_specs::acl::swap_key::v0_1 as swap;
+    let checked: swap::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let Some(signer) = ctx.verified_signer.as_deref() else {
+        return reject_with(&doc, RejectReason::ProofRequired);
+    };
+    let reason = doc.payload["reason"].as_str();
+    let outcome = ops::swap_key(
+        state,
+        signer,
+        checked.current_subject.as_str(),
+        checked.new_subject.as_str(),
+        doc.payload.get("linkProof"),
+        reason,
+    )
+    .await;
+    let (entry, repointed) = match outcome {
+        Ok(ok) => ok,
+        Err(ops::SwapError::NotHolder(m)) => {
+            return reject_with_code(&doc, extended_code(c::NOT_HOLDER.code), m, None);
+        }
+        Err(ops::SwapError::SubjectNotFound(m)) => {
+            return reject_with_code(&doc, extended_code(c::SUBJECT_NOT_FOUND.code), m, None);
+        }
+        Err(ops::SwapError::SubjectAlreadyInUse(m)) => {
+            return reject_with_code(&doc, extended_code(c::SUBJECT_ALREADY_IN_USE.code), m, None);
+        }
+        Err(ops::SwapError::LinkProofRequired) => {
+            return reject_with_code(
+                &doc,
+                extended_code(c::LINK_PROOF_REQUIRED.code),
+                "this community requires a link proof: a VP-JWT (AclSwapRequest) signed by \
+                 newSubject and addressed to this community (VTI-CLT-026)",
+                None,
+            );
+        }
+        Err(ops::SwapError::LinkProofInvalid(reason, m)) => {
+            return reject_with_code(
+                &doc,
+                extended_code(c::LINK_PROOF_INVALID.code),
+                m,
+                Some(json!({ "reason": reason })),
+            );
+        }
+        Err(ops::SwapError::App(e)) => return app_error_to_reject(&doc, &e),
+    };
+    let previous = checked.current_subject.to_string();
+    let review = crate::acl::delegation::review_for(state, &entry.did)
+        .await
+        .ok()
+        .flatten();
+    let body = json!({
+        "entry": ops::render_v0_1(entry.clone()),
+        "previousSubject": previous,
+        // `acl/swap-key/0.1` (the current version) still carries the 0.1
+        // AclEntry, which cannot state an administrative role; the entry as it
+        // now stands, every axis explicit (AclEntry 0.2), rides beside it.
+        "ext": { "org.openvtc": {
+            "entry": ops::render_v0_2(&entry, review.as_ref()),
+            "delegationsRepointed": repointed,
+        }},
+    });
+    match ops::conform::<swap::Response>(body) {
+        Ok(r) => success_response(&doc, r),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+// ─── the gate and the commit ─────────────────────────────────────────────
+
+/// Settle what a planned ACL write needs before it may be written, on the
+/// signed door.
+///
+/// - A write that **confers an authority-conferring capability** the subject
+///   did not hold needs the requester's passkey gesture **and** the consent of
+///   the capability's other holders at a covering qualifier (**VTI-APV-018**,
+///   the generalised APV-014). It parks as an action and completes on the N-th
+///   approval.
+/// - A write that **takes authority away** from a live administrator needs the
+///   gesture, and for authority-conferring capabilities their other holders'
+///   consent, requester and subject excluded (**VTI-APV-019**).
+///   `Ok(Some(prior))` means nobody else was left to give it: the caller
+///   commits, then records the reduction at `Critical`.
+/// - Any other widening of administrative authority needs the gesture.
+///
+/// Both are **bound to this document's type and payload** and spent by it
+/// ([`crate::acl::bound_step_up`], [`crate::acl::admin_consent`]). Called after
+/// every check that decides whether the write may happen and before any write.
+/// `Ok(Some((prior, agreement)))` is a reduction of an administrator, cleared:
+/// the caller commits, then tells the subject and records an unopposed one at
+/// `Critical` ([`crate::acl::admin_consent::after_reduction`]).
+pub(super) async fn settle_signed_gate(
+    state: &AppState,
+    actor: &crate::acl::AdminActor,
+    doc: &TrustTask<Value>,
+    plan: &ops::GrantPlan,
+) -> Result<
+    Option<(
+        crate::acl::VtcAclEntry,
+        crate::acl::admin_consent::Agreement,
+    )>,
+    TrustTaskOutcome,
+> {
+    use crate::acl::bound_step_up::{self, Gate};
+
+    let type_uri = doc.type_uri.to_string();
+    let step_up_refusal = |request: &crate::acl::bound_step_up::ApproveRequest| {
+        reject_with_code(
+            doc,
+            TrustTaskCode::Standard(StandardCode::PermissionDenied),
+            "a passkey gesture bound to this operation is required",
+            Some(bound_step_up::refusal_details(request)),
+        )
+    };
+    let subject = &plan.entry.did;
+
+    // A subject's own entry (VTI-ACL-052): the label alone needs nothing; an
+    // unrestricted administrator's edit in single-administrator mode needs its
+    // gesture bound to this document and a `Critical` row, and no consent —
+    // the mode states there is nobody else to give one (VTI-APV-022).
+    match plan.self_edit {
+        ops::SelfEdit::No => {}
+        ops::SelfEdit::Label => return Ok(None),
+        ops::SelfEdit::UnrestrictedInSingleAdminMode => {
+            use crate::acl::single_admin::{SelfEditGate, authorize_self_edit};
+            return match authorize_self_edit(
+                state,
+                &actor.did,
+                crate::acl::admin_consent::Operation {
+                    type_uri: &type_uri,
+                    payload: &doc.payload,
+                },
+            )
+            .await
+            {
+                Ok(SelfEditGate::Authorized) => Ok(None),
+                Ok(SelfEditGate::StepUpRequired(request)) => Err(step_up_refusal(&request)),
+                Err(e) => Err(app_error_to_reject(doc, &e)),
+            };
+        }
+    }
+
+    if !plan.conferred.is_empty() {
+        use crate::acl::admin_consent::{self, Operation, SignedGate};
+        let gate = admin_consent::gesture_then_consent(
+            state,
+            &actor.did,
+            subject,
+            &plan.conferred,
+            Operation {
+                type_uri: &type_uri,
+                payload: &doc.payload,
+            },
+            &format!(
+                "Give {subject} {}",
+                plan.conferred
+                    .iter()
+                    .map(crate::acl::CapRef::display)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            &ops::conferral_summary(subject, &plan.conferred),
+        )
+        .await;
+        let ready = match gate {
+            Ok(SignedGate::Ready(ready)) => ready,
+            Ok(SignedGate::StepUpRequired(request)) => return Err(step_up_refusal(&request)),
+            Err(e) => return Err(app_error_to_reject(doc, &e)),
+        };
+        ready
+            .spend(state)
+            .await
+            .map_err(|e| app_error_to_reject(doc, &e))?;
+    } else if let Some(prior) = plan.reduces_admin.as_ref() {
+        // One gesture covers a rewrite that moves an administrator sideways —
+        // some authority dropped, some conferred.
+        let agreement = crate::acl::admin_consent::settle_reduction(
+            state,
+            &actor.did,
+            prior,
+            Some(&plan.entry),
+            crate::acl::admin_consent::Operation {
+                type_uri: &type_uri,
+                payload: &doc.payload,
+            },
+            &format!("Reduce administrator {subject}'s authority"),
+            &format!("Reduce administrator {subject}'s authority"),
+        )
+        .await
+        .map_err(|e| task_error_to_reject(doc, &e))?;
+        return Ok(agreement.map(|a| (prior.clone(), a)));
+    } else if plan.widens {
+        let reason = format!(
+            "Grant administrative authority to {subject}: {}",
+            crate::acl_cli::describe_authority(&plan.entry.admin)
+        );
+        match bound_step_up::redeem_or_request(state, &actor.did, &type_uri, &doc.payload, &reason)
+            .await
+        {
+            Ok(Gate::Satisfied) => {}
+            Ok(Gate::Required(request)) => return Err(step_up_refusal(&request)),
+            Err(e) => return Err(app_error_to_reject(doc, &e)),
+        }
+    }
+    Ok(None)
+}
+
+/// The requester's bound gesture **and** the consent of the act's approvers,
+/// both keyed on this document, settled on the signed door — the gate for the
+/// acts that could undo APV-018 one step at a time: lowering the consent
+/// threshold (**VTI-APV-020**) and changing a policy that decides authority
+/// (**VTI-VTC-022**). Their approvers are the act's default stake
+/// ([`crate::acl::admin_consent::Act::default_stake`]).
+///
+/// The consent is spent here, so call it last before the write.
+pub(super) async fn settle_consent_gate(
+    state: &AppState,
+    actor: &crate::acl::AdminActor,
+    doc: &TrustTask<Value>,
+    act: crate::acl::admin_consent::Act,
+    subject: &str,
+    gesture_reason: &str,
+    consent_summary: &str,
+) -> Result<(), TrustTaskOutcome> {
+    use crate::acl::admin_consent::{self, Operation, SignedGate};
+    let type_uri = doc.type_uri.to_string();
+    let gate = admin_consent::gesture_then_consent_for(
+        state,
+        act,
+        &[],
+        &actor.did,
+        subject,
+        Operation {
+            type_uri: &type_uri,
+            payload: &doc.payload,
+        },
+        gesture_reason,
+        consent_summary,
+    )
+    .await;
+    let ready = match gate {
+        Ok(SignedGate::Ready(ready)) => ready,
+        Ok(SignedGate::StepUpRequired(request)) => {
+            return Err(task_error_to_reject(doc, &TaskError::step_up(request)));
+        }
+        Err(e) => return Err(app_error_to_reject(doc, &e)),
+    };
+    ready
+        .spend(state)
+        .await
+        .map_err(|e| app_error_to_reject(doc, &e))
+}
+
+/// The gate on a `config/patch` or `vtc/config/import` that changes the
+/// trusted-witness list (`witnesses.trusted`) — **VTI-CMP-090**: the
+/// requester's bound gesture and the consent of the other holders of
+/// `vtc.config.admin`, or, in single-administrator mode, the gesture alone at
+/// `Critical` ([`settle_consent_gate`]). `Ok` when the write leaves the list
+/// alone or may proceed; call it before the write.
+///
+/// One parked action is one consent, so a write that also lowers the consent
+/// threshold — a second consent with other approvers — is refused, with the
+/// two to send apart.
+pub(super) async fn settle_witness_list_gate(
+    state: &AppState,
+    actor: &crate::acl::AdminActor,
+    doc: &TrustTask<Value>,
+    overrides: &std::collections::HashMap<String, Value>,
+    how: &str,
+) -> Result<(), TrustTaskOutcome> {
+    use crate::credentials::trusted_witnesses::{WITNESSES_TRUSTED, change_in, describe};
+    let (from, to) = match change_in(state, overrides).await {
+        Ok(None) => return Ok(()),
+        Ok(Some(change)) => change,
+        Err(e) => return Err(app_error_to_reject(doc, &e)),
+    };
+    match crate::community::ops::config::lowered_threshold(state, overrides).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(app_error_to_reject(
+                doc,
+                &AppError::Validation(format!(
+                    "this write both changes `{WITNESSES_TRUSTED}` and lowers \
+                     `{}`, and each needs its own administrators' consent: send them \
+                     as two config/patch documents, one key each",
+                    crate::config_store::UNRESTRICTED_ADMIN_CONSENT_THRESHOLD
+                )),
+            ));
+        }
+        Err(e) => return Err(app_error_to_reject(doc, &e)),
+    }
+    let (from, to) = (describe(&from), describe(&to));
+    settle_consent_gate(
+        state,
+        actor,
+        doc,
+        crate::acl::admin_consent::Act::ChangeTrustedWitnesses,
+        WITNESSES_TRUSTED,
+        &format!("Change the witnesses this community trusts from {from} to {to}{how}"),
+        &format!(
+            "Change the witnesses whose credentials count as evidence in this community \
+             from {from} to {to}{how}"
+        ),
+    )
+    .await
+}
+
+/// How a committed write is answered: the response of the task asked.
+#[derive(Clone, Copy)]
+enum Render {
+    Grant,
+    Update,
+    ChangeRole,
+    Revoke,
+}
+
+/// Commit a planned ACL write whose gate ([`settle_signed_gate`]) has
+/// settled, and record an unopposed reduction (VTI-APV-019) once it has
+/// landed.
+async fn commit_settled(
+    state: &AppState,
+    actor: &crate::acl::AdminActor,
+    doc: &TrustTask<Value>,
+    plan: ops::GrantPlan,
+    reduced: Option<(
+        crate::acl::VtcAclEntry,
+        crate::acl::admin_consent::Agreement,
+    )>,
+    render: Render,
+) -> TrustTaskOutcome {
+    let entry = match ops::commit_grant(state, &actor.did, plan).await {
+        Ok((_status, entry)) => entry,
+        Err(e) => return app_error_to_reject(doc, &e),
+    };
+    // A reduction of an administrator, once it has landed: the subject is
+    // told, and an unopposed one is recorded at `Critical` (VTI-APV-019).
+    if let Some((prior, agreement)) = reduced
+        && let Err(e) = crate::acl::admin_consent::after_reduction(
+            state,
+            &actor.did,
+            &prior,
+            Some(&entry),
+            agreement,
+            &doc.type_uri.to_string(),
+            doc.payload["reason"].as_str(),
+            true,
+        )
+        .await
+    {
+        return app_error_to_reject(doc, &e);
+    }
+    if entry.admin.is_administrator()
+        && let Err(e) = ops::ensure_admin_sister_record(state, &entry.did).await
+    {
+        return app_error_to_reject(doc, &e);
+    }
+    let v = || json!({ "entry": ops::render_v0_2(&entry, None) });
+    let response = match render {
+        Render::Grant => ops::conform::<acl_grant::Response>(v()).map(|r| json!(r)),
+        Render::Update => ops::conform::<acl_update::Response>(v()).map(|r| json!(r)),
+        Render::ChangeRole => ops::conform::<acl_change_role::Response>(v()).map(|r| json!(r)),
+        Render::Revoke => ops::conform::<acl_revoke::Response>(v()).map(|r| json!(r)),
+    };
+    match response {
+        Ok(r) => success_response(doc, r),
+        Err(e) => app_error_to_reject(doc, &e),
+    }
+}
+
+/// Each `acl/*` task through the spine, as every transport hands it over.
+///
+/// The spine is the single place REST, DIDComm and TSP meet, so each task is
+/// driven through [`super::dispatch_trust_task_core`] once per
+/// [`crate::join::JoinTransport`]. The role-based behaviour through the real
+/// router is `tests/it/admin_roles.rs`; the live-mediator round trip is
+/// `tests/it/acl_trust_tasks.rs`.
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use vti_rooms_dtg::test_support::Party;
+
+    use super::super::{
+        ACL_GRANT_TYPE, ACL_LIST_TYPE, ACL_REVOKE_TYPE, ACL_SHOW_TYPE, ACL_UPDATE_TYPE,
+        JoinAuthCtx, TrustTaskOutcome, dispatch_trust_task_core,
+    };
+    use super::{acl_list, acl_revoke, acl_show};
+    use crate::acl::{
+        AdminAuthority, AdminRole, VtcAclEntry, VtcRole, get_acl_entry, store_acl_entry,
+    };
+    use crate::join::JoinTransport;
+    use crate::test_support::TestVtc;
+    use crate::trust_tasks::test_fixtures::{
+        assert_conforms, error_code, payload_of, signed, unsigned,
+    };
+    use trust_tasks_rs::TrustTask;
+
+    const TRANSPORTS: [JoinTransport; 3] = [
+        JoinTransport::Rest,
+        JoinTransport::DIDComm,
+        JoinTransport::Tsp,
+    ];
+
+    /// The subject every test acts on: an auditor.
+    const TARGET: &str = "did:key:zAclTaskTarget";
+
+    struct Fixture {
+        vtc: TestVtc,
+        /// A community administrator with the full ceiling.
+        admin: Party,
+        /// A member: authenticated, authorized for none of this.
+        member: Party,
+    }
+
+    async fn seed(vtc: &TestVtc, did: &str, role: VtcRole, admin: AdminAuthority) {
+        store_acl_entry(
+            &vtc.state.acl_ks,
+            &VtcAclEntry {
+                did: did.into(),
+                role,
+                label: None,
+                admin,
+                delegated_by: None,
+                created_at: 0,
+                created_by: "did:key:vtc-install".into(),
+                updated_at: None,
+                updated_by: None,
+                expires_at: None,
+                resource_grants: Vec::new(),
+                group_grants: Vec::new(),
+                label_set_by_subject: false,
+                suspension: None,
+            },
+        )
+        .await
+        .expect("seed ACL row");
+    }
+
+    async fn fixture() -> Fixture {
+        let vtc = TestVtc::builder()
+            .with_audit(true)
+            .with_signers(true)
+            .build()
+            .await;
+        crate::policy::default::install_defaults(
+            &vtc.state.policies_ks,
+            &vtc.state.active_policies_ks,
+        )
+        .await
+        .expect("install default policies");
+        let (admin, member) = (Party::new(), Party::new());
+        seed(
+            &vtc,
+            &admin.did,
+            VtcRole::Admin,
+            AdminAuthority::community_admin(),
+        )
+        .await;
+        seed(&vtc, &member.did, VtcRole::Member, AdminAuthority::none()).await;
+        seed(
+            &vtc,
+            TARGET,
+            VtcRole::Member,
+            AdminAuthority::for_role(AdminRole::Auditor),
+        )
+        .await;
+        Fixture { vtc, admin, member }
+    }
+
+    fn ctx(transport: JoinTransport, from: &Party) -> JoinAuthCtx {
+        match transport {
+            JoinTransport::Rest => JoinAuthCtx::rest(),
+            _ => JoinAuthCtx {
+                transport,
+                sender_did: Some(from.did.clone()),
+                verified_signer: None,
+            },
+        }
+    }
+
+    async fn dispatch_doc(
+        vtc: &TestVtc,
+        transport: JoinTransport,
+        from: &Party,
+        doc: &TrustTask<Value>,
+    ) -> TrustTaskOutcome {
+        let body = serde_json::to_vec(doc).expect("a document serialises");
+        dispatch_trust_task_core(&vtc.state, &ctx(transport, from), &body).await
+    }
+
+    async fn send(
+        vtc: &TestVtc,
+        transport: JoinTransport,
+        from: &Party,
+        uri: &str,
+        payload: Value,
+    ) -> TrustTaskOutcome {
+        let doc = signed(from, uri, payload).await;
+        dispatch_doc(vtc, transport, from, &doc).await
+    }
+
+    /// What the specifications declare, which the unsigned-document test
+    /// below rests on.
+    #[test]
+    fn the_0_2_writes_declare_a_proof_and_the_reads_do_not() {
+        let required = |uri| {
+            vti_specs::schema_index::spec_policy_for(uri)
+                .unwrap_or_else(|| panic!("{uri} has no published policy"))
+                .is_proof_required
+        };
+        assert!(required(ACL_GRANT_TYPE));
+        assert!(required(ACL_UPDATE_TYPE));
+        assert!(required(ACL_REVOKE_TYPE));
+        assert!(!required(ACL_SHOW_TYPE));
+        assert!(!required(ACL_LIST_TYPE));
+    }
+
+    /// `acl/show/0.2` and `acl/list/0.2` answer an administrator on every
+    /// transport with responses that conform to the published schemas, and
+    /// refuse a member.
+    #[tokio::test]
+    async fn the_0_2_reads_conform_on_every_transport() {
+        for t in TRANSPORTS {
+            let fix = fixture().await;
+            let out = send(
+                &fix.vtc,
+                t,
+                &fix.admin,
+                ACL_SHOW_TYPE,
+                json!({ "subject": TARGET }),
+            )
+            .await;
+            assert!(out.status.is_success(), "{t:?}: {}", payload_of(&out));
+            assert_conforms::<acl_show::Response>(&out);
+            assert_eq!(payload_of(&out)["entry"]["role"], "auditor");
+
+            let out = send(&fix.vtc, t, &fix.admin, ACL_LIST_TYPE, json!({})).await;
+            assert!(out.status.is_success(), "{t:?}: {}", payload_of(&out));
+            assert_conforms::<acl_list::Response>(&out);
+
+            let out = send(&fix.vtc, t, &fix.member, ACL_LIST_TYPE, json!({})).await;
+            assert!(!out.status.is_success(), "{t:?}: a member reads nothing");
+        }
+    }
+
+    /// `acl/update/0.2` narrows capabilities as a privilege reduction. The
+    /// subject is an administrator, so the reduction takes the requester's
+    /// bound gesture first (VTI-APV-019), and nothing moves without it.
+    #[tokio::test]
+    async fn narrowing_an_administrator_asks_for_a_bound_gesture() {
+        let fix = fixture().await;
+        let out = send(
+            &fix.vtc,
+            JoinTransport::Rest,
+            &fix.admin,
+            ACL_UPDATE_TYPE,
+            json!({ "subject": TARGET, "capabilities": {"scope": "none"} }),
+        )
+        .await;
+        assert_eq!(error_code(&out).as_deref(), Some("permissionDenied"));
+        // The fixture's administrator holds no passkey, so the refusal names
+        // the gesture it cannot give (with one, it carries the ceremony as
+        // `details.stepUpRequest`).
+        assert!(
+            payload_of(&out)["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("step-up required")),
+            "{}",
+            payload_of(&out)
+        );
+        let entry = get_acl_entry(&fix.vtc.state.acl_ks, TARGET)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.admin, AdminAuthority::for_role(AdminRole::Auditor));
+    }
+
+    /// Writing a member entry with no administrative authority confers
+    /// nothing, so no gesture is asked; the realized entry is answered in the
+    /// 0.2 shape and conforms.
+    #[tokio::test]
+    async fn a_grant_conferring_nothing_lands_without_a_gesture() {
+        let fix = fixture().await;
+        let subject = Party::new();
+        let out = send(
+            &fix.vtc,
+            JoinTransport::Rest,
+            &fix.admin,
+            ACL_GRANT_TYPE,
+            json!({ "entry": {
+                "subject": subject.did,
+                "role": "member",
+                "act": {"scope": "none"},
+                "keys": {"scope": "none"},
+                "capabilities": {"scope": "none"},
+            }}),
+        )
+        .await;
+        assert!(out.status.is_success(), "{}", payload_of(&out));
+        let entry = get_acl_entry(&fix.vtc.state.acl_ks, &subject.did)
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(entry.admin, AdminAuthority::none());
+        assert_eq!(entry.delegated_by, None, "no authority, no delegation");
+    }
+
+    /// `acl/revoke/0.2` with `{kind: act}` and a `none` act scope on an entry
+    /// already acting nowhere is not a narrowing.
+    #[tokio::test]
+    async fn revoke_0_2_refuses_a_narrowing_that_is_not_one() {
+        let fix = fixture().await;
+        let out = send(
+            &fix.vtc,
+            JoinTransport::Rest,
+            &fix.admin,
+            ACL_REVOKE_TYPE,
+            json!({ "subject": fix.member.did, "revocation": {"kind": "act", "act": {"scope": "none"}} }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&out).as_deref(),
+            Some(acl_revoke::error_codes::NOT_NARROWING.code)
+        );
+        let out = send(
+            &fix.vtc,
+            JoinTransport::Rest,
+            &fix.admin,
+            ACL_REVOKE_TYPE,
+            json!({ "subject": "did:key:zNobody", "revocation": {"kind": "entry"} }),
+        )
+        .await;
+        assert_eq!(
+            error_code(&out).as_deref(),
+            Some(acl_revoke::error_codes::SUBJECT_NOT_PRESENT.code)
+        );
+    }
+
+    /// VTI-OPS-020 / -021: the 0.2 writes declare a proof, and an unsigned one
+    /// is refused on every transport before it reaches the ACL.
+    #[tokio::test]
+    async fn vti_ops_020_an_unsigned_0_2_document_is_refused() {
+        for t in TRANSPORTS {
+            let fix = fixture().await;
+            let doc = unsigned(
+                &fix.admin,
+                ACL_UPDATE_TYPE,
+                json!({ "subject": TARGET, "label": "x" }),
+            );
+            let out = dispatch_doc(&fix.vtc, t, &fix.admin, &doc).await;
+            assert_eq!(error_code(&out).as_deref(), Some("proofRequired"), "{t:?}");
+        }
+    }
+
+    /// Over DIDComm and TSP the transport's sender must be the signer.
+    #[tokio::test]
+    async fn a_0_2_document_relayed_by_another_sender_is_refused() {
+        for t in [JoinTransport::DIDComm, JoinTransport::Tsp] {
+            let fix = fixture().await;
+            let doc = signed(
+                &fix.admin,
+                ACL_REVOKE_TYPE,
+                json!({ "subject": TARGET, "revocation": {"kind": "entry"} }),
+            )
+            .await;
+            let out = dispatch_doc(&fix.vtc, t, &fix.member, &doc).await;
+            assert!(!out.status.is_success(), "{t:?}");
+            assert!(
+                get_acl_entry(&fix.vtc.state.acl_ks, TARGET)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{t:?}"
+            );
+        }
+    }
+
+    /// VTI-ACL-052 item 2 on every transport: a subject relabels its own entry,
+    /// marked self-set; any other change to its own entry is refused, saying
+    /// the label is what it may change (single-administrator mode off).
+    #[tokio::test]
+    async fn vti_acl_052_subject_may_relabel_own_entry_on_every_transport() {
+        for t in TRANSPORTS {
+            let fix = fixture().await;
+            let out = send(
+                &fix.vtc,
+                t,
+                &fix.admin,
+                ACL_UPDATE_TYPE,
+                json!({ "subject": fix.admin.did, "label": "my laptop" }),
+            )
+            .await;
+            assert!(out.status.is_success(), "{t:?}: {}", payload_of(&out));
+            let entry = get_acl_entry(&fix.vtc.state.acl_ks, &fix.admin.did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.label.as_deref(), Some("my laptop"), "{t:?}");
+            assert!(entry.label_set_by_subject, "{t:?}");
+            assert_eq!(
+                payload_of(&out)["entry"]["ext"]["org.openvtc"]["labelSetBySubject"],
+                true,
+                "{t:?}"
+            );
+            assert_conforms::<super::acl_update::Response>(&out);
+
+            let out = send(
+                &fix.vtc,
+                t,
+                &fix.admin,
+                ACL_UPDATE_TYPE,
+                json!({ "subject": fix.admin.did, "label": "x", "approve": {"scope": "none"} }),
+            )
+            .await;
+            assert_eq!(
+                error_code(&out).as_deref(),
+                Some("permissionDenied"),
+                "{t:?}"
+            );
+            assert!(
+                payload_of(&out)["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("VTI-ACL-052") && m.contains("label yourself")),
+                "{t:?}: {}",
+                payload_of(&out)
+            );
+        }
+    }
+
+    /// VTI-ACL-052 item 3 on every transport: in single-administrator mode an
+    /// unrestricted administrator's edit of its own entry asks for its gesture
+    /// bound to the document, and writes nothing without it.
+    #[tokio::test]
+    async fn vti_acl_052_single_admin_self_edit_asks_for_a_bound_gesture_on_every_transport() {
+        for t in TRANSPORTS {
+            let fix = fixture().await;
+            fix.vtc.state.config.write().await.acl.single_admin_mode = true;
+            let out = send(
+                &fix.vtc,
+                t,
+                &fix.admin,
+                ACL_UPDATE_TYPE,
+                json!({
+                    "subject": fix.admin.did,
+                    "approve": {"scope": "none"},
+                    "approveCapabilities": {"scope": "none"},
+                }),
+            )
+            .await;
+            assert_eq!(
+                error_code(&out).as_deref(),
+                Some("permissionDenied"),
+                "{t:?}"
+            );
+            assert!(
+                payload_of(&out)["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("step-up required")),
+                "{t:?}: {}",
+                payload_of(&out)
+            );
+            let entry = get_acl_entry(&fix.vtc.state.acl_ks, &fix.admin.did)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.admin, AdminAuthority::community_admin(), "{t:?}");
+        }
+    }
+}

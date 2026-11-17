@@ -1,0 +1,319 @@
+//! Offline `vtc acl` CLI integration tests.
+//!
+//! Drives the `acl_cli` handlers against a temp store + minimal config
+//! file, exactly as the `vtc acl {list,add,remove}` subcommands do, and
+//! verifies the resulting `acl` keyspace state.
+
+use std::path::{Path, PathBuf};
+
+use tempfile::TempDir;
+use vti_common::config::StoreConfig;
+
+use vtc_service::acl::{VtcAclEntry, VtcRole, get_acl_entry};
+use vtc_service::acl_cli::{AclAddArgs, run_acl_add, run_acl_list, run_acl_remove};
+use vtc_service::store::Store;
+
+const DID: &str = "did:key:z6MkAclCliTestAdmin";
+
+/// A temp dir + a minimal `config.toml` pointing the store at it.
+/// Returns `(dir, config_path, data_dir)`; keep `dir` alive for the test.
+fn fixture() -> (TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    let cfg_path = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        format!("[store]\ndata_dir = \"{}\"\n", data_dir.display()),
+    )
+    .expect("write config");
+    (dir, cfg_path, data_dir)
+}
+
+/// Re-open the store and read back an entry — the CLI handler drops its
+/// own store (releasing the fjall lock) before this runs.
+async fn read_entry(data_dir: &Path, did: &str) -> Option<VtcAclEntry> {
+    let store = Store::open(&StoreConfig {
+        data_dir: data_dir.to_path_buf(),
+    })
+    .expect("open store");
+    let ks = store.keyspace("acl").expect("acl ks");
+    get_acl_entry(&ks, did).await.expect("get_acl_entry")
+}
+
+/// VTI-APV-014: the offline commands are the break-glass — they skip the
+/// consent and attrition rules the daemon enforces — so each write leaves a
+/// record the daemon turns into an `AclBreakGlassWritten` audit row on its next
+/// boot. Taking the records spends them.
+#[tokio::test]
+async fn vti_apv_014_every_offline_write_is_queued_for_audit() {
+    let (_dir, cfg, data_dir) = fixture();
+
+    run_acl_add(AclAddArgs {
+        config_path: Some(cfg.clone()),
+        did: DID.into(),
+        role: "admin".into(),
+        label: None,
+        contexts: vec![],
+        admin_role: None,
+        capabilities: vec![],
+        expires: None,
+    })
+    .await
+    .expect("add");
+    run_acl_remove(Some(cfg.clone()), DID.into())
+        .await
+        .expect("remove");
+
+    let store = Store::open(&StoreConfig {
+        data_dir: data_dir.to_path_buf(),
+    })
+    .expect("open store");
+    let install = vtc_service::install::InstallTokenStore::new(
+        store.keyspace("install").expect("install ks"),
+    );
+    let queued = install.take_break_glass().await.expect("take");
+    assert_eq!(queued.len(), 2, "{queued:?}");
+    assert_eq!(queued[0].command, "vtc acl add");
+    assert_eq!(queued[0].action, "grant");
+    assert_eq!(queued[0].did, DID);
+    assert_eq!(queued[0].role, "admin");
+    assert_eq!(queued[1].command, "vtc acl remove");
+    assert_eq!(queued[1].action, "remove");
+    assert!(!queued[0].operator_hostname.is_empty());
+
+    assert!(
+        install.take_break_glass().await.expect("take").is_empty(),
+        "each is audited once"
+    );
+}
+
+#[tokio::test]
+async fn add_list_remove_round_trip() {
+    let (_dir, cfg, data_dir) = fixture();
+
+    run_acl_add(AclAddArgs {
+        config_path: Some(cfg.clone()),
+        did: DID.into(),
+        role: "admin".into(),
+        label: Some("ops".into()),
+        contexts: vec![],
+        admin_role: None,
+        capabilities: vec![],
+        expires: Some(3600),
+    })
+    .await
+    .expect("add");
+
+    let e = read_entry(&data_dir, DID).await.expect("entry stored");
+    assert_eq!(e.role, VtcRole::Admin);
+    assert_eq!(e.label.as_deref(), Some("ops"));
+    // `vtc-admin-roles.md` §9: the offline `--role admin` is a community
+    // administrator with the full ceiling.
+    assert_eq!(e.admin, vtc_service::acl::AdminAuthority::community_admin());
+    assert!(e.expires_at.is_some(), "expiry should be set");
+
+    // `list` runs cleanly against a populated store.
+    run_acl_list(Some(cfg.clone())).await.expect("list");
+
+    run_acl_remove(Some(cfg.clone()), DID.into())
+        .await
+        .expect("remove");
+    assert!(read_entry(&data_dir, DID).await.is_none(), "entry removed");
+}
+
+#[tokio::test]
+async fn add_is_upsert_and_preserves_created_at() {
+    let (_dir, cfg, data_dir) = fixture();
+
+    run_acl_add(AclAddArgs {
+        config_path: Some(cfg.clone()),
+        did: DID.into(),
+        role: "member".into(),
+        label: None,
+        contexts: vec![],
+        admin_role: None,
+        capabilities: vec![],
+        expires: None,
+    })
+    .await
+    .expect("add member");
+    let first = read_entry(&data_dir, DID).await.expect("first");
+    assert_eq!(first.role, VtcRole::Member);
+
+    // Re-add the same DID with a new role — upsert, not duplicate.
+    run_acl_add(AclAddArgs {
+        config_path: Some(cfg.clone()),
+        did: DID.into(),
+        role: "moderator".into(),
+        label: Some("mod".into()),
+        contexts: vec![],
+        admin_role: None,
+        capabilities: vec![],
+        expires: None,
+    })
+    .await
+    .expect("upsert moderator");
+    let second = read_entry(&data_dir, DID).await.expect("second");
+    assert_eq!(second.role, VtcRole::Moderator);
+    assert_eq!(second.label.as_deref(), Some("mod"));
+    assert_eq!(
+        second.created_at, first.created_at,
+        "created_at preserved across update"
+    );
+}
+
+#[tokio::test]
+async fn add_rejects_unknown_role() {
+    let (_dir, cfg, data_dir) = fixture();
+    let result = run_acl_add(AclAddArgs {
+        config_path: Some(cfg),
+        did: DID.into(),
+        role: "wizard".into(),
+        label: None,
+        contexts: vec![],
+        admin_role: None,
+        capabilities: vec![],
+        expires: None,
+    })
+    .await;
+    assert!(result.is_err(), "unknown role must be rejected");
+    // Nothing was written.
+    assert!(read_entry(&data_dir, DID).await.is_none());
+}
+
+#[tokio::test]
+async fn remove_missing_did_is_ok() {
+    let (_dir, cfg, _data_dir) = fixture();
+    // Removing a DID that was never added is a clean no-op (the store is
+    // created on open), not an error.
+    run_acl_remove(Some(cfg), "did:key:zNeverAdded".into())
+        .await
+        .expect("remove missing is ok");
+}
+
+/// VTI-VTC-010: a community holds no contexts, so `--contexts` is refused
+/// rather than read as anything.
+#[tokio::test]
+async fn vti_vtc_010_add_refuses_contexts() {
+    let (_dir, cfg, data_dir) = fixture();
+    let result = run_acl_add(AclAddArgs {
+        config_path: Some(cfg),
+        did: DID.into(),
+        role: "admin".into(),
+        label: None,
+        contexts: vec!["ctx-1".into()],
+        admin_role: None,
+        capabilities: vec![],
+        expires: None,
+    })
+    .await;
+    assert!(result.is_err(), "contexts must be refused");
+    assert!(read_entry(&data_dir, DID).await.is_none());
+}
+
+/// `--admin-role` and `--capability` write a narrowed, qualified authority,
+/// checked against the role's ceiling (VTI-ACL-030, VTI-ACL-031).
+#[tokio::test]
+async fn add_takes_an_admin_role_and_qualified_capabilities() {
+    use vtc_service::acl::{AdminRole, Capability, ResourceQualifier};
+    let (_dir, cfg, data_dir) = fixture();
+    run_acl_add(AclAddArgs {
+        config_path: Some(cfg.clone()),
+        did: DID.into(),
+        role: "member".into(),
+        label: None,
+        contexts: vec![],
+        admin_role: Some("repo-manager".into()),
+        capabilities: vec!["git.repo.manage@git-ns:github.com/acme".into()],
+        expires: None,
+    })
+    .await
+    .expect("add a repo manager");
+    let e = read_entry(&data_dir, DID).await.expect("stored");
+    assert_eq!(e.admin.admin_role, Some(AdminRole::RepoManager));
+    let acme: ResourceQualifier = "git-repo:github.com/acme/r#1".parse().unwrap();
+    assert!(e.can(Capability::GitRepoManage, Some(&acme)));
+    assert!(!e.can(Capability::GitRepoManage, None));
+
+    // Outside the role's ceiling: refused, nothing written over the entry.
+    let result = run_acl_add(AclAddArgs {
+        config_path: Some(cfg),
+        did: DID.into(),
+        role: "member".into(),
+        label: None,
+        contexts: vec![],
+        admin_role: Some("auditor".into()),
+        capabilities: vec!["vtc.config.admin".into()],
+        expires: None,
+    })
+    .await;
+    assert!(result.is_err(), "outside the ceiling must be refused");
+    let unchanged = read_entry(&data_dir, DID).await.expect("still stored");
+    assert_eq!(unchanged.admin.admin_role, Some(AdminRole::RepoManager));
+}
+
+/// `vtc acl remove` offline is a departure too: the removals the entry's holder is owed from
+/// the rooms the community owns are recorded beside it, for the daemon's worker to drive
+/// (`vtc/rooms/community/members/add` item 6).
+#[tokio::test]
+async fn an_offline_removal_records_the_community_room_removals_owed() {
+    use vtc_service::rooms::community::{CommunityRooms, DepartureCause, MemberRecord};
+    let (_dir, cfg, data_dir) = fixture();
+    run_acl_add(AclAddArgs {
+        config_path: Some(cfg.clone()),
+        did: DID.into(),
+        role: "member".into(),
+        label: None,
+        contexts: vec![],
+        admin_role: None,
+        capabilities: vec![],
+        expires: None,
+    })
+    .await
+    .expect("add");
+    let rooms = |store: &Store| {
+        CommunityRooms::new(
+            store
+                .keyspace(vtc_service::store::keyspaces::COMMUNITY_ROOMS)
+                .expect("community_rooms ks"),
+            None,
+        )
+    };
+    {
+        let store = Store::open(&StoreConfig {
+            data_dir: data_dir.to_path_buf(),
+        })
+        .expect("open store");
+        rooms(&store)
+            .put_member(&MemberRecord {
+                room_id: "did:example:board-room".into(),
+                member: DID.into(),
+                actions: vec!["read".into()],
+                valid_until: "2099-01-01T00:00:00Z".into(),
+                state: MemberRecord::OFFERED.into(),
+                offered_at: "2026-01-01T00:00:00Z".into(),
+                admitted_at: None,
+                removed_at: None,
+                suspended_at: None,
+                credentials: None,
+                welcome: None,
+                admitted_epoch: None,
+                renewal: None,
+                sources: Vec::new(),
+            })
+            .await
+            .expect("put");
+        store.persist().await.expect("persist");
+    }
+    run_acl_remove(Some(cfg.clone()), DID.into())
+        .await
+        .expect("remove");
+    let store = Store::open(&StoreConfig {
+        data_dir: data_dir.to_path_buf(),
+    })
+    .expect("open store");
+    let owed = rooms(&store).pending_removals().await.expect("owed");
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert_eq!(owed[0].member, DID);
+    assert_eq!(owed[0].cause, DepartureCause::AclRemoved);
+}

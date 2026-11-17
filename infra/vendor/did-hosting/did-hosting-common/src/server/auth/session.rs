@@ -1,0 +1,1958 @@
+//! Sessions: the stored session record, its lifecycle (challenge, active,
+//! refresh, idle and absolute expiry) and cleanup.
+
+use uuid::Uuid;
+
+use crate::server::acl::Role;
+use crate::server::auth::jwt::JwtKeys;
+use crate::server::error::AppError;
+use crate::server::store::{KeyspaceHandle, WriteBatch};
+use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, warn};
+
+// Canonical Session + SessionState now live in vti-common
+// (`vti_common::auth::session`). Re-exported here so existing
+// `use crate::server::auth::session::Session` paths keep
+// compiling unchanged after the cross-repo unification.
+//
+// The storage helpers below (store_session, get_session, …)
+// keep operating on did-hosting's own `KeyspaceHandle` +
+// `AppError`; only the wire/storage shape is shared.
+pub use ::vti_common::auth::session::{Session, SessionState};
+
+fn session_key(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
+
+/// Prefix of a refresh token's stored form, [`refresh_token_digest`].
+const REFRESH_DIGEST_PREFIX: &str = "sha256:";
+
+/// The form a refresh token is kept in: `sha256:` and the lowercase hex
+/// SHA-256 of the token. Neither the session row nor any index key holds the
+/// token itself, so reading the sessions keyspace does not yield a token that
+/// redeems.
+pub fn refresh_token_digest(token: &str) -> String {
+    format!(
+        "{REFRESH_DIGEST_PREFIX}{}",
+        ::vti_common::auth::session::refresh_token_hash(token)
+    )
+}
+
+/// A session row's `refresh_token` as it is written: a value already in
+/// digest form is kept, anything else (a token just minted, here or by the
+/// canonical handlers) is replaced by its digest.
+fn stored_refresh_form(value: &str) -> String {
+    if value.starts_with(REFRESH_DIGEST_PREFIX) {
+        value.to_string()
+    } else {
+        refresh_token_digest(value)
+    }
+}
+
+/// The SHA-256 (hex) of the token a row's stored `refresh_token` stands for,
+/// for [`vti_common::auth::backend::SessionStore::current_refresh_hash`]. A
+/// row written before tokens were stored as digests holds the token itself.
+pub fn refresh_hash_of_stored(stored: &str) -> String {
+    match stored.strip_prefix(REFRESH_DIGEST_PREFIX) {
+        Some(hex) => hex.to_string(),
+        None => ::vti_common::auth::session::refresh_token_hash(stored),
+    }
+}
+
+/// Whether a row's stored `refresh_token` is the one issued as `token`.
+fn row_holds_refresh(stored: &str, token: &str) -> bool {
+    if stored.starts_with(REFRESH_DIGEST_PREFIX) {
+        stored == refresh_token_digest(token)
+    } else {
+        stored == token
+    }
+}
+
+/// Whether the refresh index entry `refresh:{indexed}` belongs to a row whose
+/// stored `refresh_token` is `stored`. An entry an earlier release wrote
+/// holds the token itself and still belongs to the row once that row has
+/// been rewritten with the token's digest.
+fn index_matches_row(indexed: &str, stored: &str) -> bool {
+    indexed == stored
+        || (!indexed.starts_with(REFRESH_DIGEST_PREFIX) && refresh_token_digest(indexed) == stored)
+}
+
+/// Index key for a refresh token a client presents.
+fn refresh_key(token: &str) -> String {
+    format!("refresh:{}", refresh_token_digest(token))
+}
+
+/// Index key for a row's stored `refresh_token`: its digest, or, for a row
+/// an earlier release wrote, the token it was indexed under then.
+fn row_refresh_key(stored: &str) -> String {
+    format!("refresh:{stored}")
+}
+
+/// Where an earlier release indexed `token`, which it kept as is. Only a
+/// token of the shape those releases issued (a hyphenated UUID) is looked up
+/// there, so a digest read from the store is never accepted in its place.
+fn legacy_refresh_key(token: &str) -> Option<String> {
+    (token.len() == 36 && Uuid::try_parse(token).is_ok()).then(|| format!("refresh:{token}"))
+}
+
+/// Per-DID reverse index: `session-did:{did}:{session_id}` → `session_id`.
+///
+/// Lets [`demote_non_passkey_step_up_sessions`] find one subject's sessions
+/// without a full `session:` table scan. Written by [`store_session`],
+/// removed by [`delete_session`] and [`cleanup_expired_sessions`] — every
+/// path that writes or removes a `session:` row keeps this in lockstep.
+fn session_did_key(did: &str, session_id: &str) -> String {
+    format!("session-did:{did}:{session_id}")
+}
+
+/// Prefix over `session_did_key` entries for `did` — every one of its
+/// sessions. The trailing colon disambiguates DIDs that are a prefix of one
+/// another (e.g. `did:example:ali` vs. `did:example:alice`).
+fn session_did_prefix(did: &str) -> String {
+    format!("session-did:{did}:")
+}
+
+/// Serialises read-modify-writes of one session row in this process.
+///
+/// A row is rewritten by activity touches, step-up elevation and passkey
+/// demotion, and removed by refresh rotation and logout. Each of those that
+/// reads the row first must hold its stripe across the read and the write,
+/// or a touch that read the row at request start writes back a copy that
+/// undoes a demotion or resurrects a rotated-away session. Striped rather
+/// than per-id so the table stays bounded however many sessions come and go.
+const SESSION_LOCK_STRIPES: usize = 64;
+static SESSION_LOCKS: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| {
+        (0..SESSION_LOCK_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect()
+    });
+
+async fn lock_session(session_id: &str) -> tokio::sync::MutexGuard<'static, ()> {
+    use std::hash::BuildHasher;
+    static HASHER: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+        std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
+    SESSION_LOCKS[(HASHER.hash_one(session_id) as usize) % SESSION_LOCK_STRIPES]
+        .lock()
+        .await
+}
+
+/// Stage `session`'s row and its per-DID index into `batch`. The row's
+/// refresh token is written in digest form ([`stored_refresh_form`]).
+fn stage_session(
+    sessions: &KeyspaceHandle,
+    batch: &mut WriteBatch,
+    session: &Session,
+) -> Result<(), AppError> {
+    let hashed;
+    let row = match session.refresh_token.as_deref() {
+        Some(token) if !token.starts_with(REFRESH_DIGEST_PREFIX) => {
+            let mut copy = session.clone();
+            copy.refresh_token = Some(refresh_token_digest(token));
+            hashed = copy;
+            &hashed
+        }
+        _ => session,
+    };
+    batch.insert(sessions, session_key(&row.session_id), row)?;
+    batch.insert_raw(
+        sessions,
+        session_did_key(&session.did, &session.session_id),
+        session.session_id.as_bytes().to_vec(),
+    );
+    Ok(())
+}
+
+/// Store a new session in the `sessions` keyspace — the row and its
+/// per-DID index in one atomic write, so neither exists without the other.
+pub async fn store_session(sessions: &KeyspaceHandle, session: &Session) -> Result<(), AppError> {
+    let mut batch = sessions.batch();
+    stage_session(sessions, &mut batch, session)?;
+    batch.commit().await?;
+    debug!(session_id = %session.session_id, did = %session.did, "session stored");
+    Ok(())
+}
+
+/// Store `session` with its refresh index (`refresh` → session id), and
+/// drop the index of `retired_refresh` (the previous row's stored
+/// `refresh_token`) if given, in one atomic write — a session is never left
+/// without the index its client will present, and a rotated refresh token's
+/// index never outlives the rotation.
+async fn store_session_with_refresh(
+    sessions: &KeyspaceHandle,
+    session: &Session,
+    refresh: &str,
+    retired_refresh: Option<&str>,
+) -> Result<(), AppError> {
+    let mut batch = sessions.batch();
+    stage_session(sessions, &mut batch, session)?;
+    if let Some(old) = retired_refresh.filter(|old| !row_holds_refresh(old, refresh)) {
+        batch.remove(sessions, row_refresh_key(old));
+    }
+    batch.insert_raw(
+        sessions,
+        refresh_key(refresh),
+        session.session_id.as_bytes().to_vec(),
+    );
+    batch.commit().await?;
+    debug!(session_id = %session.session_id, did = %session.did, "session stored");
+    Ok(())
+}
+
+/// Whether `multikey` is a base58btc multikey encoding an Ed25519 public key
+/// (`0xed 0x01` + 32 bytes) — the only session key a session can be bound to.
+///
+/// A session key is used by resolving `did:key:{pk}#{pk}` and verifying
+/// `eddsa-jcs-2022`, so nothing else can ever sign. Decoded rather than
+/// prefix-matched: a value that only *looks* like one (`z6Mk…` over the wrong
+/// bytes) would bind a key whose every later proof is refused, on a login its
+/// producer was told succeeded. Every route that accepts a session key checks
+/// it here, before the login spends anything.
+pub fn is_ed25519_multikey(multikey: &str) -> bool {
+    matches!(
+        multibase::decode(multikey),
+        Ok((multibase::Base::Base58Btc, bytes)) if bytes.len() == 34 && bytes[..2] == [0xed, 0x01]
+    )
+}
+
+/// Load a session by session_id.
+pub async fn get_session(
+    sessions: &KeyspaceHandle,
+    session_id: &str,
+) -> Result<Option<Session>, AppError> {
+    sessions.get(session_key(session_id)).await
+}
+
+/// Store a reverse index from refresh token to session_id.
+pub async fn store_refresh_index(
+    sessions: &KeyspaceHandle,
+    token: &str,
+    session_id: &str,
+) -> Result<(), AppError> {
+    sessions
+        .insert_raw(refresh_key(token), session_id.as_bytes().to_vec())
+        .await
+}
+
+/// Look up a session_id by refresh token.
+pub async fn get_session_by_refresh(
+    sessions: &KeyspaceHandle,
+    token: &str,
+) -> Result<Option<String>, AppError> {
+    let mut found = sessions.get_raw(refresh_key(token)).await?;
+    if found.is_none()
+        && let Some(legacy) = legacy_refresh_key(token)
+    {
+        found = sessions.get_raw(legacy).await?;
+    }
+    match found {
+        Some(bytes) => {
+            let session_id = String::from_utf8(bytes)
+                .map_err(|e| AppError::Internal(format!("invalid session_id bytes: {e}")))?;
+            Ok(Some(session_id))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Atomically look up *and consume* the refresh-token → session_id index.
+///
+/// Backed by `KeyspaceHandle::take_raw` (`Redis GETDEL` / DynamoDB
+/// `DeleteItem`+`ReturnValues=ALL_OLD` / fjall mutex). Exactly one
+/// concurrent caller observes `Some` for any given refresh token, even
+/// across replicas backed by Redis or DynamoDB.
+///
+/// This is the cross-replica equivalent of the in-process `RefreshClaim`
+/// added in an earlier round, and replaces it on the rotation path: the
+/// caller that wins the take is the only one that proceeds to delete the
+/// session and create a new one. Losers see `Ok(None)` and reject the
+/// refresh as already consumed.
+pub async fn take_session_id_by_refresh(
+    sessions: &KeyspaceHandle,
+    token: &str,
+) -> Result<Option<String>, AppError> {
+    let mut taken = sessions.take_raw(refresh_key(token)).await?;
+    if taken.is_none()
+        && let Some(legacy) = legacy_refresh_key(token)
+    {
+        taken = sessions.take_raw(legacy).await?;
+    }
+    match taken {
+        Some(bytes) => {
+            let session_id = String::from_utf8(bytes)
+                .map_err(|e| AppError::Internal(format!("invalid session_id bytes: {e}")))?;
+            Ok(Some(session_id))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Returns the current UNIX epoch timestamp in seconds.
+///
+/// Uses `unwrap_or_default()` so a system clock set before 1970 yields
+/// 0 rather than panicking — every caller (JWT issue, session create,
+/// log ingest) would otherwise propagate the panic and fail the
+/// request with a 500 instead of a sensible error.
+pub fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// How stale `last_seen` must be before an activity touch writes.
+///
+/// Without it a busy console rewrites the session row on every request for
+/// no gain: the idle timeout is measured in minutes, so second-level
+/// precision buys nothing and costs a store write per call.
+pub const LAST_SEEN_GRANULARITY_SECS: u64 = 60;
+
+/// Record activity on `session` by advancing `last_seen` to `now`.
+///
+/// `Ok(false)` means the write was skipped as unnecessary — the row is
+/// already fresh within [`LAST_SEEN_GRANULARITY_SECS`], or the clock went
+/// backwards.
+///
+/// **Only real requests should call this.** It is the clock the idle
+/// timeout is measured against, so anything firing on a timer — a token
+/// renewal above all — would, by touching it, hold the session open for as
+/// long as the client ran and put the timeout permanently out of reach.
+///
+/// `session` is the copy the request loaded; only its id and `last_seen`
+/// are used. The row is re-read under the session's lock and only its
+/// `last_seen` advances: writing the request's copy back would undo
+/// whatever changed the row since the request began (a refresh rotation
+/// that removed it, a demotion that lowered its `acr`). A row that has
+/// gone is left gone — `Ok(false)`.
+pub async fn touch_last_seen(
+    sessions: &KeyspaceHandle,
+    session: &Session,
+    now: u64,
+) -> Result<bool, AppError> {
+    if now < session.last_seen.saturating_add(LAST_SEEN_GRANULARITY_SECS) {
+        return Ok(false);
+    }
+    let _row = lock_session(&session.session_id).await;
+    let Some(mut current) = get_session(sessions, &session.session_id).await? else {
+        return Ok(false);
+    };
+    if now < current.last_seen.saturating_add(LAST_SEEN_GRANULARITY_SECS) {
+        return Ok(false);
+    }
+    current.last_seen = now;
+    sessions
+        .insert(session_key(&current.session_id), &current)
+        .await?;
+    Ok(true)
+}
+
+/// Delete a single session and its refresh and per-DID indexes, in one
+/// atomic write.
+pub async fn delete_session(sessions: &KeyspaceHandle, session_id: &str) -> Result<(), AppError> {
+    let _row = lock_session(session_id).await;
+    let session: Option<Session> = sessions.get(session_key(session_id)).await?;
+    if let Some(session) = session {
+        let mut batch = sessions.batch();
+        if let Some(ref token) = session.refresh_token {
+            batch.remove(sessions, row_refresh_key(token));
+        }
+        batch.remove(sessions, session_key(session_id));
+        batch.remove(sessions, session_did_key(&session.did, session_id));
+        batch.commit().await?;
+        debug!(session_id, "session deleted");
+    }
+    Ok(())
+}
+
+/// Claim a session row: atomically remove it and return what it held, then
+/// drop its refresh and per-DID indexes. Exactly one concurrent caller observes
+/// `Some` for a given session id — the claim is the store's atomic
+/// get-and-remove ([`KeyspaceHandle::take`]), so it holds across replicas
+/// sharing a store. A caller that sees `None` lost the race (or the row was
+/// never there) and must not act as if it held the row.
+pub async fn take_session(
+    sessions: &KeyspaceHandle,
+    session_id: &str,
+) -> Result<Option<Session>, AppError> {
+    let _row = lock_session(session_id).await;
+    let session: Option<Session> = sessions.take(session_key(session_id)).await?;
+    if let Some(ref session) = session {
+        // The claim must stay the store's atomic take (it is what makes one
+        // caller the winner across replicas), so the indexes follow it in a
+        // single batch rather than one remove each.
+        let mut batch = sessions.batch();
+        if let Some(ref token) = session.refresh_token {
+            batch.remove(sessions, row_refresh_key(token));
+        }
+        batch.remove(sessions, session_did_key(&session.did, session_id));
+        batch.commit().await?;
+        debug!(session_id, "session claimed");
+    }
+    Ok(session)
+}
+
+/// Demote every live session of `subject` that is currently elevated
+/// (`acr == "aal2"`) without a passkey factor in `amr` — the wallet/VTA-signed
+/// `didSigned` step-up route this relying party no longer honours for a
+/// subject holding a step-up passkey (once enrolled, only that subject's own
+/// step-up passkeys may satisfy step-up; any elevation reached another way
+/// stops counting, SPEC step-up rule).
+///
+/// Call this once a step-up passkey is enrolled for `subject`. A session
+/// already elevated *with* a passkey (`amr` contains `"passkey"`) is left
+/// untouched — it satisfies the rule that now applies. The demoted row falls
+/// back to the base `aal1`/`["did"]` shape; a live access token already
+/// carrying the higher claims is unaffected until it is next refreshed or
+/// expires, the same bound every other mid-session permission change in this
+/// store is subject to (see `AuthClaims`, which reads `acr`/`amr`/`role` from
+/// the JWT, not the session row, between refreshes).
+///
+/// Returns the number of sessions demoted.
+///
+/// Walks only `subject`'s own sessions, via the `session-did:{subject}:`
+/// index (see `session_did_key`) — not a full `session:` table scan.
+pub async fn demote_non_passkey_step_up_sessions(
+    sessions: &KeyspaceHandle,
+    subject: &str,
+) -> Result<u64, AppError> {
+    let entries = sessions
+        .prefix_iter_raw(session_did_prefix(subject))
+        .await?;
+    let mut demoted = 0u64;
+    for (_key, value) in entries {
+        let Ok(session_id) = String::from_utf8(value) else {
+            continue;
+        };
+        let _row = lock_session(&session_id).await;
+        let Some(mut session) = get_session(sessions, &session_id).await? else {
+            continue;
+        };
+        if session.did != subject
+            || session.acr != "aal2"
+            || session.amr.iter().any(|m| m == "passkey")
+        {
+            continue;
+        }
+        session.amr = vec!["did".to_string()];
+        session.acr = "aal1".to_string();
+        session.acr_expires_at = None;
+        store_session(sessions, &session).await?;
+        demoted += 1;
+    }
+    Ok(demoted)
+}
+
+/// What [`settle_subject_sessions`] does with one of the subject's sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFate {
+    /// Leave the session as it is.
+    Keep,
+    /// Drop its elevation: back to the base `aal1`/`["did"]` shape.
+    Demote,
+    /// End it: the row and its refresh and per-DID indexes are removed.
+    End,
+}
+
+/// What [`settle_subject_sessions`] did.
+#[derive(Debug, Default)]
+pub struct SettledSessions {
+    /// The ids of the sessions it ended.
+    pub ended: Vec<String>,
+    /// How many sessions it demoted.
+    pub demoted: u64,
+}
+
+/// A settled session's refresh token, `session-settled:{digest}` →
+/// [`SettledMarker`]: what [`settle_subject_sessions`] did to the session that
+/// token belonged to, kept until the token would have expired.
+///
+/// A refresh reads the session row, then writes the rotated row, and the
+/// canonical refresh handler does not hold the row lock in between. A
+/// settlement landing between the two would be undone by the write: the
+/// rotated row brings an ended session back, or a demoted one back to its
+/// elevation. The refresh path therefore checks for this marker after it has
+/// rotated ([`settle_after_refresh`]) and applies the settlement again. Keyed
+/// by the refresh token the settlement saw, which is the one an in-flight
+/// refresh presented, so a later sign-in that reuses a session id is never
+/// caught by it.
+fn settled_marker_key(refresh_token: &str) -> String {
+    format!("session-settled:{}", refresh_token_digest(refresh_token))
+}
+
+/// [`settled_marker_key`] for a row's stored `refresh_token`.
+fn row_settled_marker_key(stored: &str) -> String {
+    format!("session-settled:{}", stored_refresh_form(stored))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SettledMarker {
+    fate: String,
+    /// When the refresh token it is keyed by stops redeeming; swept after.
+    expires_at: u64,
+}
+
+/// Apply `fate` to every live session of `subject`, each read and changed
+/// under its row lock, so a concurrent touch or elevation cannot write back a
+/// copy of a session this ended or demoted; a concurrent refresh is caught by
+/// the marker it leaves ([`settle_after_refresh`]).
+///
+/// Called when what a session rests on is withdrawn — the subject's ACL entry,
+/// or a passkey the session was established or elevated with. An ended
+/// session's next request finds no row and is refused, and its refresh token
+/// no longer redeems. Walks only `subject`'s sessions, via the
+/// `session-did:` index; a session recorded under another reference to the
+/// same identity (a `did:scid` with or without its `src`) is included.
+pub async fn settle_subject_sessions(
+    sessions: &KeyspaceHandle,
+    subject: &str,
+    fate: impl Fn(&Session) -> SessionFate,
+) -> Result<SettledSessions, AppError> {
+    // No trailing colon: a `did:scid` session may be indexed with its `?src=`.
+    // Other DIDs the prefix also matches are filtered out below.
+    let entries = sessions
+        .prefix_iter_raw(format!("session-did:{}", crate::scid::identity(subject)))
+        .await?;
+    let mut settled = SettledSessions::default();
+    for (_key, value) in entries {
+        let Ok(session_id) = String::from_utf8(value) else {
+            continue;
+        };
+        let _row = lock_session(&session_id).await;
+        let Some(session) = get_session(sessions, &session_id).await? else {
+            continue;
+        };
+        if !crate::scid::same_reference(&session.did, subject) {
+            continue;
+        }
+        let chosen = fate(&session);
+        if apply_fate(sessions, session, chosen, true).await? {
+            match chosen {
+                SessionFate::End => settled.ended.push(session_id),
+                SessionFate::Demote => settled.demoted += 1,
+                SessionFate::Keep => {}
+            }
+        }
+    }
+    Ok(settled)
+}
+
+/// Apply `fate` to `session`, whose row lock the caller holds. With `mark`,
+/// leave the [`SettledMarker`] for its refresh token in the same write.
+/// Whether anything changed.
+async fn apply_fate(
+    sessions: &KeyspaceHandle,
+    mut session: Session,
+    fate: SessionFate,
+    mark: bool,
+) -> Result<bool, AppError> {
+    let label = match fate {
+        SessionFate::Keep => return Ok(false),
+        SessionFate::Demote => "demote",
+        SessionFate::End => "end",
+    };
+    let mut batch = sessions.batch();
+    if mark && let Some(ref token) = session.refresh_token {
+        let marker = SettledMarker {
+            fate: label.to_string(),
+            expires_at: session
+                .refresh_expires_at
+                .unwrap_or_else(|| now_epoch() + 86_400),
+        };
+        batch.insert(sessions, row_settled_marker_key(token), &marker)?;
+    }
+    match fate {
+        SessionFate::Demote => {
+            session.amr = vec!["did".to_string()];
+            session.acr = "aal1".to_string();
+            session.acr_expires_at = None;
+            stage_session(sessions, &mut batch, &session)?;
+        }
+        SessionFate::End => {
+            if let Some(ref token) = session.refresh_token {
+                batch.remove(sessions, row_refresh_key(token));
+            }
+            batch.remove(sessions, session_key(&session.session_id));
+            batch.remove(sessions, session_did_key(&session.did, &session.session_id));
+        }
+        SessionFate::Keep => {}
+    }
+    batch.commit().await?;
+    Ok(true)
+}
+
+/// After a refresh redeemed `presented_refresh_token` and rotated the session
+/// `session_id` to `rotated_refresh_token` and `rotated_token_id`: if a
+/// settlement ended or demoted that session while the refresh was in flight,
+/// apply it again to the rotated row, which the refresh wrote from what it
+/// read before the settlement. Only the row this refresh wrote is touched: one
+/// that has moved on since (a later refresh, a step-up) was written after the
+/// settlement and is left alone. Returns the fate applied, `None` when there
+/// was nothing to do.
+pub async fn settle_after_refresh(
+    sessions: &KeyspaceHandle,
+    presented_refresh_token: &str,
+    session_id: &str,
+    rotated_refresh_token: &str,
+    rotated_token_id: &str,
+) -> Result<Option<SessionFate>, AppError> {
+    let _row = lock_session(session_id).await;
+    let Some(bytes) = sessions
+        .take_raw(settled_marker_key(presented_refresh_token))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Ok(marker) = serde_json::from_slice::<SettledMarker>(&bytes) else {
+        return Ok(None);
+    };
+    let fate = match marker.fate.as_str() {
+        "end" => SessionFate::End,
+        "demote" => SessionFate::Demote,
+        _ => return Ok(None),
+    };
+    let Some(session) = get_session(sessions, session_id).await? else {
+        return Ok(None);
+    };
+    if !session
+        .refresh_token
+        .as_deref()
+        .is_some_and(|stored| row_holds_refresh(stored, rotated_refresh_token))
+        || session.token_id.as_deref() != Some(rotated_token_id)
+    {
+        return Ok(None);
+    }
+    apply_fate(sessions, session, fate, false).await?;
+    Ok(Some(fate))
+}
+
+/// The control plane's passkey login ceremony rows, `pk_task_meta:{authId}`.
+const LOGIN_CEREMONY_PREFIX: &str = "pk_task_meta:";
+
+/// Where a login ceremony's WebAuthn state was kept before it moved into its
+/// `pk_task_meta:` row, `pk_auth:{authId}`.
+const LEGACY_LOGIN_STATE_PREFIX: &str = "pk_auth:";
+
+/// Rows a page of [`cleanup_expired_sessions`]' walks reads.
+const CLEANUP_PAGE_ROWS: usize = 512;
+
+/// Remove expired sessions from the store.
+///
+/// - `ChallengeSent` sessions expire after `challenge_ttl` seconds from `created_at`.
+/// - `Authenticated` sessions expire when `refresh_expires_at` has passed.
+pub async fn cleanup_expired_sessions(
+    sessions: &KeyspaceHandle,
+    challenge_ttl: u64,
+) -> Result<(), AppError> {
+    // A page at a time: the sweep holds one page of rows, not the table.
+    let mut walk = sessions.walk("session:", CLEANUP_PAGE_ROWS);
+    let now = now_epoch();
+    let mut removed = 0u64;
+    // Each remaining session's stored refresh token, for the index sweep below.
+    let mut live_refresh = std::collections::HashMap::new();
+
+    while let Some(entries) = walk.next_page().await? {
+        for (key, value) in entries {
+            let session: Session = match serde_json::from_slice(&value) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("skipping malformed session record: {e}");
+                    continue;
+                }
+            };
+
+            let expired = match session.state {
+                SessionState::ChallengeSent => {
+                    now.saturating_sub(session.created_at) > challenge_ttl
+                }
+                SessionState::Authenticated => session
+                    .refresh_expires_at
+                    .is_none_or(|expires| now > expires),
+            };
+
+            if expired {
+                sessions.remove(key).await?;
+                if let Some(ref token) = session.refresh_token {
+                    sessions.remove(row_refresh_key(token)).await?;
+                }
+                sessions
+                    .remove(session_did_key(&session.did, &session.session_id))
+                    .await?;
+                removed += 1;
+            } else if let Some(token) = session.refresh_token {
+                live_refresh.insert(session.session_id, token);
+            }
+        }
+    }
+
+    // Refresh index entries no session issues any more: one whose session has
+    // gone, or one a later sign-in or rotation replaced without retiring it.
+    // Neither redeems (a refresh must present the session's current token),
+    // but nothing else would ever remove them. An entry that disagrees with
+    // the scan above is checked against the row again before it goes, since
+    // a sign-in may have written both after the scan.
+    let mut refresh_walk = sessions.walk("refresh:", CLEANUP_PAGE_ROWS);
+    while let Some(rows) = refresh_walk.next_page().await? {
+        for (key, value) in rows {
+            let Some(indexed) = key
+                .strip_prefix(b"refresh:".as_slice())
+                .and_then(|k| std::str::from_utf8(k).ok())
+            else {
+                continue;
+            };
+            let Ok(session_id) = String::from_utf8(value) else {
+                continue;
+            };
+            if live_refresh
+                .get(&session_id)
+                .is_some_and(|stored| index_matches_row(indexed, stored))
+            {
+                continue;
+            }
+            let current = get_session(sessions, &session_id)
+                .await?
+                .and_then(|row| row.refresh_token);
+            if current.is_some_and(|stored| index_matches_row(indexed, &stored)) {
+                continue;
+            }
+            sessions.remove(key.clone()).await?;
+            removed += 1;
+        }
+    }
+
+    // Expired passkey enrolment invites (`pk_invite:` + their `pk_invite_id:`
+    // index and `pk_wrong:` wrong-claim-code counter) and enrolment
+    // ceremonies (`pk_enrol:`). Both carry `expires_at`; an invite past it
+    // can no longer be redeemed, and its hashes go with it.
+    #[derive(serde::Deserialize)]
+    struct Expiry {
+        expires_at: u64,
+        #[serde(default)]
+        invite_id: Option<String>,
+    }
+    for prefix in ["pk_invite:", "pk_enrol:"] {
+        for (key, value) in sessions.prefix_iter_raw(prefix).await? {
+            if let Ok(e) = serde_json::from_slice::<Expiry>(&value)
+                && now > e.expires_at
+            {
+                sessions.remove(key.clone()).await?;
+                if let Some(id) = e.invite_id {
+                    sessions.remove(format!("pk_invite_id:{id}")).await?;
+                }
+                if let Some(token_hash) = key
+                    .strip_prefix(b"pk_invite:".as_slice())
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                {
+                    sessions.remove(format!("pk_wrong:{token_hash}")).await?;
+                }
+                removed += 1;
+            }
+        }
+    }
+
+    // Expired control-plane ceremonies: passkey login (`pk_task_meta:`, and
+    // the `pk_auth:` row an older build kept its state in), passkey
+    // revocation (`pk_revoke:`), step-up (`stepup-task:`) and DID ownership
+    // transfer offers (`did_xfer:`). Each carries `expires_at`; a finish
+    // refuses one past it, so the row is dead weight from then on. A login is
+    // opened unauthenticated, so without this every abandoned one stayed.
+    for prefix in [
+        LOGIN_CEREMONY_PREFIX,
+        "pk_revoke:",
+        "stepup-task:",
+        "did_xfer:",
+        "session-settled:",
+    ] {
+        for (key, value) in sessions.prefix_iter_raw(prefix).await? {
+            if let Ok(e) = serde_json::from_slice::<Expiry>(&value)
+                && now > e.expires_at
+            {
+                sessions.remove(key.clone()).await?;
+                if let Some(id) = key
+                    .strip_prefix(LOGIN_CEREMONY_PREFIX.as_bytes())
+                    .and_then(|id| std::str::from_utf8(id).ok())
+                {
+                    sessions
+                        .remove(format!("{LEGACY_LOGIN_STATE_PREFIX}{id}"))
+                        .await?;
+                }
+                removed += 1;
+            }
+        }
+    }
+    // A `pk_auth:` row is only ever read together with its `pk_task_meta:`
+    // row; once that is gone (finished, swept, or never written) it is
+    // unreachable.
+    for (key, _) in sessions.prefix_iter_raw(LEGACY_LOGIN_STATE_PREFIX).await? {
+        let Some(id) = key
+            .strip_prefix(LEGACY_LOGIN_STATE_PREFIX.as_bytes())
+            .and_then(|id| std::str::from_utf8(id).ok())
+        else {
+            continue;
+        };
+        if !sessions
+            .contains_key(format!("{LOGIN_CEREMONY_PREFIX}{id}"))
+            .await?
+        {
+            sessions.remove(key.clone()).await?;
+            removed += 1;
+        }
+    }
+
+    debug!(removed, "session cleanup complete");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared authenticated-session creation (used by DIDComm + passkey flows)
+// ---------------------------------------------------------------------------
+
+/// Response payload returned to clients after successful authentication.
+/// Carries the absolute access/refresh expiries + the JWT's AAL claims
+/// so the route handler can synthesise the canonical
+/// `AuthenticateResponse { session, tokens }` shape without
+/// re-deriving them.
+#[derive(Debug, Serialize)]
+pub struct TokenResponse {
+    pub session_id: String,
+    pub subject: String,
+    pub access_token: String,
+    pub access_expires_at: u64,
+    pub refresh_token: String,
+    pub refresh_expires_at: u64,
+    /// Issuance moment (Unix seconds). The canonical wire encodes
+    /// this as `session.issuedAt`; `expiresIn` = `access_expires_at -
+    /// issued_at`.
+    pub issued_at: u64,
+    /// Authentication methods references — `["did"]` for the
+    /// challenge-response path, augmented by step-up handlers.
+    pub amr: Vec<String>,
+    /// Authentication context class — `"aal1"` for single-factor,
+    /// `"aal2"` after step-up.
+    pub acr: String,
+}
+
+impl TokenResponse {
+    /// Convert to the canonical `AuthenticateResponse { session, tokens }`
+    /// wire shape. The route handler calls this once and returns
+    /// `Json(token_resp.into_canonical())`.
+    pub fn into_canonical(self) -> crate::AuthenticateResponse {
+        let session_expires_at_epoch = self.refresh_expires_at.max(self.access_expires_at);
+        crate::AuthenticateResponse {
+            session: crate::Session {
+                id: self.session_id,
+                subject: self.subject,
+                issued_at: crate::epoch_to_rfc3339(self.issued_at),
+                expires_at: crate::epoch_to_rfc3339(session_expires_at_epoch),
+                amr: self.amr,
+                acr: self.acr,
+            },
+            tokens: crate::TokenBundle {
+                access_token: self.access_token,
+                refresh_token: Some(self.refresh_token),
+                token_type: "Bearer".to_string(),
+                expires_in: self.access_expires_at.saturating_sub(self.issued_at),
+                refresh_expires_in: Some(self.refresh_expires_at.saturating_sub(self.issued_at)),
+                scope: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Generate access + refresh tokens for an authenticated session.
+///
+/// `amr_acr_override` lets refresh paths preserve an elevated session's
+/// AAL — pass `Some((["did","passkey"], "aal2"))` to mint a token at
+/// the post-step-up level. `None` falls back to the Claims-struct
+/// defaults (`["did"]`/`"aal1"`), correct for first-time authenticate.
+fn generate_tokens(
+    jwt_keys: &JwtKeys,
+    did: &str,
+    session_id: &str,
+    role: &Role,
+    access_expiry: u64,
+    refresh_expiry: u64,
+    amr_acr_override: Option<(Vec<String>, String)>,
+) -> Result<(String, u64, String, u64, String), AppError> {
+    let mut claims = JwtKeys::new_claims(
+        did.to_string(),
+        session_id.to_string(),
+        role.to_string(),
+        access_expiry,
+    );
+    if let Some((amr, acr)) = amr_acr_override {
+        claims.amr = amr;
+        claims.acr = acr;
+    }
+    let access_expires_at = claims.exp;
+    let token_id = claims.jti.clone();
+    let access_token = jwt_keys.encode(&claims)?;
+    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_expires_at = now_epoch() + refresh_expiry;
+    Ok((
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+        token_id,
+    ))
+}
+
+/// Upgrade an existing `ChallengeSent` session to `Authenticated`, generating
+/// tokens and storing the refresh index. Used by DIDComm auth which preserves
+/// the original session_id from the challenge phase.
+pub async fn finalize_challenge_session(
+    sessions: &KeyspaceHandle,
+    jwt_keys: &JwtKeys,
+    session: &mut Session,
+    role: &Role,
+    access_expiry: u64,
+    refresh_expiry: u64,
+) -> Result<TokenResponse, AppError> {
+    let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
+        generate_tokens(
+            jwt_keys,
+            &session.did,
+            &session.session_id,
+            role,
+            access_expiry,
+            refresh_expiry,
+            None,
+        )?;
+
+    // Persist AAL on the session row so refresh re-mints at the same
+    // level (challenge-response is aal1; passkey / VTA step-up
+    // elevates via `elevate_session` which records the higher value).
+    session.state = SessionState::Authenticated;
+    session.refresh_token = Some(refresh_token_digest(&refresh_token));
+    session.refresh_expires_at = Some(refresh_expires_at);
+    session.token_id = Some(token_id);
+    session.amr = vec!["did".to_string()];
+    session.acr = "aal1".to_string();
+    store_session_with_refresh(sessions, session, &refresh_token, None).await?;
+
+    Ok(TokenResponse {
+        session_id: session.session_id.clone(),
+        subject: session.did.clone(),
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+        issued_at: now_epoch(),
+        // DIDComm challenge-response: single DID-key factor.
+        amr: vec!["did".to_string()],
+        acr: "aal1".to_string(),
+    })
+}
+
+/// Create a new authenticated session, returning access + refresh tokens.
+///
+/// Reusable across DIDComm and passkey authentication flows.
+///
+/// `session_pubkey_b58btc` is the optional client-supplied ephemeral
+/// Ed25519 multikey (base58btc, `z6Mk…`) used for Data Integrity
+/// proofs on REQUIRED-spec trust-task requests. `None` for backend
+/// callers that sign with their own DID's verification methods, or
+/// when the Web UI hasn't enabled in-band signing yet.
+///
+/// `amr_acr_override` lets the refresh handler preserve an elevated
+/// session's AAL across the rotation. Initial authenticate paths
+/// pass `None` and get the defaults (`["did"]`/`"aal1"`); refresh
+/// reads the pre-rotation session's amr/acr and passes
+/// `Some((..., ...))` so the new session row + JWT carry the same
+/// values.
+// Eight cohesive parameters shared by the DIDComm and passkey auth
+// flows; grouping them into a struct would add churn at every call
+// site for no clarity gain. (clippy::too_many_arguments is default-deny
+// as of clippy 1.96.)
+#[allow(clippy::too_many_arguments)]
+pub async fn create_authenticated_session(
+    sessions: &KeyspaceHandle,
+    jwt_keys: &JwtKeys,
+    did: &str,
+    role: &Role,
+    access_expiry: u64,
+    refresh_expiry: u64,
+    session_pubkey_b58btc: Option<String>,
+    amr_acr_override: Option<(Vec<String>, String)>,
+) -> Result<TokenResponse, AppError> {
+    // A `MetricsReader` is a counters-only did:key sidecar, never an
+    // interactive principal: it must never hold a bearer session a step-up
+    // could then raise to aal2. The general task surface (`Cx::auth`) already
+    // refuses it, but every sign-in path (OOB wallet redeem, passkey login)
+    // mints its session here — so this is the single chokepoint that keeps the
+    // role off every session, whatever the sign-in route. See also
+    // `DidHostingControlAuthBackend::check_acl`, which refuses the
+    // challenge/authenticate flow before it reaches a token.
+    if matches!(role, Role::MetricsReader) {
+        return Err(AppError::Unauthorized(
+            "a metrics-reader credential cannot open an interactive session".into(),
+        ));
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+
+    let (access_token, access_expires_at, refresh_token, refresh_expires_at, token_id) =
+        generate_tokens(
+            jwt_keys,
+            did,
+            &session_id,
+            role,
+            access_expiry,
+            refresh_expiry,
+            amr_acr_override.clone(),
+        )?;
+
+    let (amr, acr) =
+        amr_acr_override.unwrap_or_else(|| (vec!["did".to_string()], "aal1".to_string()));
+    let session = Session {
+        session_id: session_id.clone(),
+        did: did.to_string(),
+        challenge: String::new(),
+        state: SessionState::Authenticated,
+        created_at: now_epoch(),
+        last_seen: now_epoch(),
+        refresh_token: Some(refresh_token_digest(&refresh_token)),
+        refresh_expires_at: Some(refresh_expires_at),
+        tee_attested: false,
+        token_id: Some(token_id),
+        session_pubkey_b58btc,
+        amr: amr.clone(),
+        acr: acr.clone(),
+        // An elevated `acr` arriving via `amr_acr_override` carries no lapse
+        // deadline: our step-up is bounded by the access token's TTL, not by
+        // vti-common's read-time downgrade in `resolve_did_session`.
+        acr_expires_at: None,
+        not_after: None,
+    };
+
+    store_session_with_refresh(sessions, &session, &refresh_token, None).await?;
+
+    Ok(TokenResponse {
+        session_id,
+        subject: did.to_string(),
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+        issued_at: now_epoch(),
+        amr,
+        acr,
+    })
+}
+
+/// Elevate an existing authenticated session to a higher assurance level,
+/// minting a fresh token with the given `amr`/`acr` and rotating the
+/// session's `token_id` so the prior (lower-`acr`) access token is
+/// invalidated. The `session_id` is preserved — this upgrades the session
+/// in place rather than creating a new one. Used by step-up.
+#[allow(clippy::too_many_arguments)]
+pub async fn elevate_session(
+    sessions: &KeyspaceHandle,
+    jwt_keys: &JwtKeys,
+    session_id: &str,
+    role: &Role,
+    amr: Vec<String>,
+    acr: &str,
+    access_expiry: u64,
+    refresh_expiry: u64,
+) -> Result<TokenResponse, AppError> {
+    let _row = lock_session(session_id).await;
+    let mut session = get_session(sessions, session_id)
+        .await?
+        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+    if session.state != SessionState::Authenticated {
+        return Err(AppError::Authentication("session not authenticated".into()));
+    }
+
+    let mut claims = JwtKeys::new_claims(
+        session.did.clone(),
+        session_id.to_string(),
+        role.to_string(),
+        access_expiry,
+    );
+    claims.amr = amr.clone();
+    claims.acr = acr.to_string();
+    let access_expires_at = claims.exp;
+    let token_id = claims.jti.clone();
+    let access_token = jwt_keys.encode(&claims)?;
+
+    let refresh_token = Uuid::new_v4().to_string();
+    let refresh_expires_at = now_epoch() + refresh_expiry;
+
+    // Persist the elevated AAL on the session row so subsequent
+    // refreshes preserve aal2 (instead of silently dropping back to
+    // the pre-step-up aal1).
+    //
+    // The elevated row, its new refresh index and the removal of the old
+    // refresh token's index are one write: the pre-elevation refresh token
+    // must stop working the moment the elevated one is issued, or it could
+    // be rotated into a parallel session.
+    let retired_refresh = session
+        .refresh_token
+        .replace(refresh_token_digest(&refresh_token));
+    session.token_id = Some(token_id);
+    session.refresh_expires_at = Some(refresh_expires_at);
+    session.amr = amr.clone();
+    session.acr = acr.to_string();
+    store_session_with_refresh(
+        sessions,
+        &session,
+        &refresh_token,
+        retired_refresh.as_deref(),
+    )
+    .await?;
+
+    Ok(TokenResponse {
+        session_id: session_id.to_string(),
+        subject: session.did.clone(),
+        access_token,
+        access_expires_at,
+        refresh_token,
+        refresh_expires_at,
+        issued_at: now_epoch(),
+        amr,
+        acr: acr.to_string(),
+    })
+}
+
+/// Guards the invariant that [`cleanup_expired_sessions`] silently depends on:
+/// **every session did-hosting creates carries a refresh token.**
+///
+/// The sweeper bounds an `Authenticated` session by `refresh_expires_at`, and
+/// treats `None` as *already expired* — so a refresh-less session is deleted on
+/// the very next pass, seconds after it is written.
+///
+/// That is harmless today because nothing here creates one. But vti-common has
+/// a second session shape — DID-keyed (`session_id == did`), no refresh token,
+/// reaped on an idle TTL via `Session::last_seen` — minted by its
+/// `resolve_did_session`. did-hosting does not use it: our DIDComm/TSP callers
+/// hold no session at all (trust-task handlers authorise per-message off the
+/// envelope's sender DID via the ACL), and the one DIDComm path that *does*
+/// authenticate hands back a normal token pair.
+///
+/// If someone later adopts `resolve_did_session` — say to give TSP callers
+/// step-up/AAL state — those sessions will be eaten by the sweeper the moment
+/// they are written, which is a baffling bug to debug from the symptom. These
+/// tests fail first, and point here.
+#[cfg(all(test, feature = "store-fjall"))]
+mod refresh_token_invariant {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::store::{KS_SESSIONS, Store};
+    use std::path::PathBuf;
+
+    async fn make_ks() -> (KeyspaceHandle, JwtKeys, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let ks = store.keyspace(KS_SESSIONS).unwrap();
+        let keys = JwtKeys::from_ed25519_bytes(&[11u8; 32]).unwrap();
+        (ks, keys, dir)
+    }
+
+    /// A `MetricsReader` is a counters-only sidecar credential and must never
+    /// obtain an interactive session, whatever sign-in path mints it — every
+    /// one funnels through here. The call is refused and nothing is stored.
+    #[tokio::test]
+    async fn metrics_reader_cannot_open_a_session() {
+        let (ks, keys, _dir) = make_ks().await;
+        let err = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:key:z6MkMetricsReader",
+            &Role::MetricsReader,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a MetricsReader must not get a session");
+        assert!(matches!(err, AppError::Unauthorized(_)), "got {err:?}");
+    }
+
+    /// Activity advances the clock the idle timeout is measured against.
+    #[tokio::test]
+    async fn touching_a_session_advances_last_seen() {
+        let (ks, keys, _dir) = make_ks().await;
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:active",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let mut stored = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Backdate so the granularity throttle does not swallow the write.
+        stored.last_seen = now_epoch() - (LAST_SEEN_GRANULARITY_SECS + 10);
+        store_session(&ks, &stored).await.unwrap();
+        let before = stored.last_seen;
+
+        let wrote = touch_last_seen(&ks, &stored, now_epoch()).await.unwrap();
+        assert!(wrote, "a stale row must be written");
+
+        let after = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.last_seen > before);
+    }
+
+    /// …but not on every request. The idle timeout is measured in minutes,
+    /// so a write per call would buy precision nobody reads.
+    #[tokio::test]
+    async fn touching_a_fresh_session_writes_nothing() {
+        let (ks, keys, _dir) = make_ks().await;
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:busy",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let stored = get_session(&ks, &created.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let wrote = touch_last_seen(&ks, &stored, now_epoch()).await.unwrap();
+        assert!(
+            !wrote,
+            "a row touched within the granularity window must not be rewritten"
+        );
+    }
+
+    /// Both production creators must leave a refresh token on the row.
+    #[tokio::test]
+    async fn sessions_we_create_carry_a_refresh_token() {
+        let (ks, keys, _dir) = make_ks().await;
+
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:alice",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let stored = get_session(&ks, &created.session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert!(
+            stored.refresh_token.is_some() && stored.refresh_expires_at.is_some(),
+            "create_authenticated_session must leave a refresh token: cleanup_expired_sessions \
+             reaps refresh-less Authenticated sessions on the next pass"
+        );
+
+        // Step-up rotates the tokens; it must not drop the refresh token either.
+        elevate_session(
+            &ks,
+            &keys,
+            &created.session_id,
+            &Role::Owner,
+            vec!["did".to_string(), "passkey".to_string()],
+            "aal2",
+            60,
+            900,
+        )
+        .await
+        .expect("elevate");
+
+        let elevated = get_session(&ks, &created.session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert!(
+            elevated.refresh_token.is_some() && elevated.refresh_expires_at.is_some(),
+            "elevate_session must leave a refresh token on the row"
+        );
+    }
+
+    /// Pins *why* the invariant matters: this is the fate of a refresh-less
+    /// session under our sweeper. If you are here because you adopted
+    /// vti-common's intrinsic (DID-keyed, refresh-less) sessions, this branch
+    /// of `cleanup_expired_sessions` is what you must teach about
+    /// `Session::last_seen` and an idle TTL first.
+    #[tokio::test]
+    async fn sweeper_reaps_a_refreshless_authenticated_session_immediately() {
+        let (ks, _keys, _dir) = make_ks().await;
+
+        let intrinsic = Session {
+            session_id: "did:example:tsp-caller".to_string(),
+            did: "did:example:tsp-caller".to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now_epoch(),
+            last_seen: now_epoch(),
+            refresh_token: None,
+            refresh_expires_at: None,
+            tee_attested: false,
+            token_id: None,
+            session_pubkey_b58btc: None,
+            amr: vec!["did".to_string()],
+            acr: "aal1".to_string(),
+            acr_expires_at: None,
+            not_after: None,
+        };
+        store_session(&ks, &intrinsic).await.expect("store");
+
+        cleanup_expired_sessions(&ks, 300).await.expect("sweep");
+
+        assert!(
+            get_session(&ks, &intrinsic.session_id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a refresh-less Authenticated session is reaped on the next sweep, however recently \
+             it was seen — teach cleanup_expired_sessions about last_seen before creating one"
+        );
+    }
+}
+
+/// #191: `demote_non_passkey_step_up_sessions` walks the `session-did:`
+/// index rather than the whole `session:` table, and that index stays in
+/// lockstep with every writer/remover of a session row.
+#[cfg(all(test, feature = "store-fjall"))]
+mod demotion_index_tests {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::store::{KS_SESSIONS, Store};
+    use std::path::PathBuf;
+
+    async fn make_ks() -> (KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        let ks = store.keyspace(KS_SESSIONS).unwrap();
+        (ks, dir)
+    }
+
+    fn session(did: &str, session_id: &str, acr: &str, amr: Vec<String>) -> Session {
+        Session {
+            session_id: session_id.to_string(),
+            did: did.to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now_epoch(),
+            last_seen: now_epoch(),
+            refresh_token: None,
+            refresh_expires_at: Some(now_epoch() + 3600),
+            tee_attested: false,
+            token_id: None,
+            session_pubkey_b58btc: None,
+            amr,
+            acr: acr.to_string(),
+            acr_expires_at: None,
+            not_after: None,
+        }
+    }
+
+    /// Demotion touches only the subject's own sessions — reached via the
+    /// `session-did:{subject}:` index — never another subject's, and never
+    /// one of the subject's own sessions that already carries a passkey
+    /// factor.
+    #[tokio::test]
+    async fn demotion_touches_only_the_subjects_own_sessions_via_the_index() {
+        let (ks, _dir) = make_ks().await;
+
+        let alice_elevated = session("did:example:alice", "s-alice-1", "aal2", vec!["did".into()]);
+        let alice_passkey = session(
+            "did:example:alice",
+            "s-alice-2",
+            "aal2",
+            vec!["did".into(), "passkey".into()],
+        );
+        let bob_elevated = session("did:example:bob", "s-bob-1", "aal2", vec!["did".into()]);
+        for s in [&alice_elevated, &alice_passkey, &bob_elevated] {
+            store_session(&ks, s).await.unwrap();
+        }
+
+        let demoted = demote_non_passkey_step_up_sessions(&ks, "did:example:alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            demoted, 1,
+            "only alice's non-passkey aal2 session is demoted"
+        );
+
+        let alice1 = get_session(&ks, "s-alice-1").await.unwrap().unwrap();
+        assert_eq!(alice1.acr, "aal1");
+
+        let alice2 = get_session(&ks, "s-alice-2").await.unwrap().unwrap();
+        assert_eq!(alice2.acr, "aal2", "a passkey-factor session is left alone");
+
+        let bob1 = get_session(&ks, "s-bob-1").await.unwrap().unwrap();
+        assert_eq!(
+            bob1.acr, "aal2",
+            "another subject's session is never touched"
+        );
+    }
+
+    /// `take_session` is a claim: the first caller gets the row (and its
+    /// did-index entry goes with it); every later one gets `None`.
+    /// A request loads its session, a refresh rotation then claims (removes)
+    /// the row, and the request's activity touch runs last. The touch must
+    /// not write the request's copy back — that would resurrect a session
+    /// the rotation retired.
+    #[tokio::test]
+    async fn touch_never_resurrects_a_rotated_session() {
+        let (ks, _dir) = make_ks().await;
+        let s = session("did:example:frank", "s-frank-1", "aal1", vec!["did".into()]);
+        store_session(&ks, &s).await.unwrap();
+
+        let loaded = get_session(&ks, &s.session_id).await.unwrap().unwrap();
+        take_session(&ks, &s.session_id).await.unwrap().unwrap();
+
+        let touched = touch_last_seen(&ks, &loaded, loaded.last_seen + 3600)
+            .await
+            .unwrap();
+        assert!(!touched);
+        assert!(
+            get_session(&ks, &s.session_id).await.unwrap().is_none(),
+            "a rotated-away session came back"
+        );
+        assert!(
+            !ks.contains_key(session_did_key(&s.did, &s.session_id))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A request loads an elevated session, a passkey enrolment then demotes
+    /// it, and the request's touch runs last. The demotion must stand; only
+    /// `last_seen` moves.
+    #[tokio::test]
+    async fn touch_never_undoes_a_demotion() {
+        let (ks, _dir) = make_ks().await;
+        let s = session("did:example:gina", "s-gina-1", "aal2", vec!["did".into()]);
+        store_session(&ks, &s).await.unwrap();
+
+        let loaded = get_session(&ks, &s.session_id).await.unwrap().unwrap();
+        assert_eq!(
+            demote_non_passkey_step_up_sessions(&ks, &s.did)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let later = loaded.last_seen + 3600;
+        assert!(touch_last_seen(&ks, &loaded, later).await.unwrap());
+        let row = get_session(&ks, &s.session_id).await.unwrap().unwrap();
+        assert_eq!(row.acr, "aal1", "the touch reverted the demotion");
+        assert_eq!(row.last_seen, later);
+    }
+
+    /// Step-up rotates the refresh token, and the pre-elevation token's index
+    /// goes in the same write: it must not stay redeemable alongside the new
+    /// one.
+    #[tokio::test]
+    async fn elevation_retires_the_previous_refresh_index() {
+        let (ks, _dir) = make_ks().await;
+        let keys = JwtKeys::from_ed25519_bytes(&[12u8; 32]).unwrap();
+        let created = create_authenticated_session(
+            &ks,
+            &keys,
+            "did:example:hank",
+            &Role::Owner,
+            60,
+            900,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let elevated = elevate_session(
+            &ks,
+            &keys,
+            &created.session_id,
+            &Role::Owner,
+            vec!["did".into(), "passkey".into()],
+            "aal2",
+            60,
+            900,
+        )
+        .await
+        .unwrap();
+        assert!(
+            get_session_by_refresh(&ks, &created.refresh_token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the pre-elevation refresh token still maps to the session"
+        );
+        assert_eq!(
+            get_session_by_refresh(&ks, &elevated.refresh_token)
+                .await
+                .unwrap(),
+            Some(created.session_id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn take_session_claims_the_row_exactly_once() {
+        let (ks, _dir) = make_ks().await;
+
+        let s = session("did:example:erin", "s-erin-1", "aal1", vec!["did".into()]);
+        store_session(&ks, &s).await.unwrap();
+
+        let taken = take_session(&ks, &s.session_id).await.unwrap();
+        assert_eq!(taken.map(|t| t.session_id), Some(s.session_id.clone()));
+        assert!(get_session(&ks, &s.session_id).await.unwrap().is_none());
+        assert!(
+            !ks.contains_key(session_did_key(&s.did, &s.session_id))
+                .await
+                .unwrap(),
+            "take_session must remove the did-index entry too"
+        );
+        assert!(take_session(&ks, &s.session_id).await.unwrap().is_none());
+    }
+
+    /// The `session-did:` index entry is removed exactly when the session
+    /// row it points to is — on delete, and on the expiry sweep — so it
+    /// never grows stale pointers to sessions that no longer exist.
+    #[tokio::test]
+    async fn the_did_index_is_removed_on_delete_and_on_cleanup() {
+        let (ks, _dir) = make_ks().await;
+
+        let deleted = session("did:example:carol", "s-carol-1", "aal1", vec!["did".into()]);
+        store_session(&ks, &deleted).await.unwrap();
+        assert!(
+            ks.contains_key(session_did_key(&deleted.did, &deleted.session_id))
+                .await
+                .unwrap(),
+            "store_session must write the index"
+        );
+        delete_session(&ks, &deleted.session_id).await.unwrap();
+        assert!(
+            !ks.contains_key(session_did_key(&deleted.did, &deleted.session_id))
+                .await
+                .unwrap(),
+            "delete_session must remove the did-index entry too"
+        );
+
+        let mut expired = session("did:example:dana", "s-dana-1", "aal1", vec!["did".into()]);
+        expired.refresh_expires_at = Some(0); // already in the past
+        store_session(&ks, &expired).await.unwrap();
+        assert!(
+            ks.contains_key(session_did_key(&expired.did, &expired.session_id))
+                .await
+                .unwrap()
+        );
+        cleanup_expired_sessions(&ks, 300).await.unwrap();
+        assert!(
+            !ks.contains_key(session_did_key(&expired.did, &expired.session_id))
+                .await
+                .unwrap(),
+            "cleanup_expired_sessions must remove the did-index entry too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_key_tests {
+    use super::is_ed25519_multikey;
+
+    fn multikey(prefix: [u8; 2], key_len: usize) -> String {
+        let mut bytes = prefix.to_vec();
+        bytes.extend(std::iter::repeat_n(7u8, key_len));
+        multibase::encode(multibase::Base::Base58Btc, bytes)
+    }
+
+    #[test]
+    fn an_ed25519_multikey_is_accepted() {
+        let pk = multikey([0xed, 0x01], 32);
+        assert!(pk.starts_with("z6Mk"));
+        assert!(is_ed25519_multikey(&pk));
+    }
+
+    /// Every one of these passed the `starts_with("z6Mk")` check it replaces.
+    #[test]
+    fn a_value_that_only_looks_like_one_is_refused() {
+        let pk = multikey([0xed, 0x01], 32);
+        let truncated = &pk[..pk.len() - 4];
+        let over_long = format!("{pk}zz");
+        let not_base58 = format!("z6Mk{}", "0OIl".repeat(10));
+        for bad in [truncated, over_long.as_str(), not_base58.as_str(), "z6Mk"] {
+            assert!(bad.starts_with("z6Mk"), "{bad}");
+            assert!(!is_ed25519_multikey(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn another_curve_or_encoding_is_refused() {
+        // secp256k1 (0xe7 0x01), and an Ed25519 key in base64 rather than base58btc.
+        assert!(!is_ed25519_multikey(&multikey([0xe7, 0x01], 33)));
+        let mut ed = vec![0xed, 0x01];
+        ed.extend([7u8; 32]);
+        assert!(!is_ed25519_multikey(&multibase::encode(
+            multibase::Base::Base64,
+            ed
+        )));
+    }
+
+    #[test]
+    fn non_ascii_input_is_refused_not_a_panic() {
+        assert!(!is_ed25519_multikey("z6Mk\u{00e9}\u{1f600}"));
+        assert!(!is_ed25519_multikey(""));
+    }
+}
+
+/// `settle_subject_sessions` and `settle_after_refresh`: a settlement reaches
+/// every reference to the subject, and a refresh in flight across it does not
+/// undo it.
+#[cfg(all(test, feature = "store-fjall"))]
+mod settlement_tests {
+    use super::*;
+    use crate::server::config::StoreConfig;
+    use crate::server::store::{KS_SESSIONS, Store};
+    use std::path::PathBuf;
+
+    async fn make_ks() -> (KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap();
+        (store.keyspace(KS_SESSIONS).unwrap(), dir)
+    }
+
+    fn session(did: &str, session_id: &str, refresh: &str, amr: &[&str], acr: &str) -> Session {
+        Session {
+            session_id: session_id.to_string(),
+            did: did.to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now_epoch(),
+            last_seen: now_epoch(),
+            refresh_token: Some(refresh.to_string()),
+            refresh_expires_at: Some(now_epoch() + 3600),
+            tee_attested: false,
+            token_id: Some("jti-1".into()),
+            session_pubkey_b58btc: None,
+            amr: amr.iter().map(|m| m.to_string()).collect(),
+            acr: acr.to_string(),
+            acr_expires_at: None,
+            not_after: None,
+        }
+    }
+
+    /// A session recorded under a `did:scid` with its `src` locator is found
+    /// when the subject is named without it, and the reverse; a DID that only
+    /// shares a prefix is not.
+    #[tokio::test]
+    async fn a_settlement_reaches_every_reference_to_the_subject() {
+        let (ks, _dir) = make_ks().await;
+        let bare = "did:scid:vh:1:QmSubject";
+        let located = "did:scid:vh:1:QmSubject?src=hosting.example";
+        let other = "did:scid:vh:1:QmSubjectOther";
+        let with_src = session(located, "s-located", "r-located", &["did"], "aal1");
+        let without = session(bare, "s-bare", "r-bare", &["did"], "aal1");
+        let unrelated = session(other, "s-other", "r-other", &["did"], "aal1");
+        for s in [&with_src, &without, &unrelated] {
+            store_session_with_refresh(&ks, s, s.refresh_token.as_deref().unwrap(), None)
+                .await
+                .unwrap();
+        }
+
+        let settled = settle_subject_sessions(&ks, bare, |_| SessionFate::End)
+            .await
+            .unwrap();
+        let mut ended = settled.ended.clone();
+        ended.sort();
+        assert_eq!(ended, vec!["s-bare".to_string(), "s-located".to_string()]);
+        assert!(get_session(&ks, "s-located").await.unwrap().is_none());
+        assert!(
+            get_session_by_refresh(&ks, "r-located")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(get_session(&ks, "s-other").await.unwrap().is_some());
+
+        let again = session(located, "s-located-2", "r-2", &["did"], "aal1");
+        store_session_with_refresh(&ks, &again, "r-2", None)
+            .await
+            .unwrap();
+        let settled = settle_subject_sessions(&ks, located, |_| SessionFate::End)
+            .await
+            .unwrap();
+        assert_eq!(settled.ended, vec!["s-located-2".to_string()]);
+    }
+
+    /// A refresh that read the row before a settlement and wrote its rotation
+    /// after: the rotation is ended (or demoted) again, its new refresh token
+    /// with it.
+    #[tokio::test]
+    async fn a_refresh_in_flight_does_not_undo_a_settlement() {
+        let (ks, _dir) = make_ks().await;
+        for (fate, id) in [
+            (SessionFate::End, "s-end"),
+            (SessionFate::Demote, "s-demote"),
+        ] {
+            let old = session(
+                "did:example:alice",
+                id,
+                &format!("{id}-r1"),
+                &["did", "passkey"],
+                "aal2",
+            );
+            store_session_with_refresh(&ks, &old, &format!("{id}-r1"), None)
+                .await
+                .unwrap();
+
+            // The refresh redeems r1 and reads the row.
+            take_session_id_by_refresh(&ks, &format!("{id}-r1"))
+                .await
+                .unwrap()
+                .unwrap();
+            let read = get_session(&ks, id).await.unwrap().unwrap();
+
+            // The settlement lands.
+            settle_subject_sessions(&ks, "did:example:alice", |s| {
+                if s.session_id == id {
+                    fate
+                } else {
+                    SessionFate::Keep
+                }
+            })
+            .await
+            .unwrap();
+
+            // The refresh writes its rotation from what it read.
+            let mut rotated = read.clone();
+            rotated.refresh_token = Some(format!("{id}-r2"));
+            rotated.token_id = Some("jti-2".into());
+            store_session_with_refresh(&ks, &rotated, &format!("{id}-r2"), None)
+                .await
+                .unwrap();
+            assert!(get_session(&ks, id).await.unwrap().is_some());
+
+            let applied =
+                settle_after_refresh(&ks, &format!("{id}-r1"), id, &format!("{id}-r2"), "jti-2")
+                    .await
+                    .unwrap();
+            assert_eq!(applied, Some(fate));
+            match fate {
+                SessionFate::End => {
+                    assert!(get_session(&ks, id).await.unwrap().is_none());
+                    assert!(
+                        get_session_by_refresh(&ks, &format!("{id}-r2"))
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                _ => {
+                    let row = get_session(&ks, id).await.unwrap().unwrap();
+                    assert_eq!(row.acr, "aal1");
+                    assert_eq!(row.amr, vec!["did".to_string()]);
+                }
+            }
+            // A later refresh of an unsettled session finds no marker.
+            assert_eq!(
+                settle_after_refresh(&ks, "never-settled", id, "r", "j")
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    /// A row that moved on after the refresh wrote it (here a step-up that
+    /// elevated it again) is not demoted by that refresh's settle.
+    #[tokio::test]
+    async fn a_step_up_after_a_settled_refresh_is_kept() {
+        let (ks, _dir) = make_ks().await;
+        let id = "s-step-up";
+        let old = session("did:example:alice", id, "r1", &["did", "passkey"], "aal2");
+        store_session_with_refresh(&ks, &old, "r1", None)
+            .await
+            .unwrap();
+        take_session_id_by_refresh(&ks, "r1")
+            .await
+            .unwrap()
+            .unwrap();
+        let read = get_session(&ks, id).await.unwrap().unwrap();
+        settle_subject_sessions(&ks, "did:example:alice", |_| SessionFate::Demote)
+            .await
+            .unwrap();
+        let mut rotated = read.clone();
+        rotated.refresh_token = Some("r2".into());
+        rotated.token_id = Some("jti-2".into());
+        store_session_with_refresh(&ks, &rotated, "r2", None)
+            .await
+            .unwrap();
+        // A step-up lands before the refresh's settle: a new token id.
+        let mut stepped = rotated.clone();
+        stepped.token_id = Some("jti-3".into());
+        stepped.amr = vec!["did".into(), "passkey".into()];
+        stepped.acr = "aal2".into();
+        store_session(&ks, &stepped).await.unwrap();
+
+        let applied = settle_after_refresh(&ks, "r1", id, "r2", "jti-2")
+            .await
+            .unwrap();
+        assert_eq!(applied, None);
+        let row = get_session(&ks, id).await.unwrap().unwrap();
+        assert_eq!(row.acr, "aal2", "the step-up was undone");
+        // No fresh marker was left for the rotated token.
+        assert!(
+            ks.get_raw(settled_marker_key("r2"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Neither the session row nor any key holds a refresh token as issued;
+    /// the token still finds its session, and the stored digest does not.
+    #[tokio::test]
+    async fn the_store_keeps_refresh_tokens_as_digests() {
+        let (ks, _dir) = make_ks().await;
+        let token = Uuid::new_v4().to_string();
+        let row = session("did:example:alice", "s-digest", &token, &["did"], "aal1");
+        store_session_with_refresh(&ks, &row, &token, None)
+            .await
+            .unwrap();
+
+        for (key, value) in ks.prefix_iter_raw("").await.unwrap() {
+            let key = String::from_utf8_lossy(&key);
+            let value = String::from_utf8_lossy(&value);
+            assert!(!key.contains(&token), "token in key {key}");
+            assert!(!value.contains(&token), "token in the value of {key}");
+        }
+        let stored = get_session(&ks, "s-digest")
+            .await
+            .unwrap()
+            .unwrap()
+            .refresh_token
+            .unwrap();
+        assert_eq!(stored, refresh_token_digest(&token));
+        assert_eq!(
+            refresh_hash_of_stored(&stored),
+            ::vti_common::auth::session::refresh_token_hash(&token)
+        );
+
+        assert!(
+            get_session_by_refresh(&ks, &stored)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            take_session_id_by_refresh(&ks, &stored)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            take_session_id_by_refresh(&ks, &token)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s-digest")
+        );
+    }
+
+    /// A session an earlier release stored, with the token itself in the row
+    /// and the index key, still refreshes, and its index goes with the row.
+    #[tokio::test]
+    async fn a_token_stored_by_an_earlier_release_still_redeems() {
+        let (ks, _dir) = make_ks().await;
+        let token = Uuid::new_v4().to_string();
+        let row = session("did:example:alice", "s-legacy", &token, &["did"], "aal1");
+        ks.insert(session_key("s-legacy"), &row).await.unwrap();
+        ks.insert_raw(format!("refresh:{token}"), b"s-legacy".to_vec())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_session_by_refresh(&ks, &token)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s-legacy")
+        );
+        assert_eq!(
+            refresh_hash_of_stored(&token),
+            ::vti_common::auth::session::refresh_token_hash(&token)
+        );
+        // The sweep keeps it: the row still issues that token.
+        cleanup_expired_sessions(&ks, 300).await.unwrap();
+        assert!(get_session_by_refresh(&ks, &token).await.unwrap().is_some());
+
+        delete_session(&ks, "s-legacy").await.unwrap();
+        assert!(get_session_by_refresh(&ks, &token).await.unwrap().is_none());
+    }
+
+    /// The sweep removes index entries no session issues: one whose session
+    /// has gone, and one a later sign-in replaced. The current one stays.
+    #[tokio::test]
+    async fn the_sweep_removes_refresh_entries_no_session_issues() {
+        let (ks, _dir) = make_ks().await;
+        let row = session("did:example:alice", "s-live", "r-current", &["did"], "aal1");
+        store_session_with_refresh(&ks, &row, "r-current", None)
+            .await
+            .unwrap();
+        store_refresh_index(&ks, "r-replaced", "s-live")
+            .await
+            .unwrap();
+        store_refresh_index(&ks, "r-orphan", "s-gone")
+            .await
+            .unwrap();
+
+        cleanup_expired_sessions(&ks, 300).await.unwrap();
+
+        assert_eq!(
+            get_session_by_refresh(&ks, "r-current")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s-live")
+        );
+        assert!(
+            get_session_by_refresh(&ks, "r-replaced")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_session_by_refresh(&ks, "r-orphan")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}

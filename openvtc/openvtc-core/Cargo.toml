@@ -1,0 +1,161 @@
+[package]
+name = "openvtc-core"
+description = "Core library for OpenVTC (Open Verifiable Trust Communities): configuration, DID personas, VTA client, DIDComm/TSP messaging and verifiable credentials"
+documentation = "https://docs.rs/openvtc-core"
+keywords = ["did", "credentials", "didcomm", "trust", "identity"]
+categories = ["cryptography", "authentication"]
+version = "0.8.0"
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+license.workspace = true
+repository = "https://github.com/OpenVTC/openvtc"
+
+[features]
+# Hardware OpenPGP-card key storage is off in the research build: it needs
+# PC/SC (pcscd) and nothing in the vetting flows uses it.
+default = []
+openpgp-card = [
+  "dep:openpgp-card",
+  "dep:card-backend-pcsc",
+  "dep:openpgp-card-rpgp",
+  "dep:pgp",
+  "dep:byteorder",
+]
+# Derives `Arbitrary` on the pure parse-surface config/message/credential
+# types so the cargo-fuzz harnesses can do structure-aware fuzzing
+# (issue #124). Off by default; nightly fuzz builds opt in. Pulls chrono's
+# own `arbitrary` feature for the `LogMessage` timestamp.
+arbitrary = ["dep:arbitrary", "chrono/arbitrary"]
+# Test-only hooks other crates' tests need (e.g. inbound `VerifyJob`s that
+# hang or panic, for the CLI's verify-queue tests). Never enabled by a
+# release build; the CLI turns it on from `[dev-dependencies]` only.
+test-support = []
+
+[dependencies]
+# The commit signer the Repos panel sets up for a persona (`git_signing`): its
+# library writes the keyring entry, profile and include file exactly as
+# `did-git-sign init --profile` does. Version rule: see the root manifest.
+# The SSHSIG encoding did-git-sign signs with, to check the VTA's proof
+# signature (`git_signing::verify_signer`). Same release as did-git-sign.
+
+aes-gcm.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+arbitrary = { workspace = true, optional = true }
+argon2.workspace = true
+affinidi-tdk.workspace = true
+affinidi-data-integrity.workspace = true
+affinidi-status-list.workspace = true
+affinidi-did-resolver-cache-sdk.workspace = true
+# `health` probes mediator transport URLs over HTTP: resolving a DID proves the
+# document is fetchable, not that the transport host behind it answers, and the
+# two fail independently.
+reqwest = { workspace = true }
+# Those transport URLs come from DID documents anyone can publish, so the probe
+# client installs the resolver's own DNS guard rather than dialling them as-is.
+affinidi-did-web.workspace = true
+# `blocked_in_chain`, so `health` can tell that guard's refusal apart from a host
+# that simply did not answer — by type, rather than by the sentence it renders.
+affinidi-net-guard.workspace = true
+# `CancellationToken`, for `start_service`'s shutdown hook.
+tokio-util = { workspace = true }
+# The delivery layer (see the root manifest).
+affinidi-messaging-delivery = { workspace = true }
+affinidi-messaging-core = { workspace = true }
+affinidi-messaging-sdk = { workspace = true }
+futures-util = { workspace = true }
+agent-names.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+didwebvh-rs.workspace = true
+dtg-credentials.workspace = true
+ed25519-dalek-bip32.workspace = true
+hkdf.workspace = true
+hex.workspace = true
+keyring-core.workspace = true
+multibase.workspace = true
+# rand 0.8: the client's key generation is written against it (the workspace pins 0.10).
+rand = "0.8"
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+trust-tasks-rs.workspace = true
+trust-tasks-capability-client.workspace = true
+url.workspace = true
+uuid.workspace = true
+vta-sdk.workspace = true
+zeroize.workspace = true
+
+# OpenPGP card support (the default `openpgp-card` feature).
+openpgp-card = { workspace = true, optional = true }
+card-backend-pcsc = { workspace = true, optional = true }
+openpgp-card-rpgp = { workspace = true, optional = true }
+pgp = { version = "0.20", optional = true }
+byteorder = { workspace = true, optional = true }
+
+[build-dependencies]
+trust-tasks-build.workspace = true
+
+[dev-dependencies]
+# Mnemonic fixtures in the BIP32 tests.
+bip39.workspace = true
+# Scratch directories for the git-workspace tests (a real clone, read back).
+tempfile = "3"
+criterion = { version = "0.8", features = ["html_reports"] }
+# In-process mediator for integration tests (in-memory backend: no Redis, no
+# on-disk fixtures). Tests that spawn it are `#[ignore]`; run them with
+# `cargo test -- --ignored`. Must be the line built on the root manifest's
+# `affinidi-tdk` / `affinidi-messaging-sdk` / `trust-tasks-rs`, or the dev graph
+# holds a second copy of each.
+affinidi-messaging-test-mediator = { workspace = true }
+# In-process `MockVta` for the e2e tests. Must be the family built on the root
+# manifest's `vta-sdk` line: an older one pulls a second sdk into the dev graph
+# and the generated wire types the tests assert on stop unifying. Check:
+# `cargo tree -i vti-common` and `-i vta-sdk` (one node each).
+vta-service = { path = "../../vti/vta-service", default-features = false, features = ["test-support", "rest", "didcomm", "transport-harness"] }
+# The community's half of hidden vetting, in process (`vtc::Vtc`, feature
+# `harness`), for `tests/hidden_vetting_onboarding.rs`. The PCS engine is the
+# VTA's; this client holds no PCS key. Same `vta-sdk` line as `vta-service`.
+vti-vetting-pcs = { path = "../../vti/vti-vetting-pcs", features = ["harness"] }
+# The registrar and ballot box of an election, in process, for
+# `tests/elections_vote_e2e.rs`. The line `vta-service` itself runs.
+vti-voting = { path = "../../vti/vti-voting" }
+base64 = { workspace = true }
+ed25519-dalek-bip32 = { workspace = true }
+secrecy = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+# `net`: the loopback listener in the `health` tests. `test-util`: the paused
+# clock for the VTA retry back-off tests.
+tokio = { workspace = true, features = ["net", "test-util"] }
+# Mock HTTP server for the agent-name resolve→verify e2e: it serves the
+# `/@name` → 302 → DID redirect the `HttpRedirectResolver` follows, so the whole
+# chain is exercised without a live host.
+wiremock = "0.6"
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[[bench]]
+name = "crypto"
+harness = false
+
+# The vta-service dev-dependency drags webauthn-rs -> openssl-sys into every
+# `cargo test` build. Hosted Windows runners ship no MSVC-linkable OpenSSL,
+# so build the vendored copy there; feature unification applies it to the
+# whole graph. Linux/macOS keep linking the system library.
+[target.'cfg(windows)'.dev-dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+pub mod acl;
+pub mod agent_names;
+/// Declarative approval requirements — which tasks need re-authentication or
+/// consent, and who may approve.
+pub mod approvals;
+pub mod audit;
+pub mod boards;
+pub mod collection;
+pub mod config;
+pub mod contexts;
+pub mod cred_vault;
+pub mod credentials;
+pub mod device;
+pub mod did_templates;
+pub mod dids;
+pub mod elections;
+pub mod elections_trustee;
+pub mod external;
+pub mod keys;
+pub mod memory;
+pub mod memory_history;
+pub mod notifications;
+/// Raw Rego policy management over the canonical `policy/*` family.
+pub mod persona;
+pub mod policy;
+pub mod rooms;
+/// The room's credentials (`rooms owner …`) and the joiner's key holder (`rooms keys …`).
+pub mod rooms_custody;
+pub mod services;
+pub mod vault;
+pub mod webs;
+pub mod webvh;
+pub mod webvh_edit;
+// #2588: every read handler answers in JSON.
+#[cfg(test)]
+mod json_census;

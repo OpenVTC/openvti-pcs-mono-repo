@@ -1,0 +1,6446 @@
+//! Fjall-backed [`MediatorStore`] implementation.
+//!
+//! Single-process embedded LSM-tree backend. Targets self-hosted
+//! mediator deployments that don't want to operate Redis. Cross-process
+//! pub/sub and consumer-group ownership are **not** supported — the
+//! implementation panics or returns errors when called in
+//! configurations that require multiple mediator instances sharing
+//! storage.
+//!
+//! # Keyspace layout
+//!
+//! Fjall 3.x renamed "partition" to "keyspace"; the `PARTITION_*`
+//! constants below keep the older name for continuity with the on-disk
+//! layout, which is unchanged. Each keyspace carries its own memtable,
+//! so the count here is also the process's memtable count.
+//!
+//! Keys are byte strings. `‖` is concatenation with **no** separator, which
+//! is sound only because DID hashes are fixed-length (see the store module's
+//! "Keys and DID hashes"); `0xFF` and `0x00` are literal separator bytes, and
+//! `be16` is a stream id as two big-endian `u64`s (`ms`, `seq`).
+//!
+//! - `messages`           — `msg_id ‖ ":" ‖ to_did_hash` → the stored record
+//!   (body and metadata: `bytes`, peer DID hashes, timestamp, expiry,
+//!   delivery state), one row per recipient of a body; there is no separate
+//!   metadata keyspace. A row keyed by the bare `msg_id` was written before
+//!   rows were per recipient and is still read for its recipient (see
+//!   `record_key`).
+//! - `inbox`, `outbox`    — `did_hash ‖ be16` → stream entry
+//! - `expiry`             — `expires_at (be u64) ‖ messages key` → empty
+//! - `sessions`           — `session_id` → JSON-serialised [`Session`]
+//! - `accounts`           — `did_hash` → JSON-serialised account record.
+//!   Carries the ACL bitmask inline, so there is no separate ACL keyspace.
+//! - `access_lists`       — `did_hash ‖ member_did_hash` → empty
+//! - `admins`             — `did_hash` → empty; membership of the admin set
+//! - `v1_routing_keys`    — base58 verkey → the bound DID
+//! - `mux_records`        — member `did_hash` → JSON mux grant record
+//! - `mux_principals`     — `principal_hash 0xFF member_did_hash` → empty
+//! - `oob_invites`        — `oob_id` → JSON `{ invite_b64, did_hash,
+//!   expires_at }`
+//! - `trust_task_claims`  — claim key → JSON `{ digest, retain_until }`; the
+//!   Trust Task duplicate-execution record, swept once `retain_until` passes
+//! - `scid_sources`       — did:scid account hash → the resolver's serialised
+//!   source record (sources and latest verified log version, VTI-KEY-162)
+//! - `forward_queue`      — `be16` → JSON-serialised [`ForwardQueueEntry`]
+//! - `forward_pending`    — `group 0x00 be16` → claim metadata
+//! - `peer_queue`         — `from_hash 0xFF to_hash` → `u32` messages queued
+//!   for that one recipient
+//! - `outbox_receipts`    — `from_hash 0xFF msg_id ":" to_hash` → why that
+//!   copy left the queue; also `"ACK\0" to_hash 0xFF msg_id` → until when an
+//!   acknowledgement is remembered
+//! - `outbox_receipt_expiry` — `expires_at (be u64) ‖ receipt key` → empty
+//! - `globals`            — counters (`i64` little-endian) and, by prefix,
+//!   `STATS:{did_hash}` (account counters), `ACTIVITY:{R|A}:{did_hash}`,
+//!   `FWD_LAST:{group}` (a consumer group's read cursor) and
+//!   `CONFIG_OVERRIDES`
+//! - `audit_log`          — `be16` → JSON-serialised [`AuditLogEntry`];
+//!   ascending by insertion (oldest-first), bounded ring
+//!
+//! That is 21 keyspaces. A data directory from before the streaming registry
+//! moved to memory also has `streaming_clients`, dropped at open.
+//!
+//! # In-process state
+//!
+//! Live-streaming pub/sub uses a per-mediator-UUID
+//! [`broadcast::channel`] with no Fjall-side persistence — subscribers
+//! disconnect on mediator restart. The streaming registrations
+//! (`streaming_set_state`) are likewise held in memory: they describe this
+//! process's sockets, which do not outlive it, so writing them to disk on
+//! every register and deregister bought no durability and left tombstones.
+//! An older data directory's `streaming_clients` keyspace is dropped at open.
+//!
+//! The DIDComm v1 routing-key reverse index (owner DID hash → verkeys) is
+//! also in memory, seeded by one scan of `v1_routing_keys` at open and
+//! maintained under `write_lock`, so `v1_routing_keys_for` and
+//! `account_remove` no longer scan and hash every routing key. Forward-queue blocking reads use a
+//! [`Notify`] that fires on each `forward_queue_enqueue`.
+//!
+//! The `audit_log` and `forward_queue` keyspaces keep a live entry count
+//! in an [`AtomicUsize`]. Fjall has no O(1) exact length — both
+//! `Keyspace::len` and `approximate_len` are unusable here (the former
+//! scans, the latter counts tombstones) — and both keyspaces need their
+//! length on every insert to enforce a bound. The counters are seeded by
+//! one key-only scan at open and maintained under `write_lock`
+//! thereafter, which is sound because this backend is single-process.
+
+use crate::error_codes;
+use affinidi_messaging_mediator_common::store::mux::{
+    MuxChangeRecord, MuxDidRecord, MuxIndexDelta,
+};
+use affinidi_messaging_mediator_common::store::{
+    AccessListUpdate, AccessListUpdateOutcome, AccountUpdate, StreamingClaim, StreamingKind,
+    StreamingWrite, is_session_over, single_process,
+};
+use affinidi_messaging_mediator_common::types::accounts::{
+    AccountActivity, AccountStats, AccountStatsDelta, ActivityKind,
+};
+use affinidi_messaging_mediator_common::{
+    circuit_breaker::CircuitBreaker,
+    errors::MediatorError,
+    store::{
+        DeletionAuthority, DeliveryDecision, DeliveryMarkReport, DeliveryState, ExpiryReport,
+        ForwardQueueClaimPage, ForwardQueueEntry, InboxStatusReply, MessageMetaData, MessageScope,
+        MetadataStats, OUTBOX_RECEIPT_TTL, OnExpired, OutboxReceipt, PubSubRecord, RefreshRotation,
+        RemovalReason, RemovedCopy, SentMessageState, Session, SessionState, SessionSweepReport,
+        StatCounter, StoreHealth, StoredMessageRef, StreamingClientState, TrustTaskClaim,
+        acknowledged_until, ops, prelude::*,
+    },
+    types::audit::{AUDIT_LOG_MAX_ENTRIES, AuditLogEntry, MediatorAuditLogList},
+};
+use affinidi_messaging_sdk::{
+    messages::{
+        FetchDeletePolicy, Folder, GetMessagesResponse, MessageList, MessageListElement,
+        fetch::FetchOptions,
+    },
+    protocols::mediator::{
+        accounts::{Account, AccountType, MediatorAccountList},
+        acls::{AccessListModeType, MediatorACLSet},
+        acls_handler::{
+            MediatorACLGetResponse, MediatorAccessListAddResponse, MediatorAccessListGetResponse,
+            MediatorAccessListListResponse,
+        },
+    },
+};
+use async_trait::async_trait;
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use serde::{Deserialize, Serialize};
+use sha256::digest;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{Mutex, Notify, broadcast};
+
+/// Fallback ring size when no tuning is supplied (tests, the embedded builder).
+/// Production derives this from `limits.pubsub_buffer / limits.message_size`.
+const PUBSUB_BROADCAST_CAPACITY: usize = 32;
+
+/// Memory tuning for the embedded Fjall database.
+///
+/// Fjall's stock defaults are sized for a general-purpose embedded store, not
+/// for a service that opens 21 keyspaces: 64 MiB of memtable *per keyspace*
+/// would permit over a GiB of write buffer on its own. These values come from
+/// `[storage.fjall]`.
+#[derive(Clone, Copy, Debug)]
+pub struct FjallTuning {
+    /// Block cache (read-side), in bytes.
+    pub block_cache: u64,
+    /// Total memtable budget across all keyspaces, in bytes. Split by
+    /// `KEYSPACE_WRITE_WEIGHTS`.
+    pub write_buffer: u64,
+    /// Journal ceiling, in bytes. The only *effective* global bound on unflushed
+    /// memory — see the field docs on the config type.
+    pub max_journal: u64,
+    /// When a write the mediator acknowledges reaches the disk.
+    pub durability: FjallDurability,
+}
+
+impl Default for FjallTuning {
+    fn default() -> Self {
+        Self {
+            block_cache: 16 * 1024 * 1024,
+            write_buffer: 32 * 1024 * 1024,
+            max_journal: 128 * 1024 * 1024,
+            durability: FjallDurability::default(),
+        }
+    }
+}
+
+/// When a write the mediator acknowledges — a stored message, an enqueued
+/// forward — is durable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FjallDurability {
+    /// Every commit reaches the OS before it is acknowledged: a crash of the
+    /// mediator process loses nothing, a power loss or kernel crash can lose
+    /// what the OS had not yet written out.
+    #[default]
+    Buffered,
+    /// Acknowledged writes are also synced to disk (`fsync`) first, so they
+    /// survive a power loss. Costs a disk sync per acknowledged write;
+    /// concurrent writers share syncs.
+    Sync,
+}
+
+/// Relative share of the write-buffer budget each keyspace gets.
+///
+/// Every open keyspace carries its own memtable, and Fjall flushes a keyspace
+/// when *its* memtable crosses *its* threshold — there is no global trigger. So
+/// the budget has to be divided up front, and dividing it evenly would be wrong:
+/// `messages` stores whole message bodies inline while `admins` stores a byte
+/// per row. Weighting by how much each keyspace actually writes keeps the hot
+/// ones from flushing constantly while the cold ones sit on memory they will
+/// never use.
+const KEYSPACE_WRITE_WEIGHTS: &[(&str, u32)] = &[
+    // Whole message bodies, inline. By far the heaviest writer.
+    (PARTITION_MESSAGES, 40),
+    // One small row per message, but written on every message.
+    (PARTITION_INBOX, 10),
+    (PARTITION_OUTBOX, 10),
+    (PARTITION_EXPIRY, 5),
+    // Whole message bodies again, but only for messages being forwarded.
+    (PARTITION_FORWARD_QUEUE, 20),
+    (PARTITION_FORWARD_PENDING, 3),
+    // Per-session and per-account rows: steady but small.
+    (PARTITION_SESSIONS, 4),
+    (PARTITION_ACCOUNTS, 2),
+    (PARTITION_AUDIT_LOG, 2),
+    // Small rows written on every message stored or removed.
+    (PARTITION_PEER_QUEUE, 2),
+    (PARTITION_OUTBOX_RECEIPTS, 2),
+    (PARTITION_OUTBOX_RECEIPT_EXPIRY, 1),
+    // Cold: written on admin action only.
+    (PARTITION_ACCESS_LISTS, 1),
+    (PARTITION_ADMINS, 1),
+    (PARTITION_V1_ROUTING_KEYS, 1),
+    (PARTITION_MUX_RECORDS, 1),
+    (PARTITION_MUX_PRINCIPALS, 1),
+    (PARTITION_OOB_INVITES, 1),
+    (PARTITION_TRUST_TASK_CLAIMS, 1),
+    (PARTITION_SCID_SOURCES, 1),
+    (PARTITION_GLOBALS, 1),
+];
+
+/// Never size a memtable below this. A memtable smaller than a few pages would
+/// flush on almost every write, turning a cold keyspace into an IO hotspot.
+const MIN_MEMTABLE_BYTES: u64 = 1024 * 1024;
+
+/// This keyspace's slice of the write-buffer budget.
+fn memtable_size_for(keyspace: &str, write_buffer: u64) -> u64 {
+    let total: u32 = KEYSPACE_WRITE_WEIGHTS.iter().map(|(_, w)| w).sum();
+    let weight = KEYSPACE_WRITE_WEIGHTS
+        .iter()
+        .find(|(name, _)| *name == keyspace)
+        .map(|(_, w)| *w)
+        .unwrap_or(1);
+    let share = write_buffer.saturating_mul(u64::from(weight)) / u64::from(total);
+    share.max(MIN_MEMTABLE_BYTES)
+}
+
+const PARTITION_MESSAGES: &str = "messages";
+const PARTITION_INBOX: &str = "inbox";
+const PARTITION_OUTBOX: &str = "outbox";
+const PARTITION_EXPIRY: &str = "expiry";
+const PARTITION_SESSIONS: &str = "sessions";
+const PARTITION_ACCOUNTS: &str = "accounts";
+const PARTITION_ACCESS_LISTS: &str = "access_lists";
+const PARTITION_ADMINS: &str = "admins";
+const PARTITION_V1_ROUTING_KEYS: &str = "v1_routing_keys";
+/// member DID hash -> JSON [`MuxDidRecord`]. Additive: a database written
+/// before it existed simply has no mux records.
+const PARTITION_MUX_RECORDS: &str = "mux_records";
+/// `<principal_hash> 0xFF <member_did_hash>` -> empty. The principal index,
+/// written in the same batch as the record it mirrors.
+const PARTITION_MUX_PRINCIPALS: &str = "mux_principals";
+const PARTITION_OOB_INVITES: &str = "oob_invites";
+const PARTITION_TRUST_TASK_CLAIMS: &str = "trust_task_claims";
+const PARTITION_SCID_SOURCES: &str = "scid_sources";
+const PARTITION_FORWARD_QUEUE: &str = "forward_queue";
+const PARTITION_FORWARD_PENDING: &str = "forward_pending";
+const PARTITION_GLOBALS: &str = "globals";
+/// `globals` key holding the `config/patch` overrides, a JSON object.
+const CONFIG_OVERRIDES_KEY: &str = "CONFIG_OVERRIDES";
+
+/// `globals` key holding an account's lifetime counters, a JSON
+/// [`AccountStats`]. One key per account: a bump is one read-modify-write
+/// under the write lock, which is also what keeps it consistent with the
+/// account's removal.
+fn stats_key(did_hash: &str) -> String {
+    format!("STATS:{did_hash}")
+}
+
+/// `globals` key holding an account's wake record (`messaging/wake/set`).
+/// One key per account, replaced whole on every set and removed with the
+/// account.
+fn wake_key(did_hash: &str) -> String {
+    format!("WAKE:{did_hash}")
+}
+
+/// `globals` key holding one of an account's activity times (a big-endian
+/// `u64` of Unix seconds). One key per [`ActivityKind`], so recording one
+/// never rewrites the other. `None` for a kind this store does not keep.
+fn activity_key(kind: ActivityKind, did_hash: &str) -> Option<String> {
+    let tag = match kind {
+        ActivityKind::Received => "R",
+        ActivityKind::Authenticated => "A",
+        _ => return None,
+    };
+    Some(format!("ACTIVITY:{tag}:{did_hash}"))
+}
+const PARTITION_STREAMING_CLIENTS: &str = "streaming_clients";
+const PARTITION_AUDIT_LOG: &str = "audit_log";
+/// Separator between the two hashes in a `peer_queue` key. `0xFF` is not a
+/// valid UTF-8 byte, so it cannot occur inside either hash and the split is
+/// unambiguous regardless of hash length.
+const PEER_QUEUE_SEP: u8 = 0xFF;
+
+/// `<from_hash> 0xFF <to_hash>` -> `u32` messages queued for that one peer.
+/// Additive partition: a database written before it existed simply has none,
+/// and `peer_queue_count` reads 0 until traffic repopulates it.
+const PARTITION_PEER_QUEUE: &str = "peer_queue";
+
+/// `<sender_hash> 0xFF <msg_id>` -> [`StoredOutboxReceipt`]: why a sent
+/// message left the queue (`messaging/message/status/0.1`). Additive: a
+/// database written before it existed has none, and every sender's answer for
+/// an older removal is `Unknown`.
+const PARTITION_OUTBOX_RECEIPTS: &str = "outbox_receipts";
+
+/// `expires_at_be_8 || <receipt key>` -> empty. The receipts' expiry index, so
+/// the sweep range-scans what is due rather than every receipt.
+const PARTITION_OUTBOX_RECEIPT_EXPIRY: &str = "outbox_receipt_expiry";
+
+fn outbox_receipt_key(from: &str, msg_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(from.len() + 1 + msg_id.len());
+    key.extend_from_slice(from.as_bytes());
+    key.push(PEER_QUEUE_SEP);
+    key.extend_from_slice(msg_id.as_bytes());
+    key
+}
+
+/// Receipt key for the copy of `msg_id` held for `to`:
+/// `outbox_receipt_key(from, msg_id) || ':' || to`. Receipts are per
+/// recipient, so one copy's removal never stands for another's. A key
+/// without the suffix was written before that and is read as a receipt for an
+/// unknown recipient until it expires.
+fn outbox_receipt_copy_key(from: &str, msg_id: &str, to: &str) -> Vec<u8> {
+    let mut key = outbox_receipt_key(from, msg_id);
+    key.push(b':');
+    key.extend_from_slice(to.as_bytes());
+    key
+}
+
+/// Key of the record that `to` removed its own copy of `msg_id` itself
+/// (`MessageStore::acknowledged`): `"ACK\0" || to || 0xFF || msg_id`. Kept in
+/// the `outbox_receipts` keyspace, which the receipt sweep prunes through
+/// `outbox_receipt_expiry`; a sender hash is hex, so no receipt key starts
+/// with `ACK\0`.
+fn acknowledged_key(to: &str, msg_id: &str) -> Vec<u8> {
+    let mut key = b"ACK\0".to_vec();
+    key.extend_from_slice(to.as_bytes());
+    key.push(PEER_QUEUE_SEP);
+    key.extend_from_slice(msg_id.as_bytes());
+    key
+}
+
+fn outbox_receipt_expiry_key(expires_at: u64, receipt_key: &[u8]) -> Vec<u8> {
+    let mut key = expires_at.to_be_bytes().to_vec();
+    key.extend_from_slice(receipt_key);
+    key
+}
+
+/// Wire format for the `outbox_receipts` partition.
+#[derive(Serialize, Deserialize)]
+struct StoredOutboxReceipt {
+    receipt: OutboxReceipt,
+    expires_at: u64,
+}
+
+/// Fjall-backed [`MediatorStore`].
+///
+/// Construct with [`FjallStore::open`] and a path to a directory the
+/// mediator may write to. Drops the underlying [`Database`] on shutdown
+/// — outstanding readers must be released first.
+pub struct FjallStore {
+    /// Top-level Fjall database. Cloned cheaply (internal `Arc`).
+    db: Database,
+    /// Whether acknowledged writes are synced to disk first (see
+    /// [`FjallDurability`]).
+    durability: FjallDurability,
+    /// On-disk path the database was opened from. Kept for diagnostics
+    /// and for `Debug` output.
+    path: PathBuf,
+
+    // ─── Partitions ─────────────────────────────────────────────────
+    messages: Keyspace,
+    inbox: Keyspace,
+    outbox: Keyspace,
+    expiry: Keyspace,
+    sessions: Keyspace,
+    accounts: Keyspace,
+    access_lists: Keyspace,
+    admins: Keyspace,
+    /// base58 routing verkey -> owning account's DID hash. See
+    /// `V1RoutingKeyStore::v1_routing_key_bind`.
+    v1_routing_keys: Keyspace,
+    mux_records: Keyspace,
+    mux_principals: Keyspace,
+    oob_invites: Keyspace,
+    trust_task_claims: Keyspace,
+    /// did:scid account hash → serialised source record.
+    scid_sources: Keyspace,
+    forward_queue: Keyspace,
+    forward_pending: Keyspace,
+    globals: Keyspace,
+    audit_log: Keyspace,
+    /// Per-relationship queue depth. Keyed `<from_hash> 0xFF <to_hash>`; the
+    /// row is removed when it reaches zero, so the partition holds only pairs
+    /// with messages actually in flight.
+    peer_queue: Keyspace,
+    /// Senders' receipts for removed messages, and their expiry index.
+    outbox_receipts: Keyspace,
+    outbox_receipt_expiry: Keyspace,
+
+    // ─── In-process state ───────────────────────────────────────────
+    /// Serializes writes across multiple partitions so composite ops
+    /// (`store_message`, `delete_message`, `account_remove`) are
+    /// effectively atomic. Reads happen inside the lock too, so each
+    /// method sees a consistent snapshot.
+    write_lock: Arc<Mutex<()>>,
+    /// Streaming registrations, by DID hash. Process-local state: see the
+    /// module-level note. A std lock, never held across an await.
+    streaming_clients: std::sync::RwLock<HashMap<String, StoredStreamingClient>>,
+    /// Owner DID hash → the v1 routing verkeys bound to it. The reverse of
+    /// `v1_routing_keys`, seeded at open and maintained under `write_lock`.
+    v1_routing_owners: std::sync::Mutex<HashMap<String, std::collections::BTreeSet<String>>>,
+    /// Most-recently-allocated stream millisecond timestamp. Used by
+    /// `alloc_stream_id` to bump the sequence within a single ms.
+    last_stream_ms: AtomicU64,
+    /// Sequence number within the current millisecond.
+    next_stream_seq: AtomicU64,
+    /// Per-mediator-UUID broadcast channels for live streaming.
+    /// First subscribe creates the channel; subsequent calls reuse it.
+    broadcast_channels: Arc<Mutex<HashMap<String, broadcast::Sender<PubSubRecord>>>>,
+    /// Fires on every `forward_queue_enqueue` so blocking
+    /// `forward_queue_read` callers wake up immediately.
+    forward_notify: Arc<Notify>,
+    /// Slots in the live-delivery broadcast ring. See `with_pubsub_capacity`.
+    pubsub_capacity: usize,
+    /// Live entry count of the `audit_log` keyspace. Seeded at open,
+    /// maintained under `write_lock`. See the module-level note.
+    audit_log_len: AtomicUsize,
+    /// Live entry count of the `forward_queue` keyspace. Seeded at open,
+    /// maintained under `write_lock`. See the module-level note.
+    forward_queue_len: AtomicUsize,
+    /// Probe-driven circuit breaker. The embedded store has no
+    /// per-request connection chokepoint like the Redis backend, so the
+    /// breaker is driven by a cheap point read in
+    /// [`circuit_breaker_state`](StoreLifecycle::circuit_breaker_state):
+    /// disk errors trip it open and `/readyz` degrades accordingly.
+    circuit_breaker: CircuitBreaker,
+}
+
+// ─── Stream IDs and key encoding ────────────────────────────────────────────
+
+/// 16-byte big-endian encoding of a `(ms, seq)` stream ID. Used as
+/// the suffix of inbox/outbox keys and the sole key of forward-queue
+/// entries. Big-endian gives byte-lex == numeric ordering, so Fjall's
+/// range scans iterate in stream-ID order.
+fn encode_stream_id(ms: u64, seq: u64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&ms.to_be_bytes());
+    buf[8..].copy_from_slice(&seq.to_be_bytes());
+    buf
+}
+
+fn decode_stream_id(bytes: &[u8]) -> Option<(u64, u64)> {
+    if bytes.len() != 16 {
+        return None;
+    }
+    let ms = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+    let seq = u64::from_be_bytes(bytes[8..].try_into().ok()?);
+    Some((ms, seq))
+}
+
+/// Pending entries one autoclaim call examines per entry it may return, as
+/// on Redis.
+const AUTOCLAIM_SCAN_FACTOR: usize = 10;
+
+fn format_stream_id(ms: u64, seq: u64) -> String {
+    format!("{ms}-{seq}")
+}
+
+fn parse_stream_id_string(s: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = s.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+/// `did_hash || encoded_stream_id` — used as the key for inbox/outbox
+/// stream entries. did_hash is fixed-width SHA-256 hex (64 bytes), so
+/// concatenation is unambiguous.
+fn stream_key(did_hash: &str, ms: u64, seq: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(did_hash.len() + 16);
+    k.extend_from_slice(did_hash.as_bytes());
+    k.extend_from_slice(&encode_stream_id(ms, seq));
+    k
+}
+
+fn stream_key_from_id(did_hash: &str, sid: (u64, u64)) -> Vec<u8> {
+    stream_key(did_hash, sid.0, sid.1)
+}
+
+/// `expires_at_be || record_key` — sortable composite key for the expiry
+/// index. Fjall scans `< now` to find expired messages. Entries written
+/// before records were per recipient carry a bare `msg_id`, which is the
+/// legacy record's key, so they resolve the same way.
+fn expiry_key(expires_at: u64, record_key: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(8 + record_key.len());
+    k.extend_from_slice(&expires_at.to_be_bytes());
+    k.extend_from_slice(record_key.as_bytes());
+    k
+}
+
+/// Key of the `messages` row holding `msg_id` for `to`: `{msg_id}:{to}`.
+///
+/// One body may be stored for several recipients, and each gets a row of its
+/// own (see `MessageRef`). A row written before that is keyed by the bare
+/// `msg_id` (a hex digest, so never containing `:`); it is that row's
+/// recipient's record and is read through [`FjallStore::record_for`] until
+/// it expires or is removed. Nothing writes a bare-id row any more.
+fn record_key(msg_id: &str, to_did_hash: &str) -> String {
+    [msg_id, ":", to_did_hash].concat()
+}
+
+/// `group_name || 0x00 || stream_id_be` — composite key for entries
+/// in the `forward_pending` partition. The null byte ensures
+/// unambiguous parsing when group names vary in length.
+fn pending_key(group: &str, stream_id: (u64, u64)) -> Vec<u8> {
+    let mut k = Vec::with_capacity(group.len() + 1 + 16);
+    k.extend_from_slice(group.as_bytes());
+    k.push(0x00);
+    k.extend_from_slice(&encode_stream_id(stream_id.0, stream_id.1));
+    k
+}
+
+/// Globals partition key for a consumer group's `last_delivered`
+/// cursor. Reusing `globals` here avoids opening yet another
+/// partition for what's essentially a tiny per-group integer.
+fn group_cursor_key(group: &str) -> Vec<u8> {
+    let mut k = b"FWD_LAST:".to_vec();
+    k.extend_from_slice(group.as_bytes());
+    k
+}
+
+fn now_ms_u64() -> u64 {
+    now_ms()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ─── On-disk record shapes ─────────────────────────────────────────────────
+
+/// Wire format for the `messages` partition. JSON-encoded so on-disk
+/// inspection is trivial; future commits may switch to bincode for
+/// compactness.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredMessage {
+    body: String,
+    bytes: usize,
+    to_did_hash: String,
+    from_did_hash: Option<String>,
+    /// Unix milliseconds when the message was received.
+    timestamp_ms: u128,
+    /// Stream ID (ms, seq) of the inbox entry — always present.
+    receive_id: (u64, u64),
+    /// Stream ID of the sender's outbox entry, when non-anonymous.
+    send_id: Option<(u64, u64)>,
+    /// Unix-seconds expiry. `0` means no expiry.
+    expires_at: u64,
+    /// Unix milliseconds when this message was first handed to its recipient.
+    ///
+    /// `#[serde(default)]` because records written before this field existed
+    /// are on disk and must still decode. They read back as never-delivered,
+    /// which is the honest answer: the mediator genuinely does not know, and
+    /// that is a different claim from "delivered zero times".
+    #[serde(default)]
+    first_delivered_at_ms: Option<u64>,
+    /// How many times it has been handed over. A lower bound — see
+    /// [`DeliveryState::attempts`].
+    #[serde(default)]
+    delivery_attempts: u32,
+}
+
+/// Wire format for inbox/outbox stream entries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredStreamEntry {
+    msg_id: String,
+    bytes: usize,
+    /// For inbox entries this is the sender's DID hash (or
+    /// "ANONYMOUS"); for outbox entries it's the recipient's.
+    peer_did: String,
+}
+
+/// Persisted account record. Mirrors the shape MemoryStore keeps in
+/// memory.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StoredAccount {
+    role: AccountType,
+    /// ACL bitmask (u64 form).
+    acls: u64,
+    send_queue_count: u32,
+    send_queue_bytes: u64,
+    receive_queue_count: u32,
+    receive_queue_bytes: u64,
+    queue_send_limit: Option<i32>,
+    queue_receive_limit: Option<i32>,
+    /// Whether this record is an account. Storing a message for a party with
+    /// no account keeps its queue counters here too (as Redis keeps them in a
+    /// `DID:<hash>` hash with no `ACLS`), but that alone does not make it an
+    /// account. Records written before the field existed read as accounts.
+    #[serde(default = "stored_account_default_is_account")]
+    is_account: bool,
+}
+
+fn stored_account_default_is_account() -> bool {
+    true
+}
+
+impl StoredAccount {
+    fn into_account(self, did_hash: String, access_list_count: u32) -> Account {
+        Account {
+            did_hash,
+            acls: self.acls,
+            _type: self.role,
+            access_list_count,
+            queue_send_limit: self.queue_send_limit,
+            queue_receive_limit: self.queue_receive_limit,
+            send_queue_count: self.send_queue_count,
+            send_queue_bytes: self.send_queue_bytes,
+            receive_queue_count: self.receive_queue_count,
+            receive_queue_bytes: self.receive_queue_bytes,
+        }
+    }
+}
+
+/// Persisted session record. The `expires_at_unix` is checked
+/// lazily on read — Fjall has no native TTL, so expired sessions
+/// linger on disk until they're either touched (lazy expiry in
+/// `get_session`) or reclaimed by the background
+/// [`sweep_expired_sessions`](SessionStore::sweep_expired_sessions)
+/// pass.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredSession {
+    session: Session,
+    /// Unix-seconds wall-clock expiry.
+    expires_at_unix: u64,
+}
+
+/// The one field of a [`StoredSession`] the expiry sweep needs. Decoding
+/// into this skips building the session itself.
+#[derive(Deserialize)]
+struct SessionExpiry {
+    expires_at_unix: u64,
+}
+
+/// Persisted Trust Task claim.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredTrustTaskClaim {
+    digest: String,
+    /// Unix seconds after which the claim is treated as absent.
+    retain_until: u64,
+}
+
+/// Persisted OOB invitation record.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredOobInvite {
+    invite_b64: String,
+    did_hash: String,
+    /// Unix-seconds wall-clock expiry. `0` means no expiry.
+    expires_at_unix: u64,
+}
+
+/// Consumer-group claim metadata for a single forward-queue entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredPendingClaim {
+    consumer: String,
+    /// Unix milliseconds when the entry was last claimed/redelivered.
+    claimed_at_ms: u64,
+    delivery_count: u32,
+}
+
+/// Persisted streaming-client state. Keyed by DID hash so each DID
+/// has at most one streaming registration at a time (matches Redis'
+/// `GLOBAL_STREAMING` hash layout).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredStreamingClient {
+    mediator_uuid: String,
+    state: StreamingClientState,
+}
+
+/// Default circuit-breaker tuning for the Fjall backend, matching the shared
+/// `[database]` config defaults. Used by [`FjallStore::open`]; the mediator
+/// binary threads the configured values via
+/// [`FjallStore::open_with_circuit_breaker`].
+const DEFAULT_CB_THRESHOLD: u32 = 5;
+const DEFAULT_CB_RECOVERY_SECS: u64 = 10;
+
+/// Key read by the circuit-breaker liveness probe. It need not exist — a
+/// missing key still exercises the partition's read path (a healthy disk
+/// returns `Ok(None)`); only an actual I/O error counts as a failure.
+const CB_PROBE_KEY: &[u8] = b"__circuit_breaker_probe__";
+
+/// Build the `peer_queue` key for one (sender, recipient) pair.
+fn mux_principal_key(principal_hash: &str, did_hash: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(principal_hash.len() + 1 + did_hash.len());
+    key.extend_from_slice(principal_hash.as_bytes());
+    key.push(PEER_QUEUE_SEP);
+    key.extend_from_slice(did_hash.as_bytes());
+    key
+}
+
+fn peer_queue_key(from_hash: &str, to_hash: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(from_hash.len() + 1 + to_hash.len());
+    k.extend_from_slice(from_hash.as_bytes());
+    k.push(PEER_QUEUE_SEP);
+    k.extend_from_slice(to_hash.as_bytes());
+    k
+}
+
+impl FjallStore {
+    /// Remove the receipts whose retention ended at or before `now_secs`.
+    ///
+    /// Range-scans the expiry index, then removes each receipt with its index
+    /// entry under the write lock. A receipt re-recorded for the same message
+    /// since the scan carries a later expiry and a different index key, so it
+    /// survives.
+    async fn sweep_expired_outbox_receipts(&self, now_secs: u64) -> Result<usize, MediatorError> {
+        let end = (now_secs.saturating_add(1)).to_be_bytes().to_vec();
+        let mut due: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for guard in self.outbox_receipt_expiry.range(..end) {
+            let (key, _) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("sweep_expired_outbox_receipts:range", e))?;
+            if key.len() > 8 {
+                due.push((key.as_ref().to_vec(), key[8..].to_vec()));
+            }
+        }
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut removed = 0;
+        for (index_key, receipt_key) in due {
+            batch.remove(&self.outbox_receipt_expiry, index_key);
+            if let Some(raw) = self
+                .outbox_receipts
+                .get(&receipt_key)
+                .map_err(|e| Self::db_err("sweep_expired_outbox_receipts:get", e))?
+                && Self::decode::<StoredOutboxReceipt>(&raw)?.expires_at <= now_secs
+            {
+                batch.remove(&self.outbox_receipts, receipt_key);
+                removed += 1;
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("sweep_expired_outbox_receipts:commit", e))?;
+        Ok(removed)
+    }
+
+    /// An account's counters as stored, or all-zeroes when it has none.
+    fn read_stats(&self, key: &str) -> Result<AccountStats, MediatorError> {
+        let Some(raw) = self
+            .globals
+            .get(key)
+            .map_err(|e| Self::db_err("account_stats:get", e))?
+        else {
+            return Ok(AccountStats::default());
+        };
+        // A record this build can't read is reported as no counters rather
+        // than failing the account view it is a footnote to.
+        Ok(serde_json::from_slice(&raw).unwrap_or_default())
+    }
+
+    /// Publish one live-streaming record into this instance's broadcast
+    /// channel. `verbatim` marks the body as the frame itself rather than a
+    /// notification to drain the stored inbox (see
+    /// `StreamingStore::streaming_publish_verbatim`).
+    async fn publish_record(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+        verbatim: bool,
+        stored: Option<StoredMessageRef>,
+    ) -> Result<(), MediatorError> {
+        let channels = self.broadcast_channels.lock().await;
+        if let Some(sender) = channels.get(mediator_uuid) {
+            let _ = sender.send(PubSubRecord {
+                did_hash: did_hash.to_string(),
+                message: message.to_string(),
+                force_delivery,
+                verbatim,
+                stored,
+            });
+        }
+        Ok(())
+    }
+    /// The row of `msg_id` held for `to`: its per-recipient row, else a
+    /// legacy bare-id row whose recipient is `to` (see [`record_key`]).
+    /// Returns the row's key with it.
+    fn record_for(
+        &self,
+        msg_id: &str,
+        to: &str,
+    ) -> Result<Option<(String, StoredMessage)>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(None);
+        }
+        let key = record_key(msg_id, to);
+        if let Some(raw) = self
+            .messages
+            .get(key.as_bytes())
+            .map_err(|e| Self::db_err("record_for:messages.get", e))?
+        {
+            return Ok(Some((key, Self::decode(&raw)?)));
+        }
+        if let Some(raw) = self
+            .messages
+            .get(msg_id.as_bytes())
+            .map_err(|e| Self::db_err("record_for:legacy.get", e))?
+        {
+            let stored: StoredMessage = Self::decode(&raw)?;
+            if stored.to_did_hash == to {
+                return Ok(Some((msg_id.to_string(), stored)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every current receipt `from` holds for `msg_id`: one per recipient
+    /// (`...:<to>`), and one written before receipts were per recipient (no
+    /// suffix), reported with an empty recipient.
+    fn receipts_for(
+        &self,
+        from: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        let now = now_ms() / 1_000;
+        let base = outbox_receipt_key(from, msg_id);
+        let mut receipts = Vec::new();
+        for guard in self.outbox_receipts.prefix(&base) {
+            let (key, raw) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("receipts_for:prefix", e))?;
+            let stored: StoredOutboxReceipt = Self::decode(&raw)?;
+            if stored.expires_at <= now {
+                continue;
+            }
+            let to = key
+                .get(base.len() + 1..)
+                .map(|to| String::from_utf8_lossy(to).into_owned())
+                .unwrap_or_default();
+            receipts.push((to, stored.receipt));
+        }
+        Ok(receipts)
+    }
+
+    /// Every row of `msg_id`: a legacy bare-id row if there is one, then the
+    /// per-recipient rows (`{msg_id}:` prefix), each with its key.
+    fn records_of(&self, msg_id: &str) -> Result<Vec<(String, StoredMessage)>, MediatorError> {
+        let mut rows = Vec::new();
+        if !ops::is_message_id(msg_id) {
+            return Ok(rows);
+        }
+        if let Some(raw) = self
+            .messages
+            .get(msg_id.as_bytes())
+            .map_err(|e| Self::db_err("records_of:legacy.get", e))?
+        {
+            rows.push((msg_id.to_string(), Self::decode(&raw)?));
+        }
+        let prefix = [msg_id, ":"].concat();
+        for guard in self.messages.prefix(prefix.as_bytes()) {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("records_of:prefix", e))?;
+            rows.push((
+                String::from_utf8_lossy(key.as_ref()).into_owned(),
+                Self::decode(&value)?,
+            ));
+        }
+        Ok(rows)
+    }
+
+    /// Remove `rows` (keyed as [`records_of`](Self::records_of) returns them)
+    /// with their stream entries, counters, current expiry entries and the
+    /// senders' receipts, in one batch. The caller holds `write_lock` and has
+    /// authorised every row.
+    fn remove_records_locked(
+        &self,
+        message_hash: &str,
+        rows: &[(String, StoredMessage)],
+        by: &DeletionAuthority,
+    ) -> Result<(), MediatorError> {
+        // Accounts and pair counts touched by several rows are read once and
+        // changed in memory, so two rows of one sender both count.
+        let mut accounts: HashMap<String, Option<StoredAccount>> = HashMap::new();
+        let mut account = |did: &str| -> Result<(), MediatorError> {
+            if !accounts.contains_key(did) {
+                let loaded = match self
+                    .accounts
+                    .get(did.as_bytes())
+                    .map_err(|e| Self::db_err("delete_message:accounts.get", e))?
+                {
+                    Some(v) => Some(Self::decode::<StoredAccount>(&v)?),
+                    None => None,
+                };
+                accounts.insert(did.to_string(), loaded);
+            }
+            Ok(())
+        };
+        for (_, stored) in rows {
+            account(&stored.to_did_hash)?;
+            if let Some(from) = &stored.from_did_hash {
+                account(from)?;
+            }
+        }
+        let mut peer_deltas: HashMap<(String, String), i64> = HashMap::new();
+
+        let mut batch = self.db.batch();
+        let mut deleted_bytes = 0i64;
+        for (key, stored) in rows {
+            if let Some(Some(recv)) = accounts.get_mut(&stored.to_did_hash) {
+                recv.receive_queue_count = recv.receive_queue_count.saturating_sub(1);
+                recv.receive_queue_bytes =
+                    recv.receive_queue_bytes.saturating_sub(stored.bytes as u64);
+            }
+            if let Some(from) = &stored.from_did_hash {
+                if let Some(Some(acc)) = accounts.get_mut(from) {
+                    acc.send_queue_count = acc.send_queue_count.saturating_sub(1);
+                    acc.send_queue_bytes = acc.send_queue_bytes.saturating_sub(stored.bytes as u64);
+                }
+                *peer_deltas
+                    .entry((from.clone(), stored.to_did_hash.clone()))
+                    .or_default() -= 1;
+            }
+            batch.remove(&self.messages, key.as_bytes());
+            batch.remove(
+                &self.inbox,
+                stream_key_from_id(&stored.to_did_hash, stored.receive_id),
+            );
+            if let (Some(from), Some(sid)) = (&stored.from_did_hash, stored.send_id) {
+                batch.remove(&self.outbox, stream_key_from_id(from, sid));
+            }
+            if stored.expires_at > 0 {
+                batch.remove(&self.expiry, expiry_key(stored.expires_at, key));
+            }
+            // The sender's receipt, in the same batch as the delete, so a
+            // removal never commits without it.
+            if let (Some(from), Some(_)) = (&stored.from_did_hash, stored.send_id)
+                && let Some(reason) = ops::removal_reason(by, &stored.to_did_hash, Some(from))
+            {
+                let expires_at = now_ms() / 1_000 + OUTBOX_RECEIPT_TTL.as_secs();
+                let receipt_key = outbox_receipt_copy_key(from, message_hash, &stored.to_did_hash);
+                batch.insert(
+                    &self.outbox_receipt_expiry,
+                    outbox_receipt_expiry_key(expires_at, &receipt_key),
+                    Vec::<u8>::new(),
+                );
+                batch.insert(
+                    &self.outbox_receipts,
+                    receipt_key,
+                    Self::encode(&StoredOutboxReceipt {
+                        receipt: OutboxReceipt {
+                            reason,
+                            at_ms: now_ms(),
+                        },
+                        expires_at,
+                    })?,
+                );
+            }
+            // The recipient removing its own copy is an acknowledgement.
+            if matches!(by, DeletionAuthority::Owner { did_hash } if *did_hash == stored.to_did_hash)
+            {
+                let until = acknowledged_until(stored.expires_at, now_ms() / 1_000);
+                let key = acknowledged_key(&stored.to_did_hash, message_hash);
+                batch.insert(
+                    &self.outbox_receipt_expiry,
+                    outbox_receipt_expiry_key(until, &key),
+                    Vec::<u8>::new(),
+                );
+                batch.insert(
+                    &self.outbox_receipts,
+                    key,
+                    Self::encode(&StoredOutboxReceipt {
+                        receipt: OutboxReceipt {
+                            reason: RemovalReason::Collected,
+                            at_ms: now_ms(),
+                        },
+                        expires_at: until,
+                    })?,
+                );
+            }
+            deleted_bytes += stored.bytes as i64;
+        }
+        for ((from, to), delta) in peer_deltas {
+            self.stage_peer_queue_delta(&mut batch, &from, &to, delta)?;
+        }
+        for (did, acc) in accounts {
+            if let Some(acc) = acc {
+                batch.insert(&self.accounts, did.as_bytes(), Self::encode(&acc)?);
+            }
+        }
+
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("delete_message:commit", e))?;
+
+        let _ = self.bump_global("DELETED_BYTES", deleted_bytes);
+        let _ = self.bump_global("DELETED_COUNT", rows.len() as i64);
+        Ok(())
+    }
+
+    /// Stage the per-pair count change for one message onto `batch`.
+    ///
+    /// `delta` is `+1` when a message is queued and `-1` when one leaves the
+    /// queue. A count that reaches zero has its row **removed** rather than
+    /// written as `0`: the partition then holds only pairs with messages
+    /// actually in flight, so a sender that has ever messaged ten thousand
+    /// peers does not keep ten thousand rows forever.
+    fn stage_peer_queue_delta(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        from_hash: &str,
+        to_hash: &str,
+        delta: i64,
+    ) -> Result<(), MediatorError> {
+        let key = peer_queue_key(from_hash, to_hash);
+        let current = self.read_peer_queue(from_hash, to_hash)?;
+        let next = if delta >= 0 {
+            current.saturating_add(delta as u32)
+        } else {
+            current.saturating_sub(delta.unsigned_abs() as u32)
+        };
+        if next == 0 {
+            batch.remove(&self.peer_queue, key);
+        } else {
+            batch.insert(&self.peer_queue, key, next.to_be_bytes().to_vec());
+        }
+        Ok(())
+    }
+
+    /// Read one pair's queue depth. A missing row means zero.
+    fn read_peer_queue(&self, from_hash: &str, to_hash: &str) -> Result<u32, MediatorError> {
+        match self
+            .peer_queue
+            .get(peer_queue_key(from_hash, to_hash))
+            .map_err(|e| Self::db_err("peer_queue.get", e))?
+        {
+            Some(v) if v.len() == 4 => Ok(u32::from_be_bytes([v[0], v[1], v[2], v[3]])),
+            _ => Ok(0),
+        }
+    }
+
+    /// Open or create a Fjall-backed store at the given directory path.
+    /// The directory is created if it doesn't exist; existing data is
+    /// recovered.
+    ///
+    /// All partitions named in the module-level docs are eagerly
+    /// created so subsequent operations don't pay the overhead of
+    /// checking for partition existence on every call.
+    ///
+    /// Uses the default circuit-breaker tuning; the mediator binary calls
+    /// [`open_with_circuit_breaker`](Self::open_with_circuit_breaker) to
+    /// thread the configured `[database]` values.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MediatorError> {
+        Self::open_with_circuit_breaker(path, DEFAULT_CB_THRESHOLD, DEFAULT_CB_RECOVERY_SECS)
+    }
+
+    /// Size the live-delivery broadcast ring. See
+    /// [`MemoryStore::with_pubsub_capacity`](crate::store::MemoryStore::with_pubsub_capacity)
+    /// for why this must come from a byte budget.
+    pub fn with_pubsub_capacity(mut self, capacity: usize) -> Self {
+        self.pubsub_capacity = capacity.max(1);
+        self
+    }
+
+    /// Like [`open`](Self::open) but with explicit circuit-breaker tuning.
+    /// The mediator threads `[database] circuit_breaker_threshold` /
+    /// `circuit_breaker_recovery_secs` here so the Fjall backend degrades
+    /// `/readyz` on disk errors the same way the Redis backend does.
+    pub fn open_with_circuit_breaker<P: AsRef<Path>>(
+        path: P,
+        circuit_breaker_threshold: u32,
+        circuit_breaker_recovery_secs: u64,
+    ) -> Result<Self, MediatorError> {
+        Self::open_with_tuning(
+            path,
+            circuit_breaker_threshold,
+            circuit_breaker_recovery_secs,
+            FjallTuning::default(),
+        )
+    }
+
+    /// Open with explicit memory tuning from `[storage.fjall]`.
+    ///
+    /// `block_cache` and `max_journal` are database-level and are applied on
+    /// every open, including existing data directories. The per-keyspace
+    /// memtable sizes derived from `write_buffer` are **only honoured when a
+    /// keyspace is first created**: Fjall persists a keyspace's memtable size at
+    /// creation and exposes no setter, so against an existing `data_dir` the
+    /// closure below is never called for keyspaces that already exist. That is
+    /// why `max_journal` — which forces rotation once the journal grows past it,
+    /// and therefore caps unflushed memtable memory — is the load-bearing bound.
+    pub fn open_with_tuning<P: AsRef<Path>>(
+        path: P,
+        circuit_breaker_threshold: u32,
+        circuit_breaker_recovery_secs: u64,
+        tuning: FjallTuning,
+    ) -> Result<Self, MediatorError> {
+        let path = path.as_ref().to_path_buf();
+        let db = Database::builder(&path)
+            .cache_size(tuning.block_cache)
+            .max_journaling_size(tuning.max_journal)
+            .open()
+            .map_err(|e| {
+                MediatorError::InternalError(
+                    error_codes::INTERNAL_ERROR,
+                    "fjall".into(),
+                    format!("FjallStore::open: failed to open database at {path:?}: {e}"),
+                )
+            })?;
+
+        let open_partition = |name: &str| -> Result<Keyspace, MediatorError> {
+            let memtable = memtable_size_for(name, tuning.write_buffer);
+            db.keyspace(name, move || {
+                KeyspaceCreateOptions::default().max_memtable_size(memtable)
+            })
+            .map_err(|e| {
+                MediatorError::InternalError(
+                    error_codes::INTERNAL_ERROR,
+                    "fjall".into(),
+                    format!("FjallStore::open: failed to open partition '{name}': {e}"),
+                )
+            })
+        };
+
+        let forward_queue = open_partition(PARTITION_FORWARD_QUEUE)?;
+        let audit_log = open_partition(PARTITION_AUDIT_LOG)?;
+
+        // Seed the bounded-keyspace counters. `Keyspace::len` is a
+        // key-only scan (it never materialises values), and it runs once
+        // per process against keyspaces that are small by construction:
+        // `audit_log` is a ring capped at AUDIT_LOG_MAX_ENTRIES, and
+        // `forward_queue` is drained by the forwarding processor.
+        let audit_log_len = audit_log
+            .len()
+            .map_err(|e| Self::db_err("open:audit_log_len", e))?;
+        let forward_queue_len = forward_queue
+            .len()
+            .map_err(|e| Self::db_err("open:forward_queue_len", e))?;
+
+        // Streaming registrations are in memory now. An older data directory
+        // still holds the keyspace they were written to; drop it so its stale
+        // rows cannot be mistaken for state.
+        if db.keyspace_exists(PARTITION_STREAMING_CLIENTS) {
+            let legacy = open_partition(PARTITION_STREAMING_CLIENTS)?;
+            db.delete_keyspace(legacy)
+                .map_err(|e| Self::db_err("open:drop_streaming_clients", e))?;
+        }
+
+        // Seed the routing-key reverse index with one scan.
+        let v1_routing_keys = open_partition(PARTITION_V1_ROUTING_KEYS)?;
+        let mut v1_routing_owners: HashMap<String, std::collections::BTreeSet<String>> =
+            HashMap::new();
+        for guard in v1_routing_keys.iter() {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("open:v1_routing_keys", e))?;
+            if let Ok(owner) = std::str::from_utf8(value.as_ref()) {
+                v1_routing_owners
+                    .entry(affinidi_messaging_mediator_common::did_identity::did_hash(
+                        owner,
+                    ))
+                    .or_default()
+                    .insert(String::from_utf8_lossy(key.as_ref()).into_owned());
+            }
+        }
+
+        Ok(Self {
+            messages: open_partition(PARTITION_MESSAGES)?,
+            inbox: open_partition(PARTITION_INBOX)?,
+            outbox: open_partition(PARTITION_OUTBOX)?,
+            expiry: open_partition(PARTITION_EXPIRY)?,
+            sessions: open_partition(PARTITION_SESSIONS)?,
+            accounts: open_partition(PARTITION_ACCOUNTS)?,
+            access_lists: open_partition(PARTITION_ACCESS_LISTS)?,
+            admins: open_partition(PARTITION_ADMINS)?,
+            v1_routing_keys,
+            mux_records: open_partition(PARTITION_MUX_RECORDS)?,
+            mux_principals: open_partition(PARTITION_MUX_PRINCIPALS)?,
+            oob_invites: open_partition(PARTITION_OOB_INVITES)?,
+            trust_task_claims: open_partition(PARTITION_TRUST_TASK_CLAIMS)?,
+            scid_sources: open_partition(PARTITION_SCID_SOURCES)?,
+            forward_queue,
+            forward_pending: open_partition(PARTITION_FORWARD_PENDING)?,
+            globals: open_partition(PARTITION_GLOBALS)?,
+            peer_queue: open_partition(PARTITION_PEER_QUEUE)?,
+            outbox_receipts: open_partition(PARTITION_OUTBOX_RECEIPTS)?,
+            outbox_receipt_expiry: open_partition(PARTITION_OUTBOX_RECEIPT_EXPIRY)?,
+            audit_log,
+            db,
+            durability: tuning.durability,
+            path,
+            write_lock: Arc::new(Mutex::new(())),
+            streaming_clients: std::sync::RwLock::new(HashMap::new()),
+            v1_routing_owners: std::sync::Mutex::new(v1_routing_owners),
+            last_stream_ms: AtomicU64::new(0),
+            next_stream_seq: AtomicU64::new(0),
+            broadcast_channels: Arc::new(Mutex::new(HashMap::new())),
+            forward_notify: Arc::new(Notify::new()),
+            pubsub_capacity: PUBSUB_BROADCAST_CAPACITY,
+            audit_log_len: AtomicUsize::new(audit_log_len),
+            forward_queue_len: AtomicUsize::new(forward_queue_len),
+            circuit_breaker: CircuitBreaker::new(
+                circuit_breaker_threshold,
+                circuit_breaker_recovery_secs,
+            ),
+        })
+    }
+
+    /// Allocate a fresh `(ms, seq)` stream ID. Monotonic across calls;
+    /// sequence resets when the millisecond advances. Caller MUST hold
+    /// `write_lock` so the alloc + write happen as one unit.
+    fn alloc_stream_id(&self) -> (u64, u64) {
+        let now = now_ms();
+        let last = self.last_stream_ms.load(Ordering::Relaxed);
+        if now > last {
+            self.last_stream_ms.store(now, Ordering::Relaxed);
+            self.next_stream_seq.store(0, Ordering::Relaxed);
+            (now, 0)
+        } else {
+            let seq = self.next_stream_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            (last, seq)
+        }
+    }
+
+    /// Helper: encode any serde value as JSON bytes, mapping errors to
+    /// `MediatorError::InternalError`.
+    /// The stored record for `did_hash`, if it is an account (see
+    /// [`StoredAccount::is_account`]).
+    fn account_record(&self, did_hash: &str) -> Result<Option<StoredAccount>, MediatorError> {
+        let Some(raw) = self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("accounts.get", e))?
+        else {
+            return Ok(None);
+        };
+        let acc: StoredAccount = Self::decode(&raw)?;
+        Ok(acc.is_account.then_some(acc))
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MediatorError> {
+        serde_json::to_vec(value).map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "fjall".into(),
+                format!("encode failed: {e}"),
+            )
+        })
+    }
+
+    /// Helper: decode JSON bytes into the target type.
+    fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, MediatorError> {
+        serde_json::from_slice(bytes).map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "fjall".into(),
+                format!("decode failed: {e}"),
+            )
+        })
+    }
+
+    fn db_err(method: &str, e: fjall::Error) -> MediatorError {
+        MediatorError::DatabaseError(
+            error_codes::DB_OPERATION_ERROR,
+            "fjall".into(),
+            format!("FjallStore::{method} failed: {e}"),
+        )
+    }
+
+    /// Make every commit so far survive a power loss, if the store is
+    /// configured to before acknowledging writes ([`FjallDurability::Sync`]).
+    ///
+    /// Called after `write_lock` is released: the sync covers every write
+    /// committed before it, so concurrent writers waiting here share syncs
+    /// instead of queueing one each behind the lock.
+    ///
+    /// The fsync runs on the blocking pool, not on the calling runtime
+    /// worker: a slow disk must stall the writer that asked for durability,
+    /// not every task scheduled on the same worker thread.
+    async fn sync_if_durable(&self, method: &str) -> Result<(), MediatorError> {
+        if self.durability == FjallDurability::Sync {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.persist(PersistMode::SyncAll))
+                .await
+                .map_err(|e| {
+                    MediatorError::InternalError(
+                        error_codes::INTERNAL_ERROR,
+                        "fjall".into(),
+                        format!("FjallStore::{method} failed: persist task: {e}"),
+                    )
+                })?
+                .map_err(|e| Self::db_err(method, e))?;
+        }
+        Ok(())
+    }
+
+    /// Record `verkey` as bound to the DID whose hash is `owner_hash`, in the
+    /// in-memory reverse index. Caller holds `write_lock`.
+    fn routing_owner_add(&self, owner_hash: String, verkey: &str) {
+        self.v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(owner_hash)
+            .or_default()
+            .insert(verkey.to_string());
+    }
+
+    /// Forget `verkey` from `owner_hash`'s entry. Caller holds `write_lock`.
+    fn routing_owner_remove(&self, owner_hash: &str, verkey: &str) {
+        let mut owners = self
+            .v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(keys) = owners.get_mut(owner_hash) {
+            keys.remove(verkey);
+            if keys.is_empty() {
+                owners.remove(owner_hash);
+            }
+        }
+    }
+
+    /// Remove the session if it is still expired, under the write lock —
+    /// the read that found it expired was not, and the session may have
+    /// been refreshed since. Best effort: the sweeper retries.
+    async fn remove_session_if_expired(&self, session_id: &str, now: u64) {
+        let _guard = self.write_lock.lock().await;
+        let still_expired = matches!(
+            self.sessions.get(session_id.as_bytes()),
+            Ok(Some(raw)) if Self::decode::<StoredSession>(&raw)
+                .is_ok_and(|s| s.expires_at_unix > 0 && s.expires_at_unix <= now)
+        );
+        if still_expired {
+            let _ = self.sessions.remove(session_id.as_bytes());
+        }
+    }
+
+    /// Read-modify-write a counter in the `globals` partition. Counters are
+    /// stored as little-endian `i64`. Not atomic on its own: the caller holds
+    /// `write_lock`, or two bumps can read the same value and lose one.
+    fn bump_global(&self, name: &str, by: i64) -> Result<(), MediatorError> {
+        let key = name.as_bytes();
+        let current: i64 = self
+            .globals
+            .get(key)
+            .map_err(|e| Self::db_err("bump_global:get", e))?
+            .and_then(|v| {
+                let bytes: [u8; 8] = v.as_ref().try_into().ok()?;
+                Some(i64::from_le_bytes(bytes))
+            })
+            .unwrap_or(0);
+        let new = current.saturating_add(by);
+        self.globals
+            .insert(key, new.to_le_bytes().to_vec())
+            .map_err(|e| Self::db_err("bump_global:insert", e))?;
+        Ok(())
+    }
+
+    /// O(n) count of access-list entries for a DID. Sufficient for
+    /// the typical "tens to low-thousands" entries; switch to a
+    /// counter partition if it ever shows up in profiling.
+    fn access_list_count_inner(&self, did_hash: &str) -> Result<usize, MediatorError> {
+        let mut count = 0usize;
+        for guard in self.access_lists.prefix(did_hash.as_bytes()) {
+            let _ = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("access_list_count:prefix", e))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Every member of `did_hash`'s access list.
+    fn access_list_members(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
+        let prefix_len = did_hash.len();
+        let mut members = Vec::new();
+        for guard in self.access_lists.prefix(did_hash.as_bytes()) {
+            let (key, _) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("access_list_members:prefix", e))?;
+            if key.len() > prefix_len {
+                members.push(String::from_utf8_lossy(&key[prefix_len..]).into_owned());
+            }
+        }
+        Ok(members)
+    }
+
+    fn access_list_contains(&self, did_hash: &str, member: &str) -> Result<bool, MediatorError> {
+        let mut k = did_hash.as_bytes().to_vec();
+        k.extend_from_slice(member.as_bytes());
+        self.access_lists
+            .contains_key(&k)
+            .map_err(|e| Self::db_err("access_list_contains", e))
+    }
+
+    /// O(1) count of entries currently in the forward queue. Used by
+    /// `forward_queue_len` and the `max_len` trim in
+    /// `forward_queue_enqueue`.
+    fn forward_queue_count_inner(&self) -> usize {
+        self.forward_queue_len.load(Ordering::Acquire)
+    }
+
+    /// O(1) count of audit-log entries. Used by `audit_log_record` for the
+    /// ring trim and by `audit_log_list` for cursor maths.
+    fn audit_log_count_inner(&self) -> usize {
+        self.audit_log_len.load(Ordering::Acquire)
+    }
+
+    /// Read a consumer group's `last_delivered` stream ID from the
+    /// `globals` partition. Returns `None` when the group hasn't been
+    /// used yet — callers treat that as "deliver from the beginning."
+    fn read_group_cursor(&self, group: &str) -> Option<(u64, u64)> {
+        self.globals
+            .get(group_cursor_key(group))
+            .ok()
+            .flatten()
+            .and_then(|v| decode_stream_id(v.as_ref()))
+    }
+
+    fn read_global(&self, name: &str) -> i64 {
+        self.globals
+            .get(name.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                let bytes: [u8; 8] = v.as_ref().try_into().ok()?;
+                Some(i64::from_le_bytes(bytes))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Read the persisted schema-version marker from the `globals`
+    /// partition. `None` means no marker has ever been written — a fresh
+    /// data dir, or one created before schema versioning existed.
+    ///
+    /// `pub(super)` so the sibling [`fjall_migrations`](super::fjall_migrations)
+    /// runner can read it without exposing the `globals` partition itself.
+    pub(super) fn read_schema_version(&self) -> Result<Option<u32>, MediatorError> {
+        let raw = self
+            .globals
+            .get(super::fjall_migrations::SCHEMA_VERSION_KEY)
+            .map_err(|e| Self::db_err("read_schema_version:get", e))?;
+        Ok(raw.and_then(|v| {
+            let bytes: [u8; 4] = v.as_ref().try_into().ok()?;
+            Some(u32::from_le_bytes(bytes))
+        }))
+    }
+
+    /// Persist the schema-version marker into the `globals` partition as
+    /// little-endian `u32`. Matches the durability of the other `globals`
+    /// writes (counters, cursors) — survives a clean reopen.
+    pub(super) fn write_schema_version(&self, version: u32) -> Result<(), MediatorError> {
+        self.globals
+            .insert(
+                super::fjall_migrations::SCHEMA_VERSION_KEY,
+                version.to_le_bytes().to_vec(),
+            )
+            .map_err(|e| Self::db_err("write_schema_version:insert", e))?;
+        Ok(())
+    }
+
+    /// Path the database was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::fmt::Debug for FjallStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FjallStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl StoreLifecycle for FjallStore {
+    fn spans_processes(&self) -> bool {
+        false
+    }
+
+    async fn initialize(&self) -> Result<(), MediatorError> {
+        // Partitions are opened eagerly in `open`. The remaining bootstrap
+        // step is the schema-version check: stamp the current version on a
+        // fresh data dir, run any pending migrations on an older one, and
+        // refuse to start on a data dir written by a newer mediator rather
+        // than silently misread its records. See `fjall_migrations`.
+        super::fjall_migrations::run_migrations(self)
+    }
+
+    async fn health(&self) -> StoreHealth {
+        match self.circuit_breaker_state() {
+            "open" => StoreHealth::Unavailable,
+            "half_open" => StoreHealth::Degraded,
+            _ => StoreHealth::Healthy,
+        }
+    }
+
+    /// Cheap synchronous liveness probe that drives the circuit breaker.
+    ///
+    /// Unlike the Redis backend — which records breaker outcomes on every
+    /// pooled connection — the embedded Fjall store has no per-request
+    /// chokepoint, so the breaker is probe-driven: each call does a single
+    /// point read against the `globals` partition. A successful read keeps
+    /// the breaker closed (or, from half-open, closes it); a disk error
+    /// records a failure and, after `circuit_breaker_threshold` consecutive
+    /// failures, trips it open so `/readyz` (which polls this method)
+    /// reports the backend unavailable instead of erroring per request.
+    ///
+    /// While open the probe fails fast (no disk read) until the recovery
+    /// window elapses, at which point one probe is allowed through to test
+    /// recovery — the same state machine the Redis backend uses.
+    fn circuit_breaker_state(&self) -> &'static str {
+        if self.circuit_breaker.allow_request() {
+            match self.globals.get(CB_PROBE_KEY) {
+                Ok(_) => self.circuit_breaker.record_success(),
+                Err(_) => self.circuit_breaker.record_failure(),
+            }
+        }
+        self.circuit_breaker.state_str()
+    }
+
+    async fn shutdown(&self) -> Result<(), MediatorError> {
+        // Drop in-process broadcast channels; subscribers see Closed.
+        self.broadcast_channels.lock().await.clear();
+        // Sync whatever the OS still holds, whatever the durability setting:
+        // a clean shutdown should not leave the last writes exposed to a
+        // power loss that follows it.
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| Self::db_err("shutdown:persist", e))
+    }
+}
+
+#[async_trait]
+impl MessageStore for FjallStore {
+    async fn store_message(
+        &self,
+        _session_id: &str,
+        message: &str,
+        to_did_hash: &str,
+        from_hash: Option<&str>,
+        expires_at: u64,
+        _queue_maxlen: usize,
+    ) -> Result<String, MediatorError> {
+        let msg_id = digest(message.as_bytes());
+        let bytes = message.len();
+        let from = from_hash
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ANONYMOUS")
+            .to_string();
+
+        let _guard = self.write_lock.lock().await;
+
+        // Idempotent per recipient. A sender that re-submits the same bytes —
+        // the delivery layer's outbox re-sends `entry.packed` verbatim when a
+        // send errors after the mediator had in fact stored it — used to get a
+        // second inbox and outbox entry and a second counter increment over a
+        // single `messages` row. The one delete then released one of each,
+        // and the rest leaked for good. Checked under the write lock, so two
+        // concurrent stores of the same bytes cannot both pass.
+        //
+        // The same bytes for another recipient get a row of their own: the
+        // row names its recipient, so neither copy can replace the other.
+        if self.record_for(&msg_id, to_did_hash)?.is_some() {
+            tracing::debug!(
+                msg_id,
+                "message already stored for this recipient; not storing it twice"
+            );
+            return Ok(msg_id);
+        }
+        let row_key = record_key(&msg_id, to_did_hash);
+
+        let receive_id = self.alloc_stream_id();
+        let send_id = if from != "ANONYMOUS" {
+            Some(self.alloc_stream_id())
+        } else {
+            None
+        };
+
+        let stored = StoredMessage {
+            body: message.to_string(),
+            bytes,
+            to_did_hash: to_did_hash.to_string(),
+            from_did_hash: if from == "ANONYMOUS" {
+                None
+            } else {
+                Some(from.clone())
+            },
+            timestamp_ms: now_ms() as u128,
+            receive_id,
+            send_id,
+            expires_at,
+            first_delivered_at_ms: None,
+            delivery_attempts: 0,
+        };
+
+        // Read-modify-write the affected accounts so their queue
+        // counters stay consistent with the streams. Reads happen
+        // first (under the lock), then everything is committed in a
+        // single batch.
+        let recv_account_key = to_did_hash.as_bytes().to_vec();
+        let mut recv_account: StoredAccount = match self
+            .accounts
+            .get(&recv_account_key)
+            .map_err(|e| Self::db_err("store_message:accounts.get", e))?
+        {
+            Some(v) => Self::decode(&v)?,
+            None => StoredAccount::default(),
+        };
+        recv_account.receive_queue_count = recv_account.receive_queue_count.saturating_add(1);
+        recv_account.receive_queue_bytes = recv_account
+            .receive_queue_bytes
+            .saturating_add(bytes as u64);
+
+        let mut sender_account_pair: Option<(Vec<u8>, StoredAccount)> = None;
+        if from != "ANONYMOUS" {
+            let key = from.as_bytes().to_vec();
+            let mut acc: StoredAccount = match self
+                .accounts
+                .get(&key)
+                .map_err(|e| Self::db_err("store_message:accounts.get", e))?
+            {
+                Some(v) => Self::decode(&v)?,
+                None => StoredAccount::default(),
+            };
+            acc.send_queue_count = acc.send_queue_count.saturating_add(1);
+            acc.send_queue_bytes = acc.send_queue_bytes.saturating_add(bytes as u64);
+            sender_account_pair = Some((key, acc));
+        }
+
+        // Build the atomic batch.
+        let mut batch = self.db.batch();
+        batch.insert(&self.messages, row_key.as_bytes(), Self::encode(&stored)?);
+        batch.insert(
+            &self.inbox,
+            stream_key_from_id(to_did_hash, receive_id),
+            Self::encode(&StoredStreamEntry {
+                msg_id: msg_id.clone(),
+                bytes,
+                peer_did: from.clone(),
+            })?,
+        );
+        if let Some(sid) = send_id {
+            batch.insert(
+                &self.outbox,
+                stream_key_from_id(&from, sid),
+                Self::encode(&StoredStreamEntry {
+                    msg_id: msg_id.clone(),
+                    bytes,
+                    peer_did: to_did_hash.to_string(),
+                })?,
+            );
+        }
+        batch.insert(
+            &self.accounts,
+            recv_account_key,
+            Self::encode(&recv_account)?,
+        );
+        if let Some((key, acc)) = sender_account_pair {
+            batch.insert(&self.accounts, key, Self::encode(&acc)?);
+        }
+        // Per-relationship depth, in the same batch as the account totals so
+        // the two cannot diverge on a crash between them.
+        if from != "ANONYMOUS" {
+            self.stage_peer_queue_delta(&mut batch, &from, to_did_hash, 1)?;
+        }
+        if expires_at > 0 {
+            batch.insert(
+                &self.expiry,
+                expiry_key(expires_at, &row_key),
+                Vec::<u8>::new(),
+            );
+        }
+
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("store_message:commit", e))?;
+
+        // Update global counters separately (best-effort — losing a
+        // counter increment on crash is acceptable and matches Redis
+        // `HINCRBY` behaviour where counters live outside the Lua
+        // function's atomic scope).
+        let _ = self.bump_global("RECEIVED_BYTES", bytes as i64);
+        let _ = self.bump_global("RECEIVED_COUNT", 1);
+        drop(_guard);
+
+        // Before the store reports success: the caller acknowledges the
+        // message to its sender on it.
+        self.sync_if_durable("store_message:persist").await?;
+        Ok(msg_id)
+    }
+
+    async fn delete_message_in(
+        &self,
+        message_hash: &str,
+        scope: MessageScope<'_>,
+        by: DeletionAuthority,
+    ) -> Result<Vec<RemovedCopy>, MediatorError> {
+        if !ops::is_message_id(message_hash) {
+            return Err(ops::delete_not_found(message_hash, None));
+        }
+        let _guard = self.write_lock.lock().await;
+
+        // Which rows, and whether `by` may remove them: shared with the
+        // memory backend via `store::ops` so the two can't drift.
+        let records = self.records_of(message_hash)?;
+        let parties: Vec<ops::RecordParties<'_>> = records
+            .iter()
+            .map(|(_, stored)| ops::RecordParties {
+                to_did_hash: &stored.to_did_hash,
+                from_did_hash: stored.from_did_hash.as_deref(),
+            })
+            .collect();
+        let chosen = ops::select_records(scope, &by, &parties)
+            .map_err(|e| e.into_delete_error(message_hash))?;
+        let chosen: Vec<(String, StoredMessage)> =
+            chosen.into_iter().map(|i| records[i].clone()).collect();
+        self.remove_records_locked(message_hash, &chosen, &by)?;
+        Ok(chosen
+            .into_iter()
+            .map(|(_, stored)| RemovedCopy {
+                to_did_hash: stored.to_did_hash,
+                from_did_hash: stored.from_did_hash,
+            })
+            .collect())
+    }
+
+    async fn acknowledged(&self, to_did_hash: &str, msg_id: &str) -> Result<bool, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(false);
+        }
+        let now = now_ms() / 1_000;
+        match self
+            .outbox_receipts
+            .get(acknowledged_key(to_did_hash, msg_id))
+            .map_err(|e| Self::db_err("acknowledged:get", e))?
+        {
+            Some(raw) => Ok(Self::decode::<StoredOutboxReceipt>(&raw)?.expires_at > now),
+            None => Ok(false),
+        }
+    }
+
+    async fn outbox_receipts(
+        &self,
+        from_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Vec<(String, OutboxReceipt)>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .receipts_for(from_did_hash, msg_id)?
+            .into_iter()
+            .filter(|(to, _)| !to.is_empty())
+            .collect())
+    }
+
+    async fn sent_message_states(
+        &self,
+        sender_did_hash: &str,
+        msg_ids: &[String],
+    ) -> Result<Vec<SentMessageState>, MediatorError> {
+        let mut states = Vec::with_capacity(msg_ids.len());
+        for id in msg_ids {
+            if !ops::is_message_id(id) {
+                states.push(SentMessageState::Unknown);
+                continue;
+            }
+            let held = self.records_of(id)?;
+            let receipts = self.receipts_for(sender_did_hash, id)?;
+            let held: Vec<ops::HeldMessage<'_>> = held
+                .iter()
+                .map(|(_, message)| ops::HeldMessage {
+                    to_did_hash: &message.to_did_hash,
+                    from_did_hash: message.from_did_hash.as_deref(),
+                    first_delivered_at_ms: message.first_delivered_at_ms,
+                })
+                .collect();
+            states.push(ops::sent_message_state(sender_did_hash, &held, &receipts));
+        }
+        Ok(states)
+    }
+
+    async fn mark_delivered(
+        &self,
+        recipient_did_hash: &str,
+        msg_ids: &[String],
+        now_ms: u64,
+        delivered_ttl_secs: u64,
+    ) -> Result<DeliveryMarkReport, MediatorError> {
+        let mut report = DeliveryMarkReport::default();
+        // One batch for the whole pickup rather than a write per message: a
+        // pickup is up to `limit` messages and this is bookkeeping alongside
+        // it, not the work itself.
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut wrote = false;
+
+        for id in msg_ids {
+            let Some((key, mut stored)) = self.record_for(id, recipient_did_hash)? else {
+                // Deleted between the read and here — nothing to stamp.
+                continue;
+            };
+            let bytes = stored.bytes;
+            let moved = ops::stamp_delivery(
+                ops::DeliveryFields {
+                    first_delivered_at_ms: &mut stored.first_delivered_at_ms,
+                    attempts: &mut stored.delivery_attempts,
+                    expires_at: &mut stored.expires_at,
+                },
+                bytes,
+                now_ms,
+                delivered_ttl_secs,
+                &mut report,
+            );
+            if let Some(deadline) = moved {
+                batch.insert(&self.expiry, expiry_key(deadline, &key), Vec::<u8>::new());
+            }
+
+            batch.insert(&self.messages, key.as_bytes(), Self::encode(&stored)?);
+            wrote = true;
+        }
+
+        if wrote {
+            batch
+                .commit()
+                .map_err(|e| Self::db_err("mark_delivered:commit", e))?;
+        }
+        Ok(report)
+    }
+
+    async fn delivery_state(
+        &self,
+        recipient_did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<DeliveryState>, MediatorError> {
+        Ok(self
+            .record_for(msg_id, recipient_did_hash)?
+            .map(|(_, stored)| DeliveryState {
+                first_delivered_at_ms: stored.first_delivered_at_ms,
+                attempts: stored.delivery_attempts,
+            }))
+    }
+
+    async fn get_message(
+        &self,
+        did_hash: &str,
+        msg_id: &str,
+    ) -> Result<Option<MessageListElement>, MediatorError> {
+        if !ops::is_message_id(msg_id) {
+            return Ok(None);
+        }
+        // Its own inbox copy, else a copy it sent (`MessageScope::Party`).
+        // Anyone else gets `None`: don't leak existence to non-owners.
+        let stored = match self.record_for(msg_id, did_hash)? {
+            Some((_, stored)) => stored,
+            None => match self
+                .records_of(msg_id)?
+                .into_iter()
+                .find(|(_, stored)| stored.from_did_hash.as_deref() == Some(did_hash))
+            {
+                Some((_, stored)) => stored,
+                None => return Ok(None),
+            },
+        };
+
+        Ok(Some(MessageListElement {
+            msg_id: msg_id.to_string(),
+            send_id: stored.send_id.map(|s| format_stream_id(s.0, s.1)),
+            receive_id: Some(format_stream_id(stored.receive_id.0, stored.receive_id.1)),
+            size: stored.bytes as u64,
+            timestamp: stored.timestamp_ms as u64,
+            to_address: Some(stored.to_did_hash.clone()),
+            from_address: stored.from_did_hash.clone(),
+            msg: Some(stored.body.clone()),
+            protocol: Some(
+                affinidi_messaging_mediator_common::types::messages::MessageProtocol::detect(
+                    &stored.body,
+                ),
+            ),
+        }))
+    }
+
+    async fn get_message_metadata(
+        &self,
+        recipient_did_hash: &str,
+        message_hash: &str,
+    ) -> Result<MessageMetaData, MediatorError> {
+        let Some((_, stored)) = self.record_for(message_hash, recipient_did_hash)? else {
+            return Err(MediatorError::DatabaseError(
+                error_codes::DB_OPERATION_ERROR,
+                "NA".into(),
+                format!("Message metadata not found for {message_hash}"),
+            ));
+        };
+        Ok(MessageMetaData {
+            bytes: stored.bytes,
+            to_did_hash: stored.to_did_hash,
+            from_did_hash: stored.from_did_hash,
+            timestamp: stored.timestamp_ms,
+        })
+    }
+
+    async fn list_messages(
+        &self,
+        did_hash: &str,
+        folder: Folder,
+        range: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<MessageList, MediatorError> {
+        let partition = match folder {
+            Folder::Inbox => &self.inbox,
+            Folder::Outbox => &self.outbox,
+        };
+
+        // Compute (start, end) sub-keys within the DID's prefix.
+        let (start, end) = range.unwrap_or(("-", "+"));
+        let start_id = ops::parse_range_bound(start, false)?;
+        let end_id = ops::parse_range_bound(end, true)?;
+        if start_id > end_id {
+            return Ok(Vec::new());
+        }
+
+        let start_key = stream_key_from_id(did_hash, start_id);
+        let end_key = stream_key_from_id(did_hash, end_id);
+        let did_len = did_hash.len();
+
+        let mut out = Vec::new();
+        for guard in partition.range(start_key..=end_key).take(limit as usize) {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("list_messages:range", e))?;
+            // Defensive: skip anything that escaped our did_hash prefix.
+            if key.len() < did_len + 16 || &key[..did_len] != did_hash.as_bytes() {
+                continue;
+            }
+            let Some(sid) = decode_stream_id(&key[did_len..did_len + 16]) else {
+                continue;
+            };
+            let entry: StoredStreamEntry = Self::decode(&value)?;
+
+            let mut element = MessageListElement {
+                msg_id: entry.msg_id.clone(),
+                size: entry.bytes as u64,
+                timestamp: sid.0,
+                ..Default::default()
+            };
+            match folder {
+                Folder::Inbox => {
+                    element.receive_id = Some(format_stream_id(sid.0, sid.1));
+                    element.from_address = Some(entry.peer_did);
+                }
+                Folder::Outbox => {
+                    element.send_id = Some(format_stream_id(sid.0, sid.1));
+                    element.to_address = Some(entry.peer_did);
+                }
+            }
+            out.push(element);
+        }
+        Ok(out)
+    }
+
+    async fn fetch_messages(
+        &self,
+        _session_id: &str,
+        did_hash: &str,
+        options: &FetchOptions,
+    ) -> Result<GetMessagesResponse, MediatorError> {
+        let start = options.start_id.as_deref().and_then(parse_stream_id_string);
+        let limit = options.limit;
+        let optimistic_delete = matches!(options.delete_policy, FetchDeletePolicy::Optimistic);
+
+        let mut response = GetMessagesResponse::default();
+
+        // Snapshot relevant entries. Use exclusive lower bound when
+        // start is provided (matches Redis `(start_id` semantics).
+        let did_bytes = did_hash.as_bytes();
+        let did_len = did_bytes.len();
+
+        // Build start key. If `start` is None, scan from the
+        // beginning of this DID's prefix.
+        let start_key = match start {
+            Some((ms, seq)) => stream_key(did_hash, ms, seq),
+            None => {
+                let mut k = did_bytes.to_vec();
+                k.extend_from_slice(&[0u8; 16]);
+                k
+            }
+        };
+        // End at the highest stream ID for this DID.
+        let end_key = stream_key(did_hash, u64::MAX, u64::MAX);
+
+        let entries: Vec<((u64, u64), StoredStreamEntry)> = {
+            let mut buf = Vec::new();
+            for guard in self.inbox.range(start_key..=end_key) {
+                // `limit` counts entries returned, so it is checked after the
+                // cursor entry itself has been skipped.
+                if buf.len() >= limit {
+                    break;
+                }
+                let (key, value) = guard
+                    .into_inner()
+                    .map_err(|e| Self::db_err("fetch_messages:range", e))?;
+                if key.len() < did_len + 16 || &key[..did_len] != did_bytes {
+                    continue;
+                }
+                let Some(sid) = decode_stream_id(&key[did_len..did_len + 16]) else {
+                    continue;
+                };
+                // Skip the start_id itself when start is provided
+                // (exclusive lower bound).
+                if let Some(s) = start
+                    && sid == s
+                {
+                    continue;
+                }
+                let entry: StoredStreamEntry = Self::decode(&value)?;
+                buf.push((sid, entry));
+            }
+            buf
+        };
+
+        for (sid, entry) in &entries {
+            let body = self
+                .record_for(&entry.msg_id, did_hash)?
+                .map(|(_, stored)| stored.body);
+
+            let element = MessageListElement {
+                msg_id: entry.msg_id.clone(),
+                receive_id: Some(format_stream_id(sid.0, sid.1)),
+                size: entry.bytes as u64,
+                timestamp: sid.0,
+                from_address: Some(entry.peer_did.clone()),
+                to_address: Some(did_hash.to_string()),
+                msg: body,
+                ..Default::default()
+            };
+
+            if optimistic_delete {
+                let result = self
+                    .delete_message_in(
+                        &entry.msg_id,
+                        MessageScope::Recipient(did_hash),
+                        DeletionAuthority::Owner {
+                            did_hash: did_hash.to_string(),
+                        },
+                    )
+                    .await;
+                // The message stays queued, and the client still gets it
+                // with the failed delete reported, as on Redis: at least
+                // once, never a body withheld while the message remains.
+                if let Err(e) = result {
+                    response
+                        .delete_errors
+                        .push((entry.msg_id.clone(), e.to_string()));
+                }
+            }
+            response.success.push(element);
+        }
+        Ok(response)
+    }
+
+    async fn delete_folder_entries(
+        &self,
+        did_hash: &str,
+        folder: Folder,
+        stream_ids: &[String],
+    ) -> Result<(), MediatorError> {
+        let partition = match folder {
+            Folder::Inbox => &self.inbox,
+            Folder::Outbox => &self.outbox,
+        };
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut any = false;
+        for id in stream_ids {
+            if let Some(sid) = parse_stream_id_string(id) {
+                batch.remove(partition, stream_key_from_id(did_hash, sid));
+                any = true;
+            }
+        }
+        if any {
+            batch
+                .commit()
+                .map_err(|e| Self::db_err("delete_folder_entries:commit", e))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_folder_stream(
+        &self,
+        _session_id: &str,
+        did_hash: &str,
+        folder: Folder,
+    ) -> Result<(), MediatorError> {
+        let partition = match folder {
+            Folder::Inbox => &self.inbox,
+            Folder::Outbox => &self.outbox,
+        };
+        let did_bytes = did_hash.as_bytes();
+        let did_len = did_bytes.len();
+        let start = stream_key(did_hash, 0, 0);
+        let end = stream_key(did_hash, u64::MAX, u64::MAX);
+
+        let _guard = self.write_lock.lock().await;
+        let mut to_remove = Vec::new();
+        for guard in partition.range(start..=end) {
+            let (key, _value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("delete_folder_stream:range", e))?;
+            if key.len() < did_len + 16 || &key[..did_len] != did_bytes {
+                continue;
+            }
+            to_remove.push(key);
+        }
+        let mut batch = self.db.batch();
+        for k in to_remove {
+            batch.remove(partition, k.as_ref());
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("delete_folder_stream:commit", e))?;
+        Ok(())
+    }
+
+    async fn peer_queue_count(&self, from_hash: &str, to_hash: &str) -> Result<u32, MediatorError> {
+        self.read_peer_queue(from_hash, to_hash)
+    }
+
+    async fn inbox_status(&self, did_hash: &str) -> Result<InboxStatusReply, MediatorError> {
+        let mut reply = InboxStatusReply {
+            recipient_did: did_hash.to_string(),
+            ..Default::default()
+        };
+
+        // Pull queue count + total bytes from the account record (cheaper
+        // than scanning the inbox).
+        if let Some(v) = self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("inbox_status:accounts.get", e))?
+        {
+            let acc: StoredAccount = Self::decode(&v)?;
+            reply.message_count = acc.receive_queue_count as u64;
+            reply.total_bytes = acc.receive_queue_bytes;
+        }
+
+        // First and last stream IDs come from the two ends of the DID's
+        // range: one entry read from each, not a walk of the whole inbox.
+        let did_bytes = did_hash.as_bytes();
+        let did_len = did_bytes.len();
+        let start = stream_key(did_hash, 0, 0);
+        let end = stream_key(did_hash, u64::MAX, u64::MAX);
+        let stream_id_of = |guard: fjall::Guard| -> Result<Option<(u64, u64)>, MediatorError> {
+            let key = guard
+                .key()
+                .map_err(|e| Self::db_err("inbox_status:range", e))?;
+            if key.len() < did_len + 16 || &key[..did_len] != did_bytes {
+                return Ok(None);
+            }
+            Ok(decode_stream_id(&key[did_len..did_len + 16]))
+        };
+        let mut first: Option<(u64, u64)> = None;
+        for guard in self.inbox.range(start.clone()..=end.clone()) {
+            if let Some(sid) = stream_id_of(guard)? {
+                first = Some(sid);
+                break;
+            }
+        }
+        let mut last: Option<(u64, u64)> = None;
+        if first.is_some() {
+            for guard in self.inbox.range(start..=end).rev() {
+                if let Some(sid) = stream_id_of(guard)? {
+                    last = Some(sid);
+                    break;
+                }
+            }
+        }
+        // The account record counts the inbox; it is the queue count.
+        reply.queue_count = reply.message_count;
+        if let Some((ms, seq)) = first {
+            reply.oldest_received = format_stream_id(ms, seq);
+        }
+        if let Some((ms, seq)) = last {
+            reply.newest_received = format_stream_id(ms, seq);
+        }
+
+        // Live delivery: a registration with live mode on. A socket that is
+        // connected but has not turned live mode on is not live.
+        reply.live_delivery = self
+            .streaming_clients
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(did_hash)
+            .is_some_and(|c| c.state == StreamingClientState::Live);
+
+        Ok(reply)
+    }
+
+    async fn sweep_expired_messages(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+    ) -> Result<ExpiryReport, MediatorError> {
+        self.sweep_expired_messages_observed(now_secs, admin_did_hash, None)
+            .await
+    }
+
+    async fn sweep_expired_messages_observed(
+        &self,
+        now_secs: u64,
+        admin_did_hash: &str,
+        on_expired: Option<OnExpired<'_>>,
+    ) -> Result<ExpiryReport, MediatorError> {
+        // Range-scan the expiry partition with `expires_at <=
+        // now_secs`. Keys are `expires_at_be_8 || msg_id`, so we
+        // bound from `0u64` up to (and including) `now_secs`'s
+        // 8-byte big-endian + a max-byte msg_id suffix.
+        let mut start = [0u8; 8].to_vec();
+        start.extend_from_slice(&[0u8; 64]); // arbitrary low msg_id
+        let mut end = now_secs.to_be_bytes().to_vec();
+        end.extend_from_slice(&[0xFFu8; 64]);
+
+        let mut report = ExpiryReport::default();
+        let mut to_delete: Vec<(Vec<u8>, u64, String)> = Vec::new();
+        let mut last_ts: Option<u64> = None;
+        for guard in self.expiry.range(start..=end) {
+            let (key, _v) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("sweep_expired_messages:range", e))?;
+            if key.len() < 8 {
+                continue;
+            }
+            let ts: [u8; 8] = key[..8].try_into().unwrap_or([0u8; 8]);
+            let ts = u64::from_be_bytes(ts);
+            if last_ts.map(|prev| ts != prev).unwrap_or(true) {
+                report.timeslots_swept += 1;
+                last_ts = Some(ts);
+            }
+            // The row the entry names: `{msg_id}:{to}`, or a legacy bare id.
+            let row_key = String::from_utf8(key[8..].to_vec()).unwrap_or_default();
+            if !row_key.is_empty() {
+                to_delete.push((key.to_vec(), ts, row_key));
+            }
+        }
+
+        // Each entry is checked against its row's current expiry and the row
+        // removed only when the entry is due (`ops::expiry_entry_is_due`),
+        // under the write lock so nothing changes in between. A row can have
+        // more than one entry — `mark_delivered` adds a delivered-TTL deadline
+        // beside the original, and an earlier copy of the same bytes for the
+        // same recipient left its own — and only the one matching the row's
+        // expiry removes it; the rest are dropped here, never the row.
+        let by = DeletionAuthority::Admin {
+            admin_did_hash: admin_did_hash.to_string(),
+        };
+        for (key, ts, row_key) in to_delete {
+            let _guard = self.write_lock.lock().await;
+            let row: Option<StoredMessage> = match self
+                .messages
+                .get(row_key.as_bytes())
+                .map_err(|e| Self::db_err("sweep_expired_messages:messages.get", e))?
+            {
+                Some(raw) => Some(Self::decode(&raw)?),
+                None => None,
+            };
+            let msg_id = row_key.split(':').next().unwrap_or_default().to_string();
+            // A legacy bare-id row is due from any of its entries, as on
+            // Redis: the earlier `mark_delivered` added a delivered-TTL entry
+            // without recording the deadline on the row, so its expiry
+            // cannot be compared.
+            let legacy = !row_key.contains(':');
+            match row.filter(|stored| legacy || ops::expiry_entry_is_due(stored.expires_at, ts)) {
+                Some(stored) => {
+                    let meta = MessageMetaData {
+                        bytes: stored.bytes,
+                        to_did_hash: stored.to_did_hash.clone(),
+                        from_did_hash: stored.from_did_hash.clone(),
+                        timestamp: stored.timestamp_ms,
+                    };
+                    let rows = [(row_key.clone(), stored)];
+                    if let Err(e) = self.remove_records_locked(&msg_id, &rows, &by) {
+                        // A store error: keep the key, so the next sweep
+                        // retries it.
+                        tracing::warn!(msg_id, error = %e, "expiry sweep could not delete message");
+                        continue;
+                    }
+                    report.expired += 1;
+                    if let Some(observe) = on_expired {
+                        observe(&msg_id, &meta);
+                    }
+                }
+                None => report.already_deleted += 1,
+            }
+            let mut batch = self.db.batch();
+            batch.remove(&self.expiry, key);
+            batch
+                .commit()
+                .map_err(|e| Self::db_err("sweep_expired_messages:commit", e))?;
+        }
+        self.sweep_expired_outbox_receipts(now_secs).await?;
+        Ok(report)
+    }
+}
+
+#[async_trait]
+impl SessionStore for FjallStore {
+    async fn get_refresh_token_hash(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, MediatorError> {
+        match self.get_session(session_id, "").await {
+            Ok(session) => Ok(session.refresh_token_hash),
+            Err(e) if is_session_over(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn put_session(&self, session: &Session, ttl: Duration) -> Result<(), MediatorError> {
+        // Take the cross-partition write lock like every other write op
+        // in this backend. Session writes are single-key today, but
+        // holding the lock keeps them sequenced against other partitions
+        // so a future composite op (e.g. "delete session + clear
+        // streaming registration") stays consistent.
+        let _guard = self.write_lock.lock().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stored = StoredSession {
+            session: session.clone(),
+            expires_at_unix: now.saturating_add(ttl.as_secs()),
+        };
+        self.sessions
+            .insert(session.session_id.as_bytes(), Self::encode(&stored)?)
+            .map_err(|e| Self::db_err("put_session:insert", e))?;
+        Ok(())
+    }
+
+    async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
+        let raw = self
+            .sessions
+            .get(session_id.as_bytes())
+            .map_err(|e| Self::db_err("get_session:get", e))?
+            .ok_or_else(|| {
+                affinidi_messaging_mediator_common::store::session_not_found(session_id)
+            })?;
+        let stored: StoredSession = Self::decode(&raw)?;
+
+        // Lazy expiry — drop the session if it's past TTL and report
+        // "not found" to match the Redis path's behaviour.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
+            self.remove_session_if_expired(session_id, now).await;
+            return Err(affinidi_messaging_mediator_common::store::session_not_found(session_id));
+        }
+
+        // `Session::session_id` is `#[serde(skip)]`; restore it from
+        // the lookup key so the returned struct is fully populated.
+        let mut session = stored.session;
+        session.session_id = session_id.to_string();
+
+        // Join with account record for ACLs + role (matches the
+        // Redis path's "session HMGET + DID HMGET" pipeline).
+        if !did.is_empty() {
+            let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
+            // A record holding only queue counters is not an account.
+            if let Some(acc) = self.account_record(&did_hash)? {
+                session.acls = MediatorACLSet::from_u64(acc.acls);
+                session.account_type = acc.role;
+            } else if session.state != SessionState::ChallengeSent {
+                return Err(affinidi_messaging_mediator_common::store::account_gone(
+                    session_id,
+                ));
+            }
+        }
+        Ok(session)
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<(), MediatorError> {
+        // See `put_session` — session ops take the write lock for
+        // consistency with the rest of the backend.
+        let _guard = self.write_lock.lock().await;
+        self.sessions
+            .remove(session_id.as_bytes())
+            .map_err(|e| Self::db_err("delete_session:remove", e))?;
+        Ok(())
+    }
+
+    /// The promote-and-rename as one `db.batch()` under the write lock: the
+    /// new (`Authenticated`) key appears and the old (`ChallengeSent`) one
+    /// disappears together or not at all, so the two never coexist, even
+    /// across a crash.
+    async fn update_session_authenticated(
+        &self,
+        old_session_id: &str,
+        new_session_id: &str,
+        did: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let did_hash = affinidi_messaging_mediator_common::did_identity::did_hash(did);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        {
+            let _guard = self.write_lock.lock().await;
+
+            // The challenge session must exist, be unexpired and still be
+            // waiting for its answer. Under the write lock, so of two
+            // answers to one challenge only the first promotes it.
+            let mut stored: StoredSession = match self
+                .sessions
+                .get(old_session_id.as_bytes())
+                .map_err(|e| Self::db_err("update_session_authenticated:get", e))?
+            {
+                Some(raw) => Self::decode(&raw)?,
+                None => {
+                    return Err(
+                        affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                            old_session_id,
+                        ),
+                    );
+                }
+            };
+            if stored.expires_at_unix <= now || stored.session.state != SessionState::ChallengeSent
+            {
+                return Err(
+                    affinidi_messaging_mediator_common::store::session_not_awaiting_answer(
+                        old_session_id,
+                    ),
+                );
+            }
+
+            if stored.session.did.is_empty() {
+                stored.session.did = did.to_string();
+                stored.session.did_hash = did_hash;
+            }
+            stored.session.state = SessionState::Authenticated;
+            stored.session.authenticated = true;
+            stored.session.refresh_token_hash = Some(refresh_token_hash.to_string());
+            stored.expires_at_unix = now.saturating_add(86_400);
+
+            let mut batch = self.db.batch();
+            batch.insert(
+                &self.sessions,
+                new_session_id.as_bytes(),
+                Self::encode(&stored)?,
+            );
+            // Guard against old == new: removing the key we just wrote
+            // would undo the promotion. (Session IDs are freshly
+            // randomised, so this is defensive.)
+            if old_session_id != new_session_id {
+                batch.remove(&self.sessions, old_session_id.as_bytes());
+            }
+            batch
+                .commit()
+                .map_err(|e| Self::db_err("update_session_authenticated:commit", e))?;
+
+            // `bump_global` is the non-locking sync counter helper (the
+            // same one `store_message` uses inside its guard), so it
+            // won't deadlock on the non-reentrant `write_lock`.
+            let _ = self.bump_global("SESSIONS_SUCCESS", 1);
+        }
+
+        Ok(())
+    }
+
+    /// Override the trait default with a targeted in-place mutation.
+    /// The default round-trips through `get_session(session_id, "")` +
+    /// `put_session`, which (a) can substitute a corrupt
+    /// `Session::default()` (state `Unknown`, empty DID) if the
+    /// empty-DID account join misbehaves, and (b) resets the TTL to 24h.
+    /// Reading the record by key and rewriting only `refresh_token_hash`
+    /// preserves every other field — including the existing expiry —
+    /// exactly as Redis' targeted `HSET` does.
+    async fn update_refresh_token_hash(
+        &self,
+        session_id: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let raw = self
+            .sessions
+            .get(session_id.as_bytes())
+            .map_err(|e| Self::db_err("update_refresh_token_hash:get", e))?
+            .ok_or_else(|| {
+                // A refresh on a session that no longer exists must fail
+                // rather than fabricate a record — the rotation has
+                // nothing to attach to.
+                MediatorError::SessionError(
+                    error_codes::DB_OPERATION_ERROR,
+                    session_id.into(),
+                    format!("Session not found: {session_id}"),
+                )
+            })?;
+        let mut stored: StoredSession = Self::decode(&raw)?;
+        stored.session.refresh_token_hash = Some(refresh_token_hash.to_string());
+        self.sessions
+            .insert(session_id.as_bytes(), Self::encode(&stored)?)
+            .map_err(|e| Self::db_err("update_refresh_token_hash:insert", e))?;
+        Ok(())
+    }
+
+    /// Compare-and-swap under `write_lock`. Every session write in this
+    /// backend takes that lock, so nothing can change the record between the
+    /// read and the insert.
+    async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        use subtle::ConstantTimeEq;
+        let _guard = self.write_lock.lock().await;
+        let Some(raw) = self
+            .sessions
+            .get(session_id.as_bytes())
+            .map_err(|e| Self::db_err("rotate_refresh_token_hash:get", e))?
+        else {
+            return Ok(RefreshRotation::Missing);
+        };
+        let mut stored: StoredSession = Self::decode(&raw)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
+            return Ok(RefreshRotation::Missing);
+        }
+        let Some(current) = stored.session.refresh_token_hash.as_deref() else {
+            return Ok(RefreshRotation::Missing);
+        };
+        if !bool::from(current.as_bytes().ct_eq(presented_hash.as_bytes())) {
+            return Ok(RefreshRotation::Mismatch);
+        }
+        stored.session.refresh_token_hash = Some(new_hash.to_string());
+        self.sessions
+            .insert(session_id.as_bytes(), Self::encode(&stored)?)
+            .map_err(|e| Self::db_err("rotate_refresh_token_hash:insert", e))?;
+        Ok(RefreshRotation::Rotated)
+    }
+
+    async fn sweep_expired_sessions(
+        &self,
+        now_secs: u64,
+    ) -> Result<SessionSweepReport, MediatorError> {
+        // Full scan of the sessions partition: collect the keys whose
+        // TTL has elapsed first, then remove them. Collecting before
+        // removing avoids mutating the partition mid-iteration, and
+        // keeps the (potentially large) scan off the cross-partition
+        // `write_lock`. The removes take the lock and re-read each
+        // session first: one refreshed since the scan is kept.
+        // `expires_at_unix == 0` means "no expiry" and is never swept,
+        // matching the lazy-expiry guard in `get_session`.
+        let mut report = SessionSweepReport::default();
+        let mut to_remove: Vec<Vec<u8>> = Vec::new();
+        for guard in self.sessions.iter() {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("sweep_expired_sessions:iter", e))?;
+            report.scanned += 1;
+            // Only the expiry is needed to decide; the session body is
+            // skipped rather than built.
+            let stored: SessionExpiry = Self::decode(&value)?;
+            if stored.expires_at_unix > 0 && stored.expires_at_unix <= now_secs {
+                to_remove.push(key.as_ref().to_vec());
+            }
+        }
+
+        if to_remove.is_empty() {
+            return Ok(report);
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        for key in to_remove {
+            let Some(raw) = self
+                .sessions
+                .get(&key)
+                .map_err(|e| Self::db_err("sweep_expired_sessions:get", e))?
+            else {
+                continue;
+            };
+            let stored: StoredSession = Self::decode(&raw)?;
+            if stored.expires_at_unix > 0 && stored.expires_at_unix <= now_secs {
+                batch.remove(&self.sessions, key);
+                report.expired += 1;
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("sweep_expired_sessions:commit", e))?;
+        Ok(report)
+    }
+}
+
+#[async_trait]
+impl AccountStore for FjallStore {
+    /// One batch under the write lock, so every member lands together.
+    async fn account_update(
+        &self,
+        did_hash: &str,
+        update: &AccountUpdate,
+    ) -> Result<bool, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let Some(mut record) = self.account_record(did_hash)? else {
+            return Ok(false);
+        };
+        if let Some(acls) = &update.acls {
+            record.acls = acls.to_u64();
+        }
+        ops::apply_queue_limit(&mut record.queue_send_limit, update.send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, update.receive_queue_limit);
+        let mut batch = self.db.batch();
+        if let Some(role) = update.role {
+            record.role = role;
+            if role.is_admin() {
+                batch.insert(&self.admins, did_hash.as_bytes(), Vec::<u8>::new());
+            } else {
+                batch.remove(&self.admins, did_hash.as_bytes());
+            }
+        }
+        batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("account_update:commit", e))?;
+        Ok(true)
+    }
+
+    async fn account_exists(&self, did_hash: &str) -> Result<bool, MediatorError> {
+        Ok(self.account_record(did_hash)?.is_some())
+    }
+
+    async fn account_get(&self, did_hash: &str) -> Result<Option<Account>, MediatorError> {
+        let Some(acc) = self.account_record(did_hash)? else {
+            return Ok(None);
+        };
+        let count = self.access_list_count_inner(did_hash)?;
+        Ok(Some(acc.into_account(did_hash.to_string(), count as u32)))
+    }
+
+    async fn account_create(
+        &self,
+        did_hash: &str,
+        acls: &MediatorACLSet,
+        queue_limit: Option<u32>,
+    ) -> Result<Option<Account>, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        // Checked under the write lock, so an existing account is never
+        // replaced. A record holding only queue counters is completed, and
+        // its counters kept: they describe messages that are really queued.
+        let counters = match self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("account_create:get", e))?
+        {
+            Some(raw) => {
+                let existing: StoredAccount = Self::decode(&raw)?;
+                if existing.is_account {
+                    return Ok(None);
+                }
+                existing
+            }
+            None => StoredAccount::default(),
+        };
+        let mut record = StoredAccount {
+            role: AccountType::Standard,
+            acls: acls.to_u64(),
+            queue_send_limit: None,
+            queue_receive_limit: None,
+            is_account: true,
+            ..counters
+        };
+        if let Some(limit) = queue_limit {
+            record.queue_send_limit = Some(limit as i32);
+            record.queue_receive_limit = Some(limit as i32);
+        }
+        let mut batch = self.db.batch();
+        batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
+        // A fresh account starts with no activity and no counters, whatever
+        // was left behind.
+        for kind in [ActivityKind::Received, ActivityKind::Authenticated] {
+            if let Some(key) = activity_key(kind, did_hash) {
+                batch.remove(&self.globals, key.as_bytes());
+            }
+        }
+        batch.remove(&self.globals, stats_key(did_hash).as_bytes());
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("account_add:insert", e))?;
+        Ok(Some(record.into_account(did_hash.to_string(), 0)))
+    }
+
+    async fn account_remove(
+        &self,
+        _session: &Session,
+        did_hash: &str,
+    ) -> Result<bool, MediatorError> {
+        // Refuse to remove protected accounts up-front.
+        if let Some(raw) = self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("account_remove:accounts.get", e))?
+        {
+            let acc: StoredAccount = Self::decode(&raw)?;
+            if acc.role == AccountType::Mediator || acc.role == AccountType::RootAdmin {
+                return Err(MediatorError::InternalError(
+                    error_codes::PROTECTED_ACCOUNT_ERROR,
+                    "fjall".into(),
+                    "Cannot remove the mediator or root admin account".into(),
+                ));
+            }
+        }
+
+        // Block ACL.
+        let mut blocked = MediatorACLSet::default();
+        blocked.set_blocked(true);
+        self.set_did_acl(did_hash, &blocked).await?;
+
+        // Drop the outbox stream key (without purging downstream copies
+        // already delivered) and purge the inbox.
+        self.delete_folder_stream("", did_hash, Folder::Outbox)
+            .await?;
+        // As the mediator, not the owner: senders see these as `discarded`,
+        // not collected by a recipient who never read them.
+        let purged = self
+            .purge_folder_by(
+                "",
+                did_hash,
+                Folder::Inbox,
+                DeletionAuthority::Admin {
+                    admin_did_hash: did_hash.to_string(),
+                },
+            )
+            .await?;
+        affinidi_messaging_mediator_common::store::purge_left_messages(did_hash, &purged)?;
+        self.delete_folder_stream("", did_hash, Folder::Inbox)
+            .await?;
+
+        // Drop account, admin entry, and access list.
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        batch.remove(&self.accounts, did_hash.as_bytes());
+        batch.remove(&self.admins, did_hash.as_bytes());
+        for kind in [ActivityKind::Received, ActivityKind::Authenticated] {
+            if let Some(key) = activity_key(kind, did_hash) {
+                batch.remove(&self.globals, key.as_bytes());
+            }
+        }
+        batch.remove(&self.globals, stats_key(did_hash).as_bytes());
+        batch.remove(&self.scid_sources, did_hash.as_bytes());
+        batch.remove(&self.globals, wake_key(did_hash).as_bytes());
+        // Delete all access-list entries for this DID.
+        let prefix = did_hash.as_bytes();
+        for guard in self.access_lists.prefix(prefix) {
+            let (key, _) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("account_remove:al.iter", e))?;
+            batch.remove(&self.access_lists, key.as_ref());
+        }
+        // Drop the account's v1 routing keys, or its verkeys keep resolving
+        // and inbound v1 traffic keeps being accepted for a mailbox that no
+        // longer exists. Found through the reverse index, not a scan.
+        let verkeys = self
+            .v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(did_hash)
+            .cloned()
+            .unwrap_or_default();
+        for verkey in &verkeys {
+            batch.remove(&self.v1_routing_keys, verkey.as_bytes());
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("account_remove:commit", e))?;
+        // Only once the removal is committed.
+        self.v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(did_hash);
+        drop(_guard);
+
+        // A message stored while the inbox was being purged — the steps above
+        // each take the lock on their own — would otherwise outlive the
+        // account, with no row left to count it against.
+        let purged = self
+            .purge_folder_by(
+                "",
+                did_hash,
+                Folder::Inbox,
+                DeletionAuthority::Admin {
+                    admin_did_hash: did_hash.to_string(),
+                },
+            )
+            .await?;
+        affinidi_messaging_mediator_common::store::purge_left_messages(did_hash, &purged)?;
+        Ok(true)
+    }
+
+    async fn account_list(
+        &self,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<MediatorAccountList, MediatorError> {
+        let limit = limit.min(100) as usize;
+        let mut accounts = Vec::with_capacity(limit);
+        let mut total_seen: u32 = 0;
+        let mut returned: u32 = 0;
+        let mut more_after = false;
+
+        // Skipped rows before the cursor are counted without reading
+        // their values.
+        let mut rows = self.accounts.iter();
+        for guard in rows.by_ref().take(cursor as usize) {
+            guard
+                .key()
+                .map_err(|e| Self::db_err("account_list:skip", e))?;
+            total_seen += 1;
+        }
+        for guard in rows {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("account_list:iter", e))?;
+            if returned as usize >= limit {
+                more_after = true;
+                break;
+            }
+            let did_hash = String::from_utf8(key.as_ref().to_vec()).unwrap_or_default();
+            let acc: StoredAccount = Self::decode(&value)?;
+            // A record holding only queue counters is not an account; it is
+            // counted towards the cursor so paging stays stable.
+            if !acc.is_account {
+                total_seen += 1;
+                continue;
+            }
+            let count = self.access_list_count_inner(&did_hash)? as u32;
+            accounts.push(acc.into_account(did_hash, count));
+            total_seen += 1;
+            returned += 1;
+        }
+
+        // The next page starts after every row this one consumed, counter-only
+        // records included; `cursor + returned` would re-serve accounts that
+        // followed a skipped row.
+        let next_cursor = if more_after { total_seen } else { 0 };
+        Ok(MediatorAccountList {
+            accounts,
+            cursor: next_cursor,
+        })
+    }
+
+    async fn account_set_role(
+        &self,
+        did_hash: &str,
+        account_type: &AccountType,
+    ) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let mut record: StoredAccount = match self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("account_set_role:get", e))?
+        {
+            Some(v) => Self::decode(&v)?,
+            None => StoredAccount::default(),
+        };
+        record.role = *account_type;
+        // A role makes the record an account, as `ROLE_TYPE` does on Redis.
+        record.is_account = true;
+
+        let mut batch = self.db.batch();
+        batch.insert(&self.accounts, did_hash.as_bytes(), Self::encode(&record)?);
+        if account_type.is_admin() {
+            batch.insert(&self.admins, did_hash.as_bytes(), Vec::<u8>::new());
+        } else {
+            batch.remove(&self.admins, did_hash.as_bytes());
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("account_set_role:commit", e))?;
+        Ok(())
+    }
+
+    async fn account_change_queue_limits(
+        &self,
+        did_hash: &str,
+        send_queue_limit: Option<i32>,
+        receive_queue_limit: Option<i32>,
+    ) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let mut record: StoredAccount = match self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("account_change_queue_limits:get", e))?
+        {
+            Some(v) => Self::decode(&v)?,
+            None => StoredAccount::default(),
+        };
+        ops::apply_queue_limit(&mut record.queue_send_limit, send_queue_limit);
+        ops::apply_queue_limit(&mut record.queue_receive_limit, receive_queue_limit);
+        self.accounts
+            .insert(did_hash.as_bytes(), Self::encode(&record)?)
+            .map_err(|e| Self::db_err("account_change_queue_limits:insert", e))?;
+        Ok(())
+    }
+
+    async fn setup_admin_account(
+        &self,
+        admin_did_hash: &str,
+        admin_type: AccountType,
+        acls: &MediatorACLSet,
+    ) -> Result<(), MediatorError> {
+        // Unconditional: a no-op for an existing account, and it completes a
+        // record that holds only queue counters, so the role below is never
+        // set on a record without ACLs.
+        self.account_create(admin_did_hash, acls, None).await?;
+        let _guard = self.write_lock.lock().await;
+        let mut record: StoredAccount = self
+            .accounts
+            .get(admin_did_hash.as_bytes())
+            .map_err(|e| Self::db_err("setup_admin_account:get", e))?
+            .map(|v| Self::decode(&v))
+            .transpose()?
+            .unwrap_or_default();
+        record.role = admin_type;
+        let mut batch = self.db.batch();
+        batch.insert(
+            &self.accounts,
+            admin_did_hash.as_bytes(),
+            Self::encode(&record)?,
+        );
+        batch.insert(&self.admins, admin_did_hash.as_bytes(), Vec::<u8>::new());
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("setup_admin_account:commit", e))?;
+        Ok(())
+    }
+
+    async fn check_admin_account(&self, did_hash: &str) -> Result<bool, MediatorError> {
+        let in_admins = self
+            .admins
+            .contains_key(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("check_admin_account:contains", e))?;
+        if !in_admins {
+            return Ok(false);
+        }
+        let role = self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("check_admin_account:get", e))?
+            .map(|v| Self::decode::<StoredAccount>(&v).map(|a| a.role))
+            .transpose()?;
+        Ok(matches!(
+            role,
+            Some(AccountType::Admin) | Some(AccountType::RootAdmin)
+        ))
+    }
+
+    async fn account_activity_record(
+        &self,
+        did_hash: &str,
+        kind: ActivityKind,
+        at: u64,
+    ) -> Result<(), MediatorError> {
+        let Some(key) = activity_key(kind, did_hash) else {
+            return Ok(());
+        };
+        // Under the write lock, so it cannot interleave with `account_remove`
+        // and leave a removed account's record behind.
+        let _guard = self.write_lock.lock().await;
+        let exists = self.account_record(did_hash)?.is_some();
+        if !exists {
+            return Ok(());
+        }
+        self.globals
+            .insert(key, at.to_be_bytes())
+            .map_err(|e| Self::db_err("account_activity_record", e))
+    }
+
+    async fn account_activity(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountActivity>, MediatorError> {
+        let read = |kind, hash: &str| -> Result<Option<u64>, MediatorError> {
+            let Some(key) = activity_key(kind, hash) else {
+                return Ok(None);
+            };
+            let value = self
+                .globals
+                .get(key)
+                .map_err(|e| Self::db_err("account_activity", e))?;
+            Ok(value.and_then(|v| <[u8; 8]>::try_from(v.as_ref()).ok().map(u64::from_be_bytes)))
+        };
+        did_hashes
+            .iter()
+            .map(|hash| {
+                let mut activity = AccountActivity::default();
+                activity.last_received = read(ActivityKind::Received, hash)?;
+                activity.last_authenticated = read(ActivityKind::Authenticated, hash)?;
+                Ok(activity)
+            })
+            .collect()
+    }
+
+    async fn account_stats_bump(
+        &self,
+        did_hash: &str,
+        delta: AccountStatsDelta,
+    ) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        if self.account_record(did_hash)?.is_none() {
+            return Ok(());
+        }
+        let key = stats_key(did_hash);
+        let mut stats = self.read_stats(&key)?;
+        stats.apply(delta);
+        self.globals
+            .insert(
+                key,
+                serde_json::to_vec(&stats).map_err(|e| {
+                    MediatorError::InternalError(
+                        error_codes::DB_OPERATION_ERROR,
+                        did_hash.into(),
+                        e.to_string(),
+                    )
+                })?,
+            )
+            .map_err(|e| Self::db_err("account_stats_bump:insert", e))
+    }
+
+    async fn account_stats(
+        &self,
+        did_hashes: &[String],
+    ) -> Result<Vec<AccountStats>, MediatorError> {
+        did_hashes
+            .iter()
+            .map(|hash| self.read_stats(&stats_key(hash)))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl AclStore for FjallStore {
+    /// Planned by `ops::plan_access_list_update` and applied as one batch
+    /// under the write lock.
+    async fn access_list_update(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        update: &AccessListUpdate,
+    ) -> Result<AccessListUpdateOutcome, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let current = self.access_list_members(did_hash)?;
+        let plan = ops::plan_access_list_update(&current, update, access_list_limit);
+        let key = |member: &str| {
+            let mut k = did_hash.as_bytes().to_vec();
+            k.extend_from_slice(member.as_bytes());
+            k
+        };
+        let mut batch = self.db.batch();
+        for member in &plan.delete {
+            batch.remove(&self.access_lists, key(member));
+        }
+        for member in &plan.insert {
+            batch.insert(&self.access_lists, key(member), Vec::<u8>::new());
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("access_list_update:commit", e))?;
+        Ok(plan.outcome)
+    }
+
+    async fn set_did_acl(
+        &self,
+        did_hash: &str,
+        acls: &MediatorACLSet,
+    ) -> Result<MediatorACLSet, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let mut record: StoredAccount = match self
+            .accounts
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("set_did_acl:get", e))?
+        {
+            Some(v) => Self::decode(&v)?,
+            None => StoredAccount::default(),
+        };
+        record.acls = acls.to_u64();
+        // ACLs make the record an account, as `ACLS` does on Redis.
+        record.is_account = true;
+        self.accounts
+            .insert(did_hash.as_bytes(), Self::encode(&record)?)
+            .map_err(|e| Self::db_err("set_did_acl:insert", e))?;
+        Ok(acls.clone())
+    }
+
+    async fn get_did_acl(&self, did_hash: &str) -> Result<Option<MediatorACLSet>, MediatorError> {
+        let Some(acc) = self.account_record(did_hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(MediatorACLSet::from_u64(acc.acls)))
+    }
+
+    async fn get_did_acls(
+        &self,
+        dids: &[String],
+        mediator_acl_mode: AccessListModeType,
+    ) -> Result<MediatorACLGetResponse, MediatorError> {
+        if dids.len() > 100 {
+            return Err(MediatorError::DatabaseError(
+                error_codes::ACL_GET_DIDS_LIMIT,
+                "fjall".into(),
+                "# of DIDs cannot exceed 100".into(),
+            ));
+        }
+        let mut response = MediatorACLGetResponse {
+            acl_response: Vec::with_capacity(dids.len()),
+            mediator_acl_mode,
+        };
+        for did in dids {
+            if let Some(acc) = self.account_record(did)? {
+                let acls = MediatorACLSet::from_u64(acc.acls);
+                response.acl_response.push(
+                    affinidi_messaging_sdk::protocols::mediator::acls_handler::MediatorACLExpanded {
+                        did_hash: did.clone(),
+                        acl_value: acls.to_hex_string(),
+                        acls,
+                    },
+                );
+            }
+        }
+        Ok(response)
+    }
+
+    async fn access_list_allowed(&self, to_hash: &str, from_hash: Option<&str>) -> bool {
+        matches!(
+            self.delivery_decision(to_hash, from_hash).await,
+            Ok(Some(decision)) if decision.access_list_allows
+        )
+    }
+
+    /// One account-partition read serves the ACL set and existence; the
+    /// membership probe is a separate prefix lookup only when the sender is
+    /// known.
+    async fn delivery_decision(
+        &self,
+        to_hash: &str,
+        from_hash: Option<&str>,
+    ) -> Result<Option<DeliveryDecision>, MediatorError> {
+        // Probe the access list before reading the account, so a recipient
+        // with no account costs the same reads as one that has one.
+        let on_access_list =
+            from_hash.map(|from| self.access_list_contains(to_hash, from).unwrap_or(false));
+        let Ok(Some(raw)) = self.accounts.get(to_hash.as_bytes()) else {
+            return Ok(None);
+        };
+        let acc = match Self::decode::<StoredAccount>(&raw) {
+            Ok(a) if a.is_account => a,
+            _ => return Ok(None),
+        };
+        let acls = MediatorACLSet::from_u64(acc.acls);
+        let sender = match on_access_list {
+            Some(on_access_list) => ops::Sender::Known { on_access_list },
+            None => ops::Sender::Anonymous,
+        };
+        let access_list_allows = ops::access_list_allowed(&acls, sender);
+        Ok(Some(DeliveryDecision {
+            acls,
+            access_list_allows,
+        }))
+    }
+
+    async fn access_list_list(
+        &self,
+        did_hash: &str,
+        cursor: u64,
+    ) -> Result<MediatorAccessListListResponse, MediatorError> {
+        let prefix = did_hash.as_bytes();
+        let prefix_len = prefix.len();
+        let mut entries = Vec::new();
+        let mut seen: u64 = 0;
+        let mut more_after = false;
+
+        for guard in self.access_lists.prefix(prefix) {
+            let (key, _v) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("access_list_list:prefix", e))?;
+            if seen < cursor {
+                seen += 1;
+                continue;
+            }
+            if entries.len() >= 100 {
+                more_after = true;
+                break;
+            }
+            // Strip the did_hash prefix to get the member DID hash.
+            if key.len() <= prefix_len {
+                continue;
+            }
+            let member = String::from_utf8(key[prefix_len..].to_vec()).unwrap_or_default();
+            entries.push(member);
+            seen += 1;
+        }
+
+        let next = if more_after {
+            Some(cursor + entries.len() as u64)
+        } else {
+            None
+        };
+        Ok(MediatorAccessListListResponse {
+            cursor: next,
+            did_hashes: entries,
+        })
+    }
+
+    async fn access_list_add(
+        &self,
+        access_list_limit: usize,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<MediatorAccessListAddResponse, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let current = self.access_list_count_inner(did_hash)?;
+        let (to_add, truncated) = ops::admit_to_access_list(current, hashes, access_list_limit);
+        let mut batch = self.db.batch();
+        for h in &to_add {
+            let mut k = did_hash.as_bytes().to_vec();
+            k.extend_from_slice(h.as_bytes());
+            batch.insert(&self.access_lists, k, Vec::<u8>::new());
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("access_list_add:commit", e))?;
+        Ok(MediatorAccessListAddResponse {
+            did_hashes: to_add,
+            truncated,
+        })
+    }
+
+    async fn access_list_remove(
+        &self,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<usize, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut removed = 0;
+        for h in hashes {
+            let mut k = did_hash.as_bytes().to_vec();
+            k.extend_from_slice(h.as_bytes());
+            // Only count actually-present entries.
+            if self
+                .access_lists
+                .contains_key(&k)
+                .map_err(|e| Self::db_err("access_list_remove:contains", e))?
+            {
+                batch.remove(&self.access_lists, k);
+                removed += 1;
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("access_list_remove:commit", e))?;
+        Ok(removed)
+    }
+
+    async fn access_list_clear(&self, did_hash: &str) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        for guard in self.access_lists.prefix(did_hash.as_bytes()) {
+            let (key, _) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("access_list_clear:prefix", e))?;
+            batch.remove(&self.access_lists, key.as_ref());
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("access_list_clear:commit", e))?;
+        Ok(())
+    }
+
+    async fn access_list_get(
+        &self,
+        did_hash: &str,
+        hashes: &[String],
+    ) -> Result<MediatorAccessListGetResponse, MediatorError> {
+        let mut found = Vec::new();
+        for h in hashes {
+            if self.access_list_contains(did_hash, h)? {
+                found.push(h.clone());
+            }
+        }
+        Ok(MediatorAccessListGetResponse { did_hashes: found })
+    }
+}
+
+#[async_trait]
+impl StatsStore for FjallStore {
+    async fn get_global_stats(&self) -> Result<MetadataStats, MediatorError> {
+        // Pulls all counters in one snapshot. The reads are independent
+        // (no atomic guarantee across counters), which matches Redis
+        // `HGETALL GLOBAL` semantics — counters are updated by separate
+        // `HINCRBY`s and a snapshot can split mid-update there too.
+        Ok(MetadataStats {
+            received_bytes: self.read_global("RECEIVED_BYTES"),
+            sent_bytes: self.read_global("SENT_BYTES"),
+            deleted_bytes: self.read_global("DELETED_BYTES"),
+            received_count: self.read_global("RECEIVED_COUNT"),
+            sent_count: self.read_global("SENT_COUNT"),
+            deleted_count: self.read_global("DELETED_COUNT"),
+            websocket_open: self.read_global("WEBSOCKET_OPEN"),
+            websocket_close: self.read_global("WEBSOCKET_CLOSE"),
+            sessions_created: self.read_global("SESSIONS_CREATED"),
+            sessions_success: self.read_global("SESSIONS_SUCCESS"),
+            oob_invites_created: self.read_global("OOB_INVITES_CREATED"),
+            oob_invites_claimed: self.read_global("OOB_INVITES_CLAIMED"),
+        })
+    }
+
+    async fn stats_increment(&self, counter: StatCounter, by: i64) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let key = match counter {
+            StatCounter::SentBytes => "SENT_BYTES",
+            StatCounter::SentCount => "SENT_COUNT",
+            StatCounter::WebsocketOpen => "WEBSOCKET_OPEN",
+            StatCounter::WebsocketClose => "WEBSOCKET_CLOSE",
+            StatCounter::SessionsCreated => "SESSIONS_CREATED",
+            StatCounter::SessionsSuccess => "SESSIONS_SUCCESS",
+            StatCounter::OobInvitesCreated => "OOB_INVITES_CREATED",
+            StatCounter::OobInvitesClaimed => "OOB_INVITES_CLAIMED",
+        };
+        self.bump_global(key, by)
+    }
+}
+
+#[async_trait]
+impl ForwardQueueStore for FjallStore {
+    /// No consumer records are kept beyond the pending entries, so there is
+    /// nothing to prune.
+    async fn forward_queue_prune_consumers(
+        &self,
+        _group_name: &str,
+        _keep_consumer: &str,
+        _min_idle: Duration,
+    ) -> Result<usize, MediatorError> {
+        Ok(0)
+    }
+
+    async fn forward_queue_enqueue(
+        &self,
+        entry: &ForwardQueueEntry,
+        max_len: usize,
+    ) -> Result<String, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let id = self.alloc_stream_id();
+        let mut entry = entry.clone();
+        entry.stream_id = format_stream_id(id.0, id.1);
+        let stream_id = entry.stream_id.clone();
+
+        let mut batch = self.db.batch();
+        batch.insert(
+            &self.forward_queue,
+            encode_stream_id(id.0, id.1).to_vec(),
+            Self::encode(&entry)?,
+        );
+
+        // Approximate `max_len` trim: drop oldest entries when over.
+        let current = self.forward_queue_count_inner();
+        let mut removed = 0usize;
+        if max_len > 0 {
+            let mut to_remove = Vec::new();
+            if current >= max_len {
+                let over = current - max_len + 1; // +1 because we're adding one
+                // `key()` skips materialising the value, unlike `into_inner()`.
+                for guard in self.forward_queue.iter().take(over) {
+                    to_remove.push(
+                        guard
+                            .key()
+                            .map_err(|e| Self::db_err("forward_queue_enqueue:trim", e))?,
+                    );
+                }
+            }
+            removed = to_remove.len();
+            for k in to_remove {
+                batch.remove(&self.forward_queue, k.as_ref());
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_enqueue:commit", e))?;
+
+        // Only after the batch is durable, so a failed commit can't drift the
+        // counter. Still under `write_lock`, so this is not racy.
+        self.forward_queue_len
+            .store(current + 1 - removed, Ordering::Release);
+        drop(_guard);
+        self.sync_if_durable("forward_queue_enqueue:persist")
+            .await?;
+        self.forward_notify.notify_waiters();
+        Ok(stream_id)
+    }
+
+    async fn forward_queue_len(&self) -> Result<usize, MediatorError> {
+        Ok(self.forward_queue_count_inner())
+    }
+
+    async fn forward_queue_read(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        count: usize,
+        block: Duration,
+    ) -> Result<Vec<ForwardQueueEntry>, MediatorError> {
+        // Inner closure: read up to `count` entries strictly past the
+        // group's `last_delivered` cursor, claim them, and update the
+        // cursor — all under the write lock so two consumers don't
+        // double-deliver.
+        let try_read = |store: &Self| -> Result<Vec<ForwardQueueEntry>, MediatorError> {
+            let last = store.read_group_cursor(group_name);
+            let lower = match last {
+                Some(sid) => std::ops::Bound::Excluded(encode_stream_id(sid.0, sid.1).to_vec()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut entries = Vec::new();
+            let mut malformed: Vec<(u64, u64)> = Vec::new();
+            let mut new_last: Option<(u64, u64)> = last;
+            for guard in store
+                .forward_queue
+                .range::<Vec<u8>, _>((lower, std::ops::Bound::Unbounded))
+                .take(count)
+            {
+                let (key, value) = guard
+                    .into_inner()
+                    .map_err(|e| Self::db_err("forward_queue_read:range", e))?;
+                let Some(sid) = decode_stream_id(key.as_ref()) else {
+                    continue;
+                };
+                new_last = Some(sid);
+                match Self::decode::<ForwardQueueEntry>(&value) {
+                    Ok(entry) => entries.push((sid, entry)),
+                    // Dropped below, rather than failing every read from here.
+                    Err(e) => {
+                        tracing::warn!(
+                            "Dropping malformed forward queue entry {}-{}: {e}",
+                            sid.0,
+                            sid.1
+                        );
+                        malformed.push(sid);
+                    }
+                }
+            }
+
+            // Persist the claims and the new cursor in one batch.
+            let mut batch = store.db.batch();
+            let now = now_ms_u64();
+            for (sid, _entry) in &entries {
+                let claim = StoredPendingClaim {
+                    consumer: consumer_name.to_string(),
+                    claimed_at_ms: now,
+                    delivery_count: 1,
+                };
+                batch.insert(
+                    &store.forward_pending,
+                    pending_key(group_name, *sid),
+                    Self::encode(&claim)?,
+                );
+            }
+            if let Some(sid) = new_last {
+                batch.insert(
+                    &store.globals,
+                    group_cursor_key(group_name),
+                    encode_stream_id(sid.0, sid.1).to_vec(),
+                );
+            }
+            for sid in &malformed {
+                batch.remove(
+                    &store.forward_queue,
+                    encode_stream_id(sid.0, sid.1).to_vec(),
+                );
+            }
+            batch
+                .commit()
+                .map_err(|e| Self::db_err("forward_queue_read:commit", e))?;
+            if !malformed.is_empty() {
+                store
+                    .forward_queue_len
+                    .fetch_sub(malformed.len(), Ordering::AcqRel);
+            }
+
+            Ok(entries.into_iter().map(|(_, e)| e).collect())
+        };
+
+        let initial = {
+            let _guard = self.write_lock.lock().await;
+            try_read(self)?
+        };
+        if !initial.is_empty() || block.is_zero() {
+            return Ok(initial);
+        }
+        // Empty + caller asked to block — wait for an enqueue or
+        // timeout, then try once more.
+        let _ = tokio::time::timeout(block, self.forward_notify.notified()).await;
+        let _guard = self.write_lock.lock().await;
+        try_read(self)
+    }
+
+    async fn forward_queue_ack(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        for id in stream_ids {
+            if let Some(sid) = parse_stream_id_string(id) {
+                batch.remove(&self.forward_pending, pending_key(group_name, sid));
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_ack:commit", e))?;
+        Ok(())
+    }
+
+    async fn forward_queue_delete(&self, stream_ids: &[&str]) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        // Removing an absent key is a no-op in Fjall but would still decrement
+        // the counter, so only count the ones that are actually there. Callers
+        // legitimately re-delete (duplicate acks, autoclaim races).
+        let mut removed = 0usize;
+        for id in stream_ids {
+            if let Some(sid) = parse_stream_id_string(id) {
+                let key = encode_stream_id(sid.0, sid.1).to_vec();
+                if self
+                    .forward_queue
+                    .contains_key(&key)
+                    .map_err(|e| Self::db_err("forward_queue_delete:contains", e))?
+                {
+                    removed += 1;
+                    batch.remove(&self.forward_queue, key);
+                }
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_delete:commit", e))?;
+
+        // Only after the batch is durable. Still under `write_lock`.
+        self.forward_queue_len.fetch_sub(removed, Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn forward_queue_ack_and_delete(
+        &self,
+        group_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<(), MediatorError> {
+        // One batch: a crash between a separate ack and delete would leave an
+        // entry no consumer holds and the group cursor has passed — never
+        // read, claimed or deleted again.
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut removed = 0usize;
+        for id in stream_ids {
+            if let Some(sid) = parse_stream_id_string(id) {
+                batch.remove(&self.forward_pending, pending_key(group_name, sid));
+                let key = encode_stream_id(sid.0, sid.1).to_vec();
+                if self
+                    .forward_queue
+                    .contains_key(&key)
+                    .map_err(|e| Self::db_err("forward_queue_ack_and_delete:contains", e))?
+                {
+                    removed += 1;
+                    batch.remove(&self.forward_queue, key);
+                }
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_ack_and_delete:commit", e))?;
+        self.forward_queue_len.fetch_sub(removed, Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn forward_queue_autoclaim(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        min_idle: Duration,
+        count: usize,
+        cursor: &str,
+    ) -> Result<ForwardQueueClaimPage, MediatorError> {
+        let now = now_ms_u64();
+        let min_idle_ms = min_idle.as_millis() as u64;
+        let start = parse_stream_id_string(cursor).unwrap_or((0, 0));
+
+        let _guard = self.write_lock.lock().await;
+        let group_prefix_len = group_name.len() + 1; // +1 for the null byte
+        // Examine a bounded stretch of the pending list per call, as Redis
+        // does, and say where to continue.
+        let scan_limit = count.max(1).saturating_mul(AUTOCLAIM_SCAN_FACTOR);
+
+        // Snapshot pending entries for this group, from the cursor, whose
+        // claim is older than `min_idle`.
+        let mut stale: Vec<((u64, u64), StoredPendingClaim)> = Vec::new();
+        let mut next_cursor = None;
+        let mut examined = 0usize;
+        for guard in self
+            .forward_pending
+            .range::<Vec<u8>, _>(pending_key(group_name, start)..)
+        {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("forward_queue_autoclaim:range", e))?;
+            // Past this group's keys: the scan is complete.
+            if key.len() < group_prefix_len + 16
+                || &key[..group_name.len()] != group_name.as_bytes()
+                || key[group_name.len()] != 0x00
+            {
+                break;
+            }
+            let Some(sid) = decode_stream_id(&key[group_prefix_len..]) else {
+                continue;
+            };
+            if examined >= scan_limit || stale.len() >= count {
+                next_cursor = Some(format_stream_id(sid.0, sid.1));
+                break;
+            }
+            examined += 1;
+            let claim: StoredPendingClaim = Self::decode(&value)?;
+            if now.saturating_sub(claim.claimed_at_ms) >= min_idle_ms {
+                stale.push((sid, claim));
+            }
+        }
+
+        // Re-claim each stale entry under the new consumer and bump
+        // delivery count. Persist updated claims + collect the
+        // associated queue entries to return.
+        let mut batch = self.db.batch();
+        let mut entries = Vec::with_capacity(stale.len());
+        let mut dropped = 0usize;
+        for (sid, claim) in stale {
+            let Some(raw) = self
+                .forward_queue
+                .get(encode_stream_id(sid.0, sid.1))
+                .map_err(|e| Self::db_err("forward_queue_autoclaim:fetch", e))?
+            else {
+                // The entry is gone (trimmed, or deleted after a crash between
+                // ack and delete): nothing left to deliver, so drop the claim
+                // rather than re-claiming it forever — as Redis's XAUTOCLAIM
+                // does for deleted entries.
+                batch.remove(&self.forward_pending, pending_key(group_name, sid));
+                continue;
+            };
+            let entry = match Self::decode::<ForwardQueueEntry>(&raw) {
+                Ok(entry) => entry,
+                // Dropped, claim and all, rather than reclaimed on every sweep.
+                Err(e) => {
+                    tracing::warn!(
+                        "Dropping malformed forward queue entry {}-{}: {e}",
+                        sid.0,
+                        sid.1
+                    );
+                    batch.remove(&self.forward_pending, pending_key(group_name, sid));
+                    batch.remove(&self.forward_queue, encode_stream_id(sid.0, sid.1).to_vec());
+                    dropped += 1;
+                    continue;
+                }
+            };
+            let new_claim = StoredPendingClaim {
+                consumer: consumer_name.to_string(),
+                claimed_at_ms: now,
+                delivery_count: claim.delivery_count.saturating_add(1),
+            };
+            batch.insert(
+                &self.forward_pending,
+                pending_key(group_name, sid),
+                Self::encode(&new_claim)?,
+            );
+            entries.push(entry);
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_autoclaim:commit", e))?;
+        if dropped > 0 {
+            self.forward_queue_len.fetch_sub(dropped, Ordering::AcqRel);
+        }
+        Ok(ForwardQueueClaimPage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    async fn forward_queue_finish(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_id: &str,
+        requeue: Option<&ForwardQueueEntry>,
+    ) -> Result<bool, MediatorError> {
+        let Some(sid) = parse_stream_id_string(stream_id) else {
+            return Ok(false);
+        };
+        // Under the write lock, so the ownership check and the write cannot
+        // be split by an autoclaim moving the claim.
+        let guard = self.write_lock.lock().await;
+        let claim_key = pending_key(group_name, sid);
+        let held = self
+            .forward_pending
+            .get(&claim_key)
+            .map_err(|e| Self::db_err("forward_queue_finish:get", e))?
+            .map(|raw| Self::decode::<StoredPendingClaim>(&raw))
+            .transpose()?
+            .is_some_and(|claim| claim.consumer == consumer_name);
+        if !held {
+            return Ok(false);
+        }
+
+        let mut batch = self.db.batch();
+        let mut len = self.forward_queue_count_inner();
+        if let Some(entry) = requeue {
+            let id = self.alloc_stream_id();
+            let mut entry = entry.clone();
+            entry.stream_id = format_stream_id(id.0, id.1);
+            batch.insert(
+                &self.forward_queue,
+                encode_stream_id(id.0, id.1).to_vec(),
+                Self::encode(&entry)?,
+            );
+            len += 1;
+        }
+        batch.remove(&self.forward_pending, claim_key);
+        let key = encode_stream_id(sid.0, sid.1).to_vec();
+        if self
+            .forward_queue
+            .contains_key(&key)
+            .map_err(|e| Self::db_err("forward_queue_finish:contains", e))?
+        {
+            len -= 1;
+            batch.remove(&self.forward_queue, key);
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_finish:commit", e))?;
+        // Only after the batch is durable. Still under `write_lock`.
+        self.forward_queue_len.store(len, Ordering::Release);
+        drop(guard);
+        self.sync_if_durable("forward_queue_finish:persist").await?;
+        if requeue.is_some() {
+            self.forward_notify.notify_waiters();
+        }
+        Ok(true)
+    }
+
+    async fn forward_queue_refresh_claims(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        stream_ids: &[&str],
+    ) -> Result<Vec<String>, MediatorError> {
+        let now = now_ms_u64();
+        // Under the write lock, so a concurrent autoclaim cannot move a claim
+        // between the ownership check and the refresh.
+        let _guard = self.write_lock.lock().await;
+        let mut batch = self.db.batch();
+        let mut lost = Vec::new();
+        for id in stream_ids {
+            let Some(sid) = parse_stream_id_string(id) else {
+                lost.push(id.to_string());
+                continue;
+            };
+            let key = pending_key(group_name, sid);
+            let claim = self
+                .forward_pending
+                .get(&key)
+                .map_err(|e| Self::db_err("forward_queue_refresh_claims:get", e))?
+                .map(|raw| Self::decode::<StoredPendingClaim>(&raw))
+                .transpose()?;
+            match claim {
+                Some(claim) if claim.consumer == consumer_name => {
+                    let refreshed = StoredPendingClaim {
+                        claimed_at_ms: now,
+                        ..claim
+                    };
+                    batch.insert(&self.forward_pending, key, Self::encode(&refreshed)?);
+                }
+                _ => lost.push(id.to_string()),
+            }
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("forward_queue_refresh_claims:commit", e))?;
+        Ok(lost)
+    }
+}
+
+#[async_trait]
+impl StreamingStore for FjallStore {
+    // One process: no other instance to coordinate with. These are the
+    // explicit single-process answers (`store::single_process`).
+
+    async fn streaming_claim(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        live: bool,
+        _kind: StreamingKind,
+        _write: StreamingWrite,
+    ) -> Result<StreamingClaim, MediatorError> {
+        single_process::streaming_claim(self, did_hash, mediator_uuid, live).await
+    }
+
+    async fn streaming_release(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        single_process::streaming_release(self, did_hash, mediator_uuid).await
+    }
+
+    async fn streaming_heartbeat(
+        &self,
+        _mediator_uuid: &str,
+        _lifetime: Duration,
+        _prune_after: Duration,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    async fn streaming_dead_instances(
+        &self,
+        mediator_uuids: &[String],
+    ) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; mediator_uuids.len()])
+    }
+
+    async fn streaming_evict(
+        &self,
+        _did_hash: &str,
+        _dead_uuid: &str,
+    ) -> Result<bool, MediatorError> {
+        Ok(false)
+    }
+
+    async fn streaming_mux_owned(&self, did_hashes: &[String]) -> Result<Vec<bool>, MediatorError> {
+        Ok(vec![false; did_hashes.len()])
+    }
+
+    async fn monitor_fanout_publish(
+        &self,
+        _scope: &str,
+        _payload: &str,
+    ) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    async fn monitor_fanout_subscribe(
+        &self,
+        _scope: &str,
+    ) -> Result<Option<broadcast::Receiver<String>>, MediatorError> {
+        Ok(None)
+    }
+
+    async fn streaming_clean_start(&self, mediator_uuid: &str) -> Result<(), MediatorError> {
+        // Drop every registration that points at this mediator UUID. The
+        // table is in memory, so on a fresh process it is already empty; the
+        // call is kept for the trait's restart contract.
+        self.streaming_clients
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, c| c.mediator_uuid != mediator_uuid);
+        Ok(())
+    }
+
+    async fn streaming_set_state(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        state: StreamingClientState,
+    ) -> Result<(), MediatorError> {
+        // In memory and under one std lock: no `write_lock`, no disk write,
+        // and no interleaving with `streaming_clean_start`.
+        let mut clients = self
+            .streaming_clients
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match state {
+            // Only the owner's leaving removes the entry: another instance
+            // may hold the DID now.
+            StreamingClientState::Deregistered => {
+                if clients
+                    .get(did_hash)
+                    .is_some_and(|c| c.mediator_uuid == mediator_uuid)
+                {
+                    clients.remove(did_hash);
+                }
+            }
+            other => {
+                clients.insert(
+                    did_hash.to_string(),
+                    StoredStreamingClient {
+                        mediator_uuid: mediator_uuid.to_string(),
+                        state: other,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn streaming_is_client_live(
+        &self,
+        did_hash: &str,
+        force_delivery: bool,
+    ) -> Option<String> {
+        let clients = self
+            .streaming_clients
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let stored = clients.get(did_hash)?;
+        match stored.state {
+            StreamingClientState::Live => Some(stored.mediator_uuid.clone()),
+            StreamingClientState::Registered if force_delivery => {
+                Some(stored.mediator_uuid.clone())
+            }
+            _ => None,
+        }
+    }
+
+    async fn streaming_publish_message(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+    ) -> Result<(), MediatorError> {
+        // Even before `streaming_set_state` lands, publishing into
+        // the broadcast channel works — it lets in-process subscribers
+        // receive notifications. The cross-process aspect (which Fjall
+        // can't do) stays unsupported.
+        self.publish_record(
+            did_hash,
+            mediator_uuid,
+            message,
+            force_delivery,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn streaming_publish_stored(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+        force_delivery: bool,
+        stored: StoredMessageRef,
+    ) -> Result<(), MediatorError> {
+        self.publish_record(
+            did_hash,
+            mediator_uuid,
+            message,
+            force_delivery,
+            false,
+            Some(stored),
+        )
+        .await
+    }
+
+    async fn streaming_publish_verbatim(
+        &self,
+        did_hash: &str,
+        mediator_uuid: &str,
+        message: &str,
+    ) -> Result<(), MediatorError> {
+        self.publish_record(did_hash, mediator_uuid, message, true, true, None)
+            .await
+    }
+
+    async fn streaming_subscribe(
+        &self,
+        mediator_uuid: &str,
+    ) -> Result<broadcast::Receiver<PubSubRecord>, MediatorError> {
+        let mut channels = self.broadcast_channels.lock().await;
+        if let Some(sender) = channels.get(mediator_uuid) {
+            return Ok(sender.subscribe());
+        }
+        let (sender, receiver) = broadcast::channel(self.pubsub_capacity);
+        channels.insert(mediator_uuid.to_string(), sender);
+        Ok(receiver)
+    }
+}
+
+#[async_trait]
+impl MuxStore for FjallStore {
+    /// One process: no other instance to tell.
+    async fn mux_changes_publish(&self, _record: &MuxChangeRecord) -> Result<(), MediatorError> {
+        Ok(())
+    }
+
+    /// One process: nothing to hear.
+    async fn mux_changes_subscribe(
+        &self,
+    ) -> Result<Option<broadcast::Receiver<MuxChangeRecord>>, MediatorError> {
+        Ok(None)
+    }
+
+    fn supports_mux(&self) -> bool {
+        true
+    }
+
+    async fn mux_record_get(&self, did_hash: &str) -> Result<Option<MuxDidRecord>, MediatorError> {
+        self.mux_records
+            .get(did_hash.as_bytes())
+            .map_err(|e| Self::db_err("mux_record_get", e))?
+            .map(|raw| Self::decode::<MuxDidRecord>(&raw))
+            .transpose()
+    }
+
+    async fn mux_record_cas(
+        &self,
+        did_hash: &str,
+        expected_version: Option<u64>,
+        new: Option<&MuxDidRecord>,
+        index: &MuxIndexDelta,
+    ) -> Result<bool, MediatorError> {
+        // Read-compare-write under the write lock, and record + index in one
+        // batch, so the index can never disagree with the record it mirrors.
+        let _guard = self.write_lock.lock().await;
+        let current = self.mux_record_get(did_hash).await?.map(|r| r.version);
+        if current != expected_version {
+            return Ok(false);
+        }
+        let mut batch = self.db.batch();
+        match new {
+            Some(rec) => {
+                let raw = serde_json::to_vec(rec).map_err(|e| {
+                    MediatorError::InternalError(
+                        error_codes::DB_OPERATION_ERROR,
+                        "fjall".into(),
+                        format!("mux record encode: {e}"),
+                    )
+                })?;
+                batch.insert(&self.mux_records, did_hash.as_bytes(), raw);
+            }
+            None => batch.remove(&self.mux_records, did_hash.as_bytes()),
+        }
+        for p in &index.add {
+            batch.insert(&self.mux_principals, mux_principal_key(p, did_hash), b"");
+        }
+        for p in &index.remove {
+            batch.remove(&self.mux_principals, mux_principal_key(p, did_hash));
+        }
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("mux_record_cas:commit", e))?;
+        Ok(true)
+    }
+
+    async fn mux_principal_dids(
+        &self,
+        principal_hash: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, MediatorError> {
+        let mut prefix = principal_hash.as_bytes().to_vec();
+        prefix.push(PEER_QUEUE_SEP);
+        let lower = match after {
+            Some(a) => std::ops::Bound::Excluded(mux_principal_key(principal_hash, a)),
+            None => std::ops::Bound::Included(prefix.clone()),
+        };
+        let mut out = Vec::new();
+        for guard in self
+            .mux_principals
+            .range::<Vec<u8>, _>((lower, std::ops::Bound::Unbounded))
+        {
+            if out.len() >= limit {
+                break;
+            }
+            let key = guard
+                .key()
+                .map_err(|e| Self::db_err("mux_principal_dids:range", e))?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            out.push(String::from_utf8_lossy(&key[prefix.len()..]).into_owned());
+        }
+        Ok(out)
+    }
+
+    async fn mux_principal_count(&self, principal_hash: &str) -> Result<usize, MediatorError> {
+        let mut prefix = principal_hash.as_bytes().to_vec();
+        prefix.push(PEER_QUEUE_SEP);
+        let mut n = 0;
+        for guard in self.mux_principals.prefix(&prefix) {
+            guard
+                .key()
+                .map_err(|e| Self::db_err("mux_principal_count:prefix", e))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+#[async_trait]
+impl V1RoutingKeyStore for FjallStore {
+    fn supports_v1_routing_keys(&self) -> bool {
+        true
+    }
+
+    async fn v1_routing_key_bind(&self, verkey: &str, did: &str) -> Result<(), MediatorError> {
+        // Read-modify-write under the write lock: without it two concurrent
+        // binds for the same verkey could both observe "unbound" and the
+        // second would silently steal the first account's routing key.
+        let _guard = self.write_lock.lock().await;
+        if let Some(existing) = self
+            .v1_routing_keys
+            .get(verkey.as_bytes())
+            .map_err(|e| Self::db_err("v1_routing_key_bind:get", e))?
+        {
+            return if existing.as_ref() == did.as_bytes() {
+                Ok(()) // idempotent re-bind by the same owner
+            } else {
+                Err(MediatorError::ConfigError(
+                    error_codes::CONFIG_ERROR,
+                    "fjall".into(),
+                    "routing verkey is already bound to a different account".into(),
+                ))
+            };
+        }
+        self.v1_routing_keys
+            .insert(verkey.as_bytes(), did.as_bytes())
+            .map_err(|e| Self::db_err("v1_routing_key_bind:insert", e))?;
+        self.routing_owner_add(
+            affinidi_messaging_mediator_common::did_identity::did_hash(did),
+            verkey,
+        );
+        Ok(())
+    }
+
+    async fn v1_routing_key_lookup(&self, verkey: &str) -> Result<Option<String>, MediatorError> {
+        let Some(raw) = self
+            .v1_routing_keys
+            .get(verkey.as_bytes())
+            .map_err(|e| Self::db_err("v1_routing_key_lookup:get", e))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(String::from_utf8_lossy(raw.as_ref()).into_owned()))
+    }
+
+    async fn v1_routing_key_unbind(&self, verkey: &str) -> Result<bool, MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let owner = self
+            .v1_routing_keys
+            .get(verkey.as_bytes())
+            .map_err(|e| Self::db_err("v1_routing_key_unbind:get", e))?;
+        let existed = owner.is_some();
+        if let Some(owner) = owner {
+            self.v1_routing_keys
+                .remove(verkey.as_bytes())
+                .map_err(|e| Self::db_err("v1_routing_key_unbind:remove", e))?;
+            if let Ok(owner) = std::str::from_utf8(owner.as_ref()) {
+                self.routing_owner_remove(
+                    &affinidi_messaging_mediator_common::did_identity::did_hash(owner),
+                    verkey,
+                );
+            }
+        }
+        Ok(existed)
+    }
+
+    async fn v1_routing_key_unbind_if_owner(
+        &self,
+        verkey: &str,
+        did: &str,
+    ) -> Result<bool, MediatorError> {
+        // Under the write lock, like bind, so the owner cannot change between
+        // the check and the remove.
+        let _guard = self.write_lock.lock().await;
+        let owned = self
+            .v1_routing_keys
+            .get(verkey.as_bytes())
+            .map_err(|e| Self::db_err("v1_routing_key_unbind_if_owner:get", e))?
+            .is_some_and(|owner| owner.as_ref() == did.as_bytes());
+        if owned {
+            self.v1_routing_keys
+                .remove(verkey.as_bytes())
+                .map_err(|e| Self::db_err("v1_routing_key_unbind_if_owner:remove", e))?;
+            self.routing_owner_remove(
+                &affinidi_messaging_mediator_common::did_identity::did_hash(did),
+                verkey,
+            );
+        }
+        Ok(owned)
+    }
+
+    async fn v1_routing_keys_for(&self, did_hash: &str) -> Result<Vec<String>, MediatorError> {
+        // The in-memory reverse index, already sorted: no scan, no hashing.
+        Ok(self
+            .v1_routing_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(did_hash)
+            .map(|keys| keys.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+}
+
+#[async_trait]
+impl AuditStore for FjallStore {
+    async fn audit_log_record(&self, entry: &AuditLogEntry) -> Result<(), MediatorError> {
+        let _guard = self.write_lock.lock().await;
+        let id = self.alloc_stream_id();
+
+        let mut batch = self.db.batch();
+        batch.insert(
+            &self.audit_log,
+            encode_stream_id(id.0, id.1).to_vec(),
+            Self::encode(entry)?,
+        );
+
+        // Bounded ring: drop the oldest entries (lowest keys, first in ascending
+        // order) once we'd exceed the cap. `+1` accounts for the entry we're
+        // adding in this same batch.
+        let current = self.audit_log_count_inner();
+        let mut removed = 0usize;
+        if current >= AUDIT_LOG_MAX_ENTRIES {
+            let over = current - AUDIT_LOG_MAX_ENTRIES + 1;
+            let mut to_remove = Vec::with_capacity(over);
+            // Steady state `over` is 1, so this walks one key, not the ring.
+            // `key()` skips materialising the value, unlike `into_inner()`.
+            for guard in self.audit_log.iter().take(over) {
+                to_remove.push(
+                    guard
+                        .key()
+                        .map_err(|e| Self::db_err("audit_log_record:trim", e))?,
+                );
+            }
+            removed = to_remove.len();
+            for k in to_remove {
+                batch.remove(&self.audit_log, k.as_ref());
+            }
+        }
+
+        batch
+            .commit()
+            .map_err(|e| Self::db_err("audit_log_record:commit", e))?;
+
+        // Only after the batch is durable, so a failed commit can't drift the
+        // counter. Both ops are under `write_lock`, so this is not racy.
+        self.audit_log_len
+            .store(current + 1 - removed, Ordering::Release);
+        Ok(())
+    }
+
+    async fn audit_log_list(
+        &self,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<MediatorAuditLogList, MediatorError> {
+        let limit = limit.min(100) as usize;
+        let total = self.audit_log_count_inner();
+
+        // Entries are stored oldest-first (ascending key), and the caller wants
+        // them newest-first, so walk the keyspace in reverse: skip `cursor`,
+        // decode `limit`. That touches `cursor + limit` entries rather than
+        // scanning and decoding the whole ring.
+        let mut entries: Vec<AuditLogEntry> = Vec::with_capacity(limit);
+        for guard in self
+            .audit_log
+            .iter()
+            .rev()
+            .skip(cursor as usize)
+            .take(limit)
+        {
+            let value = guard
+                .value()
+                .map_err(|e| Self::db_err("audit_log_list:iter", e))?;
+            entries.push(Self::decode(&value)?);
+        }
+
+        let next_cursor = if cursor as usize + entries.len() >= total {
+            0
+        } else {
+            cursor + entries.len() as u32
+        };
+        Ok(MediatorAuditLogList {
+            entries,
+            cursor: next_cursor,
+        })
+    }
+}
+
+#[async_trait]
+impl AuxiliaryStore for FjallStore {
+    async fn trust_task_claim(
+        &self,
+        key: &str,
+        digest: &str,
+        retain_until: u64,
+        now: u64,
+    ) -> Result<TrustTaskClaim, MediatorError> {
+        // Check-and-record under the write lock, so two concurrent arrivals
+        // of one document cannot both read "absent".
+        let _guard = self.write_lock.lock().await;
+        if let Some(raw) = self
+            .trust_task_claims
+            .get(key.as_bytes())
+            .map_err(|e| Self::db_err("trust_task_claim:get", e))?
+        {
+            let stored: StoredTrustTaskClaim = Self::decode(&raw)?;
+            if stored.retain_until > now {
+                return Ok(if stored.digest == digest {
+                    TrustTaskClaim::Duplicate
+                } else {
+                    TrustTaskClaim::Conflict
+                });
+            }
+        }
+        let stored = StoredTrustTaskClaim {
+            digest: digest.to_string(),
+            retain_until,
+        };
+        self.trust_task_claims
+            .insert(key.as_bytes(), Self::encode(&stored)?)
+            .map_err(|e| Self::db_err("trust_task_claim:insert", e))?;
+        Ok(TrustTaskClaim::Fresh)
+    }
+
+    async fn sweep_expired_trust_task_claims(&self, now: u64) -> Result<usize, MediatorError> {
+        let mut expired: Vec<Vec<u8>> = Vec::new();
+        for guard in self.trust_task_claims.iter() {
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("sweep_expired_trust_task_claims:iter", e))?;
+            let stored: StoredTrustTaskClaim = Self::decode(&value)?;
+            if stored.retain_until <= now {
+                expired.push(key.as_ref().to_vec());
+            }
+        }
+        // Under the lock, re-check each before removing: a claim re-recorded
+        // since the scan (same key, new window) must survive.
+        let _guard = self.write_lock.lock().await;
+        let mut removed = 0;
+        for key in expired {
+            if let Some(raw) = self
+                .trust_task_claims
+                .get(&key)
+                .map_err(|e| Self::db_err("sweep_expired_trust_task_claims:get", e))?
+                && Self::decode::<StoredTrustTaskClaim>(&raw)?.retain_until <= now
+            {
+                self.trust_task_claims
+                    .remove(&key)
+                    .map_err(|e| Self::db_err("sweep_expired_trust_task_claims:remove", e))?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn scid_source_put(&self, did_hash: &str, record: &str) -> Result<(), MediatorError> {
+        self.scid_sources
+            .insert(did_hash.as_bytes(), record.as_bytes())
+            .map_err(|e| Self::db_err("scid_source_put", e))?;
+        Ok(())
+    }
+
+    async fn scid_source_list(&self) -> Result<Vec<String>, MediatorError> {
+        let mut records = Vec::new();
+        for guard in self.scid_sources.iter() {
+            let (_, value) = guard
+                .into_inner()
+                .map_err(|e| Self::db_err("scid_source_list:iter", e))?;
+            records.push(String::from_utf8_lossy(&value).into_owned());
+        }
+        Ok(records)
+    }
+
+    async fn wake_handle_set(
+        &self,
+        did_hash: &str,
+        record: Option<&str>,
+    ) -> Result<(), MediatorError> {
+        // Under the write lock, as `account_remove` is: a set racing the
+        // account's removal must not leave a record behind it.
+        let _guard = self.write_lock.lock().await;
+        let key = wake_key(did_hash);
+        match record {
+            Some(record) => self
+                .globals
+                .insert(key.as_bytes(), record.as_bytes())
+                .map_err(|e| Self::db_err("wake_handle_set", e)),
+            None => self
+                .globals
+                .remove(key.as_bytes())
+                .map_err(|e| Self::db_err("wake_handle_set:remove", e)),
+        }
+    }
+
+    async fn wake_handle_get(&self, did_hash: &str) -> Result<Option<String>, MediatorError> {
+        let value = self
+            .globals
+            .get(wake_key(did_hash).as_bytes())
+            .map_err(|e| Self::db_err("wake_handle_get", e))?;
+        Ok(value.map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
+    async fn oob_discovery_store(
+        &self,
+        did_hash: &str,
+        invite_b64: &str,
+        expires_at: u64,
+    ) -> Result<String, MediatorError> {
+        let invite_hash = digest(invite_b64);
+        let stored = StoredOobInvite {
+            invite_b64: invite_b64.to_string(),
+            did_hash: did_hash.to_string(),
+            expires_at_unix: expires_at,
+        };
+        let _guard = self.write_lock.lock().await;
+        self.oob_invites
+            .insert(invite_hash.as_bytes(), Self::encode(&stored)?)
+            .map_err(|e| Self::db_err("oob_discovery_store:insert", e))?;
+        let _ = self.bump_global("OOB_INVITES_CREATED", 1);
+        Ok(invite_hash)
+    }
+
+    async fn oob_discovery_get(
+        &self,
+        oob_id: &str,
+    ) -> Result<Option<(String, String)>, MediatorError> {
+        let Some(raw) = self
+            .oob_invites
+            .get(oob_id.as_bytes())
+            .map_err(|e| Self::db_err("oob_discovery_get:get", e))?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredOobInvite = Self::decode(&raw)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _guard = self.write_lock.lock().await;
+        if stored.expires_at_unix > 0 && stored.expires_at_unix <= now {
+            // Expired — remove and report missing.
+            let _ = self.oob_invites.remove(oob_id.as_bytes());
+            return Ok(None);
+        }
+        let _ = self.bump_global("OOB_INVITES_CLAIMED", 1);
+        Ok(Some((stored.invite_b64, stored.did_hash)))
+    }
+
+    async fn oob_discovery_delete(&self, oob_id: &str) -> Result<bool, MediatorError> {
+        // Under the lock, so of two concurrent deletes exactly one reports
+        // that the invite existed.
+        let _guard = self.write_lock.lock().await;
+        let existed = self
+            .oob_invites
+            .contains_key(oob_id.as_bytes())
+            .map_err(|e| Self::db_err("oob_discovery_delete:contains", e))?;
+        if existed {
+            self.oob_invites
+                .remove(oob_id.as_bytes())
+                .map_err(|e| Self::db_err("oob_discovery_delete:remove", e))?;
+        }
+        Ok(existed)
+    }
+
+    async fn config_overrides_get(&self) -> Result<Option<String>, MediatorError> {
+        let value = self
+            .globals
+            .get(CONFIG_OVERRIDES_KEY)
+            .map_err(|e| Self::db_err("config_overrides_get", e))?;
+        Ok(value.map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
+    async fn config_overrides_set(&self, overrides: &str) -> Result<(), MediatorError> {
+        self.globals
+            .insert(CONFIG_OVERRIDES_KEY, overrides.as_bytes())
+            .map_err(|e| Self::db_err("config_overrides_set", e))
+    }
+}
+
+// ─── Smoke tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn open_and_close_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        assert_eq!(store.path(), dir.path());
+        store.initialize().await.expect("initialize");
+        assert!(matches!(store.health().await, StoreHealth::Healthy));
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn initialize_stamps_current_schema_version_on_a_fresh_store() {
+        use crate::store::fjall_migrations::CURRENT_SCHEMA_VERSION;
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        // Fresh data dir: no marker yet.
+        assert_eq!(store.read_schema_version().expect("read"), None);
+
+        store.initialize().await.expect("initialize");
+        assert_eq!(
+            store.read_schema_version().expect("read"),
+            Some(CURRENT_SCHEMA_VERSION),
+            "fresh init stamps the current schema version"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_is_idempotent_across_restarts() {
+        use crate::store::fjall_migrations::CURRENT_SCHEMA_VERSION;
+        let dir = TempDir::new().expect("tempdir");
+
+        {
+            let store = FjallStore::open(dir.path()).expect("open");
+            store.initialize().await.expect("first initialize");
+            store.shutdown().await.expect("shutdown");
+        }
+
+        // Re-open the same dir: the marker persisted, and a second initialize
+        // is a clean no-op (UpToDate), not a re-stamp or error.
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.read_schema_version().expect("read"),
+            Some(CURRENT_SCHEMA_VERSION),
+            "marker survives a reopen"
+        );
+        store
+            .initialize()
+            .await
+            .expect("second initialize is a no-op");
+        assert_eq!(
+            store.read_schema_version().expect("read"),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_a_data_dir_from_a_newer_mediator() {
+        use crate::store::fjall_migrations::CURRENT_SCHEMA_VERSION;
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        // Simulate a data dir written by a future mediator.
+        store
+            .write_schema_version(CURRENT_SCHEMA_VERSION + 1)
+            .expect("seed newer version");
+
+        let err = store
+            .initialize()
+            .await
+            .expect_err("must refuse a newer schema");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer than this mediator supports"),
+            "error should name the version mismatch, got: {msg}"
+        );
+
+        // The marker must be left untouched — we never downgrade it.
+        assert_eq!(
+            store.read_schema_version().expect("read"),
+            Some(CURRENT_SCHEMA_VERSION + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_probe_stays_closed_on_a_healthy_store() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        // Each call probes the globals partition; on a healthy disk the
+        // breaker stays closed and `/readyz` reports the backend ready.
+        for _ in 0..3 {
+            assert_eq!(store.circuit_breaker_state(), "closed");
+        }
+        assert!(matches!(store.health().await, StoreHealth::Healthy));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_open_after_threshold_failures() {
+        let dir = TempDir::new().expect("tempdir");
+        // threshold 2, a long recovery window so it stays open for the test.
+        let store = FjallStore::open_with_circuit_breaker(dir.path(), 2, 60).expect("open");
+        assert_eq!(store.circuit_breaker_state(), "closed");
+
+        // A real Fjall I/O error is impractical to induce in-process, so we
+        // record the failures the probe would record on a broken disk.
+        store.circuit_breaker.record_failure();
+        store.circuit_breaker.record_failure(); // 2nd hit == threshold
+
+        // Now open: the probe must fail fast (no heal) within the window, and
+        // `/readyz`/health must report the backend unavailable.
+        assert_eq!(store.circuit_breaker_state(), "open");
+        assert_eq!(store.circuit_breaker_state(), "open");
+        assert!(matches!(store.health().await, StoreHealth::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_recovers_via_probe_after_window() {
+        let dir = TempDir::new().expect("tempdir");
+        // threshold 1, 0s recovery so the next probe is allowed immediately.
+        let store = FjallStore::open_with_circuit_breaker(dir.path(), 1, 0).expect("open");
+        store.circuit_breaker.record_failure(); // trips open
+        assert_eq!(store.circuit_breaker.state_str(), "open");
+
+        // The recovery window has elapsed (0s), so the next probe is allowed
+        // through (half-open); the healthy disk read closes the breaker.
+        assert_eq!(store.circuit_breaker_state(), "closed");
+        assert!(matches!(store.health().await, StoreHealth::Healthy));
+    }
+
+    #[tokio::test]
+    async fn streaming_subscribe_returns_receiver_without_storage() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        let mut rx = store
+            .streaming_subscribe("test-uuid")
+            .await
+            .expect("subscribe");
+        store
+            .streaming_publish_message("did_hash", "test-uuid", "payload", false)
+            .await
+            .expect("publish");
+
+        let msg = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv error");
+        assert_eq!(msg.did_hash, "did_hash");
+        assert_eq!(msg.message, "payload");
+        assert!(!msg.force_delivery);
+    }
+
+    /// Use 64-char SHA-256-hex DID hashes so the inbox/outbox key
+    /// encoding (`did_hash || stream_id_be`) exercises the same
+    /// fixed-width prefix the production handlers feed in.
+    fn hash(s: &str) -> String {
+        digest(s)
+    }
+
+    #[tokio::test]
+    async fn store_and_fetch_message_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let to = hash("alice");
+        let from = hash("bob");
+
+        let msg_id = store
+            .store_message("session-1", "hello", &to, Some(&from), 0, 0)
+            .await
+            .expect("store");
+
+        let got = store
+            .get_message(&to, &msg_id)
+            .await
+            .expect("get")
+            .expect("message present");
+        assert_eq!(got.msg.as_deref(), Some("hello"));
+        assert_eq!(got.to_address.as_deref(), Some(to.as_str()));
+        assert_eq!(got.from_address.as_deref(), Some(from.as_str()));
+
+        // Non-owner sees None.
+        let none = store
+            .get_message(&hash("eve"), &msg_id)
+            .await
+            .expect("get for non-owner");
+        assert!(none.is_none());
+
+        let list = store
+            .list_messages(&to, Folder::Inbox, None, 100)
+            .await
+            .expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].msg_id, msg_id);
+
+        store
+            .delete_message(
+                &msg_id,
+                DeletionAuthority::Owner {
+                    did_hash: to.clone(),
+                },
+            )
+            .await
+            .expect("delete");
+        let after = store
+            .list_messages(&to, Folder::Inbox, None, 100)
+            .await
+            .expect("list after delete");
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_non_owner_non_admin() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let msg_id = store
+            .store_message("s", "hi", &hash("alice"), Some(&hash("bob")), 0, 0)
+            .await
+            .expect("store");
+        let err = store
+            .delete_message(
+                &msg_id,
+                DeletionAuthority::Owner {
+                    did_hash: hash("eve"),
+                },
+            )
+            .await
+            .expect_err("non-owner delete must fail");
+        // Nothing in eve's queues under that id: not found, the same answer
+        // as for an id that does not exist, so a non-party learns nothing
+        // about another account's messages. The message is untouched.
+        assert!(
+            format!("{err}").contains(ops::DELETE_NOT_FOUND),
+            "got: {err}"
+        );
+        assert!(
+            store
+                .get_message(&hash("alice"), &msg_id)
+                .await
+                .expect("get_message")
+                .is_some(),
+            "the recipient's message is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_authority_bypasses_ownership() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let msg_id = store
+            .store_message("s", "hi", &hash("alice"), Some(&hash("bob")), 0, 0)
+            .await
+            .expect("store");
+        store
+            .delete_message(
+                &msg_id,
+                DeletionAuthority::Admin {
+                    admin_did_hash: hash("admin"),
+                },
+            )
+            .await
+            .expect("admin delete");
+    }
+
+    #[tokio::test]
+    async fn fetch_messages_optimistic_delete_drains_inbox() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        for i in 0..5 {
+            store
+                .store_message("s", &format!("msg-{i}"), &alice, Some(&bob), 0, 0)
+                .await
+                .expect("store");
+        }
+        let resp = store
+            .fetch_messages(
+                "s",
+                &alice,
+                &FetchOptions {
+                    limit: 100,
+                    delete_policy: FetchDeletePolicy::Optimistic,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(resp.success.len(), 5);
+        let after = store
+            .list_messages(&alice, Folder::Inbox, None, 100)
+            .await
+            .expect("list");
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_messages_returns_in_stream_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(
+                store
+                    .store_message("s", &format!("msg-{i}"), &alice, Some(&bob), 0, 0)
+                    .await
+                    .expect("store"),
+            );
+        }
+        let list = store
+            .list_messages(&alice, Folder::Inbox, None, 100)
+            .await
+            .expect("list");
+        let returned: Vec<&str> = list.iter().map(|m| m.msg_id.as_str()).collect();
+        let expected: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        assert_eq!(returned, expected);
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_messages_drains_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        store
+            .store_message("s", "old", &alice, Some(&bob), now - 10, 0)
+            .await
+            .expect("store");
+        store
+            .store_message("s", "expiring", &alice, Some(&bob), now, 0)
+            .await
+            .expect("store");
+        store
+            .store_message("s", "future", &alice, Some(&bob), now + 1000, 0)
+            .await
+            .expect("store");
+
+        let report = store
+            .sweep_expired_messages(now, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.expired, 2, "two messages should expire at <= now");
+
+        let list = store
+            .list_messages(&alice, Folder::Inbox, None, 100)
+            .await
+            .expect("list");
+        assert_eq!(list.len(), 1);
+    }
+
+    /// A delivered-TTL deadline is a second expiry key beside the message's
+    /// own. Once the message is gone, sweeping past either key removes it, so
+    /// the index does not keep entries that are rescanned on every sweep.
+    #[tokio::test]
+    async fn sweep_drops_expiry_keys_whose_message_is_gone() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Expires in an hour; delivery brings a deadline 10s out.
+        let id = store
+            .store_message("s", "delivered", &alice, Some(&bob), now + 3_600, 0)
+            .await
+            .expect("store");
+        store
+            .mark_delivered(&alice, std::slice::from_ref(&id), now * 1_000, 10)
+            .await
+            .expect("mark");
+        assert_eq!(
+            store.expiry.iter().count(),
+            2,
+            "own key + delivered deadline"
+        );
+
+        // The recipient deletes it: the key of its current expiry (the
+        // delivered deadline) goes, the original key stays.
+        store
+            .delete_message(
+                &id,
+                DeletionAuthority::Owner {
+                    did_hash: alice.clone(),
+                },
+            )
+            .await
+            .expect("delete");
+        assert_eq!(store.expiry.iter().count(), 1);
+
+        // Sweeping past the original finds the message gone and drops the key.
+        let report = store
+            .sweep_expired_messages(now + 3_700, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.already_deleted, 1);
+        assert_eq!(store.expiry.iter().count(), 0, "no stale expiry keys left");
+
+        // And a later sweep has nothing to rescan.
+        let report = store
+            .sweep_expired_messages(now + 3_800, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.already_deleted, 0);
+    }
+
+    /// With `durability = "sync"` an acknowledged message and forward are
+    /// synced before the call returns; the store still behaves the same.
+    #[tokio::test]
+    async fn sync_durability_stores_and_reopens() {
+        let dir = TempDir::new().expect("tempdir");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        let tuning = FjallTuning {
+            durability: FjallDurability::Sync,
+            ..FjallTuning::default()
+        };
+        let id = {
+            let store = FjallStore::open_with_tuning(dir.path(), 5, 30, tuning).expect("open");
+            let id = store
+                .store_message("s", "synced", &alice, Some(&bob), 0, 0)
+                .await
+                .expect("store");
+            store
+                .forward_queue_enqueue(&forward_entry(), 0)
+                .await
+                .expect("enqueue");
+            store.shutdown().await.expect("shutdown");
+            id
+        };
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        assert!(
+            store
+                .messages
+                .contains_key(record_key(&id, &alice).as_bytes())
+                .unwrap()
+        );
+        assert_eq!(store.forward_queue_len().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn data_persists_across_open() {
+        let dir = TempDir::new().expect("tempdir");
+        let alice = hash("alice");
+        let bob = hash("bob");
+
+        let msg_id = {
+            let store = FjallStore::open(dir.path()).expect("open");
+            let id = store
+                .store_message("s", "persistent", &alice, Some(&bob), 0, 0)
+                .await
+                .expect("store");
+            store.shutdown().await.expect("shutdown");
+            drop(store);
+            id
+        };
+
+        // Re-open the same directory; previously written data must
+        // still be readable.
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        let got = store
+            .get_message(&alice, &msg_id)
+            .await
+            .expect("get")
+            .expect("message must persist across open");
+        assert_eq!(got.msg.as_deref(), Some("persistent"));
+    }
+
+    /// The routing-key reverse index is in memory (#175); it must be rebuilt
+    /// from disk on open, or `v1_routing_keys_for` reads empty after a
+    /// restart and account removal leaves the keys resolving.
+    #[tokio::test]
+    async fn routing_key_reverse_index_is_rebuilt_on_open() {
+        let dir = TempDir::new().expect("tempdir");
+        let alice = "did:example:alice";
+        let alice_hash = affinidi_messaging_mediator_common::did_identity::did_hash(alice);
+        {
+            let store = FjallStore::open(dir.path()).expect("open");
+            store.v1_routing_key_bind("vk2", alice).await.expect("bind");
+            store.v1_routing_key_bind("vk1", alice).await.expect("bind");
+            store
+                .v1_routing_key_bind("vk3", "did:example:bob")
+                .await
+                .expect("bind");
+            store.shutdown().await.expect("shutdown");
+        }
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.v1_routing_keys_for(&alice_hash).await.expect("for"),
+            vec!["vk1".to_string(), "vk2".to_string()]
+        );
+        assert!(store.v1_routing_key_unbind("vk1").await.expect("unbind"));
+        assert_eq!(
+            store.v1_routing_keys_for(&alice_hash).await.expect("for"),
+            vec!["vk2".to_string()]
+        );
+    }
+
+    /// Streaming registrations are process-local (#175): an older data
+    /// directory's on-disk keyspace is dropped at open, and the state is
+    /// held in memory.
+    #[tokio::test]
+    async fn legacy_streaming_keyspace_is_dropped_on_open() {
+        let dir = TempDir::new().expect("tempdir");
+        {
+            let db = Database::builder(dir.path()).open().expect("db");
+            let ks = db
+                .keyspace(PARTITION_STREAMING_CLIENTS, KeyspaceCreateOptions::default)
+                .expect("keyspace");
+            ks.insert(b"stale", b"{}").expect("insert");
+            db.persist(PersistMode::SyncAll).expect("persist");
+        }
+        let store = FjallStore::open(dir.path()).expect("open");
+        assert!(!store.db.keyspace_exists(PARTITION_STREAMING_CLIENTS));
+        let alice = hash("alice");
+        store
+            .streaming_set_state(&alice, "uuid-1", StreamingClientState::Live)
+            .await
+            .expect("set");
+        assert!(!store.db.keyspace_exists(PARTITION_STREAMING_CLIENTS));
+        assert_eq!(
+            store.streaming_is_client_live(&alice, false).await,
+            Some("uuid-1".to_string())
+        );
+    }
+
+    /// The KR-29 / VTI-29 regression: a sender fanning out to many recipients
+    /// must not look like a sender flooding one.
+    ///
+    /// The per-DID send total cannot tell the two apart, which is how a
+    /// community sending one membership card each to its members went silent
+    /// once enough of them had not yet collected. The per-relationship count
+    /// separates them: here one sender holds a message for each of 250
+    /// recipients — five times the per-peer limit — and every pair reads 1.
+    #[tokio::test]
+    async fn peer_queue_counts_are_per_relationship_not_per_sender() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let community = hash("community");
+        store
+            .account_add(&community, &MediatorACLSet::default(), None)
+            .await
+            .expect("sender account");
+
+        for i in 0..250 {
+            let member = hash(&format!("member-{i}"));
+            store
+                .store_message("s", &format!("card-{i}"), &member, Some(&community), 0, 0)
+                .await
+                .expect("store");
+        }
+
+        for i in 0..250 {
+            let member = hash(&format!("member-{i}"));
+            assert_eq!(
+                store
+                    .peer_queue_count(&community, &member)
+                    .await
+                    .expect("peer count"),
+                1,
+                "fan-out must not accumulate against any one relationship"
+            );
+        }
+
+        // ...while the per-DID total, the number the old gate read, is far
+        // above the 200 that used to silence the sender.
+        let acc = store
+            .account_get(&community)
+            .await
+            .expect("account")
+            .expect("exists");
+        assert_eq!(acc.send_queue_count, 250);
+    }
+
+    /// Flooding one peer *does* move the per-relationship count — the case the
+    /// gate is meant to catch.
+    #[tokio::test]
+    async fn peer_queue_count_tracks_a_single_relationship() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let sender = hash("sender");
+        let victim = hash("victim");
+        let bystander = hash("bystander");
+
+        for i in 0..60 {
+            store
+                .store_message("s", &format!("flood-{i}"), &victim, Some(&sender), 0, 0)
+                .await
+                .expect("store");
+        }
+        assert_eq!(
+            store
+                .peer_queue_count(&sender, &victim)
+                .await
+                .expect("peer count"),
+            60
+        );
+        // A different relationship from the same sender is untouched.
+        assert_eq!(
+            store
+                .peer_queue_count(&sender, &bystander)
+                .await
+                .expect("peer count"),
+            0
+        );
+    }
+
+    /// The count falls as the recipient collects, and the row is removed at
+    /// zero rather than left behind as a `0` — otherwise a sender that had once
+    /// messaged many peers would keep a row for each of them forever.
+    #[tokio::test]
+    async fn peer_queue_count_falls_on_collection_and_drops_the_row_at_zero() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let sender = hash("sender");
+        let recipient = hash("recipient");
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(
+                store
+                    .store_message("s", &format!("m-{i}"), &recipient, Some(&sender), 0, 0)
+                    .await
+                    .expect("store"),
+            );
+        }
+        assert_eq!(
+            store
+                .peer_queue_count(&sender, &recipient)
+                .await
+                .expect("peer count"),
+            3
+        );
+
+        for (collected, id) in ids.iter().enumerate() {
+            store
+                .delete_message(
+                    id,
+                    DeletionAuthority::Owner {
+                        did_hash: recipient.clone(),
+                    },
+                )
+                .await
+                .expect("delete");
+            assert_eq!(
+                store
+                    .peer_queue_count(&sender, &recipient)
+                    .await
+                    .expect("peer count"),
+                (3 - collected - 1) as u32
+            );
+        }
+
+        // Zero is represented by the absence of the row, not a stored `0`.
+        assert!(
+            store
+                .peer_queue
+                .get(peer_queue_key(&sender, &recipient))
+                .expect("raw get")
+                .is_none(),
+            "the row must be removed at zero, not written as 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_status_reflects_queue_state() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+
+        for i in 0..3 {
+            store
+                .store_message("s", &format!("m-{i}"), &alice, Some(&bob), 0, 0)
+                .await
+                .expect("store");
+        }
+        let status = store.inbox_status(&alice).await.expect("status");
+        assert_eq!(status.message_count, 3);
+        assert_eq!(status.queue_count, 3);
+        assert!(!status.oldest_received.is_empty());
+        assert!(!status.newest_received.is_empty());
+    }
+
+    // ─── Identity-primitive tests (task #15) ──────────────────────────────
+
+    #[tokio::test]
+    async fn session_lifecycle() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        let did = "did:peer:test";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
+        let did_hash = hash(did);
+        let session = Session {
+            session_id: "sid-1".into(),
+            challenge: "abc".into(),
+            did: did.into(),
+            did_hash: did_hash.clone(),
+            ..Default::default()
+        };
+        store
+            .put_session(&session, Duration::from_secs(60))
+            .await
+            .expect("put");
+
+        let got = store.get_session("sid-1", did).await.expect("get");
+        assert_eq!(got.session_id, "sid-1");
+        assert_eq!(got.challenge, "abc");
+        // Regression guard: did/did_hash must round-trip. A backend
+        // that loses these fields silently misroutes WebSocket
+        // messages and breaks the JWT auth → handler hand-off.
+        assert_eq!(got.did, did, "did must round-trip through put/get");
+        assert_eq!(
+            got.did_hash, did_hash,
+            "did_hash must round-trip through put/get"
+        );
+
+        store.delete_session("sid-1").await.expect("delete");
+        let missing = store.get_session("sid-1", did).await;
+        assert!(missing.is_err(), "deleted session must error");
+    }
+
+    #[tokio::test]
+    async fn session_expires_lazily() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        let session = Session {
+            session_id: "sid-2".into(),
+            ..Default::default()
+        };
+        // Use a 0s TTL so the entry's expires_at_unix == now and the
+        // <= comparison evicts it on the next read.
+        store
+            .put_session(&session, Duration::from_secs(0))
+            .await
+            .expect("put");
+        // Brief sleep so the wall-clock advances past the stored
+        // `expires_at_unix`.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let result = store.get_session("sid-2", "").await;
+        assert!(result.is_err(), "expired session must not return");
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_sessions_reclaims_orphans() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        // One already-expired session (0s TTL) and one still-live one.
+        // Neither is ever read back, so only the sweep can remove them —
+        // this is the orphan case lazy expiry never reaches.
+        let expired = Session {
+            session_id: "sid-expired".into(),
+            ..Default::default()
+        };
+        let live = Session {
+            session_id: "sid-live".into(),
+            ..Default::default()
+        };
+        store
+            .put_session(&expired, Duration::from_secs(0))
+            .await
+            .expect("put expired");
+        store
+            .put_session(&live, Duration::from_secs(3600))
+            .await
+            .expect("put live");
+
+        // Sweep at a wall-clock one second past the 0s-TTL entry; the
+        // live entry's expiry is ~an hour out, so it must survive.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1;
+        let report = store.sweep_expired_sessions(now).await.expect("sweep");
+
+        assert_eq!(report.scanned, 2, "both sessions inspected");
+        assert_eq!(report.expired, 1, "only the expired session removed");
+        // Removed from the partition by the sweep itself, not a lazy
+        // read on `get_session`.
+        assert!(
+            !store.sessions.contains_key(b"sid-expired").unwrap(),
+            "expired session swept from partition"
+        );
+        assert!(
+            store.sessions.contains_key(b"sid-live").unwrap(),
+            "live session retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_session_flow_end_to_end() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        crate::store::auth_flow_harness::run_auth_session_flow(&store).await;
+    }
+
+    #[tokio::test]
+    async fn account_stats() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        crate::store::activity_harness::run_account_stats(&store).await;
+    }
+
+    #[tokio::test]
+    async fn account_activity() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        crate::store::activity_harness::run_account_activity(&store).await;
+    }
+
+    #[tokio::test]
+    async fn update_session_authenticated_renames_atomically() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        let did = "did:peer:auth";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
+        let old = Session {
+            session_id: "challenge-sid".into(),
+            challenge: "chal".into(),
+            state: SessionState::ChallengeSent,
+            did: did.into(),
+            did_hash: hash(did),
+            ..Default::default()
+        };
+        store
+            .put_session(&old, Duration::from_secs(900))
+            .await
+            .expect("put challenge");
+
+        store
+            .update_session_authenticated("challenge-sid", "auth-sid", did, "refresh-hash")
+            .await
+            .expect("promote");
+
+        // The rename is atomic: old key gone, new key present — no window
+        // where both linger.
+        assert!(
+            !store.sessions.contains_key(b"challenge-sid").unwrap(),
+            "old ChallengeSent key removed"
+        );
+        assert!(
+            store.sessions.contains_key(b"auth-sid").unwrap(),
+            "new Authenticated key written"
+        );
+
+        let got = store.get_session("auth-sid", did).await.expect("get new");
+        assert_eq!(got.state, SessionState::Authenticated);
+        assert!(got.authenticated);
+        assert_eq!(got.did, did, "did preserved through promotion");
+        assert_eq!(got.did_hash, hash(did));
+        assert_eq!(got.refresh_token_hash.as_deref(), Some("refresh-hash"));
+    }
+
+    #[tokio::test]
+    async fn update_refresh_token_hash_preserves_record() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        let did = "did:peer:refresh";
+        // Sessions past the challenge step need the DID's account.
+        store
+            .account_add(&hash(did), &MediatorACLSet::default(), None)
+            .await
+            .expect("account_add");
+        let session = Session {
+            session_id: "auth-sid".into(),
+            state: SessionState::Authenticated,
+            did: did.into(),
+            did_hash: hash(did),
+            authenticated: true,
+            refresh_token_hash: Some("hash-1".into()),
+            ..Default::default()
+        };
+        store
+            .put_session(&session, Duration::from_secs(86_400))
+            .await
+            .expect("put");
+        let ttl_before: StoredSession =
+            FjallStore::decode(&store.sessions.get(b"auth-sid").unwrap().unwrap()).unwrap();
+
+        store
+            .update_refresh_token_hash("auth-sid", "hash-2")
+            .await
+            .expect("rotate");
+
+        // did/state survive (the corruption the trait default risks) and
+        // only the hash changed.
+        let got = store.get_session("auth-sid", did).await.expect("get");
+        assert_eq!(got.did, did);
+        assert_eq!(got.state, SessionState::Authenticated);
+        assert_eq!(got.refresh_token_hash.as_deref(), Some("hash-2"));
+
+        // TTL is preserved in place, not reset — matching Redis' HSET.
+        let ttl_after: StoredSession =
+            FjallStore::decode(&store.sessions.get(b"auth-sid").unwrap().unwrap()).unwrap();
+        assert_eq!(
+            ttl_after.expires_at_unix, ttl_before.expires_at_unix,
+            "expiry must not move on refresh-hash rotation"
+        );
+
+        // Rotating a non-existent session fails rather than fabricating a
+        // corrupt record.
+        assert!(
+            store
+                .update_refresh_token_hash("ghost-sid", "x")
+                .await
+                .is_err(),
+            "refresh on missing session must error"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_crud_and_persistence() {
+        let dir = TempDir::new().expect("tempdir");
+        let did = hash("did_hash_1");
+        {
+            let store = FjallStore::open(dir.path()).expect("open");
+            store
+                .account_add(&did, &MediatorACLSet::default(), Some(50))
+                .await
+                .expect("add");
+            assert!(store.account_exists(&did).await.unwrap());
+            store
+                .account_set_role(&did, &AccountType::Admin)
+                .await
+                .expect("set_role");
+            store.shutdown().await.expect("shutdown");
+        }
+        // Reopen and confirm both the account and admin status.
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        let got = store
+            .account_get(&did)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(got.did_hash, did);
+        assert!(store.check_admin_account(&did).await.unwrap());
+        assert_eq!(got._type, AccountType::Admin);
+    }
+
+    #[tokio::test]
+    async fn account_list_paginates() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        for i in 0..5 {
+            store
+                .account_add(&hash(&format!("d{i}")), &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+
+        let page1 = store.account_list(0, 2).await.expect("page1");
+        assert_eq!(page1.accounts.len(), 2);
+        assert!(page1.cursor > 0, "cursor should advance");
+
+        let page2 = store.account_list(page1.cursor, 2).await.expect("page2");
+        assert_eq!(page2.accounts.len(), 2);
+        assert!(page2.cursor > 0);
+
+        let page3 = store.account_list(page2.cursor, 2).await.expect("page3");
+        assert_eq!(page3.accounts.len(), 1);
+        assert_eq!(page3.cursor, 0, "final page returns cursor=0");
+    }
+
+    #[tokio::test]
+    async fn access_list_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        let charlie = hash("charlie");
+
+        store
+            .account_add(&alice, &MediatorACLSet::default(), None)
+            .await
+            .expect("add");
+
+        let resp = store
+            .access_list_add(100, &alice, &[bob.clone(), charlie.clone()])
+            .await
+            .expect("add");
+        assert_eq!(resp.did_hashes.len(), 2);
+        assert!(!resp.truncated);
+        assert_eq!(store.access_list_count_inner(&alice).unwrap(), 2);
+
+        let got = store
+            .access_list_get(&alice, &[bob.clone(), hash("eve")])
+            .await
+            .expect("get");
+        assert_eq!(got.did_hashes, vec![bob.clone()]);
+
+        let removed = store
+            .access_list_remove(&alice, std::slice::from_ref(&bob))
+            .await
+            .expect("remove");
+        assert_eq!(removed, 1);
+        assert_eq!(store.access_list_count_inner(&alice).unwrap(), 1);
+
+        // Clear leaves the list empty.
+        store.access_list_clear(&alice).await.expect("clear");
+        assert_eq!(store.access_list_count_inner(&alice).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn access_list_allowed_honors_acl_mode() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+
+        // ExplicitAllow → only entries in the access list pass.
+        let mut allow_set = MediatorACLSet::default();
+        let _ = allow_set.set_access_list_mode(AccessListModeType::ExplicitAllow, true, true);
+        store
+            .account_add(&alice, &allow_set, None)
+            .await
+            .expect("add alice");
+        store
+            .access_list_add(100, &alice, std::slice::from_ref(&bob))
+            .await
+            .expect("add bob to list");
+        assert!(store.access_list_allowed(&alice, Some(&bob)).await);
+        assert!(!store.access_list_allowed(&alice, Some(&hash("eve"))).await);
+
+        // Switching to ExplicitDeny inverts the meaning of the list.
+        let mut deny_set = MediatorACLSet::default();
+        let _ = deny_set.set_access_list_mode(AccessListModeType::ExplicitDeny, true, true);
+        store.set_did_acl(&alice, &deny_set).await.expect("set");
+        assert!(!store.access_list_allowed(&alice, Some(&bob)).await);
+        assert!(store.access_list_allowed(&alice, Some(&hash("eve"))).await);
+    }
+
+    // ─── Stats + forward-queue tests (task #16) ────────────────────────────
+
+    #[tokio::test]
+    async fn stats_counters_accumulate_and_persist() {
+        let dir = TempDir::new().expect("tempdir");
+        {
+            let store = FjallStore::open(dir.path()).expect("open");
+            store
+                .stats_increment(StatCounter::WebsocketOpen, 1)
+                .await
+                .expect("incr");
+            store
+                .stats_increment(StatCounter::WebsocketOpen, 2)
+                .await
+                .expect("incr");
+            store
+                .stats_increment(StatCounter::SentBytes, 100)
+                .await
+                .expect("incr");
+            store.shutdown().await.expect("shutdown");
+        }
+        // Reopen — counters should round-trip from disk.
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        let stats = store.get_global_stats().await.expect("stats");
+        assert_eq!(stats.websocket_open, 3);
+        assert_eq!(stats.sent_bytes, 100);
+    }
+
+    #[tokio::test]
+    async fn store_message_empty_from_treated_as_anonymous() {
+        // Regression: an anonymous routing/2.0/forward reaches store_message with
+        // an EMPTY from_hash (`Some("")`) rather than `None`. Before the fix the
+        // empty string built an empty store key and fjall asserted `!k.is_empty()`
+        // → panic. The guard now maps an empty hash to ANONYMOUS, so the write
+        // succeeds (redis/memory tolerated the empty key but stored it malformed).
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        store
+            .store_message("sess", "ciphertext", &hash("recipient"), Some(""), 0, 0)
+            .await
+            .expect("empty from_hash must not panic — treated as anonymous");
+    }
+
+    #[tokio::test]
+    async fn forward_queue_enqueue_read_ack() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let entry = ForwardQueueEntry {
+            stream_id: String::new(),
+            message: "encrypted".into(),
+            to_did_hash: hash("to"),
+            from_did_hash: hash("from"),
+            from_did: "did:from".into(),
+            to_did: "did:to".into(),
+            endpoint_url: "http://example".into(),
+            received_at_ms: 0,
+            delay_milli: 0,
+            expires_at: 0,
+            retry_count: 0,
+            hop_count: 0,
+            not_before_ms: 0,
+        };
+        let id = store
+            .forward_queue_enqueue(&entry, 0)
+            .await
+            .expect("enqueue");
+        assert_eq!(store.forward_queue_len().await.unwrap(), 1);
+
+        let read = store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].stream_id, id);
+
+        store.forward_queue_ack("g", &[&id]).await.expect("ack");
+        // After ack, the consumer group's cursor is past this entry,
+        // so a subsequent read returns nothing.
+        let again = store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read after ack");
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_queue_pending_claim_survives_restart() {
+        // Crash-recovery path for the forwarding processor on Fjall: a
+        // claimed-but-unACKed forward must survive a process restart
+        // and be recoverable via autoclaim by a new consumer.
+        let dir = TempDir::new().expect("tempdir");
+        let entry = ForwardQueueEntry {
+            stream_id: String::new(),
+            message: "encrypted".into(),
+            to_did_hash: hash("to"),
+            from_did_hash: hash("from"),
+            from_did: "did:from".into(),
+            to_did: "did:to".into(),
+            endpoint_url: "http://example".into(),
+            received_at_ms: 0,
+            delay_milli: 0,
+            expires_at: 0,
+            retry_count: 0,
+            hop_count: 0,
+            not_before_ms: 0,
+        };
+
+        let id = {
+            let store = FjallStore::open(dir.path()).expect("open");
+            let id = store
+                .forward_queue_enqueue(&entry, 0)
+                .await
+                .expect("enqueue");
+            // Claim under consumer c1, then "crash" before ACKing.
+            let read = store
+                .forward_queue_read("forwarding", "c1", 10, Duration::from_millis(0))
+                .await
+                .expect("read");
+            assert_eq!(read.len(), 1);
+            store.shutdown().await.expect("shutdown");
+            id
+        };
+
+        let store = FjallStore::open(dir.path()).expect("reopen");
+        // The group cursor is durable, so a plain read must not
+        // double-deliver the claimed entry...
+        let read = store
+            .forward_queue_read("forwarding", "c2", 10, Duration::from_millis(0))
+            .await
+            .expect("read after reopen");
+        assert!(read.is_empty());
+        // ...but autoclaim recovers it for the new consumer.
+        let claimed = store
+            .forward_queue_autoclaim("forwarding", "c2", Duration::from_millis(0), 10, "0-0")
+            .await
+            .expect("autoclaim")
+            .entries;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].stream_id, id);
+        assert_eq!(claimed[0].message, "encrypted");
+
+        store
+            .forward_queue_ack("forwarding", &[&id])
+            .await
+            .expect("ack");
+        store.forward_queue_delete(&[&id]).await.expect("delete");
+        assert_eq!(store.forward_queue_len().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn forward_queue_blocks_then_returns_on_enqueue() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = Arc::new(FjallStore::open(dir.path()).expect("open"));
+
+        // Spawn a reader that blocks for up to 2s.
+        let reader = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .forward_queue_read("g", "c", 10, Duration::from_secs(2))
+                    .await
+                    .expect("read")
+            })
+        };
+
+        // Give the reader a moment to actually start blocking.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entry = ForwardQueueEntry {
+            stream_id: String::new(),
+            message: "delayed".into(),
+            to_did_hash: hash("to"),
+            from_did_hash: hash("from"),
+            from_did: "did:from".into(),
+            to_did: "did:to".into(),
+            endpoint_url: "http://example".into(),
+            received_at_ms: 0,
+            delay_milli: 0,
+            expires_at: 0,
+            retry_count: 0,
+            hop_count: 0,
+            not_before_ms: 0,
+        };
+        store
+            .forward_queue_enqueue(&entry, 0)
+            .await
+            .expect("enqueue");
+
+        let read = reader.await.expect("reader join");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].message, "delayed");
+    }
+
+    // ─── Streaming-state tests (task #17) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn streaming_set_state_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+
+        // Registered (not yet live) — `is_client_live` only returns
+        // a UUID when force_delivery is set.
+        store
+            .streaming_set_state(&alice, "uuid-1", StreamingClientState::Registered)
+            .await
+            .expect("register");
+        assert!(
+            store
+                .streaming_is_client_live(&alice, false)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store.streaming_is_client_live(&alice, true).await,
+            Some("uuid-1".to_string())
+        );
+
+        // Live — both branches return the UUID.
+        store
+            .streaming_set_state(&alice, "uuid-1", StreamingClientState::Live)
+            .await
+            .expect("live");
+        assert_eq!(
+            store.streaming_is_client_live(&alice, false).await,
+            Some("uuid-1".to_string())
+        );
+
+        // Deregistered — entry is removed entirely.
+        store
+            .streaming_set_state(&alice, "uuid-1", StreamingClientState::Deregistered)
+            .await
+            .expect("deregister");
+        assert!(store.streaming_is_client_live(&alice, true).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_clean_start_drops_only_matching_uuid() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        store
+            .streaming_set_state(&hash("alice"), "uuid-1", StreamingClientState::Live)
+            .await
+            .expect("alice");
+        store
+            .streaming_set_state(&hash("bob"), "uuid-2", StreamingClientState::Live)
+            .await
+            .expect("bob");
+
+        store.streaming_clean_start("uuid-1").await.expect("clean");
+
+        // Alice's entry (uuid-1) is gone; Bob's (uuid-2) remains.
+        assert!(
+            store
+                .streaming_is_client_live(&hash("alice"), true)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store.streaming_is_client_live(&hash("bob"), false).await,
+            Some("uuid-2".to_string())
+        );
+    }
+
+    /// A forward-queue row that does not decode is dropped, by a read or by
+    /// the reclaim sweep, rather than failing every read or being reclaimed
+    /// on every sweep.
+    #[tokio::test]
+    async fn malformed_forward_queue_rows_are_dropped() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+
+        // One bad row read fresh, and one already claimed when it went bad.
+        store
+            .forward_queue
+            .insert(encode_stream_id(1, 0).to_vec(), b"not json".to_vec())
+            .expect("insert bad row");
+        store.forward_queue_len.fetch_add(1, Ordering::AcqRel);
+        let good = store
+            .forward_queue_enqueue(&forward_entry(), 0)
+            .await
+            .expect("enqueue");
+        let read = store
+            .forward_queue_read("g", "c1", 10, Duration::ZERO)
+            .await
+            .expect("a bad row does not fail the read");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].stream_id, good);
+        assert!(
+            store
+                .forward_queue
+                .get(encode_stream_id(1, 0))
+                .expect("get")
+                .is_none(),
+            "the bad row is gone"
+        );
+
+        let sid = parse_stream_id_string(&good).expect("stream id");
+        store
+            .forward_queue
+            .insert(
+                encode_stream_id(sid.0, sid.1).to_vec(),
+                b"gone bad".to_vec(),
+            )
+            .expect("corrupt the claimed row");
+        let page = store
+            .forward_queue_autoclaim("g", "c2", Duration::ZERO, 10, "0-0")
+            .await
+            .expect("a bad row does not fail the sweep");
+        assert!(page.entries.is_empty());
+        assert_eq!(store.forward_pending.iter().count(), 0, "claim dropped");
+        assert_eq!(store.forward_queue_len().await.expect("len"), 0);
+    }
+
+    #[tokio::test]
+    async fn forward_queue_autoclaim_recovers_idle_entries() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let entry = ForwardQueueEntry {
+            stream_id: String::new(),
+            message: "msg".into(),
+            to_did_hash: hash("to"),
+            from_did_hash: hash("from"),
+            from_did: "did:from".into(),
+            to_did: "did:to".into(),
+            endpoint_url: "http://example".into(),
+            received_at_ms: 0,
+            delay_milli: 0,
+            expires_at: 0,
+            retry_count: 0,
+            hop_count: 0,
+            not_before_ms: 0,
+        };
+        let id = store
+            .forward_queue_enqueue(&entry, 0)
+            .await
+            .expect("enqueue");
+
+        // First consumer claims the entry but never acks.
+        let read = store
+            .forward_queue_read("g", "consumer-a", 10, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(read.len(), 1);
+
+        // Wait long enough for the claim to look idle.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let reclaimed = store
+            .forward_queue_autoclaim("g", "consumer-b", Duration::from_millis(10), 10, "0-0")
+            .await
+            .expect("autoclaim")
+            .entries;
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].stream_id, id);
+    }
+
+    fn forward_entry() -> ForwardQueueEntry {
+        ForwardQueueEntry {
+            stream_id: String::new(),
+            message: "msg".into(),
+            to_did_hash: hash("to"),
+            from_did_hash: hash("from"),
+            from_did: "did:from".into(),
+            to_did: "did:to".into(),
+            endpoint_url: "http://example".into(),
+            received_at_ms: 0,
+            delay_milli: 0,
+            expires_at: 0,
+            retry_count: 0,
+            hop_count: 0,
+            not_before_ms: 0,
+        }
+    }
+
+    /// Ack and delete land together: the claim and the entry are both gone,
+    /// and the queue length follows.
+    #[tokio::test]
+    async fn forward_queue_ack_and_delete_releases_claim_and_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let id = store
+            .forward_queue_enqueue(&forward_entry(), 0)
+            .await
+            .expect("enqueue");
+        let read = store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(read.len(), 1);
+
+        store
+            .forward_queue_ack_and_delete("g", &[id.as_str()])
+            .await
+            .expect("ack and delete");
+        assert_eq!(store.forward_queue.iter().count(), 0);
+        assert_eq!(store.forward_pending.iter().count(), 0);
+        assert_eq!(store.forward_queue_len().await.unwrap(), 0);
+    }
+
+    /// A claim whose entry is gone (trimmed, or deleted after a crash between
+    /// a separate ack and delete) is dropped by autoclaim, not re-claimed
+    /// forever.
+    #[tokio::test]
+    async fn autoclaim_drops_claims_whose_entry_is_gone() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let id = store
+            .forward_queue_enqueue(&forward_entry(), 0)
+            .await
+            .expect("enqueue");
+        store
+            .forward_queue_read("g", "c", 10, Duration::from_millis(0))
+            .await
+            .expect("read");
+        store
+            .forward_queue_delete(&[id.as_str()])
+            .await
+            .expect("delete without ack");
+        assert_eq!(store.forward_pending.iter().count(), 1, "orphaned claim");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reclaimed = store
+            .forward_queue_autoclaim("g", "c2", Duration::from_millis(10), 10, "0-0")
+            .await
+            .expect("autoclaim")
+            .entries;
+        assert!(reclaimed.is_empty());
+        assert_eq!(store.forward_pending.iter().count(), 0, "claim dropped");
+    }
+
+    #[tokio::test]
+    async fn oob_invite_lifecycle() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let id = store
+            .oob_discovery_store(&hash("alice"), "invite-data-base64", now + 60)
+            .await
+            .expect("store");
+        let got = store
+            .oob_discovery_get(&id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(got.0, "invite-data-base64");
+        assert_eq!(got.1, hash("alice"));
+
+        // Expired invites read as None and are auto-cleaned.
+        let expired = store
+            .oob_discovery_store(&hash("alice"), "old-data", now - 5)
+            .await
+            .expect("store-expired");
+        assert!(store.oob_discovery_get(&expired).await.unwrap().is_none());
+
+        // Explicit delete returns true once, false thereafter.
+        assert!(store.oob_discovery_delete(&id).await.unwrap());
+        assert!(!store.oob_discovery_delete(&id).await.unwrap());
+    }
+
+    /// Parity with `memory_store`: the two backends must agree on delivery
+    /// state, or eviction and poison detection built on it behave differently
+    /// depending on which backend a deployment runs. Mirrors
+    /// `delivery_is_recorded_and_the_first_stamp_is_kept` there.
+    #[tokio::test]
+    async fn delivery_is_recorded_and_the_first_stamp_is_kept() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        for did in [&alice, &bob] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let id = store
+            .store_message("s", "hello", &bob, Some(&alice), 0, 0)
+            .await
+            .expect("store");
+
+        let state = store
+            .delivery_state(&bob, &id)
+            .await
+            .expect("state")
+            .expect("exists");
+        assert!(!state.delivered());
+        assert_eq!(state.attempts, 0);
+
+        store
+            .mark_delivered(&bob, std::slice::from_ref(&id), 1_000, 0)
+            .await
+            .expect("mark");
+        store
+            .mark_delivered(&bob, std::slice::from_ref(&id), 5_000, 0)
+            .await
+            .expect("mark");
+
+        let state = store
+            .delivery_state(&bob, &id)
+            .await
+            .expect("state")
+            .expect("exists");
+        assert_eq!(
+            state.first_delivered_at_ms,
+            Some(1_000),
+            "the first stamp is sticky: ageing keys off when it was FIRST handed over, \
+             so a reconnecting client must not reset its own clock"
+        );
+        assert_eq!(state.attempts, 2);
+    }
+
+    /// Parity with `memory_store`: the two backends must agree on when a
+    /// delivered message expires, or a deployment's durability depends on
+    /// which backend it happens to run. Mirrors
+    /// `a_delivered_message_expires_on_the_shorter_clock` there.
+    #[tokio::test]
+    async fn a_delivered_message_expires_on_the_shorter_clock() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        for did in [&alice, &bob] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let week = 7 * 24 * 60 * 60;
+        let id = store
+            .store_message("s", "hello", &bob, Some(&alice), week, 0)
+            .await
+            .expect("store");
+
+        let report = store
+            .mark_delivered(&bob, std::slice::from_ref(&id), 0, 3_600)
+            .await
+            .expect("mark");
+        assert_eq!(report.first_delivered, 1);
+        assert_eq!(report.expiry_advanced, 1);
+
+        assert_eq!(
+            store
+                .sweep_expired_messages(3_599, &hash("admin"))
+                .await
+                .expect("sweep")
+                .expired,
+            0,
+            "still held before its shortened deadline"
+        );
+        assert_eq!(
+            store
+                .sweep_expired_messages(3_600, &hash("admin"))
+                .await
+                .expect("sweep")
+                .expired,
+            1,
+            "gone at the shortened deadline, not in a week"
+        );
+    }
+
+    /// A redelivery must not re-arm the deadline — a client that reconnects
+    /// often would otherwise pin its sender's allowance indefinitely, which is
+    /// the mirror of the problem this feature fixes.
+    #[tokio::test]
+    async fn a_redelivery_does_not_push_the_deadline_out() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let alice = hash("alice");
+        let bob = hash("bob");
+        for did in [&alice, &bob] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("add");
+        }
+        let week = 7 * 24 * 60 * 60;
+        let id = store
+            .store_message("s", "hello", &bob, Some(&alice), week, 0)
+            .await
+            .expect("store");
+
+        store
+            .mark_delivered(&bob, std::slice::from_ref(&id), 0, 3_600)
+            .await
+            .expect("first");
+        let report = store
+            .mark_delivered(&bob, std::slice::from_ref(&id), 3_000_000, 3_600)
+            .await
+            .expect("redelivery");
+        assert_eq!(report.first_delivered, 0);
+        assert_eq!(report.redelivered, 1);
+        assert_eq!(report.expiry_advanced, 0);
+
+        assert_eq!(
+            store
+                .sweep_expired_messages(3_600, &hash("admin"))
+                .await
+                .expect("sweep")
+                .expired,
+            1,
+            "the ORIGINAL shortened deadline still holds"
+        );
+    }
+
+    /// Records written before these fields existed are on disk and must still
+    /// decode, reading back as never-delivered — which is the honest answer,
+    /// and a different claim from "delivered zero times".
+    #[tokio::test]
+    async fn a_record_written_without_delivery_fields_still_decodes() {
+        // The stored shape as it was before this change.
+        let legacy = serde_json::json!({
+            "body": "hello",
+            "bytes": 5,
+            "to_did_hash": "bob",
+            "from_did_hash": "alice",
+            "timestamp_ms": 1_700_000_000_000u64,
+            "receive_id": [1, 0],
+            "send_id": null,
+            "expires_at": 0,
+        })
+        .to_string();
+
+        let decoded: StoredMessage =
+            serde_json::from_str(&legacy).expect("a pre-existing record must still decode");
+        assert_eq!(decoded.first_delivered_at_ms, None);
+        assert_eq!(decoded.delivery_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn marking_a_vanished_message_is_not_an_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let bob = hash("bob");
+        store
+            .mark_delivered(&bob, &["never-existed".to_string()], 1_000, 0)
+            .await
+            .expect("marking an absent message must not fail a delivery");
+        assert!(
+            store
+                .delivery_state(&bob, "never-existed")
+                .await
+                .expect("state")
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod idempotent_store_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn hash(s: &str) -> String {
+        sha256::digest(s)
+    }
+
+    /// REGRESSION (2026-09-21): a re-submitted message — the delivery layer's
+    /// outbox re-sends the identical packed bytes when a send errors after the
+    /// mediator had already stored it — was counted twice and released once.
+    /// The sender's `send_queue_count` leaked one per duplicate, for good, until
+    /// a live did-hosting control DID hit `limits.queue.sender` and could answer
+    /// nobody. After the one delete, every counter must be back to zero.
+    #[tokio::test]
+    async fn a_resubmitted_message_is_stored_and_counted_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let (to, from) = (hash("vta"), hash("control"));
+        for did in [&from, &to] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account");
+        }
+
+        let a = store
+            .store_message("s", "same-bytes", &to, Some(&from), 0, 0)
+            .await
+            .expect("first store");
+        let b = store
+            .store_message("s", "same-bytes", &to, Some(&from), 0, 0)
+            .await
+            .expect("re-submitted store");
+        assert_eq!(a, b, "the same bytes keep the same id");
+
+        let sender = store.account_get(&from).await.unwrap().unwrap();
+        assert_eq!(sender.send_queue_count, 1, "counted once");
+        assert_eq!(store.peer_queue_count(&from, &to).await.unwrap(), 1);
+
+        store
+            .delete_message(
+                &a,
+                DeletionAuthority::Owner {
+                    did_hash: to.clone(),
+                },
+            )
+            .await
+            .expect("delete");
+
+        let sender = store.account_get(&from).await.unwrap().unwrap();
+        let recipient = store.account_get(&to).await.unwrap().unwrap();
+        assert_eq!(sender.send_queue_count, 0, "the sender count must not leak");
+        assert_eq!(sender.send_queue_bytes, 0);
+        assert_eq!(recipient.receive_queue_count, 0, "nor the recipient's");
+        assert_eq!(store.peer_queue_count(&from, &to).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod per_recipient_record_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn hash(s: &str) -> String {
+        digest(s.as_bytes())
+    }
+
+    async fn counters(store: &FjallStore, did: &str) -> (u32, u32) {
+        store
+            .account_get(did)
+            .await
+            .expect("account_get")
+            .map(|a| (a.receive_queue_count, a.send_queue_count))
+            .unwrap_or_default()
+    }
+
+    /// Rewrites `to`'s row of `msg_id` in the layout used before rows were
+    /// per recipient: keyed by the bare id, with a bare-id expiry entry.
+    fn make_legacy(store: &FjallStore, msg_id: &str, to: &str) {
+        let key = record_key(msg_id, to);
+        let raw = store
+            .messages
+            .get(key.as_bytes())
+            .expect("get")
+            .expect("row present");
+        let stored: StoredMessage = FjallStore::decode(&raw).expect("decode");
+        let mut batch = store.db.batch();
+        batch.remove(&store.messages, key.as_bytes());
+        batch.insert(&store.messages, msg_id.as_bytes(), raw.to_vec());
+        if stored.expires_at > 0 {
+            batch.remove(&store.expiry, expiry_key(stored.expires_at, &key));
+            batch.insert(
+                &store.expiry,
+                expiry_key(stored.expires_at, msg_id),
+                Vec::<u8>::new(),
+            );
+        }
+        batch.commit().expect("commit");
+    }
+
+    /// A row written before rows were per recipient keeps working for its
+    /// recipient: fetched, read, stored again as one record, deleted with
+    /// every counter released, and expired from its bare-id entry. The same
+    /// bytes for another recipient get a row of their own beside it.
+    #[tokio::test]
+    async fn a_legacy_row_keeps_working_beside_per_recipient_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let (a, b, from) = (hash("a"), hash("b"), hash("sender"));
+        for did in [&a, &b, &from] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account_add");
+        }
+        let body = "legacy-row";
+
+        let id = store
+            .store_message("s", body, &a, Some(&from), 0, 0)
+            .await
+            .expect("store");
+        make_legacy(&store, &id, &a);
+        assert!(store.messages.get(id.as_bytes()).unwrap().is_some());
+
+        // Read, and stored again for its recipient as the same one record.
+        let read = store.get_message(&a, &id).await.unwrap().expect("a reads");
+        assert_eq!(read.msg.as_deref(), Some(body));
+        store
+            .store_message("s", body, &a, Some(&from), 0, 0)
+            .await
+            .expect("store again");
+        assert_eq!(counters(&store, &a).await, (1, 0));
+
+        // Another recipient: a row of its own; the legacy row is untouched.
+        store
+            .store_message("s", body, &b, Some(&from), 0, 0)
+            .await
+            .expect("store for b");
+        assert_eq!(counters(&store, &b).await, (1, 0));
+        assert_eq!(counters(&store, &from).await, (0, 2));
+        assert_eq!(
+            store
+                .get_message(&a, &id)
+                .await
+                .unwrap()
+                .and_then(|m| m.to_address),
+            Some(a.clone())
+        );
+
+        // Fetch and delete as the recipient.
+        let fetched = store
+            .fetch_messages(
+                "s",
+                &a,
+                &FetchOptions {
+                    limit: 10,
+                    start_id: None,
+                    delete_policy: FetchDeletePolicy::Optimistic,
+                },
+            )
+            .await
+            .expect("fetch");
+        assert_eq!(fetched.success.len(), 1);
+        assert_eq!(fetched.success[0].msg.as_deref(), Some(body));
+        assert!(
+            fetched.delete_errors.is_empty(),
+            "{:?}",
+            fetched.delete_errors
+        );
+        assert!(store.messages.get(id.as_bytes()).unwrap().is_none());
+        assert_eq!(counters(&store, &a).await, (0, 0));
+        assert_eq!(counters(&store, &from).await, (0, 1));
+        assert_eq!(store.peer_queue_count(&from, &a).await.unwrap(), 0);
+        assert!(store.get_message(&b, &id).await.unwrap().is_some());
+
+        // A legacy row expires from its bare-id entry.
+        let now = now_ms() / 1_000;
+        let expiring = store
+            .store_message("s", "legacy-expiring", &a, Some(&from), now - 10, 0)
+            .await
+            .expect("store expiring");
+        make_legacy(&store, &expiring, &a);
+        let report = store
+            .sweep_expired_messages(now, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.expired, 1, "{report:?}");
+        assert!(store.messages.get(expiring.as_bytes()).unwrap().is_none());
+        assert_eq!(counters(&store, &a).await, (0, 0));
+        assert_eq!(counters(&store, &from).await, (0, 1), "b's copy remains");
+    }
+
+    /// A legacy row whose delivery brought its deadline forward under the
+    /// earlier build — an extra expiry entry, the row's own `expires_at`
+    /// unchanged — expires from that entry, as it did before the upgrade.
+    #[tokio::test]
+    async fn a_legacy_rows_delivered_deadline_still_expires_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FjallStore::open(dir.path()).expect("open");
+        let (a, from) = (hash("a"), hash("sender"));
+        for did in [&a, &from] {
+            store
+                .account_add(did, &MediatorACLSet::default(), None)
+                .await
+                .expect("account_add");
+        }
+        let now = now_ms() / 1_000;
+        let id = store
+            .store_message("s", "legacy-delivered", &a, Some(&from), now + 3_600, 0)
+            .await
+            .expect("store");
+        make_legacy(&store, &id, &a);
+        // The earlier build's `mark_delivered`: an entry at the deadline, the
+        // row left as it was.
+        let mut batch = store.db.batch();
+        batch.insert(&store.expiry, expiry_key(now - 5, &id), Vec::<u8>::new());
+        batch.commit().expect("commit");
+
+        let report = store
+            .sweep_expired_messages(now, &hash("admin"))
+            .await
+            .expect("sweep");
+        assert_eq!(report.expired, 1, "{report:?}");
+        assert!(store.messages.get(id.as_bytes()).unwrap().is_none());
+        assert_eq!(counters(&store, &a).await, (0, 0));
+        assert_eq!(counters(&store, &from).await, (0, 0));
+    }
+}

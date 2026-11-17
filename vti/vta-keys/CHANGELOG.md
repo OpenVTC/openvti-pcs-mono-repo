@@ -1,0 +1,988 @@
+# Changelog
+
+Notable changes to the published crates. Generated from conventional commits by
+[git-cliff](https://git-cliff.org) when a release is cut — do not edit by hand.
+## [0.44.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.43.0...vta-keys-v0.44.0) — 2026-11-15
+
+
+## [0.43.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.42.0...vta-keys-v0.43.0) — 2026-11-14
+
+
+### Build & CI
+
+- **deps**: Enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe ([#2708](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2708))
+
+* build(deps): enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe
+
+  pgp, openssl only via webauthn-rs 0.5, no wildcards, and
+  multiple-versions = "deny" with a skip list of today's duplicates grouped by
+  cause. The two advisory ignores cargo-deny reports as not detected
+  (RUSTSEC-2026-0381, RUSTSEC-2024-0436) are removed, the stale [graph]
+  comment rewritten, and the yanked crypto-bigint 0.7.6 moved to 0.7.11.
+
+  ring leaves the VTA and VTC graphs; it stays only under attest-verify.
+
+  removed from 19 crates; deliberate ones are listed under
+  [package.metadata.cargo-machete] ignored. A tier-0 "manifest hygiene" CI job
+  runs cargo-machete and the lint check.
+
+  once in [workspace.dependencies]; vta-tee inherits aws-lc-rs. The five
+  crypto crates carry real minimum-patch floors, enforced by
+  check-workspace-version-reqs.py.
+
+  (check-workspace-lints.py); unsafe_code = "forbid" workspace-wide, with
+  the four crates that need unsafe restating the table at "deny" and
+  rewritten safely. The two missing publish = false comments are added.
+
+
+
+## [0.42.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.41.0...vta-keys-v0.42.0) — 2026-11-12
+
+
+## [0.41.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.40.0...vta-keys-v0.41.0) — 2026-11-10
+
+
+## [0.40.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.39.0...vta-keys-v0.40.0) — 2026-11-09
+
+
+## [0.39.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.38.0...vta-keys-v0.39.0) — 2026-11-05
+
+
+## [0.38.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.37.0...vta-keys-v0.38.0) — 2026-11-05
+
+
+## [0.37.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.36.0...vta-keys-v0.37.0) — 2026-11-05
+
+
+## [0.36.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.35.0...vta-keys-v0.36.0) — 2026-11-04
+
+
+## [0.35.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.34.0...vta-keys-v0.35.0) — 2026-11-04
+
+
+## [0.34.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.33.0...vta-keys-v0.34.0) — 2026-11-04
+
+
+## [0.33.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.32.0...vta-keys-v0.33.0) — 2026-11-03
+
+
+## [0.32.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.31.0...vta-keys-v0.32.0) — 2026-11-03
+
+
+### Added
+
+- **vetting**: Recover or reset a lost hidden-vetting key (pcs-binding/show, pcs-binding/reset, vta/pcs/vetter/recover) ([#2406](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2406))
+
+* feat(vtc): recover or reset a lost hidden-vetting key (pcs-binding/show, pcs-binding/reset)
+
+  A vetter is bound to the PCS identifier of their first enrolment, and a
+  second identifier is refused with pcs-root:identifierRebound. The binding
+  was never cleared, so a vetter whose key was lost was locked out of hidden
+  vetting for as long as they stayed a member; revoking and re-granting the
+  role did not help.
+
+  - vtc/vetting/vetters/pcs-binding/show/0.1: a member reads their own
+    binding (identifier, enrolled labels, any pending reset), so their client
+    can recover the matching key. Membership is the entitlement;
+    notAMember otherwise.
+  - vtc/vetting/vetters/pcs-binding/reset/0.1: an administrator holding
+    vtc.vetting.manage (as vetters/grant) resets a member's binding with a
+    reason. Idempotent; notBound for a member who never enrolled. Audited as
+    HiddenVetterBindingReset, never with the identifier.
+  - Enrolment after a reset: the recorded identifier cancels it
+    (HiddenVetterResetCancelled); a new one is refused (identifierRebound)
+    while any label the old one enrolled under is live, judged at each
+    request against the caller's configuration and the stored one under the
+    enrolment lock, and bound once none is (HiddenVetterRebound) with its
+    labels afresh. The old labels are retired on the record.
+  - vtc/vetting/hidden/publish refuses to make a retired label live again,
+    checked before the consent gate and again under the enrolment lock
+    before the write. publish/0.1 declares no code for it, so it is a
+    validation refusal.
+  - Admin console: a "Reset a hidden-vetting key" card under Vetting ->
+    Vetters, shown when discovery lists the task.
+  - EnrolmentRecord gains optional reset and retiredLabels members; rows
+    without them read and write as before.
+
+  The two specifications are pinned from a locally built registry ahead of
+  their publication; trust-tasks.lock records that registry until they are
+  re-pinned against trusttasks.org.
+
+
+
+## [0.31.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.30.0...vta-keys-v0.31.0) — 2026-11-02
+
+
+## [0.30.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.29.0...vta-keys-v0.30.0) — 2026-10-30
+
+
+## [0.29.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.28.0...vta-keys-v0.29.0) — 2026-10-30
+
+
+## [0.28.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.27.0...vta-keys-v0.28.0) — 2026-10-28
+
+
+## [0.27.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.26.0...vta-keys-v0.27.0) — 2026-10-27
+
+
+## [0.26.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.25.0...vta-keys-v0.26.0) — 2026-10-26
+
+
+### Added
+
+- Growth types in published crates are #[non_exhaustive] ([#2196](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2196))
+
+A new variant on a public enum, or a new field on a public struct a consumer
+  can build with a literal, is a breaking change in a published crate. It kept
+  happening on types that were always going to grow (#1231, #1234, #1244, #1247,
+  #1250); #1262 fixed it for Capability and AuditEvent only.
+
+  This marks the rest once. 143 enums are marked: every error and refusal enum
+  (VtaError, AppError, ...) and the growth vocabularies (kinds, statuses,
+  reasons, codes, transports, SealedPayloadV1). 32 structs are marked: config
+  and response bags that no caller builds with a literal. Adding the attribute
+  is itself breaking, once. After it, additions to these types are minor
+  changes.
+
+  Left exhaustive on purpose, and pinned that way by the census:
+  VerifiedAssertion, AssertionProof, ActScope, ApproveScope, ContextDirection,
+  SigningDomain, TokenStatus and Role. For each of these, every arm must be
+  considered, and a downstream wildcard would be the bug.
+
+  Every downstream match in the workspace gets a `_ =>` arm that takes the most
+  restrictive or most generic reading: an internal error, a hidden or refused
+  entry, a stale attribute. None is unreachable!().
+
+  vta-sdk/tests/non_exhaustive_census.rs fails on a public enum in a published
+  library crate whose name ends in Error, Refusal, Violation, Kind, Event,
+  Status, Capability, Reason or Code and that is not #[non_exhaustive], unless
+  it is listed as deliberately exhaustive with a reason. It also fails when a
+  listed enum gains the attribute or disappears.
+
+
+
+## [0.25.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.24.0...vta-keys-v0.25.0) — 2026-10-18
+
+
+## [0.24.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.23.0...vta-keys-v0.24.0) — 2026-10-18
+
+
+## [0.23.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.22.0...vta-keys-v0.23.0) — 2026-10-16
+
+
+## [0.22.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.21.0...vta-keys-v0.22.0) — 2026-10-15
+
+
+### Added
+
+- **secrets**: Encrypted-at-rest file backend ([#1820](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1820)) ([#2101](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2101))
+
+* feat(secrets)!: encrypted-at-rest file backend ([#1820](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1820))
+
+  Add `encrypted_file` to vti-secrets: the secret is kept in one file under
+  AES-256-GCM, keyed from an explicitly configured key-encryption key, so a
+  headless host with no OS keychain has a secure local option instead of
+  `plaintext`.
+
+  KEK sources (`[secrets.encrypted_file] kek = { source = ... }`):
+  - `passphrase`: Argon2id (m = 64 MiB, t = 3, p = 4; salt and parameters in
+    the header, floors enforced on read), passphrase from a file or a systemd
+    credential, never from the config or an environment variable;
+  - `systemd_creds`: a 32-byte KEK from $CREDENTIALS_DIRECTORY, HKDF-SHA256;
+  - `tpm` (feature `tpm`, Linux, tss-esapi 7.7): a random KEK sealed under the
+    owner-hierarchy SRK, optionally bound to SHA-256 PCRs, stored sealed in the
+    header, HKDF-SHA256.
+
+  Envelope v1: magic, version, AEAD id, KEK source id, salt, nonce and a
+  length-prefixed descriptor, all of it the AEAD's associated data. Fresh salt
+  and nonce per write. Writes are atomic (0600 temp file via
+  `secure_file::write_secret_file`, fsync, rename, directory fsync). Fails
+  closed: only a missing file is "no secret"; a wrong key, any modified byte,
+  an unknown version, a malformed header or a header from another KEK source
+  is an error. Key material and passphrases are zeroized; no derived Debug
+  holds a secret.
+
+  Selection is explicit only, in both the VTA factory and the VTC's
+  `create_secret_store` (`encrypted-file`): implicit resolution never picks it,
+  and a `[secrets.encrypted_file]` table without the selector is a config
+  error. The VTA setup TOML and interactive wizard offer it; vta-keys
+  re-exports the store; vta-service, vta-keys and vtc-service gain a `tpm`
+  feature.
+
+
+
+## [0.21.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.20.0...vta-keys-v0.21.0) — 2026-10-13
+
+
+### Added
+
+- **vta**: The VTA as hidden-vetting (PCS) engine — vta/pcs/* for clients that cannot run PCS ([#2056](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2056))
+
+* feat(vta)!: the VTA as hidden-vetting (PCS) engine — vta/pcs/* for clients that cannot run PCS
+
+  A community that runs hidden vetting admits an applicant on a zero-knowledge
+  proof that distinct eligible vetters vetted them. Every vetter and applicant
+  holds a PCS secret key, and until now the member side ran only in a client
+  linking the PCS library, so a mobile wallet (Keyring) could not take part.
+
+  The VTA now holds those keys and runs every member-side operation (design
+  vetting-hidden-vetters-pcs.md §13 C7); the client carries messages and never
+  holds a key. Twelve Trust Tasks (trust-tasks-tf #756):
+
+  - applicant: applications/{create,show,delete}, verify-attestation, prove
+  - vetter: root-request, root-accept, tokens/{request,accept,abandon}, attest,
+    vetter/show
+
+
+
+## [0.20.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.19.0...vta-keys-v0.20.0) — 2026-10-12
+
+
+## [0.19.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.18.0...vta-keys-v0.19.0) — 2026-10-11
+
+
+### Added
+
+- **vta-sdk**: Foreign-protocol DID identities — JWK key slots, an unpublished update key, P-256 slots, and a swiyu-verifier template ([#1988](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1988)) ([#2036](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2036))
+
+A VTC that verifies swiyu wallet presentations (OpenID4VP) needs an identity of
+  its own, shaped by the Swiss Profile Anchor: a did:webvh with one P-256 key
+  published as a publicKeyJwk (publicKeyMultibase is forbidden), no keyAgreement,
+  service or @context, the Ed25519 update key kept to the log's updateKeys, and
+  portable=false. DID templates could express none of that. This adds what they
+  were missing, and the template.
+
+  - `{SLOT}_KEY_JWK`: every key slot now also renders as a JWK object (kty, crv,
+    x, y, alg), beside `{SLOT}_KEY_MB`. Either publishes the slot; a JWK
+    placeholder for an undeclared slot, or declared as a variable, is refused
+    like its multibase twin.
+  - `KeySlot::publish` (default true; **breaking** — a new public field). Only the
+    `signing` slot, the did:webvh update key, may be `publish: false`, and then
+    the document must not use it. Its key record is named by its did:key, as the
+    log names it, instead of a guessed `#key-0`.
+  - Templates that declare slots but no `ka` slot get no key-agreement key
+    published or recorded.
+  - Additional signing slots may be P-256 (`derive_p256`'s domain-separated
+    derivation).
+  - `defaults.portable: false` is binding: the VTA mints the DID non-portable
+    whatever the caller asked (pnm defaults to true). Only that direction.
+  - Minted key records are matched to the document by publicKeyJwk as well as
+    publicKeyMultibase.
+  - Built-in `swiyu-verifier` template. Mint it serverless at the swiyu
+    identifier-registry slot URL, then upload the log to that slot.
+
+
+
+## [0.18.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.17.0...vta-keys-v0.18.0) — 2026-10-11
+
+
+### Added
+
+- **vta**: External accounts — short-lived provider credentials with no inbound surface ([#2016](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2016))
+
+* feat(vta): external-accounts capabilities and keyspaces
+
+  Adds the two capabilities the external/* family (trust-tasks-tf #740) gates on: external-accounts-manage, derived by admin alone, and external-auth-use, derived by every role that holds sign (the account's binding, not the role, bounds a consumer). Both are non-additive members of the non-exhaustive Capability enum.
+
+  Registers two keyspaces: external_accounts (settings, bindings, state) in BACKED_UP, and external_secrets (wrapped provider secrets) in EXCLUDED_FROM_BACKUP, so a portable password-protected backup is never a way to take a provider secret away. DID deletion: an account's binding names its consumer, so external_accounts blocks; external_secrets is unrelated.
+
+  The device-binding Capability registry (device/_shared 0.2) does not list the two yet, so device listings carry them under ext until it does.
+
+
+
+## [0.17.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.16.0...vta-keys-v0.17.0) — 2026-10-06
+
+
+## [0.16.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.15.0...vta-keys-v0.16.0) — 2026-10-06
+
+
+## [0.15.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.14.0...vta-keys-v0.15.0) — 2026-10-05
+
+
+## [0.14.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.13.0...vta-keys-v0.14.0) — 2026-10-04
+
+
+## [0.13.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.12.0...vta-keys-v0.13.0) — 2026-10-02
+
+
+## [0.12.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.11.0...vta-keys-v0.12.0) — 2026-10-02
+
+
+## [0.11.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.10.0...vta-keys-v0.11.0) — 2026-10-01
+
+
+## [0.10.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.9.0...vta-keys-v0.10.0) — 2026-10-01
+
+
+## [0.9.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.8.2...vta-keys-v0.9.0) — 2026-09-30
+
+
+## [0.8.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.8.1...vta-keys-v0.8.2) — 2026-09-30
+
+
+## [0.8.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.8.0...vta-keys-v0.8.1) — 2026-09-27
+
+
+## [0.8.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.7.1...vta-keys-v0.8.0) — 2026-09-27
+
+
+### Added
+
+- **vta**: Health, restore status, session revoke and the wrapping key are Trust Tasks ([#1790](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1790))
+
+* feat(vta)!: health, restore status, session revoke and the wrapping key are Trust Tasks
+
+  Four REST routes become spine-dispatched, signed Trust Tasks reachable over
+  TSP, DIDComm and HTTPS (`/trust-tasks`), from trust-tasks-rs 0.23.6, and the
+  routes are removed rather than deprecated.
+
+  vta/health/details/0.1 (replaces GET /health/details)
+  - Public: in `vta_sdk::trust_tasks::PUBLIC_URIS`, so an anonymous HTTPS caller
+    (on the unauthenticated limiter) and a DIDComm/TSP sender the ACL does not
+    know are answered; request proof optional, response signed.
+  - Returns only the fixed non-identifying flags the schema admits: status,
+    mediatorUrl/mediatorDid, teeStatus (as vta/attestation/status answers it,
+    `sev_snp` spelled `sev-snp`, absent without a provider), sealed,
+    storageEncrypted, tspEnabled. The same answer for every asker; never the
+    software version or the restore record.
+
+  vta/restore/status/0.1 (the version and restore half of GET /health/details)
+  - Administrators of the VTA only (any admin, scoped or not, read from the ACL
+    now rather than the token); anyone else is `permissionDenied` before any
+    restore state is read. Request proof required, response signed.
+  - Answers `version`, `restored`, and the VTI-VTA-051 `restore` record from
+    `keys ▸ restore:provenance` exactly when restored. The SDK refuses a reply in
+    which the two disagree. `pnm health` gains a Deployment section showing both
+    tasks' answers.
+
+  auth/revoke-session/0.2 (replaces GET /auth/sessions, DELETE
+  /auth/sessions/{id}, DELETE /auth/sessions?did=)
+  - Adds the `subject` form and implements `all: true` (0.1 refused it). A caller
+    may end another subject's sessions exactly when it could remove that
+    subject's ACL entry (VTI-SES-043, VTI-ACL-050, `may_manage_subject`); outside
+    that, `permissionDenied`, decided before the subject's sessions are read and
+    identical whether or not the subject exists. A named session outside the
+    caller's authority is answered as a missing one (`revokedCount: 0`).
+  - The payload is checked against its schema and the one-form rule is enforced
+    in the handler on the validated JSON, not left to the generated type: two
+    forms, none, or `all: false` are `malformedRequest`.
+  - Every revocation and refusal is audited with caller and subject; `reason`
+    goes to the audit detail.
+  - 0.1 is no longer served (every 0.1 payload is a valid 0.2 payload);
+    vta-mobile-core's builders move to 0.2. The hand-written
+    `RevokeSessionRequest`/`RevokeSessionResponse` are deleted in favour of the
+    generated types. Listing another subject's sessions has no replacement: no
+    published task enumerates them.
+
+  keys/import-wrapping-key/0.1 (replaces GET /keys/import/wrapping-key)
+  - The wrapping key is now an Ed25519 keypair returned as a `did:key`, with
+    `keyId` and `expiresAt`; only its X25519 counterpart is kept, in memory,
+    single-use, 60 seconds. Admin only, as keys/import. Response signed.
+  - `VtaClient::get_wrapping_key` returns the generated response and always
+    verifies the reply's proof (a client with no identity is refused, and
+    `trusting_unsigned_replies` does not apply to this task). `pnm keys import`
+    seals to the did:key's X25519. The sealed path over HTTPS works through the
+    task; the cleartext carrier stays refused there.
+
+
+
+## [0.7.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.7.0...vta-keys-v0.7.1) — 2026-09-26
+
+
+## [0.7.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.10...vta-keys-v0.7.0) — 2026-09-26
+
+
+### Security
+
+- **vta**: Key custody — seed and key material only through audited, scope-checked doors (FTL-29904) ([#1715](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1715))
+
+Every key the VTA holds is a pure function of the master seed and a BIP-32
+  path, so choosing a path is holding a key. FTL-29904 reported that a
+  context-scoped admin could list and rotate the instance-wide seed; the review
+  found the same mistake, a gate asking about the caller's role or context and
+  never about the path or key it named, in five more places:
+
+  - seeds list/rotate: gated on the admin role on REST, Trust Task AND DIDComm
+    (the report named two transports). Now super-admin, enforced once in the
+    operation so all three share one audited refusal (VTI-ACL-022, VTI-ACL-092).
+  - keys/create accepted any derivationPath and recorded the key under the
+    caller's own context, so keys/export-secret released it: another tenant's
+    key or the VTA's own did:webvh update key. Only a super-admin may choose a
+    path, and the path must belong to the record's context (VTI-KEY-030/032).
+  - keys/derive-and-sign(-document) signed as any path for any admin. Now
+    super-admin only and confined to the delegated-identity subtree m/26'/9';
+    every signature is audited with a digest of what was signed (VTI-VTA-006).
+  - vault/sign-trust-task and vault/proxy-login loaded the entry's signingKeyId
+    under InternalAuthority with no scope check, so an entry naming
+    {vta_did}#key-0 made the VTA sign as itself (reachable by `initiator`). The
+    key must now be in the entry's context subtree, at use and at upsert.
+  - credentials/issue and credentials/revoke (VTA-signed VCs over caller-chosen
+    claims) required only the admin role. Now super-admin.
+  - vault/credentials/receive could bind an mdoc to a context-less key without
+    super-admin.
+
+- **workspace**: No type derives Debug over secret material ([#1711](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1711))
+
+A derived `Debug` prints every field, so on a type holding a private key, a
+  seed or mnemonic, a bearer or refresh token or a password it puts the secret
+  into anything that formats the value — a `tracing` field, an `unwrap` or
+  `expect` on an enclosing type, a test failure, a panic message. About 55 types
+  across twelve crates did exactly that. It surfaced when `vtc-client` began
+  holding an operator's key in a `HolderKey`, whose derived `Debug` printed it.
+
+  Each now has a hand-written `Debug` that reports the secret as `<redacted>` —
+  presence kept visible for an `Option` — and prints every other field as
+  before, the idiom the workspace already used where someone had thought of it.
+  Among them: `HolderKey`, `Session`, `ClientIdentity`, `CredentialBundle`,
+  `SecretEntry`, `AgentConfig`, `AgentConnect`, `AuthResult`, the key-import and
+  seed-rotation requests (mnemonic), `SeedRecord`, `MnemonicExportResponse`,
+  `SecretsConfig` (seed, Vault token, AppRole secret id), `VaultSecret`, its
+  `CustomField` values and secure notes, `TotpSeed`, the VTC install flow's
+  ephemeral signing keys, setup tokens and install JWT, the VTC backup's signing
+  bundle and password, mobile-core's X25519 and Ed25519 private keys, auth tokens
+  and push tokens (including the Web Push auth secret), and vta-mcp's
+  `--agent-key`/`--holder-key`/`--agent-secrets`.
+
+  `Zeroizing<T>` is not a redaction — its `Debug` prints the inner value — so the
+  fields wrapped in it were redacted too.
+
+  `vta-sdk/tests/secret_debug_census.rs` keeps the class closed. It parses every
+  workspace crate with `syn` and fails on a `#[derive(Debug)]` struct or enum
+  whose field has a secret-sounding name (`*_key`, `*token*`, `*secret*`,
+  `seed*`, `password`, `mnemonic`, `jwt`, and `secret_id` despite its `_id`)
+  and a raw type (`String`, bytes, `Zeroizing<_>`, optionally in an `Option` or
+  behind a reference). A field whose type is another workspace type inherits that
+  type's `Debug`, which is checked where it is defined. What the name rule
+  catches and is not a secret — a claim-type vocabulary token, a webvh path
+  called `mnemonic`, the name of an entry in a secret store — is on a
+  shrink-only list with what the field holds, and the census also refuses a
+  stale entry and a walk that has stopped finding types.
+
+  Not an API change: every type still implements `Debug`; only what it prints
+  differs, and no test asserted on the old output.
+
+
+
+## [0.6.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.9...vta-keys-v0.6.10) — 2026-09-24
+
+
+## [0.6.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.8...vta-keys-v0.6.9) — 2026-09-23
+
+
+## [0.6.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.7...vta-keys-v0.6.8) — 2026-09-23
+
+
+## [0.6.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.6...vta-keys-v0.6.7) — 2026-09-22
+
+
+## [0.6.6](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.5...vta-keys-v0.6.6) — 2026-09-22
+
+
+## [0.6.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.4...vta-keys-v0.6.5) — 2026-09-21
+
+
+## [0.6.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.3...vta-keys-v0.6.4) — 2026-09-21
+
+
+## [0.6.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.2...vta-keys-v0.6.3) — 2026-09-21
+
+
+## [0.6.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.1...vta-keys-v0.6.2) — 2026-09-20
+
+
+## [0.6.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.6.0...vta-keys-v0.6.1) — 2026-09-18
+
+
+### Added
+
+- **did-webvh**: Mint the keys a template's `keys` block asks for ([#1555](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1555))
+
+* fix(did-templates): a key slot beyond the historical pair, and the literal it used to publish
+
+  `slot_var`'s `{SLOT}_KEY_MB` rule is mechanical, and before this it was
+  mechanical in one direction only. A `schemaVersion` 2 template could *declare* a
+  third key slot — a post-quantum signing key beside the classical pair, which is
+  the shape a hybrid-credential issuer needs — and then could not be loaded,
+  because the placeholder that slot's own rule produces was rejected:
+
+      Invalid("undeclared placeholder(s) { PQ_SIGNING_KEY_MB } in document
+               — add them to requiredVars or optionalVars")
+
+  Only `SIGNING_KEY_MB` and `KA_KEY_MB` were ambient, because only those two are
+  in `RESERVED_VARS`. So `keys` at schemaVersion 2 ([#1530](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1530)) could express exactly
+  the pair it was introduced to move beyond.
+
+  ## Following the error's advice published a literal into a write-once log
+
+  The advice is the defect. `optionalVars` supplies a **default**, and the
+  renderer substitutes a default for any name the caller did not supply — and the
+  minting flow does not supply a slot's key under a name it has never heard of.
+  So declaring `PQ_SIGNING_KEY_MB` to get past the rejection passed validation
+  *and rendered*:
+
+      {
+        "id": "did:webvh:x#key-2",
+        "type": "Multikey",
+        "publicKeyMultibase": "PLACEHOLDER-NEVER-SUBSTITUTED"
+      }
+
+  — inside `assertionMethod`, in a `did:webvh` log that is signed once and cannot
+  be re-signed. `check_key_slots` already refuses a slot the document never
+  publishes: a key minted and thrown away. This is the same failure wearing the
+  other hat, a key published and never minted, and it arrived through the one door
+  that check does not watch.
+
+  ## What changes
+
+  - `DidTemplate::slot_vars()` — the placeholder names the declared slots occupy,
+    built from `key_slots()` rather than a second fixed list. For a v1 template it
+    is exactly the two already in `RESERVED_VARS`, so v1 behaviour is untouched;
+    it is what lets a v2 template name a third slot at all.
+  - `check_placeholders_declared` treats those names as ambient. An author cannot
+    declare a value they have no way to know.
+  - `check_slot_vars_not_declared` refuses the reverse — a slot's placeholder in
+    `requiredVars` or `optionalVars` — naming the slot and saying why. A v1
+    template still gets `ReservedVar` from the check that runs first, unchanged.
+  - An undeclared placeholder that is *shaped* like a slot's is told to declare a
+    **slot**, not a variable. The generic advice pointed at exactly what the new
+    check refuses; an error that recommends the defect is worse than no error.
+
+  ## The state this leaves
+
+  A third slot is expressible, and a VTA that cannot yet mint for it fails at
+  render with `Unresolved` naming the placeholder — rather than emitting a
+  document with a hole in it. Wiring derivation to the `keys` block is the next
+  change; until then the loud failure is the correct one.
+
+  Found while tracing what stands between a VTC and a second signing key: nothing
+  in the chain from template to `LocalSigner::with_additional_key` could carry one.
+
+
+
+## [0.6.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.5.2...vta-keys-v0.6.0) — 2026-09-17
+
+
+### Added
+
+- **keys**: A derived key carries the algorithm it was minted with ([#1532](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1532))
+
+* feat(keys)!: a derived key carries the algorithm it was minted with
+
+  `DerivedEntityKeys` gains `signing_key_type` / `ka_key_type`, and
+  `derive_entity_keys_with_preference` mints the first algorithm a template's
+  `keys` block asks for that this build can produce.
+
+  ## The defect this closes
+
+  Every `save_key_record` call for a signing key passed the algorithm as a
+  literal:
+
+      save_key_record(ks, &vm_ids.signing, &derived.signing_path,
+                      SdkKeyType::Ed25519,        // asserted, not carried
+                      &derived.signing_pub, ...)
+
+  Correct only while nothing else could be minted. The moment a template can ask
+  for ML-DSA, that record names an algorithm the key is not — and a later signing
+  operation reaches for a suite the key cannot work in, failing somewhere far from
+  the place that decided wrongly. Same shape as the verificationMethod
+  mislabelling fixed in #1528, one layer down: a type asserted where it should
+  have been carried.
+
+  The imported-key path reads the type from the stored `KeyRecord` rather than
+  assuming, because for an imported key the record is where the truth about its
+  algorithm lives — assuming Ed25519 there would mislabel an imported ML-DSA key
+  at the one moment the system is being told what it is.
+
+  ## Deviation from the plan, deliberately
+
+  The plan said `DerivedEntityKeys` grows "from two fixed fields to a slot map".
+  Counting the call sites changed the answer: the two slots are used in 53 places,
+  and a map turns every one into a lookup that can fail while *removing* a
+  property that is true and worth holding in the type — a DID document has exactly
+  one signing key and at most one key-agreement key. `slots["signing"]` returning
+  `Option` is a worse description of reality than a field that cannot be absent.
+
+  What the plan was really asking is that a slot's **algorithm** stop being
+  implied, which is what the two new fields do. A third slot — two signing keys at
+  once, for hybrid credentials — has no consumer until Phase 3, and an empty map
+  now would be a mechanism with no users, the thing this plan criticises elsewhere
+  about `sign_multi`. The reasoning is recorded on the struct.
+
+  ## Preference semantics
+
+  An algorithm this build cannot mint is **skipped**, not refused — that is what a
+  fallback is for, and refusing would make `["mldsa44", "ed25519"]` useless on a
+  VTA without post-quantum support. Running out is an error naming what was asked
+  for, never a quiet downgrade to Ed25519: the quiet downgrade is the whole
+  hazard, because a deployment meant to be post-quantum would ship classical keys
+  and nothing would say so.
+
+  The key-agreement slot takes no preference. X25519 is the only algorithm that
+  can serve it in a DID document; ML-KEM key agreement is TSP's hybrid KEM, not a
+  verification method.
+
+  ## Breaking
+
+  `DerivedEntityKeys` gains two fields, so struct literals no longer compile —
+  two in `vta-service`, fixed here.
+
+  Three tests. The one that matters asserts the recorded type and the actual key
+  **agree**, and was checked for non-vacuity by making them diverge: it fails with
+  "signing_key_type says ML-DSA-44 but the key is 34 bytes".
+
+
+
+## [0.5.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.5.1...vta-keys-v0.5.2) — 2026-09-16
+
+
+## [0.5.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.5.0...vta-keys-v0.5.1) — 2026-09-16
+
+
+### Added
+
+- **keys**: Derive ML-DSA keys from the BIP-32 chain ([#1505](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1505))
+
+`Bip32Extension` gains `derive_ml_dsa_44` and `derive_ml_dsa_65`, and the five
+  sites that refused post-quantum derivation now do it: key creation, both export
+  paths, and the offline `vta keys secrets` CLI. This is what stands between "a
+  `KeyRecord` can carry a post-quantum key" and "a VTA can mint one".
+
+  ## Domain separation is the whole of it
+
+  `derive_ed25519` hands the SLIP-0010 output straight to the key constructor, and
+  FIPS 204 KeyGen takes a 32-byte seed — so the obvious implementation lines up,
+  compiles, and is wrong: **the ML-DSA seed would equal the Ed25519 private key at
+  the same path**, and compromising either would yield the other. Both values are
+  32 bytes, which is exactly why it reads as correct.
+
+  `derive_p256` already solved this, and these follow its construction exactly —
+  HMAC-SHA512 over the derived signing key and chain code, keyed by a label, first
+  32 bytes taken. The label differs *per parameter set*, because ML-DSA-44 and
+  ML-DSA-65 are different algorithms and a holder of one must not be able to
+  reconstruct the other.
+
+  `ml_dsa_seed_is_independent_of_the_ed25519_key_at_the_same_path` is the test for
+  it, and it is not theoretical: built against the naive version it fails with
+  exactly that message. `the_two_ml_dsa_parameter_sets_get_independent_seeds`
+  covers the second half.
+
+  Simpler than P-256 in one respect — xi is 32 arbitrary bytes with no
+  group-order constraint, so there is no reduction and no retry.
+
+  The shared helper exists because the two derivations differ only in the label,
+  and a second copy is how they would eventually disagree about how a seed is
+  produced. That is unrecoverable rather than merely wrong: the key cannot be
+  re-derived afterwards.
+
+  ## Internal keys still refuse, and the comment now says why
+
+  Not blocked on cryptography any more — `affinidi_crypto::ml_dsa` signs and this
+  change derives. What is missing is a decision. An internal key is deliberately
+  the opposite of a derived one: CSPRNG-generated, no derivation path, absent from
+  the mnemonic, so losing the keyspace loses it and everything it authorises.
+  Whether a VTA should hold an *unrecoverable* post-quantum signing key is a
+  question about that trade, and it should not be inherited from a change whose
+  subject was derivation.
+
+  Enables `affinidi-secrets-resolver`'s `ml-dsa` feature, which nothing in this
+  workspace had turned on — so `Secret::generate_ml_dsa_44` was not compiled here
+  at all.
+
+  121 test suites green under `--no-fail-fast`, clippy clean under `-D warnings`,
+  rustfmt clean.
+
+
+
+## [0.5.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.9...vta-keys-v0.5.0) — 2026-09-16
+
+
+### Added
+
+- **keys**: ML-DSA key types, and one codec table instead of two ([#1502](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1502))
+
+
+## [0.4.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.8...vta-keys-v0.4.9) — 2026-09-14
+
+
+### Fixed
+
+- **webvh**: Key records follow the document's verification-method ids, and a repair for the ones that don't ([#1466](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1466))
+
+* fix(webvh): name a created DID's key records after the document it published
+
+  A key record's id **is** a verification-method id. `save_entity_key_records`
+  says so in its own name, and `vta_sdk::did_secrets::select_secret_kid` rule 1
+  depends on it: the kid a mediator matches inbound JWE recipients against is the
+  record id, on the reasoning that "the DID document decided what the key is
+  called".
+
+  Create never read the document to find out. It named the records `{did}#key-0`
+  and `{did}#key-1` while the document was whatever the caller or the template
+  said — and the `room` and `room-host` built-in templates number their methods
+  from `#key-1`. So on every room and every room host this VTA has ever minted:
+
+  - the document's `#key-1` is the **signing** key and the keystore's `#key-1` is
+    the **x25519** one. One name, two keys, no error anywhere. Hand the id the
+    document publishes to `keys/sign` — the natural thing to do, having read it
+    off the document — and the oracle fetches an x25519 record for an EdDSA
+    signature;
+  - the document's `keyAgreement` (`#key-2`) matches no record at all, so an
+    authcrypt message addressed to it finds no local secret. That is the storm.ws
+    outage of #337 reached from the other side: there a decorative label
+    overwrote the right kid, here the right kid was never stored;
+  - `next_fragment_id` was stored as the constant 2, so the DID's first rotation
+    allocates `#key-2` — over the id its key-agreement method is already
+    published under.
+
+  Room credentials still verify, which is why this stayed quiet: `RoomKeySigner`
+  hardcodes `{room_did}#key-1` to match the template, and the public keys line up
+  positionally, so the proof names a method that resolves to the key that signed
+  it. Everything that addresses a key *by name* is what breaks.
+
+  ## The fix reads the document rather than renumbering the templates
+
+
+
+## [0.4.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.7...vta-keys-v0.4.8) — 2026-09-12
+
+
+## [0.4.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.6...vta-keys-v0.4.7) — 2026-09-10
+
+
+## [0.4.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.4...vta-keys-v0.4.5) — 2026-09-09
+
+
+## [0.4.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.3...vta-keys-v0.4.4) — 2026-09-07
+
+
+## [0.4.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.2...vta-keys-v0.4.3) — 2026-09-07
+
+
+## [0.4.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.1...vta-keys-v0.4.2) — 2026-09-01
+
+
+## [0.4.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.4.0...vta-keys-v0.4.1) — 2026-08-29
+
+
+## [0.4.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.3.0...vta-keys-v0.4.0) — 2026-08-28
+
+
+### Chore
+
+- **deps**: Aes-gcm 0.11, and stop the nonce conversions panicking ([#1173](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1173))
+- **sdk**: Release vta-sdk 0.30.0 for the added CreateKeyBody field ([#1156](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1156))
+
+`CreateKeyBody` gained a `key_id` field while the crate stayed at 0.29.0.
+  The struct is exhaustively constructible through the public API, so an
+  existing literal no longer compiles — a breaking change under 0.x rules,
+  which the semver report has been flagging as its one real finding
+  (195 pass, 1 fail) since the field landed.
+
+  Bumps the crate and the nineteen intra-workspace requirements that pin it,
+  so `cargo check --workspace` still resolves the path copy and a consumer
+  resolving from the registry gets a version that admits the break.
+
+
+
+## [0.3.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.9...vta-keys-v0.3.0) — 2026-08-26
+
+
+### Chore
+
+- **deps**: Bring every dependency to latest, collapsing two duplicates ([#1055](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1055))
+
+`cargo outdated` reported 13 direct dependencies behind and `cargo update`
+  had 36 compatible updates waiting. Both are now clear: `cargo outdated`
+  reports "All dependencies are up to date".
+
+  Two of these were not cosmetic.
+
+  **p256 was duplicated in the build.** Our crates declared `0.13` while
+  `affinidi-crypto` — reached through `affinidi-data-integrity` and the TDK —
+  already pulled `0.14`, so the graph carried two copies of a curve
+  implementation. The lock now holds a single `p256 0.14.0`. The bump brings
+  `elliptic-curve` 0.14 and `ecdsa` 0.17, which rename the SEC1 family:
+  `EncodedPoint` -> `Sec1Point`, `From/ToEncodedPoint` -> `From/ToSec1Point`.
+  Renamed across `vta-keys`, `vta-service` and `vti-webauthn`.
+
+  **tokio-tungstenite was load-bearing, not incidental.** `vta-mobile-core`
+  depends on it solely as a feature enabler: iOS has no native trust store, so
+  `rustls-tls-webpki-roots` has to be on graph-wide or the mediator WebSocket
+  fails with "no native root CA certificates found". Features unify per major
+  version, so the declaration only works while it matches the version
+  `affinidi-messaging-sdk` pulls — and the SDK moved to 0.30 in this refresh.
+  Updating everything *except* this one would have stranded the enabler and
+  broken iOS `wss://` silently.
+
+  The rest:
+
+  - `rcgen` 0.13 -> 0.14 (dev). `signed_by` takes an `Issuer` rather than a
+    `(certificate, key)` pair, and `self_signed` borrows instead of consuming.
+    The mdoc IACA test helper builds its issuer with `Issuer::from_params`,
+    which is also a more direct statement of what it wanted.
+  - `syn` 2 -> 3 (dev). No source change; syn 3 was already in the graph via
+    `trust-tasks-rs`.
+  - `rmcp` 1.7 -> 3.1.4. Two majors, one rename: `Content` -> `ContentBlock`.
+    The `#[tool_router]` / `#[tool_handler]` macro surface the crate is built
+    on is unchanged.
+  - 36 lockfile updates, including `trust-tasks-rs` 0.11.3 (the corrected
+    `vta/app-state` error taxonomy from dtgwg-trust-tasks-tf#253) and the AWS
+    SDK set. `rustls-pemfile`, one of the unmaintained crates `cargo audit`
+    flags, drops out of the graph entirely.
+
+  Two deliberate choices where the shortest path was worse:
+
+  `vti-webauthn` keeps parse-then-validate rather than collapsing to the
+  one-shot `PublicKey::from_sec1_bytes`. That call merges "malformed SEC1
+  encoding" and "valid encoding, point not on the curve" into one error, and
+  those say different things to whoever reads the log — a broken client versus
+  a point somebody chose.
+
+  BIP-32 P-256 derivation replaces the now-deprecated `FieldBytes::from_slice`
+  with `TryFrom` and a real error arm. The input is a fixed 32-byte window of a
+  SHA-512 HMAC so it cannot fail, but the length check is now explicit rather
+  than resting on a panic inside a deprecated helper.
+
+  Unchanged and still suppressed: the four `cargo audit` advisories ignored in
+  `deny.toml`, all transitive through the AWS SDK's hyper 0.14 / rustls 0.21
+  path. `cargo deny check advisories` passes.
+
+
+
+## [0.2.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.8...vta-keys-v0.2.9) — 2026-08-22
+
+
+## [0.2.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.7...vta-keys-v0.2.8) — 2026-08-21
+
+
+## [0.2.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.6...vta-keys-v0.2.7) — 2026-08-20
+
+
+## [0.2.6](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.5...vta-keys-v0.2.6) — 2026-08-18
+
+
+## [0.2.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.4...vta-keys-v0.2.5) — 2026-08-17
+
+
+### Added
+
+- **vta-keys**: Add non-extractable internal signing keys ([#995](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/995))
+
+An ordinary VTA key is BIP-32 derived, so anyone holding the 24-word mnemonic
+  can reconstruct it offline. That is what makes the VTA recoverable, and equally
+  what makes "the operator cannot obtain this key" false — the second limb of what
+  eIDAS calls sole control.
+
+  An internal key is generated from the system CSPRNG, has no derivation path, and
+  is never returned by any surface. The VTA acts only as a signing oracle for it.
+
+  Deliberately not a flag on the imported-key path. That path wraps its secrets
+  under a KEK derived from the master seed (derive_kek(seed, salt)), so a
+  non-extractable flag on it would be decorative: the boundary it claims to
+  enforce has already been walked around. Internal keys get their own keyspace,
+  INTERNAL_KEYS, with no seed involvement at any point, and that keyspace is in
+  EXCLUDED_FROM_BACKUP by design — a backup carrying it would be an export of keys
+  the VTA promises never to export, and restoring it elsewhere would clone a
+  signer.
+
+  Refused for did:webvh log entries, enforced in code rather than left to
+  guidance. WebVH is append-only and each entry is authorised by the update key
+  the previous entry named; an unrecoverable update key means that if storage is
+  lost the DID can never be updated again by anyone, permanently, and every
+  integration pinned to it is stranded. Credentials can be re-issued, an
+  append-only identity log cannot. Internal keys remain fine as a signing
+  verificationMethod inside a published document, where loss costs the ability to
+  produce new signatures rather than control of the identity.
+
+  The export refusal is not a permission check — admin is not a bypass, because
+  the value of the origin is that no caller holds this power. There are two
+  refusals (an early return and an in-match arm); removing either leaves the other,
+  and removing both does not compile, since the match over KeyOrigin becomes
+  non-exhaustive. An export path cannot silently reopen.
+
+  Operator surfaces carry the cost prominently: `pnm keys create --internal`
+  prints what is lost and requires the operator to type a confirmation phrase
+  rather than mash y, the response repeats the warning, and docs/02-vta/
+  internal-keys.md covers when to use one, what actually protects it (enclave
+  measurement + KMS, not a mnemonic), and the two things that genuinely destroy
+  it.
+
+
+
+## [0.2.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.3...vta-keys-v0.2.4) — 2026-08-16
+
+
+## [0.2.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.2...vta-keys-v0.2.3) — 2026-08-16
+
+
+## [0.2.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-keys-v0.2.1...vta-keys-v0.2.2) — 2026-08-13
+
+
+### Added
+
+- **release**: Publish vta-service and its closure again ([#962](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/962))
+
+* feat(release): publish vta-service and its closure again
+
+  #938 unpublished `vta-service` and the twelve subsystem crates behind it,
+  on the finding that nothing external depended on them. The audit read
+  normal dependencies. `openvtc-core` depends on `vta-service` as a
+  **dev-dependency**, for `test_support::MockVta` — an in-process VTA its
+  end-to-end tests run against. That harness boots the real service, so no
+  client crate can stand in for it.
+
+  Unpublishing did not merely freeze the crate. It broke it.
+
+  `vti-common` re-exports `vta_sdk::acl::{ActScope, ApproveScope,
+  ContextDirection}` as its own public API, so **a re-export makes the
+  re-exported crate's version part of your public API**: any graph
+  combining `vti-common` with another `vta-sdk` consumer must resolve one
+  `vta-sdk`. The frozen `vta-service` 0.14.37 asks for `vta-sdk ^0.21`
+  while `vti-common` has moved to `^0.23`. A downstream `cargo update`
+  resolves both and `vta-service` fails to compile with
+
+    expected `vti_common::acl::ApproveScope`,
+       found `vta_sdk::acl::ApproveScope`
+
+  at ten call sites — which is how this surfaced, in openvtc #213. Nothing
+  downstream can fix that; only a release that moves the requirements
+  together can.
+
+  So the thirteen manifests go back to the workspace default. The cost is
+  the closure — twelve subsystem crates return to crates.io, which is
+  exactly what #938 set out to stop. Taken deliberately over the
+  alternatives: yanking the published copies breaks OpenVTC's tests with no
+  replacement, and leaving them up ships a crate on the registry that
+  cannot be built.
+
+  **On release ordering.** `cargo publish --dry-run -p vta-service` fails
+  today, and will until the closure is on the registry: packaging strips
+  path deps, so `vta-keys = "0.2"` resolves the *published* 0.2.1, which
+  still asks for `vta-sdk ^0.21` — two nodes, same error. That resolves
+  itself in the release, which publishes in dependency order: every
+  subsystem crate in this workspace already requires `vta-sdk = "0.23"`, so
+  once they upload, `vta-service` verifies against them. Crates whose
+  dependencies are all published already dry-run clean (verified on
+  `vta-keyspaces` and `vta-config`).
+
+  Docs updated to match: CLAUDE.md, RELEASING.md and the release-plz.toml
+  header all said 7-of-21. They now say 20-of-26, name the six that stay
+  internal, and record the rule the audit missed — check dev-dependencies,
+  in sibling repos, before unpublishing anything.
+
+
+
+### Build & CI
+
+- **release**: Adopt release-plz, publish 7 crates instead of 21 ([#938](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/938))
+
+Merging and releasing were the same act. publish.yml fired on every push to
+  main and shipped whatever versions were newly present, and a CI guard required
+  the version bump to live in the feature PR — so every PR was a release
+  decision, taken by whoever opened it, days before it merged. Two open PRs
+  touching one crate wrote the same number into the same line of the same
+  Cargo.toml, and the second to merge had to rebase, renumber, and fix a
+  changelog entry that had gone stale. #932/#936/#937 hit it three times in one
+  afternoon.
+
+

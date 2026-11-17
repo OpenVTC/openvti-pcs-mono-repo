@@ -1,0 +1,615 @@
+//! Canonical keyspace names (P2.5).
+//!
+//! Every keyspace the daemon opens is named exactly once here so the
+//! literals can't drift across `server.rs`, the offline CLIs, and the
+//! setup wizard's pre-create pass. [`ALL`] is the full set — the
+//! wizard's `open_keyspaces` iterates it so it can no longer silently
+//! pre-create a *subset* (it used to open 8 of 21), and a test pins
+//! `ALL.len()` to the `AppState` keyspace-field count so a keyspace
+//! can't be added to one without the other.
+//!
+//! Names are the stable on-disk fjall partition identifiers — changing
+//! one orphans existing data, so treat them as a wire contract.
+
+pub const SESSIONS: &str = "sessions";
+pub const ACL: &str = "acl";
+pub const COMMUNITY: &str = "community";
+pub const CONFIG: &str = "config";
+pub const PASSKEY: &str = "passkey";
+pub const INSTALL: &str = "install";
+pub const MEMBERS: &str = "members";
+pub const JOIN_REQUESTS: &str = "join_requests";
+/// Durable queue of pending capability-grant hook jobs (membership → grant).
+pub const HOOKS_QUEUE: &str = "hooks_queue";
+/// Singleton audit-tail cursor for the hook relay.
+pub const HOOKS_CURSOR: &str = "hooks_cursor";
+pub const POLICIES: &str = "policies";
+pub const ACTIVE_POLICIES: &str = "active_policies";
+pub const STATUS_LISTS: &str = "status_lists";
+pub const REGISTRY_RECORDS: &str = "registry_records";
+pub const SYNC_QUEUE: &str = "sync_queue";
+pub const SYNC_CURSOR: &str = "sync_cursor";
+pub const RELATIONSHIPS: &str = "relationships";
+pub const RELATIONSHIPS_BY_DID: &str = "relationships_by_did";
+pub const ENDORSEMENT_TYPES: &str = "endorsement_types";
+pub const SCHEMAS: &str = "schemas";
+pub const ENDORSEMENTS: &str = "endorsements";
+
+/// Data rooms: one row per room at `rooms:<roomId>`.
+///
+/// Holds an owner, a visibility, an epoch and a retention period — and deliberately **no
+/// member list**. Membership is decided by credentials the room itself issued, so a roster
+/// here would make the room unmovable and make this service part of its membership.
+pub use vti_rooms::ROOMS_KEYSPACE as ROOMS;
+
+/// Room records at `room_records/v2:<len>:<roomId>:<key>` (`vti_rooms::storage`).
+/// Ciphertext on the sealed tiers.
+pub use vti_rooms::ROOM_RECORDS_KEYSPACE as ROOM_RECORDS;
+
+/// The epoch key chain at `room_epoch_links/v2:<len>:<roomId>:<epoch>`, and relayed commits
+/// beside it. Wrapped key material this service cannot read — the key that opens a rung is a storage key no host ever holds.
+///
+/// **Backed up, and not optionally.** A room's records survive a restore as ciphertext; the
+/// chain is what makes anything written before the last membership change openable at all.
+/// Restoring the records without it hands the members a room they can see the shape of and
+/// cannot read.
+pub use vti_rooms::ROOM_EPOCH_LINKS_KEYSPACE as ROOM_EPOCH_LINKS;
+
+/// Each hosted room's revocation list at `room_revocations:<roomId>`: the latest list the
+/// room signed and an administrator delivered (`rooms/revocations/put`), with when this
+/// host began enforcing it.
+///
+/// **Backed up.** It is the room's state, not this host's: a restore without it would
+/// honour again every credential the room withdrew, until somebody re-delivered the list.
+pub use vti_rooms::ROOM_REVOCATIONS_KEYSPACE as ROOM_REVOCATIONS;
+
+/// The watches members armed on hosted rooms (`rooms/watch/0.1`): room, address, watermark,
+/// lease. This host's state, never the room's — consulted to authorize nothing, and it
+/// does not move with the room. **Not backed up**: a watch lapses within 30 days anyway, and
+/// a restore must not signal addresses on the strength of watches nobody re-armed.
+pub use vti_rooms::watch::ROOM_WATCHES_KEYSPACE as ROOM_WATCHES;
+/// The VTC's OpenID4VP verifier identities (`crate::oid4vp`): one record per
+/// identity, each holding the private P-256 key its request objects are
+/// signed with. Encrypted at rest under the storage key, like `install` and
+/// `passkey`.
+pub const OID4VP_KEYS: &str = "oid4vp_keys";
+/// OpenID4VP wallet sessions (`crate::oid4vp::session`): each holds a
+/// single-use nonce, the ephemeral private key the wallet's response is
+/// encrypted to, and — once a wallet answers — the presented claims held as
+/// evidence for the applicant's join. Encrypted at rest under the storage key.
+pub const OID4VP_SESSIONS: &str = "oid4vp_sessions";
+
+/// Room files' index at `room_blobs`: which blobs each room holds, on which storage config,
+/// which records name them, and the usage they add up to. **Backed up**, so a restored
+/// community still knows its files and their charges. The bytes are not in it, and are
+/// not in a VTC backup: they live in the blob store.
+pub use vti_rooms::blobs::ROOM_BLOBS_KEYSPACE as ROOM_BLOBS;
+
+/// Storage configs (`crate::rooms::storage_configs`): the backends room files are
+/// stored to, which config each room's new uploads go to, and each config's last probe.
+/// **Backed up**: nothing in it is a secret, and the blob index names its configs.
+pub const STORAGE_CONFIGS: &str = "storage_configs";
+
+/// `sealed` storage configs' credentials (`crate::rooms::storage_credentials`), one per
+/// config, encrypted at rest under the storage key. **Never backed up**
+/// (`vtc/storage/credentials/set/0.3` item 3), and cleared when a backup is imported,
+/// so a restored config reports its credential `required` until it is set again (item 7).
+pub const STORAGE_CREDENTIALS: &str = "storage_credentials";
+
+/// The rooms this community **owns** (`crate::rooms::community`): one row per room
+/// (its label, the signing key the community's VTA holds for it, who created it), one per
+/// member admitted or offered admission, with the offer's credentials and, for a while
+/// after acceptance, the Welcome a repeated accept is answered with, the `did.jsonl`
+/// of each room whose identity this community publishes itself, and one row per removal
+/// owed to a member who left the community (`crate::rooms::departures`).
+///
+/// The owner's record, **never read on the host path**: a community room's records are
+/// authorized by credential chains exactly as a member's room's are (invariant I5).
+/// **Backed up**: a restored community that forgot whom it admitted could not remove
+/// them, one that forgot a removal owed on a departure would leave the departed member in
+/// the room, and a room whose log it no longer served would stop resolving.
+pub const COMMUNITY_ROOMS: &str = "community_rooms";
+
+/// The member directory (`crate::directory`): the community's field schema
+/// (`field:<key>`), every member's card (`card:<entryId>`), and the index from a
+/// member's DID to their entry (`entry:<did>`).
+///
+/// **Backed up**: it is the community's social state. A restore without it would
+/// give every member a new entry identifier, which every reference to an entry —
+/// a link a member shared, a group membership — would then miss.
+pub const DIRECTORY: &str = "directory";
+
+/// Community elections (`crate::elections`): one record per election (its manifest
+/// as registered, where it stands with its ballot box, the board heads kept, the
+/// certification) and one per ticket issued (who took it — never the ticket).
+///
+/// **Backed up**: a restored community that forgot whom it issued tickets to would
+/// issue a second one to the same member (VTI-VOT-022), and certification holds the
+/// board to the number issued (VTI-VOT-072).
+pub const ELECTIONS: &str = "elections";
+
+/// Notifications addressed to this community (`notifications/notify`, `notifications/relay`,
+/// VTI-NTF-040 – 046): one record per (originator, `notificationId`) it accepted, the
+/// delivering document kept exactly as received so it can be relayed whole, and whom each
+/// revision was relayed to — kept until the notification's period ends, and used for nothing
+/// but relaying its later revisions (VTI-NTF-044). See `crate::notifications`.
+///
+/// **Backed up**: the relay record is the only account of whom the community told, and a
+/// restore without it could never tell them of a withdrawal (VTI-NTF-044).
+pub const NOTIFICATIONS: &str = "notifications";
+
+/// Community boards (`crate::boards`, VTI-BRD-*): each board (`board:<boardId>`), its ideas
+/// (`idea:<ideaId>`, indexed `bidea:<boardId>:<ideaId>`) and notes (`note:<noteId>`,
+/// indexed `bnote:<boardId>:<noteId>`). An accepted idea keeps only its election's
+/// identifier; where that election stands is read from `ELECTIONS`, never copied here.
+///
+/// **Backed up**: what members proposed and wrote, and which election each idea is put to,
+/// are the community's own records; a restore without them would orphan every board election.
+pub const BOARDS: &str = "boards";
+
+/// Member badges (`crate::badges`, VTI-BDG-*): the community's badge settings, each badge
+/// (`badge:<badgeId>`), each award (`award:<awardId>`, indexed by badge, recipient and
+/// giver) and each holder's own preferences (`prefs:<entryId>`). The badge group behind a
+/// community badge is the groups' (`DIRECTORY`).
+///
+/// **Backed up**: what members earned and gave is the community's own record; a restore
+/// without it would orphan every badge group.
+pub const BADGES: &str = "badges";
+
+/// Badge pictures, re-encoded by the community, keyed by digest as the directory keeps
+/// a card picture (`crate::directory::images` over this keyspace). **Backed up** with
+/// the badges they belong to.
+pub const BADGE_IMAGES: &str = "badge_images";
+
+/// Uploads and downloads in flight. Hours long at most, so **not backed up**: a restored
+/// host starts with none, and a client resumes from `begin`.
+pub use vti_rooms::blobs::ROOM_BLOB_TRANSFERS_KEYSPACE as ROOM_BLOB_TRANSFERS;
+pub const AUDIT: &str = "audit";
+pub const AUDIT_KEY: &str = "audit_key";
+/// Signed audit checkpoints (#708) — periodic Ed25519-signed commitments to
+/// the audit chain head *and its entry count*, which is what makes truncation
+/// detectable. Separate from [`AUDIT`] so a checkpoint is not just another row
+/// in the keyspace an adversary is assumed to control.
+pub const AUDIT_CHECKPOINT: &str = "audit_checkpoint";
+/// Secondary index over [`AUDIT`] (`crate::audit_index`): which rows are
+/// git-namespace operations, so their reads need not decode the whole log.
+/// Derived and caught up from the log before every read; never backed up.
+pub const AUDIT_INDEX: &str = "audit_index";
+/// Single-use ledger for redeemed Invitation Credentials (VICs): one
+/// row per consumed VIC `id`, written when a VIC-driven join is
+/// admitted. Read at verify time to set `Invitation.consumed`.
+pub const CONSUMED_INVITATIONS: &str = "consumed_invitations";
+/// Registry of *issued* Invitation Credentials: one row per VIC `id`
+/// recording its revocation-list slot, subject, granted role, and
+/// revocation state — drives the list + revoke operator surfaces.
+pub const INVITATIONS: &str = "invitations";
+/// Durable delivery-layer outbox (D2 P1a): backs
+/// [`vti_common::outbox_store::VtiOutboxStore`] for `MessagingService`
+/// `Guaranteed` sends so delivery-critical work survives a restart.
+/// Ephemeral, re-driven from live state — excluded from backup.
+pub const OUTBOX: &str = "outbox";
+
+/// Durable TSP relationship state (`vti_common::relationship_store`) — the Rev 3
+/// §7.2.2 recovery store, keyed and serialised by the SDK. Transport state, not
+/// community data: excluded from backup, like [`OUTBOX`]. Distinct from
+/// [`RELATIONSHIPS`], which is the community's social graph.
+pub const TSP_RELATIONSHIPS: &str = "tsp_relationships";
+/// Vetting statement withdrawal notices (`vtc/vetting/revoke-statement/0.1`):
+/// one row per (issuer, statement id, statement digest), written when a vetter
+/// withdraws a statement and read whenever presented statements are counted.
+pub const VETTING_REVOCATIONS: &str = "vetting_revocations";
+/// Hidden-vetter admission (ZKP, development branch `zkp-pcs`): the spent
+/// attestation tokens, one row per `(token label, serial)`, written when a
+/// hidden submission is counted and read on every later one. A serial that
+/// un-spends is a double spend, so this is backed up for the same reason
+/// `VETTING_REVOCATIONS` is.
+pub const VETTING_PCS_SPENT: &str = "vetting_pcs_spent";
+/// Hidden-vetter admission (ZKP, development branch `zkp-pcs`): what the
+/// community minted — one enrolment row per vetter (the class labels they
+/// hold a credential under, and the PCS identifier they are bound to) and one
+/// row per served drip tick. Backed up: losing an enrolment row lets a member
+/// enrol twice under one label and count twice in one proof, which is the
+/// invariant the whole counting rule rests on.
+pub const VETTING_PCS_ISSUE: &str = "vetting_pcs_issue";
+/// Vetter profiles (`vtc/vetting/vetters/profile/0.1`): one row per vetter DID,
+/// written by the vetter, deleted when they no longer hold a live grant, and
+/// read by the vetter listing.
+pub const VETTER_PROFILES: &str = "vetter_profiles";
+/// The accepted-document-id record (VTI-OPS-025…027, SPEC §7.2 item 11): one
+/// row per Trust Task document `id` accepted for execution, carrying the
+/// digest of the document accepted under it and the instant the record may be
+/// dropped. In the store rather than in a process-local map because VTI-OPS-027
+/// requires the record to be **shared across every binding** — see
+/// `crate::trust_tasks::accepted_ids`.
+pub const ACCEPTED_IDS: &str = "accepted_ids";
+/// Git namespaces (`crate::git_ns`): the namespaces this community has bound
+/// on the forges, the repositories in them, the git rights recorded on each,
+/// and forge-account link attempts. The source of truth for every git right
+/// the community publishes — the registry and the forge are projections of it.
+pub const GIT_NS: &str = "git_ns";
+/// Outstanding `git-ns/bridge/job` jobs and their results.
+pub const GIT_NS_JOBS: &str = "git_ns_jobs";
+/// The mirror of what the git-namespace projection has published to the Trust
+/// Registry, and its audit-tail cursor. A cache of a remote effect, rebuilt by
+/// reconciling against [`GIT_NS`].
+pub const GIT_NS_PROJECTION: &str = "git_ns_projection";
+
+/// Console signing-key delegations (#1684): one row per console `did:key` at
+/// `console_key:<consoleDid>`, saying which admin DID that key may act as.
+///
+/// A *credential* of an existing admin identity, the way a registered passkey
+/// is — it carries no role and confers nothing on its own, so a console key
+/// never appears in `acl list`. See `crate::acl::console_key`.
+pub const CONSOLE_KEYS: &str = "console_keys";
+
+/// Operation-bound step-up marks (#1641): a pending mark per outstanding
+/// WebAuthn challenge (`pending:<challenge>`) and a redeemable one per
+/// recorded gesture (`mark:<adminDid>:<digest>`), each living 300 s. See
+/// `crate::acl::bound_step_up`.
+pub const STEP_UP_MARKS: &str = "step_up_marks";
+
+/// Members' step-up passkeys (`auth/passkey/enroll/invite/0.3`,
+/// `purpose: stepUp`): the invites (`invite:<tokenHash>`), redemption and
+/// revocation ceremonies, and the credentials themselves in the passkey
+/// store's own row format. A keyspace of its own **by construction**: login and
+/// session step-up read [`PASSKEY`] only, so a step-up passkey can never open
+/// or elevate a session. See `crate::step_up_passkey`.
+pub const STEP_UP_PASSKEYS: &str = "step_up_passkeys";
+
+/// Member-portal sessions (`session:<id>`, `refresh:<hash>`, …, the shared
+/// session store's own row format). A keyspace of its own **by construction**:
+/// the administrator auth path reads [`SESSIONS`] only, so a member's refresh
+/// token can never be redeemed at `/v1/auth/refresh` for a console token —
+/// not even by a member who is also an administrator. See
+/// `crate::member_portal`.
+pub const MEMBER_SESSIONS: &str = "member_sessions";
+
+/// Member-portal passkeys and their WebAuthn ceremony state, in the passkey
+/// store's own row format. Kept apart from [`PASSKEY`] for the reason
+/// [`STEP_UP_PASSKEYS`] is: console login and every step-up read [`PASSKEY`]
+/// only, so a passkey a member enrolled for the portal can neither open a
+/// console session nor answer a step-up. See `crate::member_portal`.
+pub const MEMBER_PASSKEYS: &str = "member_passkeys";
+
+/// The administrator action list (`docs/05-design-notes/vtc-action-list.md`):
+/// every operation parked for other administrators' approval — VTI-APV-014's
+/// unrestricted grants, VTI-APV-019's reductions, VTI-APV-020's threshold
+/// lowerings, VTI-VTC-022's authority-policy changes — at `action:<id>`, with
+/// each approver's salted wire digest indexed at `wire:<digest>`. Open actions,
+/// and closed ones for 30 days of history. See `crate::admin_actions`.
+///
+/// Replaces the `task_consent` keyspace the re-send model kept its pending
+/// requests and grants in (design §8a: net-new, nothing is migrated).
+pub const ADMIN_ACTIONS: &str = "admin_actions";
+
+/// Step-up **approvers** (VTI-APV-015, VTI-APV-016): `did:key`s bound to one
+/// subject each as that subject's step-up factor (`approver:<did>` live
+/// bindings and revoked tombstones, `subject:<did>` the live index), plus the
+/// enrolment state that binds them — invites (`invite:<tokenHash>`),
+/// redemption ceremonies (`redeem:<enrollmentId>`), install claims
+/// (`claim:<claimId>`) and claimed-but-not-bootstrapped bindings
+/// (`pending:<installJti>`) — and the spent statement ids (`spent:<hash>`). A
+/// keyspace of its own **by construction**, like [`STEP_UP_PASSKEYS`]: only the
+/// bound step-up gate reads it, never login or session step-up. See
+/// `crate::acl::approver` and `crate::step_up_approver`.
+pub const STEP_UP_APPROVERS: &str = "step_up_approvers";
+
+/// Member pushes in flight and recently finished (`push:<id>`): the signed
+/// Trust Task, the transports still to try, and how it ended. Encrypted at rest
+/// under the storage key. See `crate::member_push`.
+pub const MEMBER_PUSHES: &str = "member_pushes";
+
+/// In-flight backup bundles (#1641): `bundle:<id>` records and `chunks:<id>`
+/// manifests for the chunked `backup/*` transfer, whose bytes are staged under
+/// `<data_dir>/backups`. See `vti_common::backup_transfer`.
+pub const BACKUP_BUNDLES: &str = "backup_bundles";
+
+/// Every keyspace the daemon opens, in `AppState` field order. The
+/// setup wizard pre-creates exactly this set; `server::run` opens
+/// exactly this set.
+pub const ALL: &[&str] = &[
+    SESSIONS,
+    ACL,
+    COMMUNITY,
+    CONFIG,
+    PASSKEY,
+    INSTALL,
+    MEMBERS,
+    JOIN_REQUESTS,
+    POLICIES,
+    ACTIVE_POLICIES,
+    STATUS_LISTS,
+    REGISTRY_RECORDS,
+    SYNC_QUEUE,
+    SYNC_CURSOR,
+    RELATIONSHIPS,
+    RELATIONSHIPS_BY_DID,
+    TSP_RELATIONSHIPS,
+    ENDORSEMENT_TYPES,
+    SCHEMAS,
+    ENDORSEMENTS,
+    ROOMS,
+    ROOM_RECORDS,
+    ROOM_EPOCH_LINKS,
+    ROOM_REVOCATIONS,
+    ROOM_WATCHES,
+    ROOM_BLOBS,
+    ROOM_BLOB_TRANSFERS,
+    STORAGE_CONFIGS,
+    STORAGE_CREDENTIALS,
+    COMMUNITY_ROOMS,
+    DIRECTORY,
+    ELECTIONS,
+    NOTIFICATIONS,
+    BOARDS,
+    BADGES,
+    BADGE_IMAGES,
+    AUDIT,
+    AUDIT_KEY,
+    AUDIT_CHECKPOINT,
+    AUDIT_INDEX,
+    CONSUMED_INVITATIONS,
+    INVITATIONS,
+    OUTBOX,
+    VETTING_REVOCATIONS,
+    VETTING_PCS_SPENT,
+    VETTING_PCS_ISSUE,
+    VETTER_PROFILES,
+    ACCEPTED_IDS,
+    CONSOLE_KEYS,
+    STEP_UP_MARKS,
+    STEP_UP_PASSKEYS,
+    MEMBER_SESSIONS,
+    MEMBER_PASSKEYS,
+    ADMIN_ACTIONS,
+    STEP_UP_APPROVERS,
+    MEMBER_PUSHES,
+    BACKUP_BUNDLES,
+    GIT_NS,
+    GIT_NS_JOBS,
+    GIT_NS_PROJECTION,
+    OID4VP_KEYS,
+    OID4VP_SESSIONS,
+];
+
+/// Keyspaces captured by `POST /v1/backup/export` (P3.9). These hold
+/// the community's durable, irreplaceable state. `audit` is included
+/// only when the caller passes `include_audit = true`; its HMAC key
+/// (`audit_key`) is always included so restored logs stay verifiable.
+///
+/// `BACKED_UP` and [`EXCLUDED_FROM_BACKUP`] must partition [`ALL`]
+/// exactly — enforced by `backup_partition_is_total`. The signing key
+/// bundle is NOT a keyspace (it lives in the `secrets` backend) and is
+/// captured separately by the backup payload.
+pub const BACKED_UP: &[&str] = &[
+    ACL,
+    COMMUNITY,
+    MEMBERS,
+    JOIN_REQUESTS,
+    POLICIES,
+    ACTIVE_POLICIES,
+    STATUS_LISTS,
+    RELATIONSHIPS,
+    RELATIONSHIPS_BY_DID,
+    ENDORSEMENT_TYPES,
+    SCHEMAS,
+    ENDORSEMENTS,
+    ROOMS,
+    ROOM_RECORDS,
+    ROOM_EPOCH_LINKS,
+    // A room's withdrawals: restored without them, every credential the room took
+    // back would be honoured again.
+    ROOM_REVOCATIONS,
+    ROOM_BLOBS,
+    // Which backend each room's files are on. The blob index names configs, so a
+    // restore without them would hold blobs it could not find.
+    STORAGE_CONFIGS,
+    // The owner's record of the rooms this community owns, whom it admitted to
+    // them, the removals owed on members' departures, and the logs of the room
+    // identities it publishes.
+    COMMUNITY_ROOMS,
+    // The directory's schema and every member's card.
+    DIRECTORY,
+    // Who took a ticket, the manifests, the checkpoints and certifications.
+    ELECTIONS,
+    NOTIFICATIONS,
+    // Ideas, notes and which election each idea is put to.
+    BOARDS,
+    // Badges, awards and holders' preferences; the pictures with them.
+    BADGES,
+    BADGE_IMAGES,
+    AUDIT,
+    AUDIT_KEY,
+    // Required, not optional: restoring the audit log without its
+    // checkpoints reads as mass truncation — every signed checkpoint would
+    // attest to more entries than the restored log holds, so a legitimate
+    // restore would look exactly like the attack this mechanism detects.
+    AUDIT_CHECKPOINT,
+    // A consumed VIC must stay consumed across a restore, else a
+    // restored community could re-redeem a single-use invitation.
+    CONSUMED_INVITATIONS,
+    // Issued-invitation registry — durable so revocation + listing
+    // survive a restore.
+    INVITATIONS,
+    // A withdrawn vetting statement must stay withdrawn across a restore, or a
+    // restored community would count a statement its vetter took back.
+    VETTING_PCS_SPENT,
+    // What a vetter was issued has to survive a restore for the same reason:
+    // a community that forgot an enrolment would issue a second credential
+    // under the same label.
+    VETTING_PCS_ISSUE,
+    VETTING_REVOCATIONS,
+    // A verifier identity's key is re-deliverable from the VTA, but only by
+    // the operator repeating the hand-off — and a restored community that has
+    // lost it cannot answer a wallet until they do. The rows are encrypted
+    // under the storage key, which a restore of the same bundle reproduces.
+    OID4VP_KEYS,
+    // A vetter's published profile is theirs to replace, not the community's to
+    // reconstruct: a restore without it would silently unlist every vetter.
+    VETTER_PROFILES,
+    // Who owns and who may commit to each governed repository. Restoring
+    // without it would restore a community whose published rights no longer
+    // have a source, and the next projection pass would withdraw them all.
+    GIT_NS,
+    // Step-up approvers (design note `vtc-approver-step-up.md` §4, §11.3).
+    // Backed up — unlike `step_up_passkeys` — because an approver is a
+    // `did:key`, bound to no WebAuthn relying party, so it is as valid on the
+    // restored host as on the original; a restore into a *different*
+    // community is already refused by the VTC-DID compatibility check. The
+    // revoked tombstones must come back too, or a burned approver DID could be
+    // bound again (`auth/step-up/approver/revoke/0.1` item 4). The enrolment
+    // rows beside them (invites, ceremonies, spent statement ids) all carry an
+    // expiry and are refused once it passes, so a restored one authorizes
+    // nothing the original could not.
+    STEP_UP_APPROVERS,
+];
+
+/// Keyspaces deliberately omitted from backup (P3.9): ephemeral auth,
+/// one-shot ceremony state, re-syncable registry mirrors, and config
+/// (carried by the backup payload's config snapshot + re-applied on
+/// import). Restoring these would resurrect stale sessions or clobber
+/// runtime state. Partitions [`ALL`] with [`BACKED_UP`].
+pub const EXCLUDED_FROM_BACKUP: &[&str] = &[
+    SESSIONS,
+    CONFIG,
+    PASSKEY,
+    INSTALL,
+    REGISTRY_RECORDS,
+    SYNC_QUEUE,
+    SYNC_CURSOR,
+    // Delivery-layer outbox — re-driven from live state; a restore must not
+    // resurrect stale in-flight sends.
+    OUTBOX,
+    // TSP relationship state is transport recovery state, local to this
+    // deployment's mediator socket — a restore into a different environment
+    // must not resurrect handshakes; peers re-relate on demand.
+    TSP_RELATIONSHIPS,
+    // The accepted-document-id record. Its whole horizon is the acceptance
+    // window — minutes — so a restored row is all but certainly expired
+    // already, and an expired row refuses nothing. Carrying it would also put
+    // recorded task *responses* into an export whose scope is the community's
+    // durable state, which this is not: it is execution bookkeeping, local to
+    // the deployment that did the executing.
+    ACCEPTED_IDS,
+    // Room-file uploads and downloads in flight: hours long, tied to staging
+    // files on this host that a backup does not carry. A client resumes from
+    // `begin` against the restored host.
+    ROOM_BLOB_TRANSFERS,
+    // Watches on hosted rooms (`rooms/watch/0.1`): this host's state, not the
+    // rooms', lapsing within 30 days. A watch does not move with a room, and a
+    // restored one would signal an address nobody re-armed.
+    ROOM_WATCHES,
+    // Console signing-key delegations. Excluded deliberately, and it is the
+    // one exclusion here that is a security decision rather than a
+    // housekeeping one: a delegation names a browser profile on a particular
+    // machine, and a restore — into a rebuilt host, a staging clone, or a
+    // different operator's hands — must not hand that browser the ability to
+    // sign as an administrator again. The operator re-enrols, behind the
+    // step-up, from the browser they are actually sitting at — one passkey
+    // gesture. Nothing else goes with it: the ACL rows, the passkeys and the
+    // bearer login all come back with the backup.
+    CONSOLE_KEYS,
+    // Operation-bound step-up marks. Each authorizes one operation for five
+    // minutes and is spent by it; a restored mark would at best be expired and
+    // at worst let a passkey gesture made on one host authorize an act on
+    // another.
+    STEP_UP_MARKS,
+    // Members' step-up passkeys, excluded for the reason `passkey` is: a
+    // credential is bound to this relying party, and a restore into another
+    // host must not arrive with gestures that authorize break-glass there. A
+    // member re-enrols through a fresh invite.
+    STEP_UP_PASSKEYS,
+    // Member-portal sessions: ephemeral auth, excluded for the reason
+    // `sessions` is — a restore must not resurrect a live session.
+    MEMBER_SESSIONS,
+    // Member-portal passkeys: bound to this relying party, like `passkey`. A
+    // member re-enrols from a wallet sign-in on the restored host.
+    MEMBER_PASSKEYS,
+    // The administrator action list. An action binds one operation against the
+    // ACL as it stood on this host when it was raised — its approver set, its
+    // state pin, the approvals collected over it. Restored elsewhere, an open
+    // action would complete on a community its approvers never saw, so it is
+    // not carried (`vtc-action-list.md` §4.1); the audit log keeps every
+    // transition regardless.
+    ADMIN_ACTIONS,
+    // Pushes in flight: delivery bookkeeping for this deployment's own
+    // outbox, whose entries are not carried either. Restored elsewhere, a push
+    // would be re-sent by a node that never queued it.
+    MEMBER_PUSHES,
+    // Wallet sessions last minutes and their evidence hours; a restored session
+    // would carry a response key and a nonce for an exchange no wallet can
+    // finish, and evidence its applicant was told would be discarded.
+    OID4VP_SESSIONS,
+    // The audit index is derived from the audit log and rebuilt from it
+    // (`crate::audit_index`); a restore clears it and the next read catches
+    // it up against the restored log.
+    AUDIT_INDEX,
+    // In-flight backup transfers. A bundle is a five-minute conversation with
+    // one operator about one set of staged bytes, which a restore elsewhere
+    // does not have — and a backup that contained its own transfer state would
+    // be a backup of itself.
+    BACKUP_BUNDLES,
+    // Bridge jobs are convergent and re-derived: the projector sends the
+    // desired roles again, and an unfinished create shows as `pendingCreate`.
+    GIT_NS_JOBS,
+    // A mirror of the registry, like `registry_records`: rebuilt by the next
+    // reconciliation against the restored `git_ns`.
+    GIT_NS_PROJECTION,
+    // Sealed storage credentials: a long-lived secret no export may carry. A restored
+    // `sealed` config asks for its credential again.
+    STORAGE_CREDENTIALS,
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ALL` must stay in sync with the `AppState` keyspace fields.
+    /// `server::run` opens every one of them into a `*_ks` field — if a
+    /// keyspace is added to one without the other, this trips.
+    #[test]
+    fn all_matches_app_state_keyspace_count() {
+        // 48 top-level `*_ks` fields (the member portal's two, `notifications_ks`, `boards_ks`, `badges_ks` and `badge_images_ks`
+        // among them) plus
+        // the three `AppState::git_ns` carries, plus the 2 hidden-vetting
+        // keyspaces (`VETTING_PCS_SPENT`, `VETTING_PCS_ISSUE`) from the
+        // `zkp-pcs` development branch, plus the two room-file keyspaces
+        // `AppState::room_files` holds (`ROOM_BLOBS`, `ROOM_BLOB_TRANSFERS`), plus the
+        // two `AppState::room_storage` holds (`STORAGE_CONFIGS`, `STORAGE_CREDENTIALS`), plus the one
+        // `AppState::community_rooms` holds (`COMMUNITY_ROOMS`), plus the one
+        // `AppState::directory` holds (`DIRECTORY`), plus the one
+        // `AppState::elections` holds (`ELECTIONS`), plus the one
+        // `AppState::room_watches` holds (`ROOM_WATCHES`). 49 with `audit_index_ks`.
+        assert_eq!(ALL.len(), 62, "ALL must list every AppState keyspace");
+    }
+
+    /// The backup census (P3.9): every keyspace is either backed up or
+    /// explicitly excluded — none silently omitted — and the two sets
+    /// are disjoint. This is the guard the design note calls for.
+    #[test]
+    fn backup_partition_is_total() {
+        use std::collections::BTreeSet;
+        let all: BTreeSet<&str> = ALL.iter().copied().collect();
+        let backed: BTreeSet<&str> = BACKED_UP.iter().copied().collect();
+        let excluded: BTreeSet<&str> = EXCLUDED_FROM_BACKUP.iter().copied().collect();
+        assert!(
+            backed.is_disjoint(&excluded),
+            "a keyspace is both backed up and excluded"
+        );
+        let union: BTreeSet<&str> = backed.union(&excluded).copied().collect();
+        assert_eq!(
+            union, all,
+            "backup partition must cover every keyspace in ALL exactly once"
+        );
+    }
+
+    /// No accidental duplicate in `ALL` (a copy-paste slip would make
+    /// the wizard pre-create one keyspace twice and skip another).
+    #[test]
+    fn all_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for name in ALL {
+            assert!(seen.insert(*name), "duplicate keyspace name in ALL: {name}");
+        }
+    }
+}

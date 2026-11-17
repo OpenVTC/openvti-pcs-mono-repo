@@ -1,0 +1,448 @@
+/**
+ * Wire → view model.
+ *
+ * The control plane answers every management call with the generated
+ * response type of its Trust Task (`lib/trust-tasks/`, generated): RFC 3339
+ * timestamps, camelCase, host-specific members under the
+ * `vnd.affinidi.webvh` extension namespace. The screens render epoch seconds
+ * and flat records, so each reply is projected here, once, at the boundary.
+ * Pure functions, so the projections are tested on their own.
+ */
+
+import type { DidRecord as WireDidRecord } from "./trust-tasks/did-management/did/list/0.2/payload";
+import type { Response as DidLogResponse } from "./trust-tasks/did-management/did/log/0.1/payload";
+import type { Response as ConfigResponse } from "./trust-tasks/did-management/server/config/0.1/payload";
+import type { Response as IdentityListResponse } from "./trust-tasks/did-management/identity/list/0.1/payload";
+import type { ServiceInstance as WireServiceInstance } from "./trust-tasks/did-management/registry/list/0.2/payload";
+import type { Response as StatsResponse } from "./trust-tasks/did-management/stats/get/0.1/payload";
+import type {
+  Payload as TimeseriesPayload,
+  Response as TimeseriesResponse,
+} from "./trust-tasks/did-management/stats/timeseries/0.2/payload";
+import type { InviteSummary } from "./trust-tasks/auth/passkey/enroll/invite/list/0.1/payload";
+import type { AclEntry as WireAclEntry } from "./trust-tasks/acl/list/0.3/payload";
+
+import type {
+  AclEntry,
+  AgentNameEntry,
+  ControlPlaneConfig,
+  DidRecord,
+  DomainBranding,
+  DomainEntry,
+  DomainQuota,
+  DidDocumentState,
+  DomainScope,
+  IdentityGeneration,
+  InviteListItem,
+  LogEntryInfo,
+  LogMetadata,
+  PasskeyCredential,
+  ServerStats,
+  WebvhParameters,
+  ServiceInstance,
+  TimeRange,
+  TimeSeriesPoint,
+} from "./api";
+import { scidAliasFromExt } from "./scid-alias";
+
+/** The extension namespace this host's members travel under. */
+export const WEBVH_EXT = "vnd.affinidi.webvh";
+
+type Ext = Record<string, unknown> | undefined;
+
+/** A JSON object (not an array, not null). */
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Strings only, from an unchecked list. */
+function strings(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
+
+/** This host's extension object off a wire record, or `{}`. */
+function webvhExt(ext: Ext): Record<string, unknown> {
+  const v = ext?.[WEBVH_EXT];
+  return isRecord(v) ? v : {};
+}
+
+/** RFC 3339 → epoch seconds. `null` for absent or unreadable. */
+export function epochSeconds(at: string | undefined | null): number | null {
+  if (typeof at !== "string") return null;
+  const ms = Date.parse(at);
+  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
+}
+
+/** As {@link epochSeconds}, for a member the schema requires. */
+function requiredEpoch(at: string): number {
+  return epochSeconds(at) ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// DIDs
+// ---------------------------------------------------------------------------
+
+export function didRecordFromWire(r: WireDidRecord): DidRecord {
+  const ext = webvhExt(r.ext as Ext);
+  const names = ext.agentNames;
+  const scidAlias = scidAliasFromExt(ext);
+  return {
+    mnemonic: r.mnemonic,
+    owner: r.owner,
+    createdAt: requiredEpoch(r.createdAt),
+    updatedAt: requiredEpoch(r.updatedAt),
+    versionCount: r.versionCount,
+    didId: r.didId ?? null,
+    didUrl: r.didUrl ?? null,
+    totalResolves: r.totalResolves ?? 0,
+    disabled: r.disabled ?? false,
+    ...(r.method ? { method: r.method } : {}),
+    ...(r.domain ? { domain: r.domain } : {}),
+    ...(Array.isArray(names) ? { agentNames: names as AgentNameEntry[] } : {}),
+    ...(scidAlias ? { scidAlias } : {}),
+  };
+}
+
+export function logEntriesFromWire(resp: DidLogResponse): LogEntryInfo[] {
+  return resp.entries.map((e) => ({
+    versionId: e.versionId ?? null,
+    versionTime: e.versionTime ?? null,
+    state: isRecord(e.state) ? (e.state as DidDocumentState) : null,
+    parameters: isRecord(e.parameters) ? (e.parameters as WebvhParameters) : null,
+  }));
+}
+
+/**
+ * Summarise a webvh log the way the detail screen shows it.
+ *
+ * did:webvh parameters are cumulative: each entry's `parameters` changes only
+ * the members it names, so the effective value of each is the last one set.
+ * `null` for an empty log.
+ */
+export function logMetadataFromEntries(entries: LogEntryInfo[]): LogMetadata | null {
+  if (entries.length === 0) return null;
+  const effective: WebvhParameters = {};
+  for (const e of entries) {
+    if (e.parameters) Object.assign(effective, e.parameters);
+  }
+  const latest = entries[entries.length - 1]!;
+  const witness = isRecord(effective.witness) ? effective.witness : null;
+  const witnessList: unknown[] = Array.isArray(witness?.witnesses) ? witness.witnesses : [];
+  const watcherUrls = strings(effective.watchers);
+  return {
+    logEntryCount: entries.length,
+    latestVersionId: latest.versionId,
+    latestVersionTime: latest.versionTime,
+    method: typeof effective.method === "string" ? effective.method : null,
+    portable: effective.portable === true,
+    preRotation: Array.isArray(effective.nextKeyHashes) && effective.nextKeyHashes.length > 0,
+    witnesses: witnessList.length > 0,
+    witnessCount: witnessList.length,
+    witnessThreshold: typeof witness?.threshold === "number" ? witness.threshold : 0,
+    watchers: watcherUrls.length > 0,
+    watcherCount: watcherUrls.length,
+    watcherUrls,
+    deactivated: effective.deactivated === true,
+    ttl: typeof effective.ttl === "number" ? effective.ttl : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Domains
+// ---------------------------------------------------------------------------
+
+/** The host's `DomainBranding` / `DomainQuota` are its storage structs,
+ *  serialised snake_case inside the extension. */
+function brandingFromWire(b: unknown): DomainBranding | null {
+  if (!isRecord(b)) return null;
+  return {
+    logoUrl: str(b.logo_url),
+    primaryColor: str(b.primary_color),
+    displayName: str(b.display_name),
+  };
+}
+function quotaFromWire(q: unknown): DomainQuota | null {
+  if (!isRecord(q)) return null;
+  return { maxDids: num(q.max_dids), maxBytes: num(q.max_bytes) };
+}
+
+/** The shared `DomainEntry` schema is open (`additionalProperties`), so the
+ *  generated type is an index signature; the members read here are the ones
+ *  `spec_domain_entry` writes. */
+export function domainFromWire(wire: object): DomainEntry {
+  const raw = wire as Record<string, unknown>;
+  const host = webvhExt(raw.ext as Ext);
+  return {
+    name: String(raw.name),
+    label: typeof raw.label === "string" ? raw.label : null,
+    scheme: host.scheme === "http" ? "http" : "https",
+    status: raw.status === "disabled" ? "disabled" : "active",
+    createdAt: epochSeconds(raw.createdAt as string) ?? 0,
+    defaultDomain: raw.defaultDomain === true,
+    branding: brandingFromWire(host.branding),
+    witnesses: Array.isArray(host.witnesses) ? strings(host.witnesses) : null,
+    watchers: Array.isArray(host.watchers) ? strings(host.watchers) : null,
+    quota: quotaFromWire(host.quota),
+    wellKnownEnabled: host.wellKnownEnabled === true,
+    disabledAt: epochSeconds(raw.disabledAt as string | undefined),
+    purgeAt: epochSeconds(raw.purgeAt as string | undefined),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fleet, stats, service
+// ---------------------------------------------------------------------------
+
+export function serviceInstanceFromWire(i: WireServiceInstance): ServiceInstance {
+  return {
+    instanceId: i.instanceId,
+    did: i.did,
+    serviceType: i.serviceType,
+    label: i.label ?? null,
+    url: i.publicUrl ?? null,
+    status: i.status,
+    lastHealthCheck: epochSeconds(i.lastHealthCheckAt),
+    registeredAt: requiredEpoch(i.registeredAt),
+    enabledMethods: i.enabledMethods ?? [],
+    servedDomains: i.servedDomains,
+    ...(i.advertisedServices ? { advertisedServices: i.advertisedServices } : {}),
+    ...(i.servicesCheckedAt
+      ? { servicesCheckedAt: epochSeconds(i.servicesCheckedAt) ?? undefined }
+      : {}),
+    ...(i.lastInbound
+      ? {
+          lastInboundTransport: i.lastInbound.transport,
+          lastInboundAt: epochSeconds(i.lastInbound.observedAt) ?? undefined,
+        }
+      : {}),
+    ...(i.lastOutbound
+      ? {
+          lastOutboundTransport: i.lastOutbound.transport,
+          lastOutboundAt: epochSeconds(i.lastOutbound.observedAt) ?? undefined,
+        }
+      : {}),
+  };
+}
+
+export function statsFromWire(s: StatsResponse): ServerStats {
+  return {
+    totalDids: s.totalDids ?? 0,
+    totalResolves: s.totalResolves,
+    totalUpdates: s.totalUpdates,
+    lastResolvedAt: epochSeconds(s.lastResolvedAt),
+    lastUpdatedAt: epochSeconds(s.lastUpdatedAt),
+  };
+}
+
+const RANGE_TO_WIRE: Record<TimeRange, TimeseriesPayload["range"]> = {
+  "1h": "lastHour",
+  "24h": "lastDay",
+  "7d": "lastWeek",
+  "30d": "last30Days",
+};
+
+export function timeRangeToWire(range: TimeRange): TimeseriesPayload["range"] {
+  return RANGE_TO_WIRE[range];
+}
+
+export function timeseriesFromWire(t: TimeseriesResponse): TimeSeriesPoint[] {
+  return t.points.map((p) => ({
+    timestamp: requiredEpoch(p.startsAt),
+    resolves: p.resolves,
+    updates: p.updates,
+    seconds: t.bucketSeconds,
+  }));
+}
+
+export function configFromWire(c: ConfigResponse): ControlPlaneConfig {
+  return {
+    controlDid: c.serviceDid,
+    softwareVersion: c.softwareVersion,
+    deploymentMode: c.deploymentMode,
+    publicUrl: c.publicUrl ?? null,
+    didHostingUrl: c.didHostingUrl ?? null,
+    mediatorDid: c.mediatorDid ?? null,
+    didcommEnabled: c.transports.didcomm,
+    tspEnabled: c.transports.tsp,
+    ...(c.advertisedServices ? { advertisedServices: c.advertisedServices } : {}),
+    enabledMethods: c.enabledMethods,
+    agentNames: c.agentNames,
+    listenAddress: c.listenAddress ?? null,
+    vtaUrl: c.vta?.url ?? null,
+    vtaDid: c.vta?.did ?? null,
+    registry: c.registry
+      ? {
+          healthCheckIntervalSecs: c.registry.healthCheckIntervalSeconds,
+          configuredInstances: c.registry.configuredInstances,
+        }
+      : null,
+    sessions: c.sessions
+      ? {
+          accessTokenExpiry: c.sessions.accessTokenSeconds,
+          refreshTokenExpiry: c.sessions.refreshTokenSeconds,
+          adminIdleTimeout: c.sessions.adminIdleTimeoutSeconds,
+          passkeyEnrollmentTtl: c.sessions.passkeyEnrollmentSeconds,
+        }
+      : null,
+    dataDir: c.storage?.dataDir ?? null,
+    logLevel: c.logging?.level ?? null,
+    logFormat: c.logging?.format ?? null,
+  };
+}
+
+export function identityFromWire(r: IdentityListResponse): {
+  generations: IdentityGeneration[];
+  rotationGraceSecs: number;
+} {
+  return {
+    generations: r.generations.map((g) => ({
+      id: g.generationId,
+      did: g.did,
+      current: g.current,
+      signingKid: g.signingKeyId,
+      keyAgreementKid: g.keyAgreementKeyId,
+      mediatorDid: g.mediatorDid ?? null,
+      didcomm: g.transports.didcomm,
+      tsp: g.transports.tsp,
+      createdAt: requiredEpoch(g.createdAt),
+      retiredAt: epochSeconds(g.retiredAt),
+      expiresAt: epochSeconds(g.expiresAt),
+    })),
+    rotationGraceSecs: r.rotationGraceSeconds,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Access
+// ---------------------------------------------------------------------------
+
+type WireRole = "admin" | "owner" | "service" | "metricsReader";
+
+/** A recognised role, preserved exactly — including the counters-only
+ *  `metricsReader`. Folding that into `owner` would let an edit form silently
+ *  promote a read-only credential on save; folding it into any other role
+ *  would mislabel the row. `undefined` for a value this client predates. */
+function knownRole(r: string | undefined): WireRole | undefined {
+  return r === "admin" || r === "owner" || r === "service" || r === "metricsReader" ? r : undefined;
+}
+
+/** Invite roles. The server refuses `metricsReader` on invites, so it only
+ *  ever surfaces on a stale/forged row — shown honestly, never rewritten. An
+ *  unrecognised value falls back to the LEAST-privileged `service`; a throw
+ *  is wrong here because this runs inside `invites.map(...)`, where one bad
+ *  row would hide the entire invite list. */
+function role(r: string | undefined): WireRole {
+  return knownRole(r) ?? "service";
+}
+
+/** ACL-entry roles. Same recognised set as invites; an entry with no or an
+ *  unrecognised role keeps its historical `owner` reading. */
+function aclRole(r: string | undefined): WireRole {
+  return knownRole(r) ?? "owner";
+}
+
+export function inviteFromWire(i: InviteSummary): InviteListItem {
+  return {
+    inviteId: i.inviteId,
+    did: i.subject,
+    purpose: i.purpose,
+    role: role(i.role),
+    createdAt: requiredEpoch(i.createdAt),
+    expiresAt: requiredEpoch(i.expiresAt),
+    expired: i.expired,
+  };
+}
+
+/** A wire credential summary — `auth/passkey/list`'s `RegisteredCredential`
+ *  and `auth/passkey/admin-list`'s `ListedCredential` share this shape (the
+ *  latter also carries an optional `signCount` this console doesn't show). */
+interface WireCredentialSummary {
+  credentialId: string;
+  deviceLabel?: string;
+  registeredAt: string;
+  lastUsedAt?: string;
+  transports?: string[];
+}
+
+export function passkeyCredentialFromWire(c: WireCredentialSummary): PasskeyCredential {
+  return {
+    credentialId: c.credentialId,
+    deviceLabel: c.deviceLabel ?? null,
+    registeredAt: requiredEpoch(c.registeredAt),
+    lastUsedAt: epochSeconds(c.lastUsedAt),
+    transports: c.transports ?? [],
+  };
+}
+
+/** Project a spec-wire ACL entry into the `AclEntry` the screens render. The
+ *  wire carries webvh fields under `ext["vnd.affinidi.webvh"]`. */
+export function aclEntryFromWire(spec: WireAclEntry): AclEntry {
+  const webvh = webvhExt(spec.ext as Ext);
+  const quota = isRecord(webvh.quota) ? webvh.quota : {};
+  return {
+    did: spec.subject,
+    role: aclRole(spec.role),
+    label: spec.label ?? null,
+    created_at: epochSeconds(spec.createdAt) ?? 0,
+    max_total_size: typeof quota.maxTotalSize === "number" ? quota.maxTotalSize : null,
+    max_did_count: typeof quota.maxDidCount === "number" ? quota.maxDidCount : null,
+    domains: domainsFromAct(
+      spec.act,
+      typeof webvh.defaultDomain === "string" ? webvh.defaultDomain : undefined,
+    ),
+  };
+}
+
+/** AclEntry 0.2's act scope. */
+export type ActScope = WireAclEntry["act"];
+
+/** Whether a role is held to its domains. Admin and Service act on every
+ *  domain, so their act scope is always `all`. */
+export function roleIsDomainScoped(role: AclEntry["role"]): boolean {
+  return role === "owner" || role === "metricsReader";
+}
+
+/** An entry's domains are its act scope: `all` → every domain, `contexts`
+ *  → those domains (with the default when it is one of them), `none` → no
+ *  domain. */
+export function domainsFromAct(act: ActScope, defaultDomain?: string): DomainScope {
+  if (act.scope === "all") return { kind: "all" };
+  if (act.scope === "none") return { kind: "allowed", domains: [] };
+  const domains = [...act.contexts];
+  return defaultDomain !== undefined && domains.includes(defaultDomain)
+    ? { kind: "allowed_with_default", domains, default: defaultDomain }
+    : { kind: "allowed", domains };
+}
+
+/** The act scope an entry with `role` and `domains` states. An empty domain
+ *  list is `none`, never an empty `contexts`. */
+export function actOf(role: AclEntry["role"], domains: DomainScope): ActScope {
+  if (!roleIsDomainScoped(role) || domains.kind === "all") return { scope: "all" };
+  if (domains.domains.length === 0) return { scope: "none" };
+  return { scope: "contexts", contexts: [...new Set(domains.domains)] as [string, ...string[]] };
+}
+
+/** The default domain `domains` names, if any (it rides in `ext`). */
+export function defaultDomainOf(domains: DomainScope): string | undefined {
+  return domains.kind === "allowed_with_default" ? domains.default : undefined;
+}
+
+/**
+ * The narrower act scope `acl/revoke` must apply before a grant can move an
+ * entry from `current` to `next`, or `null` when no domain is dropped. A
+ * grant may only re-assert or widen; dropping a domain is a revoke to
+ * `current ∩ next`, after which the grant widens to `next`.
+ */
+export function actNarrowing(current: ActScope, next: ActScope): ActScope | null {
+  if (next.scope === "all" || current.scope === "none") return null;
+  if (current.scope === "all") return next;
+  const keep = new Set(next.scope === "contexts" ? next.contexts : []);
+  const kept = current.contexts.filter((c) => keep.has(c));
+  if (kept.length === current.contexts.length) return null;
+  return kept.length === 0
+    ? { scope: "none" }
+    : { scope: "contexts", contexts: kept as [string, ...string[]] };
+}

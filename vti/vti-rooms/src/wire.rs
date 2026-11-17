@@ -1,0 +1,940 @@
+//! Wire types for the `rooms/*` Trust Tasks.
+//!
+//! # Two kinds of type, and which one is on the wire
+//!
+//! **What a host receives is the generated type.** Every request is dispatched on the
+//! generated payload type of its task (`vti_specs_rooms::rooms`, through `vti-rooms-host`),
+//! so what a host accepts is decided by the published schema, member for member, before
+//! anything here is read. None of these types implements `trust_tasks_rs::Payload`: none
+//! claims to be the payload of a task.
+//!
+//! **What is here is hand-written on purpose**, and is one of three things:
+//!
+//! - **Storage records** — [`SealedContent`], [`EpochLink`], [`RelayedCommit`],
+//!   [`CommittedRecord`], [`AuthorityPresentation`] as a record carries it — which a host
+//!   keeps and members read back. The generated types use newtypes, `NonZeroU64`,
+//!   `#[non_exhaustive]` and builders: right for a client composing a request, friction for
+//!   a crate whose types are also its storage.
+//! - **A host's reading of a request** (`*Body`): the members a handler acts on, read from
+//!   the payload the generated type has already accepted (its `ext` set aside).
+//! - **Response bodies** a host builds and a client reads back.
+//!
+//! What the generated types protect against is two descriptions of one wire format drifting
+//! apart — a `snake_case` field where the schema says `camelCase` is invisible to every Rust
+//! test, because both sides of a round trip use the same struct. So every type here is held
+//! to the published schema instead: `tests/schema_conformance.rs` validates what each
+//! serialises to, and `tests/wire_census.rs` fails on a `pub struct` in this file that it
+//! does not name. Agreeing on the wire is the requirement; agreeing on the Rust shape never
+//! was. Root `CLAUDE.md` (*Trust Task wire types*) records the exemption and this obligation.
+//!
+//! Every struct is `camelCase` and `deny_unknown_fields`: these carry authorization
+//! decisions, and an unknown member on one of those is a request that means something the
+//! service did not understand.
+
+use serde::{Deserialize, Serialize};
+
+use crate::{Record, RecordStatus, Visibility};
+
+/// `rooms/epoch/mint/0.1`.
+pub const ROOMS_EPOCH_MINT_TYPE: &str =
+    <vti_specs_rooms::rooms::epoch::mint::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/owner/transfer/0.1`.
+pub const ROOMS_OWNER_TRANSFER_TYPE: &str =
+    <vti_specs_rooms::rooms::owner::transfer::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/owner/claim/0.1`.
+pub const ROOMS_OWNER_CLAIM_TYPE: &str =
+    <vti_specs_rooms::rooms::owner::claim::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/curate/0.1`.
+pub const ROOMS_RECORDS_CURATE_TYPE: &str =
+    <vti_specs_rooms::rooms::records::curate::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/epoch/commits/0.1`.
+pub const ROOMS_EPOCH_COMMITS_TYPE: &str =
+    <vti_specs_rooms::rooms::epoch::commits::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// `rooms/records/put/0.3`: an `open` room's cleartext may say what kind of claim the
+/// record is and when it lapses — `basis`, `confidence`, `evidence`, `validFor` and
+/// `validUntil`, stored and served as received and never acted on (trust-tasks-tf #865).
+#[allow(deprecated)] // superseded by 0.4, and still served: rooms/keys/act/0.8 completes put only to 0.3
+pub const ROOMS_RECORDS_PUT_V3_TYPE: &str =
+    <vti_specs_rooms::rooms::records::put::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/put/0.4`: an `open` room's record may carry a file — its manifest, and
+/// the random key its blob is sealed under, in `cleartext.file` (trust-tasks-tf #987).
+#[allow(deprecated)] // still served beside put/0.5, to writers that send it (trust-tasks-tf #1027)
+pub const ROOMS_RECORDS_PUT_V4_TYPE: &str =
+    <vti_specs_rooms::rooms::records::put::v0_4::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/put/0.5`: an `open` room's record may say what kind it is, what it
+/// answers, and when it was written and edited (trust-tasks-tf #1027).
+pub const ROOMS_RECORDS_PUT_V5_TYPE: &str =
+    <vti_specs_rooms::rooms::records::put::v0_5::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/epoch/chain/0.2`: every response carries the room's epoch floor once it has been
+/// pruned, and no rung at or below it (trust-tasks-tf #869).
+pub const ROOMS_EPOCH_CHAIN_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::epoch::chain::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/epoch/prune/0.2`: the host keeps the room's epoch floor and returns it.
+pub const ROOMS_EPOCH_PRUNE_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::epoch::prune::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/create/0.2`: a room states its record retention at creation (trust-tasks-tf #868).
+#[allow(deprecated)] // still served beside create/0.3, to owners that send it (trust-tasks-tf #1084)
+pub const ROOMS_CREATE_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::create::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/create/0.3`: a room may also state its signal delay at creation, echoed in the
+/// response whatever was asked (trust-tasks-tf #1084).
+pub const ROOMS_CREATE_V3_TYPE: &str =
+    <vti_specs_rooms::rooms::create::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/info/0.4`: 0.3, and the room's signal delay, always present (trust-tasks-tf #1084).
+#[allow(deprecated)] // still served beside info/0.5, to readers that ask for it (trust-tasks-tf #1289)
+pub const ROOMS_INFO_V4_TYPE: &str =
+    <vti_specs_rooms::rooms::info::v0_4::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/info/0.5`: 0.4, and the host's own limits a client can refuse by before it sends —
+/// `maxRecordDocumentBytes` and `maxChunkSize` (trust-tasks-tf #1289).
+pub const ROOMS_INFO_V5_TYPE: &str =
+    <vti_specs_rooms::rooms::info::v0_5::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/signal-delay/set/0.1`: an administrator changes whether the host waits a
+/// randomised interval before the room's watch signals (trust-tasks-tf #1084).
+pub const ROOMS_SIGNAL_DELAY_SET_TYPE: &str =
+    <vti_specs_rooms::rooms::signal_delay::set::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/info/0.3`: also the record retention in force and the room's latest prune, its
+/// instant named `prunedAt` (`rooms/_shared/0.2`).
+#[allow(deprecated)] // still served beside info/0.4, to readers that ask for it (trust-tasks-tf #1084)
+pub const ROOMS_INFO_V3_TYPE: &str =
+    <vti_specs_rooms::rooms::info::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/list/0.5`: rows name their blobs, every page carries the room's
+/// `lastPrune`, and the continuation token is `nextCursor`.
+#[allow(deprecated)] // still served beside list/0.6, to readers that ask for it (trust-tasks-tf #1027)
+pub const ROOMS_RECORDS_LIST_V5_TYPE: &str =
+    <vti_specs_rooms::rooms::records::list::v0_5::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/list/0.6`: rows are `RecordMetadataV3` — an `open` record's `kind`, and
+/// the host's `createdAt`, `createdBy` and `bodyStoredAt` (trust-tasks-tf #1027).
+#[allow(deprecated)] // still served beside list/0.7, to readers that ask for it (trust-tasks-tf #1088)
+pub const ROOMS_RECORDS_LIST_V6_TYPE: &str =
+    <vti_specs_rooms::rooms::records::list::v0_6::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/list/0.7`: list 0.6, oldest or newest first (`order`), a cursor bound to
+/// the order it was issued under (trust-tasks-tf #1088).
+#[allow(deprecated)] // still served beside list/0.8, to readers that ask for it (trust-tasks-tf #1289)
+pub const ROOMS_RECORDS_LIST_V7_TYPE: &str =
+    <vti_specs_rooms::rooms::records::list::v0_7::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/list/0.8`: list 0.7, and an exclusive `beforeVersion` upper bound under
+/// either order; a cursor bound to its order, `sinceVersion` and `beforeVersion`
+/// (trust-tasks-tf #1289).
+pub const ROOMS_RECORDS_LIST_V8_TYPE: &str =
+    <vti_specs_rooms::rooms::records::list::v0_8::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/prune/0.2`: an administrator removes what the record retention makes
+/// eligible.
+pub const ROOMS_RECORDS_PRUNE_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::records::prune::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/retention/set/0.1`: an administrator replaces the record retention.
+pub const ROOMS_RECORDS_RETENTION_SET_TYPE: &str =
+    <vti_specs_rooms::rooms::records::retention::set::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/get/0.2`: a read that names the record's blobs.
+#[allow(deprecated)] // still served beside get/0.3, to readers that ask for it (trust-tasks-tf #1027)
+pub const ROOMS_RECORDS_GET_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::records::get::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/get/0.3`: get/0.2, and the host's `createdAt`, `createdBy` and
+/// `bodyStoredAt`, none of them committed (trust-tasks-tf #1027).
+#[allow(deprecated)] // superseded by get/0.4, and still served
+pub const ROOMS_RECORDS_GET_V3_TYPE: &str =
+    <vti_specs_rooms::rooms::records::get::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/records/get/0.4`: get/0.3, and the `purpose` the reader will use the record for
+/// (VTI-ACL-110). Sent by a key holder reading for a named purpose; not yet served here.
+pub const ROOMS_RECORDS_GET_V4_TYPE: &str =
+    <vti_specs_rooms::rooms::records::get::v0_4::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/blobs/chunk/0.1`.
+pub const ROOMS_BLOBS_CHUNK_TYPE: &str =
+    <vti_specs_rooms::rooms::blobs::chunk::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/blobs/upload/begin/0.2`: an upload that says how its bytes move.
+pub const ROOMS_BLOBS_UPLOAD_BEGIN_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::blobs::upload::begin::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/blobs/upload/chunk/0.2`: signed by the upload's single-use key.
+pub const ROOMS_BLOBS_UPLOAD_CHUNK_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::blobs::upload::chunk::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/blobs/upload/commit/0.2`.
+pub const ROOMS_BLOBS_UPLOAD_COMMIT_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::blobs::upload::commit::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/blobs/upload/abort/0.2`.
+pub const ROOMS_BLOBS_UPLOAD_ABORT_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::blobs::upload::abort::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/blobs/get/0.2`: a download, direct from storage or through the host.
+pub const ROOMS_BLOBS_GET_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::blobs::get::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/usage/0.1`.
+pub const ROOMS_USAGE_TYPE: &str =
+    <vti_specs_rooms::rooms::usage::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// `rooms/revocations/put/0.1`: an administrator delivers the room's signed revocation list.
+pub const ROOMS_REVOCATIONS_PUT_TYPE: &str =
+    <vti_specs_rooms::rooms::revocations::put::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/revocations/get/0.1`: an administrator reads the list a host holds.
+pub const ROOMS_REVOCATIONS_GET_TYPE: &str =
+    <vti_specs_rooms::rooms::revocations::get::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Every `rooms/*` URI this service dispatches.
+pub const ROOMS_DISPATCHED_URIS: &[&str] = &[
+    ROOMS_EPOCH_MINT_TYPE,
+    ROOMS_RECORDS_CURATE_TYPE,
+    ROOMS_OWNER_TRANSFER_TYPE,
+    ROOMS_OWNER_CLAIM_TYPE,
+    ROOMS_EPOCH_COMMITS_TYPE,
+    // Room files (data-rooms-files.md §5).
+    ROOMS_RECORDS_GET_V2_TYPE,
+    // Record provenance and expiry on the open tier (trust-tasks-tf #865).
+    ROOMS_RECORDS_PUT_V3_TYPE,
+    // A file on the open tier (trust-tasks-tf #987).
+    ROOMS_RECORDS_PUT_V4_TYPE,
+    // Record retention and prune (trust-tasks-tf #868).
+    ROOMS_CREATE_V2_TYPE,
+    // Prunes named `prunedAt` (`rooms/_shared/0.2`); list 0.5's `nextCursor`.
+    ROOMS_INFO_V3_TYPE,
+    ROOMS_RECORDS_LIST_V5_TYPE,
+    ROOMS_RECORDS_PRUNE_V2_TYPE,
+    ROOMS_RECORDS_RETENTION_SET_TYPE,
+    // The epoch floor (trust-tasks-tf #869).
+    ROOMS_EPOCH_CHAIN_V2_TYPE,
+    ROOMS_EPOCH_PRUNE_V2_TYPE,
+    ROOMS_BLOBS_CHUNK_TYPE,
+    ROOMS_USAGE_TYPE,
+    // Direct-to-storage transfer (`rooms/blobs/*` 0.2).
+    ROOMS_BLOBS_UPLOAD_BEGIN_V2_TYPE,
+    ROOMS_BLOBS_UPLOAD_CHUNK_V2_TYPE,
+    ROOMS_BLOBS_UPLOAD_COMMIT_V2_TYPE,
+    ROOMS_BLOBS_UPLOAD_ABORT_V2_TYPE,
+    ROOMS_BLOBS_GET_V2_TYPE,
+    // Revocation (trust-tasks-tf #804).
+    ROOMS_REVOCATIONS_PUT_TYPE,
+    ROOMS_REVOCATIONS_GET_TYPE,
+    // Record kinds and the host's record times (trust-tasks-tf #1027).
+    ROOMS_RECORDS_PUT_V5_TYPE,
+    ROOMS_RECORDS_LIST_V6_TYPE,
+    ROOMS_RECORDS_GET_V3_TYPE,
+    // A read's purpose of use (trust-tasks-tf #1076, VTI-ACL-110).
+    ROOMS_RECORDS_GET_V4_TYPE,
+    // A watch, and its one signal (trust-tasks-tf #1036).
+    ROOMS_WATCH_TYPE,
+    // A live watch while a conversation is open (trust-tasks-tf #1087).
+    ROOMS_WATCH_V2_TYPE,
+    // The room's signal delay (trust-tasks-tf #1084).
+    ROOMS_CREATE_V3_TYPE,
+    ROOMS_INFO_V4_TYPE,
+    ROOMS_SIGNAL_DELAY_SET_TYPE,
+    // A listing newest first, to open a conversation at its head (trust-tasks-tf #1088).
+    ROOMS_RECORDS_LIST_V7_TYPE,
+    // Load older by version, and the host's own limits (trust-tasks-tf #1289).
+    ROOMS_RECORDS_LIST_V8_TYPE,
+    ROOMS_INFO_V5_TYPE,
+];
+
+/// `rooms/watch/0.1`: arm, re-arm or cancel one `rooms/changed/0.1` signal.
+#[allow(deprecated)] // still served beside 0.2 (trust-tasks-tf #1087)
+pub const ROOMS_WATCH_TYPE: &str =
+    <vti_specs_rooms::rooms::watch::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+/// `rooms/watch/0.2`: 0.1, and a **live** watch (`live: true`) — a signal per change,
+/// coalesced, under a lease of at most 120 seconds — on a room whose signal delay is `none`.
+pub const ROOMS_WATCH_V2_TYPE: &str =
+    <vti_specs_rooms::rooms::watch::v0_2::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// What a party presents to act on a room.
+///
+/// The whole authority chain travels here, **leaf first**, and this service never
+/// dereferences a link's `parent` to fetch one it was not given. That is not an
+/// optimisation: resolving over the network would make verification depend on availability,
+/// turn an identifier into a request this service can be induced to make against an address
+/// the *presenter* chooses, and signal credential use to whoever hosts that identifier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityPresentation {
+    /// The presenter's membership credential for this room, or a zero-knowledge
+    /// presentation of it on a `private` room.
+    pub membership: String,
+
+    /// The authority chain, leaf first. The last element must be issued by the room.
+    pub authority: Vec<String>,
+
+    /// REQUIRED on a `private` room: proof that the membership credential and the chain's
+    /// leaf describe the **same subject**.
+    ///
+    /// Without it two parties pool credentials — one contributes membership, the other
+    /// authority — and the combination verifies as a single party holding both. Silent when
+    /// wrong, which is why [`crate::authz`] refuses a private-room presentation that omits
+    /// it rather than treating it as optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_binding: Option<String>,
+}
+
+/// Sealed record content, as it crosses the wire and is stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SealedContent {
+    /// The sealed record, base64url. AEAD-bound to `roomId|key|version|epoch`, where
+    /// `version` is the one it was sealed at ([`SealedContent::version`]).
+    pub ciphertext: String,
+    /// AEAD nonce, base64url.
+    pub nonce: String,
+    /// The epoch it was sealed under.
+    pub epoch: u32,
+    /// The version it was sealed at, where a curation has since moved the record past it.
+    /// Absent when that is the record's own `version`. A reader opens and verifies the body
+    /// here ([`SealedContent::sealed_at`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+}
+
+impl SealedContent {
+    /// The version this body was sealed at, for a record now at `record_version`: its own
+    /// `version` where it carries one, else the record's.
+    ///
+    /// # Errors
+    ///
+    /// A `version` above the record's own: a body cannot have been sealed for a version the
+    /// room had not reached, so the host is pairing a record with a body that is not its.
+    pub fn sealed_at(&self, record_version: u64) -> Result<u64, String> {
+        match self.version {
+            Some(v) if v > record_version => Err(format!(
+                "the host says this body was sealed at version {v}, after the record's own \
+                 version {record_version}; a body cannot be sealed for a version the room had \
+                 not reached"
+            )),
+            Some(v) => Ok(v),
+            None => Ok(record_version),
+        }
+    }
+}
+
+/// One rung of the epoch key chain: epoch `epoch - 1`'s storage key, sealed under
+/// epoch `epoch`'s.
+///
+/// A host stores these and cannot read them — the key that opens one is the storage key of
+/// the epoch it names, which no host ever holds. What a host learns from a link is that an
+/// epoch happened, which it already knew from [`super::Room::epoch`].
+///
+/// # Why the chain points backwards
+///
+/// A record is sealed under the epoch current when it was written, and MLS deliberately
+/// gives no way to derive an old epoch's exporter from a new one — that is forward secrecy,
+/// and it is the property that makes removal mean something. Without a link, advancing the
+/// epoch therefore makes every record already in the room unreadable *to everyone*,
+/// including the member who wrote it.
+///
+/// The link is the one-way street run the other way: a member holding the current key can
+/// walk back through the chain to any retained epoch, and a member holding an *old* key can
+/// derive nothing forward. Removal stays forward-only; reading stays possible.
+///
+/// # What it costs
+///
+/// Post-compromise security for record content. Once the chain exists, a compromised
+/// current key reaches every retained epoch. That is the trade a *library* makes and a
+/// message stream does not, which is why it is [`super::RetentionPolicy`] and not a
+/// constant. MLS's own post-compromise property is untouched: a compromised leaf still
+/// heals at the next commit, and a removed member still reads nothing written after them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EpochLink {
+    /// The epoch whose key opens this link. It wraps the key of `epoch - 1`.
+    pub epoch: u32,
+    /// The wrapped predecessor key, base64url. AEAD-bound to `epoch-link|epoch|epoch-1`.
+    pub wrapped: String,
+    /// AEAD nonce, base64url.
+    pub nonce: String,
+}
+
+/// Cleartext record content. `open` rooms only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CleartextContent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// The `rooms/create/0.3` payload is the type `trust-tasks-rs` generates from the
+/// specification — never a copy here (the generated-wire-types census). A host reads
+/// what it keeps from it with [`CreateRoomTerms::from_request`]; a 0.2 request, whose
+/// members 0.3 shares, reads as one too.
+pub use vti_specs_rooms::rooms::create::v0_3::Payload as CreateRoomBody;
+
+/// The terms a host records for a room it is asked to create, in this crate's own types.
+///
+/// The specification's enums and this crate's share their wire values, so each is read
+/// across by value; a value one side does not know is refused, never defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateRoomTerms {
+    pub visibility: Visibility,
+    /// The owner's choice; [`crate::RetentionPolicy::Chained`] when unstated.
+    pub retention_policy: crate::RetentionPolicy,
+    /// [`crate::AnchorCadence::Manual`] when unstated, which draws no expectation.
+    pub anchor_cadence: crate::AnchorCadence,
+    /// The days asked for, if any; the host applies its own default otherwise.
+    pub retention_days: Option<u32>,
+}
+
+impl CreateRoomTerms {
+    /// Read the terms from a request, or say why they cannot be kept.
+    pub fn from_request(req: &CreateRoomBody) -> Result<Self, String> {
+        fn across<T: Serialize, U: serde::de::DeserializeOwned>(
+            value: &T,
+            what: &str,
+        ) -> Result<U, String> {
+            serde_json::to_value(value)
+                .and_then(serde_json::from_value)
+                .map_err(|e| format!("{what} is not one this host knows: {e}"))
+        }
+        Ok(Self {
+            visibility: across(&req.visibility, "visibility")?,
+            retention_policy: match &req.retention_policy {
+                Some(p) => across(p, "retentionPolicy")?,
+                None => crate::RetentionPolicy::default(),
+            },
+            anchor_cadence: match &req.anchor_cadence {
+                Some(c) => across(c, "anchorCadence")?,
+                None => crate::AnchorCadence::default(),
+            },
+            retention_days: match req.retention_days {
+                Some(days) => Some(u32::try_from(days.get()).map_err(|_| {
+                    format!("retentionDays {days} is more days than this host can hold a room")
+                })?),
+                None => None,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod create_terms_tests {
+    use super::*;
+
+    fn request(extra: serde_json::Value) -> CreateRoomBody {
+        let mut body = serde_json::json!({
+            "roomId": "did:webvh:QmRoom:rooms.example",
+            "ownerDid": "did:key:z6MkOwner",
+            "visibility": "attributed",
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).expect("a request the schema admits")
+    }
+
+    #[test]
+    fn unstated_terms_are_the_defaults() {
+        let t = CreateRoomTerms::from_request(&request(serde_json::json!({}))).unwrap();
+        assert_eq!(t.visibility, Visibility::Attributed);
+        assert_eq!(t.retention_policy, crate::RetentionPolicy::Chained);
+        assert_eq!(t.anchor_cadence, crate::AnchorCadence::default());
+        assert_eq!(t.retention_days, None);
+    }
+
+    #[test]
+    fn stated_terms_are_kept() {
+        let t = CreateRoomTerms::from_request(&request(serde_json::json!({
+            "visibility": "open",
+            "retentionPolicy": "fromJoin",
+            "anchorCadence": "renewal",
+            "retentionDays": 30,
+            "ext": { "org.example": {} },
+        })))
+        .unwrap();
+        assert_eq!(t.visibility, Visibility::Open);
+        assert_eq!(t.retention_policy, crate::RetentionPolicy::FromJoin);
+        assert_eq!(t.anchor_cadence, crate::AnchorCadence::Renewal);
+        assert_eq!(t.retention_days, Some(30));
+    }
+
+    #[test]
+    fn retention_beyond_what_a_host_holds_is_refused_not_truncated() {
+        let r = request(serde_json::json!({ "retentionDays": u64::from(u32::MAX) + 1 }));
+        assert!(CreateRoomTerms::from_request(&r).is_err());
+    }
+
+    #[test]
+    fn a_member_the_specification_does_not_declare_is_refused() {
+        let body = serde_json::json!({
+            "roomId": "did:webvh:QmRoom:rooms.example",
+            "ownerDid": "did:key:z6MkOwner",
+            "visibility": "attributed",
+            "retentionFor": 30,
+        });
+        assert!(serde_json::from_value::<CreateRoomBody>(body).is_err());
+    }
+}
+
+/// `rooms/create/0.2#response`, without the `recordRetention` echo a host adds
+/// ([`crate::record_tasks::create_v2_response`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRoomResponse {
+    pub room_id: String,
+    pub epoch: u32,
+    /// Echoed so a caller knows what was **recorded** rather than what was
+    /// asked — the two differ on a host that predates this member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_cadence: Option<crate::AnchorCadence>,
+}
+
+/// `rooms/records/put/0.3` request, as the host reads it once it has taken `blobs`, `ext`
+/// and an open record's provenance apart — and 0.4's, once it has taken the file apart too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PutRecordBody {
+    pub room_id: String,
+    pub key: String,
+    pub presentation: AuthorityPresentation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<SealedContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleartext: Option<CleartextContent>,
+}
+
+/// The `rooms/records/put` response — the same at every version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutRecordResponse {
+    pub key: String,
+    pub version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u32>,
+}
+
+/// The `rooms/records/get/0.2` request, without `ext`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetRecordBody {
+    pub room_id: String,
+    pub key: String,
+    pub presentation: AuthorityPresentation,
+}
+
+/// `rooms/records/list/0.5` request, without `ext`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListRecordsBody {
+    pub room_id: String,
+    pub presentation: AuthorityPresentation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_version: Option<u64>,
+    /// Opaque continuation token from a previous response.
+    ///
+    /// This member is in the published request schema and was **missing here**,
+    /// and `deny_unknown_fields` turns a missing member into a refusal: a
+    /// conforming client that paged got its second page rejected as malformed.
+    /// The two halves of the defect were symmetrical — a host that never issued
+    /// a cursor and could not have accepted one back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Page size to ask for. **Never a cap on the result**: a caller that wants
+    /// the whole room follows [`ListRecordsResponse::cursor`] to its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// **The leaf preimage of the record tree** — the object a host hashes into a
+/// leaf and a reader reassembles to check a [`crate::merkle::InclusionProof`].
+///
+/// This is the wire's `CommittedRecord` (`rooms/_shared/0.1`), and it is
+/// deliberately not [`Record`]. A commitment nobody but its author can
+/// recompute is not a commitment, and hashing the *storage* record made it one:
+/// `updatedAt` is unix seconds in the store and RFC 3339 on the wire, `epoch`
+/// and `nonce` sit flat in the store and inside `sealed` on the wire, and
+/// `epoch` serialises as `null` on an open room where the wire has it absent.
+/// A second implementation reading only the specification could not reproduce
+/// a single root.
+///
+/// **Absence carries meaning**, so every presence rule here is exact:
+///
+/// - `pinned` is serialised **only** when true. `false` is not a spelling of
+///   this member; absent is. Two spellings would give one record two roots.
+/// - `epoch` is not a member. It lives inside `sealed`, where the AEAD binds
+///   it, and a top-level copy would be a second place for it to disagree with
+///   itself.
+/// - `sealed` on the sealed tiers, `cleartext` on `open`, and **neither** on a
+///   `retracted` tombstone.
+/// - `title`/`description` are not members: a listing lifts them out of an open
+///   room's body, and committing to both would commit to the same bytes twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommittedRecord {
+    pub key: String,
+    pub version: u64,
+    pub status: RecordStatus,
+    /// RFC 3339. The digest is over the **wire** form, never over the unix
+    /// seconds the store keeps.
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<SealedContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleartext: Option<serde_json::Value>,
+}
+
+/// `rooms/records/get/0.2#response`, without the `blobs` a host adds
+/// ([`crate::blob_tasks::get_v2_response`]).
+///
+/// # Why this type exists, having not existed
+///
+/// Both hosts answered a read by serialising [`Record`] — the *storage* record
+/// — and adding `dataCommitment` to whatever came out. That is not this task's
+/// response and never was. `sealed` is stored as a bare base64url string where
+/// the schema types it as a `SealedRecord` object, and `epoch`, `nonce`,
+/// `status`, `pinned`, `author` and `updatedAt` were emitted flat — so under the
+/// response's `additionalProperties: false` a single read produced a type error
+/// and six violations.
+///
+/// It survived because this module's rule — every wire type appears in
+/// `tests/schema_conformance.rs` — can only be applied to types that *exist*.
+/// A response with no type had no line to be missing from, and a storage record
+/// reached the wire because nothing stood between them.
+///
+/// The consumer is not hypothetical: `@openvtc/pnm-core`'s `roomsRecordsGet` is
+/// typed on the **generated** payload, so a caller reading `sealed.ciphertext`
+/// got `undefined` from a live host — with a green type-check on both sides.
+///
+/// # The response *is* the leaf preimage, plus three members
+///
+/// Strip `dataCommitment`, `trace` and `ext` and what remains is exactly a
+/// [`CommittedRecord`], which is why the flattened field is that type rather
+/// than a repetition of it. A reader reassembles the preimage by **deletion**,
+/// not reconstruction, and the ciphertext is never carried twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetRecordResponse {
+    /// Everything the room's commitment covers.
+    #[serde(flatten)]
+    pub record: CommittedRecord,
+    /// The room's data commitment, as a `DigestMultibase`.
+    ///
+    /// Optional for the same reason it is on a listing: a host that maintains
+    /// no tree must not invent a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_commitment: Option<String>,
+    /// How many records the room holds, as of `data_commitment`.
+    ///
+    /// A reader cannot recompute the root from a listing — a leaf commits to a
+    /// whole record and a listing returns a projection — but it can **count**.
+    /// Only against a complete listing, read to the end with no prefix and no
+    /// watermark; against a page it is a discrepancy the reader manufactured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_count: Option<u64>,
+    /// The highest record version the commitment covers, as of
+    /// `data_commitment`.
+    ///
+    /// What makes two roots comparable at all: same head and different roots is
+    /// a host caught, with no write to attribute the difference to. Without it,
+    /// two roots differing is a room that moved as readily as a host that
+    /// equivocated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_version: Option<u64>,
+    /// The path from this record's leaf to `data_commitment`.
+    ///
+    /// Served only with the commitment it reaches, and computed from the same
+    /// snapshot: a trace is a statement about the tree it was cut from, and a
+    /// room moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::merkle::InclusionProof>,
+}
+
+impl GetRecordResponse {
+    /// The response for `record`, with whatever verification the host can
+    /// offer.
+    ///
+    /// Built here rather than in each host so the two cannot answer a read
+    /// differently — which is exactly how the shape above went wrong, in two
+    /// files, for as long as the response had no type.
+    #[must_use]
+    pub fn of(
+        record: &Record,
+        head: Option<&crate::merkle::TreeHead>,
+        trace: Option<crate::merkle::InclusionProof>,
+    ) -> Self {
+        Self {
+            record: record.committed(),
+            data_commitment: head.map(|h| crate::merkle::to_multibase(&h.root)),
+            record_count: head.map(|h| h.record_count),
+            head_version: head.map(|h| h.head_version),
+            trace,
+        }
+    }
+}
+
+/// A `rooms/records/list` page as the store produces it, before the host answers it as
+/// `list/0.5` (whose continuation token is `nextCursor`, and whose every page names the
+/// room's `lastPrune`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListRecordsResponse {
+    /// Metadata only — never bodies.
+    pub records: Vec<serde_json::Value>,
+    /// The room's data commitment, as a `DigestMultibase`.
+    ///
+    /// Optional on the wire because a host that maintains no tree must not
+    /// invent a root: its absence honestly says "no completeness guarantee
+    /// here", and a fabricated one would say the opposite while meaning less.
+    /// Present when more records remain, absent at the end.
+    ///
+    /// **Absence is the only end-of-listing signal**, which is why a host that
+    /// truncated silently was worse than one that did not paginate at all: a
+    /// short page and a complete room were the same bytes. A consumer MUST NOT
+    /// infer exhaustion from a page shorter than the limit it asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_commitment: Option<String>,
+    /// How many records the room holds, as of `data_commitment`.
+    ///
+    /// A reader cannot recompute the root from a listing — a leaf commits to a
+    /// whole record and a listing returns a projection — but it can **count**.
+    /// Only against a complete listing, read to the end with no prefix and no
+    /// watermark; against a page it is a discrepancy the reader manufactured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_count: Option<u64>,
+    /// The highest record version the commitment covers, as of
+    /// `data_commitment`.
+    ///
+    /// What makes two roots comparable at all: same head and different roots is
+    /// a host caught, with no write to attribute the difference to. Without it,
+    /// two roots differing is a room that moved as readily as a host that
+    /// equivocated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_version: Option<u64>,
+}
+
+/// `rooms/records/curate/0.1` request.
+///
+/// Separate from [`PutRecordBody`] because a record's *standing* is not its content: on a
+/// sealed tier a host cannot read what it stores, so "replace this with the same body,
+/// marked deprecated" would make a member re-seal and re-upload bytes the host already
+/// holds, to say something that is not about the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CurateRecordBody {
+    pub room_id: String,
+    pub key: String,
+    /// Must confer `curate` — deliberately not implied by `write`. Deciding what a room's
+    /// shared knowledge is worth is a different grant from being able to add to it.
+    pub presentation: AuthorityPresentation,
+    /// The standing to move to. Omit to change only `pinned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<RecordStatus>,
+    /// Whether to pin. Omit to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    /// Why, for the room's audit trail. Member-authored free text — untrusted for both
+    /// rendering and any agent that reads it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Optional precondition: the record's current version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<u64>,
+}
+
+/// `rooms/records/curate/0.1#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurateRecordResponse {
+    pub key: String,
+    /// The version the curation assigned. A change others must converge on is a change like
+    /// any other, and one that left the version alone would be invisible to every
+    /// `sinceVersion` watermark in the room.
+    pub version: u64,
+    pub status: RecordStatus,
+    pub pinned: bool,
+}
+
+/// `rooms/owner/transfer/0.1` request.
+///
+/// The deliberate handover, by an owner who is still present. Its counterpart
+/// [`ClaimOwnerBody`] is what happens when they are not — two shapes because they are two
+/// acts, differing in who initiates, what authorizes, and whether the room must have lapsed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransferOwnerBody {
+    pub room_id: String,
+    /// The member taking ownership.
+    ///
+    /// **The host cannot check that they are one.** It holds no roster, and this party
+    /// presents nothing — the obligation sits with the transferring owner, who can see the
+    /// group. A host must not invent a check it has no basis for, nor treat its own
+    /// ignorance as evidence: doing so would fail every transfer on a correct host.
+    pub new_owner_did: String,
+    /// Must confer `admin` — the same grant that mints epochs.
+    pub presentation: AuthorityPresentation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `rooms/owner/claim/0.1` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimOwnerBody {
+    pub room_id: String,
+    /// The succession credential the room issued to this claimant, serialized per the
+    /// governing profile. The previous owner decided this in advance; a host checks a
+    /// decision rather than making one.
+    pub nomination: String,
+    /// The claimant's own membership and authority.
+    ///
+    /// A host cannot see the MLS group, so this — the room's own statement that the claimant
+    /// is a member — is the only membership signal available, and it is the same one every
+    /// other room task presents.
+    pub presentation: AuthorityPresentation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `rooms/owner/{transfer,claim}/0.1#response`. One shape, because both end the same way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerResponse {
+    pub room_id: String,
+    pub owner_did: String,
+}
+
+/// `rooms/epoch/mint/0.1` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MintEpochBody {
+    pub room_id: String,
+    pub epoch: u32,
+    pub presentation: AuthorityPresentation,
+    /// The rung this advance produces — see [`EpochLink`].
+    ///
+    /// Absent where the room does not keep its history readable, and necessarily absent for
+    /// a room's first epoch. A host that receives one MUST refuse it unless its `epoch`
+    /// matches, and MUST NOT replace a rung it already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<EpochLink>,
+    /// The MLS commit that produced this epoch, base64url, for the host to relay
+    /// to members who were not online to receive it.
+    ///
+    /// Carried here for the same reason `link` is: minting is the moment the
+    /// committer holds it, and a separate publish task would be a second chance
+    /// to forget. A room that advances without leaving the commit somewhere
+    /// fetchable **forks**.
+    ///
+    /// A host MUST NOT replace a commit it already holds for an epoch: the first
+    /// one published is the one members may already have applied, and a second
+    /// would fork the very group it was meant to keep together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `rooms/epoch/chain/0.2` request, without `ext`.
+///
+/// A member asks a host for the room's epoch key chain, so records sealed before they
+/// joined can still be opened. The chain is walked *downwards*, which is why this pages with
+/// `from_epoch` rather than the `since_version` watermark its records sibling uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChainBody {
+    pub room_id: String,
+    pub presentation: AuthorityPresentation,
+    /// Return only rungs at or below this epoch. Absent means from the current epoch down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_epoch: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// A `rooms/epoch/chain` page, before the host adds the room's `epochFloor` (`chain/0.2`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainResponse {
+    pub room_id: String,
+    /// The rungs, highest epoch first and contiguous within the range returned.
+    pub links: Vec<EpochLink>,
+}
+
+/// The `rooms/epoch/prune/0.2` request, without `ext`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PruneBody {
+    pub room_id: String,
+    /// Drop every rung **below** this epoch. The chain walks backwards, so this
+    /// is a floor rather than a ceiling.
+    pub before_epoch: u32,
+    pub presentation: AuthorityPresentation,
+    /// Why, for the room's audit trail. A prune is irreversible and
+    /// unattributable after the fact — the rungs are simply gone — so the only
+    /// record of intent is the one made at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `rooms/epoch/prune/0.2#response`, without the `epochFloor` a host adds
+/// ([`crate::record_tasks::epoch_prune_v2_response`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneResponse {
+    pub room_id: String,
+    /// How many rungs were dropped. `0` is a **success**: the chain already went
+    /// back no further, and a caller reading it as a failure would retry an
+    /// operation with nothing left to do.
+    pub pruned: u32,
+    /// How far back the chain still reaches.
+    ///
+    /// **Not a restatement of `before_epoch`.** A chain can already have a gap —
+    /// rungs are delivered per commit, and a delivery that never happened leaves
+    /// one — and a prune below that gap changes nothing about how far back a
+    /// member can actually walk. Echoing the request would tell an operator they
+    /// had achieved something they had not.
+    pub earliest_rung: u32,
+}
+
+/// One commit a room made, as the relay serves it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RelayedCommit {
+    pub epoch: u32,
+    /// The MLS commit, base64url, **exactly as it was published**. A host that
+    /// re-encoded it would produce something the group rejects.
+    pub commit: String,
+}
+
+/// `rooms/epoch/commits/0.1` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommitsBody {
+    pub room_id: String,
+    /// The epoch this member is at; the host returns what is **above** it.
+    pub since_epoch: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    pub presentation: AuthorityPresentation,
+}
+
+/// `rooms/epoch/commits/0.1#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitsResponse {
+    pub room_id: String,
+    /// The commits above `since_epoch`, **in ascending epoch order and with no
+    /// gaps**. MLS commits apply in sequence, so one served out of order or over
+    /// a gap is rejected by the group — a host missing one returns the run it
+    /// holds *up to* the gap and stops.
+    pub commits: Vec<RelayedCommit>,
+    /// Where the room is now.
+    ///
+    /// **Not `since_epoch` plus the number returned.** They differ exactly when a
+    /// commit is missing or the page ended early, and that difference is the
+    /// useful part: a member who applies everything served and is still behind
+    /// knows a delivery is missing rather than concluding their own state is
+    /// broken.
+    pub room_epoch: u32,
+}
+
+/// `rooms/epoch/mint/0.1#response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MintEpochResponse {
+    pub room_id: String,
+    pub epoch: u32,
+}

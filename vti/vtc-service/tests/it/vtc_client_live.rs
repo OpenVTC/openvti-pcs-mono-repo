@@ -1,0 +1,660 @@
+//! `vtc-client` driven against a live `MockVtc` — the pair, in one test.
+//!
+//! **Why this file exists.** `vtc-client` was broken on *every* route and
+//! nothing noticed, because its own tests only exercised serde shapes and the
+//! VTC's tests only exercised hand-written requests. Three independent faults
+//! had accumulated:
+//!
+//! 1. `connect` posted an anoncrypt DIDComm envelope, which the VTC stopped
+//!    accepting when `/auth/*` began requiring an authenticated sender (#771).
+//! 2. Nothing sent the `Trust-Task` URL header the VTC gates every route on, so
+//!    every call was a 400 before reaching a handler.
+//! 3. `approve_join` / `reject_join` posted to `/approve` + `/reject` mounts
+//!    that had been replaced by a single `/decide` endpoint, and `submit_join`
+//!    posted to a route that is no longer mounted at all.
+//!
+//! Each is invisible to a test that stubs the other side. So these run the real
+//! client against the real router: a regression in either direction fails here.
+
+use vtc_client::VtcClient;
+use vtc_service::acl::{VtcAclEntry, VtcRole, store_acl_entry};
+use vtc_service::test_support::MockVtc;
+
+/// The mock VTC's own DID. A signed authenticate document must name it as
+/// `recipient` (#1638) — a placeholder here would be refused as addressed
+/// to another service, which is exactly what the check is for.
+async fn vtc_did(mock: &MockVtc) -> String {
+    mock.vtc
+        .state
+        .config
+        .read()
+        .await
+        .vtc_did
+        .clone()
+        .expect("the mock VTC has a DID")
+}
+
+fn admin_entry(did: &str) -> VtcAclEntry {
+    VtcAclEntry {
+        did: did.into(),
+        role: VtcRole::Admin,
+        label: None,
+        admin: VtcRole::Admin.implied_authority(),
+        delegated_by: None,
+        created_at: 1,
+        created_by: "did:key:vtc-install".into(),
+        updated_at: None,
+        updated_by: None,
+        expires_at: None,
+        resource_grants: Vec::new(),
+        group_grants: Vec::new(),
+        label_set_by_subject: false,
+        suspension: None,
+    }
+}
+
+/// Seed the join ceremony the way `server::run` does at boot: the default
+/// policy set, so `join.rego` evaluates instead of the ceremony failing closed
+/// with "no active join policy". A bare `MockVtc` has no policies — the join
+/// tests that predate this file seed the same way.
+async fn seed_join_policies(mock: &MockVtc) {
+    let state = &mock.vtc.state;
+    vtc_service::policy::default::install_defaults(&state.policies_ks, &state.active_policies_ks)
+        .await
+        .expect("install default policies");
+}
+
+/// A deterministic `did:key` + its multibase private key.
+fn did_key_from_seed(seed_byte: u8) -> (String, String) {
+    let seed = [seed_byte; 32];
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let did = format!(
+        "did:key:{}",
+        vta_sdk::did_key::ed25519_multibase_pubkey(&sk.verifying_key().to_bytes())
+    );
+    let mut buf = vec![0x80, 0x26];
+    buf.extend_from_slice(&seed);
+    (did, multibase::encode(multibase::Base::Base58Btc, &buf))
+}
+
+/// The vetting admin verbs `cnm vetting` is built on, against the real router:
+/// the Trust-Task-bound routes (grant, resend, revoke) and the unbound ones
+/// (listing, automatic grants, branding, withdrawals) each reach their handler,
+/// and the statuses the CLI turns into guidance arrive intact.
+#[tokio::test]
+async fn vetting_admin_verbs_round_trip() {
+    let mock = MockVtc::start().await;
+    let base = format!("{}/v1", mock.base_url());
+    let state = &mock.vtc.state;
+    let purpose = affinidi_status_list::StatusPurpose::Revocation;
+    vtc_service::status_list::ensure_initial(
+        &state.status_lists_ks,
+        purpose,
+        format!("http://vtc.test/v1/status-lists/{purpose}"),
+    )
+    .await
+    .expect("status list");
+
+    let (admin, private_key_multibase) = did_key_from_seed(0x93);
+    store_acl_entry(&state.acl_ks, &admin_entry(&admin))
+        .await
+        .expect("seed admin acl row");
+    let (vetter, _) = did_key_from_seed(0x94);
+    // Admitted yesterday: a grant counts only when it post-dates the member's
+    // admission, so a member and a grant made in the same instant would not
+    // exercise the "already granted" path this test is about.
+    let mut member = vtc_service::members::Member::fresh(&vetter);
+    member.joined_at = chrono::Utc::now() - chrono::Duration::days(1);
+    vtc_service::members::storage::store_member(&state.members_ks, &member)
+        .await
+        .expect("seed member");
+    store_acl_entry(
+        &state.acl_ks,
+        &VtcAclEntry {
+            role: VtcRole::Member,
+            admin: VtcRole::Member.implied_authority(),
+            ..admin_entry(&vetter)
+        },
+    )
+    .await
+    .expect("seed member acl row");
+
+    let client = VtcClient::connect(&base, &vtc_did(&mock).await, &admin, &private_key_multibase)
+        .await
+        .expect("connect");
+
+    // Grant converges: the second call returns the first grant.
+    let grant = |payload: serde_json::Value| {
+        serde_json::from_value::<vtc_client::vetting::vetters::grant::v0_1::Payload>(payload)
+            .expect("a grant payload of the published shape")
+    };
+    let first = client
+        .grant_vetter(&grant(
+            serde_json::json!({ "memberDid": vetter, "validitySeconds": 30 * 86_400 }),
+        ))
+        .await
+        .unwrap();
+    assert!(first.created);
+    let second = client
+        .grant_vetter(&grant(serde_json::json!({ "memberDid": vetter })))
+        .await
+        .unwrap();
+    assert!(!second.created);
+    assert_eq!(second.grant.endorsement_id, first.grant.endorsement_id);
+
+    let grants = client.list_vetter_grants().await.unwrap();
+    assert_eq!(grants.vetters.len(), 1);
+    assert!(grants.vetters[0].live);
+
+    let status = client.auto_grant().await.unwrap();
+    assert!(!status.enabled);
+    let stored = client
+        .configure_auto_grant(&vtc_client::vetting::AutoGrantConfig {
+            enabled: true,
+            sweep_minutes: Some(30),
+            validity_seconds: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!((stored.enabled, stored.sweep_minutes), (true, 30));
+    assert!(matches!(
+        client
+            .configure_auto_grant(&vtc_client::vetting::AutoGrantConfig {
+                enabled: true,
+                sweep_minutes: Some(1),
+                validity_seconds: None,
+            })
+            .await,
+        Err(vtc_client::VtcError::Http { status: 400, .. })
+    ));
+
+    assert_eq!(
+        serde_json::to_value(client.branding().await.unwrap()).unwrap(),
+        serde_json::json!({})
+    );
+    let branding = client
+        .set_branding(
+            &serde_json::from_value(
+                serde_json::json!({ "displayName": "Kernel", "accentColor": "#1A2B3C" }),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        branding.accent_color.as_deref().map(String::as_str),
+        Some("#1a2b3c")
+    );
+
+    assert!(client.vetting_revocations().await.unwrap().is_empty());
+
+    let revoked = client
+        .revoke_endorsement(&first.grant.endorsement_id)
+        .await
+        .unwrap();
+    assert_eq!(revoked.endorsement_id, first.grant.endorsement_id.as_str());
+    assert_eq!(
+        revoked.revocation.credential_id,
+        first.grant.credential_id.as_str()
+    );
+}
+
+/// `VtcClient::connect` authenticates against a real VTC, and the token it
+/// returns drives an authenticated call.
+///
+/// This is the end-to-end pin for all three faults above: the login body must
+/// be what the VTC accepts, and both the login and the follow-up call must
+/// carry the Trust-Task header.
+#[tokio::test]
+async fn connect_then_list_members_round_trips() {
+    let mock = MockVtc::start().await;
+    let base = format!("{}/v1", mock.base_url());
+
+    let (did, private_key_multibase) = did_key_from_seed(0x91);
+    store_acl_entry(&mock.vtc.state.acl_ks, &admin_entry(&did))
+        .await
+        .expect("seed admin acl row");
+
+    let client = VtcClient::connect(&base, &vtc_did(&mock).await, &did, &private_key_multibase)
+        .await
+        .expect("connect must authenticate against a live VTC");
+
+    // An authenticated admin read. A fresh community has no members; the point
+    // is that the call is *accepted* — a missing Trust-Task header would be a
+    // 400 and a stale token a 401.
+    let members = client
+        .list_members(None)
+        .await
+        .expect("list_members must be accepted by a live VTC");
+    assert!(
+        members.is_empty(),
+        "a fresh community has no members, got {members:?}"
+    );
+
+    mock.shutdown().await;
+}
+
+/// The admin join queue is readable, and a decision on a non-existent request
+/// reaches the handler rather than being refused at the router.
+///
+/// A 404/400-from-the-handler is the *success* condition for the decide half:
+/// it proves the request got past the Trust-Task gate and hit the `/decide`
+/// endpoint. The old client posted to `/approve`, which is unrouted — that is
+/// indistinguishable from this at the status-code level, so the assertion is on
+/// the error *not* being the router's Trust-Task rejection.
+#[tokio::test]
+async fn join_queue_reads_and_decide_reaches_the_handler() {
+    let mock = MockVtc::start().await;
+    let base = format!("{}/v1", mock.base_url());
+
+    let (did, private_key_multibase) = did_key_from_seed(0x92);
+    store_acl_entry(&mock.vtc.state.acl_ks, &admin_entry(&did))
+        .await
+        .expect("seed admin acl row");
+
+    let client = VtcClient::connect(&base, &vtc_did(&mock).await, &did, &private_key_multibase)
+        .await
+        .expect("connect");
+
+    let queue = client
+        .list_join_requests(Some("pending"))
+        .await
+        .expect("list_join_requests must be accepted");
+    assert!(queue.is_empty(), "fresh community, got {queue:?}");
+
+    let err = client
+        .approve_join("00000000-0000-0000-0000-000000000000")
+        .await
+        .expect_err("no such join request");
+    match err {
+        vtc_client::VtcError::Http { status, body } => {
+            assert_ne!(
+                status, 400,
+                "a 400 here means the router refused the request (bad/missing \
+                 Trust-Task URL), not that the handler ran: {body}"
+            );
+            assert!(
+                !body.contains("Trust-Task"),
+                "the failure must come from the handler, not the Trust-Task gate: {body}"
+            );
+        }
+        other => panic!("expected an HTTP error from the decide handler, got {other:?}"),
+    }
+
+    mock.shutdown().await;
+}
+
+/// The applicant side, end to end: `submit_join` signs a
+/// `join-requests/submit/0.2` document with the applicant's holder key, posts it
+/// to the document endpoint with **no bearer token**, and gets the community's
+/// verdict back.
+///
+/// This is the method that could not work at all before — it posted to
+/// `POST /join-requests`, a route that is no longer mounted. Three separate
+/// server-side gates have to be satisfied for this to pass, and each was a way
+/// to get it wrong: the document's proof must verify under the `did:key`
+/// resolver, its `issuer` must equal the proven signer, and its `recipient` must
+/// equal *this* VTC's configured DID (the replay defence — a submit signed for
+/// one community cannot be posted to another).
+#[tokio::test]
+async fn submit_join_signs_and_gets_a_verdict() {
+    let mock = MockVtc::start().await;
+    let base = format!("{}/v1", mock.base_url());
+
+    seed_join_policies(&mock).await;
+    let (applicant_did, applicant_key) = did_key_from_seed(0x94);
+
+    // No token: an applicant is by definition not yet a member. The client is
+    // built with the VTC's real DID because the document is addressed to it.
+    let client = VtcClient::anonymous(&base, vtc_service::test_support::TEST_VTC_DID);
+
+    let body = vtc_client::join_requests::JoinRequestSubmitBody {
+        vp: serde_json::json!({
+            "type": "VerifiablePresentation",
+            "holder": applicant_did,
+        }),
+        registry_consent: false,
+        criterion: None,
+        extensions: serde_json::json!({}),
+        attributes: Vec::new(),
+    };
+
+    let verdict = client
+        .submit_join(&body, &applicant_did, &applicant_key)
+        .await
+        .expect("a signed submit must be accepted");
+
+    // The default policy refers the request to an admin rather than
+    // auto-admitting — the point here is that the ceremony *ran*.
+    assert_eq!(
+        verdict.verdict.effect,
+        vtc_client::join_requests::VerdictEffect::Refer,
+        "default policy refers to an admin; got {:?}",
+        verdict.verdict.effect
+    );
+
+    mock.shutdown().await;
+}
+
+/// The submitted request lands in the admin queue under the applicant's DID —
+/// i.e. the server took the *proof's* signer as the applicant, not anything the
+/// body claimed.
+#[tokio::test]
+async fn submitted_request_is_attributed_to_the_signing_did() {
+    let mock = MockVtc::start().await;
+    let base = format!("{}/v1", mock.base_url());
+
+    seed_join_policies(&mock).await;
+    let (applicant_did, applicant_key) = did_key_from_seed(0x95);
+    let (admin_did, admin_key) = did_key_from_seed(0x96);
+    store_acl_entry(&mock.vtc.state.acl_ks, &admin_entry(&admin_did))
+        .await
+        .expect("seed admin acl row");
+
+    let applicant = VtcClient::anonymous(&base, vtc_service::test_support::TEST_VTC_DID);
+    let body = vtc_client::join_requests::JoinRequestSubmitBody {
+        vp: serde_json::json!({
+            "type": "VerifiablePresentation",
+            "holder": applicant_did,
+        }),
+        registry_consent: false,
+        criterion: None,
+        extensions: serde_json::json!({}),
+        attributes: Vec::new(),
+    };
+    applicant
+        .submit_join(&body, &applicant_did, &applicant_key)
+        .await
+        .expect("submit");
+
+    let admin = VtcClient::connect(
+        &base,
+        vtc_service::test_support::TEST_VTC_DID,
+        &admin_did,
+        &admin_key,
+    )
+    .await
+    .expect("admin connect");
+    let queue = admin
+        .list_join_requests(Some("pending"))
+        .await
+        .expect("list join requests");
+
+    assert_eq!(queue.len(), 1, "one pending request, got {queue:?}");
+    assert_eq!(
+        queue[0].applicant_did, applicant_did,
+        "the request must be attributed to the DID that signed the document"
+    );
+
+    mock.shutdown().await;
+}
+
+/// A signature by a key other than the claimed `issuer` is refused — the
+/// issuer↔signer cross-check, not just "some valid proof is present".
+#[tokio::test]
+async fn submit_with_mismatched_issuer_is_refused() {
+    let mock = MockVtc::start().await;
+    let base = format!("{}/v1", mock.base_url());
+
+    let (victim_did, _) = did_key_from_seed(0x97);
+    let (attacker_did, attacker_key) = did_key_from_seed(0x98);
+
+    // Sign with the attacker's key but claim the victim as issuer.
+    let payload = serde_json::json!({
+        "vp": { "type": "VerifiablePresentation", "holder": victim_did },
+        "registryConsent": false,
+        "extensions": {},
+    });
+    let mut doc = vta_sdk::trust_task_sign::build_unsigned(
+        vtc_client::join_requests::JOIN_REQUEST_SUBMIT_TYPE,
+        payload,
+        &victim_did,
+        vtc_service::test_support::TEST_VTC_DID,
+    )
+    .expect("build");
+    vta_sdk::trust_task_sign::sign_in_place(&mut doc, &attacker_did, &attacker_key)
+        .await
+        .expect("sign with the attacker key");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/trust-tasks"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&doc).unwrap())
+        .send()
+        .await
+        .expect("POST /trust-tasks");
+
+    assert!(
+        !resp.status().is_success(),
+        "a document whose issuer is not the signer must be refused"
+    );
+
+    mock.shutdown().await;
+}
+
+/// A VTC built the way `MockVtc::start` builds one, passed through
+/// `start_with` so a test states what it depends on: the audit writer, which
+/// both a policy upload and a credentials read must record before answering.
+async fn audited_vtc() -> MockVtc {
+    let vtc = vtc_service::test_support::TestVtc::builder()
+        .with_audit(true)
+        .with_signers(true)
+        .with_public_url("http://vtc.test")
+        .build()
+        .await;
+    MockVtc::start_with(vtc).await
+}
+
+async fn admin_client(mock: &MockVtc, seed: u8) -> VtcClient {
+    let base = format!("{}/v1", mock.base_url());
+    let (did, private_key_multibase) = did_key_from_seed(seed);
+    store_acl_entry(&mock.vtc.state.acl_ks, &admin_entry(&did))
+        .await
+        .expect("seed admin acl row");
+    VtcClient::connect(&base, &vtc_did(mock).await, &did, &private_key_multibase)
+        .await
+        .expect("connect")
+}
+
+/// `upload_policy` sends the canonical `policy/upsert/0.3` body the VTC's
+/// strict (`deny_unknown_fields`) `UploadBody` accepts. It used to send
+/// `{purpose, regoSource}`, which that body refuses outright — so the method
+/// had never worked against a live VTC. Activation proves the stored revision
+/// is the one the upload described.
+#[tokio::test]
+async fn upload_policy_is_accepted_and_activates() {
+    let mock = audited_vtc().await;
+    let client = admin_client(&mock, 0xA1).await;
+
+    // A policy that decides authority (`join`, `removal`, …) takes the
+    // uploader's passkey gesture and a second administrator's consent
+    // (VTI-VTC-022), which this client has no way to give — so it is refused,
+    // and the body shape is proven on a community rule instead.
+    assert!(
+        client
+            .upload_policy(
+                "join",
+                "package vtc.join\nimport rego.v1\ndefault allow := true\n",
+            )
+            .await
+            .is_err(),
+        "an authority policy is never changed by one administrator alone"
+    );
+
+    let uploaded = client
+        .upload_policy(
+            "directory",
+            "package vtc.directory\nimport rego.v1\n\
+             default decision := {\"effect\": \"deny\", \"with\": {\"code\": \"closed\"}}\n",
+        )
+        .await
+        .expect("a live VTC must accept the upload");
+    assert_eq!(uploaded["wasCreated"], true, "{uploaded}");
+    let policy = &uploaded["policy"];
+    assert_eq!(policy["name"], "directory", "{uploaded}");
+    assert_eq!(
+        policy["ext"][vtc_client::POLICY_PURPOSE_EXT_KEY],
+        "directory",
+        "{uploaded}"
+    );
+    let id = policy["id"].as_str().expect("policy id").to_string();
+
+    let activated = client
+        .activate_policy(&id)
+        .await
+        .expect("the uploaded revision activates");
+    assert_eq!(activated["activated"], id.as_str(), "{activated}");
+
+    mock.shutdown().await;
+}
+
+/// `member_credentials` reads `vtc/members/credentials/0.1` into the generated
+/// response type, and an unknown member is the typed `NotFound` carrying the
+/// specification's declared code — not an opaque HTTP 404.
+#[tokio::test]
+async fn member_credentials_round_trips_and_types_not_found() {
+    let mock = audited_vtc().await;
+    let client = admin_client(&mock, 0xA2).await;
+    let state = &mock.vtc.state;
+
+    let (member_did, _) = did_key_from_seed(0xA3);
+    let mut member = vtc_service::members::Member::fresh(&member_did);
+    let grant = serde_json::json!({
+        "id": "urn:uuid:grant-1",
+        "type": ["VerifiableCredential", "MembershipCredential"],
+        "proof": { "proofValue": "z1" },
+    });
+    member.current_vmc = Some(grant.clone());
+    vtc_service::members::storage::store_member(&state.members_ks, &member)
+        .await
+        .expect("seed member");
+    store_acl_entry(
+        &state.acl_ks,
+        &VtcAclEntry {
+            role: VtcRole::Member,
+            admin: VtcRole::Member.implied_authority(),
+            ..admin_entry(&member_did)
+        },
+    )
+    .await
+    .expect("seed member acl row");
+
+    let creds = client
+        .member_credentials(&member_did)
+        .await
+        .expect("a member's credentials are readable");
+    assert_eq!(creds.did.as_str(), member_did);
+    assert_eq!(
+        serde_json::Value::Object(creds.membership_credential.clone()),
+        grant
+    );
+    assert!(creds.role_credential.is_empty());
+    assert!(creds.member_vmc.is_empty());
+    assert!(!creds.member_vmc_bound);
+
+    let (stranger, _) = did_key_from_seed(0xA4);
+    match client.member_credentials(&stranger).await {
+        Err(vtc_client::VtcError::NotFound { code, .. }) => assert_eq!(
+            code,
+            vtc_client::members_credentials::error_codes::NOT_FOUND.code
+        ),
+        other => panic!("an unknown member must be a typed NotFound, got {other:?}"),
+    }
+
+    mock.shutdown().await;
+}
+
+/// A client built with the operator's key sends the admin verbs that have a
+/// signed binding as documents signed by that key — not over its bearer
+/// session (#1641).
+///
+/// Proved by ending every session after connecting and driving a signed verb
+/// anyway: it still works, because the VTC authorizes it from the signer's
+/// ACL entry and never reads a token. `list_vetter_grants` used to be the last
+/// verb this client sent over the bearer session; #1858 retired its REST
+/// mount (`GET /v1/vetting/vetters`) in favour of the signed
+/// `vtc/vetting/vetters/grants/list/0.1` document, so there is no bearer-only
+/// verb left in this client to contrast it against.
+#[tokio::test]
+async fn signed_admin_verbs_do_not_ride_the_bearer_session() {
+    let mock = audited_vtc().await;
+    let client = admin_client(&mock, 0xB1).await;
+    let state = &mock.vtc.state;
+    // Removal consults the removal policy and flips a status-list bit, so it
+    // needs both seeded, as `server::run` seeds them at boot.
+    vtc_service::policy::default::install_defaults(&state.policies_ks, &state.active_policies_ks)
+        .await
+        .expect("install default policies");
+    for purpose in [
+        affinidi_status_list::StatusPurpose::Revocation,
+        affinidi_status_list::StatusPurpose::Suspension,
+    ] {
+        vtc_service::status_list::ensure_initial(
+            &state.status_lists_ks,
+            purpose,
+            format!("http://vtc.test/v1/status-lists/{purpose}"),
+        )
+        .await
+        .expect("seed the status list");
+    }
+
+    let (member_did, _) = did_key_from_seed(0xB2);
+    vtc_service::members::storage::store_member(
+        &state.members_ks,
+        &vtc_service::members::Member::fresh(&member_did),
+    )
+    .await
+    .expect("seed member");
+    store_acl_entry(
+        &state.acl_ks,
+        &VtcAclEntry {
+            role: VtcRole::Member,
+            admin: VtcRole::Member.implied_authority(),
+            ..admin_entry(&member_did)
+        },
+    )
+    .await
+    .expect("seed member acl row");
+
+    // End every session the client could be holding.
+    for (key, _) in state
+        .sessions_ks
+        .prefix_iter_raw(Vec::new())
+        .await
+        .expect("list sessions")
+    {
+        state.sessions_ks.remove(key).await.expect("end session");
+    }
+
+    // Both `list_members` (#1835) and `list_vetter_grants` (#1858) are signed
+    // documents now, so a call that would have failed on a bearer-only verb
+    // instead confirms the property this test is about: it still succeeds
+    // with every session gone.
+    client
+        .list_vetter_grants()
+        .await
+        .expect("a signed verb must not depend on the bearer session");
+
+    client
+        .update_member_extensions(&member_did, serde_json::json!({ "fleet_index": 3 }))
+        .await
+        .expect("members/update goes as a signed document");
+    let stored = vtc_service::members::storage::get_member(&state.members_ks, &member_did)
+        .await
+        .expect("read member")
+        .expect("member row");
+    assert_eq!(stored.extensions, serde_json::json!({ "fleet_index": 3 }));
+
+    client
+        .member_credentials(&member_did)
+        .await
+        .expect("members/credentials goes as a signed document");
+
+    let removed = client
+        .remove_member(&member_did, Some("decommissioned"))
+        .await
+        .expect("members/admin-remove goes as a signed document");
+    assert!(removed.removed);
+
+    mock.shutdown().await;
+}

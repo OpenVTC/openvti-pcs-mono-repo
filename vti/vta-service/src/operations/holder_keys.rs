@@ -1,0 +1,606 @@
+//! ACL-gated holder-key resolution for credential presentation (Phase 3).
+//!
+//! To sign a presentation server-side — the SD-JWT-VC holder `kb-jwt`, and the
+//! Data-Integrity proof on a consent record — the VTA needs the holder subject
+//! key's private material. That key is **VTA-managed** (derived from the master
+//! seed), looked up by the subject `did:key`, and — the load-bearing constraint
+//! — only usable **within the context the caller's ACL allows**. The VTA must
+//! refuse to sign with a key outside the caller's authorised context(s): the
+//! privilege boundary (memory `vta-holder-key-acl-gated-signing`).
+//!
+//! This reuses the **exact** ACL gate ([`AuthClaims::require_context`]) and
+//! BIP-32 derivation the signing oracle uses — the boundary is not reinvented.
+
+use std::sync::Arc;
+
+use affinidi_sd_jwt::error::SdJwtError;
+use affinidi_secrets_resolver::secrets::Secret;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ed25519_dalek::{Signature, Signer, SigningKey};
+use serde_json::Value;
+use vta_sdk::keys::{KeyOrigin, KeyRecord, KeyStatus, KeyType};
+use zeroize::Zeroizing;
+
+use crate::auth::AuthClaims;
+use crate::keys::seed_store::SeedStore;
+use crate::store::KeyspaceHandle;
+use vti_common::error::AppError;
+
+/// A production SD-JWT [`JwtSigner`](affinidi_sd_jwt::signer::JwtSigner)
+/// wrapping a derived holder key — used to sign the presentation `kb-jwt`.
+///
+/// EdDSA for an Ed25519 holder, ES256 for a P-256 one (#1988: a credential
+/// bound to a P-256 `cnf.jwk`, as swiyu and EUDI issue them). The algorithm is
+/// the key's, never a caller's choice.
+///
+/// `Debug` is derived; both signing keys' own `Debug` redacts the secret.
+#[derive(Debug)]
+pub struct HolderSdJwtSigner {
+    key: HolderSigningKey,
+    kid: String,
+}
+
+#[derive(Debug)]
+enum HolderSigningKey {
+    Ed25519(SigningKey),
+    P256(p256::ecdsa::SigningKey),
+}
+
+impl affinidi_sd_jwt::signer::JwtSigner for HolderSdJwtSigner {
+    fn algorithm(&self) -> &str {
+        match self.key {
+            HolderSigningKey::Ed25519(_) => "EdDSA",
+            HolderSigningKey::P256(_) => "ES256",
+        }
+    }
+    fn key_id(&self) -> Option<&str> {
+        Some(&self.kid)
+    }
+    fn sign_jwt(&self, header: &Value, payload: &Value) -> Result<String, SdJwtError> {
+        let h = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(header).map_err(|e| SdJwtError::Verification(e.to_string()))?,
+        );
+        let p = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(payload).map_err(|e| SdJwtError::Verification(e.to_string()))?,
+        );
+        let input = format!("{h}.{p}");
+        // JWS ES256 is the fixed-width `r || s` (RFC 7518 §3.4), which is what
+        // `p256::ecdsa::Signature::to_bytes` gives — not DER.
+        let signature = match &self.key {
+            HolderSigningKey::Ed25519(key) => {
+                let sig: Signature = key.sign(input.as_bytes());
+                sig.to_bytes().to_vec()
+            }
+            HolderSigningKey::P256(key) => {
+                use p256::ecdsa::signature::Signer as _;
+                let sig: p256::ecdsa::Signature = key.sign(input.as_bytes());
+                sig.to_bytes().to_vec()
+            }
+        };
+        Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature)))
+    }
+}
+
+/// The holder's signing material for presenting `subject_did`'s credentials —
+/// the SD-JWT `kb-jwt` signer and the consent-record DI secret, both over the
+/// same derived key.
+#[derive(Debug)]
+pub struct HolderKeys {
+    /// SD-JWT-VC `kb-jwt` signer.
+    pub signer: HolderSdJwtSigner,
+    /// Data-Integrity secret for signing a (query-scoped) consent record.
+    pub consent_secret: Secret,
+}
+
+/// Resolve the VTA-managed holder key for `subject_did`, **gated by the caller's
+/// ACL** for the key's context.
+///
+/// - The subject must be a `did:key` whose (derived, active, Ed25519 or P-256)
+///   key the VTA manages — else `NotFound` / `Validation`. A P-256 holder
+///   signs its `kb-jwt` ES256 and its consent record `ecdsa-jcs-2019`.
+/// - The caller must have ACL access to the key's `context_id` (or be
+///   super-admin for a context-less key) — else `Forbidden`. **This is the
+///   privilege boundary**: it stops a caller minting presentations from keys
+///   outside their authorised context.
+/// - The key is then derived from the master seed exactly as the signing oracle
+///   derives it.
+pub async fn resolve_holder_keys(
+    keys_ks: &KeyspaceHandle,
+    contexts_ks: &KeyspaceHandle,
+    seed_store: &Arc<dyn SeedStore>,
+    audit: &vta_audit::SharedAuditSink,
+    auth: &AuthClaims,
+    subject_did: &str,
+) -> Result<HolderKeys, AppError> {
+    let multibase = subject_did.strip_prefix("did:key:").ok_or_else(|| {
+        AppError::Validation(format!("holder subject `{subject_did}` is not a did:key"))
+    })?;
+    // did:key VMs are `<did>#<multibase>` (the multibase IS the did suffix).
+    let key_id = format!("{subject_did}#{multibase}");
+
+    let record: KeyRecord = keys_ks
+        .get(crate::keys::store_key(&key_id))
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "holder key for `{subject_did}` is not managed by this VTA"
+            ))
+        })?;
+
+    keys_for_record(
+        keys_ks,
+        contexts_ks,
+        seed_store,
+        audit,
+        auth,
+        &record,
+        key_id,
+    )
+    .await
+}
+
+/// The holder keys for a persona subject — a `did:webvh` or `did:peer` this VTA
+/// holds a key of — under the key its document lists for `authentication`, so a
+/// presentation's holder proof names a method a verifier will find there.
+///
+/// `NotFound` for a DID this agent does not hold **and** for one held in a
+/// context the caller cannot act in, indistinguishably
+/// ([`crate::operations::persona::persona_key_for`]). A `did:key` subject takes
+/// [`resolve_holder_keys`].
+pub async fn resolve_persona_holder_keys(
+    stores: crate::operations::persona::PersonaStores<'_>,
+    contexts_ks: &KeyspaceHandle,
+    seed_store: &Arc<dyn SeedStore>,
+    audit: &vta_audit::SharedAuditSink,
+    auth: &AuthClaims,
+    subject_did: &str,
+) -> Result<HolderKeys, AppError> {
+    let not_held = || {
+        AppError::NotFound(format!(
+            "holder key for `{subject_did}` is not managed by this VTA"
+        ))
+    };
+    let key = crate::operations::persona::persona_key_for(
+        stores,
+        auth,
+        subject_did,
+        crate::operations::persona::Relationship::Authentication,
+    )
+    .await?
+    .ok_or_else(not_held)?;
+    let record: KeyRecord = stores
+        .keys_ks
+        .get(crate::keys::store_key(&key.key_id))
+        .await?
+        .ok_or_else(not_held)?;
+    keys_for_record(
+        stores.keys_ks,
+        contexts_ks,
+        seed_store,
+        audit,
+        auth,
+        &record,
+        key.verification_method,
+    )
+    .await
+}
+
+/// Derive the holder keys from a held key record, gated by the caller's ACL for
+/// the record's context. `kid` is the verification method a proof names.
+async fn keys_for_record(
+    keys_ks: &KeyspaceHandle,
+    contexts_ks: &KeyspaceHandle,
+    seed_store: &Arc<dyn SeedStore>,
+    audit: &vta_audit::SharedAuditSink,
+    auth: &AuthClaims,
+    record: &KeyRecord,
+    key_id: String,
+) -> Result<HolderKeys, AppError> {
+    if !matches!(record.key_type, KeyType::Ed25519 | KeyType::P256) {
+        return Err(AppError::Validation(format!(
+            "holder key `{key_id}` is {:?}; a holder key is Ed25519 or P-256",
+            record.key_type
+        )));
+    }
+    if record.status != KeyStatus::Active {
+        return Err(AppError::Validation(format!(
+            "holder key `{key_id}` is not active"
+        )));
+    }
+    if record.origin != KeyOrigin::Derived {
+        return Err(AppError::Validation(
+            "imported holder keys are not supported for presentation yet".into(),
+        ));
+    }
+
+    // ── Privilege boundary: only sign with a key in an authorised context. ──
+    match &record.context_id {
+        Some(ctx) => auth.require_context(ctx)?,
+        None => auth.require_super_admin()?,
+    }
+
+    // Derive through key custody (same door as the signing oracle): the
+    // record's path must lie in its context's base (`vta_keys::custody` rule 6).
+    let key = crate::operations::key_custody::derive_record_key(
+        contexts_ks,
+        keys_ks,
+        &**seed_store,
+        audit,
+        &auth.did,
+        record,
+        "holder-keys",
+    )
+    .await?;
+    if record.key_type == KeyType::P256 {
+        let p256_secret = key.p256_secret()?;
+        let private = Zeroizing::new(p256_secret.secret_key.to_bytes().to_vec());
+        let signing_key = p256::ecdsa::SigningKey::from(&p256_secret.secret_key);
+        let consent_secret = Secret::from_multibase(
+            &vta_keys::encode_private_multibase(&KeyType::P256, &private),
+            Some(&key_id),
+        )
+        .map_err(|e| AppError::Internal(format!("build P-256 consent secret: {e}")))?;
+        return Ok(HolderKeys {
+            signer: HolderSdJwtSigner {
+                key: HolderSigningKey::P256(signing_key),
+                kid: key_id,
+            },
+            consent_secret,
+        });
+    }
+
+    let derived_bytes = key.ed25519_signing_key_bytes()?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&derived_bytes);
+
+    let signer = HolderSdJwtSigner {
+        key: HolderSigningKey::Ed25519(signing_key.clone()),
+        kid: key_id.clone(),
+    };
+    let mut consent_secret = Secret::generate_ed25519(Some(&key_id), Some(signing_key.as_bytes()));
+    consent_secret.id = key_id;
+
+    Ok(HolderKeys {
+        signer,
+        consent_secret,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acl::Role;
+    use affinidi_sd_jwt::signer::JwtSigner;
+    use chrono::Utc;
+    use vti_common::config::StoreConfig;
+    use vti_common::slip10::{DerivationPath, ExtendedSigningKey};
+    use vti_common::store::Store;
+
+    fn admin_of(ctx: &str) -> AuthClaims {
+        AuthClaims {
+            role: Role::Admin,
+            allowed_contexts: vec![ctx.to_string()],
+            ..Default::default()
+        }
+    }
+    fn super_admin() -> AuthClaims {
+        AuthClaims {
+            role: Role::Admin,
+            allowed_contexts: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    /// Open a keys keyspace + seed store, derive an Ed25519 key at
+    /// `m/26'/2'/0'/0'` in `context`, store its `KeyRecord`, and return the
+    /// pieces plus the derived subject `did:key`.
+    ///
+    /// The key's context is created with base `context_base`. Pass a base that
+    /// does not contain the key's path to model a planted record.
+    async fn setup_with_base(context: Option<&str>, context_base: &str) -> Fixture {
+        setup_key(context, context_base, KeyType::Ed25519).await
+    }
+
+    /// As [`setup_with_base`], for a holder key of `key_type` (Ed25519 or
+    /// P-256), with the record's public key derived exactly as the VTA mints it.
+    async fn setup_key(context: Option<&str>, context_base: &str, key_type: KeyType) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .unwrap();
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+        let audit =
+            vta_audit::shared_keyspace_sink(store.keyspace(crate::keyspaces::AUDIT).unwrap());
+        if let Some(ctx) = context {
+            crate::contexts::store_context(
+                &contexts_ks,
+                &crate::contexts::ContextRecord {
+                    id: ctx.into(),
+                    name: ctx.into(),
+                    did: None,
+                    description: None,
+                    parent: None,
+                    base_path: context_base.into(),
+                    index: 0,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    context_policy: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let seed = vec![42u8; 64];
+        let seed_store: Arc<dyn SeedStore> =
+            Arc::new(crate::test_support::TestSeedStore(seed.clone()));
+
+        let path = "m/26'/2'/0'/0'";
+        let bip32 = ExtendedSigningKey::from_seed(&seed).unwrap();
+        let subject_did = if key_type == KeyType::P256 {
+            use p256::elliptic_curve::sec1::ToSec1Point;
+            use vta_keys::derivation::Bip32Extension;
+            let point = bip32
+                .derive_p256(path)
+                .unwrap()
+                .secret_key
+                .public_key()
+                .to_sec1_point(true);
+            vta_sdk::jws::JwsKey::P256(point.as_bytes().to_vec()).did_key()
+        } else {
+            let derived = bip32
+                .derive(&path.parse::<DerivationPath>().unwrap())
+                .unwrap();
+            affinidi_crypto::did_key::ed25519_pub_to_did_key(
+                derived.signing_key.verifying_key().as_bytes(),
+            )
+        };
+        let multibase = subject_did.strip_prefix("did:key:").unwrap();
+        let key_id = format!("{subject_did}#{multibase}");
+
+        let record = KeyRecord {
+            exportable: None,
+            key_id: key_id.clone(),
+            derivation_path: path.to_string(),
+            key_type: key_type.clone(),
+            status: KeyStatus::Active,
+            public_key: multibase.to_string(),
+            label: None,
+            context_id: context.map(str::to_string),
+            seed_id: None,
+            origin: KeyOrigin::Derived,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        keys_ks
+            .insert(crate::keys::store_key(&key_id), &record)
+            .await
+            .unwrap();
+
+        Fixture {
+            _dir: dir,
+            _store: store,
+            keys_ks,
+            contexts_ks,
+            audit,
+            seed_store,
+            subject_did,
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        _store: Store,
+        keys_ks: KeyspaceHandle,
+        contexts_ks: KeyspaceHandle,
+        audit: vta_audit::SharedAuditSink,
+        seed_store: Arc<dyn SeedStore>,
+        subject_did: String,
+    }
+
+    async fn setup(context: Option<&str>) -> Fixture {
+        setup_with_base(context, "m/26'/2'/0'").await
+    }
+
+    async fn resolve(
+        f: &Fixture,
+        auth: &AuthClaims,
+        subject: &str,
+    ) -> Result<HolderKeys, AppError> {
+        resolve_holder_keys(
+            &f.keys_ks,
+            &f.contexts_ks,
+            &f.seed_store,
+            &f.audit,
+            auth,
+            subject,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn resolves_within_an_authorised_context() {
+        let f = setup(Some("acme")).await;
+        let subject_did = f.subject_did.clone();
+        let keys = resolve(&f, &admin_of("acme"), &subject_did)
+            .await
+            .expect("resolve");
+        let multibase = subject_did.strip_prefix("did:key:").unwrap();
+        let key_id = format!("{subject_did}#{multibase}");
+        assert_eq!(keys.signer.key_id(), Some(key_id.as_str()));
+        assert_eq!(keys.consent_secret.id, key_id);
+    }
+
+    /// #1988: a P-256 holder (a credential bound to a P-256 `cnf.jwk`) signs
+    /// its `kb-jwt` ES256, and the JWS verifies under the holder's own
+    /// `did:key`; its consent secret is P-256 too (`ecdsa-jcs-2019`).
+    #[tokio::test]
+    async fn a_p256_holder_signs_its_kb_jwt_es256() {
+        let f = setup_key(Some("acme"), "m/26'/2'/0'", KeyType::P256).await;
+        assert!(
+            f.subject_did.starts_with("did:key:zDn"),
+            "{}",
+            f.subject_did
+        );
+        let keys = resolve(&f, &admin_of("acme"), &f.subject_did)
+            .await
+            .expect("a P-256 holder key resolves");
+        assert_eq!(keys.signer.algorithm(), "ES256");
+
+        let jws = keys
+            .signer
+            .sign_jwt(
+                &serde_json::json!({ "alg": "ES256", "typ": "kb+jwt" }),
+                &serde_json::json!({ "aud": "did:web:verifier.example", "nonce": "n-1" }),
+            )
+            .unwrap();
+        let payload = vta_sdk::jws::JwsKey::from_did_key(&f.subject_did)
+            .unwrap()
+            .verify_compact(&jws)
+            .expect("the kb-jwt verifies under the holder's did:key");
+        assert_eq!(payload["nonce"], "n-1");
+        assert_eq!(
+            vta_vault::consent::holder_suite(&keys.consent_secret).unwrap(),
+            affinidi_data_integrity::crypto_suites::CryptoSuite::EcdsaJcs2019
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_key_outside_the_callers_context() {
+        let f = setup(Some("acme")).await;
+        // The privilege boundary: an admin of `other` must NOT sign with `acme`'s key.
+        let Err(err) = resolve(&f, &admin_of("other"), &f.subject_did).await else {
+            panic!("expected a refusal");
+        };
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn parent_admin_resolves_a_descendant_context_key() {
+        let f = setup(Some("acme/eng")).await;
+        // Folder authority (ties to hierarchical contexts): an admin of `acme`
+        // reaches a key whose context is `acme/eng`.
+        assert!(resolve(&f, &admin_of("acme"), &f.subject_did).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unknown_subject_is_not_found() {
+        let f = setup(Some("acme")).await;
+        let Err(err) = resolve(&f, &super_admin(), "did:key:zUnknownHolder").await else {
+            panic!("expected a refusal");
+        };
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+    }
+
+    /// Key custody rule 6: a record in `acme` whose path is not under
+    /// `acme`'s base (a planted record) is refused even to `acme`'s own admin.
+    #[tokio::test]
+    async fn a_record_outside_its_contexts_base_cannot_sign() {
+        let f = setup_with_base(Some("acme"), "m/26'/2'/5'").await;
+        let Err(err) = resolve(&f, &admin_of("acme"), &f.subject_did).await else {
+            panic!("expected a refusal");
+        };
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+    }
+}
+
+/// The signing material for presenting an **ISO mdoc**.
+///
+/// Separate from [`HolderKeys`] because an mdoc's holder is a *key*, not a DID:
+/// there is no subject to resolve, and the two things that must be signed are
+/// different from every other format's.
+#[derive(Debug)]
+pub struct MdocHolderKeys {
+    /// The `did:key` the device key resolves to. Names the consent receipt's
+    /// `dpv:hasDataSubject`, which must be the DID whose key signs it —
+    /// `ConsentRecord::verify_proof` binds the two.
+    pub device_did: String,
+    /// P-256 secret, in Data-Integrity form, for signing the consent receipt
+    /// under `ecdsa-jcs-2019`.
+    pub consent_secret: Secret,
+    /// The same key as raw SEC1 bytes, for the COSE_Sign1 `DeviceAuth` that
+    /// binds the presentation to the verifier's session.
+    pub device_private: Zeroizing<Vec<u8>>,
+}
+
+/// Resolve the VTA-managed **mdoc device key** named by `key_id`, gated by the
+/// caller's ACL exactly as [`resolve_holder_keys`] is.
+///
+/// `key_id` comes off the stored credential's `MDOC_DEVICE_KEY_TAG`, recorded at
+/// receive — an mdoc carries no subject DID to look one up from, and #990
+/// refuses at receive any mdoc whose device key this VTA does not hold, so a
+/// stored one always resolves here.
+pub async fn resolve_mdoc_device_keys(
+    keys_ks: &KeyspaceHandle,
+    contexts_ks: &KeyspaceHandle,
+    seed_store: &Arc<dyn SeedStore>,
+    audit: &vta_audit::SharedAuditSink,
+    auth: &AuthClaims,
+    key_id: &str,
+) -> Result<MdocHolderKeys, AppError> {
+    let record: KeyRecord = keys_ks
+        .get(crate::keys::store_key(key_id))
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "mdoc device key `{key_id}` is not managed by this VTA"
+            ))
+        })?;
+
+    if record.key_type != KeyType::P256 {
+        return Err(AppError::Validation(format!(
+            "mdoc device key `{key_id}` is {:?}, but ISO 18013-5 device keys are P-256",
+            record.key_type
+        )));
+    }
+    if record.status != KeyStatus::Active {
+        return Err(AppError::Validation(format!(
+            "mdoc device key `{key_id}` is not active"
+        )));
+    }
+    if record.origin != KeyOrigin::Derived {
+        return Err(AppError::Validation(
+            "imported mdoc device keys are not supported for presentation yet".into(),
+        ));
+    }
+
+    // ── Privilege boundary: only sign with a key in an authorised context. ──
+    // Same gate as `resolve_holder_keys`; without it a caller could present
+    // another context's mdoc by naming its device key.
+    match &record.context_id {
+        Some(ctx) => auth.require_context(ctx)?,
+        None => auth.require_super_admin()?,
+    }
+
+    let p256_secret = crate::operations::key_custody::derive_record_key(
+        contexts_ks,
+        keys_ks,
+        &**seed_store,
+        audit,
+        &auth.did,
+        &record,
+        "holder-keys",
+    )
+    .await?
+    .p256_secret()?;
+    let device_private = Zeroizing::new(p256_secret.secret_key.to_bytes().to_vec());
+
+    // The device key's canonical `did:key`, so the receipt has a subject that
+    // resolves to the key that signed it.
+    let device_did = format!("did:key:{}", record.public_key);
+    let vm = format!("{device_did}#{}", record.public_key);
+
+    let consent_secret = Secret::from_multibase(
+        &vta_keys::encode_private_multibase(&KeyType::P256, &device_private),
+        Some(&vm),
+    )
+    .map_err(|e| AppError::Internal(format!("build P-256 consent secret: {e}")))?;
+
+    Ok(MdocHolderKeys {
+        device_did,
+        consent_secret,
+        device_private,
+    })
+}

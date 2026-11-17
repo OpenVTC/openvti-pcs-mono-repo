@@ -1,0 +1,52 @@
+{
+  "name": "vtc-admin-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "VTC admin console \u2014 React shell that hosts web-component plugins.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "npm run wire:check && npm run typecheck",
+    "typecheck": "tsc -b tsconfig.json tsconfig.test.json --noEmit",
+    "test": "vitest run",
+    "wire:generate": "openapi-typescript openapi.json -o src/lib/wire.ts",
+    "wire:check": "openapi-typescript openapi.json -o /tmp/vtc-wire-check.ts && diff -q src/lib/wire.ts /tmp/vtc-wire-check.ts",
+    "build:members": "vite build -c vite.members.config.ts",
+    "dev:members": "vite -c vite.members.config.ts"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.7",
+    "@fontsource/ibm-plex-sans": "^5.2.8",
+    "@hpke/chacha20poly1305": "1.8.1",
+    "@hpke/core": "1.10.1",
+    "@hpke/dhkem-x25519": "1.8.1",
+    "@noble/curves": "2.4.0",
+    "@tanstack/react-query": "^5.107.1",
+    "cborg": "6.2.1",
+    "lucide-react": "1.70.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.5",
+    "zustand": "^5.1.0"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "jsdom": "^31.0.0",
+    "lucide-static": "1.70.0",
+    "openapi-typescript": "^7.13.0",
+    "typescript": "^5.7.2",
+    "vite": "^8.3.7",
+    "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "js-yaml": "^4.3.2"
+  }
+}

@@ -1,0 +1,535 @@
+//! Host-enforced invariants — hard guards a policy can never override
+//! (ceremony-pipeline design §5).
+//!
+//! Invariants are checked by the **host**, around the policy, not
+//! encoded in Rego — so an operator's policy edit can never disable
+//! them. The policy proposes a [`Verdict`]; [`enforce`] is the host's
+//! veto. A violated invariant refuses the transition regardless of
+//! what the policy said.
+//!
+//! ## What's enforced here (state-free invariants)
+//!
+//! These two are decidable from [`Facts`] + the policy's [`Verdict`]
+//! alone, so they live here now:
+//!
+//! - **Privilege ceiling (join)** — a `join` policy may grant
+//!   `member` / `moderator` / custom roles, **never `admin`**. Admin
+//!   is reachable only through the role-change step-up path. A
+//!   `join` policy that returns `allow{role:admin}` is vetoed.
+//! - **Step-up for admin (role-change)** — role-change *is* the
+//!   sanctioned admin-promotion path, but only with a verified
+//!   step-up. The host re-checks that any `allow{role:admin}` carries
+//!   `evidence.request.step_up == true`, so a policy edit can't grant
+//!   admin without the reauth ceremony. VTI-OPS-051.
+//! - **No self-promotion (role-change)** — a caller may not grant
+//!   themselves `admin`. A second factor proves *who* is at the
+//!   keyboard, never that a second person agreed, so the step-up above
+//!   is not a substitute for this one. VTI-OPS-050.
+//!
+//! The `step_up` fact these read is resolved by the orchestration from
+//! the caller's live session ([`crate::acl::elevation`]), not supplied
+//! by a route handler — a handler that could pass `true` would be the
+//! gate, and then the invariant would only be checking that somebody
+//! said so.
+//!
+//! ## The join criterion (`vtc/join-requests/submit/0.3`)
+//!
+//! A join is decided under one published criterion
+//! ([`crate::join::criteria`]), and what that criterion says binds the
+//! decision whatever the policy proposes. [`hold_to_criterion`] applies it:
+//!
+//! - a submission that does **not meet** its criterion is never admitted, and
+//!   never referred either — a referral is how an administrator admits, so
+//!   referring an unmet submission would admit outside the criteria. An
+//!   `allow` or `refer` becomes `requestMore`, naming what is missing;
+//! - one meeting a **`review`** criterion is referred; an `allow` becomes
+//!   `refer`, because meeting a review criterion never admits by itself;
+//! - one meeting an **`automatic`** criterion keeps the policy's verdict. The
+//!   policy may still refuse or refer it on grounds of its own (an applicant
+//!   the community has excluded) — tightening is the policy's to do, and the
+//!   verdict it returns records the ground;
+//! - a join with **no criterion** is never admitted or referred: every join
+//!   path decides under one, so its absence is a fault, not an open door.
+//!
+//! Unlike [`enforce`] this rewrites rather than vetoes: the outcome is still
+//! the one the specification requires for the case, not a refusal of the
+//! policy.
+//!
+//! ## Where the other §5 invariants live
+//!
+//! [`enforce`] is intentionally pure over `(Facts, Verdict)` — it is
+//! the *pre-effect* veto. Two design §5 invariants are naturally
+//! enforced elsewhere because they need more than the verdict:
+//!
+//! - **PII boundary (directory, registry)** — enforced in the
+//!   **effect/projection** stage ([`super::effects::plan`]), not here:
+//!   the projection intersects `allow.with.fields` with the
+//!   community whitelist as it builds the field map, so a policy can't
+//!   project a field outside the boundary. It belongs with the
+//!   projection because that's the stage that handles the fields.
+//! - **No-last-admin (leave, role-change)** — still deferred. Needs
+//!   the community's current admin count from the ACL keyspace to
+//!   refuse a transition that would drop it to zero. Lands with the
+//!   async effect executor that reads that state. Listed here, not
+//!   silently absent: the host does **not** yet guarantee it, and the
+//!   leave / role-change executor must before it ships.
+
+use super::facts::{Facts, Purpose};
+use super::verdict::Verdict;
+use crate::schemas::accepts::Admission;
+
+/// The community role that ceremonies may never self-grant through
+/// the join path, and may grant through role-change only behind
+/// step-up. Matches the literal the example policies branch on
+/// (`input.evidence.request.target_role == "admin"`).
+pub const ADMIN_ROLE: &str = "admin";
+
+/// Which host invariant a [`Verdict`] tripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invariant {
+    /// Join tried to grant `admin`.
+    PrivilegeCeiling,
+    /// Role-change tried to grant `admin` without a verified step-up.
+    StepUpForAdmin,
+    /// Role-change tried to grant `admin` to the caller themselves.
+    SelfPromotion,
+    /// An admission policy named a role other than the one the administrator
+    /// asked for. It may admit, refer or refuse; the role is the
+    /// administrator's, bounded by their own authority before the policy ran.
+    AdmissionRole,
+}
+
+impl Invariant {
+    /// Stable code for audit + the synthesized deny.
+    pub fn code(self) -> &'static str {
+        match self {
+            Invariant::PrivilegeCeiling => "privilege-ceiling",
+            Invariant::StepUpForAdmin => "step-up-required",
+            Invariant::SelfPromotion => "self-promotion",
+            Invariant::AdmissionRole => "admission-role",
+        }
+    }
+}
+
+/// A policy decision the host vetoed. Carries which invariant fired
+/// and a human-readable detail for the audit line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvariantViolation {
+    pub invariant: Invariant,
+    pub detail: String,
+}
+
+impl InvariantViolation {
+    /// The denying [`Verdict`] the host substitutes for the vetoed
+    /// decision — the transition is refused, tagged with the
+    /// invariant code so the operator can see *why* their policy's
+    /// allow didn't stick.
+    pub fn into_deny(self) -> Verdict {
+        Verdict::Deny(super::verdict::Deny {
+            code: self.invariant.code().into(),
+            reason: Some(self.detail),
+        })
+    }
+}
+
+/// Apply the host invariants to a policy's [`Verdict`].
+///
+/// Only an `allow` can violate an invariant — `deny` / `refer` /
+/// `request_more` grant nothing, so they pass through untouched. On
+/// veto, returns the [`InvariantViolation`]; the caller
+/// ([`super::decide`]) converts it to a denying verdict and logs it.
+pub fn enforce(facts: &Facts, verdict: Verdict) -> Result<Verdict, InvariantViolation> {
+    let Verdict::Allow(allow) = &verdict else {
+        return Ok(verdict);
+    };
+
+    let grants_admin = allow.role.as_deref() == Some(ADMIN_ROLE);
+
+    match facts.purpose {
+        // Join may never grant admin, full stop.
+        Purpose::Join if grants_admin => Err(InvariantViolation {
+            invariant: Invariant::PrivilegeCeiling,
+            detail: "join policy may not grant the admin role".into(),
+        }),
+        // Nobody promotes themselves, however well authenticated. Checked
+        // before the step-up guard so a self-promotion is named as one rather
+        // than sending the caller off to run a ceremony that cannot help.
+        Purpose::RoleChange if grants_admin && facts.actor.did == facts.subject.did => {
+            Err(InvariantViolation {
+                invariant: Invariant::SelfPromotion,
+                detail: "admin elevation requires a separate admin caller".into(),
+            })
+        }
+        // Role-change may grant admin only behind a verified step-up.
+        Purpose::RoleChange if grants_admin && !step_up_verified(facts) => {
+            Err(InvariantViolation {
+                invariant: Invariant::StepUpForAdmin,
+                detail: "admin promotion requires a verified step-up".into(),
+            })
+        }
+        // Admission seats exactly the role the administrator asked for, which
+        // was bounded by their own authority before the policy ran
+        // (`vtc-admin-roles.md` §6.3). A policy that names another — `admin`
+        // above all — would be choosing authority nobody checked.
+        Purpose::Admission
+            if allow
+                .role
+                .as_deref()
+                .is_some_and(|r| Some(r) != requested_admission_role(facts)) =>
+        {
+            Err(InvariantViolation {
+                invariant: Invariant::AdmissionRole,
+                detail: "an admission policy may admit, refer or refuse, but not choose the role"
+                    .into(),
+            })
+        }
+        _ => Ok(verdict),
+    }
+}
+
+/// The role a direct admission asks for (`evidence.request.role`).
+fn requested_admission_role(facts: &Facts) -> Option<&str> {
+    facts
+        .evidence
+        .request
+        .as_ref()
+        .and_then(|r| r.get("role"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Hold a `join` verdict to the criterion the submission is decided under —
+/// see the module docs. Other purposes pass through untouched. Returns the
+/// verdict to act on and, when it differs from the policy's, why.
+pub fn hold_to_criterion(facts: &Facts, verdict: Verdict) -> (Verdict, Option<&'static str>) {
+    if facts.purpose != Purpose::Join {
+        return (verdict, None);
+    }
+    let admits = matches!(verdict, Verdict::Allow(_) | Verdict::Refer(_));
+    let Some(criterion) = facts.evidence.criterion.as_ref() else {
+        if !admits {
+            return (verdict, None);
+        }
+        return (
+            Verdict::Deny(super::verdict::Deny {
+                code: CRITERION_ABSENT.into(),
+                reason: Some("a join is decided under a published criterion, and none was".into()),
+            }),
+            Some(CRITERION_ABSENT),
+        );
+    };
+    if !criterion.met {
+        if !admits {
+            return (verdict, None);
+        }
+        return (
+            Verdict::RequestMore(super::verdict::RequestMore {
+                needs: criterion.needs.clone(),
+                presentation_definition: serde_json::Value::Null,
+            }),
+            Some(CRITERION_UNMET),
+        );
+    }
+    match (criterion.admission, verdict) {
+        (Admission::Review, Verdict::Allow(_)) => (
+            Verdict::Refer(super::verdict::Refer {
+                queue: REVIEW_QUEUE.into(),
+                reason: Some(format!(
+                    "criterion `{}` admits after an administrator's review",
+                    criterion.id
+                )),
+            }),
+            Some(CRITERION_REVIEW),
+        ),
+        (_, verdict) => (verdict, None),
+    }
+}
+
+/// Why [`hold_to_criterion`] rewrote a verdict: the submission does not meet
+/// its criterion.
+pub const CRITERION_UNMET: &str = "criterion-unmet";
+/// Why [`hold_to_criterion`] rewrote a verdict: the criterion admits by review.
+pub const CRITERION_REVIEW: &str = "criterion-review";
+/// Why [`hold_to_criterion`] refused: the join carried no criterion.
+pub const CRITERION_ABSENT: &str = "no-criterion";
+/// The queue a submission meeting a `review` criterion is referred to.
+pub const REVIEW_QUEUE: &str = "admin-review";
+
+/// Whether the facts carry a verified step-up signal
+/// (`evidence.request.step_up == true`). Absent / non-`true` reads as
+/// "not stepped up" — the host defaults to refusing admin promotion.
+fn step_up_verified(facts: &Facts) -> bool {
+    facts
+        .evidence
+        .request
+        .as_ref()
+        .and_then(|r| r.get("step_up"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ceremony::facts::{Actor, Context, Evidence, State, Subject};
+    use crate::ceremony::verdict::Allow;
+    use serde_json::json;
+
+    fn facts(purpose: Purpose, request: serde_json::Value) -> Facts {
+        Facts {
+            purpose,
+            now: "2026-05-30T12:00:00Z".parse().unwrap(),
+            actor: Actor {
+                did: "did:key:zActor".into(),
+                role: Some("admin".into()),
+                authenticated: true,
+            },
+            subject: Subject {
+                did: "did:key:zTarget".into(),
+            },
+            context: Context {
+                community_did: "did:webvh:acme.example".into(),
+                channel: "rest".into(),
+                member_count: 10,
+                thread_id: None,
+            },
+            evidence: Evidence {
+                vetting: None,
+                invitation: None,
+                presentation: None,
+                request: Some(request),
+                criterion: None,
+            },
+            state: State {
+                subject_member: None,
+            },
+        }
+    }
+
+    fn allow_role(role: &str) -> Verdict {
+        Verdict::Allow(Allow {
+            role: Some(role.into()),
+            ..Default::default()
+        })
+    }
+
+    /// An admission policy may allow without a role, or with the one asked
+    /// for; naming another — `admin` above all — is vetoed.
+    #[test]
+    fn admission_policy_may_not_choose_the_role() {
+        let f = facts(
+            Purpose::Admission,
+            json!({ "action": "add", "role": "member" }),
+        );
+        let bare = Verdict::Allow(Allow::default());
+        assert_eq!(enforce(&f, bare.clone()).unwrap(), bare);
+        assert_eq!(
+            enforce(&f, allow_role("member")).unwrap(),
+            allow_role("member")
+        );
+        for other in ["admin", "moderator"] {
+            let violation = enforce(&f, allow_role(other)).expect_err("another role is vetoed");
+            assert_eq!(violation.invariant, Invariant::AdmissionRole);
+            assert_eq!(violation.into_deny().effect(), "deny");
+        }
+        // Making an administrator's entry a membership names its own role,
+        // which a policy may repeat.
+        let own = facts(
+            Purpose::Admission,
+            json!({ "action": "make-membership", "role": "admin" }),
+        );
+        assert!(enforce(&own, allow_role("admin")).is_ok());
+    }
+
+    /// A join policy granting a non-admin role passes.
+    #[test]
+    fn join_member_grant_passes() {
+        let f = facts(Purpose::Join, json!({}));
+        assert_eq!(
+            enforce(&f, allow_role("member")).unwrap(),
+            allow_role("member")
+        );
+    }
+
+    /// A join policy granting admin is vetoed by the privilege
+    /// ceiling — converted to a deny tagged `privilege-ceiling`.
+    #[test]
+    fn join_admin_grant_is_vetoed() {
+        let f = facts(Purpose::Join, json!({}));
+        let violation = enforce(&f, allow_role("admin")).expect_err("join admin must be vetoed");
+        assert_eq!(violation.invariant, Invariant::PrivilegeCeiling);
+        match violation.into_deny() {
+            Verdict::Deny(d) => assert_eq!(d.code, "privilege-ceiling"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    /// Role-change to admin *with* step-up is allowed through.
+    #[test]
+    fn role_change_admin_with_step_up_passes() {
+        let f = facts(
+            Purpose::RoleChange,
+            json!({ "target_role": "admin", "step_up": true }),
+        );
+        assert_eq!(
+            enforce(&f, allow_role("admin")).unwrap(),
+            allow_role("admin")
+        );
+    }
+
+    /// Role-change to admin *without* step-up is vetoed even though a
+    /// policy returned allow — the host guards it regardless.
+    #[test]
+    fn role_change_admin_without_step_up_is_vetoed() {
+        let f = facts(
+            Purpose::RoleChange,
+            json!({ "target_role": "admin", "step_up": false }),
+        );
+        let violation = enforce(&f, allow_role("admin")).expect_err("admin needs step-up");
+        assert_eq!(violation.invariant, Invariant::StepUpForAdmin);
+
+        // Absent step_up reads the same as false.
+        let f2 = facts(Purpose::RoleChange, json!({ "target_role": "admin" }));
+        assert!(enforce(&f2, allow_role("admin")).is_err());
+    }
+
+    /// VTI-OPS-050: a caller may not promote themselves, and a live
+    /// step-up does not buy it — a second factor is not a second person.
+    #[test]
+    fn role_change_admin_to_self_is_vetoed_even_with_step_up() {
+        let mut f = facts(
+            Purpose::RoleChange,
+            json!({ "target_role": "admin", "step_up": true }),
+        );
+        f.subject.did = f.actor.did.clone();
+        let violation =
+            enforce(&f, allow_role("admin")).expect_err("self-promotion must be vetoed");
+        assert_eq!(violation.invariant, Invariant::SelfPromotion);
+        match violation.into_deny() {
+            Verdict::Deny(d) => assert_eq!(d.code, "self-promotion"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    /// Self-*demotion* is a different act and stays allowed — the guard is
+    /// about conferring admin on yourself, not about touching your own row.
+    #[test]
+    fn role_change_to_self_at_a_lesser_role_passes() {
+        let mut f = facts(Purpose::RoleChange, json!({ "target_role": "member" }));
+        f.subject.did = f.actor.did.clone();
+        assert_eq!(
+            enforce(&f, allow_role("member")).unwrap(),
+            allow_role("member")
+        );
+    }
+
+    /// Role-change to a non-admin role doesn't engage the step-up
+    /// guard.
+    #[test]
+    fn role_change_non_admin_passes_without_step_up() {
+        let f = facts(Purpose::RoleChange, json!({ "target_role": "moderator" }));
+        assert_eq!(
+            enforce(&f, allow_role("moderator")).unwrap(),
+            allow_role("moderator")
+        );
+    }
+
+    /// Non-allow verdicts are never touched by the invariant pass.
+    #[test]
+    fn non_allow_verdicts_pass_through() {
+        let f = facts(Purpose::Join, json!({}));
+        let refer = Verdict::Refer(super::super::verdict::Refer {
+            queue: "moderator".into(),
+            reason: None,
+        });
+        assert_eq!(enforce(&f, refer.clone()).unwrap(), refer);
+    }
+
+    fn with_criterion(admission: Admission, met: bool) -> Facts {
+        let mut f = facts(Purpose::Join, json!({}));
+        f.evidence.criterion = Some(crate::join::criteria::CriterionFact {
+            id: "kernel".into(),
+            requirements_digest: "zKernel".into(),
+            admission,
+            met,
+            needs: if met {
+                vec![]
+            } else {
+                vec!["invitation".into()]
+            },
+            cited: false,
+            superseded: false,
+        });
+        f
+    }
+
+    fn refer() -> Verdict {
+        Verdict::Refer(super::super::verdict::Refer {
+            queue: "moderator".into(),
+            reason: None,
+        })
+    }
+
+    /// Submit 0.3 decision rule 3: a met automatic criterion keeps the
+    /// policy's verdict — an admission, or a tightening the policy chose.
+    #[test]
+    fn a_met_automatic_criterion_keeps_the_policys_verdict() {
+        let f = with_criterion(Admission::Automatic, true);
+        assert_eq!(
+            hold_to_criterion(&f, allow_role("member")).0,
+            allow_role("member")
+        );
+        assert_eq!(hold_to_criterion(&f, refer()).0, refer());
+    }
+
+    /// Rule 2: meeting a review criterion never admits by itself.
+    #[test]
+    fn a_met_review_criterion_turns_an_admission_into_a_referral() {
+        let f = with_criterion(Admission::Review, true);
+        let (v, why) = hold_to_criterion(&f, allow_role("member"));
+        assert_eq!(why, Some(CRITERION_REVIEW));
+        match v {
+            Verdict::Refer(r) => assert_eq!(r.queue, REVIEW_QUEUE),
+            other => panic!("expected refer, got {other:?}"),
+        }
+    }
+
+    /// Rule 1: an unmet criterion is never admitted — nor referred, which is
+    /// how an administrator would admit it.
+    #[test]
+    fn an_unmet_criterion_is_neither_admitted_nor_referred() {
+        for admission in [Admission::Automatic, Admission::Review] {
+            let f = with_criterion(admission, false);
+            for proposed in [allow_role("member"), refer()] {
+                let (v, why) = hold_to_criterion(&f, proposed);
+                assert_eq!(why, Some(CRITERION_UNMET));
+                match v {
+                    Verdict::RequestMore(m) => assert_eq!(m.needs, ["invitation"]),
+                    other => panic!("expected requestMore, got {other:?}"),
+                }
+            }
+            let deny = Verdict::Deny(super::super::verdict::Deny {
+                code: "closed".into(),
+                reason: None,
+            });
+            assert_eq!(hold_to_criterion(&f, deny.clone()).0, deny);
+        }
+    }
+
+    #[test]
+    fn a_join_without_a_criterion_is_never_admitted() {
+        let f = facts(Purpose::Join, json!({}));
+        match hold_to_criterion(&f, allow_role("member")).0 {
+            Verdict::Deny(d) => assert_eq!(d.code, CRITERION_ABSENT),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_purposes_are_not_held_to_a_criterion() {
+        let f = facts(Purpose::RoleChange, json!({ "target_role": "member" }));
+        assert_eq!(
+            hold_to_criterion(&f, allow_role("member")).0,
+            allow_role("member")
+        );
+    }
+}

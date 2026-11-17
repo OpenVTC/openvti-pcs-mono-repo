@@ -1,0 +1,202 @@
+[package]
+name = "did-hosting-daemon"
+description = "DID Hosting Daemon — Unified binary embedding server, witness, watcher, and control plane"
+version = "0.12.0"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["keyring", "store-fjall", "ui", "did-methods", "jemalloc"]
+# Use jemalloc as the `did-hosting-daemon` binary's global allocator (see the
+# dependency comment). On by default: with the system allocator the process
+# holds its RSS high-water mark for its lifetime. Disable
+# (`--no-default-features`) if you need to profile against the system allocator
+# or are building for a target jemalloc doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
+ui = ["did-hosting-control/ui", "dep:tower"]
+# NOTE: passkey/WebAuthn is always compiled in — it arrives unconditionally
+# through the `did-hosting-control` dependency (which enables
+# `did-hosting-common/passkey` and links `webauthn-rs` non-optionally), and
+# the daemon calls `passkey::build_webauthn` without a cfg gate. There is
+# intentionally no `passkey` feature to toggle; the runtime switch is the
+# `public_url` config (WebAuthn is only initialised when it is set).
+# DID methods enabled for resolution. Default-on because a daemon without
+# any method registered silently returns 404 from `/.well-known/did.jsonl`
+# — the resolve-side route and dispatcher are both `#[cfg]`-gated. Opt out
+# only if you genuinely want a method-less binary.
+did-methods = [
+  "did-hosting-server/method-webvh",
+  "did-hosting-server/method-web",
+  "did-hosting-common/method-webvh",
+  "did-hosting-common/method-web",
+]
+# did:webs, opt-in. Not in `did-methods` (and so not in `default`)
+# because it pulls the KERI stack — a daemon hosting no did:webs DIDs
+# should not carry it. Enabling it turns on both halves: the control
+# plane's write path, so a did:webs publication can be verified and
+# stored, and the server's resolve routes, so it can be served. Turning
+# on only one would give a daemon that accepts DIDs it cannot serve, or
+# serves a store nothing can write to.
+method-webs = [
+  "did-hosting-server/method-webs",
+  "did-hosting-control/method-webs",
+  "did-hosting-common/method-webs",
+]
+keyring = [
+  "did-hosting-server/keyring",
+  "webvh-witness/keyring",
+  "did-hosting-control/keyring",
+]
+aws-secrets = [
+  "did-hosting-server/aws-secrets",
+  "webvh-witness/aws-secrets",
+  "did-hosting-control/aws-secrets",
+]
+gcp-secrets = [
+  "did-hosting-server/gcp-secrets",
+  "webvh-witness/gcp-secrets",
+  "did-hosting-control/gcp-secrets",
+]
+azure-secrets = [
+  "did-hosting-server/azure-secrets",
+  "webvh-witness/azure-secrets",
+  "did-hosting-control/azure-secrets",
+]
+vault-secrets = [
+  "did-hosting-server/vault-secrets",
+  "webvh-witness/vault-secrets",
+  "did-hosting-control/vault-secrets",
+]
+k8s-secrets = [
+  "did-hosting-server/k8s-secrets",
+  "webvh-witness/k8s-secrets",
+  "did-hosting-control/k8s-secrets",
+]
+metrics = [
+  "did-hosting-server/metrics",
+  "did-hosting-control/metrics",
+]
+store-fjall = [
+  "did-hosting-common/store-fjall",
+  "did-hosting-server/store-fjall",
+  "webvh-witness/store-fjall",
+  "webvh-watcher/store-fjall",
+  "did-hosting-control/store-fjall",
+]
+store-redis = [
+  "did-hosting-server/store-redis",
+  "webvh-witness/store-redis",
+  "webvh-watcher/store-redis",
+  "did-hosting-control/store-redis",
+]
+store-dynamodb = [
+  "did-hosting-server/store-dynamodb",
+  "webvh-witness/store-dynamodb",
+  "webvh-watcher/store-dynamodb",
+  "did-hosting-control/store-dynamodb",
+]
+store-firestore = [
+  "did-hosting-server/store-firestore",
+  "webvh-witness/store-firestore",
+  "webvh-watcher/store-firestore",
+  "did-hosting-control/store-firestore",
+]
+store-cosmosdb = [
+  "did-hosting-server/store-cosmosdb",
+  "webvh-witness/store-cosmosdb",
+  "webvh-watcher/store-cosmosdb",
+  "did-hosting-control/store-cosmosdb",
+]
+
+[[bin]]
+name = "did-hosting-daemon"
+path = "src/main.rs"
+
+[dependencies]
+did-hosting-common = { version = "0.12", path = "../did-hosting-common", default-features = false, features = ["server-core", "setup-wizard"] }
+did-hosting-server = { version = "0.12", path = "../did-hosting-server", default-features = false }
+webvh-witness = { version = "0.12", path = "../webvh-witness", default-features = false }
+webvh-watcher = { version = "0.12", path = "../webvh-watcher", default-features = false }
+did-hosting-control = { version = "0.12", path = "../did-hosting-control", default-features = false }
+# Names the DID cache client handed to the shared Trust Tasks verifier
+# constructor (`did_hosting_common::server::trust_tasks::build_verifier`).
+affinidi-did-resolver-cache-sdk = { workspace = true }
+affinidi-messaging-didcomm-service = { workspace = true }
+affinidi-tdk = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true, features = ["trace"] }
+tower = { workspace = true, features = ["util"], optional = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+vta-sdk = { workspace = true }
+
+# ── Allocator ────────────────────────────────────────────────────────────
+# jemalloc, used by the `did-hosting-daemon` binary only (set as the global
+# allocator in main.rs — a library must never impose an allocator on its
+# consumers).
+#
+# The default system allocator (glibc malloc on Linux) does not return the
+# memory of freed allocations to the OS promptly. The daemon's request path is
+# a sawtooth of short-lived allocations (Trust Task envelopes, DID logs being
+# verified and served, UI and API responses, store batches), and glibc retains
+# those arenas, so RSS ratchets up to its high-water mark and stays there. That
+# reads as a leak in monitoring even though the live heap is flat. jemalloc's
+# decay-based purging returns the pages, so RSS tracks live memory.
+#
+# Not available on MSVC; the cfg gate below falls back to the system allocator
+# there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `test-support` seeds the verifier's deactivation verdicts in the daemon's
+# verifier tests; dev-only, so never part of a release build.
+did-hosting-common = { version = "0.12", path = "../did-hosting-common", default-features = false, features = ["server-core", "test-support"] }
+trust-tasks-rs = { workspace = true }
+# `tests/e2e_*.rs`: real daemon (bin) + distributed-mode (in-process) end to
+# end smoke tests, driven across TSP, DIDComm and HTTPS.
+uuid = { workspace = true }
+chrono = { workspace = true }
+trust-tasks-didcomm = { workspace = true }
+affinidi-messaging-didcomm = { workspace = true }
+affinidi-data-integrity = { workspace = true }
+didwebvh-rs = { workspace = true }
+# Embedded mediator fixture — same pin `did-hosting-control`'s own
+# `tests/mediator_replication_smoke.rs` uses; see the note there. Unlike that
+# file, this workspace's tests drive genuine TSP traffic through it (the
+# admin RPC client's TSP transport), so — unlike every other consumer of this
+# dependency in the workspace — the `tsp` feature is turned on here.
+affinidi-messaging-test-mediator = { version = "0.52.0", features = ["tsp"] }
+# A hand-rolled capturing `TspHandler` for the e2e admin RPC client (there is
+# no library-provided one — every other TSP-driving test in this workspace
+# dispatches in-process instead of over a real socket).
+async-trait = { workspace = true }
+# Reads the body out of an in-process `axum::response::Response` when
+# checking the edge's HTTP resolution and driving the daemon's HTTPS API.
+http-body-util = { workspace = true }
+# `HostPolicy::AllowPrivate` — the daemon-mode e2e test's own DID resolver
+# has to resolve a real did:webvh whose host is `localhost`, which the
+# resolver's default `PublicOnly` policy refuses (SSRF hardening that a
+# same-machine test has no use for).
+affinidi-did-web = "0.1"

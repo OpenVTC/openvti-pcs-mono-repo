@@ -1,0 +1,2290 @@
+use axum::Json;
+use axum::extract::State;
+use axum::http::header::SET_COOKIE;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use trust_tasks_rs::TrustTask;
+use uuid::Uuid;
+use vti_common::auth::extractor::ADMIN_REFRESH_COOKIE;
+use vti_specs::auth::passkey::login::start::v0_2 as start_spec;
+use vti_specs::auth::refresh::v0_2 as refresh;
+
+use vta_sdk::protocols::auth::{
+    AuthenticateResponse, ChallengeRequest, ChallengeResponse, Session as WireSession, TokenBundle,
+    epoch_to_rfc3339,
+};
+
+use crate::acl::{get_acl_entry, resolve_auth_role};
+use crate::auth::AuthClaims;
+use crate::auth::session::{
+    Session, SessionState, delete_session, get_session, list_sessions, now_epoch,
+    store_refresh_index, store_session,
+};
+use crate::error::{AppError, TaskError};
+use crate::server::AppState;
+use tracing::{info, warn};
+use vtc_audit::{
+    AuditEvent, AuthSteppedUpData, SessionRevocationRefusedData, SessionRevokedData, SignedOutData,
+};
+use vti_common::store::KeyspaceHandle;
+
+// ---------- POST /auth/challenge ----------
+
+/// Thin dispatcher — every substantive concern (ACL, rate
+/// limit, session persistence) lives in the canonical handler.
+#[utoipa::path(
+    post, path = "/auth/challenge",
+    operation_id = "authChallenge", tag = "auth",
+    request_body = ChallengeRequest,
+    responses(
+        (status = 200, description = "DID-auth challenge nonce", body = ChallengeResponse),
+        (status = 401, description = "ACL gate rejected the subject DID"),
+    ),
+)]
+pub async fn challenge(
+    State(state): State<AppState>,
+    Json(req): Json<ChallengeRequest>,
+) -> Result<Json<ChallengeResponse>, AppError> {
+    let backend = crate::auth::VtcAuthBackend::from_state(&state).await?;
+    let resp = vti_common::auth::handlers::handle_challenge(
+        &backend,
+        vti_common::auth::ChallengeInput {
+            did: req.did,
+            session_pubkey_b58btc: None,
+        },
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
+// ---------- POST /auth/ ----------
+
+/// `POST /v1/auth/` — verify a DIDComm/SIOP/Trust-Task authentication
+/// document and issue access + refresh tokens. Unauthenticated.
+#[utoipa::path(
+    post, path = "/auth/", tag = "auth",
+    request_body(content = String, description = "DIDComm envelope, SIOP id_token envelope, or Trust-Task auth document"),
+    responses(
+        (status = 200, description = "Access + refresh tokens", body = AuthenticateResponse),
+        (status = 401, description = "Authentication failed (bad proof, challenge mismatch, or replay)"),
+    ),
+)]
+pub async fn authenticate(
+    State(state): State<AppState>,
+    body: String,
+) -> Result<Json<AuthenticateResponse>, AppError> {
+    Ok(Json(authenticate_and_mint(&state, &body).await?))
+}
+
+/// Clock skew tolerance for SIOP `id_token` freshness checks, matching
+/// did-hosting-control so a wallet token minted against either service
+/// validates identically.
+const SIOP_CLOCK_SKEW_SECS: u64 = 60;
+
+/// The VTA-wallet SIOP login envelope: `{ type, payload }` where the
+/// payload carries a self-issued `id_token`. Field names are snake_case
+/// on the wire (no `rename_all`), matching what the wallet extension and
+/// did-hosting-control's `AuthenticatePayload` use.
+#[derive(Debug, Deserialize)]
+struct SiopAuthEnvelope {
+    #[serde(rename = "type")]
+    typ: String,
+    payload: SiopAuthPayload,
+}
+
+#[derive(Deserialize)]
+struct SiopAuthPayload {
+    /// Self-issued SIOPv2 id_token (compact EdDSA JWS). Required — its
+    /// presence is what distinguishes this from a DIDComm-packed body.
+    id_token: String,
+    session_id: String,
+    #[serde(default)]
+    session_pubkey_b58btc: Option<String>,
+}
+
+/// Written by hand so the id_token never reaches a log: a derived `Debug` would print it.
+impl std::fmt::Debug for SiopAuthPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiopAuthPayload")
+            .field("id_token", &"<redacted>")
+            .field("session_id", &self.session_id)
+            .field("session_pubkey_b58btc", &self.session_pubkey_b58btc)
+            .finish()
+    }
+}
+
+/// Try to authenticate a VTA-wallet SIOP `id_token`.
+///
+/// Returns `Ok(None)` when `body` is not a SIOP envelope (no
+/// `payload.id_token`), so the caller falls through to the DIDComm
+/// path. Returns `Ok(Some(_))` on a successfully verified token, or an
+/// `Err` when the body *is* a SIOP envelope but verification fails.
+///
+/// The wallet does the SIOP round-trip internally: it fetched a
+/// challenge from `/auth/challenge`, the holder self-issued an
+/// `id_token` with `nonce = challenge` and `aud = <this VTC's DID>`,
+/// and posted it here. We verify the signature (via the shared
+/// `vti_common` verifier), bind `aud` to our own DID and check
+/// freshness, then hand the holder DID + nonce to the same canonical
+/// `handle_authenticate` the DIDComm path uses — `nonce` becomes the
+/// `challenge` the session is matched against.
+async fn authenticate_siop(
+    state: &AppState,
+    body: &str,
+) -> Result<Option<AuthenticateResponse>, AppError> {
+    let backend = crate::auth::VtcAuthBackend::from_state(state).await?;
+    authenticate_siop_with(state, body, &state.sessions_ks, &backend).await
+}
+
+/// [`authenticate_siop`] against a given session keyspace and backend.
+///
+/// Shared with the member portal (`crate::member_portal`), whose sessions live
+/// in their own keyspace and whose backend admits active members only and
+/// mints for its own audience. The token checks — signature, `aud` bound to
+/// this VTC's DID, freshness — are identical for both, which is why they are
+/// one function: a member sign-in must not be a weaker SIOP verifier.
+pub(crate) async fn authenticate_siop_with<B>(
+    state: &AppState,
+    body: &str,
+    sessions_ks: &vti_common::store::KeyspaceHandle,
+    backend: &B,
+) -> Result<Option<AuthenticateResponse>, AppError>
+where
+    B: vti_common::auth::AuthBackend<Error = AppError>,
+{
+    // Not a SIOP envelope → fall through to the DIDComm path.
+    let Ok(env) = serde_json::from_str::<SiopAuthEnvelope>(body) else {
+        return Ok(None);
+    };
+    if env.typ.as_str() != AUTHENTICATE_TASK_URI || env.payload.id_token.is_empty() {
+        return Ok(None);
+    }
+
+    // SSRF hardening: bind the token's (unverified) `iss` to an existing
+    // challenge session *before* resolving it. `verify_siop_id_token`
+    // resolves `iss` — an HTTP fetch for did:web/webvh — so without this an
+    // unauthenticated caller could steer the daemon into resolving an
+    // arbitrary attacker-chosen DID. A session only exists for a DID that
+    // passed the ACL gate at challenge time, so resolution is confined to a
+    // known, authorised DID. These checks are not authoritative (the holder
+    // hasn't proven control of `iss` yet) — `handle_authenticate` below
+    // re-verifies everything; they exist purely to gate the network call.
+    let unverified_iss = vti_common::auth::parse_unverified_iss(&env.payload.id_token)
+        .map_err(|e| AppError::Authentication(format!("id_token: {e}")))?;
+    let session = crate::auth::session::get_session(sessions_ks, &env.payload.session_id)
+        .await?
+        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+    if unverified_iss != session.did {
+        return Err(AppError::Authentication(
+            "id_token `iss` does not match the challenge session's DID".into(),
+        ));
+    }
+
+    let resolver = state.did_resolver.as_ref().ok_or_else(|| {
+        AppError::Authentication("DID resolver not configured; cannot verify id_token".into())
+    })?;
+
+    // Cryptographic verification (signature + self-issuance + key
+    // binding). Policy checks (aud, nonce, freshness) are ours below.
+    let verified = vti_common::auth::verify_siop_id_token(&env.payload.id_token, resolver)
+        .await
+        .map_err(|e| AppError::Authentication(format!("id_token verification failed: {e}")))?;
+
+    // Audience binding: the token must be addressed to *this* VTC's DID.
+    let vtc_did = {
+        let cfg = state.config.read().await;
+        cfg.vtc_did.clone()
+    }
+    .ok_or_else(|| AppError::Authentication("VTC DID not configured".into()))?;
+    if verified.audience != vtc_did {
+        return Err(AppError::Authentication(
+            "id_token `aud` does not match this service".into(),
+        ));
+    }
+
+    // Freshness window (mirrors did-hosting-control).
+    let now = now_epoch();
+    if verified.expires_at <= now {
+        return Err(AppError::Authentication("id_token has expired".into()));
+    }
+    if verified.issued_at > now.saturating_add(SIOP_CLOCK_SKEW_SECS) {
+        return Err(AppError::Authentication(
+            "id_token `iat` is in the future".into(),
+        ));
+    }
+    if verified.issued_at > verified.expires_at {
+        return Err(AppError::Authentication(
+            "id_token `iat` is after `exp`".into(),
+        ));
+    }
+
+    // Optional session-bound pubkey must be an Ed25519 multikey.
+    if let Some(pk) = env.payload.session_pubkey_b58btc.as_deref()
+        && !pk.starts_with("z6Mk")
+    {
+        return Err(AppError::Authentication(
+            "session_pubkey_b58btc must be an Ed25519 multikey (z6Mk… prefix)".into(),
+        ));
+    }
+
+    let resp = vti_common::auth::handlers::handle_authenticate(
+        backend,
+        vti_common::auth::AuthenticateInput {
+            session_id: env.payload.session_id,
+            // The SIOP `nonce` is the challenge the session was issued.
+            challenge: verified.nonce,
+            // The holder DID, proven by the verified signature.
+            signer_did: verified.issuer,
+            // REST path — no DIDComm `created_time` to thread.
+            created_time: None,
+            session_pubkey_b58btc: env.payload.session_pubkey_b58btc,
+            // Bound by the id_token's `aud`, checked against this VTC's DID
+            // above before any of this runs.
+            audience: vti_common::auth::AudienceBinding::Transport,
+        },
+    )
+    .await?;
+    Ok(Some(resp))
+}
+
+/// Core authenticate + mint logic behind `POST /v1/auth/`.
+///
+/// Accepts either a VTA-wallet SIOP envelope or a DIDComm-packed
+/// authentication message, and returns the bearer `{ session, tokens }`.
+/// A browser SPA that wants the cookie session posts the resulting
+/// access token to `POST /v1/auth/admin-session`; there is no
+/// cookie-minting variant of this endpoint (#710 retired it).
+async fn authenticate_and_mint(
+    state: &AppState,
+    body: &str,
+) -> Result<AuthenticateResponse, AppError> {
+    // VTA-wallet SIOP login: a `{ type, payload: { id_token, … } }`
+    // envelope. Returns `None` for a DIDComm-packed body, so that path
+    // below is left untouched.
+    if let Some(resp) = authenticate_siop(state, body).await? {
+        return Ok(resp);
+    }
+
+    // Canonical REST login: a DI-signed `auth/authenticate/0.3` Trust Task,
+    // the same document the VTA accepts. Returns `None` for any other body.
+    if let Some(resp) = authenticate_trust_task(state, body).await? {
+        return Ok(resp);
+    }
+
+    let atm = state
+        .atm
+        .as_ref()
+        .ok_or_else(|| AppError::Authentication("ATM not configured".into()))?;
+
+    // A sender that rotated its key-agreement key since its document was
+    // cached is re-resolved once before the message is refused (VTI-KEY-134).
+    let (msg, metadata) =
+        vta_sdk::did_refresh::unpack_refreshing_sender(atm, state.did_resolver.as_ref(), body)
+            .await
+            .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
+
+    let sender_base = vti_common::auth::bind_authcrypt_sender(body, &msg, &metadata)
+        .map_err(|e| AppError::Authentication(e.message("authenticate message")))?;
+
+    // Canonical Trust-Task URI only; the legacy `affinidi.com/atm/1.0`
+    // alias was removed (all VTC clients emit the canonical type).
+    if msg.typ.as_str() != AUTHENTICATE_TASK_URI {
+        return Err(AppError::Authentication(format!(
+            "unexpected message type: {}",
+            msg.typ
+        )));
+    }
+
+    let challenge = msg.body["challenge"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("missing challenge in message body".into()))?
+        .to_string();
+    let session_id = msg.body["session_id"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("missing session_id in message body".into()))?
+        .to_string();
+
+    let backend = crate::auth::VtcAuthBackend::from_state(state).await?;
+    vti_common::auth::handlers::handle_authenticate(
+        &backend,
+        vti_common::auth::AuthenticateInput {
+            session_id,
+            challenge,
+            signer_did: sender_base,
+            // Freshness window enforcement: closes M3 — was
+            // previously passing `None`, skipping the
+            // `created_time` check entirely.
+            created_time: msg.created_time,
+            session_pubkey_b58btc: None,
+            audience: vti_common::auth::AudienceBinding::Transport,
+        },
+    )
+    .await
+}
+
+/// The canonical `auth/authenticate/0.3` Type URI, shared by all three request
+/// shapes — the DIDComm envelope's `msg.typ`, the SIOP envelope's `type`, and
+/// the REST Trust Task's `type`. 0.1 and 0.2 are no longer served.
+const AUTHENTICATE_TASK_URI: &str = crate::trust_tasks::auth_tasks::AUTHENTICATE_V0_3_TYPE;
+
+/// Try to authenticate from a DI-signed `auth/authenticate/0.3` Trust Task —
+/// the canonical REST login, and the VTC counterpart of the VTA's
+/// `try_authenticate_trust_task`.
+///
+/// **Why this exists.** The VTC accepted two login shapes: a VTA-wallet SIOP
+/// envelope, and an authcrypt DIDComm envelope. A REST client holding a plain
+/// `did:key` — no wallet to self-issue an `id_token`, no mediator to authcrypt
+/// through — could satisfy neither, so `vtc-client::connect` could not log in
+/// at all. `/auth/refresh` had already grown the Trust-Task path for exactly
+/// this reason; login had not, which left a client able to *rotate* a token it
+/// had no way to obtain.
+///
+/// The document is byte-identical to the one the VTA accepts (built by
+/// `vta_sdk::auth_di::sign_authenticate_doc`), so one client builder logs in to
+/// both services. The holder's `eddsa-jcs-2022` proof *is* the authentication:
+/// the proven `verificationMethod` DID is the signer, and the canonical handler
+/// binds it to the session's DID.
+///
+/// **Discrimination.** A body is claimed only when it parses as a Trust Task,
+/// carries the authenticate Type URI, *and* has a `proof`. The proof
+/// requirement is what keeps this from shadowing [`authenticate_siop`], whose
+/// envelope shares the Type URI — and it means an unsigned document falls
+/// through to the other paths rather than being claimed and rejected.
+///
+/// Returns `Ok(None)` when the body isn't such a document; `Err` when it *is*
+/// one but is invalid (bad proof, malformed payload, challenge mismatch).
+async fn authenticate_trust_task(
+    state: &AppState,
+    body: &str,
+) -> Result<Option<AuthenticateResponse>, AppError> {
+    use vti_specs::auth::authenticate::v0_3 as authenticate;
+
+    let doc: TrustTask<serde_json::Value> = match serde_json::from_str(body) {
+        Ok(doc) => doc,
+        Err(_) => return Ok(None), // not a Trust Task document
+    };
+    if doc.type_uri.to_string() != AUTHENTICATE_TASK_URI || doc.proof.is_none() {
+        return Ok(None);
+    }
+
+    // From here the caller's intent is unambiguous; failures are real.
+    //
+    // The proof is verified over the body as received, never over a
+    // re-serialisation of `doc` (VTI-45). It parsed as a Trust Task, so it
+    // parses as JSON.
+    let received: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| AppError::Authentication(format!("invalid authenticate document: {e}")))?;
+    let signer_did =
+        vti_common::auth::verify_trust_task_proof_value(&received, &state.trust_task_vm_resolver())
+            .await
+            .map_err(|e| AppError::Authentication(e.to_string()))?;
+    let payload: authenticate::Payload = serde_json::from_value(doc.payload.clone())
+        .map_err(|e| AppError::Authentication(format!("invalid authenticate payload: {e}")))?;
+    // A proxied login (`principal` unequal to the signer) is refused: this
+    // service verifies no delegation evidence (see `trust_tasks::auth_tasks`).
+    if let Some(principal) = payload.principal.as_ref()
+        && principal.as_str() != signer_did
+    {
+        return Err(AppError::Authentication(format!(
+            "{}: this service does not verify delegation evidence; authenticate with the \
+             principal's own key",
+            crate::trust_tasks::auth_tasks::AUTHENTICATE_V0_3_ERR_DELEGATION_NOT_RECOGNIZED
+        )));
+    }
+    // The session key binding lives on the signed-document door
+    // (`trust_tasks::auth_tasks`); this REST shape never bound one.
+    if payload.session_key.is_some() {
+        return Err(AppError::Authentication(format!(
+            "{}: bind a session key through the signed-document door (`POST /v1/trust-tasks`)",
+            crate::trust_tasks::auth_tasks::AUTHENTICATE_ERR_SESSION_KEY_UNSUPPORTED
+        )));
+    }
+
+    let backend = crate::auth::VtcAuthBackend::from_state(state).await?;
+    let resp = vti_common::auth::handlers::handle_authenticate(
+        &backend,
+        vti_common::auth::AuthenticateInput {
+            session_id: payload.session_id.to_string(),
+            challenge: payload.challenge.to_string(),
+            // Proven by the DI proof, not claimed by a header.
+            signer_did,
+            // No DIDComm `created_time`; the single-use, TTL'd challenge bound
+            // to the session is the freshness/replay anchor (the canonical
+            // handler reads `None` as a no-op freshness check, same as the SIOP
+            // path above).
+            created_time: None,
+            session_pubkey_b58btc: None,
+            // Proof-signed over plain REST: nothing binds the document to this
+            // service except its `recipient` (SPEC §7.2 item 5, #1638).
+            audience: vti_common::auth::AudienceBinding::Recipient {
+                recipient: doc.recipient.clone(),
+                own_did: state.config.read().await.vtc_did.clone(),
+            },
+        },
+    )
+    .await?;
+    Ok(Some(resp))
+}
+
+// ---------- vtc/auth/admin-session/0.2 ----------
+
+/// The `ext` member the console puts the refresh token under.
+const EXT_NAMESPACE: &str = "org.openvtc";
+
+/// Pull `ext["org.openvtc"].refreshToken` out of an admin-session request.
+///
+/// The wallet login path receives a refresh token from `/v1/auth/` and is
+/// the only party that can hand it to this task — unlike passkey login,
+/// it mints nothing and so has no refresh token of its own. A caller that
+/// omits it still gets a working cookie session; it simply cannot renew,
+/// which is the behaviour every caller had before.
+///
+/// `spec/vtc/auth/admin-session/0.2` types its payload as `{accessToken,
+/// ext}`, so a top-level `refreshToken` would be refused by the schema; `ext`
+/// is the schema's own escape hatch.
+pub(crate) fn refresh_token_from_ext(ext: Option<&JsonValue>) -> Option<String> {
+    ext?.get(EXT_NAMESPACE)?
+        .get("refreshToken")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `vtc/auth/admin-session/0.2` — exchange a bearer access token for the
+/// admin SPA's cookie session.
+///
+/// The VTA-wallet login path returns a bearer token in the response body
+/// (the wallet extension posts the SIOP `id_token` to `/wallet/auth/` and
+/// reads `tokens.accessToken`), but the admin SPA drives the API with the
+/// `vtc_admin_session` cookie + `csrf` double-submit, not an
+/// `Authorization` header. This task bridges the two: it validates the
+/// presented token (signature + VTC audience + expiry) and, on success,
+/// sets the `vtc_admin_session` + `csrf` cookie pair:
+///
+/// - `vtc_admin_session=<jwt>; Path=/; SameSite=Strict; Secure; HttpOnly` —
+///   the access-token JWT, scoped to the daemon's whole origin so the browser
+///   sends it on `/v1/*` API calls. `HttpOnly` keeps JS from reading it;
+///   `SameSite=Strict` prevents cross-site CSRF.
+/// - `csrf=<random>; Path=/; SameSite=Strict; Secure` (HttpOnly **false**, so
+///   SPA JS can mirror the value into the `X-CSRF-Token` header for the
+///   double-submit check in `routing::csrf`).
+///
+/// No privilege escalation — the caller must already possess a valid VTC
+/// access token, which it could use directly as a bearer; this only mirrors
+/// it into the cookie the browser SPA expects.
+///
+/// It is served only as a signed document on the HTTPS door
+/// (`trust_tasks::admin_session_tasks`), which checks the proof's signer is
+/// the token's subject (or a console key that subject enrolled) and sets the
+/// cookies [`admin_session_cookies`] returns. Its bearer route is gone (#1641).
+///
+/// `{ sessionId, expiresAt }` — the shape `vtc/auth/admin-session/0.2`
+/// publishes, and which the route did not return until #1059's witness put
+/// the handler beside its own schema. 0.2 sends `expiresAt` as an RFC 3339
+/// date-time, where 0.1 sent Unix seconds.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSessionResponse {
+    pub session_id: String,
+    /// The token's own expiry — the same instant the cookies' `Max-Age` is
+    /// derived from, so the two cannot disagree. RFC 3339 on the wire.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// `vtc/auth/admin_session:invalidToken` — the mirrored access token did not
+/// verify (signature, this VTC's audience, or expiry).
+pub const ADMIN_SESSION_ERR_INVALID_TOKEN: &str =
+    vti_specs::vtc::auth::admin_session::v0_2::error_codes::INVALID_TOKEN.code;
+
+/// The access token's claims, verified: signature, this VTC's audience
+/// (audience isolation — a foreign-audience token is refused here exactly as
+/// on every other surface) and expiry. A bad token is `invalidToken`, and
+/// never sets a cookie.
+pub(crate) fn decode_admin_session_token(
+    state: &AppState,
+    access_token: &str,
+) -> Result<vti_common::auth::jwt::Claims, TaskError> {
+    let jwt_keys = state
+        .jwt_keys
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("JWT keys not configured".into()))?;
+    jwt_keys.decode(access_token).map_err(|_| {
+        TaskError::declared(
+            ADMIN_SESSION_ERR_INVALID_TOKEN,
+            AppError::Authentication("invalid or expired access token".into()),
+        )
+    })
+}
+
+/// The cookie session for an access token [`decode_admin_session_token`]
+/// verified, and the `Set-Cookie` values that carry it. Nothing is minted:
+/// the session is the token's own, mirrored into cookies.
+pub(crate) async fn admin_session_cookies(
+    state: &AppState,
+    access_token: &str,
+    claims: &vti_common::auth::jwt::Claims,
+    refresh_token: Option<String>,
+) -> (AdminSessionResponse, Vec<String>) {
+    use rand::RngExt;
+
+    let max_age = claims.exp.saturating_sub(now_epoch()).max(1);
+
+    // A refresh token, if the caller sent one, is what lets this session
+    // renew. The refresh cookie must outlive the access cookie or it could
+    // never renew it; its own expiry is enforced server-side on the session
+    // row, so a generous Max-Age here grants nothing the row does not already
+    // allow.
+    let refresh_max_age = {
+        let cfg = state.config.read().await;
+        cfg.auth.refresh_token_expiry
+    };
+    // The csrf cookie has to survive as long as the longest-lived
+    // credential it protects. Scoped to the access window it would lapse
+    // first, and the renewal POST — a mutation, so CSRF-gated — would
+    // 403 with no token to present.
+    let cookie_window = if refresh_token.is_some() {
+        refresh_max_age.max(max_age)
+    } else {
+        max_age
+    };
+
+    let mut csrf_bytes = [0u8; 32];
+    rand::rng().fill(&mut csrf_bytes);
+    let csrf = hex::encode(csrf_bytes);
+
+    let mut cookies = vec![
+        build_session_cookie(access_token, max_age),
+        build_csrf_cookie(&csrf, cookie_window),
+    ];
+    if let Some(token) = refresh_token {
+        cookies.push(build_refresh_cookie(&token, refresh_max_age));
+    }
+    (
+        AdminSessionResponse {
+            session_id: claims.session_id.clone(),
+            // The same instant the cookies' `Max-Age` is derived from, so the
+            // body and the headers cannot disagree about when this session
+            // ends.
+            expires_at: epoch_to_datetime(claims.exp),
+        },
+        cookies,
+    )
+}
+
+// ---------- POST /auth/passkey-login/start ----------
+
+/// `POST /v1/auth/passkey-login/start`.
+///
+/// Browser-friendly login: the admin SPA submits no body, the
+/// daemon returns a WebAuthn assertion challenge across every
+/// registered passkey (discoverable login — the user picks their
+/// device, the browser chooses the matching credential). Modelled
+/// on `affinidi-webvh-service::login_start`.
+///
+/// Unauthenticated by design: the eventual `finish` ceremony
+/// proves possession of an enrolled credential, which is the auth.
+///
+/// The same canonical task also serves **AAL step-up**, selected by
+/// [`purpose`](PasskeyLoginStartRequest::purpose) — see that field.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+#[schema(as = AdminPasskeyLoginStartResponse)]
+pub struct PasskeyLoginStartResponse {
+    pub auth_id: String,
+    #[schema(value_type = Object)]
+    /// The value for `navigator.credentials.get({ publicKey: … })` — the
+    /// inner options, not webauthn-rs's `{publicKey: …}` wrapper. See
+    /// `admin::passkeys::RegisterStartResponse::options` for why the wrapper
+    /// went.
+    pub options: webauthn_rs_proto::PublicKeyCredentialRequestOptions,
+}
+
+/// Request body for `passkey-login/start`, per
+/// `spec/auth/passkey/login/start/0.2`.
+///
+/// Entirely optional — the admin SPA's login posts no body at all, which reads
+/// as `purpose: login`, the pre-existing behaviour.
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
+#[schema(as = AdminPasskeyLoginStartRequest)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PasskeyLoginStartRequest {
+    /// `login` (default) issues a new session; `stepUp` elevates the caller's
+    /// existing one. The two differ in more than bookkeeping: a step-up must be
+    /// authenticated, and challenges **only the caller's own** credentials, so
+    /// another admin's passkey cannot satisfy it.
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub purpose: Option<start_spec::PayloadPurpose>,
+    /// The VID the producer intends to authenticate as. Optional — omit for
+    /// the usernameless / discoverable-credential flow the admin SPA uses.
+    ///
+    /// When given it is **honoured, not noted**: a login challenge is narrowed
+    /// to that subject's credentials, and a step-up that names anyone other
+    /// than the authenticated session's subject is refused rather than quietly
+    /// answered for the session holder.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// Vendor-namespaced extensions per SPEC.md §4.5.1. Accepted and ignored,
+    /// which is what the framework asks of a consumer that defines no
+    /// extensions — the field exists so `deny_unknown_fields` doesn't reject a
+    /// spec-conformant producer that sends one.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    #[allow(dead_code)]
+    pub ext: Option<serde_json::Value>,
+}
+
+/// `POST /v1/auth/passkey-login/start` — issue a WebAuthn assertion
+/// challenge. Unauthenticated for `purpose: login`; requires a session for
+/// `purpose: stepUp`.
+#[utoipa::path(
+    post, path = "/auth/passkey-login/start", tag = "auth",
+    request_body = Option<PasskeyLoginStartRequest>,
+    responses(
+        (status = 200, description = "WebAuthn assertion challenge", body = PasskeyLoginStartResponse),
+        (status = 401, description = "WebAuthn not configured, no passkeys registered, or step-up requested without a session"),
+    ),
+)]
+pub async fn passkey_login_start(
+    auth: Option<AuthClaims>,
+    State(state): State<AppState>,
+    body: Option<Json<PasskeyLoginStartRequest>>,
+) -> Result<Json<PasskeyLoginStartResponse>, AppError> {
+    use vti_common::auth::passkey::store::{
+        StepUpBinding, get_all_passkeys, store_auth_state, store_auth_step_up,
+    };
+
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let stepping_up = matches!(req.purpose, Some(start_spec::PayloadPurpose::StepUp));
+
+    let webauthn = state
+        .webauthn
+        .as_ref()
+        .ok_or_else(|| AppError::Authentication("WebAuthn not configured".into()))?;
+
+    // Which credentials may answer the challenge is the whole difference
+    // between the two purposes. A login is discoverable across every
+    // registered passkey — the user picks their device. A step-up asserts that
+    // *this* session's holder is present, so only their own credentials count;
+    // widening it to every admin's passkey would let any operator standing at
+    // the machine elevate someone else's session.
+    let (passkeys, binding) = if stepping_up {
+        let claims = auth.ok_or_else(|| {
+            AppError::Unauthorized(
+                "step-up requires an authenticated session; sign in first".into(),
+            )
+        })?;
+        // A step-up authenticates whoever holds the session. Naming a different
+        // subject is a contradiction, not a hint to ignore — refuse it rather
+        // than run a ceremony that would elevate someone the caller didn't ask
+        // for.
+        if let Some(subject) = &req.subject
+            && subject != &claims.did
+        {
+            return Err(AppError::Validation(format!(
+                "step-up subject {subject} does not match the authenticated session ({})",
+                claims.did
+            )));
+        }
+        let user = credentials_for(&state, &claims.did).await?;
+        let binding = StepUpBinding {
+            session_id: claims.session_id.clone(),
+            did: claims.did.clone(),
+        };
+        (user, Some(binding))
+    } else if let Some(subject) = &req.subject {
+        // Answered alike whether or not `subject` holds passkeys: an enrolled
+        // subject's own credentials, otherwise a stand-in set that is stable
+        // for that subject. Either way the caller gets a challenge of the same
+        // shape and a ceremony that only a registered authenticator can finish.
+        (login_credentials_for(&state, subject).await?, None)
+    } else {
+        (get_all_passkeys(&state.passkey_ks).await?, None)
+    };
+
+    if passkeys.is_empty() {
+        warn!("passkey login refused: no passkeys registered");
+        return Err(AppError::Authentication(
+            "no passkeys registered on this server".into(),
+        ));
+    }
+
+    let (rcr, auth_state) = webauthn
+        .start_passkey_authentication(&passkeys)
+        .map_err(|e| AppError::Internal(format!("webauthn auth start failed: {e}")))?;
+
+    let auth_id = Uuid::new_v4().to_string();
+    // Write the binding *before* the ceremony state: finish reads the state
+    // first and bails when it is absent, so a crash between the two writes
+    // leaves an orphan binding that no ceremony can ever reach — rather than a
+    // live ceremony whose step-up intent was lost, which would finish as a
+    // plain login and mint a fresh session for a step-up request.
+    if let Some(binding) = &binding {
+        store_auth_step_up(&state.passkey_ks, &auth_id, binding).await?;
+    }
+    // A step-up counts against the session's subject; a login has no owner
+    // yet and counts against the shared anonymous bound.
+    let owner = binding.as_ref().map(|b| b.did.as_str());
+    store_auth_state(&state.passkey_ks, &auth_id, owner, &auth_state).await?;
+
+    info!(
+        auth_id = %auth_id,
+        passkey_count = passkeys.len(),
+        purpose = if stepping_up { "stepUp" } else { "login" },
+        "passkey login challenge issued"
+    );
+
+    Ok(Json(PasskeyLoginStartResponse {
+        auth_id,
+        options: rcr.public_key,
+    }))
+}
+
+// ---------- POST /auth/passkey-login/finish ----------
+
+/// `POST /v1/auth/passkey-login/finish`.
+///
+/// Verifies the WebAuthn assertion, looks up the registered
+/// admin DID by credential ID, and mints the cookie session.
+/// Sets the same `vtc_admin_session` + `csrf` cookies as
+/// `admin_session` does for the bearer-token bridge. Returns the
+/// bearer token in the body for clients that want to also use it
+/// programmatically.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(as = AdminPasskeyLoginFinishRequest)]
+pub struct PasskeyLoginFinishRequest {
+    pub auth_id: String,
+    #[schema(value_type = Object)]
+    pub credential: webauthn_rs::prelude::PublicKeyCredential,
+    /// Extension members. `ext["org.openvtc"].sessionKey` is the browser key
+    /// (an Ed25519 `did:key`) a console login binds to the session it mints,
+    /// so the console can later sign `auth/whoami/0.1` for that session
+    /// ([`session_key_from_ext`]). Whoever submits this finish receives the
+    /// session's cookies anyway; binding the key they hold to it confers
+    /// nothing those cookies do not.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub ext: Option<serde_json::Value>,
+}
+
+/// `POST /v1/auth/passkey-login/finish` — verify the WebAuthn assertion and
+/// either mint a cookie session + bearer token (`purpose: login`) or elevate
+/// the caller's existing session (`purpose: stepUp`). Which one it is was
+/// decided at `start`; the client does not get to re-declare it here.
+#[utoipa::path(
+    post, path = "/auth/passkey-login/finish", tag = "auth",
+    request_body = PasskeyLoginFinishRequest,
+    responses(
+        (status = 200, description = "Access + refresh tokens (sets admin session + CSRF cookies), or the elevated session for a step-up"),
+        (status = 401, description = "Passkey assertion verification failed or credential not registered"),
+    ),
+)]
+pub async fn passkey_login_finish(
+    auth: Option<AuthClaims>,
+    State(state): State<AppState>,
+    Json(req): Json<PasskeyLoginFinishRequest>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::http::HeaderValue;
+    use axum::http::header::SET_COOKIE;
+    use vti_common::auth::passkey::store::{
+        get_passkey_user_by_cred, store_passkey_user, take_auth_state, take_auth_step_up,
+    };
+
+    let webauthn = state
+        .webauthn
+        .as_ref()
+        .ok_or_else(|| AppError::Authentication("WebAuthn not configured".into()))?;
+    // JWT-keys presence is enforced by `VtcAuthBackend::from_state` at the
+    // mint step below (the shared minter owns token issuance now).
+
+    // Refused before the ceremony state is spent, so a malformed key costs
+    // the operator a retry, not the ceremony.
+    let session_key = session_key_from_ext(req.ext.as_ref())?;
+
+    // One answer for every failure before a registered credential is found
+    // (no ceremony, a lapsed one, an assertion that does not verify, a
+    // credential not registered), so a finish tells a caller no more than the
+    // start did about which subjects hold passkeys. The detail is logged.
+    let failed = || AppError::Authentication("passkey authentication failed".into());
+    let Some(auth_state) = take_auth_state(&state.passkey_ks, &req.auth_id).await? else {
+        warn!(auth_id = %req.auth_id, "passkey authentication: no live ceremony");
+        return Err(failed());
+    };
+    // Consumed together with the ceremony state: a replayed `auth_id` finds
+    // neither, so a step-up assertion cannot be spent twice.
+    let step_up = take_auth_step_up(&state.passkey_ks, &req.auth_id).await?;
+
+    let auth_result = webauthn
+        .finish_passkey_authentication(&req.credential, &auth_state)
+        .map_err(|e| {
+            warn!(auth_id = %req.auth_id, error = %e, "passkey authentication failed");
+            failed()
+        })?;
+
+    let cred_id_hex = hex::encode(auth_result.cred_id());
+    let mut user = get_passkey_user_by_cred(&state.passkey_ks, &cred_id_hex)
+        .await?
+        .ok_or_else(|| {
+            warn!(auth_id = %req.auth_id, "passkey authentication: credential not registered");
+            failed()
+        })?;
+
+    // Persist credential-counter update (WebAuthn replay protection).
+    for cred in &mut user.credentials {
+        cred.update_credential(&auth_result);
+    }
+    store_passkey_user(&state.passkey_ks, &user).await?;
+
+    // Step-up: elevate the session the ceremony was started for. No new
+    // session, no new tokens — the caller's existing ones stay valid and gain
+    // the freshness the elevation window records (spec 0.2: `tokens` is absent
+    // for `purpose: stepUp`).
+    if let Some(binding) = step_up {
+        return step_up_finish(&state, &binding, auth.as_ref(), &user.did, &auth_result).await;
+    }
+
+    // Check ACL — the DID must still be authorised; revocation
+    // since enrolment is a real path (operator demoted, etc.).
+    // Uses the VTC-aware resolver so a demoted-to-VtcRole row yields a
+    // clean 403, not a 500 in the VTA-taxonomy deserializer (P0.16).
+    //
+    // Passkey-login: amr=["passkey"], acr="aal2" — the WebAuthn
+    // assertion alone is two factors (possession of the authenticator +
+    // a user-verification gesture / biometric).
+    let AdminCookieSession {
+        session_id,
+        minted,
+        cookies,
+    } = mint_admin_cookie_session(&state, &user.did, &["passkey"], session_key, None).await?;
+    let amr = vec!["passkey".to_string()];
+    let acr = "aal2".to_string();
+
+    info!(did = %user.did, %session_id, "passkey login successful");
+
+    let resp = PasskeyLoginResponse {
+        // Required by `login/finish/0.2`, and not merely decorative: `start`
+        // decides the purpose, so the client learns which branch answered only
+        // from this member. Without it a caller must infer the branch from the
+        // presence of `tokens`, which is exactly the shape-sniffing the enum
+        // exists to remove.
+        purpose: "login".to_string(),
+        session: WireSession {
+            id: session_id.clone(),
+            subject: user.did.clone(),
+            issued_at: epoch_to_rfc3339(minted.issued_at),
+            expires_at: epoch_to_rfc3339(minted.access_expires_at),
+            amr: amr.clone(),
+            acr: acr.clone(),
+        },
+        tokens: TokenBundle {
+            access_token: minted.access_token.clone(),
+            refresh_token: Some(minted.refresh_token),
+            token_type: "Bearer".to_string(),
+            expires_in: minted.access_ttl,
+            refresh_expires_in: Some(minted.refresh_expires_at.saturating_sub(minted.issued_at)),
+            scope: Vec::new(),
+        },
+    };
+
+    let mut response = Json(resp).into_response();
+    let headers = response.headers_mut();
+    for cookie in cookies {
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::try_from(cookie)
+                .map_err(|e| AppError::Internal(format!("invalid session cookie: {e}")))?,
+        );
+    }
+
+    Ok(response)
+}
+
+/// An operator-console session just minted, and the cookies that carry it.
+pub(crate) struct AdminCookieSession {
+    pub session_id: String,
+    pub minted: vti_common::auth::handlers::MintedTokens,
+    /// `vtc_admin_session`, `csrf` and the refresh cookie, in that order.
+    pub cookies: Vec<String>,
+}
+
+/// Mint the operator-console session every interactive console sign-in
+/// issues — passkey login, and wallet sign-in by trigger link
+/// (`auth/oob/*` with the `admin` audience): the DID's role read from the
+/// ACL now (a non-administrator is `Forbidden`), tokens for the `VTC`
+/// audience through the shared minter (`aal2`, so the short access TTL),
+/// the session row and refresh index in `sessions`, and the
+/// `vtc_admin_session` + `csrf` + refresh cookie trio.
+///
+/// One function so the sign-in methods cannot drift apart in audience,
+/// cookie flags, lifetimes or CSRF — a console session is a console session
+/// whichever way the operator proved who they are.
+///
+/// `not_after` is an absolute end the session may not outlive — a wallet
+/// sign-in's grant `notAfter`. Both tokens and every cookie are minted to
+/// end by it, and it is stored on the session so that refresh rotation
+/// stays inside it and is refused once it has passed. `None` (passkey) is
+/// the usual sliding session.
+pub(crate) async fn mint_admin_cookie_session(
+    state: &AppState,
+    did: &str,
+    amr: &[&str],
+    session_pubkey_b58btc: Option<String>,
+    not_after: Option<u64>,
+) -> Result<AdminCookieSession, AppError> {
+    let (role, allowed_contexts) = resolve_auth_role(&state.acl_ks, did).await?;
+
+    // Mint access + refresh tokens through the shared minter so every
+    // console sign-in gets the same `aal2` short access TTL + Authenticated
+    // audit as the canonical `/auth/` handler (P1.4).
+    let backend = crate::auth::VtcAuthBackend::from_state(state).await?;
+    let session_id = Uuid::new_v4().to_string();
+    let amr: Vec<String> = amr.iter().map(|s| s.to_string()).collect();
+    let acr = "aal2".to_string();
+    let minted = vti_common::auth::handlers::mint_session_tokens_until(
+        &backend,
+        did,
+        &session_id,
+        &role,
+        &allowed_contexts,
+        &amr,
+        &acr,
+        false,
+        not_after,
+    )
+    .await?;
+
+    // Persist the session record so `/auth/sessions` lists it and
+    // refresh-token rotation finds it. AAL is captured so refresh keeps
+    // the holder at aal2 instead of dropping to aal1 on every rotation.
+    let session = Session {
+        session_id: session_id.clone(),
+        did: did.to_string(),
+        challenge: String::new(),
+        state: SessionState::Authenticated,
+        created_at: minted.issued_at,
+        last_seen: minted.issued_at,
+        refresh_token: Some(minted.refresh_token.clone()),
+        refresh_expires_at: Some(minted.refresh_expires_at),
+        tee_attested: false,
+        amr,
+        acr,
+        acr_expires_at: None,
+        token_id: Some(minted.token_id.clone()),
+        session_pubkey_b58btc,
+        not_after,
+    };
+    store_session(&state.sessions_ks, &session).await?;
+    store_refresh_index(&state.sessions_ks, &minted.refresh_token, &session_id).await?;
+
+    let max_age = minted.access_expires_at.saturating_sub(now_epoch()).max(1);
+    let session_cookie = build_session_cookie(&minted.access_token, max_age);
+    // The refresh cookie outlives the access cookie by design: it is what
+    // the console presents to mint the next access token, so it is scoped
+    // to the refresh TTL rather than the 300s (aal2) access window.
+    let refresh_max_age = minted.refresh_expires_at.saturating_sub(now_epoch()).max(1);
+    let refresh_cookie = build_refresh_cookie(&minted.refresh_token, refresh_max_age);
+
+    use rand::RngExt;
+    let mut csrf_bytes = [0u8; 32];
+    rand::rng().fill(&mut csrf_bytes);
+    let csrf = hex::encode(csrf_bytes);
+    // Scoped to the refresh window too. If it expired with the access
+    // cookie, the renewal POST — a mutation, and therefore CSRF-gated —
+    // would have no token to present and every renewal would 403.
+    let csrf_cookie = build_csrf_cookie(&csrf, refresh_max_age);
+
+    Ok(AdminCookieSession {
+        session_id,
+        minted,
+        cookies: vec![session_cookie, csrf_cookie, refresh_cookie],
+    })
+}
+
+/// The authenticated session subject's own credentials, for a step-up
+/// challenge scoped to them. An unauthenticated login naming a subject goes
+/// through [`login_credentials_for`] instead, which never refuses.
+async fn credentials_for(
+    state: &AppState,
+    did: &str,
+) -> Result<Vec<webauthn_rs::prelude::Passkey>, AppError> {
+    vti_common::identifier::validate_did("subject", did)?;
+    vti_common::auth::passkey::store::get_passkey_user_by_did(&state.passkey_ks, did)
+        .await?
+        .map(|user| user.credentials)
+        .ok_or_else(|| AppError::Forbidden("no passkeys registered for that subject".into()))
+}
+
+/// The credentials an unauthenticated login naming `did` is challenged
+/// over: the subject's own when it holds passkeys, otherwise a stand-in set
+/// ([`decoy_passkeys`]) derived from `did` under a key only this community
+/// holds.
+///
+/// The two are answered through the same path — one lookup, one
+/// `start_passkey_authentication`, one stored ceremony — so the response's
+/// shape, the stored state and the time taken do not say whether `did` is
+/// enrolled. The stand-in is the same on every call for one `did`, so asking
+/// twice does not tell them apart either. No authenticator holds a stand-in
+/// credential, so its ceremony fails at finish like any wrong assertion.
+async fn login_credentials_for(
+    state: &AppState,
+    did: &str,
+) -> Result<Vec<webauthn_rs::prelude::Passkey>, AppError> {
+    vti_common::identifier::validate_did("subject", did)?;
+    let own = vti_common::auth::passkey::store::get_passkey_user_by_did(&state.passkey_ks, did)
+        .await?
+        .map(|user| user.credentials)
+        .unwrap_or_default();
+    if !own.is_empty() {
+        return Ok(own);
+    }
+    let key = decoy_key(&state.passkey_ks).await?;
+    decoy_passkeys(&key, did)
+}
+
+/// Where the stand-in key lives in `passkey_ks`. Not a ceremony prefix, so
+/// no sweep touches it.
+const DECOY_KEY_ROW: &str = "pk_decoy_key";
+
+/// This community's key for stand-in credentials: 32 random bytes made on
+/// first use and kept, so a stand-in set survives restarts as a real one
+/// does. Stored like every other `passkey_ks` row (encrypted at rest when
+/// the store is).
+async fn decoy_key(ks: &KeyspaceHandle) -> Result<[u8; 32], AppError> {
+    use rand::RngExt;
+    let read = |bytes: Vec<u8>| {
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| AppError::Internal("stand-in credential key is malformed".into()))
+    };
+    if let Some(bytes) = ks.get_raw(DECOY_KEY_ROW).await? {
+        return read(bytes);
+    }
+    let mut fresh = [0u8; 32];
+    rand::rng().fill(&mut fresh);
+    // Two first uses racing: one write wins and both read it back.
+    ks.insert_raw_if_absent(DECOY_KEY_ROW, fresh.to_vec())
+        .await?;
+    match ks.get_raw(DECOY_KEY_ROW).await? {
+        Some(bytes) => read(bytes),
+        None => Err(AppError::Internal(
+            "stand-in credential key was not stored".into(),
+        )),
+    }
+}
+
+/// One or two stand-in credentials for `did`, every detail drawn from
+/// `HMAC-SHA256(key, did)`: how many, each id's length (16, 20, 32 or 64
+/// bytes, the lengths common authenticators use), the id bytes and the
+/// transports (none, or a set common authenticators report). The public key
+/// is never used: no assertion can verify.
+fn decoy_passkeys(
+    key: &[u8; 32],
+    did: &str,
+) -> Result<Vec<webauthn_rs::prelude::Passkey>, AppError> {
+    use base64::Engine as _;
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    let prf = |label: &str| -> [u8; 32] {
+        let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts any key size");
+        mac.update(b"vtc passkey stand-in v1\0");
+        mac.update(label.as_bytes());
+        mac.update(b"\0");
+        mac.update(did.as_bytes());
+        mac.finalize().into_bytes().into()
+    };
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let shape = prf("shape");
+    let count = 1 + usize::from(shape[0] & 1);
+    const LENGTHS: [usize; 4] = [16, 20, 32, 64];
+    // `None`: a client that reported no transports at registration.
+    const TRANSPORTS: [Option<&[&str]>; 5] = [
+        None,
+        Some(&["hybrid", "internal"]),
+        Some(&["internal"]),
+        Some(&["usb"]),
+        Some(&["nfc", "usb"]),
+    ];
+    (0..count)
+        .map(|i| {
+            let len = LENGTHS[usize::from(shape[1 + 2 * i]) % LENGTHS.len()];
+            let transports = TRANSPORTS[usize::from(shape[2 + 2 * i]) % TRANSPORTS.len()];
+            let mut id = prf(&format!("id-{i}-a")).to_vec();
+            id.extend_from_slice(&prf(&format!("id-{i}-b")));
+            id.truncate(len);
+            let x = prf(&format!("x-{i}"));
+            let passkey = serde_json::json!({
+                "cred": {
+                    "cred_id": b64(&id),
+                    "cred": {
+                        "type_": "EDDSA",
+                        "key": { "EC_OKP": { "curve": "ED25519", "x": b64(&x) } }
+                    },
+                    "counter": 0,
+                    "transports": transports,
+                    "user_verified": true,
+                    "backup_eligible": false,
+                    "backup_state": false,
+                    "registration_policy": "required",
+                    "extensions": {},
+                    "attestation": { "data": "None", "metadata": "None" },
+                    "attestation_format": "none"
+                }
+            });
+            serde_json::from_value(passkey)
+                .map_err(|e| AppError::Internal(format!("stand-in credential: {e}")))
+        })
+        .collect()
+}
+
+// ---------- passkey step-up ----------
+
+/// How long a step-up elevation stays fresh. Matches the VTA's
+/// `STEP_UP_ELEVATION_TTL_SECS` so an operator sees one re-prompt cadence
+/// across both services.
+///
+/// This window is the point of the whole ceremony: it is what
+/// [`StepUpAuth`](vti_common::auth::extractor::StepUpAuth) reads, and what stops
+/// one passkey gesture from authorising every future privileged operation on
+/// the session.
+const STEP_UP_ELEVATION_TTL_SECS: u64 = 900; // 15m
+
+/// `purpose: login` response — a new session plus its tokens.
+///
+/// Not `AuthenticateResponse`, which this handler used to reuse: that type
+/// serves `auth/authenticate/0.3`, whose schema is closed and has no `purpose`.
+/// One struct cannot satisfy both tasks, and reusing it here is what left
+/// `login/finish/0.2` short of a required member — the two responses look alike
+/// but answer different questions.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyLoginResponse {
+    /// Always `"login"`. The sibling of [`PasskeyStepUpResponse::purpose`].
+    pub purpose: String,
+    pub session: WireSession,
+    pub tokens: TokenBundle,
+}
+
+/// `purpose: stepUp` response — the elevated session, no tokens. Per
+/// `spec/auth/passkey/login/finish/0.2`: the caller's existing tokens remain
+/// valid and pick up the elevation at the next introspection.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyStepUpResponse {
+    /// Always `"stepUp"`. Echoed so a client driving both purposes through one
+    /// task can tell which branch answered without inspecting the shape.
+    pub purpose: String,
+    pub session: WireSession,
+    /// Carries the elevation deadline the client needs to know when to
+    /// re-prompt. Vendor-namespaced per SPEC.md §4.5.1 — the canonical
+    /// `Session` has no field for it.
+    #[schema(value_type = Object)]
+    pub ext: serde_json::Value,
+}
+
+/// Complete a `purpose: stepUp` ceremony: verify the assertion belongs to the
+/// session that asked for it, then stamp a bounded elevation onto that session.
+///
+/// Every check here is a re-check of something `start` already arranged, because
+/// none of `start`'s arrangements are load-bearing on their own: `allowCredentials`
+/// is a client-side hint the browser may ignore, and the bearer token presented
+/// at finish need not be the one presented at start.
+async fn step_up_finish(
+    state: &AppState,
+    binding: &vti_common::auth::passkey::store::StepUpBinding,
+    auth: Option<&AuthClaims>,
+    asserted_did: &str,
+    auth_result: &webauthn_rs::prelude::AuthenticationResult,
+) -> Result<axum::response::Response, AppError> {
+    // 1. The caller must still hold the session this ceremony was minted for.
+    //    Checking the DID as well as the id means a recycled session id cannot
+    //    carry an elevation across subjects.
+    let claims = auth.ok_or_else(|| {
+        AppError::Unauthorized("step-up requires an authenticated session".into())
+    })?;
+    if claims.session_id != binding.session_id || claims.did != binding.did {
+        warn!(
+            presented_session = %claims.session_id,
+            bound_session = %binding.session_id,
+            "step-up rejected: ceremony belongs to a different session",
+        );
+        return Err(AppError::Unauthorized(
+            "step-up challenge was issued for a different session".into(),
+        ));
+    }
+
+    // 2. The passkey that answered must be the session holder's own. `start`
+    //    only offered their credentials, but `allowCredentials` is advisory —
+    //    without this, any admin's passkey would elevate anyone's session.
+    if asserted_did != binding.did {
+        warn!(
+            asserted = %asserted_did,
+            bound = %binding.did,
+            "step-up rejected: assertion came from another subject's passkey",
+        );
+        return Err(AppError::Unauthorized(
+            "the presented passkey does not belong to this session".into(),
+        ));
+    }
+
+    // 3. Possession alone is not a step-up. The elevation to aal2 claims a
+    //    user-verification gesture (PIN / biometric) actually happened; a
+    //    silent assertion is a single factor.
+    if !auth_result.user_verified() {
+        return Err(AppError::Unauthorized(
+            "passkey did not assert user verification (UV); cannot step up".into(),
+        ));
+    }
+
+    // 4. Elevate. Read-modify-write on the live row so we inherit whatever the
+    //    session already carries (tokens, pubkey, tee flag) rather than
+    //    rebuilding it and dropping a field.
+    //    Conditional on the row as stored: a session signed out while the
+    //    ceremony ran stays signed out instead of being written back elevated.
+    let now = now_epoch();
+    let expires_at = now.saturating_add(STEP_UP_ELEVATION_TTL_SECS);
+    let session = crate::auth::session::update_session_with(
+        &state.sessions_ks,
+        &binding.session_id,
+        |session| {
+            if !session.amr.iter().any(|m| m == "passkey") {
+                session.amr.push("passkey".to_string());
+            }
+            session.acr = "aal2".to_string();
+            session.acr_expires_at = Some(expires_at);
+            session.last_seen = now;
+            true
+        },
+    )
+    .await?
+    .ok_or_else(|| AppError::Unauthorized("session not found".into()))?;
+
+    // The user-verification gesture is the authority for whatever privileged
+    // operation follows inside the window — and since the promote-to-admin
+    // fold, that operation is a *different request*. Record the credential
+    // here; the operation records the session id, and the two rows join.
+    if let Some(writer) = state.audit_writer.as_ref() {
+        writer
+            .write(
+                &binding.did,
+                Some(&binding.session_id),
+                AuditEvent::AuthSteppedUp(AuthSteppedUpData {
+                    session_id: binding.session_id.clone(),
+                    credential_id: hex::encode(<_ as AsRef<[u8]>>::as_ref(auth_result.cred_id())),
+                    acr: session.acr.clone(),
+                    expires_at: chrono::DateTime::from_timestamp(expires_at as i64, 0)
+                        .unwrap_or_default(),
+                }),
+            )
+            .await?;
+    }
+
+    info!(
+        did = %binding.did,
+        session_id = %binding.session_id,
+        "passkey step-up: session elevated"
+    );
+
+    Ok(Json(PasskeyStepUpResponse {
+        purpose: "stepUp".to_string(),
+        session: WireSession {
+            id: session.session_id.clone(),
+            subject: session.did.clone(),
+            issued_at: epoch_to_rfc3339(session.created_at),
+            // The caller's current access token, not the elevation — the
+            // elevation deadline rides in `ext` because it bounds one
+            // privilege window, not the session.
+            expires_at: epoch_to_rfc3339(claims.access_expires_at),
+            amr: session.amr.clone(),
+            acr: session.acr.clone(),
+        },
+        ext: serde_json::json!({
+            "org.openvtc.step-up": { "expiresAt": epoch_to_rfc3339(expires_at) }
+        }),
+    })
+    .into_response())
+}
+
+/// Build the `vtc_admin_session` cookie value.
+///
+/// `Path=/` (not `/admin`) so the browser sends the cookie on
+/// requests to `/v1/*` — the admin SPA needs the cookie on every
+/// authenticated API call, and the API doesn't live under `/admin`.
+/// The earlier M5.3.1 design used `Path=/admin` to keep the cookie
+/// scoped, but `HttpOnly` already blocks JS exfiltration on any
+/// path and `SameSite=Strict` prevents cross-site CSRF — the Path
+/// restriction added no security in exchange for breaking the
+/// cookie-based SPA-→-API path entirely.
+fn build_session_cookie(access_token: &str, max_age: u64) -> String {
+    format!(
+        "{name}={access_token}; Path=/; Max-Age={max_age}; SameSite=Strict; Secure; HttpOnly",
+        name = vti_common::auth::extractor::ADMIN_SESSION_COOKIE,
+    )
+}
+
+/// Build the companion CSRF cookie. `HttpOnly` is intentionally
+/// **not** set — the SPA needs to read this from
+/// `document.cookie` and mirror its value into the
+/// `X-CSRF-Token` header on every mutating request.
+fn build_csrf_cookie(csrf: &str, max_age: u64) -> String {
+    format!(
+        "{name}={csrf}; Path=/; Max-Age={max_age}; SameSite=Strict; Secure",
+        name = crate::routing::csrf::ADMIN_CSRF_COOKIE,
+    )
+}
+
+/// The console's three cookies under the names they had before their
+/// `__Host-` prefix (#2661), expired. Still read for one release, so whatever
+/// ends or replaces a session clears them too: a browser must not keep a
+/// credential under the old name after it signed out, or after a refresh
+/// rotated the token that name carried.
+fn legacy_cookie_clears() -> [String; 3] {
+    use vti_common::auth::extractor::{LEGACY_ADMIN_REFRESH_COOKIE, LEGACY_ADMIN_SESSION_COOKIE};
+    [
+        format!(
+            "{LEGACY_ADMIN_SESSION_COOKIE}=; Path=/; Max-Age=0; SameSite=Strict; Secure; HttpOnly"
+        ),
+        format!(
+            "{LEGACY_ADMIN_REFRESH_COOKIE}=; Path=/; Max-Age=0; SameSite=Strict; Secure; HttpOnly"
+        ),
+        format!(
+            "{name}=; Path=/; Max-Age=0; SameSite=Strict; Secure",
+            name = crate::routing::csrf::LEGACY_ADMIN_CSRF_COOKIE,
+        ),
+    ]
+}
+
+/// The console's CSRF value: the `__Host-` cookie, else the one under the name
+/// before the prefix.
+fn admin_csrf_value(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, crate::routing::csrf::ADMIN_CSRF_COOKIE)
+        .or_else(|| cookie_value(headers, crate::routing::csrf::LEGACY_ADMIN_CSRF_COOKIE))
+}
+
+/// Whether the request carries any console cookie under its name before the
+/// `__Host-` prefix.
+fn carries_legacy_cookie(headers: &HeaderMap) -> bool {
+    use vti_common::auth::extractor::{LEGACY_ADMIN_REFRESH_COOKIE, LEGACY_ADMIN_SESSION_COOKIE};
+    [
+        LEGACY_ADMIN_SESSION_COOKIE,
+        LEGACY_ADMIN_REFRESH_COOKIE,
+        crate::routing::csrf::LEGACY_ADMIN_CSRF_COOKIE,
+    ]
+    .iter()
+    .any(|name| cookie_value(headers, name).is_some())
+}
+
+/// Build the refresh cookie carrying the opaque refresh token.
+///
+/// Same flags as the session cookie, and `HttpOnly` for the same
+/// reason: the SPA never needs to *read* the token, only to have the
+/// browser send it to `/v1/auth/refresh`. Its `Max-Age` is the refresh
+/// TTL, not the access TTL — it has to outlive the access cookie or it
+/// could not renew it, which is the whole point.
+fn build_refresh_cookie(refresh_token: &str, max_age: u64) -> String {
+    format!(
+        "{name}={refresh_token}; Path=/; Max-Age={max_age}; SameSite=Strict; Secure; HttpOnly",
+        name = vti_common::auth::extractor::ADMIN_REFRESH_COOKIE,
+    )
+}
+
+#[cfg(test)]
+mod cookie_format_tests {
+    use super::*;
+
+    /// The session cookie is `Path=/` so the browser sends it on
+    /// every same-origin request — `/v1/*` (API) and `/admin/*`
+    /// (SPA). HttpOnly + SameSite=Strict are what actually
+    /// constrain the cookie's reachability; an earlier
+    /// `Path=/admin` scoping broke the cookie-based SPA-→-API
+    /// path without adding security (HttpOnly already prevents JS
+    /// exfiltration on any path).
+    #[test]
+    fn session_cookie_path_is_root() {
+        let c = build_session_cookie("jwt.token.value", 900);
+        assert!(c.contains("Path=/;"), "got {c}");
+    }
+
+    #[test]
+    fn session_cookie_has_security_flags() {
+        let c = build_session_cookie("jwt.token.value", 900);
+        // All three flags are load-bearing — losing any one is
+        // a CSRF / cookie-theft / TLS-stripping regression.
+        assert!(c.contains("HttpOnly"), "got {c}");
+        assert!(c.contains("Secure"), "got {c}");
+        assert!(c.contains("SameSite=Strict"), "got {c}");
+    }
+
+    #[test]
+    fn csrf_cookie_is_root_scoped_but_not_httponly() {
+        let c = build_csrf_cookie("abc123", 900);
+        // CSRF cookie is intentionally readable by JS so the
+        // SPA can mirror it into `X-CSRF-Token`.
+        assert!(c.contains("Path=/"), "got {c}");
+        assert!(
+            !c.contains("HttpOnly"),
+            "CSRF cookie must be JS-readable: {c}"
+        );
+        assert!(c.contains("Secure"), "got {c}");
+        assert!(c.contains("SameSite=Strict"), "got {c}");
+    }
+
+    /// #2661: every console cookie is `__Host-`-prefixed, which a browser
+    /// accepts only with `Secure`, `Path=/` and no `Domain`.
+    #[test]
+    fn issue_2661_console_cookies_hold_the_host_prefix_rules() {
+        for c in [
+            build_session_cookie("t", 1),
+            build_refresh_cookie("r", 1),
+            build_csrf_cookie("c", 1),
+        ] {
+            assert!(c.starts_with("__Host-"), "got {c}");
+            assert!(c.contains("Path=/;") && c.contains("Secure"), "got {c}");
+            assert!(!c.contains("Domain"), "got {c}");
+        }
+    }
+
+    #[test]
+    fn session_cookie_uses_canonical_name() {
+        let c = build_session_cookie("t", 1);
+        assert!(
+            c.starts_with(&format!(
+                "{}=",
+                vti_common::auth::extractor::ADMIN_SESSION_COOKIE
+            )),
+            "got {c}"
+        );
+    }
+}
+
+// ---------- POST /auth/refresh ----------
+
+/// The canonical `auth/refresh/0.2` Type URI, shared by both request shapes —
+/// the DIDComm envelope's `msg.typ` and the REST Trust Task's `type`. The
+/// legacy `affinidi.com/atm/1.0/authenticate/refresh` alias was removed.
+const REFRESH_TASK_URI: &str = <refresh::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// `POST /v1/auth/refresh` — exchange the presented refresh
+/// token for a new access + refresh pair.
+///
+/// Returns the canonical `AuthenticateResponse { session, tokens }`
+/// shape (replaces the legacy `{ sessionId, data: { accessToken,
+/// accessExpiresAt } }`). The full token-rotation logic — atomic
+/// claim, refresh-expiry check, ACL re-look-up, AAL preservation
+/// across rotation, RFC 6749 §10.4 rotation semantics — lives in
+/// the canonical handler in vti-common.
+///
+/// Two request shapes, tried in order:
+///
+/// 1. **Trust-Task `auth/refresh/0.2` document** (canonical REST) — no
+///    mediator, no DIDComm stack. See [`try_refresh_trust_task`].
+/// 2. **DIDComm authcrypt envelope** — for clients already on a mediator.
+///    Unchanged, and still gated by `bind_authcrypt_sender`.
+#[utoipa::path(
+    post, path = "/auth/refresh", tag = "auth",
+    request_body(content = String, description = "DIDComm envelope or Trust-Task refresh document"),
+    responses(
+        (status = 200, description = "Rotated access + refresh tokens", body = AuthenticateResponse),
+        (status = 401, description = "Refresh token not found, revoked, or already used"),
+    ),
+)]
+pub async fn refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, AppError> {
+    // Cookie path, tried first: the admin console posts an empty body and
+    // lets the browser present `vtc_admin_refresh`. It has to come before
+    // the others because there is no document to sniff — an empty body is
+    // not a Trust Task and not a DIDComm envelope, so without this it
+    // would fall through to "ATM not configured".
+    //
+    // This is the only path that answers with `Set-Cookie`, because it is
+    // the only one whose caller keeps its credentials in cookies.
+    if let Some(token) = vti_common::auth::extractor::admin_refresh_cookie(&headers) {
+        let backend = crate::auth::VtcAuthBackend::from_state(&state).await?;
+        let resp = vti_common::auth::handlers::handle_refresh(
+            &backend,
+            vti_common::auth::RefreshInput {
+                refresh_token: token,
+                // No proven signer on this path, exactly as on the REST
+                // Trust-Task path: the opaque token is the credential.
+                signer_did: None,
+            },
+        )
+        .await?;
+        return reissue_session_cookies(&state, resp, &headers).await;
+    }
+
+    // Canonical REST path, tried first so a VTC reached by a client with no
+    // DIDComm stack — and a VTC running with no `atm` at all — can still
+    // refresh. Falls through for any body that isn't such a document.
+    if let Some(resp) = try_refresh_trust_task(&state, &body).await? {
+        return Ok(Json(resp).into_response());
+    }
+
+    let atm = state
+        .atm
+        .as_ref()
+        .ok_or_else(|| AppError::Authentication("ATM not configured".into()))?;
+
+    // A sender that rotated its key-agreement key since its document was
+    // cached is re-resolved once before the message is refused (VTI-KEY-134).
+    let (msg, metadata) =
+        vta_sdk::did_refresh::unpack_refreshing_sender(atm, state.did_resolver.as_ref(), &body)
+            .await
+            .map_err(|e| AppError::Authentication(format!("failed to unpack message: {e}")))?;
+
+    // The opaque refresh token is the credential, but `handle_refresh` still
+    // binds `msg.from` to the session DID — so require the same authcrypt gate.
+    let sender_base = vti_common::auth::bind_authcrypt_sender(&body, &msg, &metadata)
+        .map_err(|e| AppError::Authentication(e.message("refresh message")))?;
+
+    // Canonical Trust-Task URI only — see [`REFRESH_TASK_URI`].
+    if msg.typ.as_str() != REFRESH_TASK_URI {
+        return Err(AppError::Authentication(format!(
+            "unexpected message type: {}",
+            msg.typ
+        )));
+    }
+
+    let refresh_token = msg.body["refresh_token"]
+        .as_str()
+        .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?
+        .to_string();
+
+    let backend = crate::auth::VtcAuthBackend::from_state(&state).await?;
+    let resp = vti_common::auth::handlers::handle_refresh(
+        &backend,
+        vti_common::auth::RefreshInput {
+            refresh_token,
+            signer_did: Some(sender_base),
+        },
+    )
+    .await?;
+    Ok(Json(resp).into_response())
+}
+
+/// Read one cookie's value out of a request's `Cookie` headers.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .map(str::trim)
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Re-issue the console's cookie trio after a successful cookie refresh.
+///
+/// All three move together. The session cookie carries the new access
+/// token; the refresh cookie carries the rotated refresh token, and must
+/// be replaced because rotation invalidated the old one — leaving the
+/// stale cookie in place would make the *next* renewal fail. The csrf
+/// cookie keeps its **existing value** and is re-sent only to extend its
+/// `Max-Age`: the SPA has already mirrored that value into its in-memory
+/// header state, and handing it a new one mid-flight would 403 every
+/// mutation issued between this response landing and the SPA re-reading
+/// `document.cookie`.
+async fn reissue_session_cookies(
+    state: &AppState,
+    resp: AuthenticateResponse,
+    request_headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    // The time the rotated token really has left, which is less than the
+    // configured TTL when the session has an absolute end (a wallet
+    // sign-in's grant `notAfter`) — no cookie may outlive it.
+    let refresh_ttl = match resp.tokens.refresh_expires_in {
+        Some(left) => left.max(1),
+        None => state.config.read().await.auth.refresh_token_expiry,
+    };
+    let access_max_age = resp.tokens.expires_in.max(1);
+    let session_cookie = build_session_cookie(&resp.tokens.access_token, access_max_age);
+    let refresh_cookie = resp
+        .tokens
+        .refresh_token
+        .as_ref()
+        .map(|t| build_refresh_cookie(t, refresh_ttl));
+    // Same value, longer life. A missing csrf cookie means the caller is
+    // not the console (it always has one), so there is nothing to extend.
+    let csrf_cookie = admin_csrf_value(request_headers).map(|v| build_csrf_cookie(&v, refresh_ttl));
+    // A console signed in before the `__Host-` rename moves to the new names
+    // here; the old ones are expired, so the rotated-out refresh token is not
+    // left behind under its old name.
+    let legacy_clears = carries_legacy_cookie(request_headers)
+        .then(legacy_cookie_clears)
+        .into_iter()
+        .flatten()
+        .map(Some);
+
+    let mut response = Json(resp).into_response();
+    let headers = response.headers_mut();
+    for cookie in [Some(session_cookie), refresh_cookie, csrf_cookie]
+        .into_iter()
+        .chain(legacy_clears)
+        .flatten()
+    {
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::try_from(cookie)
+                .map_err(|e| AppError::Internal(format!("invalid cookie on refresh: {e}")))?,
+        );
+    }
+    Ok(response)
+}
+
+/// Try to refresh from an `auth/refresh/0.2` Trust Task document — the
+/// canonical REST transport, and the VTC counterpart of the VTA's
+/// `try_refresh_trust_task`.
+///
+/// **Why this exists.** `POST /v1/auth/` already has a mediator-less path
+/// ([`authenticate_siop`]), so a wallet can *log in* to a VTC over plain
+/// REST. Without this, exercising the refresh token it was just handed
+/// required posting an authcrypt DIDComm envelope — a mediator stack the
+/// client otherwise never touched — so a genuinely REST-only client had to
+/// re-run the whole SIOP round-trip on every access-token expiry.
+///
+/// **Why there is no proof here.** Refresh carries none: the opaque refresh
+/// token in the payload *is* the bearer credential (RFC 6749 §10.4 rotation),
+/// verified server-side by the canonical handler's single-use rotating
+/// reverse-index. `signer_did` is therefore `None` — there is no proven signer
+/// to bind, and the handler reads `None` as "skip the optional signer-DID
+/// check". That is the same posture the DIDComm path ends up in: its
+/// `bind_authcrypt_sender` gate proves *who sent the envelope*, but the token
+/// is what actually authorizes the rotation. A stolen refresh token is
+/// therefore exactly as usable over REST as the token itself is — which is
+/// why rotation is single-use and a replay surfaces as "not found".
+///
+/// The wire shape is the canonical Trust Task, byte-identical to the VTA's
+/// (`payload.refreshToken`, camelCase per R3.1) rather than the DIDComm
+/// path's snake_case `refresh_token` body — so one REST client speaks to both
+/// services with one document builder.
+///
+/// Returns `Ok(None)` when the body isn't an `auth/refresh/0.2` Trust Task (→
+/// fall through to the DIDComm path); `Err` when it *is* one but is invalid.
+async fn try_refresh_trust_task(
+    state: &AppState,
+    body: &str,
+) -> Result<Option<AuthenticateResponse>, AppError> {
+    let doc: TrustTask<serde_json::Value> = match serde_json::from_str(body) {
+        Ok(doc) => doc,
+        Err(_) => return Ok(None), // not a Trust Task document → DIDComm path
+    };
+    if doc.type_uri.to_string() != REFRESH_TASK_URI {
+        return Ok(None);
+    }
+
+    let payload: refresh::Payload = serde_json::from_value(doc.payload)
+        .map_err(|e| AppError::Authentication(format!("invalid refresh payload: {e}")))?;
+
+    let backend = crate::auth::VtcAuthBackend::from_state(state).await?;
+    let resp = vti_common::auth::handlers::handle_refresh(
+        &backend,
+        vti_common::auth::RefreshInput {
+            refresh_token: payload.refresh_token.to_string(),
+            signer_did: None,
+        },
+    )
+    .await?;
+    Ok(Some(resp))
+}
+
+// ---------- GET /auth/whoami ----------
+
+/// Wire shape returned by `whoami`. Minimal: enough for the admin
+/// SPA's nav header to show "Signed in as …" with a role badge,
+/// without needing to decode the JWT client-side (the session
+/// cookie is HttpOnly).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(utoipa::ToSchema)]
+pub struct WhoamiResponse {
+    /// The caller's session, under the member the task publishes.
+    ///
+    /// This response was a flat `{did, role, sessionId, accessExpiresAt,
+    /// allowedContexts}` until #1112 — every member outside the canonical
+    /// vocabulary, on a response that is `additionalProperties: false`. No
+    /// conforming client could read any of it.
+    pub session: SessionView,
+    /// The caller's roles. Plural because the component says so: a single
+    /// role is one entry, and a deployment that grows to several does not
+    /// need a new response shape.
+    pub roles: Vec<String>,
+    /// The contexts this session may act in — `allowedContexts` under the
+    /// canonical name.
+    pub scopes: Vec<String>,
+    /// What the caller's ACL entry lets it do **now**, as `cap[@resource]` —
+    /// the published member for exactly this (`auth/whoami/0.1`
+    /// `capabilities`: "resolved as they would be enforced"). Read from the
+    /// live entry on every call, never from the session, so a console renders
+    /// navigation and actions per capability rather than per role. A hint for
+    /// what to offer: every operation still asks the entry itself.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// `org.openvtc`: the administrative role, and what the caller may
+    /// approve — which the published members have no place for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub ext: Option<serde_json::Value>,
+}
+
+/// The canonical `Session` shape.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionView {
+    pub id: String,
+    /// The DID this session authenticates.
+    pub subject: String,
+    /// When the session was issued — the JWT's `iat`, required by the
+    /// component and simply never surfaced before.
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// Authentication methods per RFC 8176, when the token records any.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub amr: Vec<String>,
+    /// Authentication context class per OIDC Core §2, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acr: Option<String>,
+}
+
+/// `auth/whoami/0.1`'s answer for `session`, whose subject is `did`: the
+/// session as stored, and what the subject's live ACL entry lets it do now
+/// (VTI-ACL-034).
+///
+/// Served only as a signed document (`trust_tasks::whoami_tasks`), whose
+/// signer is the key bound to `session` at sign-in or a console key the
+/// subject enrolled. The bearer route `GET /v1/auth/whoami` is gone (#1641):
+/// the cookie names a session, and a key now has to speak for it.
+///
+/// `session.expiresAt` is when the **session** ends — its refresh expiry,
+/// clamped to any absolute end — which is what the published member means
+/// ("when the session ceases to be valid"). The console's access cookie is
+/// shorter-lived and renewed through `auth/refresh/0.2`, which reports its
+/// own expiry.
+pub(crate) async fn whoami_for(
+    state: &AppState,
+    session: &Session,
+    role: vti_common::acl::Role,
+) -> WhoamiResponse {
+    let did = session.did.as_str();
+    // The live entry, read now (VTI-ACL-034): what the console may offer.
+    let entry = crate::acl::get_acl_entry(&state.acl_ks, did)
+        .await
+        .ok()
+        .flatten()
+        .filter(|e| !e.is_expired(now_epoch()));
+    let capabilities = entry
+        .as_ref()
+        .map(crate::acl::VtcAclEntry::capability_list)
+        .unwrap_or_default();
+    let ext = entry.as_ref().map(|e| {
+        let approves: Vec<String> = if e.admin.approve.is_all() {
+            e.admin
+                .effective_approvable()
+                .iter()
+                .map(crate::acl::CapRef::display)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        serde_json::json!({ "org.openvtc": {
+            "adminRole": e.admin.admin_role.as_ref().map(|r| r.to_string()),
+            "approves": approves,
+        }})
+    });
+    let ends_at = match (session.refresh_expires_at, session.not_after) {
+        (Some(r), Some(n)) => r.min(n),
+        (Some(r), None) => r,
+        (None, Some(n)) => n,
+        (None, None) => now_epoch(),
+    };
+    WhoamiResponse {
+        capabilities,
+        ext,
+        session: SessionView {
+            id: session.session_id.clone(),
+            subject: did.to_string(),
+            issued_at: epoch_to_datetime(session.created_at),
+            expires_at: epoch_to_datetime(ends_at),
+            amr: session.amr.clone(),
+            acr: Some(session.acr.clone()).filter(|a| !a.is_empty()),
+        },
+        roles: vec![role.to_string()],
+        // A VTC entry holds no contexts (VTI-VTC-010).
+        scopes: Vec::new(),
+    }
+}
+
+/// The `ext["org.openvtc"].sessionKey` a console sign-in asks to bind to the
+/// session it mints, as the Ed25519 multikey `Session::session_pubkey_b58btc`
+/// stores (`z6Mk…`).
+///
+/// The same binding `auth/authenticate/0.3`'s `sessionKey` makes and
+/// `auth/oob/redeem` makes for its `K_b`: a browser key, non-extractable on
+/// the console's side, that later signs `auth/whoami/0.1` for this session.
+/// Absent is `Ok(None)`; anything but an Ed25519 `did:key` is refused, before
+/// any ceremony state is spent.
+pub(crate) fn session_key_from_ext(ext: Option<&JsonValue>) -> Result<Option<String>, AppError> {
+    let Some(value) = ext
+        .and_then(|e| e.get(EXT_NAMESPACE))
+        .and_then(|o| o.get("sessionKey"))
+    else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .and_then(crate::member_portal::oob::did_key_multikey)
+        .map(|mk| Some(mk.to_string()))
+        .ok_or_else(|| {
+            AppError::Validation(
+                "ext[\"org.openvtc\"].sessionKey must be an Ed25519 did:key (did:key:z6Mk…)".into(),
+            )
+        })
+}
+
+/// Unix seconds to a `DateTime`, for the `format: date-time` members the
+/// canonical components use. Out-of-range input clamps to the epoch rather
+/// than panicking — a malformed timestamp should not take the endpoint down.
+fn epoch_to_datetime(secs: u64) -> DateTime<Utc> {
+    DateTime::from_timestamp(secs as i64, 0).unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+// ---------- POST /auth/sign-out ----------
+
+/// `POST /v1/auth/sign-out` — revoke the caller's session and
+/// expire the cookie pair. The cookies' HttpOnly flag means JS
+/// can't clear them itself — only the server can issue
+/// `Set-Cookie: ...; Max-Age=0` to delete from the browser's jar.
+///
+/// Signing out of a session that has already ended is what the caller
+/// wanted, so it answers `204` too. The common case is a console left
+/// open past its access token: the browser has dropped the session
+/// cookie (its `Max-Age` is the token's lifetime) but still holds the
+/// refresh cookie, which outlives it. Answering `401` there left that
+/// cookie in the jar — the clearing headers ride only on this response —
+/// and told the operator their sign-out had failed. So the session is
+/// found from whichever credential is presented: the access token, or
+/// failing that the refresh cookie when it is the one its session
+/// currently issues. With neither, there is nothing to revoke, and the
+/// cookies are still cleared.
+#[utoipa::path(
+    post, path = "/auth/sign-out", tag = "auth",
+    security((), ("bearer_jwt" = [])),
+    responses(
+        (status = 204, description = "Any session the request names is revoked; the session, refresh and CSRF cookies are cleared"),
+    ),
+)]
+pub async fn sign_out(
+    auth: Result<AuthClaims, AppError>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, AppError> {
+    use axum::http::HeaderValue;
+    use axum::http::header::SET_COOKIE;
+
+    let sessions = state.sessions_ks.clone();
+    let ending = match auth {
+        Ok(auth) => Some((auth.did, auth.session_id)),
+        Err(_) => match vti_common::auth::extractor::admin_refresh_cookie(&headers) {
+            Some(token) => session_by_current_refresh(&sessions, &token)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "sign-out: refresh-cookie session lookup failed");
+                    None
+                }),
+            None => None,
+        },
+    };
+
+    if let Some((did, session_id)) = ending {
+        // Best-effort delete — a failure still falls through to the
+        // cookie clearing below, so the browser stops sending the stale
+        // JWT either way.
+        let _ = delete_session(&sessions, &session_id).await;
+
+        // Audit the session ending. Best-effort like the delete above: a
+        // failed audit write must not leave the caller holding a live
+        // cookie pair they were told was cleared.
+        if let Some(writer) = state.audit_writer.as_ref()
+            && let Err(e) = writer
+                .write(
+                    &did,
+                    Some(&did),
+                    AuditEvent::SignedOut(SignedOutData {
+                        session_id: session_id.clone(),
+                    }),
+                )
+                .await
+        {
+            tracing::warn!(error = %e, did = %did, "sign-out audit write failed");
+        }
+        info!(did = %did, session_id = %session_id, "sign-out");
+    } else {
+        // Nothing live to end: no audit row, because no session stopped
+        // here. Only the cookies go.
+        tracing::debug!("sign-out with no live session; clearing cookies only");
+    }
+
+    // Sign-out has nothing to report: the session it names is gone, so 204
+    // is the honest status and the cookie-clearing headers are the whole
+    // effect.
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let headers = response.headers_mut();
+    let session_clear = format!(
+        "{name}=; Path=/; Max-Age=0; SameSite=Strict; Secure; HttpOnly",
+        name = vti_common::auth::extractor::ADMIN_SESSION_COOKIE,
+    );
+    let csrf_clear = format!(
+        "{name}=; Path=/; Max-Age=0; SameSite=Strict; Secure",
+        name = crate::routing::csrf::ADMIN_CSRF_COOKIE,
+    );
+    // The refresh cookie outlives the session cookie, so leaving it behind
+    // would leave a signed-out browser holding a credential that still
+    // mints access tokens — sign-out that does not sign you out.
+    let refresh_clear = format!(
+        "{name}=; Path=/; Max-Age=0; SameSite=Strict; Secure; HttpOnly",
+        name = ADMIN_REFRESH_COOKIE,
+    );
+    headers.append(
+        SET_COOKIE,
+        HeaderValue::try_from(session_clear)
+            .map_err(|e| AppError::Internal(format!("invalid session cookie: {e}")))?,
+    );
+    headers.append(
+        SET_COOKIE,
+        HeaderValue::try_from(refresh_clear)
+            .map_err(|e| AppError::Internal(format!("invalid refresh cookie: {e}")))?,
+    );
+    headers.append(
+        SET_COOKIE,
+        HeaderValue::try_from(csrf_clear)
+            .map_err(|e| AppError::Internal(format!("invalid csrf cookie: {e}")))?,
+    );
+    // The same three under their names before the `__Host-` prefix (#2661).
+    for clear in legacy_cookie_clears() {
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::try_from(clear)
+                .map_err(|e| AppError::Internal(format!("invalid cookie: {e}")))?,
+        );
+    }
+    Ok(response)
+}
+
+/// The `(did, session_id)` a refresh cookie belongs to, when it is the token
+/// that session currently issues.
+///
+/// Currency is checked the way `/auth/refresh` checks it — the
+/// `refresh-current:` record, falling back to the row only for sessions that
+/// predate it — so a superseded token cannot end the session that replaced
+/// it. It could not renew that session either; sign-out grants it nothing
+/// refresh would not.
+async fn session_by_current_refresh(
+    sessions: &KeyspaceHandle,
+    token: &str,
+) -> Result<Option<(String, String)>, AppError> {
+    use crate::auth::session::{current_refresh_hash, get_session_by_refresh, refresh_token_hash};
+
+    let Some(session_id) = get_session_by_refresh(sessions, token).await? else {
+        return Ok(None);
+    };
+    let Some(session) = get_session(sessions, &session_id).await? else {
+        return Ok(None);
+    };
+    let presented = refresh_token_hash(token);
+    let current = match current_refresh_hash(sessions, &session_id).await? {
+        Some(hash) => hash == presented,
+        None => session.refresh_token.as_deref().map(refresh_token_hash) == Some(presented),
+    };
+    Ok(current.then_some((session.did, session.session_id)))
+}
+
+/// `auth/sessions/list/0.1#response` — the sessions the caller may see.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListResponse {
+    /// Newest first (`issuedAt` descending), as the specification recommends.
+    pub sessions: Vec<SessionView>,
+}
+
+/// When `session` stops being usable, as [`crate::auth::session`]'s sweeper
+/// reckons it: a REST session at its refresh token's deadline, an intrinsic
+/// (DIDComm / TSP) session a day after it was last seen.
+fn session_expiry(session: &Session) -> u64 {
+    if session.refresh_token.is_none() && session.session_id == session.did {
+        session.last_seen.max(session.created_at)
+            + vti_common::auth::session::INTRINSIC_SESSION_IDLE_TTL_SECS
+    } else {
+        session.refresh_expires_at.unwrap_or(session.created_at)
+    }
+}
+
+/// `auth/sessions/list/0.1` — the live sessions `actor` may see: its own, and
+/// those of every subject whose access it could withdraw
+/// ([`may_end_sessions_of`], the `acl/revoke` check). The authority is the
+/// revocation's, so an administrator is shown exactly the sessions it can end:
+/// a context admin sees neither an unrestricted admin's sessions nor those of
+/// an admin whose scope reaches past its own, and a session whose subject has
+/// no ACL entry is visible only to an unrestricted admin.
+pub(crate) async fn list_sessions_for(
+    state: &AppState,
+    actor_did: &str,
+) -> Result<SessionListResponse, AppError> {
+    let now = now_epoch();
+    let mut visible = std::collections::HashMap::<String, bool>::new();
+    let mut sessions = Vec::new();
+    for session in list_sessions(&state.sessions_ks).await? {
+        if session.state != SessionState::Authenticated {
+            continue;
+        }
+        let expires = session_expiry(&session);
+        if expires < now {
+            continue;
+        }
+        let may = match visible.get(&session.did) {
+            Some(may) => *may,
+            None => {
+                let may = may_end_sessions_of(state, actor_did, &session.did).await?;
+                visible.insert(session.did.clone(), may);
+                may
+            }
+        };
+        if !may {
+            continue;
+        }
+        sessions.push(SessionView {
+            id: session.session_id.clone(),
+            subject: session.did.clone(),
+            issued_at: epoch_to_datetime(session.created_at),
+            expires_at: epoch_to_datetime(expires),
+            amr: session.amr.clone(),
+            acr: Some(session.acr.clone()).filter(|a| !a.is_empty()),
+        });
+    }
+    sessions.sort_by(|a, b| b.issued_at.cmp(&a.issued_at).then(a.id.cmp(&b.id)));
+    info!(caller = %actor_did, count = sessions.len(), "sessions listed");
+    Ok(SessionListResponse { sessions })
+}
+
+/// What `auth/revoke-session/0.2` names: one session, or every session of a
+/// subject (`all: true` is the producer's own).
+pub(crate) enum RevokeTarget {
+    Session(String),
+    Subject(String),
+}
+
+/// `auth/revoke-session/0.2`, by `actor`.
+///
+/// **One session** (`sessionId`): its own, or one whose subject the caller
+/// could withdraw the access of ([`may_end_sessions_of`]). A session that does
+/// not exist, was already revoked, or belongs to a subject outside the
+/// caller's authority is answered identically — `revokedCount: 0`, the form
+/// the specification recommends — so a retry succeeds and the answer says
+/// nothing about sessions the caller does not control.
+///
+/// **A subject** (`subject`, or `all: true` for the producer itself): refused
+/// with `permissionDenied` — the same whether or not the subject is known or
+/// holds sessions — unless the caller could withdraw the subject's access.
+/// Overlap is not enough: an admin of `a` must not sign out an admin of
+/// `[a, b]`. Super-admins are unrestricted (and may mop up orphan sessions for
+/// a DID with no ACL row). Every refusal of this form is audited (item 7).
+pub(crate) async fn revoke_sessions_task(
+    state: &AppState,
+    actor_did: &str,
+    target: RevokeTarget,
+    reason: Option<String>,
+) -> Result<RevokeSessionResponse, AppError> {
+    let sessions = &state.sessions_ks;
+    match target {
+        RevokeTarget::Session(session_id) => {
+            let none = || RevokeSessionResponse { revoked_count: 0 };
+            let Some(session) = get_session(sessions, &session_id).await? else {
+                return Ok(none());
+            };
+            if !may_end_sessions_of(state, actor_did, &session.did).await? {
+                info!(
+                    caller = %actor_did,
+                    target_did = %session.did,
+                    "session revocation outside the caller's authority, answered as absent"
+                );
+                return Ok(none());
+            }
+            delete_session(sessions, &session_id).await?;
+            if let Some(writer) = state.audit_writer.as_ref() {
+                writer
+                    .write(
+                        actor_did,
+                        Some(&session.did),
+                        AuditEvent::SessionRevoked(SessionRevokedData {
+                            session_id: Some(session_id.clone()),
+                            revoked_count: 1,
+                            reason,
+                        }),
+                    )
+                    .await?;
+            }
+            info!(caller = %actor_did, session_id = %session_id, "session revoked");
+            Ok(RevokeSessionResponse { revoked_count: 1 })
+        }
+        RevokeTarget::Subject(subject) => {
+            if !may_end_sessions_of(state, actor_did, &subject).await? {
+                info!(
+                    caller = %actor_did,
+                    target_did = %subject,
+                    "session revocation by subject refused: outside the caller's authority"
+                );
+                // Fail closed: a refusal the audit trail cannot record is not
+                // answered as though it had been.
+                if let Some(writer) = state.audit_writer.as_ref() {
+                    writer
+                        .write(
+                            actor_did,
+                            Some(&subject),
+                            AuditEvent::SessionRevocationRefused(SessionRevocationRefusedData {
+                                reason,
+                            }),
+                        )
+                        .await?;
+                }
+                return Err(AppError::Forbidden(
+                    "cannot revoke sessions for a DID outside your authority".into(),
+                ));
+            }
+            let revoked = revoke_sessions_for_did(sessions, &subject).await?;
+            if revoked > 0
+                && let Some(writer) = state.audit_writer.as_ref()
+            {
+                writer
+                    .write(
+                        actor_did,
+                        Some(&subject),
+                        AuditEvent::SessionRevoked(SessionRevokedData {
+                            session_id: None,
+                            revoked_count: revoked as u32,
+                            reason,
+                        }),
+                    )
+                    .await?;
+            }
+            info!(caller = %actor_did, target_did = %subject, revoked, "sessions revoked by DID");
+            Ok(RevokeSessionResponse {
+                revoked_count: revoked,
+            })
+        }
+    }
+}
+
+/// Whether `actor` may end `subject`'s sessions (`auth/revoke-session/0.2`
+/// Authorization, VTI-SES-043). Its own sessions always. Anyone else's takes
+/// `vtc.sessions.revoke` (incident response, `vtc-admin-roles.md` §4), read
+/// from the actor's live entry — and an administrator's also takes an entry
+/// that covers theirs (VTI-ACL-050), so a holder of the capability cannot sign
+/// out an administrator wider than itself.
+async fn may_end_sessions_of(
+    state: &AppState,
+    actor_did: &str,
+    subject: &str,
+) -> Result<bool, AppError> {
+    if actor_did == subject {
+        return Ok(true);
+    }
+    let Some(actor_entry) = get_acl_entry(&state.acl_ks, actor_did).await? else {
+        return Ok(false);
+    };
+    if !actor_entry.can(crate::acl::Capability::SessionsRevoke, None) {
+        return Ok(false);
+    }
+    Ok(match get_acl_entry(&state.acl_ks, subject).await? {
+        Some(entry) if entry.is_administrator() => crate::acl::granting::covers_entry(
+            &actor_entry,
+            &entry,
+            crate::auth::session::now_epoch(),
+        ),
+        _ => true,
+    })
+}
+
+/// `auth/revoke-session/0.2#response` — how many sessions the call ended.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokeSessionResponse {
+    pub revoked_count: u64,
+}
+
+/// Delete every session whose subject is `did`; returns the count revoked.
+///
+/// Shared by [`revoke_sessions_task`] and the ACL-downgrade path in
+/// [`crate::acl::ops::update_acl`], which revokes a demoted admin's live
+/// sessions so the still-valid JWT can't outlive the downgrade.
+pub(crate) async fn revoke_sessions_for_did(
+    sessions: &KeyspaceHandle,
+    did: &str,
+) -> Result<u64, AppError> {
+    let all = list_sessions(sessions).await?;
+    let mut revoked = 0u64;
+    for session in all {
+        if session.did == did {
+            delete_session(sessions, &session.session_id).await?;
+            revoked += 1;
+        }
+    }
+    Ok(revoked)
+}
+
+#[cfg(test)]
+mod stand_in_credential_tests {
+    use super::*;
+
+    fn ids(passkeys: &[webauthn_rs::prelude::Passkey]) -> Vec<Vec<u8>> {
+        passkeys
+            .iter()
+            .map(|p| <_ as AsRef<[u8]>>::as_ref(p.cred_id()).to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn a_subject_always_gets_the_same_stand_in_set() {
+        let key = [7u8; 32];
+        let a = decoy_passkeys(&key, "did:key:z6MkA").unwrap();
+        let again = decoy_passkeys(&key, "did:key:z6MkA").unwrap();
+        assert_eq!(ids(&a), ids(&again));
+        assert!((1..=2).contains(&a.len()));
+        for id in ids(&a) {
+            assert!([16, 20, 32, 64].contains(&id.len()), "{}", id.len());
+        }
+        let b = decoy_passkeys(&key, "did:key:z6MkB").unwrap();
+        assert_ne!(ids(&a), ids(&b));
+        let other_key = decoy_passkeys(&[8u8; 32], "did:key:z6MkA").unwrap();
+        assert_ne!(
+            ids(&a),
+            ids(&other_key),
+            "only this community's key derives them"
+        );
+    }
+
+    #[test]
+    fn a_stand_in_set_starts_a_ceremony_like_a_real_one() {
+        let webauthn =
+            vti_common::auth::passkey::build_webauthn("https://vtc.example.com").unwrap();
+        let passkeys = decoy_passkeys(&[7u8; 32], "did:key:z6MkA").unwrap();
+        let (rcr, _state) = webauthn
+            .start_passkey_authentication(&passkeys)
+            .expect("webauthn-rs accepts the stand-in credentials");
+        let options = serde_json::to_value(&rcr.public_key).unwrap();
+        let allowed = options["allowCredentials"].as_array().unwrap();
+        assert_eq!(allowed.len(), passkeys.len());
+        for entry in allowed {
+            assert_eq!(entry["type"], "public-key");
+            assert!(entry["id"].is_string());
+            assert!(entry.get("transports").is_none_or(|t| t.is_array()));
+        }
+        assert_eq!(options["userVerification"], "required");
+    }
+}

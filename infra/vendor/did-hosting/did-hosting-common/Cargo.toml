@@ -1,0 +1,285 @@
+[package]
+name = "did-hosting-common"
+description = "DID Hosting Common, Common methods and structs related to WebVH Content"
+version = "0.12.0"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = ["method-webvh", "method-web"]
+
+# ---- DID method support ----
+#
+# Each `method-*` feature gates a single `DidMethod` impl in
+# `src/method/`. The dispatcher (`method_by_name`) is compile-time —
+# disabling a feature removes its arm from the dispatcher AND its
+# resolution-endpoint route from the router. The default build
+# enables `webvh` + `web`. `method-webs` is implemented but off by
+# default — it pulls the KERI stack, and an operator who hosts no
+# did:webs DIDs should not carry it. `webplus` is still a scaffolded
+# stub that fails compile with a clear pointer.
+
+method-webvh = []
+method-web = []
+method-webs = ["dep:affinidi-did-webs"]
+method-webplus = []
+
+metrics = ["server-core"]
+server-core = [
+    "dep:vti-secrets",
+    "dep:axum", "dep:axum-extra", "dep:jsonwebtoken", "dep:ed25519-dalek",
+    "dep:multibase", "dep:chrono", "dep:rand", "dep:tokio", "dep:tokio-util",
+    "dep:tower-http", "dep:tracing-subscriber", "dep:hex",
+    "dep:trust-tasks-rs", "dep:trust-tasks-https", "dep:trust-tasks-didcomm",
+    "dep:trust-tasks-proof", "dep:affinidi-data-integrity",
+    "dep:affinidi-messaging-didcomm-service", "dep:affinidi-messaging-didcomm",
+    "dep:affinidi-tsp", "dep:affinidi-messaging-sdk",
+    "dep:trust-tasks-build", "dep:affinidi-rate-limit", "dep:affinidi-net-guard",
+    "dep:zeroize", "dep:clap",
+]
+store-fjall = ["server-core", "dep:fjall"]
+store-redis = ["server-core", "dep:redis"]
+store-dynamodb = ["server-core", "dep:aws-sdk-dynamodb", "dep:aws-config"]
+store-firestore = ["server-core", "dep:firestore", "dep:futures"]
+store-cosmosdb = ["server-core", "dep:azure_data_cosmos", "dep:azure_core", "dep:futures"]
+# Runs the Cosmos DB backend's unit tests against the Cosmos DB SDK's
+# in-memory emulator (an unstable, test-only SDK feature). Tests only.
+cosmosdb-emulator = [
+    "store-cosmosdb",
+    "test-support",
+    "azure_data_cosmos/__internal_in_memory_emulator",
+    "dep:azure_data_cosmos_driver",
+    "azure_data_cosmos_driver/__internal_in_memory_emulator",
+]
+# Secret-store backends. Every one is `vti-secrets`' implementation — the
+# same code the VTA and VTC use — wrapped by `server::secret_store`, which
+# stores the service's key envelope as the backend's payload.
+#
+# Native OS keyring: macOS Keychain, Windows Credential Manager, or a
+# Secret Service provider over D-Bus on Linux. `vta-sdk/keyring` registers
+# the platform store. A host where none is reachable (a headless Linux box
+# with no Secret Service) is refused at setup with the list of secure
+# backends — there is no silent plaintext fallback.
+keyring = ["server-core", "vti-secrets/keyring", "vta-sdk/keyring"]
+aws-secrets = ["server-core", "vti-secrets/aws-secrets"]
+gcp-secrets = ["server-core", "vti-secrets/gcp-secrets"]
+azure-secrets = ["server-core", "vti-secrets/azure-secrets"]
+# HashiCorp Vault (KV v2) secret backend, authenticating via Kubernetes
+# ServiceAccount JWT (default), static token, or AppRole.
+vault-secrets = ["server-core", "vti-secrets/vault-secrets"]
+# Native Kubernetes `Secret` backend (in-cluster ServiceAccount or local
+# kubeconfig via `Client::try_default`).
+k8s-secrets = ["server-core", "vti-secrets/k8s-secrets"]
+setup-wizard = ["server-core", "dep:dialoguer"]
+passkey = [
+    "server-core", "dep:webauthn-rs", "dep:webauthn-rs-proto", "dep:argon2", "dep:subtle",
+    "dep:sha2",
+]
+# Test-only seams (e.g. seeding a verifier's deactivation verdicts, or letting
+# a test reach a peer's Trust Task endpoint on loopback). Enabled only from
+# dev-dependencies; never compiled into a release.
+test-support = ["server-core", "affinidi-net-guard/dev-loopback"]
+
+[dependencies]
+affinidi-tdk = { workspace = true }
+affinidi-tdk-common = { workspace = true }
+affinidi-secrets-resolver = { workspace = true }
+affinidi-did-resolver-cache-sdk = { workspace = true }
+agent-names = { workspace = true }
+didwebvh-rs = { workspace = true }
+affinidi-did-common = { workspace = true }
+# `method-webs` only. Resolution-side only (no `create` feature) — see the
+# workspace manifest for why the hosting service never holds KERI keys.
+affinidi-did-webs = { workspace = true, optional = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+# CIDR matching for the multi-domain `trusted_proxy_cidrs` allowlist
+# (see `super::domain::detect`). Single-purpose dep; `cidr` and
+# hand-rolled were alternatives — ipnetwork is the most-used in the
+# ecosystem and parses RFC-style strings (`10.0.0.0/8`, `2001:db8::/32`)
+# without further plumbing.
+ipnetwork = "0.21"
+# Every per-address and per-source limit, and the trusted-proxy client
+# address rule, shared with the mediator and the DID resolver cache.
+affinidi-rate-limit = { version = "0.1.4", optional = true }
+# Egress policy for a peer-advertised `TrustTaskHTTPS` endpoint: the URL comes
+# from the peer's DID document, so it is vetted (public addresses only, https
+# only, no redirects) and the name is resolved through the guarded resolver.
+affinidi-net-guard = { version = "0.1.1", optional = true }
+vta-sdk = { workspace = true }
+
+# Cross-repo dep on the VTI Verifiable Trust Infrastructure
+# foundation crate. We consume only the canonical `Session` and
+# `SessionState` types from `vti_common::auth::session`; the
+# storage helpers and JWT machinery live on this side of the
+# dep boundary because did-hosting has its own KeyspaceHandle
+# and AppError abstractions.
+#
+# 0.7 on crates.io, published 2026-05-24 (OpenVTC PR #113 + #115).
+# The git-pinned rev that lived here through the pre-publish
+# window is gone.
+#
+# 0.12 re-pins onto vta-sdk ^0.24 + affinidi-tdk ^0.8. Keep in lockstep
+# with the workspace `vta-sdk` pin: a mismatched pair resolves to two
+# vta-sdk copies and fails to compile (E0308 on the shared auth types).
+# The 0.11.x line is not usable alongside vta-sdk 0.24: its last releases
+# straddle the boundary (0.11.40 pins ^0.23, 0.11.41 pins ^0.24), so the
+# requirement moves to the 0.12 minor rather than a pinned 0.11 patch.
+# Historically the floor was a pinned patch because each added something we
+# construct or call: 0.11.3 the `Session.last_seen` / `acr_expires_at`
+# fields, 0.11.4 the `jti` parameter to `AuthBackend::mint_access_token`,
+# and 0.11.30 the move to vta-sdk 0.20. An unlocked build against an
+# earlier line will not compile.
+vti-common = { version = "0.66", default-features = false }
+async-trait = { workspace = true }
+
+# server-core dependencies (optional)
+axum = { workspace = true, optional = true }
+axum-extra = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+multibase = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tower-http = { workspace = true, features = ["trace", "cors"], optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }
+# The subcommand groups the service binaries share (`server::cli`).
+clap = { workspace = true, optional = true }
+toml = { workspace = true }
+
+# Trust Tasks framework — see workspace Cargo.toml for the version pin.
+# Gated behind `server-core` because the dispatcher only runs on the
+# server side; the client (no trust-tasks admin surface yet) ignores
+# them. Re-evaluate when we add a typed client builder for outbound
+# trust-task documents.
+trust-tasks-rs = { workspace = true, optional = true }
+trust-tasks-https = { workspace = true, optional = true }
+trust-tasks-didcomm = { workspace = true, optional = true }
+trust-tasks-proof = { workspace = true, optional = true }
+# Direct use by `server::trust_tasks::verifier::TransportBoundVerifier`
+# (DataIntegrityProof / VerifyOptions / resolver trait). Same major.minor as
+# `trust-tasks-proof`'s `affinidi` feature → single copy in the lock.
+affinidi-data-integrity = { workspace = true, optional = true }
+
+# Needed by `server::trust_tasks::send` — the outbound counterpart to the
+# inbound dispatcher. It owns the "which transport does this peer speak"
+# decision (`didcomm_profile::resolve_transport`, already here) and therefore
+# has to be able to actually put bytes on either wire. Both binaries already
+# depend on these crates; hosting the helper here is what stops the control
+# plane and the server growing two divergent copies of the same rule.
+affinidi-messaging-didcomm-service = { workspace = true, optional = true }
+affinidi-messaging-didcomm = { workspace = true, optional = true }
+# TSP control-message types (`ControlMessage`/`ControlType`) for the inbound
+# relationship answering arm (`server::tsp_relationship`). The messaging SDK
+# re-exports `ControlMessage` but not `ControlType`, so we name both from the
+# TSP crate directly. Same single copy the messaging stack already resolves.
+affinidi-tsp = { workspace = true, optional = true }
+# Durable TSP relationship store types (`RelationshipKv`,
+# `PersistentRelationshipStore`, `RelationshipStore`) for
+# `server::tsp_relationship_store`. Same single copy the stack already resolves.
+affinidi-messaging-sdk = { workspace = true, optional = true }
+
+# **The AWS backends are invisible to an ordinary local check.** They are
+# optional, so `cargo test --workspace`, `cargo clippy --all-targets` and
+# `cargo check --locked` all pass while they are broken. After any dependency
+# bump, run what CI's `store-dynamodb` and `aws-secrets` jobs run:
+#
+#   cargo build -p did-hosting-common --no-default-features \
+#     --features "server-core,aws-secrets"
+#   cargo build -p did-hosting-common --no-default-features \
+#     --features "server-core,store-dynamodb,method-webvh,method-web"
+#
+# Background: `aws-smithy-types` 1.7.0 broke `aws-smithy-json` 0.63.0 in a
+# minor release, and this workspace held the AWS subtree below 1.7 until
+# `aws-smithy-json` 0.63.1 compiled against the new line. `vti-secrets` now
+# bounds `aws-smithy-types` itself (`< 1.9`), which is what holds `aws-config`
+# at 1.12.
+
+# store backends (optional)
+fjall = { workspace = true, optional = true }
+redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
+# No default features: the SDK's default `rustls` feature is the legacy
+# hyper-0.14 client on rustls 0.21 (unpatched: GHSA-c8m5-c952-6cm4 and two
+# lows). `default-https-client` is the current client on rustls 0.23.
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+firestore = { version = "0.61", optional = true }
+futures = { version = "0.3", optional = true }
+azure_data_cosmos = { version = "1", features = ["key_auth", "control_plane"], optional = true }
+# Only for `cosmosdb-emulator`: the SDK's in-memory emulator, which the
+# Cosmos DB backend's tests run the store conformance suite against.
+azure_data_cosmos_driver = { version = "1", optional = true }
+azure_core = { version = "1.0", optional = true }
+# Used by the DynamoDB store backend.
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+
+# Secret-store backends (the `*-secrets` / `keyring` features above).
+# Published by verifiable-trust-infrastructure; on vti-common ^0.66, so it
+# shares this crate's single vti-common copy.
+vti-secrets = { version = "0.39.0", optional = true }
+
+# Setup wizard helper (optional, behind `setup-wizard` feature)
+dialoguer = { workspace = true, optional = true }
+
+# passkey / WebAuthn (optional)
+webauthn-rs = { workspace = true, optional = true }
+webauthn-rs-proto = { workspace = true, optional = true }
+# Hashed enrolment invites (`passkey::invite`): SHA-256 over the 256-bit token,
+# Argon2id over the short claim code, compared in constant time.
+argon2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+# base64 (needed by firestore/cosmosdb store backends)
+base64 = { workspace = true }
+
+[build-dependencies]
+# Generates the Trust Task types from `trust-tasks.lock` (see build.rs).
+trust-tasks-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Deletes the keyring round-trip test's entry; the store itself is `vti-secrets`'.
+keyring-core = "1"
+tokio = { workspace = true, features = ["time", "test-util"] }
+# Deterministic versionTime stamps in the fuzz seed-corpus generator
+# (`examples/gen_corpus.rs`).
+chrono = { workspace = true }
+# Trust-Tasks router unit tests use `oneshot()` + raw body collection.
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+# Test-only stub `ProofVerifier` impls (`AlwaysOkVerifier`,
+# `AlwaysErrVerifier`, `PanickingVerifier`) use the
+# `#[async_trait::async_trait]` macro to match the trait's
+# `async fn verify<P>(...)` shape. Prod code uses `ProofPolicy`
+# variants that don't carry a custom verifier impl, so the dep is
+# test-only.
+async-trait = { workspace = true }
+# `verifier::tests` sign real `eddsa-jcs-2022` Data Integrity proofs with a
+# generated ed25519 `did:key` to exercise the bind-when-present /
+# signature-only-when-absent paths end-to-end.
+affinidi-secrets-resolver = "0.5"
+# `did_ops::tests` signs real witness proofs (the same way didwebvh-rs's own
+# witness-threshold tests do) to exercise
+# `verify_did_log_for_publish`'s register/publish witness-threshold split
+# end-to-end, without needing a running witness service.
+affinidi-data-integrity = { workspace = true }

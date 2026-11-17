@@ -1,0 +1,50 @@
+# The Trust Task specifications this application uses. `trust-tasks add`,
+# `remove` and `update` edit this file; `trust-tasks.lock` records what each
+# entry resolved to. A value is an exact version ("0.4") or "latest".
+# Tasks from a third-party source are named "<source>:<slug>", with the
+# source declared as [sources.<source>] url = "https://…" (or path = "…").
+# Tasks with two versions are served side by side: 0.2 is the current
+# version, 0.1 stays until it is withdrawn so older clients keep working.
+[tasks]
+"audit/list" = ["0.1", "0.2"]
+"config/patch" = "0.1"
+"config/reload" = "0.1"
+"config/show" = "0.1"
+"messaging/access-list/list" = "0.1"
+"messaging/access-list/update" = "0.1"
+"messaging/account/add" = ["0.1", "0.2"]
+"messaging/account/get" = ["0.1", "0.2"]
+"messaging/account/list" = ["0.1", "0.2"]
+"messaging/account/remove" = "0.1"
+"messaging/account/update" = ["0.1", "0.2"]
+"messaging/acl/get" = "0.1"
+"messaging/message/delete" = "0.1"
+"messaging/message/get" = "0.1"
+"messaging/message/list" = "0.1"
+"messaging/message/status" = ["0.1", "0.2"]
+"messaging/monitor/event" = ["0.2", "0.3"]
+"messaging/monitor/subscribe" = ["0.1", "0.2"]
+"messaging/monitor/unsubscribe" = "0.1"
+"messaging/mux/ack" = "0.1"
+"messaging/mux/admin-list" = "0.1"
+"messaging/mux/admin-revoke" = "0.1"
+"messaging/mux/admin-revoke-all" = "0.1"
+"messaging/mux/attach" = "0.1"
+"messaging/mux/connections" = "0.1"
+"messaging/mux/detach" = "0.1"
+"messaging/mux/event" = "0.1"
+"messaging/mux/grant" = "0.1"
+"messaging/mux/list" = "0.1"
+"messaging/mux/notice" = "0.1"
+"messaging/mux/revoke" = "0.1"
+"messaging/mux/revoke-all" = "0.1"
+"messaging/mux/update" = "0.1"
+"messaging/ping" = ["0.1", "0.2"]
+"messaging/queue/list" = "0.1"
+"messaging/queue/purge" = "0.1"
+"messaging/queue/status" = "0.1"
+"messaging/receipt" = "0.1"
+"messaging/stats/show" = "0.1"
+"messaging/wake/request" = "0.1"
+"messaging/wake/set" = "0.1"
+"push/wake" = "0.2"

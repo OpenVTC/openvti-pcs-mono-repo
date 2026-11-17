@@ -1,0 +1,1144 @@
+use ratatui::{
+    buffer::{Buffer, CellDiffOption},
+    layout::Rect,
+    style::{Color, Modifier},
+    widgets::Widget,
+};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+// ── Bin-name registration ───────────────────────────────────────────
+//
+// pnm-cli and cnm-cli both consume this crate's shared command
+// handlers. When one of those handlers needs to point the operator at a
+// follow-up command (e.g. context-create → "did you mean to run X
+// instead?"), it must use the binary the operator actually invoked,
+// not a hard-coded `pnm`. Each CLI binary calls `set_bin_name("pnm")`
+// or `set_bin_name("cnm")` at startup; handlers read via `bin_name()`
+// and fall back to "vta" if neither was registered (the offline `vta
+// bootstrap …` path also calls into shared modules).
+
+static BIN_NAME: OnceLock<&'static str> = OnceLock::new();
+
+/// Register the binary name used in operator-facing hints. Call once at
+/// CLI startup. Only the first call sticks; later calls are ignored so
+/// that nested invocations (e.g. unit tests) don't clobber it.
+pub fn set_bin_name(name: &'static str) {
+    let _ = BIN_NAME.set(name);
+}
+
+/// The binary name registered via [`set_bin_name`]. Defaults to `"vta"`
+/// (the offline binary's name) when nothing has been registered, so
+/// shared handlers still produce a syntactically valid command string.
+pub fn bin_name() -> &'static str {
+    BIN_NAME.get().copied().unwrap_or("vta")
+}
+
+// ── The session's own DID ───────────────────────────────────────────
+//
+// A refusal hint that says "inspect your ACL entry" can name the entry: the
+// CLI knows which DID it authenticated as. Registered once the client has
+// connected; hints fall back to `<your-did>` when it was never set (#2586).
+
+static SESSION_DID: OnceLock<String> = OnceLock::new();
+
+/// Register the DID this process authenticated as, for hints that name it.
+pub fn set_session_did(did: &str) {
+    let _ = SESSION_DID.set(did.to_string());
+}
+
+/// The registered session DID, if any.
+#[must_use]
+pub fn session_did() -> Option<&'static str> {
+    SESSION_DID.get().map(String::as_str)
+}
+
+/// The command that re-authenticates, for the binary `bin`.
+#[must_use]
+pub fn reauth_hint(bin: &str) -> String {
+    match bin {
+        "cnm" => "Re-run `cnm setup`, or import a fresh credential with                   `cnm auth login --credential-bundle <bundle.armored> --expect-digest <sha256>`"
+            .to_string(),
+        "pnm" => "Try `pnm setup` to re-authenticate".to_string(),
+        other => format!("Re-authenticate with `{other} setup`"),
+    }
+}
+
+/// The command that inspects the caller's ACL entry, naming `did` when known.
+#[must_use]
+pub fn acl_inspect_hint(bin: &str, did: Option<&str>) -> String {
+    format!("`{bin} acl get {}`", did.unwrap_or("<your-did>"))
+}
+
+/// Where to check the VTA's address after a network failure, per binary.
+/// `cnm` has no `vta` subcommand: its VTA comes from the community profile.
+#[must_use]
+pub fn network_hint(bin: &str) -> String {
+    match bin {
+        "cnm" => "Check the community's VTA with `cnm community list`, or point at it directly:                   `cnm --url <url> health`"
+            .to_string(),
+        "pnm" => "Check its URL with `pnm vta info`".to_string(),
+        other => format!("Check its URL with `{other} --help`"),
+    }
+}
+
+// ── Full-display toggle ─────────────────────────────────────────────
+//
+// CLI global `--full-display` flag. When enabled, list commands emit
+// every identifier in full (no ratatui-Table truncation) as a sequence
+// of key-value blocks. Default rendering stays as the compact table
+// for a readable overview; full display is the escape hatch for
+// copying complete DIDs, key ids, template names, etc.
+
+static FULL_DISPLAY: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable full-display output. Called once at CLI startup
+/// from the global flag.
+pub fn set_full_display(enabled: bool) {
+    FULL_DISPLAY.store(enabled, Ordering::Relaxed);
+}
+
+/// Current full-display mode. List commands check this to choose
+/// between table and full-form output.
+pub fn is_full_display() -> bool {
+    FULL_DISPLAY.load(Ordering::Relaxed)
+}
+
+/// Tell the reader that this table shortens identifiers, and how to get them
+/// whole.
+///
+/// The compact table is the right default — it is readable, and most of the
+/// time nobody needs the full value. But a shortened identifier still *looks*
+/// like an identifier, and the obvious thing to do with one is select it and
+/// paste it into the next command. That produces an argument containing a
+/// literal `…` (U+2026), which is not a DID and never was.
+///
+/// `--full-display` already existed. The gap was that you only learned it
+/// existed after being caught by its absence, so the hint goes where the
+/// truncation happens rather than in `--help`.
+pub fn print_truncation_hint() {
+    println!(
+        "  {DIM}Identifiers are shortened to fit. Re-run with `{} --full-display …` \
+         to copy one in full.{RESET}",
+        bin_name()
+    );
+}
+
+/// Emit a list entry as aligned `label: value` lines. Used in
+/// full-display mode where ratatui-Table truncation would hide full
+/// identifiers.
+///
+/// `pairs` is `[(label, value)]`. Labels are padded to the widest so
+/// values line up vertically. A trailing blank line separates entries.
+pub fn print_full_entry(pairs: &[(&str, &str)]) {
+    let widest = pairs.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    for (label, value) in pairs {
+        let pad = " ".repeat(widest.saturating_sub(label.len()));
+        println!("  {label}:{pad}  {DIM}{value}{RESET}");
+    }
+    println!();
+}
+
+/// [`print_full_entry`] for owned values. `crate::display::full_display_pairs`
+/// builds `(&'static str, String)` pairs — it has to, since a display name is
+/// computed rather than borrowed from the response — so this saves every call
+/// site the same re-borrowing dance.
+pub fn print_full_entry_owned(pairs: &[(&str, String)]) {
+    let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(l, v)| (*l, v.as_str())).collect();
+    print_full_entry(&borrowed);
+}
+
+/// Print a bold section heading used above a list of full-display
+/// entries. Matches the title style of the table-mode block borders.
+pub fn print_full_list_title(title: &str, count: usize) {
+    println!();
+    println!("{BOLD}{title} ({count}){RESET}");
+    println!();
+}
+
+// ── Output format ───────────────────────────────────────────────────
+//
+// Global `--json` flag. When enabled, list commands emit a single JSON
+// document instead of the ratatui table / full-display rendering. This
+// is the automation entry point — scripts piping `pnm acl list --json`
+// into `jq` get a stable shape, while interactive operators get the
+// human-readable default.
+
+/// Output format selected by the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Human,
+    Json,
+}
+
+static OUTPUT_FORMAT: AtomicU8 = AtomicU8::new(0); // 0 = Human, 1 = Json
+
+/// Register the output format. Called once at CLI startup from the
+/// global `--json` flag.
+pub fn set_output_format(format: OutputFormat) {
+    OUTPUT_FORMAT.store(
+        match format {
+            OutputFormat::Human => 0,
+            OutputFormat::Json => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Current output format. Default `Human`.
+pub fn output_format() -> OutputFormat {
+    if OUTPUT_FORMAT.load(Ordering::Relaxed) == 1 {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    }
+}
+
+/// Returns true when the operator passed `--json`. List commands check
+/// this and dispatch to a JSON serializer instead of their human-
+/// readable renderer.
+#[must_use]
+pub fn is_json_output() -> bool {
+    output_format() == OutputFormat::Json
+}
+
+/// Pretty-print a serializable value as JSON to stdout. Used by list
+/// commands when [`is_json_output`] is true. Errors here are surfaced
+/// as a CLI error rather than a panic so the caller can render via
+/// `print_cli_error`.
+pub fn print_json<T: serde::Serialize>(value: &T) -> Result<(), serde_json::Error> {
+    let text = serde_json::to_string_pretty(value)?;
+    println!("{text}");
+    Ok(())
+}
+
+/// Print `value` as JSON, or exit reporting what could not be serialized.
+///
+/// A failure here is a bug in the shape being emitted, not something the
+/// caller can recover from or the operator can act on, so there is no
+/// `Result` worth threading back. `what` names the thing, so the message
+/// says which command produced the bad shape. Exits 1 — the generic
+/// operational failure both CLIs use.
+pub fn print_json_or_exit<T: serde::Serialize>(value: &T, what: &str) {
+    if let Err(e) = print_json(value) {
+        eprintln!("Error serializing {what}: {e}");
+        std::process::exit(1);
+    }
+}
+
+// ── Colour ──────────────────────────────────────────────────────────
+//
+// Colour is a property of the terminal, not of the data. Escape codes
+// written into a pipe or a log file are noise to a reader and a corrupt
+// field to a parser, so they are emitted only when the destination is a
+// terminal and the operator has not set `NO_COLOR`
+// (<https://no-color.org>). Default is on, so a caller that never
+// registers anything keeps the old behaviour.
+
+static COLOR: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable colour output. Called once at CLI startup from the
+/// terminal check.
+pub fn set_color(enabled: bool) {
+    COLOR.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether colour may be emitted. Renderers check this before writing
+/// any escape sequence.
+#[must_use]
+pub fn color_enabled() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
+
+// ── ANSI constants ──────────────────────────────────────────────────
+
+/// An ANSI escape that writes itself only while [`color_enabled`].
+///
+/// Every `{GREEN}…{RESET}` in a format string goes through `Display`, so
+/// gating here is what makes `NO_COLOR` (and a non-terminal) reach the
+/// hundreds of hand-coloured lines, not only the table renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ansi(&'static str);
+
+impl Ansi {
+    /// The raw escape sequence, whatever the colour setting.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Ansi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if color_enabled() {
+            f.write_str(self.0)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub const BOLD: Ansi = Ansi("\x1b[1m");
+pub const DIM: Ansi = Ansi("\x1b[2m");
+pub const GREEN: Ansi = Ansi("\x1b[32m");
+pub const RED: Ansi = Ansi("\x1b[31m");
+pub const CYAN: Ansi = Ansi("\x1b[36m");
+pub const YELLOW: Ansi = Ansi("\x1b[33m");
+pub const RESET: Ansi = Ansi("\x1b[0m");
+
+// ── Error reporting ─────────────────────────────────────────────────
+
+/// Print a CLI error to stderr in a form an operator can act on.
+///
+/// Downcasts to [`vta_sdk::error::VtaError`] when possible and emits a
+/// tailored remediation hint for the common failure modes (auth, network,
+/// forbidden, validation). Falls back to the raw error message + source
+/// chain for anything else, so unknown failures still get their underlying
+/// cause surfaced.
+///
+/// Call this from the top-level CLI match instead of `eprintln!("Error:
+/// {e}")` — the raw form loses auth/network context that operators need
+/// to fix things themselves.
+pub fn print_cli_error(err: &(dyn std::error::Error + 'static)) {
+    use vta_sdk::error::VtaError;
+    if let Some(vta_err) = err.downcast_ref::<VtaError>() {
+        match vta_err {
+            VtaError::Auth(msg) => {
+                eprintln!("{RED}\u{2717}{RESET} Authentication failed: {msg}");
+                eprintln!(
+                    "  {DIM}Token may be expired. {}, or check that the VTA's `/auth` endpoint \
+                     is reachable.{RESET}",
+                    reauth_hint(bin_name())
+                );
+            }
+            VtaError::Forbidden(msg) => {
+                eprintln!("{RED}\u{2717}{RESET} Forbidden: {msg}");
+                eprintln!(
+                    "  {DIM}Your role or context access doesn't permit this operation. \
+                     Inspect with {}.{RESET}",
+                    acl_inspect_hint(bin_name(), session_did())
+                );
+            }
+            VtaError::NotFound(msg) => {
+                eprintln!("{RED}\u{2717}{RESET} Not found: {msg}");
+            }
+            VtaError::Conflict(msg) => {
+                // The SDK preserves the full 409 JSON body so programmatic
+                // callers can extract structured fields (e.g. `mediator_did`).
+                // For humans, surface the `message` (or `error`) field rather
+                // than dumping the raw JSON; fall back to the raw text for
+                // non-JSON bodies.
+                eprintln!(
+                    "{RED}\u{2717}{RESET} Conflict: {}",
+                    extract_human_message(msg)
+                );
+            }
+            VtaError::Gone(msg) => {
+                // Same treatment as the `Conflict` arm below: the SDK keeps
+                // the full 410 body, so surface the human field rather than
+                // dumping raw JSON at the operator.
+                let human = extract_human_message(msg);
+                eprintln!("{RED}\u{2717}{RESET} Resource is gone: {human}");
+                // 410 has more than one producer — the TEE bootstrap carve-out
+                // and the one-shot backup blob slots — so the carve-out
+                // walkthrough only prints when the refusal is actually about
+                // the carve-out. Unconditionally, it would send a backup
+                // operator down the admin-provisioning path for a bundle that
+                // simply expired. The marker is the server's own wording in
+                // `routes::bootstrap::carve_out_closed_error`; a miss costs
+                // the generic hint, never a wrong one.
+                if human.contains(CARVE_OUT_MARKER) {
+                    let bin = bin_name();
+                    eprintln!(
+                        "  {DIM}This usually means the bootstrap carve-out has already been \
+                         used. For a second admin, run `{bin} bootstrap provision-request` from \
+                         the new operator's host and have an existing admin run \
+                         `{bin} bootstrap provision-integration` against this VTA.{RESET}"
+                    );
+                } else {
+                    eprintln!(
+                        "  {DIM}This resource was single-use or time-limited, and has been \
+                         consumed or has expired. Retrying will not help — restart the \
+                         operation to get a fresh one.{RESET}"
+                    );
+                }
+            }
+            VtaError::Validation(msg) => {
+                eprintln!("{RED}\u{2717}{RESET} Invalid request: {msg}");
+            }
+            VtaError::RateLimited {
+                limited_by,
+                retry_after,
+                limiter,
+                url,
+            } => {
+                let (headline, hints) = rate_limit_message(
+                    *limited_by,
+                    *retry_after,
+                    limiter.as_deref(),
+                    url.as_deref(),
+                    chrono::Utc::now(),
+                    bin_name(),
+                );
+                eprintln!("{RED}\u{2717}{RESET} {headline}");
+                for hint in hints {
+                    eprintln!("  {DIM}{hint}{RESET}");
+                }
+            }
+            VtaError::Network(e) => {
+                eprintln!("{RED}\u{2717}{RESET} Network error: {e}");
+                eprintln!(
+                    "  {DIM}Is the VTA reachable? {}.{RESET}",
+                    network_hint(bin_name())
+                );
+            }
+            VtaError::Server { status, body } => {
+                eprintln!("{RED}\u{2717}{RESET} Server error (HTTP {status}): {body}");
+                eprintln!(
+                    "  {DIM}This is a VTA-side failure. Check server logs or contact the operator.{RESET}"
+                );
+            }
+            VtaError::UnsupportedTransport(msg) => {
+                eprintln!("{RED}\u{2717}{RESET} Unsupported transport: {msg}");
+                eprintln!(
+                    "  {DIM}This operation requires a specific transport (REST or DIDComm). \
+                     Check which mode your CLI is in and whether the endpoint supports it.{RESET}"
+                );
+            }
+            VtaError::DidcommTransport(msg) => {
+                eprintln!("{RED}\u{2717}{RESET} DIDComm transport error: {msg}");
+                eprintln!(
+                    "  {DIM}Mediator or peer unreachable. Retry after checking mediator \
+                     connectivity.{RESET}"
+                );
+            }
+            VtaError::DidcommRemote { code, comment } => {
+                eprintln!("{RED}\u{2717}{RESET} Remote error ({code}): {comment}");
+            }
+            VtaError::Protocol(msg) => {
+                eprintln!("{RED}\u{2717}{RESET} Protocol error: {msg}");
+            }
+            VtaError::Rejected { code, message, .. } => {
+                eprintln!("{RED}\u{2717}{RESET} Refused [{code}]: {message}");
+                if let Some(fix) = vta_sdk::client::webs_refusal_fix(vta_err) {
+                    eprintln!("  {DIM}{fix}{RESET}");
+                }
+            }
+            // ── Runtime service-management variants (T0.2) ────────
+            VtaError::LastServiceRefused => {
+                let bin = bin_name();
+                eprintln!(
+                    "{RED}\u{2717}{RESET} Refused: would leave the VTA with no advertised services."
+                );
+                eprintln!(
+                    "  {DIM}At least one transport (REST or DIDComm) must remain advertised. \
+                     Enable the other transport first via `{bin} services <kind> enable …`, \
+                     then retry.{RESET}"
+                );
+            }
+            VtaError::ServiceNotPresent => {
+                let bin = bin_name();
+                eprintln!("{RED}\u{2717}{RESET} Service is not present.");
+                eprintln!(
+                    "  {DIM}The service kind isn't currently enabled. Use `{bin} services \
+                     <kind> enable …` to bring it online before updating, disabling, or rolling \
+                     it back.{RESET}"
+                );
+            }
+            VtaError::ServiceAlreadyEnabled => {
+                let bin = bin_name();
+                eprintln!("{RED}\u{2717}{RESET} Service is already enabled.");
+                eprintln!(
+                    "  {DIM}Use `{bin} services <kind> update …` to change its configuration, \
+                     or `{bin} services <kind> disable` to remove it.{RESET}"
+                );
+            }
+            VtaError::MediatorHandshakeFailed { reason } => {
+                eprintln!("{RED}\u{2717}{RESET} Mediator handshake failed: {reason}");
+                eprintln!(
+                    "  {DIM}Confirm the mediator DID is correct and the mediator is reachable. \
+                     The reason above is the specific cause from the handshake protocol.{RESET}"
+                );
+            }
+            VtaError::DrainTtlOutOfBounds {
+                min,
+                max,
+                requested,
+            } => {
+                eprintln!(
+                    "{RED}\u{2717}{RESET} Drain TTL {requested}s is outside the allowed range \
+                     [{min}s, {max}s]."
+                );
+                eprintln!(
+                    "  {DIM}Pick a value within those bounds. The minimum applies when the \
+                     command is delivered over DIDComm transport (so the listener stays up long \
+                     enough for the response).{RESET}"
+                );
+            }
+            VtaError::NoMatchingProtocol {
+                counterparty_did,
+                ours,
+                theirs,
+            } => {
+                let (headline, hints) =
+                    no_matching_protocol_message(counterparty_did, ours, theirs, bin_name());
+                eprintln!("{RED}\u{2717}{RESET} {headline}");
+                for hint in hints {
+                    eprintln!("  {DIM}{hint}{RESET}");
+                }
+            }
+            VtaError::NoPriorMutation => {
+                let bin = bin_name();
+                eprintln!("{RED}\u{2717}{RESET} No prior mutation to roll back.");
+                eprintln!(
+                    "  {DIM}Use `{bin} services <kind> {{enable,update,disable}} …` directly \
+                     instead of rollback.{RESET}"
+                );
+            }
+            other => eprintln!("{RED}\u{2717}{RESET} Error: {other}"),
+        }
+        return;
+    }
+    eprintln!("{RED}\u{2717}{RESET} Error: {err}");
+    let mut source = err.source();
+    while let Some(s) = source {
+        eprintln!("  {DIM}caused by: {s}{RESET}");
+        source = s.source();
+    }
+}
+
+/// The operator-facing text for [`VtaError::NoMatchingProtocol`]: a headline,
+/// then the transports that would close the gap. Pure, like
+/// [`rate_limit_message`], so the wording is testable.
+///
+/// `ours` is the sender's set — this CLI's, or, when a VTA refused on the
+/// client's behalf, what that VTA can start for the document it was sending.
+/// The fix is a transport in both sets, and which side can add one is what the
+/// hints name.
+///
+/// [`VtaError::NoMatchingProtocol`]: vta_sdk::error::VtaError::NoMatchingProtocol
+fn no_matching_protocol_message(
+    peer: &str,
+    ours: &[vta_sdk::protocol::matching::Protocol],
+    theirs: &[vta_sdk::protocol::matching::Protocol],
+    bin: &str,
+) -> (String, Vec<String>) {
+    use vta_sdk::protocol::matching::Protocol;
+    let list = |set: &[Protocol]| {
+        if set.is_empty() {
+            "nothing".to_string()
+        } else {
+            set.iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let headline = format!(
+        "No transport in common with `{peer}`: it advertises [{}], and the sender can start [{}].",
+        list(theirs),
+        list(ours)
+    );
+    let mut hints = Vec::new();
+    if theirs.is_empty() {
+        hints.push(format!(
+            "`{peer}` advertises no TSP, DIDComm or Trust-Task HTTPS service in its DID \
+             document; nobody can reach it until it publishes one."
+        ));
+        return (headline, hints);
+    }
+    if !theirs.contains(&Protocol::Rest) {
+        hints.push(format!(
+            "Ask `{peer}`'s operator to publish a Trust-Task HTTPS service (`TrustTaskHTTPS`) \
+             in its DID document. It carries any signed document, including one signed as a \
+             room persona, which TSP and DIDComm cannot carry for a VTA."
+        ));
+    }
+    if theirs.contains(&Protocol::Didcomm) && !ours.contains(&Protocol::Didcomm) {
+        hints.push(format!(
+            "If the sending VTA has no DIDComm session, `{bin} services didcomm enable \
+             --mediator-did <did>` gives it one. That does not help a document signed as a \
+             room persona: DIDComm authenticates the VTA's own DID."
+        ));
+    }
+    if theirs.contains(&Protocol::Tsp) && !ours.contains(&Protocol::Tsp) {
+        hints.push(format!(
+            "If the sending VTA has no TSP session, `{bin} services tsp enable \
+             --mediator-did <did>` gives it one (same caveat for a persona-signed document)."
+        ));
+    }
+    (headline, hints)
+}
+
+/// The operator-facing text for a rate-limit refusal: a headline, then hint
+/// lines. Pure (no ANSI, `now` and the binary name passed in) so the wording is
+/// testable.
+///
+/// Answers the three things an operator needs, in order: *who* refused (a rate
+/// limit is not a fault, and not necessarily the VTA's), *how long* to wait,
+/// and *which knob* loosens it. The knob names come from
+/// `vta_sdk::rate_limit`, which holds every one of them once.
+fn rate_limit_message(
+    limited_by: vta_sdk::rate_limit::RateLimitSource,
+    retry_after: Option<chrono::DateTime<chrono::Utc>>,
+    limiter: Option<&str>,
+    url: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    bin: &str,
+) -> (String, Vec<String>) {
+    use vta_sdk::rate_limit::{self as rl, RateLimitSource};
+
+    let scope = limiter;
+    let limiter = limiter.map(|l| format!(" ({l})")).unwrap_or_default();
+    let headline = format!(
+        "Rate limited by {}{limiter} — the request was refused, not failed.",
+        limited_by.label()
+    );
+
+    let mut hints = Vec::new();
+    hints.push(match retry_after {
+        Some(at) => {
+            // Round up: "wait 0s" for a 400 ms hint would invite an immediate,
+            // refused, retry.
+            let ms = (at - now).num_milliseconds().max(0);
+            let secs = (ms + 999) / 1000;
+            format!("Wait {secs}s before retrying.")
+        }
+        None => "No wait was given; wait a few seconds before retrying.".to_string(),
+    });
+    if let Some(url) = url {
+        hints.push(format!("Refused request: {url}"));
+    }
+
+    match limited_by {
+        // This client's own share of the operation budget: the fix is on the
+        // client's side, not a per-IP knob.
+        RateLimitSource::Vta if scope == Some(rl::OPERATIONS_SUBJECT_LIMITER) => {
+            hints.push(
+                "This client has used its own share of the VTA's operation budget; other \
+                 clients are not affected. Retry after the wait, or spread the work out."
+                    .to_string(),
+            );
+            hints.push(format!(
+                "The share is `[server] {}` (operations per second, per client DID); on a TEE \
+                 VTA it comes from the tenant overlay's `server` block. See {}.",
+                rl::VTA_OPERATION_PER_SUBJECT_KEY,
+                rl::VTA_DOCS,
+            ));
+        }
+        // The per-appliance budget, not a per-IP limiter: the per-IP knobs
+        // would not help, and the operator should know the whole VTA is busy.
+        RateLimitSource::Vta if scope == Some(rl::OPERATIONS_LIMITER) => {
+            hints.push(
+                "The VTA is at its operation budget: the whole appliance is at capacity, not \
+                 only this client. Retry after the wait."
+                    .to_string(),
+            );
+            hints.push(format!(
+                "The budget is `[server] {}` / `{}` (operations per second), sized for the \
+                 instance; on a TEE VTA it comes from the tenant overlay's `server` block. \
+                 Raise it only with a larger instance. See {}.",
+                rl::VTA_OPERATION_RATE_KEY,
+                rl::VTA_OPERATION_BURST_KEY,
+                rl::VTA_DOCS,
+            ));
+        }
+        RateLimitSource::Vta => {
+            hints.push(format!(
+                "To loosen it, in the VTA's `[server]` config: `{}` / `{}` for the auth and \
+                 bootstrap endpoints, `{}` / `{}` for the VTA's own did.jsonl. Intervals are \
+                 seconds per token, so lower is looser.",
+                rl::VTA_INTERVAL_KEY,
+                rl::VTA_BURST_KEY,
+                rl::VTA_DID_LOG_INTERVAL_KEY,
+                rl::VTA_DID_LOG_BURST_KEY,
+            ));
+            hints.push(format!(
+                "At runtime: `{bin} {}`, or `{bin} {}`.",
+                rl::VTA_RUNTIME_FLAGS,
+                rl::VTA_DID_LOG_RUNTIME_FLAGS,
+            ));
+            hints.push(format!(
+                "Behind a reverse proxy with `{} = false`, every client shares one bucket. \
+                 See {}.",
+                rl::VTA_TRUST_XFF_KEY,
+                rl::VTA_DOCS,
+            ));
+        }
+        RateLimitSource::Mediator => hints.push(format!(
+            "This is the DIDComm/TSP mediator, not the VTA. Its operator tunes {} — requests \
+             per second, so higher is looser.",
+            rl::MEDIATOR_KEYS,
+        )),
+        RateLimitSource::Upstream => {
+            hints.push(format!(
+                "The response carried no `{}` header, so nothing says who sent it: a reverse \
+                 proxy or load balancer in front of the VTA, or a VTA older than that header.",
+                rl::SOURCE_HEADER,
+            ));
+            hints.push(format!(
+                "Check the proxy / load balancer's limits and logs, or upgrade the VTA so its \
+                 own refusals are labelled. See {}.",
+                rl::VTA_DOCS,
+            ));
+        }
+        // VTC, DID host, and any source added later: the SDK's hint is the
+        // whole story — none of them has a knob this CLI can name.
+        other => hints.push(rl::suggested_fix(other).to_string()),
+    }
+    (headline, hints)
+}
+
+/// Pull a human-readable line out of a (possibly JSON) error body.
+///
+/// The SDK hands `VtaError::Conflict` the *raw* 409 response body so that
+/// programmatic callers can deserialize structured fields. For terminal
+/// output we don't want to dump JSON at the operator, so prefer the body's
+/// `message` field, then its `error` field, and only fall back to the raw
+/// text when the body isn't the expected JSON shape.
+/// Substring that marks a 410 as the TEE first-boot bootstrap carve-out
+/// rather than one of the other single-use resources that now render as
+/// `Gone` (the backup blob slots). Mirrors the server's wording in
+/// `vta_service::routes::bootstrap::carve_out_closed_error`.
+const CARVE_OUT_MARKER: &str = "carve-out";
+
+fn extract_human_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .or_else(|| v.get("error"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string())
+}
+
+// ── Ratatui rendering helpers ───────────────────────────────────────
+
+pub fn print_widget(widget: impl Widget, height: u16) {
+    print!("{}", render_widget(widget, height, color_enabled()));
+}
+
+/// Render `widget` to the string `print_widget` would emit.
+///
+/// Takes `color` rather than reading the global, so the escape-sequence
+/// behaviour — the whole point of the gate — is testable without
+/// capturing stdout and without tests racing each other over one flag.
+fn render_widget(widget: impl Widget, height: u16, color: bool) -> String {
+    let width = ratatui::crossterm::terminal::size().map_or(120, |(w, _)| w);
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    widget.render(area, &mut buf);
+
+    let mut out = String::new();
+    for y in 0..height {
+        let mut cur_fg = Color::Reset;
+        let mut cur_bg = Color::Reset;
+        let mut cur_mod = Modifier::empty();
+        let mut line = String::new();
+
+        for x in 0..width {
+            let cell = &buf[(x, y)];
+            if cell.diff_option == CellDiffOption::Skip {
+                continue;
+            }
+
+            if color && (cell.fg != cur_fg || cell.bg != cur_bg || cell.modifier != cur_mod) {
+                line.push_str("\x1b[0m");
+                push_ansi_fg(&mut line, cell.fg);
+                push_ansi_bg(&mut line, cell.bg);
+                push_ansi_mod(&mut line, cell.modifier);
+                cur_fg = cell.fg;
+                cur_bg = cell.bg;
+                cur_mod = cell.modifier;
+            }
+
+            line.push_str(cell.symbol());
+        }
+
+        if color {
+            out.push_str(&line);
+            out.push_str("\x1b[0m\n");
+        } else {
+            // Every row is padded to the terminal width; uncoloured that
+            // padding is just trailing blanks in someone's file.
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+pub fn push_ansi_fg(out: &mut String, color: Color) {
+    use std::fmt::Write as _;
+    match color {
+        Color::Reset => {}
+        Color::Black => out.push_str("\x1b[30m"),
+        Color::Red => out.push_str("\x1b[31m"),
+        Color::Green => out.push_str("\x1b[32m"),
+        Color::Yellow => out.push_str("\x1b[33m"),
+        Color::Blue => out.push_str("\x1b[34m"),
+        Color::Magenta => out.push_str("\x1b[35m"),
+        Color::Cyan => out.push_str("\x1b[36m"),
+        Color::Gray => out.push_str("\x1b[37m"),
+        Color::DarkGray => out.push_str("\x1b[90m"),
+        Color::LightRed => out.push_str("\x1b[91m"),
+        Color::LightGreen => out.push_str("\x1b[92m"),
+        Color::LightYellow => out.push_str("\x1b[93m"),
+        Color::LightBlue => out.push_str("\x1b[94m"),
+        Color::LightMagenta => out.push_str("\x1b[95m"),
+        Color::LightCyan => out.push_str("\x1b[96m"),
+        Color::White => out.push_str("\x1b[97m"),
+        Color::Rgb(r, g, b) => {
+            let _ = write!(out, "\x1b[38;2;{r};{g};{b}m");
+        }
+        Color::Indexed(i) => {
+            let _ = write!(out, "\x1b[38;5;{i}m");
+        }
+    }
+}
+
+pub fn push_ansi_bg(out: &mut String, color: Color) {
+    use std::fmt::Write as _;
+    match color {
+        Color::Reset => {}
+        Color::Black => out.push_str("\x1b[40m"),
+        Color::Red => out.push_str("\x1b[41m"),
+        Color::Green => out.push_str("\x1b[42m"),
+        Color::Yellow => out.push_str("\x1b[43m"),
+        Color::Blue => out.push_str("\x1b[44m"),
+        Color::Magenta => out.push_str("\x1b[45m"),
+        Color::Cyan => out.push_str("\x1b[46m"),
+        Color::Gray => out.push_str("\x1b[47m"),
+        Color::DarkGray => out.push_str("\x1b[100m"),
+        Color::LightRed => out.push_str("\x1b[101m"),
+        Color::LightGreen => out.push_str("\x1b[102m"),
+        Color::LightYellow => out.push_str("\x1b[103m"),
+        Color::LightBlue => out.push_str("\x1b[104m"),
+        Color::LightMagenta => out.push_str("\x1b[105m"),
+        Color::LightCyan => out.push_str("\x1b[106m"),
+        Color::White => out.push_str("\x1b[107m"),
+        Color::Rgb(r, g, b) => {
+            let _ = write!(out, "\x1b[48;2;{r};{g};{b}m");
+        }
+        Color::Indexed(i) => {
+            let _ = write!(out, "\x1b[48;5;{i}m");
+        }
+    }
+}
+
+pub fn push_ansi_mod(out: &mut String, modifier: Modifier) {
+    if modifier.contains(Modifier::BOLD) {
+        out.push_str("\x1b[1m");
+    }
+    if modifier.contains(Modifier::DIM) {
+        out.push_str("\x1b[2m");
+    }
+    if modifier.contains(Modifier::ITALIC) {
+        out.push_str("\x1b[3m");
+    }
+    if modifier.contains(Modifier::UNDERLINED) {
+        out.push_str("\x1b[4m");
+    }
+    if modifier.contains(Modifier::REVERSED) {
+        out.push_str("\x1b[7m");
+    }
+    if modifier.contains(Modifier::CROSSED_OUT) {
+        out.push_str("\x1b[9m");
+    }
+}
+
+pub fn print_section(title: &str) {
+    let pad = 46usize.saturating_sub(title.len());
+    println!(
+        "\n{DIM}──{RESET} {BOLD}{title}{RESET} {DIM}{}{RESET}",
+        "─".repeat(pad)
+    );
+}
+
+#[cfg(test)]
+mod rate_limit_render_tests {
+    use super::rate_limit_message;
+    use vta_sdk::rate_limit::RateLimitSource;
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn a_vta_refusal_names_the_vta_the_wait_and_every_knob() {
+        let (headline, hints) = rate_limit_message(
+            RateLimitSource::Vta,
+            Some(now() + chrono::Duration::milliseconds(3_200)),
+            Some("auth"),
+            Some("https://vta.example.com/auth/challenge"),
+            now(),
+            "pnm",
+        );
+        assert_eq!(
+            headline,
+            "Rate limited by the VTA (auth) — the request was refused, not failed."
+        );
+        let all = hints.join("\n");
+        assert_eq!(hints[0], "Wait 4s before retrying.", "rounded up");
+        for needle in [
+            "Refused request: https://vta.example.com/auth/challenge",
+            "`rate_limit_interval_secs` / `rate_limit_burst`",
+            "`did_log_rate_limit_interval_secs` / `did_log_rate_limit_burst`",
+            "lower is looser",
+            "`pnm config update --rate-limit-interval-secs <N> --rate-limit-burst <N>`",
+            "`pnm config update --did-log-rate-limit-interval-secs <N> --did-log-rate-limit-burst <N>`",
+            "`trust_xff = false`",
+            "docs/02-vta/rate-limiting.md",
+        ] {
+            assert!(all.contains(needle), "missing {needle:?} in:\n{all}");
+        }
+    }
+
+    #[test]
+    fn an_operation_budget_refusal_names_the_budget_not_the_per_ip_knobs() {
+        let (headline, hints) = rate_limit_message(
+            RateLimitSource::Vta,
+            Some(now() + chrono::Duration::seconds(1)),
+            Some("operations"),
+            None,
+            now(),
+            "pnm",
+        );
+        assert!(headline.contains("(operations)"), "{headline}");
+        let all = hints.join("\n");
+        assert!(
+            all.contains("`[server] operation_rate_limit_per_sec`"),
+            "{all}"
+        );
+        assert!(all.contains("tenant overlay"), "{all}");
+        assert!(
+            !all.contains("config update"),
+            "the budget is not runtime-patchable, so no `config update` hint:\n{all}"
+        );
+    }
+
+    #[test]
+    fn a_per_client_refusal_names_the_clients_share() {
+        let (_, hints) = rate_limit_message(
+            RateLimitSource::Vta,
+            None,
+            Some("operations-subject"),
+            None,
+            now(),
+            "pnm",
+        );
+        let all = hints.join("\n");
+        assert!(all.contains("its own share"), "{all}");
+        assert!(
+            all.contains("`[server] operation_rate_limit_per_subject_per_sec`"),
+            "{all}"
+        );
+        assert!(!all.contains("config update"), "{all}");
+    }
+
+    #[test]
+    fn an_unlabelled_refusal_points_at_the_proxy_and_uses_the_invoked_binary() {
+        let (headline, hints) =
+            rate_limit_message(RateLimitSource::Upstream, None, None, None, now(), "cnm");
+        assert!(headline.contains("unidentified service"), "{headline}");
+        let all = hints.join("\n");
+        assert!(all.contains("No wait was given"), "{all}");
+        assert!(all.contains("`x-rate-limit-source`"), "{all}");
+        assert!(all.contains("load balancer"), "{all}");
+        assert!(
+            !all.contains("config update"),
+            "an unattributed 429 must not send the operator to retune the VTA:\n{all}"
+        );
+    }
+
+    #[test]
+    fn a_mediator_refusal_names_the_mediator_limits_not_the_vta_config() {
+        let (headline, hints) = rate_limit_message(
+            RateLimitSource::Mediator,
+            Some(now() - chrono::Duration::seconds(5)),
+            None,
+            None,
+            now(),
+            "pnm",
+        );
+        assert!(headline.contains("the mediator"), "{headline}");
+        let all = hints.join("\n");
+        assert!(all.contains("Wait 0s"), "a stale hint is no wait: {all}");
+        assert!(all.contains("rate_limit_per_ip"), "{all}");
+        assert!(!all.contains("rate_limit_interval_secs"), "{all}");
+    }
+
+    #[test]
+    fn a_did_host_refusal_says_it_is_not_tunable_from_the_vta() {
+        let (_, hints) =
+            rate_limit_message(RateLimitSource::DidHost, None, None, None, now(), "pnm");
+        assert!(hints.join("\n").contains("not tunable from the VTA"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_human_message, no_matching_protocol_message, render_widget};
+
+    /// The live case: a persona-signed room request from a VTA that can only
+    /// use REST for it, to a host advertising DIDComm alone. The operator is
+    /// told both sets and that the host needs a Trust-Task HTTPS service.
+    #[test]
+    fn no_matching_protocol_names_both_sets_and_the_missing_service() {
+        use vta_sdk::protocol::matching::Protocol;
+        let (headline, hints) = no_matching_protocol_message(
+            "did:webvh:vtc",
+            &[Protocol::Rest],
+            &[Protocol::Didcomm],
+            "pnm",
+        );
+        assert!(
+            headline.contains("advertises [didcomm]") && headline.contains("start [rest]"),
+            "{headline}"
+        );
+        let all = hints.join("\n");
+        assert!(all.contains("TrustTaskHTTPS"), "{all}");
+        assert!(all.contains("pnm services didcomm enable"), "{all}");
+        assert!(!all.contains("services tsp"), "TSP is not on offer: {all}");
+    }
+
+    #[test]
+    fn no_matching_protocol_with_nothing_advertised_says_so() {
+        let (headline, hints) = no_matching_protocol_message("did:example:p", &[], &[], "pnm");
+        assert!(headline.contains("advertises [nothing]"), "{headline}");
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("no TSP, DIDComm or Trust-Task HTTPS"));
+    }
+
+    #[test]
+    fn prefers_message_field() {
+        let body = r#"{"error":"didcomm_already_enabled","message":"DIDComm is already enabled.","mediator_did":"did:peer:2.med"}"#;
+        assert_eq!(extract_human_message(body), "DIDComm is already enabled.");
+    }
+
+    #[test]
+    fn falls_back_to_error_field_when_no_message() {
+        let body = r#"{"error":"duplicate_key"}"#;
+        assert_eq!(extract_human_message(body), "duplicate_key");
+    }
+
+    #[test]
+    fn falls_back_to_raw_text_for_non_json() {
+        let body = "plain conflict text";
+        assert_eq!(extract_human_message(body), "plain conflict text");
+    }
+
+    #[test]
+    fn falls_back_to_raw_text_when_fields_missing() {
+        // Valid JSON but neither `message` nor `error` present → raw text.
+        let body = r#"{"detail":"something"}"#;
+        assert_eq!(extract_human_message(body), body);
+    }
+
+    // ── Colour gate ─────────────────────────────────────────────────
+
+    use ratatui::style::{Color, Style};
+    use ratatui::widgets::Paragraph;
+
+    fn coloured_line() -> Paragraph<'static> {
+        Paragraph::new("hello").style(Style::default().fg(Color::Red))
+    }
+
+    #[test]
+    fn test_widget_colour_enabled_emits_escapes() {
+        let out = render_widget(coloured_line(), 1, true);
+        assert!(
+            out.contains('\u{1b}'),
+            "expected escape sequences with colour on, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_widget_colour_disabled_emits_none() {
+        let out = render_widget(coloured_line(), 1, false);
+        assert!(
+            !out.contains('\u{1b}'),
+            "no escape may reach a non-terminal, got {out:?}"
+        );
+        assert!(out.contains("hello"), "the text itself must survive");
+    }
+
+    #[test]
+    fn test_widget_colour_disabled_trims_row_padding() {
+        let out = render_widget(coloured_line(), 1, false);
+        for line in out.lines() {
+            assert_eq!(
+                line.trim_end(),
+                line,
+                "rows are padded to terminal width; uncoloured that is trailing blanks"
+            );
+        }
+    }
+}
+
+/// #2586: a hint a `cnm` operator can reach must not tell them to run `pnm`.
+/// Every runtime string in the modules `cnm` shares names the binary through
+/// [`bin_name`]; the only literal `pnm` commands left sit in a `"pnm" =>` arm
+/// that answers for pnm alone. Comments and tests are not output.
+#[cfg(test)]
+mod bin_name_hints {
+    const CNM_REACHABLE: &[(&str, &str)] = &[
+        ("render.rs", include_str!("render.rs")),
+        ("sealed_consumer.rs", include_str!("sealed_consumer.rs")),
+        (
+            "commands/did_templates.rs",
+            include_str!("commands/did_templates.rs"),
+        ),
+        ("commands/keys.rs", include_str!("commands/keys.rs")),
+        ("commands/acl.rs", include_str!("commands/acl.rs")),
+        ("commands/contexts.rs", include_str!("commands/contexts.rs")),
+        (
+            "commands/credentials.rs",
+            include_str!("commands/credentials.rs"),
+        ),
+        ("commands/config.rs", include_str!("commands/config.rs")),
+    ];
+
+    #[test]
+    fn no_cnm_reachable_hint_names_pnm() {
+        let mut offenders = Vec::new();
+        for (name, src) in CNM_REACHABLE {
+            for (i, line) in src.lines().enumerate() {
+                if line.starts_with("#[cfg(test)]") {
+                    break;
+                }
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("\"pnm\" =>") {
+                    continue;
+                }
+                if t.contains("`pnm ") || t.contains("\"pnm ") {
+                    offenders.push(format!("{name}:{}: {t}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "literal pnm commands:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_hints_follow_the_binary() {
+        assert!(super::reauth_hint("cnm").contains("cnm auth login"));
+        assert!(super::network_hint("cnm").contains("cnm community list"));
+        assert_eq!(
+            super::acl_inspect_hint("cnm", Some("did:key:z6Mk")),
+            "`cnm acl get did:key:z6Mk`"
+        );
+        assert_eq!(
+            super::acl_inspect_hint("pnm", None),
+            "`pnm acl get <your-did>`"
+        );
+    }
+}

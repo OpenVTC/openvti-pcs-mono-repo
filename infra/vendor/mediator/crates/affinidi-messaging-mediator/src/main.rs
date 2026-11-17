@@ -1,0 +1,171 @@
+//! The `mediator` binary.
+//!
+//! `mediator [-c conf/mediator.toml]` runs the server from a configuration
+//! file (written by `mediator-setup`; every `### Env:` key in the annotated
+//! template can be overridden from the environment). Subcommands:
+//!
+//! - `mediator healthcheck` GETs the configured `livez` route and exits 0 when
+//!   it answers 2xx (the container image's `HEALTHCHECK`);
+//! - `mediator rotate-admin [--dry-run]` rotates the admin credential of a
+//!   VTA-linked deployment (`vta` feature).
+//!
+//! The library half of this crate (`MediatorBuilder`) runs the same server
+//! inside another process. See `docs/operations.md` for the probe routes,
+//! metrics and shutdown behaviour.
+
+use affinidi_messaging_mediator::commands;
+use affinidi_messaging_mediator::server::start;
+use clap::{Parser, Subcommand};
+
+// ─── Allocator ──────────────────────────────────────────────────────────────
+//
+// Set on the binary only. A library that installs a #[global_allocator] forces
+// it on every consumer, so this deliberately does not live in lib.rs.
+//
+// Why not the system allocator: the storage backend churns large, short-lived
+// buffers (write buffers, packed message bodies). glibc malloc keeps those
+// arenas rather than returning them, so RSS ratchets to the high-water mark and
+// never falls back — indistinguishable from a leak on a memory graph.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc tuning, read by jemalloc itself at startup via this well-known symbol.
+///
+/// `background_thread:true` runs the purger off the request path.
+/// `dirty_decay_ms` / `muzzy_decay_ms` are how long freed pages linger before
+/// being returned to the OS; jemalloc's defaults (10s / 10s) are tuned for
+/// throughput on allocation-heavy workloads, and hold RSS well above the live
+/// heap. 5s keeps the memory graph honest at a negligible cost here, because
+/// the mediator's hot path is I/O-bound, not allocation-bound.
+///
+/// Raise these (or drop the `jemalloc` feature) if you are optimising for
+/// allocation throughput over resident footprint.
+///
+/// The name is `_rjem_malloc_conf`, not `malloc_conf`: `tikv-jemalloc-sys`
+/// builds jemalloc with the `_rjem_` symbol prefix, so an unprefixed
+/// `malloc_conf` is silently ignored (it was, until this was fixed: jemalloc
+/// ran on its defaults, with no background purge thread).
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. This is the name jemalloc documents for exactly
+/// this, it is defined once (in the binary, never the library), and the value
+/// is the NUL-terminated static string jemalloc expects. The type is a
+/// reference to a fixed-size array, a thin pointer matching jemalloc's
+/// `const char *malloc_conf`; a `&[u8]` slice reference would be two words.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+/// Affinidi Messaging Mediator.
+///
+/// Without a subcommand, runs the mediator HTTP server (the historical
+/// behaviour). Subcommands cover one-shot operator tasks that share
+/// the server's config + secret-backend code paths but don't need a
+/// running mediator.
+#[derive(Parser)]
+#[command(
+    name = "mediator",
+    about = "Affinidi Messaging Mediator",
+    long_about = "Run the mediator server (default), or invoke an operator subcommand \
+                  like `mediator rotate-admin`."
+)]
+struct Cli {
+    /// Path to the mediator config file. Defaults to
+    /// `conf/mediator.toml` (relative to CWD) for parity with the
+    /// historical hard-coded path; pass `--config <path>` to point at
+    /// a config the wizard wrote to a non-default location.
+    #[arg(short = 'c', long, default_value = "conf/mediator.toml", global = true)]
+    config: String,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Check that a running mediator is alive (for container healthchecks).
+    ///
+    /// GETs the `livez` route of the mediator described by the config file
+    /// (`--config`, with the usual environment overrides): `listen_address`
+    /// (a wildcard bind is probed on loopback), `api_prefix` and `use_ssl`.
+    /// Exits 0 when it answers 2xx, 1 otherwise.
+    Healthcheck {
+        /// Probe this URL instead of the one derived from the config.
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Rotate the mediator's admin credential. Needs the `vta` feature: the
+    /// whole operation is a conversation with a VTA.
+    #[cfg(feature = "vta")]
+    ///
+    /// Reads the existing credential from the unified secret backend,
+    /// authenticates to the VTA, registers a fresh did:key with the
+    /// same ACL scope, writes the new credential back, and removes
+    /// the old ACL entry. Use `--dry-run` to preview without
+    /// touching state. The config path comes from the top-level
+    /// `--config` flag (default `conf/mediator.toml`).
+    RotateAdmin {
+        /// Skip the VTA mutation + backend write. The wizard prints
+        /// the rotation plan and exits.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    // Subcommand first, server second: no subcommand means "run the
+    // mediator", which is the historical behaviour.
+    match cli.command {
+        None => {}
+        Some(Command::Healthcheck { url }) => {
+            // No tracing subscriber: a healthcheck's output is its exit
+            // status plus one line on failure.
+            if let Err(e) = commands::healthcheck::run(&cli.config, url.as_deref()).await {
+                eprintln!("unhealthy: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "vta")]
+        Some(Command::RotateAdmin { dry_run }) => {
+            // Subcommands handle their own tracing init lazily
+            // (rotate_admin uses the global subscriber if one is
+            // already in place; otherwise it falls back to a minimal
+            // env-filter setup so info!/warn! land somewhere visible).
+            init_subcommand_tracing();
+            if let Err(e) = commands::rotate_admin::run(&cli.config, dry_run).await {
+                eprintln!("\x1b[31mError:\x1b[0m {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
+    if let Err(e) = start(&cli.config).await {
+        eprintln!("\x1b[31mMediator failed:\x1b[0m {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Subcommands run outside of `server::start`, which is where the
+/// production tracing subscriber is normally installed. Set up a
+/// minimal one here so `tracing::info!` calls inside the rotation
+/// flow actually surface to stderr — without this the rotation runs
+/// "silent" except for `println!`s.
+#[cfg(feature = "vta")]
+fn init_subcommand_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .try_init();
+}

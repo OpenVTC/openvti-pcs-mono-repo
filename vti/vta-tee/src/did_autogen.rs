@@ -1,0 +1,718 @@
+//! Auto-generate VTA did:webvh identity on first boot in TEE mode.
+//!
+//! When `tee.kms.vta_did_template` is configured, the VTA generates its own
+//! did:webvh identity on first boot using the KMS-bootstrapped seed. The DID
+//! is persisted in the encrypted store and the did.jsonl log entry is written
+//! to disk for the operator to upload to their WebVH server.
+//!
+//! On subsequent boots, the DID is restored from the store.
+
+use std::sync::Arc;
+
+use didwebvh_rs::create::{CreateDIDConfig, create_did};
+use didwebvh_rs::log_entry::LogEntryMethods;
+use didwebvh_rs::parameters::Parameters as WebVHParameters;
+use didwebvh_rs::prelude::Secret;
+use serde_json::json;
+use tracing::{info, warn};
+
+use vta_config::AppConfig;
+use vta_keys as keys;
+use vta_keys::seed_store::SeedStore;
+use vta_keys::seeds::{get_active_seed_id, load_seed_bytes};
+use vta_support::contexts;
+use vta_support::version_time::next_version_time;
+use vti_common::error::AppError;
+use vti_common::store::{KeyspaceHandle, Store};
+
+/// Well-known store key for the auto-generated VTA DID.
+///
+/// Public because the DID this module mints is read back outside `vta-tee` —
+/// see [`DID_LOG_STORE_KEY`] for why these names are exported rather than
+/// re-typed at each call site.
+pub const VTA_DID_STORE_KEY: &str = "tee:vta_did";
+
+/// Well-known store key for the auto-generated `did.jsonl` log.
+///
+/// Written here under **both** the `KEYS` keyspace (encrypted, read by the
+/// service) and the `BOOTSTRAP` keyspace (unencrypted, read by the parent-side
+/// proxy so it can write `did.jsonl` to disk for the operator).
+///
+/// Exported because the readers live in other crates —
+/// `vta_service::routes::attestation::did_log` serves it over
+/// `GET /attestation/did-log`. Renaming this key silently breaks those readers
+/// if each one spells the string itself, so they take the constant instead.
+///
+/// One reader deliberately cannot: `deploy/nitro/enclave-proxy` is a separate
+/// cargo project on the *parent* side and does not link enclave code, so it
+/// repeats the literal with a comment pointing back here.
+pub const DID_LOG_STORE_KEY: &str = "tee:did_log";
+
+/// Check for an existing DID in the store, or auto-generate one from the template.
+///
+/// Sets `config.vta_did` on success (either from store or newly generated).
+/// Returns `Ok(())` on success or if no template is configured (no-op).
+pub async fn maybe_generate_vta_did(
+    config: &mut AppConfig,
+    seed_store: &dyn SeedStore,
+    store: &Store,
+    storage_encryption_key: Option<[u8; 32]>,
+) -> Result<(), AppError> {
+    // Open encrypted keyspaces up front. The persistent store is the
+    // AUTHORITATIVE VTA identity, so it must be consulted BEFORE trusting any
+    // config-supplied `vta_did`. In un-baked (fleet) TEE mode the tenant overlay
+    // CANNOT carry a `vta_did` at all (see `TenantConfigOverlay`); the only
+    // source of a supplied `config.vta_did` is a trusted, baked self-host config.
+    // Consulting the store first still matters: a rebuild/restore must never let
+    // even a baked value redirect an already-established identity on a later boot.
+    // See docs/05-design-notes/tenant-config-allowlist.md §3.6.
+    let apply_enc = |ks: KeyspaceHandle| -> KeyspaceHandle {
+        if let Some(key) = storage_encryption_key {
+            ks.with_encryption(key)
+        } else {
+            ks
+        }
+    };
+    let keys_ks = apply_enc(store.keyspace(vta_keyspaces::KEYS)?);
+
+    // Store wins: an already-established identity is never silently redirected.
+    if let Some(did_bytes) = keys_ks.get_raw(VTA_DID_STORE_KEY).await? {
+        let stored = String::from_utf8(did_bytes)
+            .map_err(|e| AppError::Internal(format!("corrupt stored VTA DID: {e}")))?;
+        match &config.vta_did {
+            Some(supplied) if supplied != &stored => {
+                warn!(
+                    stored = %stored,
+                    supplied = %supplied,
+                    "baked config supplied a VTA DID that differs from the \
+                     established stored identity — ignoring the supplied value and \
+                     keeping the stored DID (a later boot must not redirect an \
+                     already-established identity)"
+                );
+            }
+            _ => {
+                info!(did = %stored, "restored VTA identity from encrypted store");
+            }
+        }
+        config.vta_did = Some(stored);
+        return Ok(());
+    }
+
+    // No stored identity yet.
+    // First boot with an explicit DID from a *baked* self-host config: persist it
+    // now so it becomes the authoritative stored identity. A later boot then
+    // restores THIS DID from the store, and the store-precedence check above
+    // rejects any *different* supplied DID.
+    //
+    // NOTE: the fleet tenant overlay deliberately CANNOT carry a `vta_did` (see
+    // `vta_config::tenant_overlay::TenantConfigOverlay` and ADR-0109) — an
+    // untrusted parent must not be able to install a bare, keyless identity. A
+    // fleet enclave provisions its identity from `vta_did_template` below, which
+    // derives the key records. This branch therefore only applies to a trusted,
+    // baked/self-host `config.vta_did`.
+    if let Some(direct) = config.vta_did.clone() {
+        let inserted = keys_ks
+            .insert_raw_if_absent(VTA_DID_STORE_KEY, direct.as_bytes().to_vec())
+            .await?;
+        if inserted {
+            info!(did = %direct, "persisted directly-supplied VTA DID as the first-boot identity");
+        }
+        return Ok(());
+    }
+
+    // A did:webs identity (`vta_did_webs`) is minted by
+    // `vta_service::tee_webs`, which runs next: the create lives in the
+    // service's `did:webs` operations. Asking for both is ambiguous, and
+    // choosing one silently would boot as an identifier the operator did not
+    // ask for (VTI-KEY-009) — refuse.
+    if let Some(kms) = &config.tee.kms
+        && kms.vta_did_webs.is_some()
+        && kms.vta_did_template.is_some()
+    {
+        return Err(AppError::Config(
+            "[tee.kms] sets both vta_did_template (did:webvh) and vta_did_webs (did:webs): \
+             choose one identity for this VTA"
+                .into(),
+        ));
+    }
+
+    // Guard: no KMS config or no template → nothing to generate.
+    let kms_config = match &config.tee.kms {
+        Some(kms) if kms.vta_did_template.is_some() => kms.clone(),
+        _ => return Ok(()),
+    };
+    let template = kms_config.vta_did_template.as_ref().unwrap();
+
+    // First boot: generate the DID
+    info!(template = %template, "auto-generating VTA did:webvh identity from template");
+    let contexts_ks = apply_enc(store.keyspace(vta_keyspaces::CONTEXTS)?);
+
+    // Load seed
+    let active_seed_id = get_active_seed_id(&keys_ks)
+        .await
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    let seed = load_seed_bytes(&keys_ks, seed_store, Some(active_seed_id))
+        .await
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+    // Create or get the "vta" context
+    let ctx = match contexts::get_context(&contexts_ks, "vta").await? {
+        Some(ctx) => ctx,
+        None => contexts::create_context(&contexts_ks, "vta", "VTA Identity")
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to create VTA context: {e}")))?,
+    };
+
+    // Derive entity keys
+    let mut derived = keys::derive_entity_keys(
+        &seed,
+        &ctx.base_path,
+        "VTA signing key",
+        "VTA key-agreement key",
+        &keys_ks,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+    // Derive the VTA's third key — `{vta_did}#sealed-transfer-0` — used
+    // only for sealed-transfer producer assertions. Kept separate from
+    // `#key-0` (VC issuance) so a compromise of one doesn't void the
+    // other and each can rotate independently. See
+    // `operations::provision_integration::build_did_signed_assertion`.
+    let sealed_transfer = keys::derive_sealed_transfer_key(
+        &seed,
+        &ctx.base_path,
+        "VTA sealed-transfer producer-assertion key",
+        &keys_ks,
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+    // Convert signing key ID to did:key format (required by didwebvh-rs)
+    let signing_pub_mb = derived
+        .signing_secret
+        .get_public_keymultibase()
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    derived.signing_secret.id = format!("did:key:{signing_pub_mb}#{signing_pub_mb}");
+
+    // Parse the template to get the URL for didwebvh-rs.
+    // Template: "did:webvh:{SCID}:example.com:vta"
+    // URL:      "https://example.com/vta"
+    let url_str = template_to_url(template)?;
+
+    // Build DID document (inline — avoids dependency on webvh feature-gated modules)
+    let did_document = build_vta_did_document(&derived, &sealed_transfer, config);
+
+    // Generate pre-rotation keys (default: 1)
+    let (next_key_hashes, pre_rotation_keys) =
+        vta_keys::derivation::derive_pre_rotation_keys(&seed, &ctx.base_path, "VTA", &keys_ks, 1)
+            .await?;
+
+    // Build parameters
+    let parameters = WebVHParameters {
+        update_keys: Some(Arc::new(vec![derived.signing_pub.clone().into()])),
+        portable: Some(true),
+        next_key_hashes: if next_key_hashes.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                next_key_hashes.into_iter().map(Into::into).collect(),
+            ))
+        },
+        ..Default::default()
+    };
+
+    // Create the DID
+    let create_config = build_genesis_create_config(
+        &url_str,
+        derived.signing_secret.clone(),
+        did_document,
+        parameters,
+        config.dids.scid_also_known_as,
+    )
+    .await?;
+
+    let result = create_did(create_config)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create DID: {e}")))?;
+
+    let final_did = result.did().to_string();
+    let scid = result
+        .log_entry()
+        .get_scid()
+        .unwrap_or_default()
+        .to_string();
+    let log_content = serde_json::to_string(result.log_entry())
+        .map_err(|e| AppError::Internal(format!("failed to serialize DID log: {e}")))?;
+
+    // Save key records
+    keys::save_entity_key_records(
+        &final_did,
+        &derived,
+        &keys_ks,
+        Some("vta"),
+        Some(active_seed_id),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+    // Save the sealed-transfer key at `{vta_did}#sealed-transfer-0`.
+    keys::save_sealed_transfer_key_record(
+        &final_did,
+        &sealed_transfer,
+        &keys_ks,
+        Some("vta"),
+        Some(active_seed_id),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+    // Save pre-rotation key records
+    for (i, pk) in pre_rotation_keys.iter().enumerate() {
+        keys::save_key_record(
+            &keys_ks,
+            &format!("{final_did}#pre-rotation-{i}"),
+            &pk.path,
+            keys::KeyType::Ed25519,
+            &pk.public_key,
+            &pk.label,
+            Some("vta"),
+            Some(active_seed_id),
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    }
+
+    // Update context with the new DID
+    let mut ctx = ctx;
+    ctx.did = Some(final_did.clone());
+    ctx.updated_at = chrono::Utc::now();
+    contexts::store_context(&contexts_ks, &ctx)
+        .await
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+    // Persist the DID in a well-known key for subsequent boots
+    keys_ks
+        .insert_raw(VTA_DID_STORE_KEY, final_did.as_bytes().to_vec())
+        .await?;
+
+    // Store did.jsonl in encrypted keyspace for REST API access
+    keys_ks
+        .insert_raw(DID_LOG_STORE_KEY, log_content.as_bytes().to_vec())
+        .await?;
+
+    // Also store in bootstrap keyspace (no encryption) so the parent proxy
+    // can read it and write did.jsonl to disk for the operator.
+    let bootstrap_ks = store.keyspace(vta_keyspaces::BOOTSTRAP)?;
+    bootstrap_ks
+        .insert_raw(DID_LOG_STORE_KEY, log_content.as_bytes().to_vec())
+        .await?;
+
+    // Flush the store to ensure durability
+    store.persist().await?;
+
+    info!(
+        did = %final_did,
+        scid = %scid,
+        store_key = DID_LOG_STORE_KEY,
+        "VTA did:webvh identity auto-generated — retrieve did.jsonl via: \
+         GET /attestation/did-log or from the bootstrap keyspace key in `store_key`"
+    );
+
+    config.vta_did = Some(final_did);
+    Ok(())
+}
+
+/// Build a minimal DID document for the VTA identity.
+///
+/// Self-contained to avoid depending on webvh feature-gated modules.
+fn build_vta_did_document(
+    derived: &keys::DerivedEntityKeys,
+    sealed_transfer: &keys::DerivedSealedTransferKey,
+    config: &AppConfig,
+) -> serde_json::Value {
+    let mut did_document = json!({
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://www.w3.org/ns/cid/v1"
+        ],
+        "id": "{DID}",
+        "verificationMethod": [
+            {
+                "id": "{DID}#key-0",
+                "type": "Multikey",
+                "controller": "{DID}",
+                "publicKeyMultibase": &derived.signing_pub
+            },
+            {
+                "id": "{DID}#key-1",
+                "type": "Multikey",
+                "controller": "{DID}",
+                "publicKeyMultibase": &derived.ka_pub
+            },
+            {
+                "id": "{DID}#sealed-transfer-0",
+                "type": "Multikey",
+                "controller": "{DID}",
+                "publicKeyMultibase": &sealed_transfer.public_key
+            }
+        ],
+        "authentication": ["{DID}#key-0"],
+        // `#key-0` issues VC Data-Integrity proofs; `#sealed-transfer-0`
+        // signs the sealed-transfer producer assertion. Both are
+        // assertion-flavoured but keyed separately — see
+        // `operations::provision_integration::build_did_signed_assertion`.
+        "assertionMethod": ["{DID}#key-0", "{DID}#sealed-transfer-0"],
+        "keyAgreement": ["{DID}#key-1"]
+    });
+
+    // Add DIDComm mediator service if configured
+    if let Some(ref msg) = config.messaging {
+        let services = did_document
+            .as_object_mut()
+            .unwrap()
+            .entry("service")
+            .or_insert_with(|| json!([]));
+        services.as_array_mut().unwrap().push(json!({
+            "id": "{DID}#vta-didcomm",
+            "type": "DIDCommMessaging",
+            "serviceEndpoint": [{
+                "accept": ["didcomm/v2"],
+                "uri": msg.mediator_did
+            }]
+        }));
+    }
+
+    // One reading of `public_url` for both services below. Trimming in only
+    // one of them would let `public_url = "  https://host/  "` advertise a
+    // usable REST endpoint and, beside it, a TeeAttestation endpoint of
+    // "  https://host/  /attestation/report" — `trim_end_matches('/')` strips
+    // nothing from a string that ends in whitespace.
+    let public_url = config
+        .public_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+
+    // Match setup's REST advertisement policy. The public API may have a
+    // different host, port, or path from the DID log — never infer it from
+    // vta_did_template.
+    if config.services.rest
+        && let Some(url) = public_url
+    {
+        let services = did_document
+            .as_object_mut()
+            .unwrap()
+            .entry("service")
+            .or_insert_with(|| json!([]));
+        services.as_array_mut().unwrap().push(json!({
+            "id": "{DID}#vta-rest",
+            "type": "VTARest",
+            "serviceEndpoint": url,
+        }));
+    }
+
+    // No `TeeAttestation` service: attestation is the `vta/attestation/*`
+    // Trust Tasks, reached over the transports above, not a REST URL.
+
+    did_document
+}
+
+/// Convert a did:webvh template to an HTTPS URL for didwebvh-rs.
+///
+/// `did:webvh:{SCID}:example.com:vta` → `https://example.com/vta`
+/// `did:webvh:{SCID}:example.com%3A8080:vta` → `https://example.com:8080/vta`
+fn template_to_url(template: &str) -> Result<String, AppError> {
+    // Strip "did:webvh:{SCID}:" prefix
+    let rest = template.strip_prefix("did:webvh:{SCID}:").ok_or_else(|| {
+        AppError::Config(format!(
+            "vta_did_template must start with 'did:webvh:{{SCID}}:' — got: {template}"
+        ))
+    })?;
+
+    if rest.is_empty() {
+        return Err(AppError::Config(
+            "vta_did_template must include a domain after 'did:webvh:{SCID}:'".into(),
+        ));
+    }
+
+    // did:webvh encoding: ":" separates path segments, "%3A" is a literal colon (port)
+    // Decode %3A back to ":" for port numbers, then replace ":" with "/" for path
+    let url_path = rest
+        .replace("%3A", "\x00")
+        .replace(':', "/")
+        .replace('\x00', ":");
+
+    Ok(format!("https://{url_path}"))
+}
+
+/// Build the genesis `CreateDIDConfig` for the VTA's own did:webvh identity.
+///
+/// Extracted from [`maybe_generate_vta_did`] so that the one property here
+/// which cannot be observed until far too late is testable without a seed
+/// store, a KMS or an enclave: the genesis entry MUST go through the same
+/// [`next_version_time`] policy every other entry in this workspace does.
+///
+/// Leave it to the builder's default (`Utc::now()`) and nothing fails
+/// immediately. It used to fail one update later: the VTA's first runtime
+/// update was backdated by an earlier, asymmetric version of this policy, so
+/// it landed *earlier* than a wall-clock genesis; `didwebvh-rs` checks
+/// monotonicity only at resolve time, so it signed, appended and published
+/// that entry anyway, and — because the log is append-only — no later update
+/// could repair it. The DID was then permanently unresolvable — which took
+/// down mediator connection, DIDComm and backup export on TEE VTAs until
+/// PR #1456. Routing genesis through the same policy as every update removes
+/// the asymmetry rather than papering over it. See `vta_support::version_time`.
+async fn build_genesis_create_config(
+    url: &str,
+    authorization_key: Secret,
+    did_document: serde_json::Value,
+    parameters: WebVHParameters,
+    also_known_as_scid: bool,
+) -> Result<CreateDIDConfig, AppError> {
+    CreateDIDConfig::builder()
+        .address(url)
+        .authorization_key(authorization_key)
+        .did_document(did_document)
+        .parameters(parameters)
+        // VTI-KEY-166, VTI-VTA-035: the did:scid alias, per `[dids]`.
+        .also_known_as_scid(also_known_as_scid)
+        // Genesis: no previous entry to clamp against.
+        .version_time(next_version_time(None).await)
+        .build()
+        .map_err(|e| AppError::Internal(format!("failed to build DID config: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use didwebvh_rs::DIDWebVHState;
+    use didwebvh_rs::log_entry::LogEntry;
+    use didwebvh_rs::log_entry_state::{LogEntryState, LogEntryValidationStatus};
+    use didwebvh_rs::update::{UpdateDIDConfig, update_did};
+
+    #[test]
+    fn test_template_to_url_simple() {
+        assert_eq!(
+            template_to_url("did:webvh:{SCID}:example.com:vta").unwrap(),
+            "https://example.com/vta"
+        );
+    }
+
+    #[test]
+    fn test_template_to_url_nested_path() {
+        assert_eq!(
+            template_to_url("did:webvh:{SCID}:example.com:org:agents:vta-1").unwrap(),
+            "https://example.com/org/agents/vta-1"
+        );
+    }
+
+    #[test]
+    fn test_template_to_url_with_port() {
+        assert_eq!(
+            template_to_url("did:webvh:{SCID}:example.com%3A8080:vta").unwrap(),
+            "https://example.com:8080/vta"
+        );
+    }
+
+    #[test]
+    fn test_template_to_url_domain_only() {
+        assert_eq!(
+            template_to_url("did:webvh:{SCID}:example.com").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_template_to_url_invalid_prefix() {
+        assert!(template_to_url("did:key:z6Mk...").is_err());
+    }
+
+    #[test]
+    fn test_template_to_url_empty_domain() {
+        assert!(template_to_url("did:webvh:{SCID}:").is_err());
+    }
+
+    /// Build the inputs `maybe_generate_vta_did` hands to
+    /// [`build_genesis_create_config`]. Only the `versionTime` matters here,
+    /// so the document and parameters are the minimum `create_did` accepts.
+    fn genesis_inputs() -> (Secret, serde_json::Value, WebVHParameters) {
+        let mut signing = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+        let signing_pub = signing.get_public_keymultibase().unwrap();
+        // Same `did:key` id shape `maybe_generate_vta_did` sets before handing
+        // the secret to didwebvh-rs; the library rejects any other form.
+        signing.id = format!("did:key:{signing_pub}#{signing_pub}");
+
+        let document = json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:webvh:{SCID}:example.com:vta",
+        });
+        let parameters = WebVHParameters {
+            update_keys: Some(Arc::new(vec![signing_pub.clone().into()])),
+            portable: Some(true),
+            ..Default::default()
+        };
+
+        (signing, document, parameters)
+    }
+
+    /// The TEE genesis entry must carry an explicit `versionTime` from
+    /// [`next_version_time`], not the builder's bare `Utc::now()` default —
+    /// so that it goes through the exact same policy a runtime update does.
+    ///
+    /// Asserting on the built config rather than the helper alone is the
+    /// point: deleting the `.version_time(...)` call reintroduces the
+    /// asymmetry PR #1456 fixed and must fail here.
+    #[tokio::test]
+    async fn genesis_version_time_is_stamped_and_not_future() {
+        let (signing, document, parameters) = genesis_inputs();
+
+        let config = build_genesis_create_config(
+            "https://example.com/vta",
+            signing,
+            document,
+            parameters,
+            false,
+        )
+        .await
+        .expect("genesis config builds");
+
+        let stamped = config
+            .version_time
+            .expect("genesis must set an explicit versionTime, not inherit Utc::now()");
+
+        let result = create_did(config).await.expect("genesis entry is created");
+        let entry_time = result.log_entry().get_version_time();
+
+        assert_eq!(
+            entry_time, stamped,
+            "the log entry must carry the versionTime the config set"
+        );
+
+        let now = chrono::Utc::now().fixed_offset();
+        assert!(
+            entry_time <= now,
+            "genesis must not be future-dated, got {entry_time} against now={now}"
+        );
+        assert!(
+            entry_time > now - chrono::Duration::seconds(5),
+            "genesis should be essentially now, not backdated, got {entry_time} against now={now}"
+        );
+    }
+
+    /// The VTA's first runtime update — `next_version_time(Some(genesis))`,
+    /// the sequence a TEE VTA runs when `services didcomm enable` follows
+    /// first boot — must be strictly later than genesis, even though genesis
+    /// is no longer backdated and the two calls can land in the same wall-
+    /// clock second. This is the two-entry chain that PR #1456 fixed, asserted
+    /// end to end rather than one half at a time.
+    ///
+    /// Deliberately **not** `start_paused`: the final assertion checks against
+    /// the real wall clock (`chrono::Utc::now`), which a paused tokio clock
+    /// does not advance — `next_version_time` would then return a target a
+    /// virtual second ahead of a real clock that never actually moved, and
+    /// this test would fail on exactly the property it means to prove.
+    #[tokio::test]
+    async fn first_update_after_genesis_is_strictly_later() {
+        let (signing, document, parameters) = genesis_inputs();
+
+        let config = build_genesis_create_config(
+            "https://example.com/vta",
+            signing,
+            document,
+            parameters,
+            false,
+        )
+        .await
+        .expect("genesis config builds");
+        let genesis_time = create_did(config)
+            .await
+            .expect("genesis entry is created")
+            .log_entry()
+            .get_version_time();
+
+        let update_time = next_version_time(Some(genesis_time)).await;
+
+        assert!(
+            update_time > genesis_time,
+            "first update must be strictly after genesis: \
+             update={update_time}, genesis={genesis_time}"
+        );
+        assert_ne!(
+            update_time.timestamp(),
+            genesis_time.timestamp(),
+            "must differ after did:webvh's second-granularity truncation"
+        );
+        assert!(
+            update_time <= chrono::Utc::now().fixed_offset(),
+            "first update must not be future-dated"
+        );
+    }
+
+    /// The original failure shape: TEE genesis followed immediately by a real
+    /// update. Rebuild the resulting JSONL into a fresh state so validation
+    /// covers the serialized chain, including signature and versionTime rules.
+    #[tokio::test]
+    async fn tee_genesis_then_immediate_update_resolves() {
+        let (signing, document, parameters) = genesis_inputs();
+        let config = build_genesis_create_config(
+            "https://example.com/vta",
+            signing.clone(),
+            document,
+            parameters,
+            // With the alias the default config lists: genesis then a real
+            // update must still verify.
+            true,
+        )
+        .await
+        .expect("genesis config builds");
+        let genesis = create_did(config).await.expect("genesis entry is created");
+        let genesis_entry = genesis.log_entry().clone();
+        let genesis_time = genesis_entry.get_version_time();
+        let mut genesis_state = DIDWebVHState::default();
+        genesis_state.log_entries_mut().push(LogEntryState {
+            log_entry: genesis_entry.clone(),
+            version_number: genesis_entry.get_version_id_fields().expect("version id").0,
+            validation_status: LogEntryValidationStatus::NotValidated,
+            validated_parameters: WebVHParameters::default(),
+        });
+        genesis_state
+            .validate()
+            .expect("genesis chain validates")
+            .assert_complete()
+            .expect("genesis chain is complete");
+
+        let update_config = UpdateDIDConfig::<Secret, Secret>::builder_generic()
+            .state(genesis_state)
+            .signing_key(signing)
+            .version_time(next_version_time(Some(genesis_time)).await)
+            .build()
+            .expect("update config builds");
+        let update = update_did(update_config)
+            .await
+            .expect("immediate update is created");
+
+        let jsonl = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&genesis_entry).expect("serialize genesis"),
+            serde_json::to_string(update.log_entry()).expect("serialize update"),
+        );
+        let mut resolved = DIDWebVHState::default();
+        for line in jsonl.lines() {
+            let entry = LogEntry::deserialize_string(line, None).expect("parse serialized entry");
+            let version_number = entry.get_version_id_fields().expect("version id").0;
+            resolved.log_entries_mut().push(LogEntryState {
+                log_entry: entry,
+                version_number,
+                validation_status: LogEntryValidationStatus::NotValidated,
+                validated_parameters: WebVHParameters::default(),
+            });
+        }
+        resolved
+            .validate()
+            .expect("TEE genesis and update chain validates")
+            .assert_complete()
+            .expect("TEE genesis and update chain is complete");
+        assert_eq!(resolved.log_entries().len(), 2);
+    }
+}

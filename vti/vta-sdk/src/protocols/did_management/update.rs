@@ -1,0 +1,448 @@
+//! Wire types for the webvh DID update + key rotation messages.
+//!
+//! Both REST (`POST /contexts/{ctx_id}/dids/{scid}/update`) and DIDComm
+//! (`update-did-webvh` / `rotate-did-webvh-keys`) carry these bodies.
+//! The result body is identical for both operations — `rotate_did_webvh_keys`
+//! is a thin wrapper that drives the same flow as `update_did_webvh`
+//! after rebuilding the document with fresh key bytes.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Caller-supplied parameters for an update.
+///
+/// `witnesses` is carried as opaque JSON to keep this crate free of a
+/// `didwebvh-rs` dependency. The vta-service handler deserializes it
+/// into the library's `Witnesses` enum at intake.
+/// Caller-supplied parameters for a webvh DID update.
+///
+/// **camelCase on the wire.** Every other Trust-Task payload in this SDK is
+/// camelCase and so is every published spec; this type was the outlier, and the
+/// cost of that was not theoretical. A caller sending the framework-conventional
+/// `expectedVersionId` had it **silently discarded** — serde matched no field and
+/// nothing rejected the unknown member — so the optimistic-concurrency
+/// precondition simply never applied, and a concurrent update was overwritten by
+/// a chain in which every signature still verified. That is the exact lost-update
+/// this field exists to prevent.
+///
+/// The snake_case names remain accepted as aliases, so callers written against
+/// the old shape keep working.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct UpdateDidWebvhBody {
+    /// New DID document. `None` = keep existing. When `Some`, the VTA
+    /// rotates `update_keys` + pre-rotation commitments as a parallel
+    /// consequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<Value>,
+    /// Override pre-rotation count. `None` = keep current; `Some(0)`
+    /// disables pre-rotation; `Some(n)` uses `n` new commitments.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "pre_rotation_count"
+    )]
+    pub pre_rotation_count: Option<u32>,
+    /// New witness configuration as raw JSON (matches the library's
+    /// `Witnesses` enum on the wire). The vta-service handler
+    /// deserializes into the typed shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witnesses: Option<Value>,
+    /// New watcher URLs. `None` = keep current; `Some(vec![])` disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchers: Option<Vec<String>>,
+    /// New TTL in seconds. `None` = keep current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    /// Operator-facing audit label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optimistic-concurrency precondition. When `Some`, the VTA refuses
+    /// the update if the DID's latest log entry no longer matches this
+    /// versionId — i.e. someone else updated the DID between the
+    /// caller's `GetDid` and this save. Lets a `get → edit → save` flow
+    /// detect lost updates instead of silently overwriting another
+    /// operator's edits with a chain that's structurally valid but
+    /// content-wise based on a stale read.
+    ///
+    /// `None` (default) preserves prior behaviour for scripted callers
+    /// that don't care about concurrent edits.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "expected_version_id"
+    )]
+    pub expected_version_id: Option<String>,
+    /// `vta/webvh/dids/update/1.1`: list (`Some(true)`) or remove
+    /// (`Some(false)`) the log's `did:scid:vh:1:<scid>?src=<source>` DID URL in
+    /// `alsoKnownAs` (VTI-KEY-164). The VTA derives the DID URL; the caller
+    /// never writes it. Applied to `document` when one is supplied, otherwise to
+    /// the current document. Changing it publishes an entry and so **rotates
+    /// the update key**, exactly as `document` does.
+    ///
+    /// `None` leaves `alsoKnownAs` alone and keeps the request a 1.0 request;
+    /// [`VtaClient::update_did_webvh_by_did`](crate::client::VtaClient::update_did_webvh_by_did)
+    /// sends 1.1 only when this is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scid_also_known_as: Option<bool>,
+}
+
+/// Caller-supplied parameters for a rotate-keys call.
+///
+/// camelCase on the wire, snake_case accepted as an alias — see
+/// [`UpdateDidWebvhBody`].
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct RotateDidWebvhKeysBody {
+    /// Override pre-rotation count for the new commitment set.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "pre_rotation_count"
+    )]
+    pub pre_rotation_count: Option<u32>,
+    /// Operator-facing audit label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Result of a successful update or rotate-keys call.
+///
+/// Emitted camelCase — the canonical `vta/webvh/dids/update/1.0` response is
+/// `additionalProperties: false` with camelCase members, so the previous
+/// snake_case emission failed its schema (#857). Snake_case aliases keep
+/// accepting the legacy form on intake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct UpdateDidWebvhResultBody {
+    pub did: String,
+    #[serde(alias = "new_version_id")]
+    pub new_version_id: String,
+    #[serde(alias = "new_scid")]
+    pub new_scid: String,
+    #[serde(alias = "new_log_entry")]
+    pub new_log_entry: String,
+    #[serde(alias = "update_keys_count")]
+    pub update_keys_count: u32,
+    #[serde(alias = "pre_rotation_key_count")]
+    pub pre_rotation_key_count: u32,
+    /// True when the DID is self-hosted (the VTA's stored
+    /// `server_id` is `"serverless"`). The new log entry is
+    /// persisted locally but NOT pushed to any webvh host — the
+    /// operator must fetch the updated `did.jsonl` and redeploy it.
+    /// `false` when the VTA published to a registered host as part
+    /// of this call.
+    ///
+    /// `#[serde(default)]` for back-compat with VTAs that don't
+    /// emit the field; absent → `false` (i.e. assume hosted, which
+    /// keeps old CLIs from showing a spurious self-host hint).
+    #[serde(default)]
+    pub serverless: bool,
+    /// `vta/webvh/dids/update/1.1`: whether the published document lists
+    /// [`Self::scid_did_url`] in `alsoKnownAs`. A 1.1 response always carries
+    /// it; `None` from a 1.0 (or rotate-keys) response, whose closed schema has
+    /// no such member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scid_also_known_as: Option<bool>,
+    /// `vta/webvh/dids/update/1.1`: the `did:scid:vh:1:<scid>?src=<source>` DID
+    /// URL of the log at its current location, listed or not. Present exactly
+    /// when [`Self::scid_also_known_as`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scid_did_url: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_body_round_trips_minimal() {
+        let body = UpdateDidWebvhBody::default();
+        let json = serde_json::to_string(&body).unwrap();
+        let restored: UpdateDidWebvhBody = serde_json::from_str(&json).unwrap();
+        assert!(restored.document.is_none());
+        assert!(restored.pre_rotation_count.is_none());
+    }
+
+    #[test]
+    fn update_body_round_trips_full() {
+        let body = UpdateDidWebvhBody {
+            document: Some(serde_json::json!({"id": "did:webvh:abc"})),
+            pre_rotation_count: Some(2),
+            witnesses: None,
+            watchers: Some(vec!["https://watcher.example.com".into()]),
+            ttl: Some(3600),
+            label: Some("rotate after audit".into()),
+            expected_version_id: None,
+            scid_also_known_as: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let restored: UpdateDidWebvhBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.pre_rotation_count, Some(2));
+        assert_eq!(restored.ttl, Some(3600));
+        assert_eq!(restored.label.as_deref(), Some("rotate after audit"));
+    }
+
+    #[test]
+    fn update_body_expected_version_id_round_trips_and_defaults_none() {
+        // Absent on the wire → defaults to None (back-compat).
+        let body: UpdateDidWebvhBody =
+            serde_json::from_str(r#"{"document":{"id":"did:webvh:abc"}}"#).unwrap();
+        assert!(body.expected_version_id.is_none());
+
+        // Present → preserved.
+        let body = UpdateDidWebvhBody {
+            expected_version_id: Some("2-QmHash".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let restored: UpdateDidWebvhBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.expected_version_id.as_deref(), Some("2-QmHash"));
+    }
+
+    #[test]
+    fn rotate_body_round_trips() {
+        let body = RotateDidWebvhKeysBody {
+            pre_rotation_count: Some(3),
+            label: Some("scheduled".into()),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let restored: RotateDidWebvhKeysBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.pre_rotation_count, Some(3));
+    }
+
+    #[test]
+    fn result_body_round_trips() {
+        let r = UpdateDidWebvhResultBody {
+            did: "did:webvh:abc".into(),
+            new_version_id: "3-zVer".into(),
+            new_scid: "abc".into(),
+            new_log_entry: "{\"versionId\":\"3-...\"}".into(),
+            update_keys_count: 1,
+            pre_rotation_key_count: 2,
+            serverless: true,
+            scid_also_known_as: None,
+            scid_did_url: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let restored: UpdateDidWebvhResultBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.update_keys_count, 1);
+        assert_eq!(restored.new_version_id, "3-zVer");
+        assert!(restored.serverless);
+    }
+
+    /// Old VTA → new client: `serverless` absent on the wire must
+    /// default to `false`, not fail deserialization. Pins the
+    /// back-compat guarantee `#[serde(default)]` provides.
+    #[test]
+    fn result_body_serverless_defaults_to_false_when_absent() {
+        let legacy = r#"{
+            "did": "did:webvh:abc",
+            "new_version_id": "3-zVer",
+            "new_scid": "abc",
+            "new_log_entry": "{}",
+            "update_keys_count": 1,
+            "pre_rotation_key_count": 2
+        }"#;
+        let r: UpdateDidWebvhResultBody = serde_json::from_str(legacy).unwrap();
+        assert!(!r.serverless);
+    }
+}
+
+#[cfg(test)]
+mod casing_tests {
+    use super::*;
+
+    /// The bug this casing fixes, pinned.
+    ///
+    /// `expectedVersionId` is the optimistic-concurrency precondition: it is what
+    /// stops a `get → edit → save` cycle from overwriting somebody else's edit
+    /// with a chain that is structurally valid but based on a stale read.
+    ///
+    /// Before this, the field was snake_case only. A caller sending the
+    /// framework-conventional camelCase had it **silently discarded** — serde
+    /// matched no field, and with no `deny_unknown_fields` nothing rejected the
+    /// unknown member. The precondition never applied. The lost update it exists
+    /// to prevent happened anyway, and every signature in the resulting chain
+    /// still verified.
+    ///
+    /// An unset field must be **absent**, never `null`.
+    ///
+    /// The published `vta/webvh/dids/update/1.0` schema types each optional
+    /// member by what it holds — object, string, integer, array — and none of
+    /// them accept null. Serialising `None` as `null` therefore fails schema
+    /// validation on arrival, and it fails once per unset field:
+    ///
+    /// ```text
+    /// payload failed schema validation: null is not of type "object";
+    /// null is not of type "string"; null is not of type "integer";
+    /// null is not of type "integer"; null is not of type "array"
+    /// ```
+    ///
+    /// Every other body in `did_management` already skips its `None`s; this
+    /// one did not, which made *every partial update* unusable over the
+    /// trust-task transport — `pnm did-mgmt dids edit --label x` could not
+    /// run at all. Supplying more flags did not help: each one only removed
+    /// a single null and left the rest.
+    #[test]
+    fn an_unset_field_is_absent_from_the_wire_not_null() {
+        // The exact shape the CLI sends for `--label resync`.
+        let partial = UpdateDidWebvhBody {
+            label: Some("resync".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&partial).expect("serialises");
+
+        assert_eq!(
+            json,
+            serde_json::json!({"label": "resync"}),
+            "a partial update must carry only the fields that were set"
+        );
+
+        // Stated independently of the equality above: the schema rejects null
+        // per member, so no member may serialise to one.
+        let obj = json.as_object().expect("object");
+        assert!(
+            obj.values().all(|v| !v.is_null()),
+            "no member may serialise as null: {json}"
+        );
+
+        // An empty body is the degenerate case — `{}`, not seven nulls.
+        assert_eq!(
+            serde_json::to_value(UpdateDidWebvhBody::default()).expect("serialises"),
+            serde_json::json!({}),
+        );
+
+        // The sibling request body has the same contract.
+        assert_eq!(
+            serde_json::to_value(RotateDidWebvhKeysBody {
+                label: Some("resync".into()),
+                ..Default::default()
+            })
+            .expect("serialises"),
+            serde_json::json!({"label": "resync"}),
+        );
+    }
+
+    /// Skipping `None` must not make a set field vanish — including the
+    /// falsy-looking ones a naive `skip_serializing_if` would drop.
+    #[test]
+    fn a_set_field_still_reaches_the_wire() {
+        let body = UpdateDidWebvhBody {
+            // `Some(0)` is meaningful: it *disables* pre-rotation, which is
+            // the opposite of "leave it alone". It must survive.
+            pre_rotation_count: Some(0),
+            // `Some(vec![])` likewise disables watchers rather than keeping
+            // the current set.
+            watchers: Some(vec![]),
+            expected_version_id: Some("1-QmPrior".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&body).expect("serialises");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "preRotationCount": 0,
+                "watchers": [],
+                "expectedVersionId": "1-QmPrior",
+            }),
+        );
+    }
+
+    /// A silently-ignored safety precondition is worse than an absent one: it
+    /// reads, in the caller's source, as though the danger were handled.
+    #[test]
+    fn the_concurrency_precondition_is_read_from_the_wire() {
+        let camel: UpdateDidWebvhBody =
+            serde_json::from_str(r#"{"expectedVersionId":"3-QmPrior"}"#).expect("camelCase parses");
+        assert_eq!(
+            camel.expected_version_id.as_deref(),
+            Some("3-QmPrior"),
+            "the framework's camelCase is the wire form and MUST reach the field"
+        );
+
+        // Callers written against the old shape keep working.
+        let snake: UpdateDidWebvhBody =
+            serde_json::from_str(r#"{"expected_version_id":"3-QmPrior"}"#)
+                .expect("snake_case still parses");
+        assert_eq!(snake.expected_version_id.as_deref(), Some("3-QmPrior"));
+    }
+
+    /// 1.1's `scidAlsoKnownAs` is camelCase on the wire, absent when unset (so
+    /// an untouched body stays a valid 1.0 payload), and `false` survives:
+    /// `false` removes the alias, the opposite of leaving it alone.
+    #[test]
+    fn scid_also_known_as_is_camel_case_and_false_survives() {
+        assert_eq!(
+            serde_json::to_value(UpdateDidWebvhBody {
+                scid_also_known_as: Some(false),
+                ..Default::default()
+            })
+            .expect("serialises"),
+            serde_json::json!({ "scidAlsoKnownAs": false }),
+        );
+        let b: UpdateDidWebvhBody =
+            serde_json::from_str(r#"{"scidAlsoKnownAs":true}"#).expect("parses");
+        assert_eq!(b.scid_also_known_as, Some(true));
+        assert!(
+            serde_json::to_value(UpdateDidWebvhBody::default())
+                .unwrap()
+                .get("scidAlsoKnownAs")
+                .is_none()
+        );
+    }
+
+    /// The 1.1 response members are absent unless set, so a 1.0 or rotate-keys
+    /// response — closed schemas without them — stays valid.
+    #[test]
+    fn scid_response_members_are_absent_unless_set() {
+        let mut r = UpdateDidWebvhResultBody {
+            did: "did:webvh:Qm:example.com".into(),
+            new_version_id: "2-Qm".into(),
+            new_scid: "Qm".into(),
+            new_log_entry: "{}".into(),
+            update_keys_count: 1,
+            pre_rotation_key_count: 0,
+            serverless: false,
+            scid_also_known_as: None,
+            scid_did_url: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("scidAlsoKnownAs").is_none() && v.get("scidDidUrl").is_none());
+        r.scid_also_known_as = Some(true);
+        r.scid_did_url = Some("did:scid:vh:1:Qm?src=example.com".into());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["scidAlsoKnownAs"], true);
+        assert_eq!(v["scidDidUrl"], "did:scid:vh:1:Qm?src=example.com");
+    }
+
+    #[test]
+    fn pre_rotation_count_reads_from_either_casing() {
+        let camel: UpdateDidWebvhBody =
+            serde_json::from_str(r#"{"preRotationCount":2}"#).expect("camelCase");
+        assert_eq!(camel.pre_rotation_count, Some(2));
+
+        let snake: UpdateDidWebvhBody =
+            serde_json::from_str(r#"{"pre_rotation_count":2}"#).expect("snake_case");
+        assert_eq!(snake.pre_rotation_count, Some(2));
+
+        let rotate: RotateDidWebvhKeysBody =
+            serde_json::from_str(r#"{"preRotationCount":3}"#).expect("camelCase");
+        assert_eq!(rotate.pre_rotation_count, Some(3));
+    }
+
+    /// Single-word members are identical in both casings — no alias needed, and
+    /// this pins that they were not broken by the rename.
+    #[test]
+    fn single_word_members_are_unaffected() {
+        let b: UpdateDidWebvhBody =
+            serde_json::from_str(r#"{"document":{"id":"did:webvh:x"},"ttl":600,"label":"l"}"#)
+                .expect("parses");
+        assert!(b.document.is_some());
+        assert_eq!(b.ttl, Some(600));
+        assert_eq!(b.label.as_deref(), Some("l"));
+    }
+}

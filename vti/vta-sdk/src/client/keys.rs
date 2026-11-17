@@ -1,0 +1,597 @@
+//! Key + seed management methods on [`VtaClient`].
+
+use super::{
+    CreateKeyRequest, CreateKeyResponse, GetKeySecretResponse, ImportKeyRequest, ImportKeyResponse,
+    InvalidateKeyResponse, ListKeysResponse, ListSeedsResponse, RenameKeyResponse,
+    RotateSeedRequest, RotateSeedResponse, SignResponse, VtaClient, WrappingKeyResponse,
+};
+use crate::error::VtaError;
+use crate::keys::{KeyRecord, KeyType};
+use crate::protocols::key_management::derive_and_sign::DeriveAndSignResultBody;
+use crate::protocols::key_management::derive_and_sign_document::DeriveAndSignDocumentResultBody;
+use crate::protocols::key_management::sign::SignAlgorithm;
+use crate::trust_tasks;
+
+#[cfg(feature = "client")]
+impl VtaClient {
+    // ── Key methods ─────────────────────────────────────────────────
+
+    /// Create a key.
+    ///
+    /// Trust-task leg note: `spec/vta/keys/create/1.0` auto-generates the
+    /// key id from the derivation path, so an explicit `req.key_id` only
+    /// takes effect on the REST leg — exactly as it did on the legacy
+    /// DIDComm message, which never carried `key_id` either.
+    pub async fn create_key(&self, req: CreateKeyRequest) -> Result<CreateKeyResponse, VtaError> {
+        // Built from the canonical body rather than a hand-rolled map: the map
+        // spelled its members snake_case and carried `mnemonic` before the
+        // registry had a member for it, so it was one rename away from
+        // silently dropping the create-from-a-phrase path (see #884's
+        // `update_acl`, the same failure with different members).
+        // `internal` and `derivation_path` are forwarded, not dropped.
+        //
+        // `internal` was hardcoded `None` here while `CreateKeyRequest::internal`
+        // was never read, so `pnm keys create --internal` printed its whole
+        // non-recoverable-key warning, made the operator type "i understand this
+        // key cannot be recovered", and then minted an ordinary derived key —
+        // one that *is* in backups and *is* exportable. The operator was told
+        // the opposite of what happened.
+        //
+        // `derivation_path` was `unwrap_or_default()`, sending `""` for absent.
+        // The operation layer reads `""` as absent, so it worked; but the wire
+        // then carried a member the caller never set, and the empty string is
+        // meaningless to any other maintainer.
+        let body = crate::protocols::key_management::create::CreateKeyBody {
+            internal: req.internal,
+            key_id: req.key_id.clone(),
+            key_type: req.key_type.clone(),
+            derivation_path: req.derivation_path.clone(),
+            mnemonic: req.mnemonic.clone(),
+            label: req.label.clone(),
+            context_id: req.context_id.clone(),
+        };
+        let wrapped: crate::protocols::key_management::create::CreateKeyResponseBody = self
+            .rpc_tt(
+                trust_tasks::TASK_KEYS_CREATE_0_1,
+                serde_json::to_value(&body)?,
+                30,
+            )
+            .await?;
+        let key = wrapped.key;
+        Ok(CreateKeyResponse {
+            origin: key.origin,
+            key_id: key.key_id,
+            key_type: key.key_type,
+            derivation_path: key.derivation_path,
+            public_key: key.public_key,
+            status: key.status,
+            label: key.label,
+            created_at: key.created_at,
+        })
+    }
+
+    /// Import an externally-created private key.
+    ///
+    /// Canonical `keys/import/0.1` on **every** transport. The carrier is a
+    /// confidentiality decision the VTA enforces rather than a formatting one:
+    /// `private_key_sealed` and `private_key_jwe` encrypt to the VTA and are
+    /// accepted anywhere, while the cleartext `private_key_multibase` is
+    /// accepted only where the transport is confidential end-to-end — DIDComm
+    /// and TSP — and refused over REST, whose TLS terminates wherever the
+    /// operator terminates it.
+    ///
+    /// The multibase carrier used to fork onto the legacy
+    /// `key-management/1.0/import-key` message here. That was dead: the VTA has
+    /// never routed that type, so the call failed with `unsupported message
+    /// type` on DIDComm and was refused outright on REST. It works now.
+    pub async fn import_key(&self, req: ImportKeyRequest) -> Result<ImportKeyResponse, VtaError> {
+        let body = crate::protocols::key_management::import::ImportKeyBody {
+            key_type: req.key_type.clone(),
+            private_key_sealed: req.private_key_sealed.clone(),
+            private_key_jwe: req.private_key_jwe.clone(),
+            private_key_multibase: req.private_key_multibase.clone(),
+            label: req.label.clone(),
+            context_id: req.context_id.clone(),
+        };
+        let wrapped: crate::protocols::key_management::create::CreateKeyResponseBody = self
+            .rpc_tt(
+                trust_tasks::TASK_KEYS_IMPORT_0_1,
+                serde_json::to_value(&body)?,
+                30,
+            )
+            .await?;
+        Ok(ImportKeyResponse {
+            key_id: wrapped.key.key_id,
+            key_type: wrapped.key.key_type,
+            public_key: wrapped.key.public_key,
+            status: wrapped.key.status,
+            label: wrapped.key.label,
+            origin: wrapped.key.origin,
+            created_at: wrapped.key.created_at,
+        })
+    }
+
+    /// `keys/list/0.2` — one page of key records. Pass the previous page's
+    /// `next_cursor` as `cursor` (`None` for the first page); a page carrying
+    /// no `next_cursor` is the last.
+    pub async fn list_keys(
+        &self,
+        cursor: Option<&str>,
+        limit: u64,
+        status: Option<&str>,
+        context_id: Option<&str>,
+    ) -> Result<ListKeysResponse, VtaError> {
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_LIST_0_2,
+            serde_json::to_value(crate::protocols::key_management::list::ListKeysBody {
+                cursor: cursor.map(str::to_string),
+                limit: Some(limit),
+                status: status
+                    .map(str::to_string)
+                    .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
+                context_id: context_id.map(str::to_string),
+            })?,
+            30,
+        )
+        .await
+    }
+
+    pub async fn get_key(&self, key_id: &str) -> Result<KeyRecord, VtaError> {
+        // Canonical `keys/show/0.1` answers `{ key }`, with `key: null` for a
+        // key the maintainer does not hold — a successful answer, not an error.
+        // This method promises a record, so absence becomes `NotFound` here
+        // rather than a decode failure the caller cannot interpret.
+        let wrapped: crate::protocols::key_management::get::GetKeyResponseBody = self
+            .rpc_tt(
+                trust_tasks::TASK_KEYS_SHOW_0_1,
+                serde_json::json!({ "keyId": key_id }),
+                30,
+            )
+            .await?;
+        wrapped
+            .key
+            .ok_or_else(|| VtaError::NotFound(format!("no key record for `{key_id}`")))
+    }
+
+    /// Export one key's private half.
+    ///
+    /// `keys/export-secret/0.1`. This used to dispatch
+    /// `vta/seeds/export-mnemonic/1.0`, which exported no mnemonic and no seed
+    /// — a per-key secret export wearing the name of the thing it was migrated
+    /// from, in the wrong family, with no published spec, and gated on **global
+    /// Admin** so that wanting one key meant holding authority over every other
+    /// context in the VTA. The replacement is admin of the key's own scope.
+    ///
+    /// The response is private key material in the clear: never log it, never
+    /// cache it in a shared store, never put it in a diagnostic bundle.
+    pub async fn get_key_secret(&self, key_id: &str) -> Result<GetKeySecretResponse, VtaError> {
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_EXPORT_SECRET_0_1,
+            serde_json::to_value(crate::protocols::key_management::secret::GetKeySecretBody {
+                key_id: key_id.to_string(),
+            })?,
+            30,
+        )
+        .await
+    }
+
+    /// Sign a payload using a VTA-managed key.
+    ///
+    /// Sends the base64url-encoded payload to the VTA, which derives the key,
+    /// signs in memory, and returns the signature. Key material never leaves VTA.
+    pub async fn sign(
+        &self,
+        key_id: &str,
+        payload: &[u8],
+        algorithm: SignAlgorithm,
+    ) -> Result<SignResponse, VtaError> {
+        use base64::Engine;
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_SIGN_0_1,
+            serde_json::json!({
+                "keyId": key_id,
+                "payload": payload_b64,
+                "algorithm": algorithm,
+            }),
+            30,
+        )
+        .await
+    }
+
+    /// `keys/sign-sshsig/0.1` — an SSHSIG signature over `message_hash` (the
+    /// format git verifies for SSH commit signing), made by a key that never
+    /// leaves the VTA.
+    ///
+    /// The VTA builds the signed data from `namespace`, `hash_algorithm` and
+    /// the digest — see
+    /// [`signed_data`](crate::protocols::key_management::sign_sshsig::signed_data)
+    /// — and returns the raw signature. The caller assembles the armoured
+    /// SSHSIG blob from it and the public key it already holds, and should
+    /// verify the signature over the same signed data before using it.
+    ///
+    /// Needs the `sign-sshsig` capability (or `sign`, which confers more).
+    pub async fn sign_sshsig(
+        &self,
+        key_id: &str,
+        algorithm: crate::protocols::key_management::sign_sshsig::SignSshsigAlgorithm,
+        namespace: &str,
+        hash_algorithm: crate::protocols::key_management::sign_sshsig::SshsigHashAlgorithm,
+        message_hash: &[u8],
+    ) -> Result<crate::protocols::key_management::sign_sshsig::SignSshsigResponse, VtaError> {
+        use crate::protocols::key_management::sign_sshsig::SignSshsigPayload;
+        use base64::Engine;
+        let payload = SignSshsigPayload::builder()
+            .key_id(key_id)
+            .algorithm(algorithm)
+            .namespace(namespace)
+            .hash_algorithm(hash_algorithm)
+            .message_hash(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message_hash));
+        let payload = SignSshsigPayload::try_from(payload)
+            .map_err(|e| VtaError::Validation(format!("keys/sign-sshsig request: {e}")))?;
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_SIGN_SSHSIG_0_1,
+            serde_json::to_value(payload)
+                .map_err(|e| VtaError::Protocol(format!("encode keys/sign-sshsig: {e}")))?,
+            30,
+        )
+        .await
+    }
+
+    /// `keys/sign-jws/0.1` — a compact JWS over the JSON object `payload`,
+    /// with the protected `header` members given (never `alg`, `crit`, `b64`,
+    /// `jwk`, `jku` or `x5u`), made by a key that never leaves the VTA.
+    ///
+    /// The VTA sets `alg` from the key and serialises header and payload
+    /// itself (RFC 8785), so use the returned `jws` as it is — and verify it
+    /// against the key's public half before relying on it.
+    ///
+    /// Needs the `sign-jws` capability; `sign` does not confer it.
+    pub async fn sign_jws(
+        &self,
+        key_id: &str,
+        header: serde_json::Map<String, serde_json::Value>,
+        payload: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<crate::protocols::key_management::sign_jws::SignJwsResponse, VtaError> {
+        use crate::protocols::key_management::sign_jws::SignJwsPayload;
+        let mut body = serde_json::json!({ "keyId": key_id, "payload": payload });
+        if !header.is_empty() {
+            body["header"] = serde_json::Value::Object(header);
+        }
+        // Read back through the generated type, so a request the schema
+        // refuses is refused here rather than by the VTA.
+        let payload: SignJwsPayload = serde_json::from_value(body)
+            .map_err(|e| VtaError::Validation(format!("keys/sign-jws request: {e}")))?;
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_SIGN_JWS_0_1,
+            serde_json::to_value(payload)
+                .map_err(|e| VtaError::Protocol(format!("encode keys/sign-jws: {e}")))?,
+            30,
+        )
+        .await
+    }
+
+    /// `keys/sign-document/0.1` — an `eddsa-jcs-2022` Data Integrity proof over
+    /// `document` from a key that never leaves the VTA, made as the DID the
+    /// document names in `issuer` or `controller`. `proof_purpose` is
+    /// `assertionMethod` when `None`.
+    ///
+    /// Use the returned `document` exactly as it is: the proof covers every
+    /// member sent. Needs the `sign-document` capability; `sign` does not
+    /// confer it.
+    pub async fn sign_document(
+        &self,
+        key_id: &str,
+        document: serde_json::Value,
+        proof_purpose: Option<&str>,
+    ) -> Result<crate::protocols::key_management::sign_document::SignDocumentResponse, VtaError>
+    {
+        use crate::protocols::key_management::sign_document::SignDocumentPayload;
+        let mut body = serde_json::json!({ "keyId": key_id, "document": document });
+        if let Some(purpose) = proof_purpose {
+            body["proofPurpose"] = purpose.into();
+        }
+        // Read back through the generated type, so a request the schema
+        // refuses is refused here; sent as built, so the document is carried
+        // whole.
+        serde_json::from_value::<SignDocumentPayload>(body.clone())
+            .map_err(|e| VtaError::Validation(format!("keys/sign-document request: {e}")))?;
+        self.rpc_tt(trust_tasks::TASK_KEYS_SIGN_DOCUMENT_0_1, body, 30)
+            .await
+    }
+
+    /// `keys/sign-csr/0.1` — a PKCS#10 certificate signing request (PEM) for a
+    /// key that never leaves the VTA, naming `subject` (in encoded order:
+    /// element 0 is the first RDN, conventionally `C`) and, optionally,
+    /// subject alternative names.
+    ///
+    /// The VTA builds the request from these and the key's own public key.
+    /// Check that `publicKey` in the answer is the key you meant to certify
+    /// before submitting the request to a CA.
+    ///
+    /// Needs the `sign-csr` capability; `sign` does not confer it.
+    pub async fn sign_csr(
+        &self,
+        key_id: &str,
+        subject: Vec<crate::protocols::key_management::sign_csr::SignCsrRdnAttribute>,
+        subject_alt_names: Option<
+            crate::protocols::key_management::sign_csr::SignCsrSubjectAltNames,
+        >,
+    ) -> Result<crate::protocols::key_management::sign_csr::SignCsrResponse, VtaError> {
+        use crate::protocols::key_management::sign_csr::SignCsrPayload;
+        let payload = SignCsrPayload::builder()
+            .key_id(key_id)
+            .subject(subject)
+            .subject_alt_names(subject_alt_names);
+        let payload = SignCsrPayload::try_from(payload)
+            .map_err(|e| VtaError::Validation(format!("keys/sign-csr request: {e}")))?;
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_SIGN_CSR_0_1,
+            serde_json::to_value(payload)
+                .map_err(|e| VtaError::Protocol(format!("encode keys/sign-csr: {e}")))?,
+            30,
+        )
+        .await
+    }
+
+    /// Ephemerally derive a key at `derivation_path` and sign `payload` —
+    /// **without persisting a key record**. Super-admin only, and the path must
+    /// lie inside `m/26'/9'` (the VTA's delegated-identity subtree). Returns the
+    /// derived public key + signature.
+    ///
+    /// This is how a client (e.g. a fleet manager whose fleet seed *is* this
+    /// VTA's seed) acts as a derived child identity — e.g. a per-VTA super-admin
+    /// at `m/26'/9'/<idx>'` — so the seed never leaves the VTA. REST:
+    /// `POST /keys/derive-and-sign`; DIDComm: the `keys/derive-and-sign/1.0`
+    /// trust task.
+    pub async fn derive_and_sign(
+        &self,
+        key_type: KeyType,
+        derivation_path: &str,
+        payload: &[u8],
+        algorithm: SignAlgorithm,
+    ) -> Result<DeriveAndSignResultBody, VtaError> {
+        use base64::Engine;
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        let body = serde_json::json!({
+            "keyType": serde_json::to_value(&key_type)?,
+            "derivationPath": derivation_path,
+            "payload": payload_b64,
+            "algorithm": algorithm,
+        });
+        self.rpc_tt(trust_tasks::TASK_KEYS_DERIVE_AND_SIGN_0_1, body.clone(), 30)
+            .await
+    }
+
+    /// Derive a key at `derivation_path` and attach an `eddsa-jcs-2022`
+    /// Data-Integrity proof to `document`, signed **as the derived key** —
+    /// persisting no key record. Super-admin only, inside `m/26'/9'`. Returns
+    /// the signer `did:key` + the signed document. This is how a fleet manager has its fleet VTA sign an
+    /// auth document as a per-VTA super-admin without the seed leaving the VTA.
+    pub async fn derive_and_sign_document(
+        &self,
+        key_type: KeyType,
+        derivation_path: &str,
+        document: serde_json::Value,
+        proof_purpose: Option<&str>,
+    ) -> Result<DeriveAndSignDocumentResultBody, VtaError> {
+        // Built from the canonical body, not a hand-rolled map. The map spelled
+        // `proofPurpose` unconditionally, so an unset purpose went on the wire
+        // as `null` and `keys/derive-and-sign-document/0.1` — which types it
+        // `"string"` — rejected the request. Omitting the member is what
+        // selects the `assertionMethod` default, so the *documented* way to
+        // call this was the one that could not work. Same defect as #919's
+        // `keys/create`, and the same fix: let the body struct's
+        // `skip_serializing_if` decide what reaches the wire.
+        let body = serde_json::to_value(
+            crate::protocols::key_management::derive_and_sign_document::DeriveAndSignDocumentBody {
+                key_type,
+                derivation_path: derivation_path.to_string(),
+                document,
+                proof_purpose: proof_purpose.map(str::to_string),
+            },
+        )?;
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_DERIVE_AND_SIGN_DOCUMENT_0_1,
+            body.clone(),
+            30,
+        )
+        .await
+    }
+
+    pub async fn invalidate_key(&self, key_id: &str) -> Result<InvalidateKeyResponse, VtaError> {
+        self.invalidate_key_with_reason(key_id, None).await
+    }
+
+    /// [`Self::invalidate_key`] with the `reason` member of `keys/revoke/0.1`.
+    pub async fn invalidate_key_with_reason(
+        &self,
+        key_id: &str,
+        reason: Option<&str>,
+    ) -> Result<InvalidateKeyResponse, VtaError> {
+        let mut body = serde_json::json!({ "keyId": key_id });
+        if let Some(r) = reason {
+            body["reason"] = serde_json::Value::String(r.to_string());
+        }
+        self.rpc_tt(trust_tasks::TASK_KEYS_REVOKE_0_1, body, 30)
+            .await
+    }
+
+    pub async fn rename_key(
+        &self,
+        key_id: &str,
+        new_key_id: &str,
+    ) -> Result<RenameKeyResponse, VtaError> {
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_RENAME_0_1,
+            serde_json::json!({ "keyId": key_id, "newKeyId": new_key_id }),
+            30,
+        )
+        .await
+    }
+
+    /// Set whether a key's private half may be released.
+    ///
+    /// `exportable` is the state the key should be in afterwards, **not a
+    /// delta**, so a retry of a lost `false` lands on `false` rather than
+    /// toggling back. There is deliberately no toggle form.
+    ///
+    /// The two directions do not cost the same. Imposing the restriction needs
+    /// admin of the key's context; lifting it needs strictly more — super-admin
+    /// or a live step-up. A restriction the party who imposed it can lift
+    /// unilaterally protects against accident but not against a compromised
+    /// caller holding that party's credentials, which is the case it exists for.
+    pub async fn set_key_exportability(
+        &self,
+        key_id: &str,
+        exportable: bool,
+    ) -> Result<
+        crate::protocols::key_management::set_exportability::SetKeyExportabilityResultBody,
+        VtaError,
+    > {
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_SET_EXPORTABILITY_0_1,
+            serde_json::json!({ "keyId": key_id, "exportable": exportable }),
+            30,
+        )
+        .await
+    }
+
+    // ── Import key methods ──────────────────────────────────────────
+
+    /// A fresh, single-use wrapping key to seal a private key to before
+    /// [`import_key`](Self::import_key) — `keys/import-wrapping-key/0.1`.
+    ///
+    /// The key is an Ed25519 `did:key`; seal to its X25519 counterpart
+    /// (`affinidi_crypto::did_key::ed25519_pub_to_x25519_bytes`) before
+    /// `expiresAt`, and use it once. Reachable over every transport, though a
+    /// DIDComm or TSP client does not need it: those carry the cleartext
+    /// `privateKeyMultibase` end-to-end encrypted.
+    ///
+    /// **The reply's proof is always verified, and must be the VTA's.** This
+    /// task exists for transports with an intermediary that sees plaintext, and
+    /// that intermediary could hand back a key of its own and read whatever is
+    /// sealed to it. So a client with no identity to verify against is refused
+    /// here, and the unsigned-reply staging control
+    /// ([`trusting_unsigned_replies`](Self::trusting_unsigned_replies)) does not
+    /// apply to this task.
+    pub async fn get_wrapping_key(&self) -> Result<WrappingKeyResponse, VtaError> {
+        #[cfg(feature = "test-loopback")]
+        let loopback = self.loopback.is_some();
+        #[cfg(not(feature = "test-loopback"))]
+        let loopback = false;
+        if self.identity.is_none() && !loopback {
+            return Err(VtaError::Protocol(
+                "a wrapping key cannot be used unverified, and this client has no VTA DID to \
+                 verify the reply against — build the client with an identity"
+                    .into(),
+            ));
+        }
+        self.rpc_tt(
+            trust_tasks::TASK_KEYS_IMPORT_WRAPPING_KEY_0_1,
+            serde_json::json!({}),
+            30,
+        )
+        .await
+    }
+
+    // ── Seed methods ────────────────────────────────────────────────
+
+    pub async fn list_seeds(&self) -> Result<ListSeedsResponse, VtaError> {
+        self.rpc_tt(trust_tasks::TASK_SEEDS_LIST_1_0, serde_json::json!({}), 30)
+            .await
+    }
+
+    pub async fn rotate_seed(
+        &self,
+        mnemonic: Option<String>,
+    ) -> Result<RotateSeedResponse, VtaError> {
+        let _body = RotateSeedRequest {
+            mnemonic: mnemonic.clone(),
+        };
+        self.rpc_tt(
+            trust_tasks::TASK_SEEDS_ROTATE_1_0,
+            serde_json::json!({ "mnemonic": mnemonic }),
+            30,
+        )
+        .await
+    }
+}
+
+#[cfg(all(test, feature = "test-loopback", feature = "client"))]
+mod exportability_tests {
+    use crate::client::loopback::RecordingSink;
+    use std::sync::Arc;
+
+    /// The producer side of `keys/set-exportability`: the URI it dispatches and
+    /// the body it builds.
+    ///
+    /// Worth pinning because this method is the only way an operator can reach
+    /// the task — the VTA served it for a release with no client and no CLI, so
+    /// nothing would have noticed a wrong URI here.
+    #[tokio::test]
+    async fn it_sends_the_state_absolutely_under_the_right_uri() {
+        let sink = Arc::new(RecordingSink::new());
+        let client = crate::client::VtaClient::loopback(sink.clone());
+
+        // The response will not deserialize from `null`; the request was
+        // captured before that, which is what this test is asking about.
+        let _ = client.set_key_exportability("app-signing-key", false).await;
+
+        let (uri, payload) = sink.recorded().pop().expect("one task was dispatched");
+        assert_eq!(uri, crate::trust_tasks::TASK_KEYS_SET_EXPORTABILITY_0_1);
+        assert_eq!(payload["keyId"], "app-signing-key");
+        assert_eq!(
+            payload["exportable"], false,
+            "a boolean, not a string: `\"false\"` is truthy in several languages \
+             and would invert the request"
+        );
+        assert!(
+            payload.get("toggle").is_none(),
+            "the state is absolute — a toggle would make a retried request undo itself"
+        );
+    }
+
+    /// #2583: the operator's reason reaches `keys/revoke/0.1`, and
+    /// `acl/revoke/0.3` for an entry deletion, so the audit row can carry it.
+    #[tokio::test]
+    async fn a_revocation_carries_its_reason() {
+        let sink = Arc::new(RecordingSink::new());
+        let client = crate::client::VtaClient::loopback(sink.clone());
+
+        let _ = client
+            .invalidate_key_with_reason("k1", Some("leaked in a log"))
+            .await;
+        let (uri, payload) = sink.recorded().pop().expect("one task was dispatched");
+        assert_eq!(uri, crate::trust_tasks::TASK_KEYS_REVOKE_0_1);
+        assert_eq!(payload["keyId"], "k1");
+        assert_eq!(payload["reason"], "leaked in a log");
+
+        let _ = client.invalidate_key("k2").await;
+        let (_, payload) = sink.recorded().pop().expect("dispatched");
+        assert!(payload.get("reason").is_none(), "{payload}");
+
+        let _ = client
+            .delete_acl_with_reason("did:key:z6Mk", Some("left the team"))
+            .await;
+        let (uri, payload) = sink.recorded().pop().expect("dispatched");
+        assert_eq!(uri, crate::trust_tasks::TASK_ACL_REVOKE_0_3);
+        assert_eq!(payload["subject"], "did:key:z6Mk");
+        assert_eq!(payload["reason"], "left the team");
+    }
+
+    /// The other direction reaches the same task. It is the one the VTA gates
+    /// harder, and a client that spelled it differently would fail at the far
+    /// end rather than here.
+    #[tokio::test]
+    async fn releasing_uses_the_same_task() {
+        let sink = Arc::new(RecordingSink::new());
+        let client = crate::client::VtaClient::loopback(sink.clone());
+
+        let _ = client.set_key_exportability("app-signing-key", true).await;
+
+        let (uri, payload) = sink.recorded().pop().expect("one task was dispatched");
+        assert_eq!(uri, crate::trust_tasks::TASK_KEYS_SET_EXPORTABILITY_0_1);
+        assert_eq!(payload["exportable"], true);
+    }
+}

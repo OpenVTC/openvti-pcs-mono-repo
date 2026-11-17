@@ -1,0 +1,518 @@
+pub use vta_sdk::contexts::ContextRecord;
+
+use chrono::Utc;
+use vta_sdk::context_path::parent_path;
+use vta_sdk::context_policy::ContextPolicy;
+
+use vti_common::error::AppError;
+use vti_common::store::KeyspaceHandle;
+
+fn ctx_key(id: &str) -> String {
+    format!("ctx:{id}")
+}
+
+/// Retrieve a context by ID.
+pub async fn get_context(ks: &KeyspaceHandle, id: &str) -> Result<Option<ContextRecord>, AppError> {
+    ks.get(ctx_key(id)).await
+}
+
+/// Resolve the *effective* [`ContextPolicy`] for `context_id` by intersecting
+/// the policies of every context on the path root→leaf (field-wise, additive
+/// narrowing — see [`ContextPolicy`] docs). Contexts with no policy (or a
+/// missing record) contribute nothing; a chain that constrains nothing resolves
+/// to [`ContextPolicy::unrestricted`], i.e. today's behaviour.
+///
+/// Because enforcement always resolves the whole chain, a permissive policy
+/// written at a child level can never widen what an ancestor allows.
+pub async fn effective_context_policy(
+    ks: &KeyspaceHandle,
+    context_id: &str,
+) -> Result<ContextPolicy, AppError> {
+    Ok(effective_context_policy_and_record(ks, context_id).await?.0)
+}
+
+/// [`effective_context_policy`], plus the record of `context_id` itself (read
+/// on the way), for a caller that needs both without reading it twice.
+pub async fn effective_context_policy_and_record(
+    ks: &KeyspaceHandle,
+    context_id: &str,
+) -> Result<(ContextPolicy, Option<ContextRecord>), AppError> {
+    // Collect ids leaf→root, then resolve root→leaf.
+    let mut ids: Vec<String> = Vec::new();
+    let mut cur: Option<String> = Some(context_id.to_string());
+    while let Some(id) = cur {
+        cur = parent_path(&id).map(str::to_string);
+        ids.push(id);
+    }
+    ids.reverse();
+
+    // Keep the records and resolve over borrowed policies: nothing is cloned
+    // per ancestor on the keys/sign path, and the leaf comes back whole (its
+    // own policy included). `ids` runs root→leaf, so the leaf is the last.
+    let mut records: Vec<Option<ContextRecord>> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        records.push(get_context(ks, id).await?);
+    }
+    let policy = ContextPolicy::resolve(
+        records
+            .iter()
+            .filter_map(|r| r.as_ref()?.context_policy.as_ref()),
+    );
+    let leaf = records.pop().flatten();
+    Ok((policy, leaf))
+}
+
+/// Enforce a per-day operation quota for a context (the `quotas` arm of
+/// [`ContextPolicy`]). Atomically counts this operation in the current UTC day
+/// and returns `Forbidden` once the ceiling is reached. Counters are keyed by
+/// day (`quota:{context}:{op}:{YYYY-MM-DD}`) in the contexts keyspace, so they
+/// roll over automatically and stale days are inert (a future sweep can prune
+/// them). `allocate_u32` is 0-indexed, so the call that returns `limit` is the
+/// `(limit+1)`-th — rejecting it allows exactly `limit` operations per day.
+pub async fn enforce_daily_quota(
+    ks: &KeyspaceHandle,
+    context_id: &str,
+    op_class: &str,
+    limit: u64,
+) -> Result<(), AppError> {
+    let day = Utc::now().format("%Y-%m-%d");
+    let key = format!("quota:{context_id}:{op_class}:{day}");
+    let slot = vti_common::store::counter::allocate_u32(ks, &key).await?;
+    if u64::from(slot) >= limit {
+        return Err(AppError::Forbidden(format!(
+            "daily quota exceeded for {op_class} in context {context_id} ({limit}/day)"
+        )));
+    }
+    Ok(())
+}
+
+/// Remove every daily quota counter of `context_id`
+/// (`quota:{context}:{op}:{day}`), returning how many went.
+///
+/// For a context deletion. A counter left behind is inherited by a context
+/// created again under the same id, which would start its day with the old
+/// one's operations already counted against it. The trailing `:` keeps a
+/// sibling whose id merely starts with this one (`acme2`) out of the scan; a
+/// sub-context (`acme/eng`) is a different key segment and is purged with its
+/// own deletion.
+pub async fn purge_quota_counters(
+    ks: &KeyspaceHandle,
+    context_id: &str,
+) -> Result<usize, AppError> {
+    let keys = ks.prefix_keys(format!("quota:{context_id}:")).await?;
+    for key in &keys {
+        ks.remove(key.clone()).await?;
+    }
+    Ok(keys.len())
+}
+
+/// Store (create or overwrite) a context record.
+pub async fn store_context(ks: &KeyspaceHandle, record: &ContextRecord) -> Result<(), AppError> {
+    ks.insert(ctx_key(&record.id), record).await
+}
+
+/// Store a NEW context record, claiming the id atomically. Returns
+/// `false` (storing nothing) when the id is already taken — creation
+/// paths must treat that as a Conflict, never overwrite: last-writer-
+/// wins on a context record silently re-points its BIP-32 base path.
+pub async fn store_new_context(
+    ks: &KeyspaceHandle,
+    record: &ContextRecord,
+) -> Result<bool, AppError> {
+    ks.insert_if_absent(ctx_key(&record.id), record).await
+}
+
+fn provisioner_key(id: &str) -> String {
+    format!("ctx_provisioner:{id}")
+}
+
+/// [`store_new_context`], recording in the same atomic write that
+/// `provisioner` created the context under the `context-create` capability
+/// rather than as an administrator.
+///
+/// The record is what lets that provisioner later fill the context's unset
+/// DID, and nothing else: a provisioner may finish a context it created, never
+/// one an administrator created or another provisioner did. One batch, so a
+/// crash cannot leave a context without its provisioner (or a provisioner
+/// row without its context).
+pub async fn store_new_provisioned_context(
+    ks: &KeyspaceHandle,
+    record: &ContextRecord,
+    provisioner: &str,
+) -> Result<bool, AppError> {
+    let mut batch = vti_common::store::Batch::new();
+    batch
+        .require_absent(ctx_key(&record.id))
+        .insert(ctx_key(&record.id), record)?
+        .insert(provisioner_key(&record.id), &provisioner)?;
+    Ok(ks.apply_batch(batch).await?.is_applied())
+}
+
+/// The DID that created `id` under the `context-create` capability, or `None`
+/// when an administrator created it (or it predates the record).
+pub async fn context_provisioner(
+    ks: &KeyspaceHandle,
+    id: &str,
+) -> Result<Option<String>, AppError> {
+    ks.get(provisioner_key(id)).await
+}
+
+/// A context record as stored, for a later [`store_context_if_unchanged`].
+pub async fn get_context_raw(ks: &KeyspaceHandle, id: &str) -> Result<Option<Vec<u8>>, AppError> {
+    ks.get_raw(ctx_key(id)).await
+}
+
+/// Overwrite a context record only while it still holds exactly `expected`
+/// (its bytes from [`get_context_raw`]). Returns `false`, writing nothing,
+/// when another writer changed or removed it in between.
+///
+/// For a write whose permission was decided on what the record held — a
+/// check made on one read and a write made on another is a race, not a check.
+pub async fn store_context_if_unchanged(
+    ks: &KeyspaceHandle,
+    record: &ContextRecord,
+    expected: Vec<u8>,
+) -> Result<bool, AppError> {
+    let mut batch = vti_common::store::Batch::new();
+    batch
+        .require_unchanged(ctx_key(&record.id), expected)
+        .insert(ctx_key(&record.id), record)?;
+    Ok(ks.apply_batch(batch).await?.is_applied())
+}
+
+/// Delete a context by ID, with its provisioner record if it has one.
+pub async fn delete_context(ks: &KeyspaceHandle, id: &str) -> Result<(), AppError> {
+    let mut batch = vti_common::store::Batch::new();
+    batch.remove(ctx_key(id)).remove(provisioner_key(id));
+    ks.apply_batch(batch).await?;
+    Ok(())
+}
+
+/// List all context records.
+///
+/// A row that fails to deserialize is skipped with a warning rather than
+/// aborting the whole listing — one corrupt context must not break
+/// context management for every other context.
+pub async fn list_contexts(ks: &KeyspaceHandle) -> Result<Vec<ContextRecord>, AppError> {
+    let raw = ks.prefix_iter_raw("ctx:").await?;
+    let mut records = Vec::with_capacity(raw.len());
+    let mut skipped = 0usize;
+    for (key, value) in raw {
+        match serde_json::from_slice::<ContextRecord>(&value) {
+            Ok(record) => records.push(record),
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(
+                    key = %String::from_utf8_lossy(&key),
+                    error = %e,
+                    "skipping undeserializable context row in list_contexts"
+                );
+            }
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "list_contexts skipped corrupt rows");
+    }
+    Ok(records)
+}
+
+/// Allocate the next context index and return `(index, base_path)`.
+///
+/// Allocate the next BIP-32 base path under `base_prefix`, bumping the counter
+/// at `counter_key`.
+///
+/// Top-level contexts use [`CONTEXT_KEY_BASE`] + the legacy `ctx_counter` key
+/// (so existing indices are preserved). A sub-context passes its **parent's**
+/// `base_path` as the prefix and a **per-parent** counter key, so each parent
+/// allocates its children independently and the derivation path nests:
+/// `{parent.base_path}/<child>'`.
+pub async fn allocate_context_index(
+    ks: &KeyspaceHandle,
+    base_prefix: &str,
+    counter_key: &str,
+) -> Result<(u32, String), AppError> {
+    // Serialised via the shared counter allocator: two concurrent
+    // context creations handed the same index would share an entire
+    // BIP-32 subtree — identical private keys across trust boundaries.
+    let current = vti_common::store::counter::allocate_u32(ks, counter_key).await?;
+    let base_path = format!("{base_prefix}/{current}'");
+    Ok((current, base_path))
+}
+
+/// Validate a **single** context id segment.
+///
+/// Deliberately stricter than
+/// [`vti_common::identifier::validate_identifier`], which also admits
+/// uppercase, `.` and `_`. Context ids surface in DID paths, derivation
+/// labels and operator commands, so they are held to one canonical
+/// lowercase-slug spelling rather than several that differ only by case
+/// or punctuation.
+///
+/// **Segment-only.** A hierarchical id (`acme/eng`) is the *stored*
+/// form, built by `context_path::child_path` from an already-validated
+/// parent plus a leaf validated here. Never call this on a full path —
+/// the `/` would be rejected.
+pub fn validate_slug(id: &str) -> Result<(), AppError> {
+    if id.is_empty() {
+        return Err(AppError::Validation("context id cannot be empty".into()));
+    }
+    if id.len() > 64 {
+        return Err(AppError::Validation(
+            "context id must be 64 characters or fewer".into(),
+        ));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppError::Validation(
+            "context id must contain only lowercase alphanumeric characters and hyphens".into(),
+        ));
+    }
+    if id.starts_with('-') || id.ends_with('-') {
+        return Err(AppError::Validation(
+            "context id must not start or end with a hyphen".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Create a new top-level application context and store it.
+///
+/// Applies the same [`validate_slug`] gate as the authenticated
+/// `operations::contexts::create_context`. Both must, or setup-time
+/// callers (`setup::from_toml`, `tee::did_autogen`) could persist ids
+/// the operator-facing API would later refuse — leaving a deployment
+/// whose own CLI rejects a context it already has.
+pub async fn create_context(
+    contexts_ks: &KeyspaceHandle,
+    id: &str,
+    name: &str,
+) -> Result<ContextRecord, Box<dyn std::error::Error>> {
+    validate_slug(id).map_err(|e| format!("{e}"))?;
+    let (index, base_path) = allocate_context_index(contexts_ks, CONTEXT_KEY_BASE, "ctx_counter")
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let now = Utc::now();
+    let record = ContextRecord {
+        id: id.to_string(),
+        name: name.to_string(),
+        did: None,
+        description: None,
+        parent: None,
+        base_path,
+        index,
+        created_at: now,
+        updated_at: now,
+        context_policy: None,
+    };
+    if !store_new_context(contexts_ks, &record)
+        .await
+        .map_err(|e| format!("{e}"))?
+    {
+        // The allocated counter slot is intentionally left as a gap —
+        // counters skip forward on a lost race, they never reuse.
+        return Err(format!("context already exists: {id}").into());
+    }
+    Ok(record)
+}
+
+/// Base path for application context keys.
+pub const CONTEXT_KEY_BASE: &str = "m/26'/2'";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    fn temp_ks() -> (KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("open store");
+        (
+            store.keyspace(vta_keyspaces::CONTEXTS).expect("keyspace"),
+            dir,
+        )
+    }
+
+    /// The write a permission was decided on must fail once the record moved:
+    /// a DID set between the read and the write is not overwritten.
+    #[tokio::test]
+    async fn store_context_if_unchanged_refuses_a_record_that_moved() {
+        let (ks, _dir) = temp_ks();
+        let mut record = create_context(&ks, "agent", "Agent").await.unwrap();
+        let raw = get_context_raw(&ks, "agent").await.unwrap().unwrap();
+
+        // Someone else sets the DID in between.
+        let mut theirs = record.clone();
+        theirs.did = Some("did:web:admin.example".into());
+        store_context(&ks, &theirs).await.unwrap();
+
+        record.did = Some("did:key:zMine".into());
+        assert!(
+            !store_context_if_unchanged(&ks, &record, raw).await.unwrap(),
+            "a stale read must not win"
+        );
+        assert_eq!(
+            get_context(&ks, "agent")
+                .await
+                .unwrap()
+                .unwrap()
+                .did
+                .as_deref(),
+            Some("did:web:admin.example")
+        );
+
+        // Against what is there now, the write goes through.
+        let raw = get_context_raw(&ks, "agent").await.unwrap().unwrap();
+        assert!(store_context_if_unchanged(&ks, &record, raw).await.unwrap());
+    }
+
+    /// A provisioned create claims the id like any other: a taken id stores
+    /// nothing, provisioner record included.
+    #[tokio::test]
+    async fn store_new_provisioned_context_never_overwrites() {
+        let (ks, _dir) = temp_ks();
+        let record = create_context(&ks, "taken", "Taken").await.unwrap();
+        assert!(
+            !store_new_provisioned_context(&ks, &record, "did:key:zP")
+                .await
+                .unwrap()
+        );
+        assert_eq!(context_provisioner(&ks, "taken").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn daily_quota_allows_up_to_limit_then_forbids() {
+        let (ks, _dir) = temp_ks();
+        // Limit 2: the first two operations pass, the third is refused.
+        enforce_daily_quota(&ks, "sales", "sign", 2).await.unwrap();
+        enforce_daily_quota(&ks, "sales", "sign", 2).await.unwrap();
+        let err = enforce_daily_quota(&ks, "sales", "sign", 2).await;
+        assert!(matches!(err, Err(AppError::Forbidden(_))), "{err:?}");
+
+        // A different op-class (and a different context) has an independent
+        // counter.
+        enforce_daily_quota(&ks, "sales", "vault/release", 1)
+            .await
+            .unwrap();
+        let err2 = enforce_daily_quota(&ks, "sales", "vault/release", 1).await;
+        assert!(matches!(err2, Err(AppError::Forbidden(_))), "{err2:?}");
+        enforce_daily_quota(&ks, "eng", "sign", 2).await.unwrap();
+    }
+
+    /// Regression test for the context-index race: N concurrent
+    /// allocations must yield N distinct base paths. Two contexts
+    /// handed the same index would share an entire BIP-32 subtree —
+    /// identical private keys across trust boundaries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn allocate_context_index_is_collision_free_under_concurrency() {
+        let (ks, _dir) = temp_ks();
+
+        let n = 64usize;
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let ks = ks.clone();
+            handles.push(tokio::spawn(async move {
+                allocate_context_index(&ks, CONTEXT_KEY_BASE, "ctx_counter")
+                    .await
+                    .expect("alloc")
+            }));
+        }
+        let mut paths = std::collections::HashSet::with_capacity(n);
+        for h in handles {
+            let (_, base_path) = h.await.expect("join");
+            assert!(
+                paths.insert(base_path.clone()),
+                "duplicate context base path {base_path}"
+            );
+        }
+        assert_eq!(paths.len(), n);
+    }
+
+    /// Concurrent creates with the same id: exactly one may win; the
+    /// losers must not overwrite the winner's record (last-writer-wins
+    /// would silently re-point the context's BIP-32 base path).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_id_creates_admit_exactly_one() {
+        let (ks, _dir) = temp_ks();
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let ks = ks.clone();
+            handles.push(tokio::spawn(async move {
+                create_context(&ks, "contested", "Contested").await.ok()
+            }));
+        }
+        let mut winners = Vec::new();
+        for h in handles {
+            if let Some(rec) = h.await.expect("join") {
+                winners.push(rec);
+            }
+        }
+        assert_eq!(winners.len(), 1, "exactly one same-id create may win");
+
+        let stored = get_context(&ks, "contested")
+            .await
+            .expect("get")
+            .expect("record exists");
+        assert_eq!(
+            stored.base_path, winners[0].base_path,
+            "stored record must be the winner's — no overwrite by losers"
+        );
+    }
+
+    #[test]
+    fn validate_slug_accepts_canonical_shapes() {
+        for ok in ["a", "vta", "trust-registry", "ctx-1", "a1-b2-c3"] {
+            validate_slug(ok).unwrap_or_else(|e| panic!("{ok:?} should be valid: {e}"));
+        }
+        validate_slug(&"a".repeat(64)).expect("64 chars is the limit, not over it");
+    }
+
+    #[test]
+    fn validate_slug_rejects_non_canonical_shapes() {
+        // Uppercase, `.` and `_` are accepted by the *looser*
+        // `validate_identifier` used for parent path segments. Context
+        // ids are held to the narrower slug rule, so these must fail
+        // here even though they are legal identifiers elsewhere.
+        for bad in [
+            "MyApp", "ctx.v2", "my_app", "-lead", "trail-", "", "a/b", "a b",
+        ] {
+            assert!(
+                validate_slug(bad).is_err(),
+                "{bad:?} must be rejected as a context id"
+            );
+        }
+        assert!(validate_slug(&"a".repeat(65)).is_err(), "65 chars is over");
+    }
+
+    /// The setup-time path (`setup::from_toml`, `tee::did_autogen`)
+    /// must not be able to persist an id that the authenticated
+    /// `operations::contexts::create_context` would refuse — otherwise
+    /// a deployment ends up with a context its own CLI rejects.
+    #[tokio::test]
+    async fn low_level_create_context_enforces_the_slug_rule() {
+        let (ks, _dir) = temp_ks();
+
+        let err = create_context(&ks, "MyApp", "My App")
+            .await
+            .expect_err("non-slug id must be refused");
+        assert!(
+            err.to_string().contains("lowercase"),
+            "error should name the rule, got: {err}"
+        );
+
+        assert!(
+            get_context(&ks, "MyApp").await.expect("get").is_none(),
+            "a rejected id must not have been persisted"
+        );
+
+        create_context(&ks, "myapp", "My App")
+            .await
+            .expect("the slug form is accepted");
+    }
+}

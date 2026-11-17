@@ -1,0 +1,723 @@
+[workspace]
+members = [
+  "did-hosting-common",
+  "did-hosting-control",
+  "did-hosting-daemon",
+  "did-hosting-server",
+  "webvh-watcher",
+  "webvh-witness",
+]
+# `fuzz/` is a detached cargo-fuzz crate with its own [workspace]; keep it out
+# of the root workspace so normal builds never pull the nightly libfuzzer deps.
+exclude = ["fuzz"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+authors = ["Glenn Gore <glenn@affinidi.com>"]
+homepage = "https://affinidi.com/"
+license = "Apache-2.0"
+keywords = ["ssi", "affinidi", "webvh"]
+repository = "https://github.com/affinidi/did-hosting-service"
+publish = true
+rust-version = "1.95.0"
+
+[workspace.dependencies]
+
+# Affinidi Trust Development Kit
+# Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.90 and vti-common
+# 0.66 both depend on affinidi-tdk ^0.45, so all three resolve to a single
+# affinidi-tdk copy. This number is not chosen independently — read it off
+# whichever vta-sdk/vti-common pair the block below pins, and move it in the
+# same commit. A plain `cargo update` that floats vti-common on its own is how
+# a second affinidi-tdk copy gets added; see the vta-sdk note.
+affinidi-tdk = "0.45"
+# `tsp` feature: routes inbound TSP frames on the shared mediator socket
+# to the `TspHandler`. Without it the handler is stored but never invoked
+# (the crate compiles TSP support out).
+affinidi-messaging-didcomm-service = { version = "0.32.0", features = ["tsp"] }
+affinidi-tdk-common = "0.7"
+affinidi-messaging-didcomm = "0.15.14"
+affinidi-secrets-resolver = "0.5.18"
+
+
+# Cancellation token for DIDComm service
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Async runtime
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "sync",
+  "signal",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# RFC 8785 JCS canonicalization. Used by the task-consent `payloadDigest`,
+# which the spec defines over the canonical payload so the digest is stable
+# across serializers on both sides of the approval. Held at 0.3 while the
+# Affinidi stack (vti-common, verifiable-trust-infrastructure) is on it: 0.4
+# would add a second copy for no gain.
+serde_json_canonicalizer = "0.4"
+
+# Error handling
+thiserror = "2"
+
+# Embedded key-value store
+fjall = "3"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random number generation
+rand = "0.10"
+
+# Cryptography
+# `ed25519-dalek` 3 and `sha2` 0.11 are chosen to sit on the *same* copy as the
+# Affinidi stack we exchange keys and digests with, not merely because they are
+# latest: affinidi-crypto / -data-integrity / -messaging-didcomm / -tsp,
+# vta-sdk and vti-common are all on dalek 3, and didwebvh-rs / vta-sdk /
+# vti-common on sha2 0.11. The only remaining dalek 2 in the lock is
+# jsonwebtoken's own, which never crosses our API (we hand it DER/raw bytes —
+# see `server::auth::jwt::JwtKeys::from_ed25519_bytes`).
+ed25519-dalek = "3"
+multibase = "0.9"
+sha2 = "0.11"
+# Already in the lock through the Affinidi stack (affinidi-secrets-resolver
+# derives `ZeroizeOnDrop` on its `Secret`); used directly to wipe the
+# service's own key material when it is dropped.
+zeroize = { version = "1.8", features = ["derive"] }
+
+# JWT — still deliberately held at 10, but the reason has changed and the old
+# one no longer applies. It used to be that `trust-tasks-https`'s `jwt` feature
+# and `vti-common` *both* pinned ^10, so 10 was the single copy. As of
+# vti-common 0.18 that is gone: vti-common moved to ^11 while trust-tasks-https
+# stayed on ^10 (still true at 0.19.4), so the graph carries both copies no
+# matter what we
+# declare, and our declaration only picks which one we compile against.
+#
+# We pick 10, for two reasons that survive the split:
+#   * We cross neither crate's JWT surface. `server::auth::jwt` mints and
+#     verifies *our own* session tokens end to end, handing the library raw/DER
+#     key bytes (`JwtKeys::from_ed25519_bytes`) and never passing a
+#     `jsonwebtoken` type to or from vti-common or trust-tasks-https. So this
+#     is a free choice, not a compatibility one — do not "fix" it by chasing
+#     whichever neighbour moved most recently.
+#   * 11 buys no consolidation anywhere else: it is still on ed25519-dalek
+#     ^2.1.1 and base64 ^0.22, exactly like 10.
+# Revisit if trust-tasks-https moves to 11 — at that point 11 becomes the
+# single copy again and this hold should be dropped.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+# HTTP stack, shared by every service crate. Declared once so the members
+# cannot drift onto different majors; each crate adds the features it needs
+# (`tower-http`'s `trace` / `cors`, `tower`'s `util`) at its own use site.
+axum = "0.8"
+tower = "0.5"
+tower-http = "0.7"
+http-body-util = "0.1"
+async-trait = "0.1"
+
+# Config files
+toml = "1.0"
+
+# Test / scratch directories
+tempfile = "3"
+
+# Axum extras (typed headers for Bearer auth)
+axum-extra = { version = "0.12", features = ["typed-header"] }
+
+# Base64 encoding. This used to be held at 0.22 on the reasoning that "every
+# Affinidi crate in the graph is on 0.22" — that premise has since inverted:
+# vta-sdk 0.34 and vti-common 0.18 both moved to ^0.23, and the whole
+# affinidi-crypto / -data-integrity stack behind them with it. Holding at 0.22
+# would have left *us* as the odd copy out.
+#
+# Moving does not reduce the copy count — three remain, and always did: 0.21
+# under webauthn-rs, 0.22 under `headers`/axum-extra and jsonwebtoken, 0.23
+# under the Affinidi stack and us. It only decides which one we compile
+# against, and base64 is pure encoding that crosses no API, so the choice is
+# free. Take the copy the crates we exchange encoded data with are on.
+base64 = "0.23"
+
+# WebAuthn / Passkey
+# `conditional-ui` adds the discoverable-credential ceremony a passkey login
+# uses: the browser picks the credential, so the login start lists none.
+webauthn-rs = { version = "0.5", features = [
+  "danger-allow-state-serialisation",
+  "conditional-ui",
+] }
+webauthn-rs-proto = "0.5"
+# Passkey enrolment invites: the claim code is short enough to type, so it is
+# stored only as a slow, salted Argon2id hash (`auth/passkey/enroll/invite/0.2`
+# Conformance item 4). No `password-hash`: the salt and parameters are kept
+# beside the digest by `passkey::invite`. 0.6 is the line already in the lock.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+subtle = "2.6"
+url = "2"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Interactive prompts
+dialoguer = "0.12"
+
+# Static file embedding (for UI feature)
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+
+# Local GeoIP lookups for the control plane's wallet sign-in
+# (`did-hosting-control` `geoip`): reads DB-IP / MaxMind `.mmdb` files from
+# disk, never a network call (base design §12.6). No default features — the
+# file is read into memory, so `mmap` (and its `unsafe`) stays off. Same line
+# as the VTC's, which this lookup mirrors.
+maxminddb = { version = "0.32", default-features = false }
+
+# DID resolver
+# `did-webs`: the resolver every Trust Task verifier resolves a signer through
+# must resolve a `did:webs` issuer, or a did:webs ACL member (a VTA, once its
+# self-registration made it an Owner) is refused on every later request. Not
+# gated on `method-webs`: that feature decides whether this host *hosts*
+# did:webs, not whether it accepts requests from one. vta-sdk 0.90 happens to
+# turn the feature on as well; it is declared here so that this requirement
+# does not depend on what vta-sdk enables. 0.8.57 is the first on
+# `affinidi-did-webs` ^0.13.8; 0.13.9 (below) is the floor that resolves a
+# did:webs designating a service at all.
+affinidi-did-resolver-cache-sdk = { version = "0.8.57", features = ["did-webs"] }
+
+# HTTP client
+reqwest = { version = "0.13", features = ["json"] }
+
+# Error handling (lightweight)
+anyhow = "1"
+
+# DID WebVH
+# Agent names (DID shortcuts) — parsing, canonicalisation and the
+# alsoKnownAs verification rule. Shared with the resolver side so both
+# normalise identically.
+agent-names = "0.1.3"
+# 0.7 because `affinidi-did-resolver-cache-sdk` 0.8.39 (pulled by affinidi-tdk
+# 0.21) is on it; staying on 0.6 put two copies in the shipped graph.
+#
+# Pinned EXACTLY to 0.8.2 for now. 0.8.3 widened its own requirements to
+# `affinidi-data-integrity >=0.8, <0.10` and `affinidi-secrets-resolver >=0.5,
+# <0.7`, so an unlocked resolve (`cargo update`, `cargo install`) picks the 0.9
+# / 0.6 generation for didwebvh-rs while everything else here stays on 0.8 /
+# 0.5: its `Signer` is then implemented for the other generation's `Secret`
+# and the workspace does not compile (the Upstream drift job, E0277 x21). The
+# real fix is moving the whole family to that generation (affinidi-tdk 0.49,
+# affinidi-data-integrity 0.9, affinidi-secrets-resolver 0.6,
+# affinidi-messaging-sdk 0.50, trust-tasks 0.40, ...), which is blocked on
+# vta-sdk / vti-common: their latest releases (0.90 / 0.66) still require
+# affinidi-tdk 0.45, affinidi-data-integrity 0.8 and secrets-resolver 0.5,
+# and their types cross ours. Drop the `=` when that move lands (#486).
+didwebvh-rs = "=0.8.2"
+# DID URL helpers, including the `src` locator of a did:scid (`scid`).
+affinidi-did-common = "0.4.7"
+
+# DID webs — `did:web` discovery with KERI-verified key state.
+#
+# Taken WITHOUT the `create` feature on purpose. Creating a did:webs
+# identifier means holding its KERI signing keys, and the hosting service
+# never does: the controller (a VTA, or any external publisher) incepts and
+# rotates, then publishes the resulting `keri.cesr` here. What this service
+# needs is the other half — parse the stream, verify the key event log, and
+# derive the document the log implies. That is the default feature set, and
+# it keeps `affinidi-keri` (and its LMDB store) out of the dep graph.
+#
+# 0.13.9 is a floor, not a preference: earlier versions compared a service's
+# `type` as raw JSON, so the `"X"` a key event log designates and the `["X"]`
+# a `did.json` rendered from a `Document` carries (this host's own, among
+# them) mismatched, and every did:webs designating a service failed
+# resolution with `DocumentMismatch`.
+affinidi-did-webs = "0.13.9"
+
+# VTA SDK — 0.90 on crates.io, bumped in lockstep with vti-common 0.66
+# (which re-pins onto vta-sdk ^0.90), vti-secrets 0.39 (on vti-common ^0.66)
+# and trust-tasks-rs 0.39. vta-sdk 0.90 is on affinidi-messaging-sdk 0.47 /
+# affinidi-tdk 0.45 / trust-tasks 0.39 / affinidi-crypto 0.3, the same line
+# `-didcomm-service` 0.32 is built on, so the shipped graph holds one copy of
+# each. trust-tasks is held at 0.39 although 0.40 is out: it is the version
+# vta-sdk and the messaging SDK carry, and a newer one here would be a second.
+#
+# vta-sdk 0.90 / vti-common 0.66 turn on no prebuilt spec family of
+# `trust-tasks-rs`, only its `validate` feature (which, unified across the
+# graph, every crate here is then built with).
+# Carries the canonical SIOPv2 /
+# RFC 6749 wire types (`protocols::auth::{Session, TokenBundle,
+# AuthenticateResponse, ChallengeResponse, epoch_to_rfc3339}`) that the
+# cross-repo auth-architecture work introduced. vta-sdk and vti-common
+# share these types and MUST move together — a mismatched pair resolves
+# to two vta-sdk copies and fails to compile (E0308 on AuthenticateResponse).
+# The `vti-common = "0.66"` declarations in did-hosting-{common,control,
+# server} and the `vti-secrets` pin in did-hosting-common are the other half
+# of that pin; move them all together. `vti-secrets` belongs in this set: its
+# 0.4.9 patch release re-pinned onto vti-common 0.30 / vta-sdk 0.57, and an
+# unlocked `cargo install` against vta-sdk 0.56 then failed with E0631 on
+# `from_vti` in `server::secret_store` — two `vti_common::error::AppError`
+# types. Verify afterwards with
+# `cargo tree -d -e normal,build`, which must list none of `vta-sdk`,
+# `vti-common`, `affinidi-tdk` or `trust-tasks-rs`.
+#
+# The version requirement is a caret, so a plain `cargo update` floats
+# vti-common to the newest compatible release on its own — and the newest
+# re-pins onto a vta-sdk we do not ask for. Resolution does not fail when that
+# happens: cargo just adds the second copy, and the report is three E0308s in
+# `routes/auth.rs` naming two identical-looking `AuthenticateResponse` types.
+# That is precisely what vti-common 0.11.38 (^0.22) and 0.11.39 (^0.23) did to
+# a workspace still pinning vta-sdk ^0.21, and what 0.11.41 (^0.24) did on
+# 2026-08-16 to one still pinning ^0.23. If you see that error, look at
+# `cargo tree -d`, not at auth.rs. The `Upstream drift` canary exists to catch
+# it a day early — it went red on 2026-08-13 for exactly this, one day before
+# an operator's unlocked build hit it.
+#
+# Note what the 0.11.41 repeat teaches that the first one did not: the
+# committed lockfile is the only thing holding the good pair, so the break is
+# invisible to `cargo build` here and shows up first in an *unlocked* consumer
+# build — `cargo install --path did-hosting-control` re-resolves unless you
+# pass `--locked`. Deploy with `--locked`; that is the difference between
+# shipping the pair we tested and shipping whatever crates.io published today.
+#
+# The dev graph used to be a separate question, and NOT clean: `did-hosting-control`
+# dev-depends on `affinidi-messaging-test-mediator`, which pulled
+# `affinidi-messaging-mediator` 0.18.11, which pinned vta-sdk ^0.21 — so
+# `cargo tree -d -e normal,build,dev` showed vta-sdk 0.21.9 and, behind it,
+# trust-tasks-rs 0.2.60. That was tolerated, not overlooked: neither copy crossed
+# into a type-checking context of ours (the mediator is a test fixture we only
+# spawn), and the alternative was holding our own SDK back to whatever the
+# mediator last published against.
+#
+# **It collapsed once, then split again on the very next bump — which is the
+# lesson.** The messaging stack republished on the trust-tasks 0.9 line
+# (mediator 0.18.18 / test-mediator 0.2.51) and the dev graph went clean; moving
+# the shipped graph to trust-tasks 0.17 immediately re-split it, because
+# test-mediator was still pinned `^0.2` and dragged affinidi-tdk 0.8 /
+# trust-tasks-rs 0.11 back in behind it. Bumping the dev-dep to
+# `affinidi-messaging-test-mediator = "0.4"` (mediator 0.20, trust-tasks-rs
+# 0.17) closed it again. The trust-tasks 0.17 → 0.18 move repeated the pattern
+# a third time and was closed the same way: test-mediator `0.4` → `0.5`
+# (mediator 0.22, affinidi-messaging-sdk 0.22, affinidi-tdk 0.12). The
+# 0.18 → 0.19 move made it four for four: test-mediator `0.5` → `0.6`
+# (mediator 0.23, affinidi-messaging-sdk 0.23, affinidi-tdk 0.13). Four for
+# four — assume the dev-dep needs bumping every time this family moves, and
+# check rather than hope.
+#
+# So: this dev-dep is not independent of the trust-tasks family — it carries a
+# copy, and it has to move in the same commit. `cargo tree -d -e
+# normal,build,dev` must list none of `vta-sdk`, `vti-common`, `affinidi-tdk` or
+# `trust-tasks-rs`; a dev-graph split is cheap to acquire and easy to stop
+# noticing. Keep the lock's `affinidi-messaging-mediator` at >= 0.18.4
+# regardless.
+#
+# `trust-tasks-rs` has now been duplicated in the *shipped* graph twice, and
+# collapsed twice, by the same move: bring every crate that carries it onto one
+# major. First when vta-sdk 0.21 / vti-common 0.11.35 pinned ^0.2 against our
+# ^0.4 (the 0.23 bump closed it), then again on 0.4 → 0.6, where four
+# transitive carriers had to move together (see the Trust Tasks block below).
+# Do not "fix" a future split by dropping *back* a major — that splits the
+# messaging stack instead of joining it.
+#
+# `tsp` feature: enables the Trust Spanning Protocol client surface
+# (`session::TspPingSession`, `atm.tsp().send/unpack`) that the TSP
+# transport binding rides on. Pulls `affinidi-tdk/tsp` +
+# `affinidi-messaging-sdk/tsp`.
+vta-sdk = { version = "0.90.0", features = [
+  "session",
+  "provision-integration",
+  "provision-client",
+  "client",
+  "tsp",
+] }
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Trust Tasks (DTGWG, ToIP). The whole family
+# moves as one workspace event — `trust-tasks-rs`'s core types cross the
+# public API of `-https` / `-didcomm` / `-proof` / `-tsp`, so a graph
+# mixing majors does not type-check. Bump all five together, and in
+# lockstep with verifiable-trust-infrastructure.
+#
+# **The task types are generated, not taken from `trust-tasks-rs`.** 0.35.4
+# deprecated the prebuilt `trust_tasks_rs::specs::<family>` modules (they are
+# to be removed in a later withdrawal batch). Every task this workspace speaks
+# is pinned in `did-hosting-common/trust-tasks.lock`, its bundle vendored under
+# `did-hosting-common/trust-tasks/`, and generated by `trust-tasks-build` in
+# that crate's build.rs into `did_hosting_common::tasks` — the same module
+# paths (`tasks::acl::grant::v0_2`). All crates use those types, so a type
+# crossing a crate boundary is one type. `trust-tasks-rs` is declared with
+# `default-features = false`: we need the runtime and the framework's own
+# specifications (`trust_tasks_rs::specs::trust_task_discovery`), nothing else.
+# To change a pin: `cargo install trust-tasks-cli`, then from
+# `did-hosting-common/` run `trust-tasks add <slug>/<M.N>` (or `update`), and
+# commit trust-tasks.toml, trust-tasks.lock and trust-tasks/ together. CI runs
+# `trust-tasks check`. The UI generates its TypeScript types from the same lock.
+#
+# What 0.35 → 0.36 changed for us: the framework's error document moved to
+# `trust-task-error/0.6` (a strict superset of 0.5: it adds the
+# `unsupportedExtension` and `indeterminate` codes), so the hand-written
+# `framework_error_type_uri()` moved with it. It moves with vta-sdk 0.75 /
+# vti-common 0.51 / vti-secrets 0.24, affinidi-tdk 0.36,
+# affinidi-messaging-sdk 0.44, `-didcomm-service` 0.29 and test-mediator 0.48.
+# No pinned task changed.
+#
+# What 0.32 → 0.35 changed for us: the deprecation above, which is what moved
+# us onto generated types, and every pinned task onto its latest version — a
+# coordinated wire break with the VTA, the wallet and the UI. It moves with
+# vta-sdk 0.74 / vti-common 0.50 / vti-secrets 0.23, affinidi-tdk 0.33,
+# affinidi-messaging-sdk 0.41 (and `affinidi-tsp` 0.3 with it),
+# `-didcomm-service` 0.26 and test-mediator 0.46. vta-sdk 0.74 made
+# `VtaEvent` / `DiagStatus` `#[non_exhaustive]`.
+#
+# What 0.23 → 0.24 changed for us: 0.24 fixes the codegen defect behind
+# `auth/passkey/enroll/invite/update/0.1`'s local workaround type (issue
+# #218) — the schema's `oneOf` (role alone, or `expiresAt` XOR `extendBy`)
+# used to narrow the generated `Payload`'s role branch to an empty enum, so
+# the handler carried its own hand-rolled copy of the payload shape instead.
+# 0.24's generated `Payload` is now permissive (every member but `inviteId`
+# is `Option`) rather than encoding the `oneOf` at all, so
+# `did-hosting-control::control_tasks::auth::invite_update` now uses the
+# generated type directly and re-validates the raw payload against
+# `PAYLOAD_SCHEMA` at runtime (`trust_tasks_rs::validate::ValidatedPayload`)
+# before acting — see the `validate` feature note on `did-hosting-control`'s
+# own `trust-tasks-rs` declaration. That also corrected a bug the workaround
+# had: the old hand-written check demanded *exactly* one of
+# role/expiresAt/extendBy, so a `role` + `expiresAt` update was wrongly
+# refused; the real schema allows a role change alongside either expiry
+# change, only `expiresAt` and `extendBy` are mutually exclusive.
+#
+# `-https` / `-didcomm` / `-proof` / `-tsp` 0.24.0 are each byte-identical in
+# `src/` to their 0.23.6 — the move re-pins them onto `trust-tasks-rs
+# "^0.24"` and nothing else, so `trust-task-error/0.5` is unchanged and no
+# other source here moved.
+#
+# Of the four transitive carriers the paragraph below tracks,
+# `affinidi-messaging-didcomm-service` needed a bump to keep one copy of
+# `trust-tasks-rs`: 0.13 pinned `trust-tasks-rs "0.23"`; 0.14 moved to
+# `"0.24"`, and pulled `affinidi-messaging-sdk` 0.29 with it — bumped our own
+# direct pin (0.28.1 → 0.29.0, below) to match rather than carry a second
+# copy of that too.
+#
+# **This closes for good on the 0.56/0.24.2 move.** `vta-sdk` 0.54.0 → 0.56.0
+# and `vti-common` 0.27.0 → 0.29.0 (the four `vti-common = "0.27"`
+# declarations below moved to `"0.29"` alongside it) are the releases that
+# retire the "still pin trust-tasks-tsp / trust-tasks-capability-client at
+# their old 0.23.x majors" residual this note used to describe: 0.56 and
+# 0.29.0 both declare `trust-tasks-rs ^0.24.2`, the same line
+# `affinidi-messaging-didcomm-service` 0.15.1 and this workspace's own five
+# `trust-tasks-*` lines (below) are now on. `cargo tree -d -e
+# normal,build,dev` was run after this move and lists no duplicate of
+# `trust-tasks-rs`, `trust-tasks-tsp` or `trust-tasks-capability-client` —
+# confirm this stays true before assuming a future bump keeps it that way.
+#
+# The dev-graph half needed test-mediator `0.12` → `0.14` (mediator 0.33,
+# affinidi-messaging-sdk 0.30, affinidi-tdk 0.20) to keep pace with the
+# affinidi-messaging-sdk bump above and to land on the same `vta-sdk` 0.56
+# line; `did-hosting-control`'s own `affinidi-messaging-test-mediator` pin
+# (below) moved with it.
+#
+# The compiler-invisible check was run again and still passes: the
+# framework emits `trust-task-error/0.5`, unchanged since 0.9, and
+# `server::trust_tasks::framework_error_type_uri()` still agrees.
+#
+# What 0.28 → 0.32 changed for us: `auth/oob/{prove,respond,grant}` gained a
+# 0.2 (trust-tasks-tf #820: step 2 may offer a `signingScope`, which the grant
+# copies). The wallet now sends `prove/0.2` first and falls back to 0.1 only on
+# an `unsupportedType` refusal. Here an unserved `auth/oob` version from the
+# wallet's `did:key` was refused `permissionDenied` by the ACL pre-filter, so
+# the current wallet could not sign in at all. Now 0.2 is served (offering no
+# scope: `did-hosting-control::oob::types`), and an unserved `auth/oob`
+# version answers `unsupportedType` (`messaging::proof_rule`), so the next
+# version falls back instead of failing. The one other source change came from
+# vti-secrets: `SecretBackend` is `#[non_exhaustive]` and gained
+# `EncryptedFile`, which this service refuses as unsupported. It moves with
+# vta-sdk 0.72 / vti-common 0.48 / vti-secrets 0.21, affinidi-tdk 0.27,
+# affinidi-messaging-sdk 0.37 and `-didcomm-service` 0.22 in one commit; the
+# dev-graph half needed test-mediator `0.20` → `0.43`. `cargo tree -d -e
+# normal,build,dev` lists no duplicate of the family, and the framework still
+# emits `trust-task-error/0.5`.
+#
+# What 0.25 → 0.28 changed for us: 0.27.8 is the first release with the
+# `auth/oob/*` bindings (`trust_tasks_rs::specs::auth::oob`), which is what
+# let wallet sign-in become rows of `did-hosting-control::control_tasks`
+# instead of a divert with local wire types. The one other source change came
+# from vti-common: `Session` gained `not_after` (an absolute session end, for
+# VTI's own wallet sign-in); every `Session` built here passes `None`, the
+# sliding behaviour it had before — this service bounds a session's absolute
+# lifetime itself (`store_auth_proxy_meta`). The family moves with vta-sdk 0.65
+# / vti-common 0.41 / vti-secrets 0.14, affinidi-tdk 0.24 (and
+# affinidi-tdk-common 0.7), affinidi-messaging-sdk 0.34, `-didcomm-service`
+# 0.19, affinidi-data-integrity 0.8 and didwebvh-rs 0.8 in one commit; the
+# dev-graph half needed test-mediator `0.15` → `0.20`. `cargo tree -d -e
+# normal,build,dev` lists no duplicate of the family, and the framework still
+# emits `trust-task-error/0.5`.
+#
+# What 0.24 → 0.25 changed for us: nothing from the trust-tasks family itself.
+# The one source change came from `didwebvh-rs` 0.7, which moved with it: its
+# resolver now contacts public hosts only by default, and the verifier's
+# deactivation check (`server::trust_tasks::verifier::DeactivationCache`) reads
+# signer logs through it, so it now takes the same `HostPolicy` as the DID
+# cache (`TransportBoundVerifier::with_did_cache_and_host_policy`). The daemon
+# e2e test, whose daemon DID lives on `localhost`, is what caught it. It moves with vta-sdk 0.58 / vti-common 0.31 /
+# vti-secrets 0.5, affinidi-tdk 0.21, affinidi-messaging-sdk 0.31,
+# `-didcomm-service` 0.16 and didwebvh-rs 0.7 in one commit. The dev-graph half
+# needed test-mediator `0.14` → `0.15` (mediator 0.34, affinidi-messaging-sdk
+# 0.31, affinidi-tdk 0.21) again. `cargo tree -d -e normal,build,dev` lists no
+# duplicate of the family.
+#
+# **"All five" undersells it.** `trust-tasks-rs` also arrives transitively
+# through four crates we pin by caret, and every one of them has to reach a
+# release on the same major or the shipped graph carries two copies:
+# `vti-common`, `affinidi-messaging-sdk`, `affinidi-messaging-didcomm-service`
+# and `trust-tasks-capability-client`. On the 0.4 → 0.6 move all four needed a
+# lockfile update and nothing else — the requirements were already wide enough —
+# but `cargo tree -d -e normal,build` is what tells you, and it listed
+# trust-tasks-rs twice until the last of them moved. Run it; do not assume the
+# five manifest lines were the whole job.
+#
+# What 0.20 → 0.21 changed for us: nothing in this workspace — no source
+# change at all, and the whole workspace (including the feature-gated
+# `server-core`/`store-fjall` server modules and every test target) compiled
+# clean on the first try. This bump's real driver was **TSP rev3**:
+# `affinidi-tsp` 0.1 → 0.2 is the rev3 release (published 2026-09-15), and it
+# pulls the family with it — `affinidi-tdk` 0.14 → 0.16,
+# `affinidi-messaging-didcomm-service` 0.8 → 0.10 (sdk 0.24 → 0.26), vta-sdk
+# 0.38 → 0.41, vti-common 0.18.5 → 0.18.9, and all five trust-tasks lines
+# 0.20 → 0.21, in one commit. rev3 adds the post-quantum ML-DSA envelope
+# suite underneath (visible as new `ml-dsa` / `crypto_secretbox` deps in the
+# lock); none of it crosses our source, which speaks trust-tasks documents,
+# not TSP envelope internals. `cargo tree -d -e normal,build{,,dev}` lists no
+# duplicate of the family.
+#
+# The compiler-invisible check was run again and still passes: the framework
+# emits `trust-task-error/0.5` at 0.21.2, unchanged since 0.9, and
+# `server::trust_tasks::framework_error_type_uri()` still agrees.
+#
+# What 0.22 → 0.23 changed for us: one source change, in
+# `server::trust_tasks::verifier`. `trust-tasks-proof` 0.23's
+# `CachedDidResolver` no longer implements the purpose-less
+# `VerificationMethodResolver`; it is a `ProofPurposeResolver`, and a proof is
+# verified through `PurposeBound::new(resolver, purpose)`, which refuses a key
+# not listed under the relationship the purpose names. `TransportBoundVerifier`
+# now resolves every key that way: `verify_operational` binds
+# `authentication`, `verify_approval` binds `assertionMethod`, and the plain
+# `ProofVerifier::verify` binds the purpose the proof declares. Our own
+# relationship walk is gone; the library's is the one that runs. Signing now
+# defaults to `authentication` upstream, but every signer here names its
+# purpose explicitly. It moves with affinidi-tdk 0.18 /
+# affinidi-messaging-sdk 0.28 / `-didcomm-service` 0.13 and vta-sdk 0.54 /
+# vti-common 0.27 in one commit; the framework still emits
+# `trust-task-error/0.5`. The dev-graph half needed test-mediator `0.10` →
+# `0.11` (mediator 0.30, affinidi-messaging-sdk 0.28, affinidi-tdk 0.18).
+#
+# What 0.21 → 0.22 changed for us: nothing in this workspace's source. It
+# moves with affinidi-tdk 0.17 / affinidi-messaging-sdk 0.27 /
+# `-didcomm-service` 0.12 and vta-sdk 0.52 / vti-common 0.25 in one commit;
+# the framework still emits `trust-task-error/0.5`.
+#
+# The dev-graph half was NOT free again — test-mediator `0.7` → `0.9`
+# (mediator 0.26, affinidi-messaging-sdk 0.26, affinidi-tdk 0.16).
+#
+# What 0.19 → 0.20 changed for us: no source change in this workspace, but
+# one *behavioural* change arrived underneath it, and it is the only thing
+# this bump cost. `vti-common` 0.18.5's canonical challenge handler no longer
+# refuses an unknown subject at `POST /auth/challenge` (VTI-SES-006/007): a
+# challenge endpoint that answers a known DID and refuses an unknown one is an
+# enumeration oracle, so both now get a challenge and only an enrolled subject
+# gets a session to redeem it against. `challenge_rejected_when_vta_not_yet_
+# authorized` asserted the old `403` and was rewritten to pin the property the
+# gate was standing in for — an un-authorized VTA obtains no session — one step
+# later, at `/auth/authenticate`, where it actually holds. If that test fails
+# again, check which of the two it is asserting before changing anything.
+#
+# The compiler-invisible check was run again and still passes: the framework
+# emits `trust-task-error/0.5` at 0.20.5, and
+# `server::trust_tasks::framework_error_type_uri()` still agrees.
+#
+# The dev-graph half was not free again — test-mediator `0.6` → `0.7`.
+#
+# What 0.18 → 0.19 changed for us: nothing in this workspace, for the same
+# reason as the bump before it — 0.19.0's breaking changes are all in the
+# `rooms/*` family, which we consume none of. `rooms/owner/issue-authority`
+# retired 0.1 for a 0.2 that makes `validUntil` REQUIRED (a chain root whose
+# authority never lapses is authority nobody can withdraw), and
+# `rooms/keys/present` 0.2 dropped `audience`/`nonce`. Neither reaches us.
+#
+# The compiler-invisible check was run again and still passes: the framework
+# emits `trust-task-error/0.5` at 0.19.4, unchanged since 0.9, and
+# `server::trust_tasks::framework_error_type_uri()` still agrees.
+#
+# The dev-graph half was NOT free again — test-mediator `0.5` → `0.6`.
+#
+# **This paragraph used to say what the 0.19 bump could NOT take.** It was
+# gated on verifiable-trust-infrastructure publishing a vta-sdk/vti-common
+# pair pinning `^0.20`, with the instruction to take the step all at once
+# rather than piecemeal. That gate lifted with vta-sdk 0.38 / vti-common
+# 0.18.5, and the step was taken exactly that way: all five trust-tasks lines,
+# `affinidi-tdk` 0.13 → 0.14, `affinidi-messaging-didcomm-service` 0.7 → 0.8
+# and test-mediator 0.6 → 0.7 in one commit, because moving any subset is the
+# diamond the paragraph above describes. `cargo tree -d -e normal,build` is
+# how that was checked and it lists no duplicate of `trust-tasks-rs`,
+# `vta-sdk`, `vti-common`, `affinidi-tdk` or `affinidi-messaging-sdk`. Keep it
+# that way: the next family bump is the same all-at-once move.
+#
+# What 0.17 → 0.18 changed for us: nothing in this workspace, and the reason is
+# worth recording because it is the first bump of this family that cost no
+# source change at all. 0.18.0's sole breaking change is in the `persona`
+# family — `persona/profile/get/1.0` stopped typing its `resolved` entries as
+# the pool-record `Attribute` and gained its own `ResolvedClaim`, so an inline
+# profile entry is representable. We consume no `persona/*` payload, so the
+# break does not reach us. Everything else on the 0.17.x → 0.18.5 path is
+# additive (`auth/step-up/approve-response` recorded status, the
+# `persona/claim-types/list` registry, the `rooms` epoch key chain).
+#
+# The compiler-invisible check still had to be run by hand and still passed:
+# the framework emits `trust-task-error/0.5`, unchanged since 0.9, and our
+# hand-written copy in `server::trust_tasks::framework_error_type_uri()` still
+# agrees. Do not let a clean `cargo check` stand in for that grep.
+#
+# The dev-graph half of the move was NOT free — `affinidi-messaging-test-mediator`
+# needed `0.4` → `0.5`. See the vta-sdk block above.
+#
+# What 0.6 → 0.9 changed for us:
+#   * 0.7.0 — `StandardCode` became `#[non_exhaustive]`. Nothing here matches on
+#     it, so no arm was needed. It is also the last time a new framework error
+#     code will break a downstream `match`.
+#   * 0.8.0 — added `StandardCode::Cancelled` and `trust-task-control/0.1`.
+#     Additive in Rust, thanks to the attribute above.
+#   * 0.9.0 — `consume_inbound` gained a REQUIRED `PayloadPolicy` argument
+#     (SPEC §7.2 item 2), and `ValidatedPayload::SCHEMA_JSON` became
+#     `Payload::PAYLOAD_SCHEMA`. We call `consume_inbound` through exactly one
+#     shim (`did-hosting-common`'s `server::trust_tasks::run_pipeline`), so the
+#     policy is decided there once for all ~28 call sites rather than threaded
+#     through each. It is `AcceptUnvalidated` — see the note beside the
+#     `validate` feature below, which gives the same reasoning. We used no
+#     `SCHEMA_JSON`.
+#   * The wire moved even though little source did: the framework now emits
+#     `trust-task-error/0.5` (was `0.3`), because `0.4` added `idConflict` and
+#     `0.5` added `cancelled`, neither of which validates against the older
+#     payload schema's `code` enum. Our one hand-written copy of that version —
+#     `framework_error_type_uri()`, for the unrouted paths where no request
+#     document exists to reject from — had to move with it, and
+#     `unrouted_and_routed_errors_agree_on_the_type_uri` is what caught it.
+#     **That kind of drift is invisible to the compiler.** When bumping this
+#     family, grep for `trust-task-error/0.` before trusting a green build.
+#
+# What 0.4 → 0.6 changed for us:
+#   * 0.5.0 — `TrustTask<P>` gained an optional `ceremony` member (framework
+#     0.4, SPEC §4.11), so struct-literal construction of the envelope needs
+#     it. Four sites here, and they are not all the same: the three unrouted
+#     body-parse error builders pass `None` (nothing parsed, so there is no
+#     request to carry a ceremony from), while `messaging::tt_reply` builds a
+#     *response* and must carry `request.ceremony.clone()` — SPEC §7.1 keeps a
+#     reply inside the enactment its request belonged to, and `None` there
+#     would silently drop it out.
+#   * 0.6.0 — `DigestMultibase` narrowed to the two multibase headers CID §2.4
+#     requires (`z` base58btc, `u` base64url-no-pad) and now enforces each
+#     alphabet instead of assuming it. We mint base58btc, so nothing moved —
+#     but a peer that had chosen `b`/`f`/`m` (the old pattern admitted them)
+#     parses before this bump and fails after. `routes::task_consent` has a
+#     test asserting the base; keep it.
+#
+# What 0.2 → 0.4 changed for us:
+#   * 0.3.0 — `TrustTask` gained `parent_thread_id` and `ErrorPayload`
+#     gained `in_response_to`, so struct-literal construction of either
+#     needs the new field (`TrustTask::new` / `for_payload` and
+#     `ErrorPayload::new` are unaffected). Error responses are emitted as
+#     `trust-task-error/0.3`, and `trust-tasks-didcomm` now sets the
+#     DIDComm `thid` from the document's `threadId` (falling back to its
+#     `id`), so a response continues its request's thread.
+#   * 0.4.0 — digest-carrying payload members are the validating
+#     `DigestMultibase` newtype rather than `String`. That covers
+#     `task-consent/{request,decision,granted}`'s `payloadDigest`, which
+#     we produce and verify: it is now a multibase-multihash over the
+#     RFC 8785 canonicalization, not raw hex.
+#
+# The acl/* typed payloads we consume directly are still v0_1 in 0.4.x.
+#
+# `validate` feature: NOT enabled here (default workspace dependency stays
+# off it). The codegen-emitted `Payload` structs use
+# `#[serde(deny_unknown_fields)]` plus newtype wrappers that reject
+# `minLength: 1` / regex constraints at deserialise time, so we get
+# framework-shape + payload-shape validation as a side-effect of typed
+# dispatch for almost every spec — the `validate` feature's JSON-Schema-driven
+# validation against the embedded schema string would be redundant for those
+# and a compile-time tax we don't pay.
+#
+# `did-hosting-control` overrides this to `features = ["validate"]` on its own
+# `trust-tasks-rs` declaration (Cargo unifies the feature across the graph,
+# so every crate is built with it once one turns it on): its
+# `auth/passkey/enroll/invite/update/0.1` handler needs runtime schema
+# validation for a `oneOf` (role alone, or `expiresAt` XOR `extendBy`) that
+# 0.24's now-permissive generated `Payload` — every member `Option` — cannot
+# express as a Rust type shape. That is a per-handler decision, not the
+# framework-wide `PayloadPolicy` this workspace still runs
+# `AcceptUnvalidated` (see `run_pipeline` in did-hosting-common): re-enable
+# more broadly only if a future spec's constraints are similarly
+# unrepresentable and need the same treatment.
+trust-tasks-rs = { version = "0.39.0", default-features = false }
+trust-tasks-https = { version = "0.39", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.39", default-features = false }
+trust-tasks-proof = { version = "0.39", default-features = false, features = ["affinidi"] }
+trust-tasks-build = "0.1.3"
+# Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
+# directly for the outbound TSP send path and VID/envelope helpers. `messaging-core` pulls the
+# protocol-agnostic `affinidi-messaging-core` traits shared with DIDComm.
+affinidi-tsp = { version = "0.3", features = ["messaging-core"] }
+# Affinidi Messaging SDK — named directly only for the durable TSP relationship
+# store types (`RelationshipKv`, `PersistentRelationshipStore`,
+# `RelationshipStore`) that back `server::tsp_relationship_store`. Not a new
+# copy: it is the same `affinidi-messaging-sdk` the whole messaging stack
+# already resolves (transitively via vta-sdk / -didcomm-service), pinned here so
+# a crate can name it. Moves with that family; `tsp` feature exposes the store
+# surface.
+affinidi-messaging-sdk = { version = "0.47.2", features = ["tsp"] }
+# Pinned to the same major.minor `trust-tasks-proof`'s `affinidi` feature
+# resolves, so the lock keeps a single copy (avoids the crypto-stack diamond).
+# Used directly by `did-hosting-common`'s `TransportBoundVerifier` for the
+# signature-only-when-issuer-absent path.
+affinidi-data-integrity = "0.8.7"
+
+# Global allocator of the service binaries (did-hosting-server, -control,
+# -daemon, webvh-witness, webvh-watcher); see any of their Cargo.toml.
+tikv-jemallocator = "0.7"
+
+# Lints every member opts into with `[lints] workspace = true`.
+[workspace.lints.rust]
+# CONTRIBUTING rule 6: no `unsafe` in production code. `deny`, not `forbid`,
+# so a test module that has to mutate the process environment
+# (`std::env::set_var` is `unsafe` in edition 2024) can opt out locally with
+# `#[allow(unsafe_code)]`; nothing outside a `#[cfg(test)]` module may.
+unsafe_code = "deny"
+
+# Argon2 in an unoptimised build takes seconds per hash, and every test that
+# issues or redeems an enrolment invite runs one; optimise just the hash.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.release]
+# Optimise for size. Measured against `opt-level = 3` on the hot path — webvh
+# log verification (`did_ops::verify_did_log_proofs` over the fuzz corpus
+# chains, both with lto + codegen-units = 1): the two were within run-to-run
+# noise of each other (~96-176 us per verify, neither consistently ahead),
+# while 3 made the binary ~27% larger. The work is dominated by the Ed25519 /
+# SHA-2 crates, whose inner loops are hand-tuned either way. Re-measure before
+# changing it.
+opt-level = "s"
+lto = true
+# One codegen unit lets LTO see, and inline across, the whole crate graph.
+codegen-units = 1
+# Release binaries ship without symbol tables, so a panic backtrace from one
+# shows addresses rather than function names. Build with
+# `CARGO_PROFILE_RELEASE_STRIP=none` to debug a release build.
+strip = "symbols"

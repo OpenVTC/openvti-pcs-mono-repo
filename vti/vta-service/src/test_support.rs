@@ -1,0 +1,2267 @@
+//! Shared test-harness helpers — in-memory keyspaces, default
+//! `AppConfig`, and a `bootstrap_test_vta` routine that provisions the
+//! minimum VTA state `operations::provision_integration::provision_integration`
+//! needs (active seed, `#key-0`, `#sealed-transfer-0`, DID resolver,
+//! populated `vta_did`).
+//!
+//! Gated behind the `test-support` feature *and* `cfg(test)` for the
+//! lib's own unit tests. Downstream integration tests (under
+//! `tests/`) enable the feature via a `[dev-dependencies]` entry.
+//!
+//! What stays here is what this crate's own unit tests build on: a unit test
+//! compiles `vta-service` as its own crate, so it cannot take a fixture from a
+//! crate that depends on `vta-service` without getting a second, incompatible
+//! copy of every type. The mock VTA a *downstream* test drives over the wire —
+//! `MockVta`, the stub DID hosting service and the transport harness — is in
+//! the `vta-test-support` crate (#2570), which re-exports everything here.
+
+#![cfg(any(test, feature = "test-support"))]
+
+/// Validates real dispatch output against published response schemas. See the
+/// module docs for why it sits at the spine rather than in middleware.
+pub mod response_conformance;
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::Duration;
+use ed25519_dalek::SigningKey;
+use serde_json::Value;
+use tokio::sync::RwLock;
+use vti_common::slip10::{DerivationPath, ExtendedSigningKey};
+
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+
+use crate::acl::Role;
+use crate::auth::AuthClaims;
+use crate::config::{AppConfig, StoreConfig};
+use crate::didcomm_bridge::DIDCommBridge;
+use crate::keys::seed_store::PlaintextSeedStore;
+use crate::keys::{KeyType as SdkKeyType, save_key_record};
+use crate::operations::provision_integration::ProvisionIntegrationDeps;
+use crate::store::{KeyspaceHandle, Store};
+use vta_sdk::did_key::ed25519_multibase_pubkey;
+use vta_sdk::provision_integration::{
+    BootstrapAsk, BootstrapRequest, DidTemplateRef, TemplateBootstrapAsk, VerifiedBootstrapRequest,
+};
+
+/// A freshly-opened tempdir-backed store plus every keyspace the
+/// `ProvisionIntegrationDeps` shape needs. Drops the tempdir on `Drop`
+/// so tests never leak.
+pub struct TestStore {
+    // `_dir` has to outlive the store (it owns the on-disk backing), and
+    // `_store` must outlive all keyspace handles (fjall's keyspace
+    // handles are weak wrt the store's lifetime). Held here as fields
+    // so the caller only has to keep `TestStore` alive.
+    _dir: tempfile::TempDir,
+    _store: Store,
+    pub contexts_ks: KeyspaceHandle,
+    pub did_templates_ks: KeyspaceHandle,
+    pub keys_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    pub audit_ks: KeyspaceHandle,
+    /// The sink over [`Self::audit_ks`] — tests that *write* audit rows take
+    /// this, tests that read them back take the keyspace.
+    pub audit: vta_audit::SharedAuditSink,
+    pub imported_ks: KeyspaceHandle,
+    /// VTA-minted key material. Needed by anything that signs with a key this
+    /// service generated rather than one a caller imported.
+    pub internal_ks: KeyspaceHandle,
+    pub webvh_ks: KeyspaceHandle,
+    /// `did:webs` records ([`crate::webs_store`]).
+    pub webs_ks: KeyspaceHandle,
+    pub sealed_nonces_ks: KeyspaceHandle,
+    /// Persisted drain set for the runtime service-management
+    /// surface. Required by `disable_didcomm` / `update_didcomm` /
+    /// rollback ops.
+    pub drains_ks: KeyspaceHandle,
+    /// Per-kind previous-config snapshot store for fail-forward
+    /// rollback (spec §3.5a). Required by every forward op + the
+    /// rollback dispatchers.
+    pub snapshot_ks: KeyspaceHandle,
+    /// Persistent runtime state for service enable/disable
+    /// (`operations::protocol::runtime_state`). Required by every
+    /// forward + rollback op.
+    pub service_state_ks: KeyspaceHandle,
+    pub data_dir: PathBuf,
+}
+
+/// Open a fresh tempdir-backed `TestStore` with every keyspace wired.
+pub async fn open_test_store() -> TestStore {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data_dir = dir.path().to_path_buf();
+    // Keyspaces copied from a pre-built template: creating them here fsyncs
+    // ~8 times each (`F_FULLFSYNC` on macOS). See
+    // `vti_common::store::test_fixture`.
+    let store =
+        vti_common::store::test_fixture::open_with_keyspaces(&data_dir, crate::keyspaces::ALL)
+            .expect("open store");
+    TestStore {
+        contexts_ks: store
+            .keyspace(crate::keyspaces::CONTEXTS)
+            .expect("contexts ks"),
+        did_templates_ks: store
+            .keyspace(crate::keyspaces::DID_TEMPLATES)
+            .expect("did_templates ks"),
+        keys_ks: store.keyspace(crate::keyspaces::KEYS).expect("keys ks"),
+        acl_ks: store.keyspace(crate::keyspaces::ACL).expect("acl ks"),
+        audit_ks: store.keyspace(crate::keyspaces::AUDIT).expect("audit ks"),
+        audit: vta_audit::shared_keyspace_sink(
+            store.keyspace(crate::keyspaces::AUDIT).expect("audit ks"),
+        ),
+        imported_ks: store
+            .keyspace(crate::keyspaces::IMPORTED_SECRETS)
+            .expect("imported ks"),
+        internal_ks: store
+            .keyspace(crate::keyspaces::INTERNAL_KEYS)
+            .expect("internal keys ks"),
+        webvh_ks: store.keyspace(crate::keyspaces::WEBVH).expect("webvh ks"),
+        webs_ks: store.keyspace(crate::keyspaces::WEBS).expect("webs ks"),
+        sealed_nonces_ks: store
+            .keyspace(crate::keyspaces::SEALED_NONCES)
+            .expect("nonces ks"),
+        drains_ks: store.keyspace(crate::keyspaces::DRAINS).expect("drains ks"),
+        snapshot_ks: store
+            .keyspace(crate::operations::protocol::snapshot::KEYSPACE_NAME)
+            .expect("snapshot ks"),
+        service_state_ks: store
+            .keyspace(crate::keyspaces::SERVICE_STATE)
+            .expect("service_state ks"),
+        _dir: dir,
+        _store: store,
+        data_dir,
+    }
+}
+
+/// A minimal `AppConfig` suitable for in-memory tests. All external
+/// services (keyring, TEE, cloud secret managers, ...) are left at
+/// their defaults.
+pub fn test_app_config(data_dir: PathBuf) -> AppConfig {
+    AppConfig {
+        trusted_presentation_verifiers: Vec::new(),
+        credential_holder_did: None,
+        vta_did: None,
+        vta_name: None,
+        public_url: None,
+        resolver_url: None,
+        did_cache: Default::default(),
+        server: Default::default(),
+        log: Default::default(),
+        store: StoreConfig { data_dir },
+        fjall: Default::default(),
+        messaging: None,
+        mediator_readiness: Default::default(),
+        services: Default::default(),
+        dids: Default::default(),
+        auth: Default::default(),
+        audit: Default::default(),
+        vault: Default::default(),
+        app_state: Default::default(),
+        witness: Default::default(),
+        notifications: Default::default(),
+        collection: Default::default(),
+        policy: Default::default(),
+        secrets: Default::default(),
+        tee: Default::default(),
+        hardened: Default::default(),
+        config_path: PathBuf::new(),
+        unknown_keys: Vec::new(),
+        effective_config_digest: None,
+        effective_config_view: None,
+    }
+}
+
+/// Build a `ProvisionIntegrationDeps` from a `TestStore`. The returned
+/// deps have no DID resolver — use [`bootstrap_test_vta`] when the
+/// full happy path is needed.
+pub fn test_deps(ts: &TestStore) -> ProvisionIntegrationDeps {
+    ProvisionIntegrationDeps {
+        keys_ks: ts.keys_ks.clone(),
+        acl_ks: ts.acl_ks.clone(),
+        audit: vta_audit::shared_keyspace_sink(ts.audit_ks.clone()),
+        contexts_ks: ts.contexts_ks.clone(),
+        did_templates_ks: ts.did_templates_ks.clone(),
+        imported_ks: ts.imported_ks.clone(),
+        webvh_ks: ts.webvh_ks.clone(),
+        webs_ks: ts.webs_ks.clone(),
+        sealed_nonces_ks: ts.sealed_nonces_ks.clone(),
+        seed_store: Arc::new(PlaintextSeedStore::new(&ts.data_dir)),
+        config: Arc::new(RwLock::new(test_app_config(ts.data_dir.clone()))),
+        did_resolver: None,
+        didcomm_bridge: Arc::new(DIDCommBridge::placeholder()),
+    }
+}
+
+/// Synthesise a super-admin `AuthClaims` for tests that bypass the
+/// normal session/JWT gate.
+/// The test super-admin's identity — a **real** `did:key`, derived from a fixed
+/// seed so it is stable across runs and reproducible from this constant alone.
+///
+/// It used to be the literal `"did:key:zTestAdmin"`, which is not a `did:key`
+/// at all: nothing resolves it, and no document issued by it can carry a
+/// verifiable proof. That was fine while the dispatcher accepted proofless
+/// documents. It stopped being fine when the spine started enforcing SPEC §7.2
+/// item 7 — 72 of the 109 dispatched specs declare `proof` REQUIRED, and a test
+/// that cannot sign cannot exercise any of them.
+pub const TEST_ADMIN_SEED: [u8; 32] = [0x7A; 32];
+
+/// The mock VTA's own seed, and the reason it is no longer a sentinel.
+///
+/// It used to be the literal `"did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD"` — the same mistake
+/// `TEST_ADMIN_SEED` above records fixing for the *admin*: not a `did:key` at
+/// all, resolving nowhere, so nothing it signed could carry a verifiable proof.
+/// That was survivable while only requests were checked and a VTA's answers
+/// were taken on trust.
+///
+/// `VtaClient` verifies replies now
+/// (OpenVTC/verifiable-trust-infrastructure#1341), and production has always
+/// signed them with its own key for every DID method that is not `did:peer`
+/// (`server.rs`). A mock that cannot sign is therefore not a cheap
+/// stand-in any more — it is a VTA that behaves in a way no real one does, and
+/// every test through it fails with the client blaming the reply.
+pub const TEST_VTA_SEED: [u8; 32] = [0x5A; 32];
+
+/// The mock VTA's `did:key` and its verification method,
+/// `did:key:<id>#<id>` — the one method a did:key has, and the one production
+/// signs as (`server.rs`, the did:key branch of `AuthInit`). A did:key has no
+/// `#key-0`, and a verifier refuses a proof naming one (VTI-KEY-022).
+///
+/// Derived, not written down: a literal here is what the sentinel was.
+pub fn test_vta_did() -> (String, String) {
+    let (did, _vm) = did_for_seed(TEST_VTA_SEED[0]);
+    let vm = crate::operations::credentials::vta_signing_vm(&did);
+    (did, vm)
+}
+
+/// The mock VTA's own signing secret, as production wires it into
+/// `signing_vm_id`.
+pub(crate) fn test_vta_signer() -> VtaOwnSigner {
+    use ed25519_dalek::SigningKey;
+    let sk = SigningKey::from_bytes(&[TEST_VTA_SEED[0]; 32]);
+    let (_did, vm_id) = test_vta_did();
+    VtaOwnSigner {
+        vm_id: vm_id.clone(),
+        secret: secret_from_ed25519(&sk, vm_id),
+    }
+}
+
+/// Sign a Trust-Task response document the way this agent signs its own.
+///
+/// The agent's own [`attach_proof_in_place`](crate::trust_tasks::attach_proof_in_place),
+/// exposed so a harness standing in for a VTA signs identically rather than
+/// approximately. `secret.id` names the verification method the proof carries,
+/// so it has to be a key in the stand-in's own DID document — `{did}#key-1` for
+/// a `did:peer:2` minted with an Ed25519 verification key first.
+///
+/// # Why a harness needs this at all
+///
+/// `VtaClient` verifies a reply's proof and binds the proven signer to the
+/// agent it is addressing (OpenVTC/verifiable-trust-infrastructure#1341). A
+/// responder that answers unsigned is therefore not a cheap stand-in any more —
+/// it is a VTA that behaves in a way no real one does, and every round trip
+/// through it fails with the client blaming the reply. Same reasoning as
+/// [`TEST_VTA_SEED`], one layer further out: that one covers a mock this crate
+/// builds, this one a DIDComm responder in a downstream test crate.
+///
+/// Sign only what the binding says is a Trust-Task document. A reply body under
+/// some other DIDComm type is not one, nothing verifies it, and a `proof`
+/// member added to it is a member its consumer never asked for.
+///
+/// `false` when the signature will not attach.
+pub async fn sign_response_document(
+    secret: &affinidi_secrets_resolver::secrets::Secret,
+    doc: &mut serde_json::Value,
+) -> bool {
+    crate::trust_tasks::attach_proof_in_place(secret, doc).await
+}
+
+/// An ed25519 signing key as a `Secret`.
+///
+/// **Multicodec-prefixed** (`0x80 0x26`, ed25519-priv). `Secret::from_multibase`
+/// requires the prefix and refuses raw bytes with `Unsupported key type`, while
+/// `decode_private_key_multibase` accepts either — so the two encodings look
+/// interchangeable and are not.
+pub(crate) fn secret_from_ed25519(
+    sk: &ed25519_dalek::SigningKey,
+    id: String,
+) -> affinidi_tdk::secrets_resolver::secrets::Secret {
+    let mut prefixed = vec![0x80u8, 0x26];
+    prefixed.extend_from_slice(sk.to_bytes().as_slice());
+    let mb = multibase::encode(multibase::Base::Base58Btc, prefixed);
+    let mut secret = affinidi_tdk::secrets_resolver::secrets::Secret::from_multibase(&mb, None)
+        .expect("construct an ed25519 Secret");
+    secret.id = id;
+    secret
+}
+
+/// The test super-admin's `did:key`, and the verification method inside it.
+///
+/// `did:key` encodes the public key in the identifier, so the DID document is
+/// derivable from the string — no network, no resolver cache, and the VTA
+/// verifies a proof from it without any test-only resolution path.
+pub fn test_admin_did() -> (String, String) {
+    did_for_seed(TEST_ADMIN_SEED[0])
+}
+
+/// The `did:key` and verification method for a one-byte test seed.
+///
+/// One byte, not 32, because a test only ever needs identities to be *distinct*
+/// and *reproducible*; naming them by a single number keeps a two-caller test
+/// from having to invent two DID strings and keep them in step with two tokens.
+pub fn did_for_seed(seed: u8) -> (String, String) {
+    use ed25519_dalek::SigningKey;
+    let sk = SigningKey::from_bytes(&[seed; 32]);
+    let mut mc = vec![0xed, 0x01];
+    mc.extend_from_slice(sk.verifying_key().as_bytes());
+    let mb = multibase::encode(multibase::Base::Base58Btc, mc);
+    let did = format!("did:key:{mb}");
+    let vm = format!("{did}#{mb}");
+    (did, vm)
+}
+
+/// Attach an `eddsa-jcs-2022` Data Integrity proof from the test super-admin.
+///
+/// Mirrors the producer side: the proof is taken over the document with any
+/// existing `proof` removed, which is what `prepare_sign_input` expects and
+/// what the VTA re-derives when it verifies.
+pub fn sign_as_test_admin(doc: &mut trust_tasks_rs::TrustTask<serde_json::Value>) {
+    sign_as(TEST_ADMIN_SEED[0], doc)
+}
+
+/// Attach an `eddsa-jcs-2022` proof from the identity `seed` names.
+///
+/// The document's `issuer` must be [`did_for_seed`] of the same seed: SPEC §7.2
+/// item 6 rejects a document whose in-band issuer disagrees with the
+/// transport-authenticated identity, so a test that mints a token for one DID
+/// and signs with another is refused for that rather than for whatever it meant
+/// to check.
+pub fn sign_as(seed: u8, doc: &mut trust_tasks_rs::TrustTask<serde_json::Value>) {
+    sign_as_for(seed, "assertionMethod", doc)
+}
+
+/// As [`sign_as`], with the proof made for `purpose`.
+pub fn sign_as_for(
+    seed: u8,
+    purpose: &str,
+    doc: &mut trust_tasks_rs::TrustTask<serde_json::Value>,
+) {
+    let (_did, vm) = did_for_seed(seed);
+    sign_with_vm(seed, &vm, purpose, doc);
+}
+
+pub fn super_admin_claims() -> AuthClaims {
+    AuthClaims {
+        did: test_admin_did().0,
+        role: Role::Admin,
+        allowed_contexts: Vec::new(),
+        session_id: "test-session".into(),
+        access_expires_at: 0,
+        issued_at: 0,
+        amr: Vec::new(),
+        acr: String::new(),
+    }
+}
+
+/// An admin whose authority is confined to `context` — the caller every
+/// "an id you cannot reach" test needs, and the one `super_admin_claims`
+/// cannot stand in for, since an unrestricted admin reaches everything.
+pub fn admin_claims_for_context(context: &str) -> AuthClaims {
+    AuthClaims {
+        allowed_contexts: vec![context.to_string()],
+        ..super_admin_claims()
+    }
+}
+
+/// Build + sign + verify a template-driven `BootstrapRequest` with no
+/// admin rollover and no extra template vars.
+pub async fn signed_request(template_name: &str, context_hint: &str) -> VerifiedBootstrapRequest {
+    signed_request_with_vars(template_name, context_hint, BTreeMap::new()).await
+}
+
+/// Build + sign + verify a template-driven `BootstrapRequest` with the
+/// given template vars (e.g. `URL`, `WEBVH_SERVER`).
+pub async fn signed_request_with_vars(
+    template_name: &str,
+    context_hint: &str,
+    vars: BTreeMap<String, Value>,
+) -> VerifiedBootstrapRequest {
+    let seed = [7u8; 32];
+    let signing = SigningKey::from_bytes(&seed);
+    let pub_bytes: [u8; 32] = signing.verifying_key().to_bytes();
+    let client_did = affinidi_crypto::did_key::ed25519_pub_to_did_key(&pub_bytes);
+
+    let ask = BootstrapAsk::TemplateBootstrap(TemplateBootstrapAsk {
+        context_hint: Some(context_hint.into()),
+        template: DidTemplateRef {
+            name: template_name.into(),
+            vars,
+        },
+        admin_template: None,
+        note: None,
+    });
+
+    let req = BootstrapRequest::sign(
+        &seed,
+        &client_did,
+        [0u8; 16],
+        Duration::minutes(10),
+        None,
+        ask,
+    )
+    .await
+    .expect("sign bootstrap request");
+    req.verify().expect("verify bootstrap request")
+}
+
+/// Build + sign + verify a `BootstrapAsk::AdminRotation` request — the
+/// admin-only-rotation wire shape. Uses the same `[7u8; 32]` setup
+/// seed as the TemplateBootstrap helpers so `bootstrap_test_vta`'s
+/// pre-installed ACL row authenticates this request too.
+pub async fn signed_admin_rotation_request(
+    admin_template_name: &str,
+    context_hint: &str,
+) -> VerifiedBootstrapRequest {
+    use vta_sdk::provision_integration::AdminRotationAsk;
+
+    let seed = [7u8; 32];
+    let signing = SigningKey::from_bytes(&seed);
+    let pub_bytes: [u8; 32] = signing.verifying_key().to_bytes();
+    let client_did = affinidi_crypto::did_key::ed25519_pub_to_did_key(&pub_bytes);
+
+    let ask = BootstrapAsk::AdminRotation(AdminRotationAsk {
+        context_hint: Some(context_hint.into()),
+        admin_template: DidTemplateRef {
+            name: admin_template_name.into(),
+            vars: BTreeMap::new(),
+        },
+        note: None,
+    });
+
+    let req = BootstrapRequest::sign(
+        &seed,
+        &client_did,
+        [0u8; 16],
+        Duration::minutes(10),
+        None,
+        ask,
+    )
+    .await
+    .expect("sign bootstrap request");
+    req.verify().expect("verify bootstrap request")
+}
+
+/// Provision the minimum VTA state a full `provision_integration()`
+/// call needs: an active seed, the VTA's `{vta_did}#key-0` signing key
+/// and `#sealed-transfer-0` producer-assertion key saved in the keystore,
+/// a DID resolver that can resolve the VTA's own `did:key`, and an
+/// `AppConfig` with `vta_did` populated.
+///
+/// Returns `(vta_did, deps_with_resolver)` — the caller plugs the
+/// returned deps into `provision_integration()` instead of [`test_deps`].
+/// Provision the VTA's own signing identity into `keys_ks`: write a
+/// deterministic active seed to a [`PlaintextSeedStore`] under `data_dir`,
+/// derive the `{vta_did}#key-0` VC-issuance key and the `#sealed-transfer-0`
+/// producer-assertion key, and persist their keystore records. Returns the
+/// resulting `vta_did` (a real, self-resolving `did:key`) and the seed store
+/// the keys were derived from.
+///
+/// Shared by [`bootstrap_test_vta`] (direct-call deps) and the provisionable
+/// HTTP app ([`build_provisionable_test_app`] / `MockVta::start_provisionable`),
+/// so both paths use the exact same identity wiring the real VTA bootstrap does.
+/// `vta_did_override` replaces the derived `did:key` as the identity the
+/// keystore records are filed under (see [`TestAppOptions::vta_transport`]). The
+/// signing key itself is seed-derived either way — only the record ids change.
+async fn provision_vta_signing_identity(
+    keys_ks: &KeyspaceHandle,
+    data_dir: &std::path::Path,
+    vta_did_override: Option<&str>,
+) -> (String, Arc<PlaintextSeedStore>, VtaOwnSigner) {
+    use crate::keys::seeds::{SeedRecord, save_seed_record, set_active_seed_id};
+
+    // Deterministic 64-byte seed (BIP-32 wants ≥16 bytes; 64 mirrors
+    // the mnemonic-derived seed shape used in production setup).
+    let raw_seed = [0xC5u8; 64];
+    let seed_store = PlaintextSeedStore::new(data_dir);
+    crate::keys::seed_store::SeedStore::set(&seed_store, &raw_seed)
+        .await
+        .expect("write test seed to plaintext store");
+
+    let now = chrono::Utc::now();
+    save_seed_record(
+        keys_ks,
+        &SeedRecord {
+            id: 0,
+            seed_hex: None,
+            seed_enc: None,
+            created_at: now,
+            retired_at: None,
+        },
+    )
+    .await
+    .expect("save seed record");
+    set_active_seed_id(keys_ks, 0)
+        .await
+        .expect("set active seed id");
+
+    // Derive a fresh Ed25519 key at a canonical VTA path, convert to
+    // did:key, save a keystore record whose id matches the
+    // `{vta_did}#key-0` convention `load_vta_vc_issuance_secret` looks up.
+    let vta_base_path = "m/26'/1'/0'";
+    let root = ExtendedSigningKey::from_seed(&raw_seed).expect("bip-32 root");
+    let dp: DerivationPath = vta_base_path.parse().expect("derivation path");
+    let derived = root.derive(&dp).expect("derive VTA key");
+    let signing = ed25519_dalek::SigningKey::from_bytes(derived.signing_key.as_bytes());
+    let pub_bytes = signing.verifying_key().to_bytes();
+    let multibase = ed25519_multibase_pubkey(&pub_bytes);
+    let vta_did = match vta_did_override {
+        Some(did) => did.to_string(),
+        None => format!("did:key:{multibase}"),
+    };
+    let key_id = format!("{vta_did}#key-0");
+
+    // The same key, as a `Secret` the response signer can use.
+    //
+    // Production sets `signing_vm_id` to `{vta_did}#key-0` for did:webvh and
+    // to `did:key:<id>#<id>` for did:key (`server.rs`, `AuthInit`), so
+    // a REST-only VTA signs its answers with its own key and needs no transport
+    // identity to do it. This harness never ran that path — it populated the
+    // signer only from `build_transport_state`, which requires a `did:peer:2` —
+    // so a `MockVta` answered unsigned where the real thing signs.
+    //
+    // That gap was invisible until `VtaClient` began verifying replies
+    // (#1341), at which point every round-trip test failed with the client
+    // blaming the reply for something the harness had never provided.
+    let own_signer = {
+        // Multicodec-prefixed, which is what `Secret::from_multibase` reads —
+        // `0x80 0x26` is ed25519-priv. The raw 32 bytes decode fine through
+        // `decode_private_key_multibase`, which tolerates an unprefixed key,
+        // and are refused here; the two are not interchangeable.
+        let mut prefixed = vec![0x80u8, 0x26];
+        prefixed.extend_from_slice(signing.to_bytes().as_slice());
+        let private_key_multibase = multibase::encode(multibase::Base::Base58Btc, prefixed);
+        let mut secret = affinidi_tdk::secrets_resolver::secrets::Secret::from_multibase(
+            &private_key_multibase,
+            None,
+        )
+        .expect("construct the VTA's own signing secret");
+        // The record is stored under `#key-0` whatever the method; the proof
+        // names the method the DID document lists.
+        let vm_id = crate::operations::credentials::vta_signing_vm(&vta_did);
+        secret.id = vm_id.clone();
+        VtaOwnSigner { vm_id, secret }
+    };
+
+    save_key_record(
+        keys_ks,
+        &key_id,
+        vta_base_path,
+        SdkKeyType::Ed25519,
+        &multibase,
+        "VTA signing key",
+        None,
+        Some(0),
+    )
+    .await
+    .expect("save VTA key record");
+
+    // Mirror the real VTA bootstrap: provision `#sealed-transfer-0`
+    // (separate from `#key-0`, see review item 12) so
+    // `provision_integration` can sign the producer assertion without
+    // hitting the "re-bootstrap required" guard in
+    // `load_vta_sealed_transfer_secret`.
+    let st_base_path = "m/26'/1'/1'";
+    let st_dp: DerivationPath = st_base_path.parse().expect("st derivation path");
+    let st_derived = root.derive(&st_dp).expect("derive VTA sealed-transfer key");
+    let st_signing = ed25519_dalek::SigningKey::from_bytes(st_derived.signing_key.as_bytes());
+    let st_pub_bytes = st_signing.verifying_key().to_bytes();
+    let st_multibase = ed25519_multibase_pubkey(&st_pub_bytes);
+    save_key_record(
+        keys_ks,
+        &format!("{vta_did}#sealed-transfer-0"),
+        st_base_path,
+        SdkKeyType::Ed25519,
+        &st_multibase,
+        "VTA sealed-transfer producer-assertion key",
+        None,
+        Some(0),
+    )
+    .await
+    .expect("save VTA sealed-transfer key record");
+
+    (
+        vta_did,
+        Arc::new(PlaintextSeedStore::new(data_dir)),
+        own_signer,
+    )
+}
+
+pub async fn bootstrap_test_vta(ts: &TestStore) -> (String, ProvisionIntegrationDeps) {
+    let (vta_did, _seed_store, _own_signer) =
+        provision_vta_signing_identity(&ts.keys_ks, &ts.data_dir, None).await;
+
+    let mut config = test_app_config(ts.data_dir.clone());
+    config.vta_did = Some(vta_did.clone());
+    config.public_url = Some("https://vta.test".into());
+
+    let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        .await
+        .expect("DID resolver");
+
+    let deps = ProvisionIntegrationDeps {
+        keys_ks: ts.keys_ks.clone(),
+        acl_ks: ts.acl_ks.clone(),
+        audit: vta_audit::shared_keyspace_sink(ts.audit_ks.clone()),
+        contexts_ks: ts.contexts_ks.clone(),
+        did_templates_ks: ts.did_templates_ks.clone(),
+        imported_ks: ts.imported_ks.clone(),
+        webvh_ks: ts.webvh_ks.clone(),
+        webs_ks: ts.webs_ks.clone(),
+        sealed_nonces_ks: ts.sealed_nonces_ks.clone(),
+        seed_store: Arc::new(PlaintextSeedStore::new(&ts.data_dir)),
+        config: Arc::new(RwLock::new(config)),
+        did_resolver: Some(resolver),
+        didcomm_bridge: Arc::new(DIDCommBridge::placeholder()),
+    };
+    // The operator every provisioning test acts as ([`super_admin_claims`])
+    // must hold an entry: an ACL write is bounded by the writer's own entry
+    // (VTI-ACL-053), and a real caller could not have authenticated without
+    // one.
+    if crate::acl::get_acl_entry(&ts.acl_ks, &test_admin_did().0)
+        .await
+        .expect("read ACL")
+        .is_none()
+    {
+        seed_acl_entry(
+            &ts.acl_ks,
+            &test_admin_did().0,
+            crate::acl::Role::Admin,
+            vec![],
+        )
+        .await;
+    }
+    (vta_did, deps)
+}
+
+/// Build a full [`crate::server::AppState`] whose VTA signing identity is
+/// provisioned (active seed + `{vta_did}#key-0`), so handlers that **mint**
+/// VTA-signed credentials (e.g. `trust_tasks::credentials::handle_issue`) can
+/// load the issuer key and produce a real Data-Integrity proof.
+///
+/// Returns the `AppState` plus the owning `TempDir` (the caller must keep it
+/// alive — dropping it removes the on-disk fjall store). Uses the canonical
+/// [`build_app_state`](crate::server::build_app_state) constructor so the test
+/// state can't diverge from production wiring.
+pub async fn build_signing_test_app_state() -> (crate::server::AppState, tempfile::TempDir) {
+    build_signing_test_app_state_with_sink(None).await
+}
+
+/// As [`build_signing_test_app_state`], with an audit sink installed.
+///
+/// Split out for the audit-coverage census, which needs to observe what a
+/// dispatched task records. Everything else is identical, and the no-sink form
+/// above delegates here so the two states cannot drift.
+pub async fn build_signing_test_app_state_with_sink(
+    audit_sink: Option<vta_audit::SharedAuditSink>,
+) -> (crate::server::AppState, tempfile::TempDir) {
+    use crate::server::{AppStateParts, build_app_state};
+    use tokio::sync::watch;
+
+    init_jwt_provider();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store =
+        vti_common::store::test_fixture::open_with_keyspaces(dir.path(), crate::keyspaces::ALL)
+            .expect("open store");
+
+    // Provision the VTA's `{vta_did}#key-0` VC-issuance key into the keystore
+    // and point the config at the resulting self-resolving did:key.
+    let keys_ks = store.keyspace(crate::keyspaces::KEYS).expect("keys ks");
+    let (vta_did, seed_store, _own_signer) =
+        provision_vta_signing_identity(&keys_ks, dir.path(), None).await;
+    let seed_store: Arc<dyn crate::keys::seed_store::SeedStore> = seed_store;
+
+    let mut config = test_app_config(dir.path().to_path_buf());
+    config.vta_did = Some(vta_did);
+    config.public_url = Some("https://vta.test".into());
+
+    let (restart_tx, _rx) = watch::channel(false);
+    let state = build_app_state(
+        config,
+        &store,
+        seed_store,
+        None,
+        None,
+        restart_tx,
+        // `..Default::default()` rather than default-then-assign: this is the
+        // same crate, so the non-exhaustive struct literal is available here
+        // even though `tests/audit_sink.rs` cannot use it from outside.
+        AppStateParts {
+            audit_sink,
+            // Tests on this state stand up room hosts on loopback.
+            endpoint_policy: Some(vta_sdk::http::EndpointPolicy::private_allowed()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("build signing app state");
+    // The super admin [`super_admin_claims`] stands for has an entry, as every caller of a
+    // running VTA does (a token is minted only for a DID with one): purpose-bound reads are
+    // held to the stored entry's purposes, and refuse a caller with none (VTI-ACL-101).
+    let admin = super_admin_claims();
+    if crate::acl::get_acl_entry(&state.acl_ks, &admin.did)
+        .await
+        .expect("read acl")
+        .is_none()
+    {
+        seed_acl_entry(&state.acl_ks, &admin.did, admin.role, Vec::new()).await;
+    }
+    (state, dir)
+}
+
+/// The context [`bootstrap_provisionable_test_vta`] registers and the one a
+/// well-formed request should target (`context_hint` + the `context` param).
+pub const PROVISIONABLE_CONTEXT: &str = "provisionable-ctx";
+
+/// Like [`bootstrap_test_vta`] but the returned VTA can actually *succeed*: it
+/// additionally registers a fresh target context ([`PROVISIONABLE_CONTEXT`]),
+/// so a well-formed request reaches the high-value render → seal → issue path
+/// instead of erroring at the context-existence precondition.
+///
+/// No template needs registering — the built-in `didcomm-mediator` /
+/// `vta-admin` templates resolve via the SDK's embedded loader, so a request
+/// naming one of those + a valid var set renders directly. Pair this with
+/// [`provisionable_mediator_vars`] for a known-`Ok` baseline that a fuzz
+/// campaign can mutate, e.g.:
+///
+/// ```ignore
+/// let ts = open_test_store().await;
+/// let (_vta_did, deps) = bootstrap_provisionable_test_vta(&ts).await;
+/// let request = signed_request_with_vars(
+///     "didcomm-mediator", PROVISIONABLE_CONTEXT, fuzzed_vars,
+/// ).await;
+/// let out = provision_integration(&deps, &super_admin_claims(), ProvisionIntegrationParams {
+///     request, context: PROVISIONABLE_CONTEXT.into(),
+///     assertion_mode: AssertionMode::PinnedOnly, vc_validity: None,
+/// }).await;
+/// ```
+///
+/// Both `AssertionMode::PinnedOnly` and `AssertionMode::DidSigned` return `Ok`
+/// for a well-formed request (the `#sealed-transfer-0` producer key is
+/// provisioned by [`bootstrap_test_vta`]); `Attested` needs Nitro material and
+/// is out of scope here.
+pub async fn bootstrap_provisionable_test_vta(
+    ts: &TestStore,
+) -> (String, ProvisionIntegrationDeps) {
+    let (vta_did, deps) = bootstrap_test_vta(ts).await;
+    crate::contexts::create_context(
+        &ts.contexts_ks,
+        PROVISIONABLE_CONTEXT,
+        "Provisionable Context",
+    )
+    .await
+    .expect("create provisionable context");
+    (vta_did, deps)
+}
+
+/// A baseline well-formed variable set for the built-in `didcomm-mediator`
+/// template — the known-`Ok` starting point a fuzz campaign mutates to drive
+/// hostile variables through the real renderer/sealer/issuer.
+pub fn provisionable_mediator_vars() -> BTreeMap<String, Value> {
+    let mut vars = BTreeMap::new();
+    vars.insert("URL".into(), Value::String("https://mediator.test".into()));
+    vars.insert(
+        "WS_URL".into(),
+        Value::String("wss://mediator.test/ws".into()),
+    );
+    vars.insert("ROUTING_KEYS".into(), Value::Array(vec![]));
+    vars
+}
+
+// ---------------------------------------------------------------------------
+// HTTP test scaffolding — shared by `tests/api_integration.rs` and any future
+// route-level test crate. The `TestApp` type returned here owns the axum
+// `Router` so the caller can `.oneshot(req)` against it directly.
+//
+// Pre-consolidation, every integration-test file built its own ~140 LoC
+// `TestApp::new()` from scratch. That duplication scaled poorly and made
+// the rate-limit / body-cap regression tests impractical to write. The
+// helpers below collapse the common substrate to ~10 LoC at the call
+// site.
+// ---------------------------------------------------------------------------
+
+/// The fixtures both services share live in `vti_common::test_support` (#2572).
+pub use vti_common::test_support::{build_offline_atm, init_jwt_provider};
+
+/// In-memory seed store for tests that need a stable seed without touching
+/// the filesystem-backed `PlaintextSeedStore`. The bytes are the seed; the
+/// caller chooses the value.
+pub struct TestSeedStore(pub Vec<u8>);
+
+impl crate::keys::seed_store::SeedStore for TestSeedStore {
+    fn get(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<Vec<u8>>, crate::error::AppError>>
+                + Send
+                + '_,
+        >,
+    > {
+        let v = self.0.clone();
+        Box::pin(async move { Ok(Some(v)) })
+    }
+    fn set(
+        &self,
+        _seed: &[u8],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::error::AppError>> + Send + '_>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Bag of cloned references the integration test needs to mutate state
+/// that the router otherwise owns (insert sessions / ACL rows / etc.).
+/// Returned alongside [`build_test_app`] so tests don't have to re-open
+/// the store to find these.
+pub struct TestAppContext {
+    pub jwt_keys: Arc<vti_common::auth::jwt::JwtKeys>,
+    pub sessions_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    pub keys_ks: KeyspaceHandle,
+    pub vault_ks: KeyspaceHandle,
+    pub backup_bundles_ks: KeyspaceHandle,
+    pub backup_blob_dir: std::path::PathBuf,
+    /// The webvh keyspace — exposed so a harness can seed a hosting server
+    /// via [`seed_webvh_server`] before driving a DID-mint / join flow.
+    #[cfg(feature = "webvh")]
+    pub webvh_ks: KeyspaceHandle,
+    /// The policy keyspace — exposed so an end-to-end harness can install the
+    /// Rego a deployment would, rather than reach past the Policy Decision Point
+    /// it is trying to exercise.
+    pub policy_ks: KeyspaceHandle,
+    /// The contexts keyspace — exposed so a harness can seed the trust context a
+    /// DID mint requires, the way a provisioning flow would.
+    pub contexts_ks: KeyspaceHandle,
+    /// The VTA DID this app is configured with — the `did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD`
+    /// sentinel for [`build_test_app`], or a real, self-resolving `did:key`
+    /// for [`build_provisionable_test_app`]. A harness driving a URL-direct
+    /// provision passes this as the `vta_did` argument.
+    pub vta_did: String,
+    pub config: Arc<RwLock<AppConfig>>,
+    /// The durable messaging outbox keyspace. Exposed because
+    /// [`crate::messaging::service::build_messaging`] requires one, and a
+    /// mediator-backed harness has to build the listener itself.
+    pub outbox_ks: KeyspaceHandle,
+    /// The durable TSP relationship keyspace — `build_messaging` requires it too,
+    /// for the same reason.
+    pub relationships_ks: KeyspaceHandle,
+    /// The app's `AppState`. Exposed so a harness can run the **production**
+    /// inbound loop against the very state the HTTP router serves — the same
+    /// reason `vtc-service`'s `TestVtc` exposes its own.
+    pub state: crate::server::AppState,
+    /// The temporary directory holding the fjall data dir. Dropping this does
+    /// **not** delete it: the app's store does, once the database has closed,
+    /// so a test may drop the context and keep using the router.
+    pub _dir: tempfile::TempDir,
+}
+
+impl TestAppContext {
+    /// Make `did` this VTA's own DID, as a restart onto it would: the config
+    /// names it, and the bridge signs outbound documents with its `#key-0`,
+    /// so what the VTA sends a peer is issued and signed by one identity.
+    ///
+    /// The key must already be in the keystore, as a DID this VTA minted has.
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    pub async fn adopt_vta_did(&self, did: &str) {
+        use affinidi_secrets_resolver::SecretsResolver as _;
+        self.config.write().await.vta_did = Some(did.to_string());
+        let vm_id = format!("{did}#key-0");
+        let key = crate::operations::keys::key_secret_for_test_support(
+            &self.keys_ks,
+            &self.state.imported_ks,
+            &self.contexts_ks,
+            &*self.state.seed_store,
+            &self.state.audit_sink,
+            &vm_id,
+        )
+        .await
+        .expect("the adopted DID's #key-0 is in the keystore");
+        let mut secret = affinidi_tdk::secrets_resolver::secrets::Secret::from_multibase(
+            &key.private_key_multibase,
+            None,
+        )
+        .expect("the key is a signing secret");
+        secret.id = vm_id.clone();
+        let (resolver, _task) = affinidi_secrets_resolver::ThreadedSecretsResolver::new(None).await;
+        resolver.insert(secret).await;
+        self.state
+            .didcomm_bridge
+            .set_document_signer(Arc::new(resolver), vm_id);
+    }
+
+    /// Mint a signing identity **and** a matching token, for a test that drives
+    /// the VTA through `vta_sdk::VtaClient`.
+    ///
+    /// [`mint_token`](Self::mint_token) alone is no longer enough for those.
+    /// The spine enforces SPEC §7.2, so a document needs an in-band `recipient`
+    /// (item 5b, every dispatched spec) and a `proof` from the same identity
+    /// the token authenticates (items 6 and 7a, 72 of them). A token names a
+    /// DID; signing needs the key behind it, and `did:key` is the method where
+    /// the two are derivable from one seed.
+    ///
+    /// `seed` selects the identity, so a test that wants two callers asks for
+    /// two seeds rather than two unrelated strings.
+    pub async fn mint_signing_identity(
+        &self,
+        seed: u8,
+        role: &str,
+        contexts: Vec<String>,
+        vta_did: &str,
+    ) -> (vta_sdk::client::ClientIdentity, String) {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let mut mc = vec![0xed, 0x01];
+        mc.extend_from_slice(sk.verifying_key().as_bytes());
+        let did = format!(
+            "did:key:{}",
+            multibase::encode(multibase::Base::Base58Btc, mc)
+        );
+        let token = self.mint_token(&did, role, contexts).await;
+        // The private key travels as the multibase-encoded *seed*, which is what
+        // `trust_task_sign::sign_in_place` decodes.
+        let private_key_multibase =
+            multibase::encode(multibase::Base::Base58Btc, sk.to_bytes().as_slice());
+        (
+            vta_sdk::client::ClientIdentity {
+                client_did: did,
+                private_key_multibase,
+                vta_did: vta_did.to_string(),
+                verification_method: None,
+            },
+            token,
+        )
+    }
+
+    /// Mint an access token for `did` with `role` + `contexts`, bypassing the
+    /// live challenge-response handshake. The SDK's `challenge_response` packs a
+    /// DIDComm envelope the server unpacks via ATM; a REST-only `MockVta` has
+    /// no ATM, so authenticated-endpoint tests take this shortcut (the same one
+    /// the route-integration suite uses): store an `Authenticated` session and
+    /// encode a matching AAL1 JWT. An empty `contexts` vec is super-admin.
+    ///
+    /// Also writes the ACL row the token stands for, when there is none: a real
+    /// token is only minted for a DID with an entry, and an ACL write is
+    /// bounded by the writer's own entry (VTI-ACL-053). A row the test seeded
+    /// itself is left as it is.
+    pub async fn mint_token(&self, did: &str, role: &str, contexts: Vec<String>) -> String {
+        use vti_common::auth::session::{Session, SessionState, store_session};
+        if let Ok(parsed) = crate::acl::Role::parse(role)
+            && crate::acl::get_acl_entry(&self.acl_ks, did)
+                .await
+                .expect("read ACL")
+                .is_none()
+        {
+            seed_acl_entry(&self.acl_ks, did, parsed, contexts.clone()).await;
+        }
+        let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let session = Session {
+            session_id: session_id.clone(),
+            did: did.to_string(),
+            challenge: String::new(),
+            state: SessionState::Authenticated,
+            created_at: now,
+            last_seen: now,
+            refresh_token: None,
+            refresh_expires_at: None,
+            tee_attested: false,
+            amr: Vec::new(),
+            acr: String::new(),
+            acr_expires_at: None,
+            token_id: None,
+            session_pubkey_b58btc: None,
+            not_after: None,
+        };
+        store_session(&self.sessions_ks, &session)
+            .await
+            .expect("store session");
+        let claims = self.jwt_keys.new_claims(
+            did.to_string(),
+            session_id,
+            role.to_string(),
+            contexts,
+            900,
+            false,
+        );
+        self.jwt_keys.encode(&claims).expect("encode jwt")
+    }
+}
+
+/// Knobs for [`build_test_app_with`]. Defaults reproduce the historical
+/// [`build_test_app`] behaviour exactly.
+#[derive(Default)]
+pub struct TestAppOptions {
+    /// When `true`, provision a real VTA signing identity (active seed +
+    /// `{vta_did}#key-0` + `#sealed-transfer-0`) via
+    /// [`provision_vta_signing_identity`] and set `config.vta_did` to the
+    /// derived, self-resolving `did:key` — so `provision_integration`
+    /// round-trips (VC issuance + bundle sealing) actually succeed against
+    /// the app. The default (`false`) keeps the cheap sentinel-DID app the
+    /// bulk of route tests rely on (no seed I/O, no key derivation).
+    pub provisionable_vta: bool,
+
+    /// DID documents to pre-seed into the app's DID resolver cache as
+    /// `(did, document-json)` pairs. `resolve()` is cache-first, so a seeded
+    /// DID resolves in-process with no network — used to make a stub webvh
+    /// hosting server's `did:webvh:<scid>:<domain>` resolve to a loopback
+    /// `WebVHHosting` endpoint (see `MockVta::start_with_webvh_host`). The
+    /// JSON deserializes into the resolver's `Document` type.
+    pub preseed_did_docs: Vec<(String, serde_json::Value)>,
+
+    /// webvh hosting servers to register in the registry keyspace as
+    /// `(server_id, server_did)` — the equivalent of [`seed_webvh_server`]
+    /// applied at build time, so `create_did_webvh` finds the server.
+    #[cfg(feature = "webvh")]
+    pub webvh_servers: Vec<(String, String)>,
+
+    /// Optional messaging (ATM) handle to wire into `AppState.atm`. The
+    /// default (`None`) leaves the app REST-only, so the DIDComm branch of
+    /// `POST /auth/` short-circuits on "ATM not configured". Tests that need
+    /// to exercise `atm.unpack` (e.g. the plaintext-forgery guard)
+    /// build an offline ATM via [`build_offline_atm`] and pass it here.
+    pub atm: Option<affinidi_tdk::messaging::ATM>,
+
+    /// A pre-minted transport identity for the VTA, replacing the `did:key`
+    /// [`provision_vta_signing_identity`] would derive. Set by
+    /// `MockVta::start_with_transports` to a `did:peer:2` advertising
+    /// `DIDCommMessaging` / `TSPTransport` — a `did:key` cannot carry a service
+    /// block, so it can never tell a client which transports the VTA speaks.
+    pub vta_transport: Option<VtaTransportIdentity>,
+
+    /// `[server] operation_rate_limit_per_sec` for the app: the per-appliance
+    /// operation budget. `None` (the default) leaves it unlimited.
+    pub operation_rate_limit_per_sec: Option<u32>,
+
+    /// `[server] operation_rate_limit_per_subject_per_sec`: each client's
+    /// share. `None` (the default) takes the VTA's default share.
+    pub operation_rate_limit_per_subject_per_sec: Option<u32>,
+
+    /// The clock the operation budgets read. `None` (the default) is the
+    /// monotonic clock; a test of a budget passes
+    /// [`BudgetClock::manual`](crate::trust_tasks::operation_budget::BudgetClock::manual),
+    /// so no token refills while it runs and it moves time itself.
+    pub operation_budget_clock: Option<crate::trust_tasks::operation_budget::BudgetClock>,
+
+    /// A store directory the caller owns and keeps, for a test that builds the
+    /// app twice over the same disk — a restart (#2402). `None` (the default)
+    /// is a fresh temporary directory owned by the returned context, as every
+    /// other test has always had.
+    ///
+    /// An empty directory is seeded from the keyspace template, like the
+    /// default; a directory already holding a store is reopened as it is, so
+    /// the second app sees exactly what the first one left. fjall locks the
+    /// directory for as long as any handle on the database lives, so the
+    /// reopen succeeds only once the first app — router, context and every
+    /// keyspace handle — has been dropped.
+    pub data_dir: Option<std::path::PathBuf>,
+}
+
+/// A mediator-backed transport identity for the mock VTA
+/// ([`TestAppOptions::vta_transport`]).
+///
+/// The seed-derived `{vta_did}#key-0` / `#sealed-transfer-0` keystore records
+/// are still provisioned against [`did`](Self::did); those ids are keystore
+/// record *keys*, not verification methods resolved from the document, so the
+/// DID method is free to be `did:peer`. The [`secrets`](Self::secrets) here are
+/// the separate *transport* keys (`#key-1` Ed25519, `#key-2` X25519) that the
+/// DIDComm/TSP packing paths resolve out of the document — the same split
+/// `MockVtcDidcomm` uses.
+#[derive(Clone)]
+pub struct VtaTransportIdentity {
+    /// The `did:peer:2` that becomes `config.vta_did`.
+    pub did: String,
+    /// Its `#key-1` (Ed25519) + `#key-2` (X25519) secrets.
+    pub secrets: Vec<affinidi_tdk::secrets_resolver::secrets::Secret>,
+    /// The mediator both advertised services point at.
+    pub mediator_did: String,
+}
+
+/// The VTA's own response-signing key, as production wires it.
+///
+/// The same verification method `server.rs` puts in `signing_vm_id` for every
+/// DID method that is not `did:peer`: `{vta_did}#key-0`, or
+/// `did:key:<id>#<id>` for a did:key. Carried out of
+/// [`provision_vta_signing_identity`] rather than re-derived, so the harness
+/// signs with the key it actually provisioned.
+pub(crate) struct VtaOwnSigner {
+    pub(crate) vm_id: String,
+    pub(crate) secret: affinidi_tdk::secrets_resolver::secrets::Secret,
+}
+
+/// What [`build_transport_state`] hands back — a struct rather than a tuple so
+/// the `Option`s stay distinguishable at the call site.
+///
+/// There is no TSP profile here. The harness used to build one the way
+/// `init_auth` did — no mediator — which made it a faithful copy of the wiring
+/// defect rather than a check on it: a profile with no mediator fails every TSP
+/// operation inside the SDK, so a test holding one proved nothing about a TSP
+/// path working. A harness that wants real TSP needs a mediator-registered
+/// profile, which means a mediator; until there is one, `AppState::tsp_transport`
+/// answers `None` here and the TSP arms take their not-configured branch.
+#[derive(Default)]
+struct TransportState {
+    secrets_resolver: Option<Arc<affinidi_secrets_resolver::ThreadedSecretsResolver>>,
+    signing_vm_id: Option<String>,
+    ka_vm_id: Option<String>,
+    atm: Option<affinidi_tdk::messaging::ATM>,
+}
+
+/// Build the AppState transport slots from a pre-minted
+/// [`VtaTransportIdentity`], or all-`None` when there isn't one (the REST-only
+/// default every existing caller gets).
+///
+/// The verification-method ids are the fixed `did:peer:2` shape
+/// `#key-1` (Ed25519) / `#key-2` (X25519) that
+/// [`crate::operations::did_peer`] mints — read from the secrets rather than
+/// re-derived, so a change in that shape surfaces here instead of silently
+/// packing with the wrong key.
+async fn build_transport_state(
+    identity: Option<&VtaTransportIdentity>,
+    did_resolver: Option<&DIDCacheClient>,
+) -> TransportState {
+    use affinidi_secrets_resolver::SecretsResolver as _;
+    use affinidi_tdk::common::TDKSharedState;
+    use affinidi_tdk::common::config::TDKConfig;
+    use affinidi_tdk::messaging::config::ATMConfig;
+
+    let Some(identity) = identity else {
+        return TransportState::default();
+    };
+
+    let (secrets_resolver, _task) =
+        affinidi_secrets_resolver::ThreadedSecretsResolver::new(None).await;
+    secrets_resolver.insert_vec(&identity.secrets).await;
+
+    // `#key-1` is Ed25519 (verification), `#key-2` X25519 (key agreement).
+    let vm_id = |suffix: &str| -> Option<String> {
+        identity
+            .secrets
+            .iter()
+            .map(|s| s.id.clone())
+            .find(|id| id.ends_with(suffix))
+    };
+
+    let mut builder = TDKConfig::builder().with_load_environment(false);
+    if let Some(dr) = did_resolver {
+        builder = builder.with_did_resolver(dr.clone());
+    }
+    let tdk = TDKSharedState::new(builder.build().expect("TDK config"))
+        .await
+        .expect("TDK shared state");
+    for secret in &identity.secrets {
+        tdk.secrets_resolver().insert(secret.clone()).await;
+    }
+    let atm = affinidi_tdk::messaging::ATM::new(
+        ATMConfig::builder().build().expect("ATM config"),
+        Arc::new(tdk),
+    )
+    .await
+    .expect("transport ATM");
+
+    TransportState {
+        secrets_resolver: Some(Arc::new(secrets_resolver)),
+        signing_vm_id: vm_id("#key-1"),
+        ka_vm_id: vm_id("#key-2"),
+        atm: Some(atm),
+    }
+}
+
+/// Spin up an in-memory router suitable for `tower::ServiceExt::oneshot`
+/// HTTP testing. Uses [`TestSeedStore`] so no filesystem seed I/O,
+/// `aws_lc` JWT provider via [`init_jwt_provider`], and the full
+/// `routes::router()` + `routes::health_router()` merged together.
+///
+/// `vta_did` is `did:key:z6MkfMo6gxqdBhaHMNnmfhgZFBjpCDTkmJMJLoypsBZS9PwD` — a sentinel that resolves
+/// nowhere but satisfies the routes that just compare it as a string.
+/// `vta_name` and `public_url` are set so the JWT audience / DID
+/// document construction don't take their None branches in tests.
+///
+/// For an app whose VTA DID is real and resolvable (needed to drive a full
+/// `provision_integration` over HTTP), use [`build_provisionable_test_app`].
+pub async fn build_test_app() -> (axum::Router, TestAppContext) {
+    build_test_app_with(TestAppOptions::default()).await
+}
+
+/// [`build_test_app`] with a real, self-resolving `did:key` VTA identity and
+/// the signing keys `provision_integration` needs — the build half of
+/// `MockVta::start_provisionable`.
+pub async fn build_provisionable_test_app() -> (axum::Router, TestAppContext) {
+    build_test_app_with(TestAppOptions {
+        provisionable_vta: true,
+        ..Default::default()
+    })
+    .await
+}
+
+/// Answers a resolution with one of [`TestAppOptions::preseed_did_docs`]'
+/// documents, then declines (`None`) for every other DID, so the method's
+/// normal chain runs unchanged behind it.
+///
+/// `DIDCacheClient::add_did_document` only seeds the resolver's *cache* — it
+/// does not survive an eviction. A verifier that fails a proof against a
+/// cached document re-resolves the signer once, fresh, before refusing it
+/// (VTI-KEY-134), and a fresh resolution goes straight to the resolver chain,
+/// bypassing the cache entirely. Without a resolver here, that forced
+/// re-resolution of a stub DID like `webvh-host.test` cannot be satisfied —
+/// there is nothing at that address — and the caller sees a key-retrieval
+/// failure instead of the forged proof it meant to prove out. Prepending this
+/// resolver in front of the chain means the forced re-resolution finds the
+/// same document the cache would have, so a genuinely bad proof is refused as
+/// exactly that.
+#[derive(Clone)]
+struct PreseededDidResolver {
+    docs: Arc<std::collections::HashMap<String, affinidi_tdk::did_common::Document>>,
+}
+
+impl affinidi_did_resolver_cache_sdk::Resolver for PreseededDidResolver {
+    fn name(&self) -> &str {
+        "test-preseeded-docs"
+    }
+
+    fn resolve(
+        &self,
+        did: &affinidi_tdk::did_common::DID,
+    ) -> affinidi_did_resolver_cache_sdk::Resolution {
+        self.docs.get(&did.to_string()).cloned().map(Ok)
+    }
+}
+
+/// Deletes a test's temporary directory when dropped. Handed to the store
+/// ([`vti_common::store::Store::holding`]) so the directory goes only after
+/// the database using it has closed.
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Backing builder for [`build_test_app`] / [`build_provisionable_test_app`].
+pub async fn build_test_app_with(opts: TestAppOptions) -> (axum::Router, TestAppContext) {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+    use tokio::sync::watch;
+
+    init_jwt_provider();
+
+    // Not deleted when `TestAppContext` drops: many tests keep the router (and
+    // with it the store) but drop the context, and a data directory removed
+    // under a live store makes fjall's next compaction fail and poison it. The
+    // store deletes it instead, once the database has closed (below).
+    let dir = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .expect("temp dir");
+    let data_dir = opts
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| dir.path().to_path_buf());
+    let reopening = std::fs::read_dir(&data_dir).is_ok_and(|mut d| d.next().is_some());
+    let store = if reopening {
+        vti_common::store::Store::open(&vti_common::config::StoreConfig {
+            data_dir: data_dir.clone(),
+        })
+        .expect("reopen the retained store — is a handle from the previous app still alive?")
+    } else {
+        vti_common::store::test_fixture::open_with_keyspaces(&data_dir, crate::keyspaces::ALL)
+            .expect("open store")
+    };
+    let store = store.holding(RemoveDirOnDrop(dir.path().to_path_buf()));
+
+    let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+    let sessions_ks = store.keyspace(crate::keyspaces::SESSIONS).unwrap();
+    let acl_ks = store.keyspace(crate::keyspaces::ACL).unwrap();
+    let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+    // Seed a default `ctx1` context so route tests that reference
+    // it in ACL entries or key derivations don't have to set up
+    // contexts themselves. The ACL `create`/`update` operations
+    // now refuse to reference unregistered contexts (see
+    // `operations::acl::require_contexts_exist`).
+    {
+        use chrono::Utc;
+        let now = Utc::now();
+        crate::contexts::store_context(
+            &contexts_ks,
+            &crate::contexts::ContextRecord {
+                id: "ctx1".into(),
+                name: "ctx1".into(),
+                did: None,
+                description: None,
+                parent: None,
+                base_path: "m/26'/2'/0'".into(),
+                index: 0,
+                created_at: now,
+                updated_at: now,
+                context_policy: None,
+            },
+        )
+        .await
+        .expect("seed ctx1");
+    }
+    let audit_ks = store.keyspace(crate::keyspaces::AUDIT).unwrap();
+    let vault_ks = store.keyspace(crate::keyspaces::VAULT).unwrap();
+    let vault_ks_ctx = vault_ks.clone();
+    let service_state_ks = store.keyspace(crate::keyspaces::SERVICE_STATE).unwrap();
+    let imported_ks = store.keyspace(crate::keyspaces::IMPORTED_SECRETS).unwrap();
+    let sealed_nonces_ks = store.keyspace(crate::keyspaces::SEALED_NONCES).unwrap();
+    let backup_bundles_ks = store.keyspace(crate::keyspaces::BACKUP_BUNDLES).unwrap();
+    let backup_blob_dir = data_dir.join("backups");
+    let did_templates_ks = store.keyspace(crate::keyspaces::DID_TEMPLATES).unwrap();
+    #[cfg(feature = "webvh")]
+    let webvh_ks = store.keyspace(crate::keyspaces::WEBVH).unwrap();
+    // Register any caller-requested webvh hosting servers up front so
+    // `create_did_webvh` finds them in the catalogue.
+    #[cfg(feature = "webvh")]
+    for (id, did) in &opts.webvh_servers {
+        seed_webvh_server(&webvh_ks, id, did).await;
+    }
+    #[cfg(feature = "webvh")]
+    let passkey_vms_ks = store.keyspace(crate::keyspaces::PASSKEY_VMS).unwrap();
+    #[cfg(feature = "webvh")]
+    let drains_ks = store.keyspace(crate::keyspaces::DRAINS).unwrap();
+    #[cfg(feature = "webvh")]
+    let snapshot_ks = store
+        .keyspace(crate::operations::protocol::snapshot::KEYSPACE_NAME)
+        .unwrap();
+
+    let jwt_seed = [0x42u8; 32];
+    let jwt_keys = Arc::new(
+        vti_common::auth::jwt::JwtKeys::from_ed25519_bytes(&jwt_seed, "VTA").expect("jwt keys"),
+    );
+
+    // Default: a cheap in-memory seed store + non-resolvable sentinel DID.
+    // Provisionable: a real signing identity (active seed + `#key-0` +
+    // `#sealed-transfer-0`) derived into `keys_ks`, and `vta_did` set to the
+    // resulting self-resolving `did:key`.
+    let (vta_did, seed_store, own_signer): (
+        String,
+        Arc<dyn crate::keys::seed_store::SeedStore>,
+        Option<VtaOwnSigner>,
+    ) = if opts.provisionable_vta {
+        let (did, ps, signer) = provision_vta_signing_identity(
+            &keys_ks,
+            &data_dir,
+            opts.vta_transport.as_ref().map(|t| t.did.as_str()),
+        )
+        .await;
+        let store: Arc<dyn crate::keys::seed_store::SeedStore> = ps;
+        (did, store, Some(signer))
+    } else {
+        // A real `did:key` and the key behind it — but no seed records and no
+        // keystore, so a test that asserts an *unprovisioned* VTA still gets
+        // one. The identity is only as real as it must be for the mock to sign
+        // its answers, which every production VTA does.
+        let store: Arc<dyn crate::keys::seed_store::SeedStore> =
+            Arc::new(TestSeedStore(vec![0xABu8; 32]));
+        let (did, _vm) = test_vta_did();
+        (did, store, Some(test_vta_signer()))
+    };
+
+    let mut config: AppConfig = toml::from_str(&format!(
+        r#"
+        vta_did = "{vta_did}"
+        [store]
+        data_dir = "{}"
+        [auth]
+        jwt_signing_key = "{}"
+        "#,
+        data_dir.display(),
+        BASE64.encode(jwt_seed),
+    ))
+    .expect("parse config");
+    config.config_path = data_dir.join("config.toml");
+    config.server.operation_rate_limit_per_sec = opts.operation_rate_limit_per_sec;
+    config.server.operation_rate_limit_per_subject_per_sec =
+        opts.operation_rate_limit_per_subject_per_sec;
+
+    let (restart_tx, _rx) = watch::channel(false);
+
+    let telemetry: vti_common::telemetry::SharedTelemetrySink =
+        Arc::new(vti_common::telemetry::RingBufferTelemetry::new());
+    #[cfg(feature = "webvh")]
+    let mediator_registry = Arc::new(crate::messaging::registry::MediatorListenerRegistry::new(
+        Arc::clone(&telemetry),
+    ));
+    #[cfg(feature = "webvh")]
+    let drain_sweeper = {
+        let (tx, _rx) = crate::messaging::drain_sweeper::teardown_channel(8);
+        Arc::new(crate::messaging::drain_sweeper::DrainSweeper::new(
+            Arc::clone(&mediator_registry),
+            drains_ks.clone(),
+            tx,
+        ))
+    };
+
+    let config = Arc::new(RwLock::new(config));
+
+    // Build the DID resolver and pre-seed any caller-supplied documents into its
+    // cache. `resolve()` is cache-first, so a seeded `did:webvh:<scid>:<domain>`
+    // resolves in-process (no network) to its loopback `WebVHHosting` endpoint.
+    //
+    // The same documents also go in front of the resolver chain
+    // (`PreseededDidResolver`), not only the cache: a proof checked against a
+    // cached document that fails is re-resolved once, fresh, before it is
+    // refused (VTI-KEY-134), and a fresh resolution does not consult the
+    // cache. Without the chain entry, that forced re-resolution of a stub DID
+    // has nothing to answer it.
+    let did_resolver = {
+        let mut resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .ok();
+        if let Some(client) = resolver.as_mut() {
+            let mut preseeded_docs = std::collections::HashMap::new();
+            for (did, doc_json) in &opts.preseed_did_docs {
+                let doc: affinidi_tdk::did_common::Document =
+                    serde_json::from_value(doc_json.clone())
+                        .expect("preseed DID document must deserialize into a resolver Document");
+                client.add_did_document(did, doc.clone()).await;
+                preseeded_docs.insert(did.clone(), doc);
+            }
+            if !preseeded_docs.is_empty() {
+                let preseeded_docs = Arc::new(preseeded_docs);
+                let methods: std::collections::HashSet<_> = preseeded_docs
+                    .keys()
+                    .filter_map(|did| did.parse::<affinidi_tdk::did_common::DID>().ok())
+                    .map(|did| affinidi_did_resolver_cache_sdk::MethodName::from(&did.method()))
+                    .collect();
+                for method in methods {
+                    client
+                        .prepend_resolver(
+                            method,
+                            Box::new(PreseededDidResolver {
+                                docs: preseeded_docs.clone(),
+                            }),
+                        )
+                        .expect("prepend the preseeded-doc resolver for a fresh test method");
+                }
+            }
+        }
+        resolver
+    };
+
+    // Transport wiring. Mirrors what `server::init_auth` does in production —
+    // the VTA's own secrets in a resolver, its `#key-1`/`#key-2` verification
+    // method ids, an ATM for `auth`'s unpack path, and (TSP) a registered
+    // profile for `tsp-message` unseal.
+    //
+    // This ATM deliberately has NO websocket: `MockVta::start_with_transports`
+    // gives the *listener* its own, and the mediator permits one socket per DID
+    // — a second would be terminated as `w.websocket.duplicate-channel`. Same
+    // split, and the same reason, as `MockVtcDidcomm`.
+    let mut transport =
+        build_transport_state(opts.vta_transport.as_ref(), did_resolver.as_ref()).await;
+
+    // A REST-only VTA signs with its own `#key-0`, exactly as production does.
+    // `build_transport_state` only ever fills these from a `did:peer:2`
+    // transport identity, so without this a `MockVta` answers unsigned — which
+    // the real thing does not, and which every round-trip test now fails on.
+    // The transport key wins where there is one: that is the production
+    // ordering and this must not change it.
+    if transport.signing_vm_id.is_none()
+        && let Some(signer) = own_signer
+    {
+        use affinidi_secrets_resolver::SecretsResolver as _;
+        let (resolver, _task) = affinidi_secrets_resolver::ThreadedSecretsResolver::new(None).await;
+        resolver.insert(signer.secret).await;
+        transport.secrets_resolver = Some(Arc::new(resolver));
+        transport.signing_vm_id = Some(signer.vm_id);
+    }
+
+    let policy_ks = store.keyspace(crate::keyspaces::POLICY).unwrap();
+    let state = crate::server::AppState {
+        // The chained sink, as `build_app_state` installs in production: a test
+        // VTA that writes a flat, keyless trail cannot show what a real one
+        // records — the chain, or the commitments that stand in for personal
+        // data (VTI-AUD-004/005).
+        audit_sink: vta_audit::shared_chained_sink(
+            store.keyspace(crate::keyspaces::AUDIT).unwrap(),
+            store.keyspace(crate::keyspaces::AUDIT_KEY).unwrap(),
+        ),
+        internal_ks: store.keyspace(crate::keyspaces::INTERNAL_KEYS).unwrap(),
+        idempotency_ks: store.keyspace(crate::keyspaces::IDEMPOTENCY).unwrap(),
+        accepted_ids_ks: store.keyspace(crate::keyspaces::ACCEPTED_IDS).unwrap(),
+        // Empty by default: a test VTA trusts no mdoc issuer until one is
+        // configured, matching the fail-closed production default. A test that
+        // needs mdoc receive builds its own anchors and swaps this out.
+        mdoc_trust: std::sync::Arc::new(
+            vta_vault::mdoc_trust::IacaTrustAnchors::from_pem(&[])
+                .expect("an empty anchor set always parses"),
+        ),
+        keys_ks: keys_ks.clone(),
+        sessions_ks: sessions_ks.clone(),
+        acl_ks: acl_ks.clone(),
+        contexts_ks: contexts_ks.clone(),
+        did_templates_ks,
+        audit_ks,
+        imported_ks,
+        vault_ks,
+        consent_ks: store.keyspace(crate::keyspaces::CONSENT).unwrap(),
+        consent_approvers_ks: store.keyspace(crate::keyspaces::CONSENT_APPROVERS).unwrap(),
+        issued_credentials_ks: store
+            .keyspace(crate::keyspaces::ISSUED_CREDENTIALS)
+            .unwrap(),
+        memory_ks: store.keyspace(crate::keyspaces::MEMORY).unwrap(),
+        external_accounts_ks: store.keyspace(crate::keyspaces::EXTERNAL_ACCOUNTS).unwrap(),
+        external_secrets_ks: store.keyspace(crate::keyspaces::EXTERNAL_SECRETS).unwrap(),
+        external_rate: std::sync::Arc::new(vta_external::rate::BindingRateLimiter::new()),
+        operation_budget: std::sync::Arc::new(
+            crate::trust_tasks::operation_budget::OperationBudget::with_clock(
+                &config.read().await.server,
+                opts.operation_budget_clock.clone().unwrap_or_default(),
+            ),
+        ),
+        pcs_engine_ks: store.keyspace(crate::keyspaces::PCS_ENGINE).unwrap(),
+        witness_sessions_ks: store.keyspace(crate::keyspaces::WITNESS_SESSIONS).unwrap(),
+        notifications_ks: store.keyspace(crate::keyspaces::NOTIFICATIONS).unwrap(),
+        collection_ks: store.keyspace(crate::keyspaces::COLLECTION).unwrap(),
+        collection: std::sync::Arc::new(crate::operations::collection::CollectionControl::new(
+            config.read().await.collection.suspend,
+        )),
+        room_key_watches: std::sync::Arc::new(
+            crate::operations::room_key_watch::RoomKeyWatches::new(
+                store.keyspace(crate::keyspaces::ROOM_KEY_WATCHES).unwrap(),
+            ),
+        ),
+        room_groups_ks: store.keyspace(crate::keyspaces::ROOM_GROUPS).unwrap(),
+        room_invitations_ks: store.keyspace(crate::keyspaces::ROOM_INVITATIONS).unwrap(),
+        app_state_ks: store.keyspace(crate::keyspaces::APP_STATE).unwrap(),
+        persona_ks: store.keyspace(crate::keyspaces::PERSONA).unwrap(),
+        // A fixed test key: the fixture is not encrypted at rest, and the
+        // correlation index only needs a key that is stable within one run.
+        persona_correlation_key: [0u8; 32],
+        app_state_locks: crate::operations::app_state::NamespaceLocks::default(),
+        memory_locks: crate::operations::app_state::NamespaceLocks::default(),
+        policy_ks: policy_ks.clone(),
+        policy_cache: std::sync::Arc::new(crate::policy::PolicyCache::new()),
+        task_consent_ks: store.keyspace(crate::keyspaces::TASK_CONSENT).unwrap(),
+        service_state_ks,
+        sealed_nonces_ks,
+        backup_bundles_ks: backup_bundles_ks.clone(),
+        backup_blob_dir: backup_blob_dir.clone(),
+        #[cfg(feature = "webvh")]
+        webvh_ks: webvh_ks.clone(),
+        webs_ks: store.keyspace(crate::keyspaces::WEBS).unwrap(),
+        #[cfg(feature = "webvh")]
+        passkey_vms_ks,
+        #[cfg(feature = "webvh")]
+        drains_ks,
+        #[cfg(feature = "webvh")]
+        snapshot_ks,
+        #[cfg(feature = "webvh")]
+        mediator_registry,
+        #[cfg(feature = "webvh")]
+        drain_sweeper,
+        telemetry,
+        wrapping_cache: crate::keys::wrapping::WrappingKeyCache::new(),
+        config: config.clone(),
+        seed_store,
+        store: store.clone(),
+        storage_encryption_key: None,
+        did_resolver,
+        status_list_resolver: None,
+        secrets_resolver: transport.secrets_resolver,
+        // Un-gated with the field: the spine signs every success response with
+        // it, so a build without didcomm still needs it populated.
+        signing_vm_id: transport.signing_vm_id,
+        #[cfg(feature = "didcomm")]
+        ka_vm_id: transport.ka_vm_id,
+        #[cfg(feature = "didcomm")]
+        didcomm_bridge: Arc::new(DIDCommBridge::placeholder()),
+        #[cfg(feature = "tsp")]
+        tsp_reach: Arc::new(crate::messaging::tsp_reach::TspReachability::new()),
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        trust_task_pushes_ks: store
+            .keyspace(crate::keyspaces::TRUST_TASK_PUSHES)
+            .expect("trust_task_pushes keyspace"),
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        outbox_ks: store
+            .keyspace(crate::keyspaces::OUTBOX)
+            .expect("outbox keyspace"),
+        #[cfg(all(test, any(feature = "didcomm", feature = "tsp")))]
+        push_log: Default::default(),
+        // Not feature-gated, in test scaffolding as in `build_app_state`: reply
+        // correlation is a document concern, so the spine consults it on every
+        // transport. A test agent with no registry would dispatch a reply as a
+        // request, which is the defect the registry exists to prevent.
+        pending_replies: crate::trust_tasks::pending_replies::PendingReplies::new(),
+        #[cfg(feature = "tsp")]
+        tsp_recovery: std::sync::Arc::new(affinidi_messaging_sdk::RecoveryCoordinator::new(
+            affinidi_messaging_sdk::BackoffPolicy::default(),
+        )),
+        #[cfg(feature = "tsp")]
+        tsp_relationships: vti_common::relationship_store::build_relationship_store(
+            store
+                .keyspace(crate::keyspaces::RELATIONSHIPS)
+                .expect("relationships keyspace"),
+        ),
+        #[cfg(feature = "tsp")]
+        tsp_idle_reinvites: Default::default(),
+        jwt_keys: Some(jwt_keys.clone()),
+        atm: transport.atm.or(opts.atm),
+        tee: None,
+        restart_gate: std::sync::Arc::new(crate::server::RestartGate::new(restart_tx)),
+        // The harness's stand-in peers (room hosts, a DID hosting service)
+        // listen on loopback, so its outbound sends may dial private and
+        // loopback endpoints. Stated here rather than through the process-wide
+        // switch, so it is this state's and nothing else's.
+        endpoint_policy: vta_sdk::http::EndpointPolicy::private_allowed(),
+        #[cfg(feature = "rest")]
+        metrics_handle: None,
+    };
+    // As `server::build_app_state` does: the bridge signs what this VTA sends a
+    // peer (a DID hosting service, among others) with its own key.
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    if let (Some(resolver), Some(vm_id)) = (&state.secrets_resolver, &state.signing_vm_id) {
+        state
+            .didcomm_bridge
+            .set_document_signer(resolver.clone(), vm_id.clone());
+    }
+
+    let state_for_ctx = state.clone();
+    // Quotas are read live from the harness config, as in production, so a
+    // test that patches a rate-limit key sees it applied.
+    //
+    // The harness trusts loopback and then synthesises a loopback peer,
+    // because `tower::oneshot` carries no socket: that pair is what lets a
+    // test pick its own rate-limit bucket with `x-forwarded-for`
+    // (`unauth_endpoint_rate_limit_returns_429_after_burst` sets
+    // `192.0.2.1`). Both halves live here, in the harness, and neither is in
+    // the production router — see `routes::build_api_router`, which refuses a
+    // request that has no peer rather than inventing one.
+    let router = crate::routes::router_with_cors(
+        &[],
+        &["127.0.0.1/32".parse().unwrap()],
+        crate::routes::QuotaSource::Live(state.config.clone()),
+    )
+    .with_state(state.clone())
+    .merge(crate::routes::health_router().with_state(state))
+    .layer(axum::middleware::from_fn(
+        vti_common::rate_limit::insert_default_connect_info_if_missing,
+    ));
+
+    let ctx = TestAppContext {
+        jwt_keys,
+        sessions_ks,
+        acl_ks,
+        keys_ks,
+        vault_ks: vault_ks_ctx,
+        backup_bundles_ks,
+        backup_blob_dir,
+        #[cfg(feature = "webvh")]
+        webvh_ks,
+        policy_ks,
+        contexts_ks: contexts_ks.clone(),
+        vta_did,
+        config,
+        outbox_ks: store.keyspace(crate::keyspaces::OUTBOX).unwrap(),
+        relationships_ks: store.keyspace(crate::keyspaces::RELATIONSHIPS).unwrap(),
+        state: state_for_ctx,
+        _dir: dir,
+    };
+
+    (router, ctx)
+}
+
+/// Seed a webvh hosting server directly into the registry keyspace, bypassing
+/// the network DID-resolution validation that `operations::did_webvh::servers::
+/// add_webvh_server` performs.
+///
+/// `build_test_app` / `MockVta` register no hosting server, so the join
+/// DID-mint path (`list_webvh_servers` → pick first → `create_did_webvh`)
+/// would otherwise hit an empty catalogue. Call this against
+/// [`TestAppContext::webvh_ks`] (or `MockVta::seed_webvh_server`) to make
+/// that first server appear in `list_webvh_servers`.
+///
+/// The `server_did` is stored verbatim and is **not** made resolvable — this
+/// is enough for catalogue/listing tests, but a `create_did_webvh` *mint*
+/// additionally needs the server DID to resolve to a reachable
+/// `WebVHHosting` endpoint. For that, use
+/// `MockVta::start_with_webvh_host`, which stands up an in-process
+/// `StubWebvhHost` and registers a resolvable server DID pointing at it.
+#[cfg(feature = "webvh")]
+pub async fn seed_webvh_server(webvh_ks: &KeyspaceHandle, id: &str, server_did: &str) {
+    use chrono::Utc;
+    let now = Utc::now();
+    let record = vta_sdk::webvh::WebvhServerRecord {
+        id: id.to_string(),
+        did: server_did.to_string(),
+        label: Some(format!("test server {id}")),
+        created_at: now,
+        updated_at: now,
+    };
+    crate::webvh_store::store_server(webvh_ks, &record)
+        .await
+        .expect("seed webvh server");
+}
+
+/// Authorize `did` in the ACL so a URL-direct provision / authenticated call is
+/// accepted instead of bouncing off the challenge gate with
+/// `403 forbidden: DID not in ACL`. An empty `contexts` vec is super-admin.
+///
+/// Goes through the canonical [`store_acl_entry`](crate::acl::store_acl_entry)
+/// so the internal `acl:{did}` key convention and `AclEntry` shape stay
+/// encapsulated — callers don't touch the raw [`KeyspaceHandle`]. Counterpart
+/// to [`seed_webvh_server`]; reach it ergonomically via
+/// `MockVta::authorize_did` / `MockVta::grant_super_admin`.
+pub async fn seed_acl_entry(
+    acl_ks: &KeyspaceHandle,
+    did: &str,
+    role: crate::acl::Role,
+    contexts: Vec<String>,
+) {
+    let entry = crate::acl::AclEntry::new(did, role, "test-support").with_contexts(contexts);
+    crate::acl::store_acl_entry(acl_ks, &entry)
+        .await
+        .expect("seed acl entry");
+}
+
+/// Move a webvh version's key handles to the `superseded:` prefix — the
+/// `crate`-private [`supersede_keys_for_version`] for `vta-test-support`'s
+/// `MockVta::corrupt_supersede_keys`, which reproduces a pre-#730 failed-publish
+/// loop.
+///
+/// [`supersede_keys_for_version`]: crate::operations::did_webvh::webvh_keys::supersede_keys_for_version
+pub async fn supersede_webvh_keys_for_version(
+    keys_ks: &KeyspaceHandle,
+    scid: &str,
+    version_id: &str,
+) -> Result<(), crate::error::AppError> {
+    crate::operations::did_webvh::webvh_keys::supersede_keys_for_version(keys_ks, scid, version_id)
+        .await
+}
+
+/// Sign `doc` **exactly as it stands** — the JSON a non-Rust producer sends —
+/// as [`did_for_seed`]`(seed)`, for `purpose`, with the proof's `created` set to
+/// the string given, verbatim (VTI-45).
+///
+/// [`sign_with_vm`] signs a `TrustTask`, which can only ever carry the
+/// spellings `trust-tasks-rs` writes. A JavaScript producer writes `.000Z` on
+/// every whole second and keeps `null` members; this is how a test sends what
+/// it would.
+pub fn sign_received_as(seed: u8, purpose: &str, created: &str, doc: &mut serde_json::Value) {
+    use affinidi_data_integrity::DataIntegrityProof;
+    use affinidi_data_integrity::crypto_suites::CryptoSuite;
+    use affinidi_data_integrity::prepare_sign_input;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let (_did, vm) = did_for_seed(seed);
+    let mut di = DataIntegrityProof::new(
+        CryptoSuite::EddsaJcs2022,
+        vm,
+        purpose.to_string(),
+        None,
+        Some(created.to_string()),
+        None,
+    );
+    doc.as_object_mut()
+        .expect("a document is an object")
+        .remove("proof");
+    let input = prepare_sign_input(&*doc, &di, CryptoSuite::EddsaJcs2022)
+        .expect("the test document prepares for signing");
+    let sk = SigningKey::from_bytes(&[seed; 32]);
+    di.proof_value = Some(multibase::encode(
+        multibase::Base::Base58Btc,
+        sk.sign(&input).to_bytes(),
+    ));
+    doc["proof"] = serde_json::to_value(&di).expect("proof serialises");
+}
+
+/// Now, on a whole second, as JavaScript's `toISOString()` writes it:
+/// `2026-09-25T12:37:33.000Z` (VTI-45).
+pub fn javascript_whole_second_now() -> String {
+    format!("{}.000Z", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S"))
+}
+
+/// Attach an `eddsa-jcs-2022` proof made by `seed`'s key under the
+/// verification method `vm`, for `purpose`.
+pub fn sign_with_vm(
+    seed: u8,
+    vm: &str,
+    purpose: &str,
+    doc: &mut trust_tasks_rs::TrustTask<serde_json::Value>,
+) {
+    use affinidi_data_integrity::DataIntegrityProof;
+    use affinidi_data_integrity::crypto_suites::CryptoSuite;
+    use affinidi_data_integrity::prepare_sign_input;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let sk = SigningKey::from_bytes(&[seed; 32]);
+    let mut di = DataIntegrityProof::new(
+        CryptoSuite::EddsaJcs2022,
+        vm.to_string(),
+        purpose.to_string(),
+        None,
+        Some(
+            chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                .to_string(),
+        ),
+        None,
+    );
+    doc.proof = None;
+    let input = prepare_sign_input(&*doc, &di, CryptoSuite::EddsaJcs2022)
+        .expect("the test document prepares for signing");
+    di.proof_value = Some(multibase::encode(
+        multibase::Base::Base58Btc,
+        sk.sign(&input).to_bytes(),
+    ));
+    doc.proof = Some(
+        serde_json::from_value(serde_json::to_value(&di).expect("proof serialises"))
+            .expect("proof round-trips into the framework type"),
+    );
+}
+
+// ── Soft WebAuthn authenticator ──────────────────────────────────────────────
+
+/// A WebAuthn authenticator in software, enough to complete a registration
+/// ceremony against this VTA.
+///
+/// `vta/passkey-vms/enroll-submit` runs `finish_passkey_registration`, which is
+/// full WebAuthn verification — the challenge, the RP-ID hash, the flags, and
+/// the credential public key all have to line up. There is no way to reach that
+/// handler with a hand-written fixture, which is why `enroll-submit` and
+/// `revoke` (which needs a verification method that was really enrolled) sat
+/// uncovered.
+///
+/// Attestation format is `none`: it carries no attestation statement, which is
+/// what a platform authenticator sends when the RP asks for none, and what this
+/// VTA's `finish_passkey_registration` is configured to accept. Producing a
+/// packed or TPM statement would prove something about a certificate chain
+/// rather than about this service.
+pub struct SoftAuthenticator {
+    signing_key: p256::ecdsa::SigningKey,
+    credential_id: Vec<u8>,
+}
+
+/// The members a registration produces, in the shapes `enroll-submit` takes.
+pub struct SoftRegistration {
+    pub credential_id: String,
+    pub public_key_multibase: String,
+    pub cose_algorithm: i64,
+    pub attestation_object: String,
+    pub client_data_json: String,
+    pub authenticator_data: String,
+}
+
+impl SoftAuthenticator {
+    /// Deterministic from `seed`, so a test that wants two authenticators asks
+    /// for two seeds and neither has to be written down.
+    pub fn new(seed: u8) -> Self {
+        let signing_key = p256::ecdsa::SigningKey::from_bytes(&[seed; 32].into())
+            .expect("a fixed 32-byte scalar is a valid P-256 key");
+        Self {
+            signing_key,
+            credential_id: vec![seed; 32],
+        }
+    }
+
+    /// Complete a registration for `challenge` (base64url, as the challenge
+    /// response carries it).
+    pub fn register(&self, rp_id: &str, origin: &str, challenge: &str) -> SoftRegistration {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use sha2::{Digest, Sha256};
+
+        // The COSE_Key the authenticator would have generated. Built as CBOR
+        // rather than through a helper because the byte layout is the thing
+        // under test: the VTA re-derives its Multikey from exactly these bytes.
+        let point = self.signing_key.verifying_key().to_sec1_point(false);
+        let cose = ciborium::value::Value::Map(vec![
+            // kty: EC2
+            (
+                ciborium::value::Value::Integer(1.into()),
+                ciborium::value::Value::Integer(2.into()),
+            ),
+            // alg: ES256
+            (
+                ciborium::value::Value::Integer(3.into()),
+                ciborium::value::Value::Integer((-7).into()),
+            ),
+            // crv: P-256
+            (
+                ciborium::value::Value::Integer((-1).into()),
+                ciborium::value::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::value::Value::Integer((-2).into()),
+                ciborium::value::Value::Bytes(point.x().expect("uncompressed point").to_vec()),
+            ),
+            (
+                ciborium::value::Value::Integer((-3).into()),
+                ciborium::value::Value::Bytes(point.y().expect("uncompressed point").to_vec()),
+            ),
+        ]);
+        let mut cose_bytes = Vec::new();
+        ciborium::ser::into_writer(&cose, &mut cose_bytes).expect("COSE key serialises");
+
+        // authData = rpIdHash | flags | signCount | attestedCredentialData
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        // UP (0x01) | UV (0x04) | AT (0x40). AT is what says an attested
+        // credential follows; without it the VTA finds no public key at all.
+        auth_data.push(0x45);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]); // AAGUID: none, for `none` attestation
+        auth_data.extend_from_slice(&(self.credential_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(&self.credential_id);
+        auth_data.extend_from_slice(&cose_bytes);
+
+        let attestation = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("fmt".into()),
+                ciborium::value::Value::Text("none".into()),
+            ),
+            (
+                ciborium::value::Value::Text("attStmt".into()),
+                ciborium::value::Value::Map(vec![]),
+            ),
+            (
+                ciborium::value::Value::Text("authData".into()),
+                ciborium::value::Value::Bytes(auth_data.clone()),
+            ),
+        ]);
+        let mut attestation_bytes = Vec::new();
+        ciborium::ser::into_writer(&attestation, &mut attestation_bytes)
+            .expect("attestation object serialises");
+
+        let client_data = serde_json::json!({
+            "type": "webauthn.create",
+            "challenge": challenge,
+            "origin": origin,
+            "crossOrigin": false,
+        });
+        let client_data_json = serde_json::to_vec(&client_data).expect("client data serialises");
+
+        // Through the VTA's own converter, so the advisory value the producer
+        // sends and the authoritative one the VTA re-derives cannot disagree
+        // for want of two implementations.
+        let (cose_algorithm, public_key_multibase) =
+            crate::operations::passkey_vms::multikey::cose_key_to_multikey(&cose_bytes)
+                .expect("the COSE key converts to a Multikey");
+
+        SoftRegistration {
+            credential_id: B64URL.encode(&self.credential_id),
+            public_key_multibase,
+            cose_algorithm,
+            attestation_object: B64URL.encode(&attestation_bytes),
+            client_data_json: B64URL.encode(&client_data_json),
+            authenticator_data: B64URL.encode(&auth_data),
+        }
+    }
+
+    /// Complete a WebAuthn **assertion** (`webauthn.get`) over `challenge_b64`
+    /// for a credential this authenticator already holds — the login/step-up
+    /// counterpart to [`Self::register`]'s registration ceremony. Full
+    /// signature verification, exactly as `vti_webauthn::verify_assertion`
+    /// runs it: `authenticatorData ‖ SHA-256(clientDataJSON)`, ECDSA P-256,
+    /// ASN.1 DER.
+    ///
+    /// `challenge_b64` is already base64url-encoded, exactly as the WebAuthn
+    /// `clientData.challenge` member carries it — callers deriving it from a
+    /// server-issued opaque nonce string base64url-encode that string's raw
+    /// bytes first (matching `verify_webauthn_gate`, which passes
+    /// `challenge.as_bytes()` as the expected-challenge bytes).
+    ///
+    /// No `attestedCredentialData`: an assertion's `authenticatorData` never
+    /// carries one (WebAuthn L3 §6.1), unlike [`Self::register`]'s.
+    pub fn assert(
+        &self,
+        rp_id: &str,
+        origin: &str,
+        challenge_b64: &str,
+        user_verified: bool,
+    ) -> SoftAssertion {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use p256::ecdsa::Signature;
+        use p256::ecdsa::signature::Signer as _;
+        use sha2::{Digest, Sha256};
+
+        // authData = rpIdHash | flags | signCount (37 bytes; no
+        // attestedCredentialData/extensions trailer).
+        let mut auth_data = Vec::with_capacity(37);
+        auth_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        let mut flags = 0x01u8; // UP — always required for an assertion.
+        if user_verified {
+            flags |= 0x04; // UV
+        }
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&1u32.to_be_bytes()); // signCount
+
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": challenge_b64,
+            "origin": origin,
+            "crossOrigin": false,
+        });
+        let client_data_json = serde_json::to_vec(&client_data).expect("client data serialises");
+
+        let mut message = Vec::with_capacity(auth_data.len() + 32);
+        message.extend_from_slice(&auth_data);
+        message.extend_from_slice(&Sha256::digest(&client_data_json));
+
+        let signature: Signature = self.signing_key.sign(&message);
+        let der_signature = signature.to_der();
+
+        SoftAssertion {
+            credential_id: B64URL.encode(&self.credential_id),
+            authenticator_data: B64URL.encode(&auth_data),
+            client_data_json: B64URL.encode(&client_data_json),
+            signature: B64URL.encode(der_signature.as_bytes()),
+        }
+    }
+}
+
+/// The members a WebAuthn assertion ceremony produces, in the shapes
+/// `auth/step-up/approve-response`'s `evidence.assertion` (and
+/// `passkey-login/finish`) take.
+pub struct SoftAssertion {
+    pub credential_id: String,
+    pub authenticator_data: String,
+    pub client_data_json: String,
+    pub signature: String,
+}
+
+// ── Held credentials ─────────────────────────────────────────────────────────
+
+/// Mint an SD-JWT-VC and receive it into the vault, as a holder would.
+///
+/// `credential-exchange/pending/approve` answers a deferred presentation, so it
+/// needs a credential that actually satisfies the deferred query — it refuses
+/// with "no held credential satisfies the deferred query" otherwise, which is
+/// why that task sat uncovered. Seeding a stored row directly would skip the
+/// receive path that decides how a credential is indexed, and the DCQL match
+/// runs off that index; so this mints and receives rather than writing a row.
+///
+/// Returns the stored credential's id.
+/// `subject_did` must be a holder key this VTA manages: presenting the
+/// credential means signing as the holder, and the operation refuses a subject
+/// whose key it does not hold. The VTA's own DID is the one a test fixture has.
+pub async fn seed_held_credential(
+    vault_ks: &KeyspaceHandle,
+    vct: &str,
+    disclosable_claim: &str,
+    subject_did: &str,
+) -> String {
+    use affinidi_sd_jwt::error::SdJwtError;
+    use affinidi_sd_jwt::signer::JwtSigner;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signer, SigningKey};
+    use vta_vault::mint::{MintRequest, mint_sd_jwt_vc};
+
+    /// The issuer. A `did:key`, so the receive path can resolve it without a
+    /// network or a resolver fixture.
+    struct EddsaSigner {
+        key: SigningKey,
+        kid: String,
+    }
+    impl JwtSigner for EddsaSigner {
+        fn algorithm(&self) -> &str {
+            "EdDSA"
+        }
+        fn key_id(&self) -> Option<&str> {
+            Some(&self.kid)
+        }
+        fn sign_jwt(
+            &self,
+            header: &serde_json::Value,
+            payload: &serde_json::Value,
+        ) -> Result<String, SdJwtError> {
+            let h = URL_SAFE_NO_PAD.encode(serde_json::to_string(header)?.as_bytes());
+            let p = URL_SAFE_NO_PAD.encode(serde_json::to_string(payload)?.as_bytes());
+            let input = format!("{h}.{p}");
+            let sig = self.key.sign(input.as_bytes());
+            Ok(format!(
+                "{input}.{}",
+                URL_SAFE_NO_PAD.encode(sig.to_bytes())
+            ))
+        }
+    }
+
+    let issuer_key = SigningKey::from_bytes(&[0x71; 32]);
+    let issuer_did =
+        affinidi_crypto::did_key::ed25519_pub_to_did_key(issuer_key.verifying_key().as_bytes());
+    let signer = EddsaSigner {
+        key: issuer_key,
+        kid: format!("{issuer_did}#key-0"),
+    };
+
+    let compact = mint_sd_jwt_vc(
+        &MintRequest {
+            vct,
+            issuer_did: &issuer_did,
+            subject_did,
+            claims: &serde_json::json!({ disclosable_claim: "Alice" }),
+            disclosable: &[disclosable_claim],
+            iat: 1_700_000_000,
+            exp: Some(1_900_000_000),
+        },
+        &signer,
+    )
+    .expect("mint the SD-JWT-VC");
+
+    // Nested under `credential_response`, which is where the issue message
+    // carries it — a bare `credential` member is refused as "no credential".
+    let body = serde_json::from_value(
+        serde_json::json!({ "credential_response": { "credential": compact } }),
+    )
+    .expect("issue body deserialises");
+    let cred = crate::operations::credential_exchange::receive_issued_credential(
+        vault_ks,
+        &body,
+        None,
+        None,
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("receive the issued credential");
+    cred.id
+}
+
+/// Seed a **holder** key this VTA manages, and return its `did:key`.
+///
+/// Distinct from the VTA's own signing identity, which is not a holder key:
+/// presenting a credential means signing *as the subject*, and
+/// `resolve_holder_keys` looks the subject up in the keys keyspace under
+/// `{did:key}#{multibase}`. A test that uses `vta_did` as the subject is
+/// refused with "holder key … is not managed by this VTA", correctly.
+///
+/// Derived from the app state's own seed at `derivation_path`, so the record
+/// and the key material agree — a record whose public half did not match the
+/// seed would resolve and then fail to sign.
+pub async fn seed_holder_key(
+    state: &crate::server::AppState,
+    derivation_path: &str,
+    context_id: Option<&str>,
+) -> String {
+    use vta_sdk::keys::{KeyOrigin, KeyRecord, KeyStatus, KeyType};
+    use vti_common::slip10::{DerivationPath, ExtendedSigningKey};
+
+    let seed = state
+        .seed_store
+        .get()
+        .await
+        .expect("read the seed")
+        .expect("an active seed");
+    let bip32 = ExtendedSigningKey::from_seed(&seed).expect("seed is a valid BIP-32 root");
+    let derived = bip32
+        .derive(&derivation_path.parse::<DerivationPath>().expect("a path"))
+        .expect("derive");
+    let did = affinidi_crypto::did_key::ed25519_pub_to_did_key(
+        derived.signing_key.verifying_key().as_bytes(),
+    );
+    let multibase = did.strip_prefix("did:key:").expect("a did:key");
+    let key_id = format!("{did}#{multibase}");
+
+    let record = KeyRecord {
+        key_id: key_id.clone(),
+        derivation_path: derivation_path.to_string(),
+        key_type: KeyType::Ed25519,
+        status: KeyStatus::Active,
+        public_key: multibase.to_string(),
+        label: None,
+        context_id: context_id.map(str::to_string),
+        seed_id: None,
+        exportable: None,
+        origin: KeyOrigin::Derived,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    state
+        .keys_ks
+        .insert(crate::keys::store_key(&key_id), &record)
+        .await
+        .expect("store the holder key record");
+    did
+}
+
+/// Make `member` (a holder key this VTA manages — [`seed_holder_key`]) a member
+/// of the room `room_did`: an authority credential conferring `actions` and a
+/// membership credential, both issued and signed by the room with
+/// `room_secret`, put in this VTA's vault where the room oracle looks for them.
+/// Valid from a minute ago for 30 days.
+pub async fn seed_room_membership(
+    state: &crate::server::AppState,
+    room_did: &str,
+    room_secret: &affinidi_tdk::secrets_resolver::secrets::Secret,
+    member: &str,
+    actions: &[&str],
+) {
+    use chrono::{Duration, Utc};
+    use dtg_credentials::DTGCredential;
+
+    let now = Utc::now();
+    let mut vac = DTGCredential::new_vac(
+        room_did.to_string(),
+        dtg_credentials::IssuerScope::Public,
+        member.to_string(),
+        room_did.to_string(),
+        actions.iter().map(|a| a.to_string()).collect(),
+        now - Duration::minutes(1),
+        now + Duration::days(30),
+    )
+    .expect("an authority credential")
+    .with_id(format!("urn:example:vac:{member}"));
+    vac.sign(room_secret, None)
+        .await
+        .expect("the room signs the authority credential");
+    let mut vmc = DTGCredential::new_vmc(
+        room_did.to_string(),
+        member.to_string(),
+        now - Duration::minutes(1),
+        Some(now + Duration::days(30)),
+        false,
+    );
+    vmc.sign(room_secret, None)
+        .await
+        .expect("the room signs the membership credential");
+    for (type_tag, cred) in [
+        (crate::operations::room_oracle::AUTHORITY_TYPE, &vac),
+        (crate::operations::room_oracle::MEMBERSHIP_TYPE, &vmc),
+    ] {
+        use crate::vault::model::{CredentialFormat, CredentialStatus, StoredCredential};
+        crate::vault::storage::put(
+            &state.vault_ks,
+            &StoredCredential {
+                id: format!("{type_tag}-{room_did}-{member}"),
+                format: CredentialFormat::EddsaJcs2022,
+                types: vec![type_tag.into()],
+                schema_id: None,
+                community_did: None,
+                context_id: None,
+                subject_did: None,
+                issuer_did: Some(room_did.to_string()),
+                purpose: None,
+                status: CredentialStatus::Unknown,
+                valid_from: None,
+                valid_until: None,
+                received_at: now.to_rfc3339(),
+                source: None,
+                tags: Default::default(),
+                body: serde_json::to_vec(cred).expect("serialize the credential"),
+                lifecycle: vti_common::vault::VaultStatus::Active,
+                archived_at: None,
+                deleted_at: None,
+                grace_until: None,
+            },
+        )
+        .await
+        .expect("put the room credential in the vault");
+    }
+}

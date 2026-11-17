@@ -1,0 +1,3214 @@
+//! Passkey enrolment, end to end, with a software authenticator: hashed
+//! invites, the claim-code lockout, expiry and single use, the separation of
+//! step-up and login credentials, and user verification bound to its
+//! ceremony — on every transport.
+
+use serde_json::{Value, json};
+
+use did_hosting_common::server::acl::{Role, get_acl_entry};
+use did_hosting_common::server::passkey::{invite, store as pk};
+use did_hosting_common::server::store::KS_PASSKEY_STEP_UP;
+
+use super::harness::{
+    Caller, VIAS, Via, code, conforms, member, ok, request, session_for, state, stranger,
+};
+use super::soft_passkey::SoftPasskey;
+use crate::server::AppState;
+
+/// `harness::call`, boxed: these tests chain many ceremonies, and an unboxed
+/// future of that depth overflows a test thread's stack in a debug build.
+async fn call(
+    state: &AppState,
+    via: Via,
+    caller: &Caller,
+    type_uri: &str,
+    payload: Value,
+) -> Value {
+    Box::pin(super::harness::call(state, via, caller, type_uri, payload)).await
+}
+
+/// `harness::send`, boxed.
+async fn send(state: &AppState, via: Via, sender: &Caller, doc: Value) -> Value {
+    Box::pin(super::harness::send(state, via, sender, doc)).await
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn t(slug: &str) -> String {
+    format!("https://trusttasks.org/spec/{slug}")
+}
+
+const INVITE: &str = "auth/passkey/enroll/invite/0.3";
+const REDEEM_START: &str = "auth/passkey/enroll/redeem/start/0.1";
+const REDEEM_FINISH: &str = "auth/passkey/enroll/redeem/finish/0.1";
+const START: &str = "auth/passkey/enroll/start/0.2";
+const FINISH: &str = "auth/passkey/enroll/finish/0.2";
+const LOGIN_START: &str = "auth/passkey/login/start/0.2";
+const LOGIN_FINISH: &str = "auth/passkey/login/finish/0.2";
+const LIST: &str = "auth/passkey/enroll/invite/list/0.1";
+const STEP_UP_START: &str = "auth/step-up/start/0.2";
+const STEP_UP_APPROVE: &str = "auth/step-up/approve-response/0.7";
+const PK_LIST: &str = "auth/passkey/list/0.1";
+const PK_ADMIN_LIST: &str = "auth/passkey/admin-list/0.1";
+const PK_REVOKE_START: &str = "auth/passkey/revoke/start/0.2";
+const PK_REVOKE_FINISH: &str = "auth/passkey/revoke/finish/0.2";
+
+/// An issued invite's two secrets.
+struct Issued {
+    token: String,
+    code: String,
+    body: Value,
+}
+
+async fn issue(state: &AppState, admin: &Caller, subject: &str, purpose: &str) -> Issued {
+    let reply = call(
+        state,
+        Via::Tsp,
+        admin,
+        &t(INVITE),
+        json!({ "subject": subject, "purpose": purpose }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(INVITE));
+    Issued {
+        token: body["invite"]["token"].as_str().unwrap().into(),
+        code: body["claimCode"].as_str().unwrap().into(),
+        body,
+    }
+}
+
+/// An unsigned document from `from`, as a browser (or any holder of no key)
+/// sends one. Over HTTPS it names no issuer at all.
+async fn unsigned(state: &AppState, via: Via, from: &Caller, slug: &str, payload: Value) -> Value {
+    let mut doc = request(&t(slug), &from.did, payload);
+    if via == Via::Https {
+        doc.as_object_mut().unwrap().remove("issuer");
+    }
+    send(state, via, from, doc).await
+}
+
+async fn redeem_start(state: &AppState, via: Via, from: &Caller, token: &str, code: &str) -> Value {
+    unsigned(
+        state,
+        via,
+        from,
+        REDEEM_START,
+        json!({ "token": token, "claimCode": code }),
+    )
+    .await
+}
+
+/// Redeem `issued` with `passkey` (answering `uv` when the start asks), and
+/// return the finish reply.
+async fn redeem(
+    state: &AppState,
+    via: Via,
+    from: &Caller,
+    issued: &Issued,
+    passkey: &mut SoftPasskey,
+    uv: Option<&mut SoftPasskey>,
+) -> Value {
+    let reply = redeem_start(state, via, from, &issued.token, &issued.code).await;
+    conforms(&reply);
+    let start = ok(&reply, &t(REDEEM_START));
+    let mut payload = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": passkey.attest(&start["options"]),
+    });
+    if let Some(uv) = uv {
+        payload["uvCredential"] = uv.assert(&start["uvOptions"]);
+    }
+    unsigned(state, via, from, REDEEM_FINISH, payload).await
+}
+
+/// Sign in with `passkey` over `via`, as the console does: an unsigned start,
+/// and a finish signed by a fresh session did:key.
+async fn login(state: &AppState, via: Via, passkey: &mut SoftPasskey, seed: u8) -> Value {
+    let browser = stranger(seed);
+    let reply = unsigned(state, via, &browser, LOGIN_START, json!({})).await;
+    let start = ok(&reply, &t(LOGIN_START));
+    let assertion = passkey.assert(&start["options"]);
+    call(
+        state,
+        via,
+        &browser,
+        &t(LOGIN_FINISH),
+        json!({ "authId": start["authId"], "credential": assertion }),
+    )
+    .await
+}
+
+async fn store_text(state: &AppState) -> String {
+    let mut text = String::new();
+    for ks in [
+        state.sessions_ks.clone(),
+        state.store.keyspace(KS_PASSKEY_STEP_UP).unwrap(),
+    ] {
+        for (k, v) in ks.iter_all().await.unwrap() {
+            text.push_str(&String::from_utf8_lossy(&k));
+            text.push_str(&String::from_utf8_lossy(&v));
+        }
+    }
+    text
+}
+
+/// The token and claim code are returned once, the code never in the URL, and
+/// neither is stored or listed — only their hashes are.
+#[tokio::test]
+async fn an_invite_discloses_its_secrets_once_and_stores_only_hashes() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 1, Role::Admin).await;
+    let issued = issue(&state, &admin, "did:example:carol", "session").await;
+    let url = issued.body["invite"]["url"].as_str().unwrap();
+    // In the fragment, never the query: a browser does not send it.
+    assert!(url.starts_with("https://control.test/enroll#token="));
+    assert!(!url.contains('?'));
+    assert!(url.contains(&issued.token));
+    assert!(!url.contains(&issued.code));
+    assert_eq!(issued.body["purpose"], "session");
+    assert!(issued.token.len() >= 43, "256-bit token");
+
+    let text = store_text(&state).await;
+    let bare = invite::normalise_claim_code(&issued.code);
+    assert!(!text.contains(&issued.token), "token stored in plaintext");
+    assert!(
+        !text.contains(&issued.code) && !text.contains(&bare),
+        "claim code stored"
+    );
+    assert!(text.contains(&invite::hash_token(&issued.token)));
+
+    let listed = call(&state, Via::Didcomm, &admin, &t(LIST), json!({})).await;
+    conforms(&listed);
+    let listed = listed.to_string();
+    assert!(!listed.contains(&issued.token) && !listed.contains(&issued.code));
+}
+
+/// Wrong claim codes are counted per invite and lock it out; the answer is the
+/// same for a wrong code, an unknown token and an expired invite.
+#[tokio::test]
+async fn wrong_claim_codes_lock_an_invite_out_on_every_transport() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 2, Role::Admin).await;
+    for (i, via) in VIAS.into_iter().enumerate() {
+        let invitee = stranger(20 + i as u8);
+        let issued = issue(&state, &admin, &format!("did:example:lock-{i}"), "session").await;
+        // Unknown token: the same refusal as a wrong code.
+        let reply = redeem_start(
+            &state,
+            via,
+            &invitee,
+            "inv_not-a-real-token-at-all",
+            &issued.code,
+        )
+        .await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/redeem/start:inviteInvalid",
+            "{via:?} {reply}"
+        );
+        for n in 1..invite::MAX_WRONG_CODES {
+            let reply = redeem_start(&state, via, &invitee, &issued.token, "0000-0000-0000").await;
+            assert_eq!(
+                code(&reply),
+                "auth/passkey/enroll/redeem/start:inviteInvalid",
+                "{via:?} wrong code {n}: {reply}"
+            );
+        }
+        let reply = redeem_start(&state, via, &invitee, &issued.token, "0000-0000-0000").await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/redeem/start:tooManyAttempts",
+            "{via:?} {reply}"
+        );
+        // Invalidated: the right code no longer redeems it.
+        let reply = redeem_start(&state, via, &invitee, &issued.token, &issued.code).await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/redeem/start:inviteInvalid",
+            "{via:?} {reply}"
+        );
+    }
+}
+
+/// A messaging-transport source is rate-limited on redemption attempts.
+#[tokio::test]
+async fn redemption_is_rate_limited_per_source() {
+    let (state, _dir) = state().await;
+    let invitee = stranger(30);
+    let mut last = Value::Null;
+    for _ in 0..=crate::rate_limit::REDEEM_MAX_PER_WINDOW {
+        last = redeem_start(
+            &state,
+            Via::Tsp,
+            &invitee,
+            "inv_not-a-real-token-at-all",
+            "0000-0000-0000",
+        )
+        .await;
+    }
+    assert_eq!(code(&last), "unavailable", "{last}");
+}
+
+/// A session invite, redeemed on each transport: the credential is bound, the
+/// ACL entry the invite names is created, the new passkey signs its subject in
+/// — and the invite and the ceremony are each spent.
+#[tokio::test]
+async fn a_session_invite_redeems_once_on_every_transport() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 3, Role::Admin).await;
+    for (i, via) in VIAS.into_iter().enumerate() {
+        let subject = format!("did:example:session-{i}");
+        let invitee = stranger(40 + i as u8);
+        let issued = issue(&state, &admin, &subject, "session").await;
+
+        let reply = redeem_start(&state, via, &invitee, &issued.token, &issued.code).await;
+        conforms(&reply);
+        let start = ok(&reply, &t(REDEEM_START));
+        assert_eq!(start["subject"], subject.as_str());
+        assert_eq!(start["purpose"], "session");
+        assert!(
+            start.get("uvOptions").is_none(),
+            "a first passkey has nothing to verify with"
+        );
+        let mut passkey = SoftPasskey::new();
+        let finish = json!({
+            "enrollmentId": start["enrollmentId"],
+            "credential": passkey.attest(&start["options"]),
+            "deviceLabel": "Carol's laptop",
+        });
+        let reply = unsigned(&state, via, &invitee, REDEEM_FINISH, finish.clone()).await;
+        conforms(&reply);
+        let body = ok(&reply, &t(REDEEM_FINISH));
+        assert_eq!(body["credentialId"], passkey.id());
+        assert_eq!(body["deviceLabel"], "Carol's laptop");
+        assert_eq!(
+            get_acl_entry(&state.acl_ks, &subject)
+                .await
+                .unwrap()
+                .unwrap()
+                .role,
+            Role::Owner
+        );
+
+        // Replayed finish: the ceremony is spent.
+        let reply = unsigned(&state, via, &invitee, REDEEM_FINISH, finish).await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/redeem/finish:enrollmentNotFound",
+            "{reply}"
+        );
+        // Single use: the invite is spent.
+        let reply = redeem_start(&state, via, &invitee, &issued.token, &issued.code).await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/redeem/start:inviteInvalid",
+            "{reply}"
+        );
+
+        // The passkey is a login credential.
+        let reply = login(&state, via, &mut passkey, 50 + i as u8).await;
+        let body = ok(&reply, &t(LOGIN_FINISH));
+        assert_eq!(body["session"]["subject"], subject.as_str(), "{reply}");
+    }
+}
+
+/// A role-conferring redemption decides whether to create the subject's ACL
+/// entry from a read of the ACL, so it waits for the ACL write lock the
+/// `acl/*` handlers hold — and, once it has it, keeps an entry an admin
+/// granted meanwhile rather than overwriting it with the invite's role.
+#[tokio::test]
+async fn a_redemption_waits_for_the_acl_write_lock() {
+    use did_hosting_common::server::acl::{AclEntry, store_acl_entry};
+    use did_hosting_common::server::domain::DomainScope;
+
+    let (state, _dir) = state().await;
+    let admin = member(&state, 3, Role::Admin).await;
+    let subject = "did:example:raced-grant";
+    let invitee = stranger(90);
+    let issued = issue(&state, &admin, subject, "session").await;
+    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
+    let start = ok(&reply, &t(REDEEM_START));
+    let mut passkey = SoftPasskey::new();
+    let payload = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": passkey.attest(&start["options"]),
+    });
+
+    let acl_lock = state
+        .acl_locks
+        .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+        .await;
+    let mut finish = Box::pin(unsigned(&state, Via::Tsp, &invitee, REDEEM_FINISH, payload));
+    tokio::select! {
+        reply = &mut finish => panic!("the redemption wrote the ACL without its lock: {reply}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {}
+    }
+    // An admin's grant, committed while the redemption waits.
+    store_acl_entry(
+        &state.acl_ks,
+        &AclEntry {
+            did: subject.into(),
+            role: Role::Admin,
+            label: None,
+            created_at: 1,
+            max_total_size: None,
+            max_did_count: None,
+            domains: DomainScope::All,
+        },
+    )
+    .await
+    .unwrap();
+    drop(acl_lock);
+    let reply = finish.await;
+    ok(&reply, &t(REDEEM_FINISH));
+    assert_eq!(
+        get_acl_entry(&state.acl_ks, subject)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        Role::Admin,
+        "the redemption overwrote an admin's grant"
+    );
+}
+
+/// An expired invite redeems nothing, nor does a ceremony past its expiry,
+/// nor one a newer start has superseded.
+#[tokio::test]
+async fn expired_invites_and_ceremonies_redeem_nothing() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 4, Role::Admin).await;
+    let invitee = stranger(60);
+
+    let issued = issue(&state, &admin, "did:example:late", "session").await;
+    let hash = invite::hash_token(&issued.token);
+    let mut stored = invite::by_token_hash(&state.sessions_ks, &hash)
+        .await
+        .unwrap()
+        .unwrap();
+    stored.expires_at = 1;
+    invite::save(&state.sessions_ks, &stored).await.unwrap();
+    let reply = redeem_start(&state, Via::Https, &invitee, &issued.token, &issued.code).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/start:inviteInvalid",
+        "{reply}"
+    );
+
+    // A ceremony past its expiry.
+    let issued = issue(&state, &admin, "did:example:slow", "session").await;
+    let start = ok(
+        &redeem_start(&state, Via::Https, &invitee, &issued.token, &issued.code).await,
+        &t(REDEEM_START),
+    );
+    let id = start["enrollmentId"].as_str().unwrap();
+    let mut ceremony = pk::take_ceremony(&state.sessions_ks, id)
+        .await
+        .unwrap()
+        .unwrap();
+    ceremony.expires_at = 1;
+    pk::store_ceremony(&state.sessions_ks, &ceremony)
+        .await
+        .unwrap();
+    let mut passkey = SoftPasskey::new();
+    let reply = unsigned(
+        &state,
+        Via::Https,
+        &invitee,
+        REDEEM_FINISH,
+        json!({ "enrollmentId": id, "credential": passkey.attest(&start["options"]) }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:enrollmentExpired",
+        "{reply}"
+    );
+
+    // Superseded: a newer start on the same invite retires the older one.
+    let older = ok(
+        &redeem_start(&state, Via::Https, &invitee, &issued.token, &issued.code).await,
+        &t(REDEEM_START),
+    );
+    let newer = ok(
+        &redeem_start(&state, Via::Https, &invitee, &issued.token, &issued.code).await,
+        &t(REDEEM_START),
+    );
+    let reply = unsigned(
+        &state,
+        Via::Https,
+        &invitee,
+        REDEEM_FINISH,
+        json!({ "enrollmentId": older["enrollmentId"], "credential": passkey.attest(&older["options"]) }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:enrollmentNotFound",
+        "{reply}"
+    );
+    let reply = unsigned(
+        &state,
+        Via::Https,
+        &invitee,
+        REDEEM_FINISH,
+        json!({ "enrollmentId": newer["enrollmentId"], "credential": passkey.attest(&newer["options"]) }),
+    )
+    .await;
+    ok(&reply, &t(REDEEM_FINISH));
+}
+
+/// A step-up credential is stored apart from login credentials: it never
+/// signs anyone in, and a login credential never stands in for one.
+#[tokio::test]
+async fn step_up_and_login_credentials_are_kept_apart() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 5, Role::Admin).await;
+    let dana = member(&state, 6, Role::Owner).await;
+    let invitee = stranger(70);
+
+    // Dana has a login passkey.
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    // Her first step-up passkey: no user verification to give — the login
+    // passkey is not a step-up credential.
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    assert_eq!(issued.body["purpose"], "stepUp");
+    let start = ok(
+        &redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await,
+        &t(REDEEM_START),
+    );
+    assert_eq!(start["purpose"], "stepUp");
+    assert!(start.get("uvOptions").is_none(), "{start}");
+    let excluded = start["options"]["excludeCredentials"].to_string();
+    assert!(
+        !excluded.contains(&login_key.id()),
+        "a login credential is not excluded from step-up"
+    );
+    let reply = unsigned(
+        &state,
+        Via::Tsp,
+        &invitee,
+        REDEEM_FINISH,
+        json!({ "enrollmentId": start["enrollmentId"], "credential": step_up.attest(&start["options"]) }),
+    )
+    .await;
+    assert_eq!(ok(&reply, &t(REDEEM_FINISH))["purpose"], "stepUp");
+
+    // Stored in the step-up keyspace, and not in the login one.
+    let hex_id = hex(&step_up.cred_id);
+    let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP).unwrap();
+    assert!(
+        pk::get_passkey_user_by_cred(&step_up_ks, &hex_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &hex_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&step_up_ks, &hex(&login_key.cred_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The step-up passkey is never offered at login, and never accepted there.
+    for (i, via) in VIAS.into_iter().enumerate() {
+        let browser = stranger(80 + i as u8);
+        let start = ok(
+            &unsigned(&state, via, &browser, LOGIN_START, json!({})).await,
+            &t(LOGIN_START),
+        );
+        assert!(
+            !start["options"].to_string().contains(&step_up.id()),
+            "{start}"
+        );
+        let reply = call(
+            &state,
+            via,
+            &browser,
+            &t(LOGIN_FINISH),
+            json!({ "authId": start["authId"], "credential": step_up.assert(&start["options"]) }),
+        )
+        .await;
+        assert!(
+            code(&reply).starts_with("auth/passkey/login/finish:"),
+            "{via:?} {reply}"
+        );
+        // Nor as a session step-up for its subject.
+        let start = ok(
+            &unsigned(
+                &state,
+                via,
+                &browser,
+                LOGIN_START,
+                json!({ "purpose": "stepUp", "subject": dana.did }),
+            )
+            .await,
+            &t(LOGIN_START),
+        );
+        assert!(
+            !start["options"].to_string().contains(&step_up.id()),
+            "{start}"
+        );
+    }
+
+    // A second step-up passkey needs a user-verified assertion from the first,
+    // and a login passkey's does not count.
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    let start = ok(
+        &redeem_start(&state, Via::Didcomm, &invitee, &issued.token, &issued.code).await,
+        &t(REDEEM_START),
+    );
+    let allowed = start["uvOptions"]["allowCredentials"].to_string();
+    assert!(
+        allowed.contains(&step_up.id()) && !allowed.contains(&login_key.id()),
+        "{start}"
+    );
+    let mut second = SoftPasskey::new();
+    let reply = unsigned(
+        &state,
+        Via::Didcomm,
+        &invitee,
+        REDEEM_FINISH,
+        json!({
+            "enrollmentId": start["enrollmentId"],
+            "credential": second.attest(&start["options"]),
+            "uvCredential": login_key.assert(&start["uvOptions"]),
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:userVerificationFailed",
+        "{reply}"
+    );
+    // The invite survives a failed finish; a correct one binds.
+    let reply = redeem(
+        &state,
+        Via::Didcomm,
+        &invitee,
+        &issued,
+        &mut second,
+        Some(&mut step_up),
+    )
+    .await;
+    ok(&reply, &t(REDEEM_FINISH));
+}
+
+/// A subject adding a passkey to an account that has one must answer the
+/// start's own user-verification challenge, with UV, from a passkey it
+/// already holds — once.
+#[tokio::test]
+async fn user_verification_is_bound_to_its_ceremony_and_refused_on_replay() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 7, Role::Admin).await;
+    let erin = stranger(90);
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &erin, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    let start = |via| {
+        let state = &state;
+        let erin = &erin;
+        async move {
+            let reply = call(
+                state,
+                via,
+                erin,
+                &t(START),
+                json!({ "deviceLabel": "phone" }),
+            )
+            .await;
+            conforms(&reply);
+            ok(&reply, &t(START))
+        }
+    };
+    let finish = |via, payload: Value| {
+        let state = &state;
+        let erin = &erin;
+        async move { call(state, via, erin, &t(FINISH), payload).await }
+    };
+
+    for via in VIAS {
+        let s = start(via).await;
+        assert!(
+            s["uvOptions"].is_object(),
+            "{via:?}: the subject has a passkey: {s}"
+        );
+        assert_ne!(s["uvOptions"]["challenge"], s["options"]["challenge"]);
+        assert_eq!(s["uvOptions"]["userVerification"], "required");
+        let mut new = SoftPasskey::new();
+
+        // No assertion at all is a failure, never consent.
+        let reply = finish(
+            via,
+            json!({ "enrollmentId": s["enrollmentId"], "credential": new.attest(&s["options"]) }),
+        )
+        .await;
+        assert_eq!(code(&reply), "permissionDenied", "{via:?} {reply}");
+        // ...and it spent the ceremony.
+        let reply = finish(
+            via,
+            json!({ "enrollmentId": s["enrollmentId"], "credential": new.attest(&s["options"]) }),
+        )
+        .await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/finish:enrollmentNotFound",
+            "{via:?} {reply}"
+        );
+
+        // An assertion over another ceremony's challenge.
+        let a = start(via).await;
+        let b = start(via).await;
+        let reply = finish(
+            via,
+            json!({
+                "enrollmentId": a["enrollmentId"],
+                "credential": new.attest(&a["options"]),
+                "uvCredential": first.assert(&b["uvOptions"]),
+            }),
+        )
+        .await;
+        assert_eq!(code(&reply), "permissionDenied", "{via:?} {reply}");
+        // The registration challenge is not the user-verification one.
+        let reply = finish(
+            via,
+            json!({
+                "enrollmentId": b["enrollmentId"],
+                "credential": new.attest(&b["options"]),
+                "uvCredential": first.assert(&json!({ "challenge": b["options"]["challenge"], "rpId": "control.test" })),
+            }),
+        )
+        .await;
+        assert_eq!(code(&reply), "permissionDenied", "{via:?} {reply}");
+
+        // Without the UV flag.
+        let s = start(via).await;
+        first.user_verified = false;
+        let uv = first.assert(&s["uvOptions"]);
+        first.user_verified = true;
+        let reply = finish(
+            via,
+            json!({ "enrollmentId": s["enrollmentId"], "credential": new.attest(&s["options"]), "uvCredential": uv }),
+        )
+        .await;
+        assert_eq!(code(&reply), "permissionDenied", "{via:?} {reply}");
+
+        // Someone else finishing Erin's enrolment.
+        let s = start(via).await;
+        let mallory = member(&state, 91, Role::Owner).await;
+        let reply = call(
+            &state,
+            via,
+            &mallory,
+            &t(FINISH),
+            json!({
+                "enrollmentId": s["enrollmentId"],
+                "credential": new.attest(&s["options"]),
+                "uvCredential": first.assert(&s["uvOptions"]),
+            }),
+        )
+        .await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/finish:subjectMismatch",
+            "{via:?} {reply}"
+        );
+
+        // Done right, it binds — once.
+        let s = start(via).await;
+        let payload = json!({
+            "enrollmentId": s["enrollmentId"],
+            "credential": new.attest(&s["options"]),
+            "uvCredential": first.assert(&s["uvOptions"]),
+        });
+        let reply = finish(via, payload.clone()).await;
+        conforms(&reply);
+        let body = ok(&reply, &t(FINISH));
+        assert_eq!(body["subject"], erin.did.as_str());
+        assert_eq!(body["deviceLabel"], "phone");
+        let reply = finish(via, payload).await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/finish:enrollmentNotFound",
+            "{via:?} {reply}"
+        );
+    }
+}
+
+/// The invite's own refusals.
+#[tokio::test]
+async fn invites_are_refused_as_the_spec_says() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 8, Role::Admin).await;
+    let owner = member(&state, 9, Role::Owner).await;
+    let invitee = stranger(95);
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &owner,
+        &t(INVITE),
+        json!({ "subject": "did:example:x" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/invite:roleNotPermitted",
+        "{reply}"
+    );
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t(INVITE),
+        json!({ "subject": owner.did, "purpose": "stepUp", "role": "admin" }),
+    )
+    .await;
+    assert_eq!(code(&reply), "malformedRequest", "{reply}");
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t(INVITE),
+        json!({ "subject": "did:example:nobody", "purpose": "stepUp" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/invite:subjectUnknown",
+        "{reply}"
+    );
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t(INVITE),
+        json!({ "subject": "did:example:x", "role": "emperor" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/invite:roleNotPermitted",
+        "{reply}"
+    );
+
+    // A session invite for a subject who already has a login passkey.
+    let issued = issue(&state, &admin, &owner.did, "session").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Tsp,
+            &invitee,
+            &issued,
+            &mut SoftPasskey::new(),
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t(INVITE),
+        json!({ "subject": owner.did }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/invite:subjectAlreadyEnrolled",
+        "{reply}"
+    );
+}
+
+/// A subject holding `MetricsReader` never gets a passkey: an invite for it,
+/// of either purpose, is refused, and an invite issued before the role was
+/// granted is refused at redemption — before the invite is consumed.
+#[tokio::test]
+async fn a_metrics_reader_is_never_paired_with_a_passkey() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 120, Role::Admin).await;
+    let reader = member(&state, 121, Role::MetricsReader).await;
+    let invitee = stranger(122);
+
+    for purpose in ["session", "stepUp"] {
+        let reply = call(
+            &state,
+            Via::Tsp,
+            &admin,
+            &t(INVITE),
+            json!({ "subject": reader.did, "purpose": purpose }),
+        )
+        .await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/enroll/invite:roleNotPermitted",
+            "{purpose}: {reply}"
+        );
+    }
+
+    // Issued while the subject held no role, then granted `MetricsReader`.
+    let later = stranger(123);
+    let issued = issue(&state, &admin, &later.did, "session").await;
+    member(&state, 123, Role::MetricsReader).await;
+    // Refused at the start, before the invitee makes a credential.
+    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        pk::get_passkey_user_by_did(&state.sessions_ks, &later.did)
+            .await
+            .unwrap()
+            .is_none_or(|u| u.credentials.is_empty()),
+        "no login passkey landed"
+    );
+    // Refused before the take: the invite is still live.
+    assert!(
+        invite::by_token_hash(&state.sessions_ks, &invite::hash_token(&issued.token))
+            .await
+            .unwrap()
+            .is_some(),
+        "the refusal spent the invite"
+    );
+}
+
+/// Over HTTPS the source is the client IP, counted before dispatch, and the
+/// refusal is a routed `unavailable` document with a retry time.
+#[tokio::test]
+async fn https_redemption_is_rate_limited_per_client_ip() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = state().await;
+    let addr: std::net::SocketAddr = "203.0.113.7:4000".parse().unwrap();
+    let mut last = Value::Null;
+    for _ in 0..=crate::rate_limit::REDEEM_MAX_PER_WINDOW {
+        let mut doc = request(
+            &t(REDEEM_START),
+            "unused",
+            json!({ "token": "inv_not-a-real-token-at-all", "claimCode": "0000-0000-0000" }),
+        );
+        doc.as_object_mut().unwrap().remove("issuer");
+        let response = crate::routes::trust_tasks::trust_tasks_endpoint(
+            None,
+            axum::extract::State(state.clone()),
+            Ok(axum::extract::ConnectInfo(addr)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+        )
+        .await
+        .into_response();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        last = serde_json::from_slice(&bytes).unwrap();
+    }
+    assert_eq!(code(&last), "unavailable", "{last}");
+    assert!(last["payload"]["retryAfter"].is_string(), "{last}");
+}
+
+/// The mounted route reads the body itself, bounded: a body over the largest
+/// document any served task accepts is refused `413` before it is read.
+#[tokio::test]
+async fn the_mounted_route_refuses_an_oversized_body_before_reading_it() {
+    use axum::response::IntoResponse;
+
+    let (state, _dir) = state().await;
+    let addr: std::net::SocketAddr = "203.0.113.9:4000".parse().unwrap();
+    let oversized = vec![b' '; crate::routes::trust_tasks_body_limit_bytes() + 1];
+    let response = crate::routes::trust_tasks::trust_tasks_route(
+        None,
+        axum::extract::State(state.clone()),
+        Ok(axum::extract::ConnectInfo(addr)),
+        axum::http::HeaderMap::new(),
+        axum::body::Body::from(oversized),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// An IPv6 client is counted by its /64: stepping to a new address inside the
+/// block for each attempt does not earn a fresh allowance.
+#[tokio::test]
+async fn https_redemption_counts_an_ipv6_client_by_its_network() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = state().await;
+    let mut last = Value::Null;
+    for i in 0..=crate::rate_limit::REDEEM_MAX_PER_WINDOW {
+        let addr: std::net::SocketAddr =
+            format!("[2001:db8:7:7::{:x}]:4000", i + 1).parse().unwrap();
+        let mut doc = request(
+            &t(REDEEM_START),
+            "unused",
+            json!({ "token": "inv_not-a-real-token-at-all", "claimCode": "0000-0000-0000" }),
+        );
+        doc.as_object_mut().unwrap().remove("issuer");
+        let response = crate::routes::trust_tasks::trust_tasks_endpoint(
+            None,
+            axum::extract::State(state.clone()),
+            Ok(axum::extract::ConnectInfo(addr)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+        )
+        .await
+        .into_response();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        last = serde_json::from_slice(&bytes).unwrap();
+    }
+    assert_eq!(code(&last), "unavailable", "{last}");
+    assert!(last["payload"]["retryAfter"].is_string(), "{last}");
+}
+
+/// A redemption body over its size limit is refused for its size, before it
+/// is parsed, and does not count against the client's redemption limit.
+#[tokio::test]
+async fn https_oversized_redemption_is_refused_for_its_size_and_not_counted() {
+    use axum::response::IntoResponse;
+    use did_hosting_common::server::trust_tasks::size::{
+        DEFAULT_MAX_DOCUMENT_BYTES, DETAILS_MAX_BYTES,
+    };
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = state().await;
+    let addr: std::net::SocketAddr = "203.0.113.8:4000".parse().unwrap();
+    let post = |doc: Value| {
+        let state = state.clone();
+        async move {
+            let response = crate::routes::trust_tasks::trust_tasks_endpoint(
+                None,
+                axum::extract::State(state),
+                Ok(axum::extract::ConnectInfo(addr)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            )
+            .await
+            .into_response();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+    let redeem_doc = |padding: usize| {
+        let mut doc = request(
+            &t(REDEEM_START),
+            "unused",
+            json!({
+                "token": "inv_not-a-real-token-at-all",
+                "claimCode": "0000-0000-0000",
+                "padding": "x".repeat(padding),
+            }),
+        );
+        doc.as_object_mut().unwrap().remove("issuer");
+        doc
+    };
+    for _ in 0..=crate::rate_limit::REDEEM_MAX_PER_WINDOW {
+        let reply = post(redeem_doc(DEFAULT_MAX_DOCUMENT_BYTES)).await;
+        assert_eq!(code(&reply), "malformedRequest", "{reply}");
+        assert_eq!(
+            reply["payload"]["details"][DETAILS_MAX_BYTES],
+            json!(DEFAULT_MAX_DOCUMENT_BYTES),
+            "{reply}"
+        );
+    }
+    // None of them was counted: an ordinary attempt is still served (and
+    // refused only for its unknown token).
+    let reply = post(redeem_doc(0)).await;
+    assert_ne!(code(&reply), "unavailable", "{reply}");
+}
+
+/// A step-up approve-response's `webauthn` evidence is gated on the
+/// subject's step-up-only store: offered only once one is enrolled, bound to
+/// the ceremony's own challenge, refused without user verification, and
+/// refused for a login passkey's assertion even though it's a real,
+/// currently-valid credential for the same subject.
+#[tokio::test]
+async fn step_up_accepts_its_own_passkey_and_refuses_a_login_one() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 100, Role::Admin).await;
+    let dana = member(&state, 101, Role::Owner).await;
+    let invitee = stranger(102);
+
+    // Dana has a login passkey but, so far, no step-up passkey.
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let tokens = session_for(&state, &dana).await;
+    let session_id = tokens.session_id.clone();
+
+    // No step-up passkey yet: didSigned only, no webauthn gate offered.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    conforms(&reply);
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    assert_eq!(
+        request["payload"]["accepts"],
+        json!(["didSigned"]),
+        "{request}"
+    );
+    assert!(request["payload"].get("webauthn").is_none(), "{request}");
+
+    // Give her a step-up passkey.
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    // Now the start offers a WebAuthn gate, bound to the ceremony's own
+    // challenge — the same value, not merely an equal-looking one.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    conforms(&reply);
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    assert_eq!(
+        request["payload"]["accepts"],
+        json!(["webauthn"]),
+        "{request}"
+    );
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let webauthn_options = request["payload"]["webauthn"].clone();
+    assert_eq!(webauthn_options["challenge"], challenge, "{request}");
+
+    // A login passkey's assertion over the same options: refused. It's a
+    // real, currently-bound credential for this subject — just not one this
+    // ceremony was opened for (the ceremony only knows the step-up store's
+    // credentials).
+    let bad = login_key.assert(&webauthn_options);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": bad },
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:assertionInvalid",
+        "{reply}"
+    );
+
+    // Single use: that refusal burned the challenge. A fresh start, and an
+    // assertion with no user verification: also refused.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    step_up.user_verified = false;
+    let no_uv = step_up.assert(&request["payload"]["webauthn"]);
+    step_up.user_verified = true;
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": no_uv },
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:assertionInvalid",
+        "{reply}"
+    );
+
+    // The subject's own step-up passkey, user-verified: accepted.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let good = step_up.assert(&request["payload"]["webauthn"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": good },
+        }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["status"], "elevated", "{body}");
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+    assert!(
+        body["session"]["amr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "passkey"),
+        "{body}"
+    );
+}
+
+/// `auth/passkey/list` answers only the caller's own credentials, of every
+/// purpose; `auth/passkey/admin-list` answers one subject's credentials of
+/// one purpose, and only to an administrator.
+#[tokio::test]
+async fn passkey_list_and_admin_list_answer_the_right_scope() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 110, Role::Admin).await;
+    let dana = member(&state, 111, Role::Owner).await;
+    let erin = member(&state, 112, Role::Owner).await;
+    let invitee = stranger(113);
+
+    let mut dana_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_login, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut dana_step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut dana_step_up,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    // Dana's own list sees both of hers; Erin, who has enrolled nothing,
+    // sees none of Dana's.
+    let reply = call(&state, Via::Https, &dana, &t(PK_LIST), json!({})).await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_LIST));
+    let creds = body["credentials"].as_array().unwrap();
+    assert_eq!(creds.len(), 2, "{body}");
+    assert!(
+        creds
+            .iter()
+            .any(|c| c["credentialId"] == json!(dana_login.id()))
+    );
+    assert!(
+        creds
+            .iter()
+            .any(|c| c["credentialId"] == json!(dana_step_up.id()))
+    );
+
+    let reply = call(&state, Via::Https, &erin, &t(PK_LIST), json!({})).await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_LIST));
+    assert!(body["credentials"].as_array().unwrap().is_empty(), "{body}");
+
+    // Erin is not an administrator: she cannot read Dana's inventory.
+    let reply = call(
+        &state,
+        Via::Https,
+        &erin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": dana.did, "purpose": "session" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/admin-list:notAdministrator",
+        "{reply}"
+    );
+
+    // The administrator reads it, purpose by purpose.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": dana.did, "purpose": "session" }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_ADMIN_LIST));
+    assert_eq!(body["purpose"], "session", "{body}");
+    let creds = body["credentials"].as_array().unwrap();
+    assert_eq!(creds.len(), 1, "{body}");
+    assert_eq!(creds[0]["credentialId"], json!(dana_login.id()));
+
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": dana.did, "purpose": "stepUp" }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_ADMIN_LIST));
+    let creds = body["credentials"].as_array().unwrap();
+    assert_eq!(creds.len(), 1, "{body}");
+    assert_eq!(creds[0]["credentialId"], json!(dana_step_up.id()));
+
+    // An unrecognised subject is refused.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_ADMIN_LIST),
+        json!({ "subject": "did:example:nobody", "purpose": "session" }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/admin-list:subjectUnknown",
+        "{reply}"
+    );
+}
+
+/// Revoke authority: a subject revokes their own credential (re-authenticated
+/// with their own login passkey); an administrator revokes another subject's
+/// (re-authenticated with *their own* login passkey, never the target's); a
+/// non-administrator asking for anyone else's is refused outright; and a
+/// subject's last login passkey cannot be revoked this way.
+#[tokio::test]
+async fn revoke_authority_is_own_or_administrator_others_are_refused() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 120, Role::Admin).await;
+    let dana = member(&state, 121, Role::Owner).await;
+    let erin = member(&state, 122, Role::Owner).await;
+    let invitee = stranger(123);
+
+    // The administrator's own login passkey, for re-verifying presence when
+    // revoking someone else's credential.
+    let mut admin_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &admin.did, "session").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut admin_login,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    let mut dana_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_login, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut dana_step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut dana_step_up,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    let mut erin_login = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut erin_login, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut erin_step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "stepUp").await;
+    ok(
+        &redeem(
+            &state,
+            Via::Https,
+            &invitee,
+            &issued,
+            &mut erin_step_up,
+            None,
+        )
+        .await,
+        &t(REDEEM_FINISH),
+    );
+
+    // Erin is not an administrator: she cannot even start a revocation of
+    // Dana's credential.
+    let reply = call(
+        &state,
+        Via::Https,
+        &erin,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": dana_step_up.id(), "subject": dana.did }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/revoke/start:notAuthorized",
+        "{reply}"
+    );
+
+    // Dana revokes her own step-up passkey, re-authenticating with her own
+    // login passkey.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": dana_step_up.id() }),
+    )
+    .await;
+    conforms(&reply);
+    let start = ok(&reply, &t(PK_REVOKE_START));
+    let uv = dana_login.assert(&start["uvOptions"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_FINISH),
+        json!({ "revocationId": start["revocationId"], "uvCredential": uv }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_REVOKE_FINISH));
+    assert_eq!(body["credentialId"], json!(dana_step_up.id()));
+    assert_eq!(body["purpose"], "stepUp", "{body}");
+    assert_eq!(body["subject"], dana.did.as_str());
+    assert_eq!(body["remaining"], 0, "{body}");
+    let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP).unwrap();
+    assert!(
+        pk::get_passkey_user_by_cred(&step_up_ks, &hex(&dana_step_up.cred_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The administrator revokes Erin's step-up passkey, re-authenticating
+    // with the administrator's own login passkey — not Erin's.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": erin_step_up.id(), "subject": erin.did }),
+    )
+    .await;
+    conforms(&reply);
+    let start = ok(&reply, &t(PK_REVOKE_START));
+    let uv = admin_login.assert(&start["uvOptions"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_REVOKE_FINISH),
+        json!({ "revocationId": start["revocationId"], "uvCredential": uv }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(PK_REVOKE_FINISH));
+    assert_eq!(body["subject"], erin.did.as_str());
+    assert_eq!(body["purpose"], "stepUp", "{body}");
+
+    // Erin's login passkey is her last: revoking it is refused, even for an
+    // administrator.
+    let reply = call(
+        &state,
+        Via::Https,
+        &admin,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": erin_login.id(), "subject": erin.did }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/revoke/start:lastCredential",
+        "{reply}"
+    );
+}
+
+/// Open a step-up on `session_id` and return its approve-request payload.
+async fn step_up_payload(state: &AppState, subject: &Caller, session_id: &str) -> Value {
+    let reply = call(
+        state,
+        Via::Https,
+        subject,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    ok(&reply, &t(STEP_UP_START))["approveRequest"]["payload"].clone()
+}
+
+/// A step-up passkey assertion is single use, even raced: two responses
+/// carrying the same valid assertion arrive together and exactly one
+/// elevates the session. Replayed afterwards — into this session or a new
+/// step-up — it is refused.
+#[tokio::test]
+async fn a_step_up_assertion_elevates_once_even_raced_and_never_replays() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 130, Role::Admin).await;
+    let dana = member(&state, 131, Role::Owner).await;
+    let invitee = stranger(132);
+
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let session_id = session_for(&state, &dana).await.session_id;
+
+    let approve = |challenge: &Value, assertion: &Value| {
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": assertion },
+        })
+    };
+
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    let good = step_up.assert(&payload["webauthn"]);
+    let body = approve(&payload["challenge"], &good);
+    let approve_type = t(STEP_UP_APPROVE);
+    let (a, b) = tokio::join!(
+        call(&state, Via::Https, &dana, &approve_type, body.clone()),
+        call(&state, Via::Https, &dana, &approve_type, body.clone()),
+    );
+    let response = format!("{}#response", t(STEP_UP_APPROVE));
+    let elevated = [&a, &b].iter().filter(|r| r["type"] == response).count();
+    assert_eq!(elevated, 1, "exactly one racer elevates: {a} / {b}");
+
+    // Replayed into the same, now-consumed step-up: refused.
+    let reply = call(&state, Via::Https, &dana, &t(STEP_UP_APPROVE), body).await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:challengeUnknown",
+        "{reply}"
+    );
+
+    // Replayed against a fresh step-up on another session — its own
+    // challenge, the old assertion: the ceremony that assertion answers is
+    // gone, so it does not verify.
+    let other_session = session_for(&state, &dana).await.session_id;
+    let payload = step_up_payload(&state, &dana, &other_session).await;
+    let mut replay = approve(&payload["challenge"], &good);
+    replay["sessionId"] = json!(other_session);
+    let reply = call(&state, Via::Https, &dana, &t(STEP_UP_APPROVE), replay).await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:assertionInvalid",
+        "{reply}"
+    );
+}
+
+/// Two revocations of a subject's last two login passkeys, finished at the
+/// same moment, can't both pass the last-login-passkey guard: exactly one
+/// revokes, the other is refused, and the survivor still signs in.
+#[tokio::test]
+async fn concurrent_revokes_cannot_remove_the_last_login_passkey() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 140, Role::Admin).await;
+    let dana = member(&state, 141, Role::Owner).await;
+    let invitee = stranger(142);
+
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    // A second login credential for Dana: enrolled for another subject, then
+    // rebound to Dana in the store. It is only ever a revoke target here, so
+    // its user handle doesn't matter.
+    let erin = member(&state, 143, Role::Owner).await;
+    let mut second = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut second, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let erins = pk::get_passkey_user_by_did(&state.sessions_ks, &erin.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut danas = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    danas.credentials.push(erins.credentials[0].clone());
+    let mut batch = state.store.batch();
+    pk::stage_new_credential(
+        &mut batch,
+        &state.sessions_ks,
+        &danas,
+        &hex(&second.cred_id),
+    )
+    .unwrap();
+    batch.commit().await.unwrap();
+
+    // Two open revocations, one per credential; each passes `start`'s guard.
+    let mut finishes = Vec::new();
+    for target in [first.id(), second.id()] {
+        let reply = call(
+            &state,
+            Via::Https,
+            &dana,
+            &t(PK_REVOKE_START),
+            json!({ "credentialId": target }),
+        )
+        .await;
+        let start = ok(&reply, &t(PK_REVOKE_START));
+        let uv = first.assert(&start["uvOptions"]);
+        finishes.push(json!({ "revocationId": start["revocationId"], "uvCredential": uv }));
+    }
+    let finish_type = t(PK_REVOKE_FINISH);
+    let (a, b) = tokio::join!(
+        call(&state, Via::Https, &dana, &finish_type, finishes[0].clone()),
+        call(&state, Via::Https, &dana, &finish_type, finishes[1].clone()),
+    );
+    let response = format!("{}#response", t(PK_REVOKE_FINISH));
+    let revoked = [&a, &b].iter().filter(|r| r["type"] == response).count();
+    assert_eq!(revoked, 1, "exactly one revoke may win: {a} / {b}");
+
+    let user = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.credentials.len(), 1);
+    let survivor = hex(user.credentials[0].cred_id());
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &survivor)
+            .await
+            .unwrap()
+            .is_some(),
+        "the surviving credential is still indexed"
+    );
+}
+
+/// Once a subject holds a step-up passkey, a decision with no `webauthn`
+/// evidence — a plain framework-proof (`didSigned`) approval, exactly as a
+/// wallet or VTA-signed approve-response would send, and exactly what
+/// satisfied step-up before this subject enrolled one — no longer grants it,
+/// however validly it is signed. Only the passkey does.
+#[tokio::test]
+async fn step_up_with_a_passkey_refuses_a_no_passkey_decision() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 150, Role::Admin).await;
+    let dana = member(&state, 151, Role::Owner).await;
+    let invitee = stranger(152);
+
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let session_id = session_for(&state, &dana).await.session_id;
+
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    assert_eq!(payload["accepts"], json!(["webauthn"]), "{payload}");
+
+    // A framework-proof-only decision, no evidence at all: refused. The
+    // subject's own step-up passkey is the only route left.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": payload["challenge"],
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/step-up/approve-response:noGate",
+        "{reply}"
+    );
+
+    // The refusal consumed that challenge (single use, whatever the
+    // decision) — re-open, and the passkey still completes it.
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    let good = step_up.assert(&payload["webauthn"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": payload["challenge"],
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": good },
+        }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["status"], "elevated", "{body}");
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+}
+
+/// A subject with no step-up passkey keeps today's route: a plain
+/// framework-proof (`didSigned`) approve-response elevates the session.
+/// Enrolling a step-up passkey afterwards drops that elevation — a fresh
+/// step-up start no longer answers `notNeeded`, and now only the new
+/// passkey satisfies it.
+#[tokio::test]
+async fn enrolling_a_step_up_passkey_revokes_a_prior_non_passkey_elevation() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 160, Role::Admin).await;
+    let dana = member(&state, 161, Role::Owner).await;
+    let invitee = stranger(162);
+
+    let mut login_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut login_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let session_id = session_for(&state, &dana).await.session_id;
+
+    // No step-up passkey yet: the old didSigned route elevates the session.
+    let payload = step_up_payload(&state, &dana, &session_id).await;
+    assert_eq!(payload["accepts"], json!(["didSigned"]), "{payload}");
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": payload["challenge"],
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+        }),
+    )
+    .await;
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+
+    // Confirmed elevated: a further step-up start answers notNeeded.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    assert_eq!(code(&reply), "auth/step-up/start:notNeeded", "{reply}");
+
+    // Dana enrols a step-up passkey.
+    let mut step_up = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut step_up, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    // The old elevation is gone: the session needs a step-up again, and now
+    // only its own passkey may satisfy it.
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_START),
+        json!({ "sessionId": session_id }),
+    )
+    .await;
+    conforms(&reply);
+    let request = ok(&reply, &t(STEP_UP_START))["approveRequest"].clone();
+    assert_eq!(
+        request["payload"]["accepts"],
+        json!(["webauthn"]),
+        "{request}"
+    );
+
+    // And it can be completed with the new passkey.
+    let challenge = request["payload"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let good = step_up.assert(&request["payload"]["webauthn"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(STEP_UP_APPROVE),
+        json!({
+            "challenge": challenge,
+            "decision": "approved",
+            "subject": dana.did,
+            "sessionId": session_id,
+            "evidence": { "kind": "webauthn", "assertion": good },
+        }),
+    )
+    .await;
+    conforms(&reply);
+    let body = ok(&reply, &t(STEP_UP_APPROVE));
+    assert_eq!(body["status"], "elevated", "{body}");
+    assert_eq!(body["session"]["acr"], "aal2", "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// Passkey login start: what an unauthenticated caller learns, and what it
+// leaves behind
+// ---------------------------------------------------------------------------
+
+/// An unsigned login start from `from` over `via` with `payload`.
+async fn login_start(state: &AppState, via: Via, from: &Caller, payload: Value) -> Value {
+    unsigned(state, via, from, LOGIN_START, payload).await
+}
+
+/// An unauthenticated start that names no subject lists no credentials. One
+/// that names a subject lists that subject's credentials, so a passkey
+/// enrolled as non-discoverable still signs in, and for a subject with no
+/// passkey lists stable decoys of the same shape, so the answer does not say
+/// who is enrolled. A named subject is held to its own passkey at finish.
+#[tokio::test]
+async fn a_login_start_discloses_no_credentials_or_subjects() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 120, Role::Admin).await;
+    let invitee = stranger(121);
+    let dana = stranger(122);
+    let erin = stranger(123);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut erin_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut erin_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+
+    for (i, via) in VIAS.into_iter().enumerate() {
+        let browser = stranger(124 + i as u8);
+        // Nothing named: no list.
+        let start = ok(
+            &login_start(&state, via, &browser, json!({})).await,
+            &t(LOGIN_START),
+        );
+        assert!(
+            start["options"].get("allowCredentials").is_none(),
+            "{start}"
+        );
+
+        let listed = |payload: Value| {
+            let state = &state;
+            let browser = &browser;
+            async move {
+                let reply = login_start(state, via, browser, payload).await;
+                conforms(&reply);
+                ok(&reply, &t(LOGIN_START))["options"].clone()
+            }
+        };
+        let keys = |options: &Value| {
+            let mut keys: Vec<String> = options.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        for purpose in ["login", "stepUp"] {
+            // dana: exactly her credential.
+            let real = listed(json!({ "purpose": purpose, "subject": dana.did })).await;
+            assert_eq!(
+                real["allowCredentials"],
+                json!([{ "type": "public-key", "id": dana_key.id() }]),
+                "{real}"
+            );
+            // Nobody: decoys, the same on every start, shaped like a real list.
+            let decoy =
+                listed(json!({ "purpose": purpose, "subject": "did:example:nobody" })).await;
+            let again =
+                listed(json!({ "purpose": purpose, "subject": "did:example:nobody" })).await;
+            assert_eq!(decoy["allowCredentials"], again["allowCredentials"]);
+            assert_ne!(decoy["challenge"], again["challenge"]);
+            assert_eq!(keys(&decoy), keys(&real), "{decoy} / {real}");
+            let ids = decoy["allowCredentials"].as_array().unwrap();
+            assert!((1..=2).contains(&ids.len()), "{decoy}");
+            for d in ids {
+                assert_eq!(keys(d), vec!["id".to_string(), "type".to_string()], "{d}");
+                assert_ne!(d["id"], json!(dana_key.id()));
+                assert_ne!(d["id"], json!(erin_key.id()));
+            }
+            // Another unknown subject gets other decoys.
+            let other = listed(json!({ "purpose": purpose, "subject": "did:example:other" })).await;
+            assert_ne!(other["allowCredentials"], decoy["allowCredentials"]);
+        }
+
+        // An unnamed login signs in whoever's passkey answers.
+        let reply = login(&state, via, &mut dana_key, 130 + i as u8).await;
+        let body = ok(&reply, &t(LOGIN_FINISH));
+        assert_eq!(body["session"]["subject"], dana.did.as_str(), "{body}");
+
+        // A login named for dana refuses erin's passkey.
+        let browser = stranger(135 + i as u8);
+        let start = ok(
+            &login_start(&state, via, &browser, json!({ "subject": dana.did })).await,
+            &t(LOGIN_START),
+        );
+        let reply = call(
+            &state,
+            via,
+            &browser,
+            &t(LOGIN_FINISH),
+            json!({ "authId": start["authId"], "credential": erin_key.assert(&start["options"]) }),
+        )
+        .await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/login/finish:assertionInvalid",
+            "{via:?} {reply}"
+        );
+    }
+}
+
+/// A discoverable assertion whose user handle is missing, or is not the
+/// credential's user, is refused, though the signature is the credential's
+/// own.
+#[tokio::test]
+async fn a_login_refuses_a_user_handle_that_is_not_the_credentials() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 140, Role::Admin).await;
+    let invitee = stranger(141);
+    let dana = stranger(142);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    assert!(dana_key.user_handle.is_some());
+    for handle in [Some("AAAAAAAAAAAAAAAAAAAAAA".to_string()), None] {
+        dana_key.user_handle = handle;
+        let reply = login(&state, Via::Https, &mut dana_key, 143).await;
+        assert_eq!(
+            code(&reply),
+            "auth/passkey/login/finish:assertionInvalid",
+            "{reply}"
+        );
+    }
+}
+
+/// Only the subject's own session is told that it has no passkey, or that it
+/// is unknown.
+#[tokio::test]
+async fn the_subjects_own_session_gets_its_credential_list() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 144, Role::Admin).await;
+    let invitee = stranger(145);
+    let dana = stranger(146);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let claims = |did: &str| crate::auth::AuthClaims {
+        did: did.to_string(),
+        role: Role::Owner,
+        session_id: "sess-own".into(),
+        session_pubkey_b58btc: None,
+        amr: vec!["did".into()],
+        acr: "aal1".into(),
+    };
+    let start = |subject: &str| {
+        let mut doc = request(
+            &t(LOGIN_START),
+            "unused",
+            json!({ "purpose": "stepUp", "subject": subject }),
+        );
+        doc.as_object_mut().unwrap().remove("issuer");
+        doc
+    };
+    let reply = super::harness::https(&state, Some(claims(&dana.did)), start(&dana.did)).await;
+    let body = ok(&reply, &t(LOGIN_START));
+    assert!(
+        body["options"]["allowCredentials"]
+            .to_string()
+            .contains(&dana_key.id()),
+        "{body}"
+    );
+    // Another subject's session sees what anyone naming her sees.
+    let reply = super::harness::https(&state, Some(claims(&admin.did)), start(&dana.did)).await;
+    let body = ok(&reply, &t(LOGIN_START));
+    assert!(
+        body["options"]["allowCredentials"]
+            .to_string()
+            .contains(&dana_key.id()),
+        "{body}"
+    );
+    // Without its own session, an unknown subject is answered with decoys,
+    // not an error.
+    let reply = super::harness::https(&state, Some(claims(&dana.did)), start(&admin.did)).await;
+    ok(&reply, &t(LOGIN_START));
+    // A session's own subject with no passkey is told so.
+    let reply = super::harness::https(&state, Some(claims(&admin.did)), start(&admin.did)).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/login/start:subjectNotRecognized",
+        "{reply}"
+    );
+}
+
+/// A login start stores one small row however many passkeys are enrolled,
+/// and an unfinished one is swept once it expires — as are the other
+/// ceremonies that carry an expiry, and the per-ceremony state rows an older
+/// build left beside them.
+#[tokio::test]
+async fn unfinished_ceremonies_are_swept_when_they_expire() {
+    let (state, _dir) = state().await;
+    let ks = &state.sessions_ks;
+    let browser = stranger(150);
+    let start = ok(
+        &login_start(&state, Via::Tsp, &browser, json!({})).await,
+        &t(LOGIN_START),
+    );
+    let auth_id = start["authId"].as_str().unwrap().to_string();
+    let rows = ks.prefix_iter_raw("pk_task_meta:").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(ks.prefix_iter_raw("pk_auth:").await.unwrap().is_empty());
+
+    let now = did_hosting_common::server::auth::session::now_epoch();
+    let expiring = |expires_at: u64| json!({ "expires_at": expires_at, "subject": "x" });
+    // The login ceremony, aged past its expiry.
+    let mut row: Value = ks
+        .get(format!("pk_task_meta:{auth_id}"))
+        .await
+        .unwrap()
+        .unwrap();
+    row["expires_at"] = json!(now - 1);
+    ks.insert(format!("pk_task_meta:{auth_id}"), &row)
+        .await
+        .unwrap();
+    ks.insert(format!("pk_auth:{auth_id}"), &json!({}))
+        .await
+        .unwrap();
+    // An orphaned state row, and expired and live rows of the other kinds.
+    ks.insert("pk_auth:orphan", &json!({})).await.unwrap();
+    for prefix in ["pk_revoke:", "stepup-task:", "did_xfer:"] {
+        ks.insert(format!("{prefix}old"), &expiring(now - 1))
+            .await
+            .unwrap();
+        ks.insert(format!("{prefix}live"), &expiring(now + 600))
+            .await
+            .unwrap();
+    }
+    let live = ok(
+        &login_start(&state, Via::Tsp, &browser, json!({})).await,
+        &t(LOGIN_START),
+    );
+
+    did_hosting_common::server::auth::session::cleanup_expired_sessions(ks, 300)
+        .await
+        .unwrap();
+
+    let keys: Vec<String> = ks
+        .iter_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
+        .collect();
+    assert!(
+        !keys.contains(&format!("pk_task_meta:{auth_id}")),
+        "{keys:?}"
+    );
+    assert!(!keys.iter().any(|k| k.starts_with("pk_auth:")), "{keys:?}");
+    assert!(
+        keys.contains(&format!(
+            "pk_task_meta:{}",
+            live["authId"].as_str().unwrap()
+        )),
+        "{keys:?}"
+    );
+    for prefix in ["pk_revoke:", "stepup-task:", "did_xfer:"] {
+        assert!(!keys.contains(&format!("{prefix}old")), "{keys:?}");
+        assert!(keys.contains(&format!("{prefix}live")), "{keys:?}");
+    }
+}
+
+/// One messaging-transport source may open only so many logins a minute; the
+/// refusal is the task's own `rateLimited`.
+#[tokio::test]
+async fn login_start_is_rate_limited_per_source() {
+    let (state, _dir) = state().await;
+    let browser = stranger(151);
+    for _ in 0..crate::rate_limit::LOGIN_START_MAX_PER_WINDOW {
+        ok(
+            &login_start(&state, Via::Tsp, &browser, json!({})).await,
+            &t(LOGIN_START),
+        );
+    }
+    let reply = login_start(&state, Via::Tsp, &browser, json!({})).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/login/start:rateLimited",
+        "{reply}"
+    );
+    // Another source is unaffected.
+    ok(
+        &login_start(&state, Via::Tsp, &stranger(152), json!({})).await,
+        &t(LOGIN_START),
+    );
+}
+
+/// Over HTTPS the source is the client IP, counted before dispatch.
+#[tokio::test]
+async fn https_login_start_is_rate_limited_per_client_ip() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let (state, _dir) = state().await;
+    let addr: std::net::SocketAddr = "203.0.113.8:4000".parse().unwrap();
+    let mut last = Value::Null;
+    for _ in 0..=crate::rate_limit::LOGIN_START_MAX_PER_WINDOW {
+        let mut doc = request(&t(LOGIN_START), "unused", json!({}));
+        doc.as_object_mut().unwrap().remove("issuer");
+        let response = crate::routes::trust_tasks::trust_tasks_endpoint(
+            None,
+            axum::extract::State(state.clone()),
+            Ok(axum::extract::ConnectInfo(addr)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+        )
+        .await
+        .into_response();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        last = serde_json::from_slice(&bytes).unwrap();
+    }
+    assert_eq!(code(&last), "unavailable", "{last}");
+    assert!(last["payload"]["retryAfter"].is_string(), "{last}");
+}
+
+// ---------------------------------------------------------------------------
+// A first login passkey, self-enrolled
+// ---------------------------------------------------------------------------
+
+/// A browser session's delegated key, and the session claims it signs under.
+fn browser_session(subject: &Caller, seed: u8, acr: &str) -> (Caller, crate::auth::AuthClaims) {
+    let key = stranger(seed);
+    let pk = key.did.strip_prefix("did:key:").unwrap().to_string();
+    let claims = crate::auth::AuthClaims {
+        did: subject.did.clone(),
+        role: subject.role.clone(),
+        session_id: format!("sess-{seed}"),
+        session_pubkey_b58btc: Some(pk),
+        amr: vec!["did".into()],
+        acr: acr.into(),
+    };
+    (key, claims)
+}
+
+/// `type_uri` with `payload`, issued as `subject` and signed by `signer`,
+/// over HTTPS under `claims`.
+async fn as_session(
+    state: &AppState,
+    subject: &Caller,
+    signer: &Caller,
+    claims: crate::auth::AuthClaims,
+    type_uri: &str,
+    payload: Value,
+) -> Value {
+    use affinidi_data_integrity::crypto_suites::CryptoSuite;
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+    // Signed by the session's key on the subject's behalf, as the console
+    // signs: the issuer is the subject, the key is not the subject's (so the
+    // issuer-binding signing helpers refuse it).
+    let mut doc = request(type_uri, &subject.did, payload);
+    let proof = DataIntegrityProof::sign(
+        &doc,
+        &signer.key,
+        SignOptions::new()
+            .with_proof_purpose("authentication")
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+    )
+    .await
+    .expect("sign");
+    doc["proof"] = serde_json::to_value(&proof).unwrap();
+    Box::pin(super::harness::https(state, Some(claims), doc)).await
+}
+
+/// A login passkey signs in at `aal2`, so a subject's first one is added only
+/// with that much: from a stepped-up session, or by the subject's own DID
+/// key. A plain browser session's key cannot add it, at start or at finish.
+#[tokio::test]
+async fn a_first_login_passkey_needs_a_stepped_up_session_or_the_subjects_key() {
+    let (state, _dir) = state().await;
+    let frank = member(&state, 160, Role::Owner).await;
+
+    // An aal1 browser session: refused at start.
+    let (session_key, aal1) = browser_session(&frank, 161, "aal1");
+    let reply = as_session(
+        &state,
+        &frank,
+        &session_key,
+        aal1.clone(),
+        &t(START),
+        json!({}),
+    )
+    .await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        reply["payload"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("step_up_required"),
+        "{reply}"
+    );
+
+    // Stepped up: allowed, and the finish binds it.
+    let (session_key, aal2) = browser_session(&frank, 162, "aal2");
+    let reply = as_session(
+        &state,
+        &frank,
+        &session_key,
+        aal2.clone(),
+        &t(START),
+        json!({}),
+    )
+    .await;
+    let start = ok(&reply, &t(START));
+    // ...but a finish under an aal1 session is refused, even for that start.
+    let mut first = SoftPasskey::new();
+    let finish = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": first.attest(&start["options"]),
+    });
+    let mut demoted = aal2.clone();
+    demoted.acr = "aal1".into();
+    let reply = as_session(&state, &frank, &session_key, demoted, &t(FINISH), finish).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    let reply = as_session(
+        &state,
+        &frank,
+        &session_key,
+        aal2.clone(),
+        &t(START),
+        json!({}),
+    )
+    .await;
+    let start = ok(&reply, &t(START));
+    let finish = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": first.attest(&start["options"]),
+    });
+    let reply = as_session(&state, &frank, &session_key, aal2, &t(FINISH), finish).await;
+    ok(&reply, &t(FINISH));
+
+    // Signed by the subject's own key (no session): allowed.
+    let gina = member(&state, 163, Role::Owner).await;
+    for via in VIAS {
+        let start = ok(
+            &call(&state, via, &gina, &t(START), json!({})).await,
+            &t(START),
+        );
+        // A login credential is asked to be discoverable: an unnamed login
+        // lists none.
+        assert_eq!(
+            start["options"]["authenticatorSelection"]["residentKey"], "preferred",
+            "{start}"
+        );
+    }
+
+    // Once a login passkey is held, an aal1 session may start adding another
+    // (its finish answers user verification over the first instead).
+    let (session_key, aal1) = browser_session(&frank, 164, "aal1");
+    let reply = as_session(&state, &frank, &session_key, aal1, &t(START), json!({})).await;
+    let start = ok(&reply, &t(START));
+    assert!(start["uvOptions"].is_object(), "{start}");
+}
+
+/// An invite enrols a passkey, so an administrator's session issues one only
+/// at `aal2` (or by its own DID key's signature) — whoever it names.
+#[tokio::test]
+async fn issuing_an_invite_needs_a_stepped_up_session_or_the_callers_key() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 170, Role::Admin).await;
+    let payloads = [
+        json!({ "subject": admin.did, "purpose": "session" }),
+        json!({ "subject": "did:example:someone", "purpose": "session" }),
+        json!({ "subject": admin.did, "purpose": "stepUp" }),
+    ];
+    let (session_key, aal1) = browser_session(&admin, 171, "aal1");
+    for payload in &payloads {
+        let reply = as_session(
+            &state,
+            &admin,
+            &session_key,
+            aal1.clone(),
+            &t(INVITE),
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(code(&reply), "permissionDenied", "{payload}: {reply}");
+        assert_eq!(reply["payload"]["message"], "step_up_required", "{reply}");
+    }
+    let (session_key, aal2) = browser_session(&admin, 172, "aal2");
+    let reply = as_session(
+        &state,
+        &admin,
+        &session_key,
+        aal2,
+        &t(INVITE),
+        payloads[1].clone(),
+    )
+    .await;
+    ok(&reply, &t(INVITE));
+    // Signed by the administrator's own key: allowed.
+    issue(&state, &admin, "did:example:another", "session").await;
+}
+
+/// A credential id already bound — to anyone, for either purpose — is
+/// refused at enrolment, and its holder keeps it.
+#[tokio::test]
+async fn a_credential_id_already_bound_is_refused_at_enrolment() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 173, Role::Admin).await;
+    let invitee = stranger(174);
+    let dana = stranger(175);
+    let mut shared = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut shared, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let dana_handle = shared.user_handle.clone();
+
+    // By invite, for another subject, with the same credential.
+    let issued = issue(&state, &admin, "did:example:mallory", "session").await;
+    let reply = redeem(&state, Via::Tsp, &invitee, &issued, &mut shared, None).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:attestationInvalid",
+        "{reply}"
+    );
+    // As a step-up credential for someone else.
+    let carol = member(&state, 176, Role::Owner).await;
+    let issued = issue(&state, &admin, &carol.did, "stepUp").await;
+    let reply = redeem(&state, Via::Tsp, &invitee, &issued, &mut shared, None).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:attestationInvalid",
+        "{reply}"
+    );
+    // By self-enrolment.
+    let frank = member(&state, 177, Role::Owner).await;
+    let start = ok(
+        &call(&state, Via::Tsp, &frank, &t(START), json!({})).await,
+        &t(START),
+    );
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &frank,
+        &t(FINISH),
+        json!({ "enrollmentId": start["enrollmentId"], "credential": shared.attest(&start["options"]) }),
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/finish:attestationInvalid",
+        "{reply}"
+    );
+
+    // Dana still signs in with it.
+    shared.user_handle = dana_handle;
+    let reply = login(&state, Via::Tsp, &mut shared, 178).await;
+    let body = ok(&reply, &t(LOGIN_FINISH));
+    assert_eq!(body["session"]["subject"], dana.did.as_str(), "{body}");
+}
+
+/// A messaging-transport login start with no authenticated sender has no
+/// source to be counted against, and is refused.
+#[tokio::test]
+async fn a_login_start_without_a_sender_is_refused_on_messaging_transports() {
+    let (state, _dir) = state().await;
+    let mut doc = request(&t(LOGIN_START), "unused", json!({}));
+    doc.as_object_mut().unwrap().remove("issuer");
+    let out = crate::tsp::run_tsp_trust_task(&state, "", &serde_json::to_vec(&doc).unwrap())
+        .await
+        .expect("TSP handler ok")
+        .expect("TSP reply");
+    let reply: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    assert!(
+        reply["payload"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("authenticated sender"),
+        "{reply}"
+    );
+}
+
+/// A login that named its subject fails the same way whether the subject is
+/// enrolled or was answered with decoys, whatever passkey answers: so two
+/// requests cannot tell an enrolled subject from an unknown one.
+#[tokio::test]
+async fn a_named_login_fails_the_same_for_enrolled_and_unknown_subjects() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 180, Role::Admin).await;
+    let invitee = stranger(181);
+    let dana = stranger(182);
+    let erin = stranger(183);
+    let mut dana_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut dana_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut erin_key = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut erin_key, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut unenrolled = SoftPasskey::new();
+
+    for via in VIAS {
+        let browser = stranger(184);
+        let mut outcomes = Vec::new();
+        for subject in [dana.did.as_str(), "did:example:nobody"] {
+            for key in [&mut unenrolled, &mut erin_key] {
+                let start = ok(
+                    &login_start(&state, via, &browser, json!({ "subject": subject })).await,
+                    &t(LOGIN_START),
+                );
+                let reply = call(
+                    &state,
+                    via,
+                    &browser,
+                    &t(LOGIN_FINISH),
+                    json!({ "authId": start["authId"], "credential": key.assert(&start["options"]) }),
+                )
+                .await;
+                outcomes.push((
+                    code(&reply),
+                    reply["payload"]["message"].clone(),
+                    reply["payload"]["retryable"].clone(),
+                ));
+            }
+        }
+        assert_eq!(outcomes[0].0, "auth/passkey/login/finish:assertionInvalid");
+        assert!(
+            outcomes.iter().all(|o| o == &outcomes[0]),
+            "{via:?}: {outcomes:?}"
+        );
+        // The real subject still signs in with its own passkey.
+        let start = ok(
+            &login_start(&state, via, &browser, json!({ "subject": dana.did })).await,
+            &t(LOGIN_START),
+        );
+        let reply = call(
+            &state,
+            via,
+            &browser,
+            &t(LOGIN_FINISH),
+            json!({ "authId": start["authId"], "credential": dana_key.assert(&start["options"]) }),
+        )
+        .await;
+        ok(&reply, &t(LOGIN_FINISH));
+    }
+}
+
+/// A login racing a revocation never writes the revoked credential back: the
+/// counter update waits for the subject's credentials guard and re-reads.
+#[tokio::test]
+async fn a_login_does_not_restore_a_revoked_credential() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 185, Role::Admin).await;
+    let invitee = stranger(186);
+    let dana = stranger(187);
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Tsp, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    // Hold the subject's credentials guard, as a revocation does, start a
+    // login, remove the credential, then release the guard.
+    let browser = stranger(188);
+    let start = ok(
+        &login_start(&state, Via::Tsp, &browser, json!({})).await,
+        &t(LOGIN_START),
+    );
+    let guard = super::passkey::credentials_guard(
+        &state,
+        did_hosting_common::server::passkey::invite::Purpose::Session,
+        &dana.did,
+    )
+    .await;
+    let finish = {
+        let state = state.clone();
+        let assertion = first.assert(&start["options"]);
+        let auth_id = start["authId"].clone();
+        tokio::spawn(async move {
+            let browser = stranger(188);
+            call(
+                &state,
+                Via::Tsp,
+                &browser,
+                &t(LOGIN_FINISH),
+                json!({ "authId": auth_id, "credential": assertion }),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut user = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    user.credentials.clear();
+    pk::store_passkey_user(&state.sessions_ks, &user)
+        .await
+        .unwrap();
+    drop(guard);
+    let reply = finish.await.unwrap();
+    assert!(
+        code(&reply).starts_with("auth/passkey/login/finish:"),
+        "{reply}"
+    );
+    let user = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        user.credentials.is_empty(),
+        "the revoked credential came back"
+    );
+}
+
+/// A session for `subject` with the given `amr` and `acr`, as a login or a
+/// step-up leaves one; its id.
+async fn seeded_session(state: &AppState, subject: &Caller, amr: &[&str], acr: &str) -> String {
+    did_hosting_common::server::auth::session::create_authenticated_session(
+        &state.sessions_ks,
+        state.jwt_keys.as_deref().unwrap(),
+        &subject.did,
+        &subject.role,
+        900,
+        3600,
+        None,
+        Some((amr.iter().map(|m| m.to_string()).collect(), acr.to_string())),
+    )
+    .await
+    .unwrap()
+    .session_id
+}
+
+async fn session_row(
+    state: &AppState,
+    session_id: &str,
+) -> Option<did_hosting_common::server::auth::session::Session> {
+    did_hosting_common::server::auth::session::get_session(&state.sessions_ks, session_id)
+        .await
+        .unwrap()
+}
+
+/// Revoking a login passkey ends the subject's passkey-login sessions and
+/// drops a passkey elevation back to `aal1`; a session no passkey vouched for
+/// is left alone.
+#[tokio::test]
+async fn revoking_a_login_passkey_ends_the_sessions_it_vouched_for() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 190, Role::Admin).await;
+    let dana = member(&state, 191, Role::Owner).await;
+    let erin = member(&state, 192, Role::Owner).await;
+    let invitee = stranger(193);
+
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    // A second login credential for Dana, rebound from Erin in the store: it
+    // is only the revoke target.
+    let mut second = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut second, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let erins = pk::get_passkey_user_by_did(&state.sessions_ks, &erin.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut danas = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    danas.credentials.push(erins.credentials[0].clone());
+    let mut batch = state.store.batch();
+    pk::stage_new_credential(
+        &mut batch,
+        &state.sessions_ks,
+        &danas,
+        &hex(&second.cred_id),
+    )
+    .unwrap();
+    batch.commit().await.unwrap();
+
+    let by_passkey = seeded_session(&state, &dana, &["passkey"], "aal2").await;
+    let elevated = seeded_session(&state, &dana, &["did", "passkey"], "aal2").await;
+    let by_did = seeded_session(&state, &dana, &["did"], "aal1").await;
+    let erins_session = seeded_session(&state, &erin, &["passkey"], "aal2").await;
+
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_START),
+        json!({ "credentialId": second.id() }),
+    )
+    .await;
+    let start = ok(&reply, &t(PK_REVOKE_START));
+    let uv = first.assert(&start["uvOptions"]);
+    let reply = call(
+        &state,
+        Via::Https,
+        &dana,
+        &t(PK_REVOKE_FINISH),
+        json!({ "revocationId": start["revocationId"], "uvCredential": uv }),
+    )
+    .await;
+    ok(&reply, &t(PK_REVOKE_FINISH));
+
+    assert!(
+        session_row(&state, &by_passkey).await.is_none(),
+        "a passkey-login session outlived the revocation"
+    );
+    let demoted = session_row(&state, &elevated).await.expect("kept");
+    assert_eq!(demoted.acr, "aal1");
+    assert_eq!(demoted.amr, vec!["did".to_string()]);
+    let untouched = session_row(&state, &by_did).await.expect("kept");
+    assert_eq!(untouched.amr, vec!["did".to_string()]);
+    assert!(
+        session_row(&state, &erins_session).await.is_some(),
+        "another subject's session was ended"
+    );
+}
+
+/// Removing a subject's ACL entry ends every one of its sessions and
+/// withdraws the enrolment invites issued for it; narrowing its act scope
+/// does neither.
+#[tokio::test]
+async fn removing_an_acl_entry_ends_its_sessions_and_invites() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 194, Role::Admin).await;
+    let dana = member(&state, 195, Role::Owner).await;
+    let erin = member(&state, 196, Role::Owner).await;
+    let invitee = stranger(197);
+
+    let danas = [
+        seeded_session(&state, &dana, &["did"], "aal1").await,
+        seeded_session(&state, &dana, &["passkey"], "aal2").await,
+    ];
+    let erins = seeded_session(&state, &erin, &["did"], "aal1").await;
+    let issued = issue(&state, &admin, &dana.did, "stepUp").await;
+    // An invite a second administrator issued, before that administrator is
+    // removed.
+    let other_admin = member(&state, 202, Role::Admin).await;
+    let from_removed = issue(&state, &other_admin, &erin.did, "stepUp").await;
+
+    // Narrowing is not removal.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("acl/revoke/0.2"),
+        json!({ "subject": dana.did, "revocation": { "kind": "act", "act": { "scope": "none" } } }),
+    )
+    .await;
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    for id in &danas {
+        assert!(session_row(&state, id).await.is_some());
+    }
+
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("acl/revoke/0.2"),
+        json!({ "subject": dana.did, "revocation": { "kind": "entry" } }),
+    )
+    .await;
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    for id in &danas {
+        assert!(
+            session_row(&state, id).await.is_none(),
+            "a session outlived its subject's ACL entry"
+        );
+    }
+    assert!(session_row(&state, &erins).await.is_some());
+
+    // The invite issued for Dana is gone, so it cannot recreate her entry.
+    let reply = redeem_start(&state, Via::Https, &invitee, &issued.token, &issued.code).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/start:inviteInvalid",
+        "{reply}"
+    );
+
+    // Removing an administrator withdraws the invites it issued.
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t("acl/revoke/0.2"),
+        json!({ "subject": other_admin.did, "revocation": { "kind": "entry" } }),
+    )
+    .await;
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    let reply = redeem_start(
+        &state,
+        Via::Https,
+        &invitee,
+        &from_removed.token,
+        &from_removed.code,
+    )
+    .await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/start:inviteInvalid",
+        "{reply}"
+    );
+}
+
+/// The passkey session a revocation is made from is kept, though a login
+/// passkey of its subject is revoked; an elevation on it is still dropped.
+#[tokio::test]
+async fn a_revocation_keeps_the_passkey_session_it_was_made_from() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 203, Role::Admin).await;
+    let dana = member(&state, 204, Role::Owner).await;
+    let erin = member(&state, 205, Role::Owner).await;
+    let invitee = stranger(206);
+
+    let mut first = SoftPasskey::new();
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut first, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let mut second = SoftPasskey::new();
+    let issued = issue(&state, &admin, &erin.did, "session").await;
+    ok(
+        &redeem(&state, Via::Https, &invitee, &issued, &mut second, None).await,
+        &t(REDEEM_FINISH),
+    );
+    let erins = pk::get_passkey_user_by_did(&state.sessions_ks, &erin.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut danas = pk::get_passkey_user_by_did(&state.sessions_ks, &dana.did)
+        .await
+        .unwrap()
+        .unwrap();
+    danas.credentials.push(erins.credentials[0].clone());
+    let mut batch = state.store.batch();
+    pk::stage_new_credential(
+        &mut batch,
+        &state.sessions_ks,
+        &danas,
+        &hex(&second.cred_id),
+    )
+    .unwrap();
+    batch.commit().await.unwrap();
+
+    let current = seeded_session(&state, &dana, &["passkey"], "aal2").await;
+    let other = seeded_session(&state, &dana, &["passkey"], "aal2").await;
+    let bearer = |session_id: &str| crate::auth::AuthClaims {
+        did: dana.did.clone(),
+        role: Role::Owner,
+        session_id: session_id.to_string(),
+        session_pubkey_b58btc: None,
+        amr: vec!["passkey".into()],
+        acr: "aal2".into(),
+    };
+
+    let doc = super::harness::signed(
+        request(
+            &t(PK_REVOKE_START),
+            &dana.did,
+            json!({ "credentialId": second.id() }),
+        ),
+        &dana.key,
+    )
+    .await;
+    let reply = super::harness::https(&state, Some(bearer(&current)), doc).await;
+    let start = ok(&reply, &t(PK_REVOKE_START));
+    let uv = first.assert(&start["uvOptions"]);
+    let doc = super::harness::signed(
+        request(
+            &t(PK_REVOKE_FINISH),
+            &dana.did,
+            json!({ "revocationId": start["revocationId"], "uvCredential": uv }),
+        ),
+        &dana.key,
+    )
+    .await;
+    let reply = super::harness::https(&state, Some(bearer(&current)), doc).await;
+    ok(&reply, &t(PK_REVOKE_FINISH));
+
+    assert!(
+        session_row(&state, &current).await.is_some(),
+        "the revoking session was ended"
+    );
+    assert!(
+        session_row(&state, &other).await.is_none(),
+        "another passkey session outlived the revocation"
+    );
+}
+
+/// Demote `admin` to `Owner`, in place.
+async fn demote(state: &AppState, admin: &Caller) {
+    let mut entry = get_acl_entry(&state.acl_ks, &admin.did)
+        .await
+        .unwrap()
+        .unwrap();
+    entry.role = Role::Owner;
+    did_hosting_common::server::acl::store_acl_entry(&state.acl_ks, &entry)
+        .await
+        .unwrap();
+}
+
+/// Whether `subject` got neither an ACL entry nor `passkey`.
+async fn enrolled_nothing(state: &AppState, subject: &str, passkey: &SoftPasskey) {
+    assert!(
+        get_acl_entry(&state.acl_ks, subject)
+            .await
+            .unwrap()
+            .is_none(),
+        "the invite granted an entry"
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &hex(&passkey.cred_id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the invite enrolled a passkey"
+    );
+}
+
+/// Finish the redemption `start` opened, with `passkey`.
+async fn redeem_finish(
+    state: &AppState,
+    via: Via,
+    from: &Caller,
+    start: &Value,
+    passkey: &mut SoftPasskey,
+) -> Value {
+    let payload = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": passkey.attest(&start["options"]),
+    });
+    unsigned(state, via, from, REDEEM_FINISH, payload).await
+}
+
+/// The operator's CLI invite, as the `invite` subcommand issues it.
+async fn cli_invite(state: &AppState, subject: &str, role: &str) -> invite::IssuedInvite {
+    did_hosting_common::server::passkey::issue_cli_invite(
+        &state.sessions_ks,
+        600,
+        subject,
+        role,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap()
+}
+
+fn issued(made: &invite::IssuedInvite) -> Issued {
+    Issued {
+        token: made.token.clone(),
+        code: made.claim_code.clone(),
+        body: Value::Null,
+    }
+}
+
+/// An invite is honoured only while its issuer is still an administrator. One
+/// whose issuer is demoted before the redemption starts is refused at the
+/// start, before the invitee makes a credential, and is not spent by it; one
+/// whose issuer is demoted after the start is refused at the finish. Neither
+/// enrols anything or grants an entry.
+#[tokio::test]
+async fn an_invite_from_a_former_administrator_enrols_nothing() {
+    let (state, _dir) = state().await;
+    let issuer = member(&state, 198, Role::Admin).await;
+    let _other_admin = member(&state, 199, Role::Admin).await;
+    let newcomer = stranger(200);
+    let invitee = stranger(201);
+
+    // Demoted before the start.
+    let early = issue(&state, &issuer, &newcomer.did, "session").await;
+    demote(&state, &issuer).await;
+    let reply = redeem_start(&state, Via::Https, &invitee, &early.token, &early.code).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    let token_hash = invite::hash_token(&early.token);
+    assert!(
+        invite::by_token_hash(&state.sessions_ks, &token_hash)
+            .await
+            .unwrap()
+            .is_some(),
+        "a refused start spent the invite"
+    );
+
+    // Demoted between the start and the finish.
+    let mut entry = get_acl_entry(&state.acl_ks, &issuer.did)
+        .await
+        .unwrap()
+        .unwrap();
+    entry.role = Role::Admin;
+    did_hosting_common::server::acl::store_acl_entry(&state.acl_ks, &entry)
+        .await
+        .unwrap();
+    let late = issue(&state, &issuer, &newcomer.did, "session").await;
+    let reply = redeem_start(&state, Via::Https, &invitee, &late.token, &late.code).await;
+    let start = ok(&reply, &t(REDEEM_START));
+    demote(&state, &issuer).await;
+    let mut passkey = SoftPasskey::new();
+    let reply = redeem_finish(&state, Via::Https, &invitee, &start, &mut passkey).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+    enrolled_nothing(&state, &newcomer.did, &passkey).await;
+}
+
+/// The operator's CLI invite is how the first administrator enrols: issued
+/// through the `invite` subcommand's own path, it redeems with no
+/// administrator in the ACL, and grants the role it carries.
+#[tokio::test]
+async fn an_operator_cli_invite_enrols_the_first_administrator() {
+    let (state, _dir) = state().await;
+    let newcomer = stranger(210);
+    let invitee = stranger(211);
+
+    let made = cli_invite(&state, &newcomer.did, "admin").await;
+    assert!(made.invite.issued_by.is_operator());
+
+    let mut passkey = SoftPasskey::new();
+    let reply = redeem(
+        &state,
+        Via::Https,
+        &invitee,
+        &issued(&made),
+        &mut passkey,
+        None,
+    )
+    .await;
+    ok(&reply, &t(REDEEM_FINISH));
+    assert_eq!(
+        get_acl_entry(&state.acl_ks, &newcomer.did)
+            .await
+            .unwrap()
+            .expect("the invite granted no entry")
+            .role,
+        Role::Admin
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &hex(&passkey.cred_id))
+            .await
+            .unwrap()
+            .is_some(),
+        "the invite enrolled no passkey"
+    );
+}
+
+/// The `invite` subcommand refuses a role no invite can enrol, as
+/// `auth/passkey/enroll/invite` does, rather than issue one that could only
+/// be refused at the finish.
+#[tokio::test]
+async fn an_operator_cli_invite_refuses_a_role_no_invite_enrols() {
+    let (state, _dir) = state().await;
+    let newcomer = stranger(212);
+    for role in ["metricsReader", "nobody"] {
+        assert!(
+            did_hosting_common::server::passkey::issue_cli_invite(
+                &state.sessions_ks,
+                600,
+                &newcomer.did,
+                role,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .is_err(),
+            "the CLI issued a `{role}` invite"
+        );
+    }
+    assert!(
+        invite::list(&state.sessions_ks).await.unwrap().is_empty(),
+        "a refused CLI invite was stored"
+    );
+}
+
+/// An administrator who changes an invite lends it their authority: the
+/// operator's CLI invite they amended is honoured only while they remain an
+/// administrator, and withdrawn with their ACL entry.
+#[tokio::test]
+async fn an_invite_an_administrator_amended_rests_on_their_standing() {
+    const UPDATE: &str = "auth/passkey/enroll/invite/update/0.1";
+    let (state, _dir) = state().await;
+    let admin = member(&state, 213, Role::Admin).await;
+    let other_admin = member(&state, 214, Role::Admin).await;
+    let remover = member(&state, 219, Role::Admin).await;
+    let invitee = stranger(215);
+
+    // Demoted after amending: the amended invite is refused.
+    let newcomer = stranger(216);
+    let made = cli_invite(&state, &newcomer.did, "owner").await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &admin,
+        &t(UPDATE),
+        json!({ "inviteId": made.invite.invite_id, "role": "admin" }),
+    )
+    .await;
+    ok(&reply, &t(UPDATE));
+    let stored = invite::by_id(&state.sessions_ks, &made.invite.invite_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.issued_by.is_operator());
+    assert_eq!(stored.amended_by, std::slice::from_ref(&admin.did));
+    demote(&state, &admin).await;
+    let reply = redeem_start(&state, Via::Https, &invitee, &made.token, &made.claim_code).await;
+    assert_eq!(code(&reply), "permissionDenied", "{reply}");
+
+    // Removed after amending: the amended invite is withdrawn.
+    let newcomer = stranger(217);
+    let made = cli_invite(&state, &newcomer.did, "owner").await;
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &other_admin,
+        &t(UPDATE),
+        json!({ "inviteId": made.invite.invite_id, "extendBy": 60 }),
+    )
+    .await;
+    ok(&reply, &t(UPDATE));
+    let reply = call(
+        &state,
+        Via::Tsp,
+        &remover,
+        &t("acl/revoke/0.2"),
+        json!({ "subject": other_admin.did, "revocation": { "kind": "entry" } }),
+    )
+    .await;
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    let reply = redeem_start(&state, Via::Https, &invitee, &made.token, &made.claim_code).await;
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/start:inviteInvalid",
+        "{reply}"
+    );
+
+    // Unamended, the operator's invite still enrols with no administrator.
+    let newcomer = stranger(218);
+    let made = cli_invite(&state, &newcomer.did, "owner").await;
+    let mut passkey = SoftPasskey::new();
+    let reply = redeem(
+        &state,
+        Via::Https,
+        &invitee,
+        &issued(&made),
+        &mut passkey,
+        None,
+    )
+    .await;
+    ok(&reply, &t(REDEEM_FINISH));
+}
+
+/// A redemption of a role-conferring invite racing an `acl/revoke` of its
+/// subject never recreates the entry: the revoke holds the removal lock from
+/// before the entry goes until the invite is withdrawn, and the redemption
+/// waits for it.
+#[tokio::test]
+async fn a_redemption_racing_an_acl_removal_does_not_recreate_the_entry() {
+    let (state, _dir) = state().await;
+    let admin = member(&state, 207, Role::Admin).await;
+    let dana = member(&state, 208, Role::Owner).await;
+    let invitee = stranger(209);
+    let issued = issue(&state, &admin, &dana.did, "session").await;
+    let reply = redeem_start(&state, Via::Tsp, &invitee, &issued.token, &issued.code).await;
+    let start = ok(&reply, &t(REDEEM_START));
+    let mut passkey = SoftPasskey::new();
+    let payload = json!({
+        "enrollmentId": start["enrollmentId"],
+        "credential": passkey.attest(&start["options"]),
+    });
+
+    // Hold the ACL write lock, so the revoke, once it holds the removal lock,
+    // waits inside its handler.
+    let acl_lock = state
+        .acl_locks
+        .guard(did_hosting_common::server::trust_tasks::ACL_WRITE_LOCK_KEY)
+        .await;
+    let revoke = {
+        let state = state.clone();
+        // The same DID and key as `admin` (`member` seeds from its seed).
+        let admin = stranger(207);
+        let subject = dana.did.clone();
+        tokio::spawn(async move {
+            call(
+                &state,
+                Via::Tsp,
+                &admin,
+                &t("acl/revoke/0.2"),
+                json!({ "subject": subject, "revocation": { "kind": "entry" } }),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let finish = {
+        let state = state.clone();
+        let invitee = stranger(209);
+        tokio::spawn(
+            async move { unsigned(&state, Via::Tsp, &invitee, REDEEM_FINISH, payload).await },
+        )
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    drop(acl_lock);
+
+    let reply = revoke.await.unwrap();
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|ty| ty.ends_with("#response")),
+        "{reply}"
+    );
+    let reply = finish.await.unwrap();
+    assert_eq!(
+        code(&reply),
+        "auth/passkey/enroll/redeem/finish:enrollmentNotFound",
+        "{reply}"
+    );
+    assert!(
+        get_acl_entry(&state.acl_ks, &dana.did)
+            .await
+            .unwrap()
+            .is_none(),
+        "the redemption recreated the removed entry"
+    );
+    assert!(
+        pk::get_passkey_user_by_cred(&state.sessions_ks, &hex(&passkey.cred_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

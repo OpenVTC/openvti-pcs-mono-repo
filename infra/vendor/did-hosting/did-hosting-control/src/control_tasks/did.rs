@@ -1,0 +1,873 @@
+//! `did-management/did/*` and `webvh/witness/publish`.
+
+use did_hosting_common::server::auth::session::now_epoch;
+use did_hosting_common::tasks::{
+    did_management::did::{
+        change_owner, check_name, delete, info, list, log, register, rollback, set_state,
+    },
+    webvh::witness::publish as witness_publish,
+};
+use serde_json::json;
+use tracing::info;
+use trust_tasks_rs::StandardCode;
+
+use did_hosting_common::server::error::ValidationKind;
+use did_hosting_common::server::trust_tasks::ext::WEBVH_EXT_KEY;
+
+use super::{Cx, TaskError, at, spec_record, typed};
+use crate::did_ops;
+use crate::server::AppState;
+use did_hosting_common::server::error::AppError;
+
+/// `did/check-name/0.1`: an availability probe, or (`reserve: true`) an atomic
+/// claim of a slot — auto-assigned when `path` is absent.
+pub(crate) async fn check_name(
+    cx: &Cx<'_>,
+    p: check_name::v0_1::Payload,
+) -> Result<check_name::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let path = p.path.as_deref().map(String::as_str);
+
+    // Probe mode is read-only and must name a path; a path-less request only
+    // means something as an auto-assign reservation.
+    if !p.reserve {
+        let path = path.ok_or_else(|| {
+            AppError::validation(
+                did_hosting_common::server::error::ValidationKind::InvalidPath,
+                "check-name without `reserve: true` requires a `path` to probe",
+            )
+        })?;
+        let probe = did_ops::check_name(state, path).await?;
+        return typed(
+            json!({ "available": probe.available, "reserved": false }),
+            "check-name response",
+        );
+    }
+
+    // Domain: explicit on the wire → caller's ACL default → system default.
+    // An explicit domain that does not resolve is refused rather than dropped.
+    let acl_scope =
+        match did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, &auth.did).await? {
+            Some(e) => e.domains,
+            None => did_hosting_common::server::domain::DomainScope::All,
+        };
+    let system_default =
+        did_hosting_common::server::domain::get_default_domain(&state.store).await?;
+    let resolved_domain = match did_hosting_common::server::domain::resolve_request_domain(
+        p.domain.as_deref(),
+        &acl_scope,
+        system_default.as_deref(),
+    ) {
+        Ok(d) => Some(d),
+        Err(e) if p.domain.is_some() => {
+            return Err(AppError::validation(
+                did_hosting_common::server::error::ValidationKind::UnknownDomain,
+                format!("did-management:unknown_domain — {e}"),
+            )
+            .into());
+        }
+        Err(_) => None,
+    };
+
+    // A named path that is already taken is not an error: the spec answers
+    // `available: false, reserved: false` and changes nothing.
+    match did_ops::create_did(&auth, state, path, false, resolved_domain.as_deref()).await {
+        // Answer from the record reserved, not a read-back an eventually
+        // consistent store can miss.
+        Ok(record) => {
+            let record: check_name::v0_1::DidRecord = spec_record(state, &record)?;
+            typed(
+                json!({ "available": true, "reserved": true, "record": record }),
+                "check-name response",
+            )
+        }
+        Err(AppError::Conflict(_)) => typed(
+            json!({ "available": false, "reserved": false }),
+            "check-name response",
+        ),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `did/register/0.1`: claim a slot and publish its first (or next) signed log
+/// in one step.
+pub(crate) async fn register(
+    cx: &Cx<'_>,
+    p: register::v0_1::Payload,
+) -> Result<register::v0_1::Response, TaskError> {
+    // A `did:webs` outside the ACL that the gate verified against its own
+    // key event log (`crate::webs_self_register`) registers as itself, an
+    // owner with no ACL entry yet; everyone else is authorised on the ACL.
+    let auth = match cx.self_certified {
+        Some(webs) => webs.claims(),
+        None => cx.auth().await?,
+    };
+    let state = cx.state;
+    let (method, payload) = register_method_and_data(&p)?;
+    // webvh, and did:webs where this host is built to verify it: a `keri.cesr`
+    // stream, from which the identifier is built with the slot and domain
+    // (`register_did_atomic`). Every other method is refused by name, so a
+    // caller can tell "this host does not host it" from a bad log.
+    match method.as_str() {
+        "webvh" => {}
+        #[cfg(feature = "method-webs")]
+        "webs" => {}
+        #[cfg(not(feature = "method-webs"))]
+        "webs" => {
+            return Err(AppError::invalid(
+                "this host does not host did:webs: it was built without the `method-webs` \
+                 feature",
+            )
+            .into());
+        }
+        other => {
+            return Err(AppError::invalid(format!(
+                "this host registers webvh and did:webs over this task; received method = \
+                 '{other}'"
+            ))
+            .into());
+        }
+    }
+    let did_log = std::str::from_utf8(&payload).map_err(|e| {
+        AppError::validation(
+            did_hosting_common::server::error::ValidationKind::InvalidLog,
+            format!("{method} didData is not valid UTF-8: {e}"),
+        )
+    })?;
+
+    // One self-registration per domain at a time, from the count to the
+    // grant, so the domain's `max_registrations` holds under concurrency.
+    let _reserved = match cx.self_certified {
+        Some(webs) => {
+            // The gate read this same document; a disagreement here would be
+            // a routing bug, and is refused before anything is written.
+            webs.matches(p.path.as_str(), p.domain.as_deref(), &method, p.force)?;
+            Some(webs.reserve(state).await?)
+        }
+        None => None,
+    };
+
+    let record = did_ops::register_did_atomic(
+        &auth,
+        state,
+        p.path.as_str(),
+        did_log,
+        p.force,
+        p.domain.as_deref(),
+    )
+    .await?;
+    if let Some(webs) = cx.self_certified {
+        // After the slot, never before it: a grant for a registration that
+        // then failed would leave a stranger standing here with no slot to
+        // show for it. A crash between the two leaves an owned slot and no
+        // entry, and a retry (the same DID, the same slot) takes this path
+        // again and grants it then.
+        webs.grant_owner_entry(state, &record).await?;
+    }
+
+    typed(
+        json!({ "record": spec_record::<register::v0_1::DidRecord>(state, &record)? }),
+        "register response",
+    )
+}
+
+/// The method a `did/register/0.1` payload declares and the bytes it
+/// publishes. The typed payload is the schema's; `DidRegisterRequest::resolve`
+/// is the one place the method is derived from and cross-checked against the
+/// data — for the row, and for the self-registration gate, which must read the
+/// payload exactly as the row will.
+pub(crate) fn register_method_and_data(
+    p: &register::v0_1::Payload,
+) -> Result<(String, Vec<u8>), AppError> {
+    let req: did_hosting_common::DidRegisterRequest = serde_json::from_value(json!({
+        "path": p.path.as_str(),
+        "method": serde_json::to_value(&p.method)?,
+        "didData": serde_json::to_value(&p.did_data)?,
+        "force": p.force,
+    }))
+    .map_err(|e| AppError::invalid(format!("invalid register payload: {e}")))?;
+    req.resolve().map_err(AppError::invalid)
+}
+
+/// `did/info/0.1`.
+pub(crate) async fn info(
+    cx: &Cx<'_>,
+    p: info::v0_1::Payload,
+) -> Result<info::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let (record, log_metadata) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
+    did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref())?;
+
+    let mut body = serde_json::Map::new();
+    let mut record_json =
+        serde_json::to_value(spec_record::<info::v0_1::DidRecord>(state, &record)?)?;
+    // The did:scid alias state of the latest document — the DID URL it would
+    // list and whether it does, for its current location (VTI-KEY-164). Read
+    // from the log, never stored: whoever signs the log decides it. Derived
+    // here so a client never re-derives the `src` locator itself.
+    if let Some(alias) = log_metadata.as_ref().and_then(|m| m.scid_alias.as_ref()) {
+        record_json["ext"][WEBVH_EXT_KEY]["scidAlias"] = serde_json::to_value(alias)?;
+    }
+    body.insert("record".into(), record_json);
+    if let Some(meta) = log_metadata {
+        let mut summary = serde_json::Map::new();
+        if let Some(id) = meta.latest_version_id {
+            summary.insert("latestVersionId".into(), json!(id));
+        }
+        if let Some(time) = meta
+            .latest_version_time
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        {
+            summary.insert(
+                "latestVersionTime".into(),
+                json!(
+                    time.with_timezone(&chrono::Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ),
+            );
+        }
+        body.insert("logSummary".into(), serde_json::Value::Object(summary));
+    }
+    typed(serde_json::Value::Object(body), "info response")
+}
+
+/// `did/list/0.2`: `{records, nextCursor?}`, paged by cursor. A non-admin may
+/// name only themselves as `owner`; naming anyone else is refused, not ignored.
+pub(crate) async fn list(
+    cx: &Cx<'_>,
+    p: list::v0_2::Payload,
+) -> Result<list::v0_2::Response, TaskError> {
+    use did_hosting_common::server::acl::Role;
+
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    if auth.role != Role::Admin
+        && let Some(owner) = p.owner.as_deref()
+        && owner != auth.did
+    {
+        return Err(TaskError::Declared(
+            list::v0_2::error_codes::FORBIDDEN,
+            "only an administrator may list another owner's slots".into(),
+        ));
+    }
+    let domain = match p.domain.as_deref() {
+        Some(d) => {
+            let canonical = did_hosting_common::server::domain::normalize_domain_name(d)
+                .map_err(|_| unknown_domain(d))?;
+            if did_hosting_common::server::domain::get_domain(&state.store, &canonical)
+                .await?
+                .is_none()
+            {
+                return Err(unknown_domain(d));
+            }
+            Some(canonical)
+        }
+        None => None,
+    };
+
+    // A registered hosting server reconciling against the listing: it is sent
+    // every slot anyway, and the listing is how it catches what it missed
+    // (the replication staleness bound). Only a server-type registry entry
+    // under the caller's own DID qualifies — a witness or watcher with the
+    // Service role does not, unless it has registered as a server, which
+    // already hands it every slot's content. The listing it gets withholds
+    // each slot's owner and resolve count (below), so it discloses nothing
+    // beyond that sync.
+    // The webvh extension's filters: `search`, and `agentName` (which needs
+    // the `domain` it is held on).
+    let ext: did_hosting_common::server::trust_tasks::ext::WebvhDidListExt =
+        did_hosting_common::server::trust_tasks::ext::request_webvh_ext(&p.ext)
+            .map_err(|e| TaskError::Standard(StandardCode::MalformedRequest, e))?;
+    if let Some(search) = ext.search.as_deref()
+        && (search.is_empty() || search.chars().count() > 200)
+    {
+        return Err(TaskError::Standard(
+            StandardCode::MalformedRequest,
+            "`search` must be 1 to 200 characters".into(),
+        ));
+    }
+    if ext.agent_name.is_some() && domain.is_none() {
+        return Err(TaskError::Standard(
+            StandardCode::MalformedRequest,
+            "`agentName` needs the `domain` it is held on".into(),
+        ));
+    }
+
+    let replica = auth.role == Role::Service && is_hosting_server(state, &auth.did).await;
+    let binding = list_cursor::binding(
+        &auth.did,
+        replica,
+        p.owner.as_deref(),
+        domain.as_deref(),
+        ext.search.as_deref(),
+        ext.agent_name.as_deref(),
+    );
+    let cursor_key = list_cursor::key(state).await?;
+    let after = match p.cursor.as_deref() {
+        Some(c) => Some(list_cursor::open(&cursor_key, c, &binding).ok_or_else(|| {
+            TaskError::Standard(
+                StandardCode::MalformedRequest,
+                "`cursor` is not one this service issued for this listing".into(),
+            )
+        })?),
+        None => None,
+    };
+    if replica && p.owner.is_none() && after.is_none() {
+        crate::registry::record_reconcile(&state.registry_ks, &auth.did, now_epoch()).await;
+    }
+    let did_ops::ListPage {
+        records,
+        resume_after,
+    } = did_ops::list_dids_page(
+        &auth,
+        replica,
+        state,
+        &did_ops::ListFilter {
+            owner: p.owner.as_deref(),
+            domain: domain.as_deref(),
+            search: ext.search.as_deref(),
+            agent_name: ext.agent_name.as_deref(),
+        },
+        p.limit
+            .map(|l| usize::try_from(l.get()).unwrap_or(usize::MAX)),
+        after.as_deref(),
+    )
+    .await?;
+    let next_cursor = resume_after.map(|after| list_cursor::seal(&cursor_key, &after, &binding));
+    let records = records
+        .iter()
+        .map(|(record, total_resolves)| {
+            let mut value =
+                serde_json::to_value(spec_record::<list::v0_2::DidRecord>(state, record)?)?;
+            if replica {
+                // A replica reconciles on the slot, its DID, version and
+                // disabled state. Who owns each slot, and how often it is
+                // resolved, is tenant data it has no use for — and is not in
+                // the sync it is already sent — so it is withheld. `owner` is
+                // required by the record schema, so it stays, empty.
+                value["owner"] = json!("");
+                if let Some(obj) = value.as_object_mut() {
+                    obj.remove("totalResolves");
+                }
+            } else {
+                value["totalResolves"] = json!(total_resolves);
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, TaskError>>()?;
+    let mut body = json!({ "records": records });
+    if let Some(next) = next_cursor {
+        body["nextCursor"] = json!(next);
+    }
+    typed(body, "list response")
+}
+
+/// `did/list` continuation tokens.
+///
+/// A cursor names the last mnemonic of the page it ends, bound to the listing
+/// it was minted for (the caller, whether it was served as a replica, and the
+/// `owner` / `domain` filters) and authenticated with a key kept in the
+/// store's `meta` keyspace. So a cursor this service did not issue, or one
+/// carried to another caller or another filter, is refused
+/// (`malformedRequest`) rather than read — the spec's "MUST NOT accept a
+/// cursor it did not issue". Because the key lives in the store, a cursor
+/// survives a restart and is honoured by every control-plane replica sharing
+/// that store.
+mod list_cursor {
+    use sha2::{Digest, Sha256};
+
+    use crate::server::AppState;
+    use did_hosting_common::server::store::keyspaces::KS_META;
+
+    const VERSION: &str = "v1";
+    const MAC_LEN: usize = 16;
+
+    fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn hex_decode(s: &str) -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2)
+            || !s
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    const KEY_NAME: &str = "did-list-cursor-key";
+
+    /// The MAC key, created on first use. Two replicas creating it at once
+    /// each write, then both read back whichever landed, so they agree; a
+    /// cursor minted in that instant under the losing key is refused once and
+    /// the caller starts its listing again.
+    pub(super) type Key = [u8; 32];
+
+    pub(super) async fn key(
+        state: &AppState,
+    ) -> Result<Key, did_hosting_common::server::error::AppError> {
+        let ks = state.store.keyspace(KS_META)?;
+        if let Some(k) = ks
+            .get_raw(KEY_NAME)
+            .await?
+            .and_then(|v| Key::try_from(v).ok())
+        {
+            return Ok(k);
+        }
+        let fresh: Key = rand::random();
+        ks.insert_raw(KEY_NAME, fresh.to_vec()).await?;
+        Ok(ks
+            .get_raw(KEY_NAME)
+            .await?
+            .and_then(|v| Key::try_from(v).ok())
+            .unwrap_or(fresh))
+    }
+
+    /// HMAC-SHA256 (RFC 2104) over `msg`, truncated to [`MAC_LEN`] bytes.
+    fn mac(k: &Key, msg: &[u8]) -> [u8; MAC_LEN] {
+        let (mut ipad, mut opad) = ([0x36u8; 64], [0x5cu8; 64]);
+        for (i, b) in k.iter().enumerate() {
+            ipad[i] ^= b;
+            opad[i] ^= b;
+        }
+        let inner = Sha256::new()
+            .chain_update(ipad)
+            .chain_update(msg)
+            .finalize();
+        let outer = Sha256::new()
+            .chain_update(opad)
+            .chain_update(inner)
+            .finalize();
+        let mut out = [0u8; MAC_LEN];
+        out.copy_from_slice(&outer[..MAC_LEN]);
+        out
+    }
+
+    /// The listing a cursor belongs to. Length-prefixed, so no two distinct
+    /// listings share an encoding.
+    ///
+    /// The `search` and `agentName` filters are appended only when given, so
+    /// a cursor issued before they existed still opens for the same listing.
+    pub(super) fn binding(
+        caller: &str,
+        replica: bool,
+        owner: Option<&str>,
+        domain: Option<&str>,
+        search: Option<&str>,
+        agent_name: Option<&str>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut push = |part: Option<&str>| match part {
+            Some(p) => {
+                out.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                out.extend_from_slice(p.as_bytes());
+            }
+            None => out.extend_from_slice(&u32::MAX.to_be_bytes()),
+        };
+        for part in [
+            Some(caller),
+            Some(if replica { "r" } else { "-" }),
+            owner,
+            domain,
+        ] {
+            push(part);
+        }
+        if search.is_some() || agent_name.is_some() {
+            push(Some("filters"));
+            push(search);
+            push(agent_name);
+        }
+        out
+    }
+
+    fn message(after: &str, binding: &[u8]) -> Vec<u8> {
+        let mut msg = b"did-management/did/list cursor ".to_vec();
+        msg.extend_from_slice(VERSION.as_bytes());
+        msg.extend_from_slice(&(after.len() as u32).to_be_bytes());
+        msg.extend_from_slice(after.as_bytes());
+        msg.extend_from_slice(binding);
+        msg
+    }
+
+    /// The cursor that resumes a listing after `after`.
+    pub(super) fn seal(key: &Key, after: &str, binding: &[u8]) -> String {
+        format!(
+            "{VERSION}.{}.{}",
+            hex_encode(after),
+            hex_encode(mac(key, &message(after, binding)))
+        )
+    }
+
+    /// The mnemonic a cursor resumes after, when this process issued it for
+    /// this listing; `None` otherwise.
+    pub(super) fn open(key: &Key, cursor: &str, binding: &[u8]) -> Option<String> {
+        let mut parts = cursor.split('.');
+        let (version, after, tag) = (parts.next()?, parts.next()?, parts.next()?);
+        if version != VERSION || parts.next().is_some() {
+            return None;
+        }
+        let after = String::from_utf8(hex_decode(after)?).ok()?;
+        let tag = hex_decode(tag)?;
+        let expected = mac(key, &message(&after, binding));
+        // Constant-time compare: the tag is a MAC.
+        let ok = tag.len() == MAC_LEN
+            && tag
+                .iter()
+                .zip(expected.iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        ok.then_some(after)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn round_trips_only_for_its_own_listing() {
+            let k: Key = [7; 32];
+            let b = binding(
+                "did:example:a",
+                false,
+                None,
+                Some("example.com"),
+                None,
+                None,
+            );
+            let c = seal(&k, "abc", &b);
+            assert_eq!(open(&k, &c, &b).as_deref(), Some("abc"));
+            // Another caller, another filter, the replica view: refused.
+            assert!(
+                open(
+                    &k,
+                    &c,
+                    &binding(
+                        "did:example:b",
+                        false,
+                        None,
+                        Some("example.com"),
+                        None,
+                        None
+                    )
+                )
+                .is_none()
+            );
+            assert!(
+                open(
+                    &k,
+                    &c,
+                    &binding("did:example:a", false, None, None, None, None)
+                )
+                .is_none()
+            );
+            assert!(
+                open(
+                    &k,
+                    &c,
+                    &binding("did:example:a", true, None, Some("example.com"), None, None)
+                )
+                .is_none()
+            );
+            // Another key (another store): refused.
+            assert!(open(&[8; 32], &c, &b).is_none());
+        }
+
+        #[test]
+        fn refuses_forged_and_malformed_cursors() {
+            let k: Key = [7; 32];
+            let b = binding("did:example:a", false, None, None, None, None);
+            let c = seal(&k, "abc", &b);
+            let forged = c.replacen(&hex_encode("abc"), &hex_encode("abd"), 1);
+            assert!(open(&k, &forged, &b).is_none());
+            for bad in ["", "v1", "v1.zz.00", "v2.616263.00", &format!("{c}.x")] {
+                assert!(open(&k, bad, &b).is_none(), "{bad}");
+            }
+        }
+    }
+}
+
+/// Whether `did` is registered here as a hosting server (an edge).
+async fn is_hosting_server(state: &AppState, did: &str) -> bool {
+    matches!(
+        crate::registry::get_instance(&state.registry_ks, &did.replace(':', "_")).await,
+        Ok(Some(instance)) if instance.service_type == crate::registry::ServiceType::Server
+            && instance.metadata.get("did").and_then(|d| d.as_str()) == Some(did)
+    )
+}
+
+fn unknown_domain(domain: &str) -> TaskError {
+    TaskError::Declared(
+        list::v0_2::error_codes::UNKNOWN_DOMAIN,
+        format!("`{domain}` is not a hosting domain on this service"),
+    )
+}
+
+/// `did/delete/0.1`: answers with the record as it stood. Irreversible, so a
+/// request carrying a bearer session needs it stepped up (`aal2`).
+pub(crate) async fn delete(
+    cx: &Cx<'_>,
+    p: delete::v0_1::Payload,
+) -> Result<delete::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    cx.require_stepped_up_session(&auth, "deleting a DID")?;
+    let state = cx.state;
+    let (record, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
+    did_ops::delete_did(&auth, state, &p.mnemonic, p.domain.as_deref()).await?;
+    typed(
+        json!({ "record": spec_record::<delete::v0_1::DidRecord>(state, &record)? }),
+        "delete response",
+    )
+}
+
+/// `did/change-owner/0.1`.
+pub(crate) async fn change_owner(
+    cx: &Cx<'_>,
+    p: change_owner::v0_1::Payload,
+) -> Result<change_owner::v0_1::Response, TaskError> {
+    use change_owner::v0_1::error_codes;
+
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let change = match did_ops::change_did_owner(
+        &auth,
+        state,
+        &p.mnemonic,
+        &p.new_owner,
+        p.domain.as_deref(),
+    )
+    .await
+    {
+        Ok(change) => change,
+        Err(did_ops::OwnerChangeError::TargetNotAuthorized(why)) => {
+            // Only an administrator's transfer or the recipient's own
+            // acceptance is checked against the recipient, so the reason goes
+            // to one of them: an owner's offer looks nothing up.
+            return Err(TaskError::Declared(error_codes::TARGET_NOT_AUTHORIZED, why));
+        }
+        Err(did_ops::OwnerChangeError::Failed(e)) => return Err(e.into()),
+    };
+    let mut body = json!({
+        "record": spec_record::<change_owner::v0_1::DidRecord>(state, &change.record)?,
+    });
+    if let Some(offer) = change.offer {
+        // The slot has not moved: its owner offered it, and it moves when the
+        // recipient sends this same request naming itself.
+        body["ext"] = json!({
+            WEBVH_EXT_KEY: {
+                "ownerTransfer": {
+                    "status": "offered",
+                    "newOwner": offer.to,
+                    "expiresAt": at(offer.expires_at),
+                }
+            }
+        });
+    }
+    typed(body, "change-owner response")
+}
+
+/// `webvh/witness/publish/0.1`.
+pub(crate) async fn witness_publish(
+    cx: &Cx<'_>,
+    p: witness_publish::v0_1::Payload,
+) -> Result<witness_publish::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    did_ops::upload_witness(&auth, state, &p.mnemonic, &p.witness).await?;
+    let base_url = state
+        .config
+        .did_hosting_url
+        .as_deref()
+        .or(state.config.public_url.as_deref())
+        .unwrap_or("http://localhost");
+    let witness_url = format!(
+        "{}/{}/did-witness.json",
+        base_url.trim_end_matches('/'),
+        p.mnemonic.as_str()
+    );
+    info!(did = %auth.did, mnemonic = %p.mnemonic.as_str(), "witness proofs published");
+    typed(
+        json!({ "mnemonic": p.mnemonic.as_str(), "witnessUrl": witness_url }),
+        "witness publish response",
+    )
+}
+
+/// `did/set-state/0.1`: `suspended` stops the slot resolving on every edge,
+/// `active` resumes it. The state travels to edges with the slot's content.
+pub(crate) async fn set_state(
+    cx: &Cx<'_>,
+    p: set_state::v0_1::Payload,
+) -> Result<set_state::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let (current, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
+    did_ops::ensure_slot_domain_matches(&current, p.domain.as_deref())?;
+    let disabled = match p.state {
+        set_state::v0_1::PayloadState::Active => false,
+        set_state::v0_1::PayloadState::Suspended => true,
+        _ => return Err(AppError::invalid("unsupported DID state").into()),
+    };
+    let record = did_ops::set_did_disabled(&auth, state, &p.mnemonic, disabled).await?;
+    typed(
+        json!({ "record": spec_record::<set_state::v0_1::DidRecord>(state, &record)? }),
+        "set-state response",
+    )
+}
+
+/// `did/rollback/0.1`: discard every entry after `targetVersion`.
+pub(crate) async fn rollback(
+    cx: &Cx<'_>,
+    p: rollback::v0_1::Payload,
+) -> Result<rollback::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let (current, _) = did_ops::get_did_info(&auth, state, &p.mnemonic).await?;
+    did_ops::ensure_slot_domain_matches(&current, p.domain.as_deref())?;
+    let (record, _, removed) =
+        did_ops::rollback_did_to(&auth, state, &p.mnemonic, Some(p.target_version.get()))
+            .await
+            .map_err(|e| match e {
+                AppError::Validation {
+                    kind: did_hosting_common::server::error::ValidationKind::InvalidTargetVersion,
+                    message,
+                } => TaskError::Declared(
+                    rollback::v0_1::error_codes::INVALID_TARGET_VERSION,
+                    message,
+                ),
+                other => other.into(),
+            })?;
+    typed(
+        json!({
+            "record": spec_record::<rollback::v0_1::DidRecord>(state, &record)?,
+            "removedVersions": removed,
+        }),
+        "rollback response",
+    )
+}
+
+/// `did/log/0.1`: the slot's history, oldest first — and, with `raw`, the
+/// stored artifacts verbatim. A slot that does not exist, one the caller may
+/// not read, and one with no published content are answered alike.
+pub(crate) async fn log(
+    cx: &Cx<'_>,
+    p: log::v0_1::Payload,
+) -> Result<log::v0_1::Response, TaskError> {
+    let auth = cx.auth().await?;
+    let state = cx.state;
+    let not_found = || {
+        TaskError::Declared(
+            log::v0_1::error_codes::NOT_FOUND,
+            "no such slot with published content".into(),
+        )
+    };
+    // A path no slot can have is answered as a missing slot too. Whether an
+    // AID-shaped path is valid depends on whether a did:webs slot is
+    // recorded there, so answering it differently would tell a caller that
+    // may not read the slot that one exists.
+    let (record, _) = did_ops::get_did_info(&auth, state, &p.mnemonic)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) | AppError::Forbidden(_) => not_found(),
+            e if e.validation_kind() == ValidationKind::InvalidPath => not_found(),
+            other => other.into(),
+        })?;
+    did_ops::ensure_slot_domain_matches(&record, p.domain.as_deref().map(|d| d.as_str()))?;
+    let content = match did_ops::get_raw_log(&auth, state, &p.mnemonic).await {
+        Ok(content) => content,
+        Err(AppError::NotFound(_)) => return Err(not_found()),
+        Err(e) => return Err(e.into()),
+    };
+    let entries: Vec<serde_json::Value> = if record.method == "webs" {
+        webs_log_entries(&record, &content)
+    } else {
+        log_entries(&content)
+    };
+    let method = if record.method.is_empty() {
+        "webvh".to_string()
+    } else {
+        record.method.clone()
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("mnemonic".into(), json!(p.mnemonic.as_str()));
+    body.insert("method".into(), json!(method));
+    body.insert("entries".into(), json!(entries));
+    if p.raw.unwrap_or(false) {
+        body.insert("logContent".into(), json!(content));
+        if let Some(witness) = state
+            .dids_ks
+            .get_raw(did_hosting_common::did_ops::content_witness_key(
+                &p.mnemonic,
+            ))
+            .await?
+            .and_then(|w| String::from_utf8(w).ok())
+            .filter(|w| !w.is_empty())
+        {
+            body.insert("witnessContent".into(), json!(witness));
+        }
+    }
+    typed(serde_json::Value::Object(body), "log response")
+}
+
+/// A did:webvh log's entries, one per line.
+fn log_entries(content: &str) -> Vec<serde_json::Value> {
+    did_hosting_common::did_ops::parse_log_entries(content)
+        .into_iter()
+        .map(|e| {
+            let mut entry = serde_json::Map::new();
+            if let Some(id) = e.version_id {
+                entry.insert("versionId".into(), json!(id));
+            }
+            if let Some(time) = e.version_time {
+                entry.insert("versionTime".into(), json!(time));
+            }
+            entry.insert(
+                "state".into(),
+                e.state
+                    .filter(|s| s.is_object())
+                    .unwrap_or_else(|| json!({})),
+            );
+            if let Some(parameters) = e.parameters.filter(|p| p.is_object()) {
+                entry.insert("parameters".into(), parameters);
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect()
+}
+
+/// A did:webs slot's entries: the document its key event log implies now.
+/// The stream is re-verified, as on every resolution; a stream that does not
+/// verify (a corrupt store) yields no entries rather than an unverified
+/// document. Earlier establishment events are not listed.
+#[cfg(feature = "method-webs")]
+fn webs_log_entries(
+    record: &did_hosting_common::did_ops::DidRecord,
+    content: &str,
+) -> Vec<serde_json::Value> {
+    use did_hosting_common::method::webs::Webs;
+
+    record
+        .did_id
+        .as_deref()
+        .and_then(|did| Webs::derive_document(did, content.as_bytes()).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(serde_json::Value::is_object)
+        .map(|document| vec![json!({ "state": document })])
+        .unwrap_or_default()
+}
+
+/// Without `method-webs` the stream cannot be verified, so nothing is derived
+/// from it; `raw` still returns it verbatim.
+#[cfg(not(feature = "method-webs"))]
+fn webs_log_entries(
+    _record: &did_hosting_common::did_ops::DidRecord,
+    _content: &str,
+) -> Vec<serde_json::Value> {
+    Vec::new()
+}

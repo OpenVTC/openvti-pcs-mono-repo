@@ -1,0 +1,423 @@
+use super::super::message_inbound::InboundMessage;
+use super::AuthenticationChallenge;
+use super::helpers::{_create_access_token, _create_refresh_token, create_random_string};
+use crate::didcomm_compat::MetaEnvelope;
+use crate::error_codes;
+use crate::{
+    SharedData,
+    common::session::{Session, SessionState},
+};
+use affinidi_messaging_mediator_common::errors::{AppError, MediatorError, SuccessResponse};
+use affinidi_messaging_sdk::messages::{
+    AuthorizationResponse,
+    known::MessageType,
+    problem_report::{ProblemReportScope, ProblemReportSorter},
+};
+use axum::{Json, extract::State};
+use http::StatusCode;
+use subtle::ConstantTimeEq;
+use tracing::{Instrument, Level, debug, info, span};
+
+/// POST /authenticate
+/// Response from client to the challenge
+/// Unpack the message (only accepts Affinidi Authenticate Protocol)
+/// Retrieve Session data from database
+/// Check that the DID matches from the message to the session DID recorded
+pub async fn authentication_response(
+    State(state): State<SharedData>,
+    Json(body): Json<InboundMessage>,
+) -> Result<(StatusCode, Json<SuccessResponse<AuthorizationResponse>>), AppError> {
+    let _span = span!(Level::DEBUG, "authentication_response",);
+
+    async move {
+        let s = serde_json::to_string(&body).map_err(|e| {
+            MediatorError::problem_with_log(
+                error_codes::PARSE_ERROR,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "message.serialize",
+                "Failed to serialize request body: {1}",
+                vec![e.to_string()],
+                StatusCode::BAD_REQUEST,
+                format!("Failed to serialize request body: {e}"),
+            )
+        })?;
+
+        let envelope = match MetaEnvelope::new(&s, &state.did_resolver).await {
+            Ok(envelope) => envelope,
+            Err(e) => {
+                return Err(MediatorError::problem_with_log(
+                    error_codes::AUTH_RESPONSE_PARSE,
+                    "",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "authentication.response.parse",
+                    "authentication response couldn't be parsed: {1}",
+                    vec![e.to_string()],
+                    StatusCode::BAD_REQUEST,
+                    format!("authentication response couldn't be parsed: {e}"),
+                )
+                .into());
+            }
+        };
+
+        // Authentication messages MUST be signed and authenticated!
+        if envelope.metadata.authenticated && envelope.metadata.encrypted {
+            debug!("Auth message verified: signed and encrypted")
+        } else {
+            return Err(MediatorError::problem_with_log(
+                error_codes::AUTH_NOT_SIGNED_OR_ENCRYPTED,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.message.not_signed_or_encrypted",
+                "DIDComm message MUST be signed ({1}) and encrypted ({2}) for this transaction",
+                vec![
+                    envelope.metadata.authenticated.to_string(),
+                    envelope.metadata.encrypted.to_string(),
+                ],
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "DIDComm message MUST be signed ({}) and encrypted ({}) for this transaction",
+                    envelope.metadata.authenticated, envelope.metadata.encrypted
+                ),
+            )
+            .into());
+        }
+
+        // Whether this DID may log in is decided once the challenge is
+        // answered (`helpers::register_account_after_proof`), on every login
+        // path.
+        let Some(from_did) = envelope.from_did.clone() else {
+            return Err(MediatorError::problem(
+                error_codes::AUTH_INVALID_DID,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.response.from",
+                "Authentication response message is missing the `from` header",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            )
+            .into());
+        };
+
+        // Unpack the message + enforce the signed/encrypted invariant.
+        let (msg, unpack_metadata) = super::helpers::unpack_auth_message(&envelope, &state).await?;
+
+        // Check that the inner plaintext from matches the envelope skid
+        if let Some(msg_from) = &msg.from {
+            if msg_from != envelope.from_did.as_ref().unwrap_or(&String::new()) {
+                // Inner and outer envelope don't match
+                return Err(MediatorError::problem(
+                    error_codes::MESSAGE_FROM_INCORRECT,
+                    "",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "message.from.incorrect",
+                    "Inner DIDComm plaintext from field does NOT match signing or encryption DID",
+                    vec![],
+                    StatusCode::BAD_REQUEST,
+                )
+                .into());
+            }
+        } else {
+            return Err(MediatorError::problem(
+                error_codes::AUTH_INVALID_DID,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.response.from",
+                "inner message: Missing the `from` header",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            )
+            .into());
+        }
+
+        // Only accepts AffinidiAuthenticate messages
+        match msg.typ.as_str().parse::<MessageType>().map_err(|err| {
+            MediatorError::problem_with_log(
+                error_codes::MESSAGE_TYPE_INCORRECT,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "message.type.incorrect",
+                "Unexpected message type: {1}. Reason: {2}",
+                vec![msg.typ.to_string(), err.to_string()],
+                StatusCode::BAD_REQUEST,
+                format!("Unexpected message type: {}. Reason: {}", msg.typ, err),
+            )
+        })? {
+            MessageType::AffinidiAuthenticate => (),
+            _ => {
+                return Err(MediatorError::problem_with_log(
+                    error_codes::MESSAGE_TYPE_INCORRECT,
+                    "",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "message.type.incorrect",
+                    "Unexpected message type: {1}",
+                    vec![msg.typ.to_string()],
+                    StatusCode::BAD_REQUEST,
+                    format!("Unexpected message type: {}", msg.typ),
+                )
+                .into());
+            }
+        }
+
+        // Ensure the message hasn't expired
+        let now = state.clock.unix_secs();
+        if let Some(expires) = msg.expires_time {
+            if expires <= now {
+                return Err(MediatorError::problem_with_log(
+                    error_codes::MESSAGE_EXPIRED,
+                    "",
+                    None,
+                    ProblemReportSorter::Error,
+                    ProblemReportScope::Protocol,
+                    "message.expired",
+                    "Message has expired: {1}",
+                    vec![expires.to_string()],
+                    StatusCode::BAD_REQUEST,
+                    "Message has expired",
+                )
+                .into());
+            }
+        } else {
+            // Authentication responses must have an expires_time header
+            return Err(MediatorError::problem(
+                error_codes::EXPIRES_TIME_MISSING,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "message.expires_time.missing",
+                "Authentication messages must include an expires_time header",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            )
+            .into());
+        }
+
+        // Turn message body into Challenge response
+        let challenge: AuthenticationChallenge = serde_json::from_value(msg.body).map_err(|e| {
+            MediatorError::problem_with_log(
+                error_codes::AUTH_RESPONSE_PARSE,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.response.parse",
+                "authentication response couldn't be parsed: {1}",
+                vec![e.to_string()],
+                StatusCode::BAD_REQUEST,
+                format!("authentication response couldn't be parsed: {e}"),
+            )
+        })?;
+
+        // Retrieve the session info from the database. Convert from
+        // the trait-layer Session to the local Session shape.
+        let mut session: Session = match state
+            .database
+            .get_session(&challenge.session_id, &from_did)
+            .await
+        {
+            Ok(session) => session.into(),
+            // The caller has no session yet: the cause stays in the log.
+            Err(e) => {
+                return Err(MediatorError::storage_error_opaque(
+                    error_codes::DB_OPERATION_ERROR,
+                    "",
+                    e,
+                )
+                .into());
+            }
+        };
+
+        // check that the DID matches from what was given for the initial challenge request to what was used for the message response
+        if let Some(from_did) = &msg.from
+            && !affinidi_messaging_mediator_common::did_identity::same_account(
+                from_did,
+                &session.did,
+            )
+        {
+            return Err(MediatorError::problem_with_log(
+                error_codes::AUTH_SESSION_MISMATCH,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.session.mismatch",
+                "DID mismatch during authentication process",
+                vec![],
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "DID mismatch during authentication process: first_did({}) second_did({})",
+                    session.did, from_did
+                ),
+            )
+            .into());
+        }
+
+        // The answer must carry the challenge this session issued.
+        if !bool::from(
+            challenge
+                .challenge
+                .as_bytes()
+                .ct_eq(session.challenge.as_bytes()),
+        ) {
+            return Err(MediatorError::problem(
+                error_codes::AUTH_SESSION_INVALID,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.session.invalid",
+                "Session is in an invalid state to complete authentication",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            )
+            .into());
+        }
+
+        // Check that this isn't a replay attack
+        if let SessionState::ChallengeSent = session.state {
+            debug!("Session state valid: ChallengeSent");
+        } else {
+            return Err(MediatorError::problem(
+                error_codes::AUTH_SESSION_INVALID,
+                "",
+                None,
+                ProblemReportSorter::Error,
+                ProblemReportScope::Protocol,
+                "authentication.session.invalid",
+                "Session is in an invalid state to complete authentication",
+                vec![],
+                StatusCode::BAD_REQUEST,
+            )
+            .into());
+        }
+        // The mux unknown-key rule on the authcrypt sender key, before any
+        // token is issued: a login that cannot be checked fails (fail closed).
+        let mux_suspended = if state.config.limits.mux.enabled && state.database.supports_mux() {
+            Some(
+                crate::mux::notice::unknown_key_check(
+                    &state,
+                    &session.did_hash,
+                    crate::mux::notice::DirectKey::Authcrypt(
+                        unpack_metadata.encrypted_from_kid.clone(),
+                    ),
+                )
+                .await
+                .map_err(super::helpers::mux_check_failed)?,
+            )
+        } else {
+            None
+        };
+
+        // The challenge is answered: give the DID its account (or refuse it
+        // under `explicit_allow`) before any token exists for it.
+        super::helpers::register_account_after_proof(&state, &session.did_hash).await?;
+
+        let old_sid = session.session_id;
+        session.session_id = create_random_string(12);
+
+        // Passed all the checks, now create the JWT tokens
+        let (access_token, access_expires_at) = _create_access_token(
+            &session.did,
+            &session.session_id,
+            state.config.security.jwt_access_expiry,
+            now,
+            state.config.security.jwt_encoding_key(),
+        )?;
+
+        let refresh_expiry = state.config.security.refresh_token_lifetime();
+        let (refresh_token, refresh_expires_at, refresh_token_hash) = _create_refresh_token(
+            &session.did,
+            &session.session_id,
+            refresh_expiry,
+            now,
+            state.config.security.jwt_encoding_key(),
+        )?;
+
+        session.expires_at = access_expires_at;
+
+        let response = AuthorizationResponse {
+            access_token,
+            access_expires_at,
+            refresh_token,
+            refresh_expires_at,
+        };
+
+        // Set the session state to Authorized and store refresh token hash.
+        // Pass the raw DID — the trait impl computes its hash internally.
+        // Passing a hash here would cause `get_session` to look up the
+        // wrong `DID:<sha256(did_hash)>` key and silently overwrite the
+        // session with an empty-DID record.
+        state
+            .database
+            .update_session_authenticated(
+                &old_sid,
+                &session.session_id,
+                &session.did,
+                &refresh_token_hash,
+            )
+            .await
+            // Tokens are not issued yet: the cause stays in the log.
+            .map_err(|e| {
+                MediatorError::storage_error_opaque(error_codes::DB_OPERATION_ERROR, "", e)
+            })?;
+
+        // A did:scid account's version floor, persisted now its account exists.
+        crate::scid_sources::remember(&*state.database, &state.did_resolver, &session.did).await;
+        // After registration, so a first authentication has an account to
+        // record it against.
+        state
+            .activity
+            .authenticated(&state, &session.did_hash)
+            .await;
+
+        // Notices the unknown-key check owes; login does not wait on them.
+        if let Some(suspended) = mux_suspended {
+            let (state, did, did_hash) =
+                (state.clone(), session.did.clone(), session.did_hash.clone());
+            tokio::spawn(async move {
+                crate::mux::notice::after_direct_auth(
+                    &state,
+                    &did,
+                    &did_hash,
+                    suspended,
+                    affinidi_messaging_mediator_common::store::mux::NoticeWire::DidComm,
+                )
+                .await;
+            });
+        }
+
+        metrics::counter!(crate::common::metrics::names::AUTH_SUCCESS_TOTAL).increment(1);
+        info!(did_hash = %session.did_hash, "Authentication successful");
+
+        Ok((
+            StatusCode::OK,
+            Json(SuccessResponse {
+                session_id: session.session_id.clone(),
+                http_code: StatusCode::OK.as_u16(),
+                error_code: 0,
+                error_code_str: "NA".to_string(),
+                message: "Success".to_string(),
+                data: Some(response),
+            }),
+        ))
+    }
+    .instrument(_span)
+    .await
+}

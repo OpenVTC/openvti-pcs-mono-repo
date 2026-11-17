@@ -1,0 +1,90 @@
+[package]
+name = "cnm-cli"
+description = "CLI Tool for Verified Trust Agents operating in Verified Trust Communities"
+version = "0.56.0"
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cnm"
+path = "src/main.rs"
+
+[features]
+default = ["keyring"]
+keyring = ["vta-sdk/keyring"]
+config-session = ["vta-sdk/config-session"]
+azure-secrets = ["vta-sdk/azure-secrets"]
+
+[dependencies]
+vta-sdk = { path = "../vta-sdk", version = "0.90", features = ["session", "crypto-provider", "acl-setup", "sealed-transfer"] }
+# `agent-names` powers the global `--resolve-agent-names` flag; without it
+# the flag parses but can never resolve anything.
+vta-cli-common = { path = "../vta-cli-common", version = "0.63", features = [
+  "agent-names",
+] }
+affinidi-did-resolver-cache-sdk = { workspace = true }
+# `cnm vetting …`, `cnm audit` and `cnm backup` drive the VTC's admin REST
+# surface through the VTC client rather than hand-built requests: it
+# authenticates with the VTC's own DID as the audience, and carries the
+# Trust-Task headers, finite HTTP timeouts and typed errors the commands turn
+# into guidance.
+# `tsp` (which includes `didcomm`): `cnm backup` reaches the VTC only end to end.
+vtc-client = { path = "../vtc-client", version = "0.45", features = ["tsp"] }
+# `cnm rooms`: a request's type URI is read off its generated payload type.
+trust-tasks-rs = { workspace = true }
+# The generated Trust Task wire types, at the versions VTI pins (CLAUDE.md,
+# "Pinning a task version").
+vti-specs = { path = "../vti-specs", version = "0.15" }
+# `cnm elections manifest check`: the manifest rules the community itself runs on create
+# (`rules::check_new_manifest`), offline, rather than a copy that could drift from them.
+vti-voting = { path = "../vti-voting", version = "0.19" }
+# `cnm vetting bootstrap-pgp`: parse an OpenPGP keyring, verify third-party
+# certifications and cleartext-signed link statements.
+pgp = { workspace = true }
+chrono = { workspace = true }
+# A fresh identifier for each sealed storage credential (`storage.rs`).
+uuid = { workspace = true }
+# `storage.rs`: a did:webs community publishes its key as a JWK (`x`, base64url).
+base64 = { workspace = true }
+# `cnm git link`: the authorisation URL is parsed before it is printed.
+url = { workspace = true }
+ratatui = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+clap_complete = { workspace = true }
+dialoguer = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+# `cnm actions watch` reads a streamed HTTPS response (binding 0.3 §2.1).
+reqwest = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The bootstrap tests generate a small web of trust with rPGP, whose key
+# generation takes a rand 0.8 RNG (the workspace is on 0.10). A seeded StdRng
+# keeps the keys, and so the fingerprints, the same on every run.
+#
+# Dependabot proposed 0.10 (#1445); it does not build, because `pgp` wants the
+# rand 0.8 trait set (`StdRng: rand_core::CryptoRng is not satisfied`). `rand`
+# is in Dependabot's ignore list for that reason; lift both together when the
+# OpenPGP stack releases on a newer rand.
+rand = "0.8"
+tempfile = { workspace = true }
+# `vtc::tests` stands up a mock VTC to read the authenticate document `cnm`
+# sends it, and mints the did:key that signs it.
+wiremock = { workspace = true }
+ed25519-dalek = { workspace = true }
+multibase = { workspace = true }
+# `InMemorySessionBackend`: the setup tests drive the session store without the
+# OS keyring. Path-only, so publishing strips it rather than pinning a version.
+vta-sdk = { path = "../vta-sdk", features = ["test-support"] }
+
+[lints]
+workspace = true

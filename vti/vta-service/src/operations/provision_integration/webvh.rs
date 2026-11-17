@@ -1,0 +1,347 @@
+//! Helpers for the `WEBVH_SERVER` / `WEBVH_PATH` / `WEBVH_DOMAIN`
+//! template variables — the "transport metadata" vars that control
+//! where the VTA publishes the integration's `did.jsonl` log. These
+//! are *not* document content; they never reach the template renderer.
+//!
+//! The rest of the provision-integration flow treats webvh-hosted and
+//! serverless integrations uniformly; these helpers are the only
+//! places that know about the `WEBVH_*` var names.
+
+use std::collections::BTreeMap;
+
+use serde_json::Value;
+
+use crate::error::AppError;
+
+/// Read the optional `WEBVH_SERVER` template var, validate it against
+/// the registered-server catalogue, and return the resolved id.
+///
+/// Returns `Ok(None)` when the var is absent, JSON-null, or the empty
+/// string (treated as "not set"). Returns `Err(AppError::NotFound)` when
+/// the var names an id that isn't registered with this VTA — caller
+/// surfaces that to the operator before any state is written.
+pub(super) async fn resolve_webvh_server(
+    template_vars: &BTreeMap<String, Value>,
+    webvh_ks: &crate::store::KeyspaceHandle,
+) -> Result<Option<String>, AppError> {
+    let raw = match template_vars.get("WEBVH_SERVER") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s,
+        Some(other) => {
+            let actual = match other {
+                Value::Bool(_) => "bool",
+                Value::Number(_) => "number",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                _ => "non-string",
+            };
+            return Err(AppError::Validation(format!(
+                "WEBVH_SERVER must be a string (registered webvh-server id), got {actual}"
+            )));
+        }
+    };
+    let id = raw.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    if crate::webvh_store::get_server(webvh_ks, id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!(
+            "WEBVH_SERVER '{id}' is not a registered webvh hosting server on this VTA \
+             — register it via `vta did-mgmt servers add` first, or omit `WEBVH_SERVER` \
+             to self-host at the URL"
+        )));
+    }
+    Ok(Some(id.to_string()))
+}
+
+/// Remove and return the optional `WEBVH_PATH` template var.
+///
+/// `WEBVH_PATH` is transport metadata — it tells the webvh server which
+/// path to allocate when the VTA calls `POST /api/dids`. It is removed
+/// from `template_vars` before the renderer sees the map so that a
+/// template author never accidentally picks it up as document content.
+///
+/// `Ok(None)` when the var is absent or JSON-null. `Ok(Some(path))` when
+/// it is a non-empty string. Empty strings and non-string types fail
+/// loud — the operator set the var intentionally and a silent fallback
+/// would mask a typo.
+pub(super) fn take_webvh_path(
+    template_vars: &mut BTreeMap<String, Value>,
+) -> Result<Option<String>, AppError> {
+    let removed = match template_vars.remove("WEBVH_PATH") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let s = match removed {
+        Value::String(s) => s,
+        _ => {
+            return Err(AppError::Validation(
+                "WEBVH_PATH must be a non-empty string".into(),
+            ));
+        }
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(
+            "WEBVH_PATH must be a non-empty string".into(),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Reject an explicit root (`.well-known`) DID request on a shared
+/// (server-managed) hosting server.
+///
+/// A domain's `/.well-known/did.jsonl` slot can belong to only one
+/// tenant, so on a shared hosting server an explicit root request must
+/// fail loud — before any state is written — rather than collide on the
+/// remote. Serverless mode owns the whole domain and serves root from the
+/// bare `URL`, so it passes here (and never consults the path mode
+/// anyway). The check is unconditional: it rejects root on a shared
+/// server even when the slot happens to be free, because the rule is a
+/// policy, not a runtime occupancy test — hence `Validation` (400), not
+/// `Conflict` (409).
+pub(super) fn reject_root_on_shared_server(
+    path_mode: &vta_sdk::protocols::did_management::create::WebvhPathMode,
+    server_managed: bool,
+) -> Result<(), AppError> {
+    use vta_sdk::protocols::did_management::create::WebvhPathMode;
+    if server_managed && matches!(path_mode, WebvhPathMode::WellKnown) {
+        return Err(AppError::Validation(
+            "WEBVH_PATH '.well-known' (root DID) is not available on a shared webvh \
+             hosting server — a domain's root slot can belong to only one tenant. Omit \
+             WEBVH_PATH for a server-assigned path, or set an explicit label. Root DIDs \
+             are only available in serverless mode (omit WEBVH_SERVER and self-host at \
+             the URL)."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Remove and return the optional `WEBVH_DOMAIN` template var.
+///
+/// `WEBVH_DOMAIN` is transport metadata — it tells the webvh hosting
+/// server which of its tenant domains to allocate the DID under (the
+/// `did:webvh:<scid>:<host>` host slot). Like `WEBVH_PATH` it is removed
+/// from `template_vars` before the renderer sees the map so a template
+/// author never picks it up as document content.
+///
+/// `Ok(None)` when the var is absent or JSON-null — the remote server
+/// then runs its own resolution chain (caller's ACL default → system
+/// default). `Ok(Some(domain))` when it is a non-empty string. Empty
+/// strings and non-string types fail loud, matching [`take_webvh_path`].
+pub(super) fn take_webvh_domain(
+    template_vars: &mut BTreeMap<String, Value>,
+) -> Result<Option<String>, AppError> {
+    let removed = match template_vars.remove("WEBVH_DOMAIN") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let s = match removed {
+        Value::String(s) => s,
+        _ => {
+            return Err(AppError::Validation(
+                "WEBVH_DOMAIN must be a non-empty string".into(),
+            ));
+        }
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(
+            "WEBVH_DOMAIN must be a non-empty string".into(),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Take `DID_METHOD=webs`: the integration's DID is a `did:webs` (level 1,
+/// class `service`, design note did-webs-in-the-vta §4, S7) rather than a
+/// `did:webvh` log. Any other value — `webvh`, `scid`, absent — is left for
+/// [`take_did_presentation`], which reads it as how a webvh log is presented.
+///
+/// A var, not a template's `methods`: the node templates (`dtg-witness`,
+/// `ballot-box`, …) describe one document shape that either method can carry,
+/// so the method is the operator's choice per provisioning, as `DID_METHOD`
+/// already is for `did:scid`. Removed from the map like the other transport
+/// metadata, so the renderer never sees it.
+pub(super) fn take_webs_method(template_vars: &mut BTreeMap<String, Value>) -> bool {
+    let is_webs = matches!(
+        template_vars.get("DID_METHOD"),
+        Some(Value::String(s))
+            if matches!(s.trim().to_ascii_lowercase().as_str(), "webs" | "did:webs")
+    );
+    if is_webs {
+        template_vars.remove("DID_METHOD");
+    }
+    is_webs
+}
+
+/// Optional `DID_METHOD` (`webvh` | `scid`) and `SCID_ALSO_KNOWN_AS`
+/// (`true` | `false`) vars: how the minted DID is presented and whether it lists
+/// its did:scid alias (VTI-VTA-036). Removed from the map like `WEBVH_DOMAIN` —
+/// they shape the log, not the document's content. Absent → the VTA's `[dids]`.
+pub(super) fn take_did_presentation(
+    template_vars: &mut BTreeMap<String, Value>,
+) -> Result<(Option<vta_sdk::did_scid::DidMethod>, Option<bool>), AppError> {
+    let method = match template_vars.remove("DID_METHOD") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(
+            s.parse()
+                .map_err(|e: String| AppError::Validation(format!("DID_METHOD: {e}")))?,
+        ),
+        Some(_) => {
+            return Err(AppError::Validation(
+                "DID_METHOD must be 'webvh' or 'scid'".into(),
+            ));
+        }
+    };
+    let alias = match template_vars.remove("SCID_ALSO_KNOWN_AS") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(b),
+        Some(Value::String(s)) if s == "true" => Some(true),
+        Some(Value::String(s)) if s == "false" => Some(false),
+        Some(_) => {
+            return Err(AppError::Validation(
+                "SCID_ALSO_KNOWN_AS must be true or false".into(),
+            ));
+        }
+    };
+    Ok((method, alias))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn did_presentation_vars_are_taken() {
+        let mut v = vars(&[
+            ("DID_METHOD", json!("scid")),
+            ("SCID_ALSO_KNOWN_AS", json!("true")),
+            ("OTHER", json!("x")),
+        ]);
+        assert_eq!(
+            take_did_presentation(&mut v).unwrap(),
+            (Some(vta_sdk::did_scid::DidMethod::Scid), Some(true))
+        );
+        assert!(!v.contains_key("DID_METHOD") && !v.contains_key("SCID_ALSO_KNOWN_AS"));
+        assert!(v.contains_key("OTHER"));
+        assert_eq!(take_did_presentation(&mut vars(&[])).unwrap(), (None, None));
+        assert!(take_did_presentation(&mut vars(&[("DID_METHOD", json!("key"))])).is_err());
+    }
+
+    /// `DID_METHOD=webs` selects did:webs and is taken; every other value is
+    /// left for the webvh presentation reader.
+    #[test]
+    fn did_method_webs_is_taken_and_nothing_else_is() {
+        for webs in ["webs", " WEBS ", "did:webs"] {
+            let mut v = vars(&[("DID_METHOD", json!(webs))]);
+            assert!(take_webs_method(&mut v), "{webs}");
+            assert!(!v.contains_key("DID_METHOD"));
+        }
+        for other in [json!("webvh"), json!("scid"), json!(1)] {
+            let mut v = vars(&[("DID_METHOD", other.clone())]);
+            assert!(!take_webs_method(&mut v), "{other}");
+            assert_eq!(v["DID_METHOD"], other);
+        }
+        assert!(!take_webs_method(&mut vars(&[])));
+    }
+
+    fn vars(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn take_webvh_domain_absent_is_none() {
+        let mut v = vars(&[]);
+        assert_eq!(take_webvh_domain(&mut v).unwrap(), None);
+    }
+
+    #[test]
+    fn take_webvh_domain_null_is_none() {
+        let mut v = vars(&[("WEBVH_DOMAIN", Value::Null)]);
+        assert_eq!(take_webvh_domain(&mut v).unwrap(), None);
+    }
+
+    #[test]
+    fn take_webvh_domain_trims_and_returns() {
+        let mut v = vars(&[("WEBVH_DOMAIN", json!("  acme.example.com "))]);
+        assert_eq!(
+            take_webvh_domain(&mut v).unwrap(),
+            Some("acme.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn take_webvh_domain_removes_from_map() {
+        // Must be stripped before the renderer sees the var — it's
+        // transport metadata, not document content.
+        let mut v = vars(&[("WEBVH_DOMAIN", json!("acme.example.com"))]);
+        let _ = take_webvh_domain(&mut v).unwrap();
+        assert!(!v.contains_key("WEBVH_DOMAIN"));
+    }
+
+    #[test]
+    fn take_webvh_domain_empty_string_errors() {
+        let mut v = vars(&[("WEBVH_DOMAIN", json!("   "))]);
+        assert!(matches!(
+            take_webvh_domain(&mut v),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn take_webvh_domain_non_string_errors() {
+        let mut v = vars(&[("WEBVH_DOMAIN", json!(42))]);
+        assert!(matches!(
+            take_webvh_domain(&mut v),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    mod reject_root {
+        use super::super::reject_root_on_shared_server;
+        use crate::error::AppError;
+        use vta_sdk::protocols::did_management::create::WebvhPathMode;
+
+        #[test]
+        fn root_on_shared_server_is_rejected() {
+            let err = reject_root_on_shared_server(&WebvhPathMode::WellKnown, true)
+                .expect_err("root on a shared server must be rejected");
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "must be a 400 validation error, got: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(".well-known"),
+                "error should name the offending value: {err}"
+            );
+        }
+
+        #[test]
+        fn root_in_serverless_mode_is_allowed() {
+            // `server_managed = false` — serverless owns the whole domain.
+            assert!(reject_root_on_shared_server(&WebvhPathMode::WellKnown, false).is_ok());
+        }
+
+        #[test]
+        fn explicit_path_on_shared_server_is_allowed() {
+            assert!(
+                reject_root_on_shared_server(&WebvhPathMode::Explicit("acme".into()), true).is_ok()
+            );
+        }
+
+        #[test]
+        fn auto_assign_on_shared_server_is_allowed() {
+            assert!(reject_root_on_shared_server(&WebvhPathMode::AutoAssign, true).is_ok());
+        }
+    }
+}

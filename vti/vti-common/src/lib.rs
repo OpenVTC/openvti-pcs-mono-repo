@@ -1,0 +1,63 @@
+pub mod acl;
+pub mod audit;
+pub mod auth;
+pub mod backup_transfer;
+pub mod blob_store;
+/// Client-side wire helpers for the capability Trust Task families —
+/// re-exported from the `trust-tasks-capability-client` crate so both this
+/// (the hook producer) and out-of-repo consumers (management UIs) share one
+/// contract-tested implementation.
+pub use trust_tasks_capability_client as capability_client;
+pub mod config;
+pub mod consent;
+pub mod context_path;
+pub mod error;
+pub mod guards;
+#[cfg(feature = "host-session")]
+pub mod host_session;
+pub mod idempotency;
+pub mod identifier;
+/// Keeping a node's mediator inbox collected: the catch-up watch (with
+/// receive-leg health and bounded socket reconnects), the unprocessable-frame
+/// count, and the per-recipient "not collecting" report. Shared by the VTA and
+/// the VTC.
+pub mod inbox;
+pub mod integrity;
+pub mod outbox_store;
+pub mod pagination;
+/// The bounded regorus engine the VTA and the VTC evaluate policy with (#2577).
+#[cfg(feature = "policy")]
+pub mod policy_engine;
+#[cfg(feature = "rate-limit")]
+pub mod rate_limit;
+#[cfg(feature = "tsp")]
+pub mod relationship_store;
+/// Process plumbing every service shares (`shutdown_signal`).
+pub mod runtime;
+pub mod scid_floors;
+pub mod secure_file;
+pub mod seed_store;
+/// Per-sender arrival ordering for a concurrent inbound loop: a TSP
+/// relationship-control frame is a barrier for its sender's later traffic
+/// (Keyring VTI-43). Shared by the VTA and the VTC.
+pub mod sender_order;
+#[cfg(feature = "setup")]
+pub mod setup;
+pub mod slip10;
+pub mod store;
+pub mod task_consent;
+pub mod telemetry;
+#[cfg(feature = "test-support")]
+pub mod test_support;
+pub mod trust_task;
+/// Push a signed Trust Task over TSP > DIDComm > REST, durably, with
+/// escalation — shared by the VTA and the VTC.
+pub mod trust_task_push;
+/// Which peers were recently seen sending over TSP, learned from inbound —
+/// how a node reaches over TSP a peer whose DID document advertises nothing.
+pub mod tsp_reach;
+/// Reaching a TSP peer on another mediator: the invite routed through its
+/// mediator and the payload nested (VTI-56).
+#[cfg(feature = "tsp")]
+pub mod tsp_route;
+pub mod vault;

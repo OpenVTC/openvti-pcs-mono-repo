@@ -1,0 +1,218 @@
+//! `vault/sign-trust-task/0.1` business logic — attach an `eddsa-jcs-2022`
+//! Data-Integrity proof to a Trust Task envelope, signing as the principal DID
+//! of a `did-self-issued` / `didcomm-peer` vault entry (P2.4).
+//!
+//! Moved out of `routes/trust_tasks/vault.rs` so the route handler is a thin
+//! adapter: it keeps the capability/context/step-up gates + the audit log +
+//! the wire response, and maps the typed [`SignTrustTaskError`] back to the
+//! canonical spec reject codes. The signable-kind check, envelope structural
+//! validation, and the signing live here.
+//!
+//! The proof purpose is the envelope type's, never the requester's: an
+//! operational document (including `auth/oob/identify`) is signed for
+//! `authentication`, and only the approver/attestation types (including
+//! `auth/oob/grant`) in
+//! [`vta_sdk::trust_task_proof::ATTESTATION_SLUGS`] for `assertionMethod`
+//! (VTI-KEY-022, VTI-KEY-106).
+
+use serde_json::Value;
+
+use vti_common::auth::ProofPurpose;
+use vti_common::vault::VaultSecret;
+
+use crate::error::AppError;
+use crate::keys::seed_store::SeedStore;
+use crate::store::KeyspaceHandle;
+
+/// A signed envelope + the principal DID it was signed as (for the route's
+/// audit log).
+pub struct SignedEnvelope {
+    pub signed: Value,
+    pub principal_did: String,
+    /// The purpose the proof was made for, decided by the envelope's `type`.
+    pub proof_purpose: ProofPurpose,
+}
+
+/// Why signing failed. The route maps each onto the canonical
+/// `vault/sign-trust-task/0.1` reject reason (conformance-ordered:
+/// `not_signable` → `envelope_invalid` → `envelope_already_proofed` →
+/// `envelope_issuer_mismatch` → `envelope_expired`).
+#[non_exhaustive]
+pub enum SignTrustTaskError {
+    /// Entry kind carries no DID-based signing identity.
+    NotSignable { kind: &'static str },
+    /// `unsignedEnvelope` is not a JSON object.
+    EnvelopeNotObject,
+    /// A required envelope field is missing.
+    EnvelopeMissingField { field: &'static str },
+    /// `issuer` is present but not a string.
+    IssuerNotString,
+    /// `type` is not a Trust Task Type URI, so the purpose it must be signed
+    /// for cannot be decided.
+    TypeNotTypeUri,
+    /// The envelope already carries a `proof`.
+    AlreadyProofed,
+    /// `envelope.issuer` != the entry's principal DID.
+    IssuerMismatch {
+        envelope_issuer: String,
+        expected: String,
+    },
+    /// `expiresAt` is present but not an RFC-3339 timestamp.
+    ExpiresAtNotRfc3339 { value: String },
+    /// `expiresAt` is in the past.
+    Expired { value: String },
+    /// Internal failure (key load, sign, serialise).
+    App(AppError),
+}
+
+impl From<AppError> for SignTrustTaskError {
+    fn from(e: AppError) -> Self {
+        SignTrustTaskError::App(e)
+    }
+}
+
+/// Validate `unsigned_envelope` against `secret`'s principal identity and
+/// attach an `eddsa-jcs-2022` proof signed as that principal.
+///
+/// The caller has already gated capability + context scope + step-up.
+pub async fn sign_envelope(
+    keys_ks: &KeyspaceHandle,
+    imported_ks: &KeyspaceHandle,
+    contexts_ks: &KeyspaceHandle,
+    audit: &vta_audit::SharedAuditSink,
+    seed_store: &dyn SeedStore,
+    persona: crate::operations::persona::PersonaStores<'_>,
+    entry_context_id: &str,
+    secret: &VaultSecret,
+    unsigned_envelope: &Value,
+) -> Result<SignedEnvelope, SignTrustTaskError> {
+    // Only DID-anchored kinds carry a principal identity to sign as.
+    let (principal_did, signing_key_id) = match secret {
+        VaultSecret::DidSelfIssued {
+            did,
+            signing_key_id,
+            ..
+        }
+        | VaultSecret::DidcommPeer {
+            peer_did: did,
+            signing_key_id,
+            ..
+        } => (did.clone(), signing_key_id.clone()),
+        other => {
+            return Err(SignTrustTaskError::NotSignable {
+                kind: super::secret_kind_label(other.kind()),
+            });
+        }
+    };
+
+    // Structural validation. Per spec: id, type, issuer, recipient, issuedAt,
+    // payload all required; proof must be absent.
+    let envelope_obj = unsigned_envelope
+        .as_object()
+        .ok_or(SignTrustTaskError::EnvelopeNotObject)?;
+    for field in ["id", "type", "issuer", "recipient", "issuedAt", "payload"] {
+        if !envelope_obj.contains_key(field) {
+            return Err(SignTrustTaskError::EnvelopeMissingField { field });
+        }
+    }
+    // The proof purpose is decided by the document type alone (VTI-KEY-022,
+    // VTI-KEY-106): an operational document is signed for `authentication`,
+    // and only the approver/attestation types the registry names for
+    // `assertionMethod`. The requester has no say, so a relying party that
+    // refuses `assertionMethod` on operational tasks accepts what the vault
+    // signs, and an operational document can never be passed off as an
+    // attestation.
+    let proof_purpose = envelope_obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .and_then(|t| t.parse::<trust_tasks_rs::TypeUri>().ok())
+        .map(|t| vti_common::auth::purpose_for_document_type(&t))
+        .ok_or(SignTrustTaskError::TypeNotTypeUri)?;
+
+    if envelope_obj.contains_key("proof") {
+        return Err(SignTrustTaskError::AlreadyProofed);
+    }
+
+    // Strict issuer match: refuse to silently rewrite the consumer's issuer.
+    let envelope_issuer = envelope_obj
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .ok_or(SignTrustTaskError::IssuerNotString)?;
+    if envelope_issuer != principal_did {
+        return Err(SignTrustTaskError::IssuerMismatch {
+            envelope_issuer: envelope_issuer.to_string(),
+            expected: principal_did.clone(),
+        });
+    }
+
+    // expiresAt (if present) must be a future RFC-3339 timestamp.
+    if let Some(exp_v) = envelope_obj.get("expiresAt") {
+        let exp_str = exp_v.as_str().unwrap_or_default();
+        match chrono::DateTime::parse_from_rfc3339(exp_str) {
+            Ok(exp) if exp < chrono::Utc::now() => {
+                return Err(SignTrustTaskError::Expired {
+                    value: exp_str.to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return Err(SignTrustTaskError::ExpiresAtNotRfc3339 {
+                    value: exp_str.to_string(),
+                });
+            }
+        }
+    }
+
+    // A key-role identity publishes a different key for each purpose
+    // (VTI-KEY-072): its `operational` key under `authentication`, its
+    // `attestation` key under `assertionMethod`. An entry stores one key id, so
+    // signing every document with it leaves one of the two purposes naming a
+    // method the principal's document does not list for it, and a verifier
+    // refuses the proof (VTI-KEY-022). Where the principal is such an identity
+    // this agent holds, the purpose decides the key; the entry's own key is
+    // used for every other principal. Either way the key is held to the
+    // entry's context below (custody rule 7).
+    let relationship = match proof_purpose {
+        ProofPurpose::AssertionMethod => crate::operations::persona::Relationship::AssertionMethod,
+        _ => crate::operations::persona::Relationship::Authentication,
+    };
+    let signing_key_id =
+        crate::operations::persona::role_key_id_for(persona, &principal_did, relationship)
+            .await?
+            .unwrap_or(signing_key_id);
+
+    // Load the signing key as an affinidi Secret and sign. The proof's
+    // verificationMethod kid IS the key record's id.
+    let secret_key = super::load_signing_secret_by_id(
+        keys_ks,
+        imported_ks,
+        contexts_ks,
+        seed_store,
+        audit,
+        &signing_key_id,
+        entry_context_id,
+    )
+    .await?;
+    let proof = affinidi_data_integrity::DataIntegrityProof::sign(
+        unsigned_envelope,
+        &secret_key,
+        affinidi_data_integrity::SignOptions::new().with_proof_purpose(proof_purpose.as_str()),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("DataIntegrityProof sign failed: {e}")))?;
+    let proof_value = serde_json::to_value(&proof)
+        .map_err(|e| AppError::Internal(format!("serialize proof: {e}")))?;
+
+    // Attach the proof, preserving every other field byte-for-byte.
+    let mut signed = unsigned_envelope.clone();
+    signed
+        .as_object_mut()
+        .expect("envelope is an object — checked above")
+        .insert("proof".to_string(), proof_value);
+
+    Ok(SignedEnvelope {
+        signed,
+        principal_did,
+        proof_purpose,
+    })
+}

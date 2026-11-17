@@ -1,0 +1,79 @@
+# ============================================================================
+# DID Hosting Server (edge) Build Recipe
+# ============================================================================
+#
+# Drives `did-hosting-server setup --from <this-file>` non-interactively. The
+# did-hosting-server is an edge: it serves DID documents over HTTP and
+# receives signed sync updates from its control plane (over TSP, DIDComm or
+# HTTPS, whichever the edge's DID document advertises). Set
+# `[identity].control_did` below before running it.
+#
+# SECURITY: This file contains NO secrets.
+# ============================================================================
+
+[deployment]
+service = "server"
+vta_mode = "online"
+
+[output]
+config_path = "config.toml"
+
+[server]
+host = "0.0.0.0"
+port = 8530
+log_level = "info"
+log_format = "text"
+data_dir = "data/did-hosting-server"
+
+[identity]
+# Public URL that becomes the server's did:webvh identifier.
+public_url = "https://server1.example.com"
+# DIDComm mediator for runtime sync (NOT embedded in the DID document).
+# mediator_did = "did:webvh:mediator.example.com"
+# Messaging transport(s): "didcomm", "tsp", or "both" (default). Only
+# applies when `mediator_did` is set; both ride the mediator socket.
+# transport = "both"
+
+# REQUIRED. The DID of the control plane that drives this edge. The edge
+# accepts sync, domain and registration replies only from documents signed
+# by this DID, and `setup` refuses a recipe without it. Replace the
+# placeholder with your control plane's DID (printed by
+# `did-hosting-control setup`, and in its config.toml as `server_did`).
+# For a single host with no separate control plane, use did-hosting-daemon.
+control_did = "did:webvh:QmControlPlaneScidPlaceholder:control.example.com"
+# Optional HTTP URL of the control plane (used by tooling, not the runtime).
+# control_url = "https://control.example.com"
+
+[vta]
+did = "did:webvh:vta.example.com"
+context_id = "did-hosting"
+
+# ── Air-gapped (offline) setup ──────────────────────────────────────────────
+# Both phases of the sealed-bundle flow run non-interactively from this
+# same recipe file. Phase 1 writes a request + persists the ephemeral
+# seed in the configured secret backend; phase 2 opens the sealed reply
+# the VTA admin returned.
+#
+# Phase 1 (uncomment, set vta_mode = "offline-prepare" above):
+# request_path = "bootstrap-request.json"
+#
+# Phase 2 (after the VTA admin returns the sealed bundle; switch
+# vta_mode = "offline-complete" above):
+# bundle_path   = "bundle.armor"
+# expect_digest = "<lowercase-hex-sha256>"
+
+[secrets]
+backend = "keyring"
+keyring_service = "webvh"
+# Alternative backends (build with the matching feature, then pick one):
+# backend = "aws";   aws_region = "us-east-1"; aws_secret_name = "did-hosting-server-secrets"
+# backend = "gcp";   gcp_project = "my-project"; gcp_secret_name = "did-hosting-server-secrets"
+# backend = "azure"; azure_vault_url = "https://my-vault.vault.azure.net/"; azure_secret_name = "did-hosting-server-secrets"
+# backend = "vault"; vault_addr = "https://vault.example.com:8200"; vault_secret_path = "webvh/server-secrets"; vault_auth_method = "kubernetes"; vault_k8s_role = "did-hosting-server"
+# backend = "k8s";   k8s_secret_name = "did-hosting-server-secrets"; k8s_namespace = "webvh"
+
+[admin]
+mode = "skip"
+
+[reprovision]
+force = false

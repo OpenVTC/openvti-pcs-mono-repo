@@ -1,0 +1,1070 @@
+//! WebVH-DID-lifecycle slice trust-task handlers.
+//!
+//! **Feature-gated** — requires `webvh` (the entire op layer for
+//! WebVH DID-doc creation, update, deletion, and host registration
+//! lives under `cfg(feature = "webvh")`). The whole module is
+//! `#![cfg(feature = "webvh")]` at the top; mod.rs's `mod webvh;`
+//! declaration carries the same gate. URIs are declared in vta-sdk
+//! unconditionally — the parity harness uses
+//! `KNOWN_FEATURE_GATED_URIS` to recognise them when this module
+//! isn't compiled.
+//!
+//! Auth requirements per URI (enforced by the operation function or
+//! by the typed `AdminAuth` / `SuperAdminAuth` extractors used in the
+//! REST handlers — replicated here at the slice boundary since
+//! trust-task handlers take `AuthClaims` directly):
+//!
+//! | URI                                         | Auth        |
+//! |---------------------------------------------|-------------|
+//! | `webvh/servers/list/1.0`                    | any authed  |
+//! | `webvh/servers/register/1.0`                | super-admin |
+//! | `webvh/servers/remove/1.0`                  | super-admin |
+//! | `webvh/servers/domains/0.1`                 | any authed  |
+//! | `webvh/servers/reconcile/0.1`               | super-admin |
+//! | `webvh/servers/retire-orphan/0.1`           | super-admin |
+//! | `webvh/dids/list/1.0`                       | any authed  |
+//! | `webvh/dids/create/1.2`                     | `key-mint`  |
+//! | `webvh/dids/get/1.0` (log via `includeLog`) | any authed  |
+//! | `webvh/dids/delete/1.0`                     | admin       |
+//! | `webvh/dids/update/1.0`, `1.1`              | admin       |
+//! | `webvh/dids/rotate-keys/1.0`                | admin       |
+//! | `webvh/dids/realign-keys/1.0`               | admin       |
+//! | `webvh/dids/register-with-server/1.0`       | super-admin |
+//! | `webvh/agent-name/*` (list 1.1, others 1.0) | the DID's context |
+
+#![cfg(feature = "webvh")]
+
+use super::helpers::TrustTaskOutcome;
+use didwebvh_rs::witness::Witnesses;
+use serde_json::Value;
+use trust_tasks_rs::{RejectReason, TrustTask};
+
+use vta_sdk::protocols::did_management::{
+    agent_name::{
+        AgentNameBody, AgentNameCheckBody, AgentNameCheckResultBody, AgentNameResultBody,
+    },
+    create::CreateDidWebvhBody,
+    delete::DeleteDidWebvhBody,
+    get::GetDidWebvhBody,
+    realign::RealignDidKeysBody,
+    servers::{
+        ListWebvhServerDomainsBody, ListWebvhServersBody, ReconcileWebvhServerDidsBody,
+        RegisterDidWithServerBody, RegisterDidWithServerResultBody, RegisterWebvhServerBody,
+        RemoveWebvhServerBody,
+    },
+    update::{RotateDidWebvhKeysBody, UpdateDidWebvhBody},
+};
+
+use crate::auth::AuthClaims;
+use crate::error::AppError;
+use crate::operations;
+use crate::operations::did_webvh::{
+    AgentNameVerb, RegisterDidWithServerError, RegisterDidWithServerParams,
+    RotateDidWebvhKeysOptions, UpdateDidWebvhOptions, register_did_with_server,
+};
+use crate::server::AppState;
+
+use super::helpers::{
+    TRANSPORT_TRUST_TASK, app_error_to_reject, parse_payload, reject_declared, reject_with,
+    success_response,
+};
+
+// ─── Server CRUD ────────────────────────────────────────────────────────
+
+/// Refuse a syntactically invalid `did` before it reaches a store lookup.
+///
+/// [`vti_common::identifier::validate_did`] has always existed and names the
+/// offending character and its position. Nothing on this surface called it, so
+/// a malformed DID fell through to `webvh_store::get_did`, missed, and came
+/// back as `not found`.
+///
+/// That is the wrong answer, not merely a worse one. "Not found" is a claim
+/// about the world — it says the DID does not exist here — and it sends the
+/// operator looking for something that was deleted instead of at the argument
+/// they passed. The case that produced this: a DID copy-pasted out of the
+/// `dids list` table, which elides the middle of the SCID, so the argument
+/// carried a literal `…` (U+2026). The store answered honestly and the answer
+/// was misleading. It cost two people an hour and a wrong diagnosis each.
+fn reject_malformed_did(doc: &TrustTask<Value>, did: &str) -> Option<TrustTaskOutcome> {
+    vti_common::identifier::validate_did("did", did)
+        .err()
+        .map(|e| app_error_to_reject(doc, e))
+}
+
+/// The did:webvh DID of the log a `webvh/dids` request names. The family takes
+/// either form of a log this VTA created (`vta/webvh/dids/create/1.2`): its
+/// did:webvh DID, or its did:scid DID, with or without `src`, which names the
+/// same log (VTI-KEY-160). A did:scid this VTA holds no log for is not found.
+async fn log_did_of(
+    state: &AppState,
+    doc: &TrustTask<Value>,
+    did: &str,
+) -> Result<String, TrustTaskOutcome> {
+    if let Some(reject) = reject_malformed_did(doc, did) {
+        return Err(reject);
+    }
+    match vta_webvh::webvh_store::log_did_for(&state.webvh_ks, did).await {
+        Ok(Some(log_did)) => Ok(log_did),
+        Ok(None) => Err(app_error_to_reject(
+            doc,
+            AppError::NotFound(format!("no did:webvh log here is known as {did}")),
+        )),
+        Err(e) => Err(app_error_to_reject(doc, e)),
+    }
+}
+
+/// `webvh/servers/list/1.0` — list registered webvh hosts.
+pub(super) async fn handle_servers_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let _: ListWebvhServersBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match operations::did_webvh::list_webvh_servers(&state.webvh_ks, auth, TRANSPORT_TRUST_TASK)
+        .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `webvh/servers/register/1.0` — register a webvh host, or update the
+/// label of one already registered. Super-admin.
+///
+/// Absorbs the retired `servers/add/1.0` and `servers/update/1.0`.
+pub(super) async fn handle_servers_register(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let req: RegisterWebvhServerBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    match operations::did_webvh::register_webvh_server(
+        &state.webvh_ks,
+        auth,
+        &req.id,
+        req.did.as_deref(),
+        req.label,
+        Some(did_resolver),
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `webvh/servers/remove/1.0` — deregister a webvh host. Super-admin.
+pub(super) async fn handle_servers_remove(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let req: RemoveWebvhServerBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match operations::did_webvh::remove_webvh_server(
+        &state.webvh_ks,
+        auth,
+        &req.id,
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+// ─── DID lifecycle ──────────────────────────────────────────────────────
+
+/// `webvh/dids/create/1.2` — mint a new DID, presented as its did:webvh or
+/// its did:scid:vh:1 DID, the response stating the form applied, the log and its
+/// did:scid DID URL (VTI-KEY-165, VTI-KEY-166, VTI-VTA-036). The `key-mint`
+/// capability, in the target context (Keyring VTI-23; gated in
+/// `create_did_webvh`).
+pub(super) async fn handle_dids_create(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let body: CreateDidWebvhBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let config = state.config.read().await;
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let params = body.into();
+    let deps =
+        operations::did_webvh::CreateDidWebvhDeps::from_app_state(state, &config, did_resolver);
+    match operations::did_webvh::create_did_webvh(&deps, auth, params, TRANSPORT_TRUST_TASK).await {
+        Ok(body) => success_response(&doc, body),
+        Err(e) if operations::did_webvh::presentation::is_scid_alias_required(&e) => {
+            reject_declared(
+                &doc,
+                vti_specs::vta::webvh::dids::create::v1_2::error_codes::SCID_ALIAS_REQUIRED,
+                e.to_string(),
+            )
+        }
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `webvh/dids/get/1.0` — fetch a DID record, optionally with its raw
+/// `did.jsonl` (`includeLog`).
+///
+/// Absorbs the retired `webvh/dids/get-log/1.0`. The unauthenticated
+/// public log mirror (`GET /did/{did}/log`) remains deliberately NOT
+/// trust-task-wrapped — it stays plain REST as the DID-resolver
+/// failover path.
+pub(super) async fn handle_dids_get(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: GetDidWebvhBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, &req.did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    match operations::did_webvh::get_did_webvh(
+        &state.webvh_ks,
+        auth,
+        &log_did,
+        TRANSPORT_TRUST_TASK,
+        req.include_log,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `webvh/dids/delete/1.0` — delete a DID locally (+ remote cleanup
+/// when hosted). Admin role on the DID's context.
+pub(super) async fn handle_dids_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: DeleteDidWebvhBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, &req.did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::delete_did_webvh(
+        &deps,
+        auth,
+        &log_did,
+        vta_did.as_deref(),
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `webvh/dids/update/1.0` and `1.1` — apply a generic DID-doc patch. Admin
+/// role on the DID's context. 1.1 adds `scidAlsoKnownAs` (list or remove the
+/// log's did:scid alias, VTI-KEY-164) and reports `scidAlsoKnownAs` /
+/// `scidDidUrl`; it extends 1.0, so one handler serves both and the two are
+/// gated alike (see `policy_gate`).
+///
+/// The SDK wire body
+/// (`vta_sdk::protocols::did_management::update::UpdateDidWebvhBody`)
+/// carries `witnesses` as opaque JSON (no `didwebvh-rs` dependency
+/// for SDK consumers). Convert to the op-layer's typed
+/// `UpdateDidWebvhOptions` at the slice boundary by deserialising
+/// the JSON into `Witnesses` (the enum is `#[serde(untagged)]`, so
+/// the wire shapes are identical).
+///
+/// The trust-task envelope has no URL path, so the caller carries
+/// the target `did` at the payload top level via the
+/// [`UpdateDidWithDid`] wrapper.
+pub(super) async fn handle_dids_update(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: UpdateDidWithDid = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let UpdateDidWithDid { did, body } = req;
+    // 1.1 extends 1.0 and one handler serves both. The spine has already read
+    // the payload against the version's closed schema, so a 1.0 request cannot
+    // carry `scidAlsoKnownAs`; this restates it rather than rely on it.
+    let v1_1 = is_update_1_1(&doc);
+    if !v1_1 && body.scid_also_known_as.is_some() {
+        return reject_with(
+            &doc,
+            RejectReason::MalformedRequest {
+                reason: "scidAlsoKnownAs is a vta/webvh/dids/update/1.1 member; send 1.1".into(),
+            },
+        );
+    }
+    let did = match log_did_of(state, &doc, &did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    let options = match update_body_to_options(body) {
+        Ok(o) => o,
+        Err(resp) => return reject_with(&doc, resp),
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::update_did_webvh(
+        &deps,
+        auth,
+        &did,
+        options,
+        vta_did.as_deref(),
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(body) if v1_1 => match with_scid_alias_report(body) {
+            Ok(body) => success_response(&doc, body),
+            Err(e) => app_error_to_reject(&doc, e),
+        },
+        Ok(body) => success_response(&doc, body),
+        Err(operations::did_webvh::UpdateDidWebvhError::ScidAliasRequired(msg)) if v1_1 => {
+            reject_declared(
+                &doc,
+                vti_specs::vta::webvh::dids::update::v1_1::error_codes::SCID_ALIAS_REQUIRED,
+                msg,
+            )
+        }
+        Err(operations::did_webvh::UpdateDidWebvhError::NoChange(msg)) if v1_1 => reject_declared(
+            &doc,
+            vti_specs::vta::webvh::dids::update::v1_1::error_codes::NO_CHANGE,
+            msg,
+        ),
+        Err(e) => {
+            // A Destructive update that passed the consent gate and then failed
+            // in execute previously vanished into a bare 422 — no line named the
+            // cause, so a consent-approved-but-still-looping DID was undiagnosable
+            // from the log. The error's Display distinguishes the sub-causes
+            // (`reconcile publish_did: …`, `webvh server … missing`,
+            // `get_published_version: …`, a signing/library failure), so log it.
+            tracing::warn!(
+                did = %did,
+                error = %e,
+                "webvh dids/update execute failed after the consent gate passed — \
+                 returning task error to requester"
+            );
+            app_error_to_reject(&doc, AppError::from(e))
+        }
+    }
+}
+
+/// `spec/vta/webvh/agent-name/list/1.1` — read the DID's agent-name registry
+/// from the hosting control plane, parked names included. Read-only.
+pub(super) async fn handle_agent_name_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use vti_specs::vta::webvh::agent_name::list::v1_1 as t;
+    let req: t::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, req.did.as_str()).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::list_agent_names(&deps, auth, &log_did, vta_did.as_deref()).await {
+        Ok((did, names)) => {
+            let names: Vec<Value> = names
+                .into_iter()
+                .map(|e| {
+                    // The host speaks RFC 3339, and so does 1.1's entry.
+                    serde_json::json!({
+                        "name": e.name,
+                        "enabled": e.enabled,
+                        "createdAt": e.created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    })
+                })
+                .collect();
+            match serde_json::from_value::<t::Response>(
+                serde_json::json!({ "did": did, "names": names }),
+            ) {
+                Ok(body) => success_response(&doc, body),
+                Err(e) => app_error_to_reject(
+                    &doc,
+                    AppError::Internal(format!("agent-name/list response: {e}")),
+                ),
+            }
+        }
+        Err(e) => app_error_to_reject(&doc, AppError::from(e)),
+    }
+}
+
+/// `spec/vta/webvh/agent-name/check/1.0` — is this name free on the DID's
+/// host? Read-only; lets a client report a collision before signing anything.
+pub(super) async fn handle_agent_name_check(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: AgentNameCheckBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, &req.did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::check_agent_name(
+        &deps,
+        auth,
+        &log_did,
+        &req.name,
+        vta_did.as_deref(),
+    )
+    .await
+    {
+        Ok(a) => success_response(
+            &doc,
+            AgentNameCheckResultBody {
+                name: a.name,
+                domain: a.domain,
+                available: a.available,
+                reserved: a.reserved,
+            },
+        ),
+        Err(e) => app_error_to_reject(&doc, AppError::from(e)),
+    }
+}
+
+/// `spec/vta/webvh/agent-name/set/1.0` — bind an agent name: publish a new
+/// signed version claiming it in `alsoKnownAs` and register the binding with
+/// the host, which refuses a reserved name or one another DID already holds.
+/// Destructive.
+pub(super) async fn handle_agent_name_set(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    handle_agent_name(state, auth, doc, AgentNameVerb::Set).await
+}
+
+/// `spec/vta/webvh/agent-name/remove/1.0` — release an agent name: publish a
+/// new signed version dropping it from `alsoKnownAs` and tell the host to drop
+/// the reservation, so anyone may reclaim it. Destructive — and unlike
+/// `disable`, not recoverable by this DID alone.
+pub(super) async fn handle_agent_name_remove(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    handle_agent_name(state, auth, doc, AgentNameVerb::Remove).await
+}
+
+/// `spec/vta/webvh/agent-name/disable/1.0` — park an agent name: publish a new
+/// signed version dropping it from `alsoKnownAs` and tell the host to keep it
+/// reserved. Destructive.
+pub(super) async fn handle_agent_name_disable(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    handle_agent_name(state, auth, doc, AgentNameVerb::Disable).await
+}
+
+/// `spec/vta/webvh/agent-name/enable/1.0` — resume serving a parked name:
+/// publish a new signed version that claims it again.
+pub(super) async fn handle_agent_name_enable(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    handle_agent_name(state, auth, doc, AgentNameVerb::Enable).await
+}
+
+async fn handle_agent_name(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+    verb: AgentNameVerb,
+) -> TrustTaskOutcome {
+    let req: AgentNameBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, &req.did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::agent_name_op(
+        &deps,
+        auth,
+        &log_did,
+        &req.name,
+        verb,
+        vta_did.as_deref(),
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(_) => success_response(
+            &doc,
+            AgentNameResultBody {
+                did: log_did,
+                name: req.name,
+                // Whether the name resolves now — `remove` reports `false`
+                // like `disable`; the caller knows which verb it sent.
+                enabled: verb.claims_name(),
+            },
+        ),
+        Err(e) => app_error_to_reject(&doc, AppError::from(e)),
+    }
+}
+
+/// `webvh/dids/rotate-keys/1.0` — rotate every VM's key bytes on a
+/// DID and apply the resulting document change as one update. Admin
+/// role on the DID's context.
+pub(super) async fn handle_dids_rotate_keys(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: RotateKeysWithDid = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, &req.did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let options = RotateDidWebvhKeysOptions {
+        pre_rotation_count: req.body.pre_rotation_count,
+        label: req.body.label,
+    };
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::rotate_did_webvh_keys(
+        &deps,
+        auth,
+        &log_did,
+        options,
+        vta_did.as_deref(),
+        state.secrets_resolver.as_deref(),
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, AppError::from(e)),
+    }
+}
+
+/// `webvh/dids/realign-keys/1.0` — rename this DID's key records onto the
+/// verification-method ids its published document declares.
+///
+/// `Mutating`, not `Destructive`, and the distinction is the point: no key
+/// material is created, destroyed or exported. The same private halves remain,
+/// reachable under the names the document publishes for them — which is the
+/// state they were always supposed to be in.
+///
+/// The payload names no key. `did` and `dryRun` are the whole request, and the
+/// operation derives every target from that DID's own log; see
+/// `operations::did_webvh::realign` for why that is what makes this safe to
+/// expose at all.
+pub(super) async fn handle_dids_realign_keys(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: RealignDidKeysBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, &req.did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    match operations::did_webvh::realign_did_key_records(
+        &state.keys_ks,
+        &state.webvh_ks,
+        &state.audit_sink,
+        auth,
+        &log_did,
+        req.dry_run,
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `webvh/dids/register-with-server/1.0` — promote a serverless DID
+/// to a server-managed one. Super-admin.
+pub(super) async fn handle_dids_register_with_server(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_super_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let req: RegisterDidWithServerBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let log_did = match log_did_of(state, &doc, &req.did).await {
+        Ok(did) => did,
+        Err(reject) => return reject,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match register_did_with_server(
+        &deps,
+        auth,
+        RegisterDidWithServerParams {
+            did: log_did,
+            server_id: req.server_id,
+            force: req.force,
+            domain: req.domain.clone(),
+        },
+        vta_did.as_deref(),
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(result) => success_response(
+            &doc,
+            RegisterDidWithServerResultBody {
+                did: result.did,
+                server_id: result.server_id,
+                log_entry_count: result.log_entry_count,
+            },
+        ),
+        Err(e) => app_error_to_reject(&doc, map_register_err(e)),
+    }
+}
+
+/// Map `RegisterDidWithServerError` onto `AppError`. Mirrors the
+/// `map_register_err` helper in `routes::did_webvh` so REST and
+/// trust-task transports return the same statuses for the same
+/// failure modes. Kept private to the slice — sharing the helper
+/// with `routes::did_webvh` would mean making it `pub(crate)`,
+/// which we don't yet need.
+fn map_register_err(e: RegisterDidWithServerError) -> AppError {
+    use RegisterDidWithServerError as E;
+    match e {
+        E::Auth(msg) => AppError::Forbidden(msg),
+        E::DidNotFound(msg) | E::ServerNotFound(msg) | E::LogMissing(msg) => {
+            AppError::NotFound(msg)
+        }
+        E::AlreadyServerManaged { .. } | E::Conflict(_) => AppError::Conflict(e.to_string()),
+        E::Transport(msg) => AppError::Internal(format!("publish: {msg}")),
+        // Pass the host's typed rejection through untouched — see
+        // `RegisterDidWithServerError::Publish`.
+        E::Publish(e) => e,
+        E::DidUrlParse { .. } => AppError::Validation(e.to_string()),
+        E::Storage(msg) => AppError::Internal(msg),
+    }
+}
+
+// ─── Helpers internal to this slice ─────────────────────────────────────
+
+/// Convert the camelCase wire body into the op-layer options shape.
+///
+/// `pub(crate)` so the REST route shares this one conversion rather than
+/// deserialising the caller's JSON straight into [`UpdateDidWebvhOptions`].
+/// That shortcut silently dropped `expectedVersionId`: the wire body is
+/// `rename_all = "camelCase"`, the op-layer struct is snake_case with no
+/// aliases and no `deny_unknown_fields`, so the field matched nothing and
+/// defaulted to `None` — the optimistic-concurrency precondition never
+/// applied on that path. Two conversions are two chances to drift; there is
+/// deliberately only one.
+pub(crate) fn update_body_to_options(
+    body: UpdateDidWebvhBody,
+) -> Result<UpdateDidWebvhOptions, RejectReason> {
+    let witnesses = match body.witnesses {
+        Some(v) => match serde_json::from_value::<Witnesses>(v) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                return Err(RejectReason::MalformedRequest {
+                    reason: format!("witnesses: {e}"),
+                });
+            }
+        },
+        None => None,
+    };
+    Ok(UpdateDidWebvhOptions {
+        document: body.document,
+        pre_rotation_count: body.pre_rotation_count,
+        witnesses,
+        watchers: body.watchers,
+        ttl: body.ttl,
+        label: body.label,
+        expected_version_id: body.expected_version_id,
+        scid_also_known_as: body.scid_also_known_as,
+    })
+}
+
+/// Whether `doc` is a `vta/webvh/dids/update/1.1` request (rather than 1.0).
+fn is_update_1_1(doc: &TrustTask<Value>) -> bool {
+    let uri = doc.type_uri.to_string();
+    uri.split('#').next() == Some(vta_sdk::trust_tasks::TASK_WEBVH_DIDS_UPDATE_1_1)
+}
+
+/// Add the `update/1.1` response members, read from the entry just published:
+/// `scidAlsoKnownAs` as that document has it, and `scidDidUrl` always (update
+/// 1.1 item 6).
+fn with_scid_alias_report(
+    mut body: vta_sdk::protocols::did_management::update::UpdateDidWebvhResultBody,
+) -> Result<vta_sdk::protocols::did_management::update::UpdateDidWebvhResultBody, AppError> {
+    let entry: Value = serde_json::from_str(&body.new_log_entry)
+        .map_err(|e| AppError::Internal(format!("read the published entry: {e}")))?;
+    let document = entry
+        .get("state")
+        .ok_or_else(|| AppError::Internal("the published entry has no state".into()))?;
+    let (_, url) = vta_sdk::did_scid::scid_forms(&body.did)
+        .ok_or_else(|| AppError::Internal(format!("{} has no did:scid form", body.did)))?;
+    body.scid_also_known_as = Some(operations::did_webvh::presentation::document_lists_alias(
+        document,
+    ));
+    body.scid_did_url = Some(url);
+    Ok(body)
+}
+
+/// Wrapper carrying `RotateDidWebvhKeysBody` plus the target `did`.
+/// The trust-task envelope has no URL path; the caller must include
+/// the DID at the payload top level.
+#[derive(Debug, serde::Deserialize)]
+struct RotateKeysWithDid {
+    did: String,
+    #[serde(flatten)]
+    body: RotateDidWebvhKeysBody,
+}
+
+/// Wrapper carrying `UpdateDidWebvhBody` plus the target `did`. Same
+/// rationale as [`RotateKeysWithDid`].
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct UpdateDidWithDid {
+    pub(super) did: String,
+    #[serde(flatten)]
+    pub(super) body: UpdateDidWebvhBody,
+}
+
+/// `vta/webvh/servers/domains/0.1` — relay a hosting server's caller-scoped
+/// domain view.
+///
+/// The VTA holds the registration and the credentials; the *server* holds the
+/// ACL that decides which domains this caller may use. The relay is therefore
+/// deliberately transparent — no second filter here, because narrowing a list
+/// the server already scoped would report fewer domains than the caller may
+/// actually use, and the caller has no way to tell that happened.
+/// `spec/vta/webvh/servers/reconcile/0.1` — diff a hosting server's DIDs against
+/// this VTA's records. Read-only; super-admin (the operation explains why).
+pub(super) async fn handle_servers_reconcile(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: ReconcileWebvhServerDidsBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::reconcile_webvh_server_dids(
+        &deps,
+        auth,
+        vta_did.as_deref(),
+        &req.server_id,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `spec/vta/webvh/servers/retire-orphan/0.1` — remove a slot the host serves
+/// and this VTA has no record of. Destructive, no undo, super-admin.
+///
+/// The refusals are the interesting half. Three conditions decline, and each
+/// carries the specification's extended code in `details.reason` so a caller
+/// keys on a stable field rather than on prose — the same shape the consent
+/// gate uses. Two of the three are *uncertainty* rather than contradiction,
+/// and refusing on uncertainty is deliberate: the alternative to a false
+/// refusal is a retry, and the alternative to a false removal is nothing.
+pub(super) async fn handle_servers_retire_orphan(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use vta_sdk::protocols::did_management::servers::RetireOrphanSlotBody;
+    let req: RetireOrphanSlotBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::retire_orphan_slot(&deps, auth, vta_did.as_deref(), &req).await {
+        Ok(Ok(body)) => success_response(&doc, body),
+        Ok(Err(refusal)) => {
+            tracing::info!(
+                caller = %auth.did,
+                server_id = %req.server_id,
+                slot_id = %req.slot_id,
+                code = refusal.code(),
+                "retire-orphan refused"
+            );
+            super::helpers::reject_with(
+                &doc,
+                trust_tasks_rs::RejectReason::TaskFailed {
+                    reason: refusal.message(),
+                    details: Some(serde_json::json!({
+                        "reason": refusal.code(),
+                        "serverId": req.server_id,
+                        "slotId": req.slot_id,
+                    })),
+                },
+            )
+        }
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+pub(super) async fn handle_servers_domains(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: ListWebvhServerDomainsBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let did_resolver = match state.did_resolver.as_ref() {
+        Some(r) => r,
+        None => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Internal("DID resolver not available".into()),
+            );
+        }
+    };
+    let vta_did = state.config.read().await.vta_did.clone();
+    let deps = operations::did_webvh::WebvhDeps::from_app_state(state, did_resolver);
+    match operations::did_webvh::list_webvh_server_domains(
+        &deps,
+        auth,
+        vta_did.as_deref(),
+        &req.server_id,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(did: &str) -> TrustTask<Value> {
+        serde_json::from_value(serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000000",
+            "type": "https://trusttasks.org/spec/vta/webvh/dids/delete/1.0",
+            "issuer": "did:key:z6MkIssuer",
+            "recipient": "did:key:z6MkVta",
+            "payload": { "did": did },
+        }))
+        .expect("a well-formed Trust Task")
+    }
+
+    /// The case that sent two people to the wrong conclusion: a DID copied out
+    /// of the `dids list` table, which elides the middle of the SCID, so the
+    /// argument carries a literal `…` (U+2026).
+    ///
+    /// Before this guard it reached the store, missed, and came back as `not
+    /// found` — which reads as "that DID was deleted" rather than "look at what
+    /// you typed".
+    #[test]
+    fn a_truncated_did_is_refused_as_malformed_not_as_missing() {
+        let bad = "did:webvh:QmbsoTcwkM\u{2026}:webvh.storm.ws:hurdle-surface";
+        let outcome = reject_malformed_did(&doc(bad), bad).expect("a truncated DID is refused");
+
+        let rendered = String::from_utf8_lossy(&outcome.body).to_string();
+        assert!(
+            rendered.contains("malformedRequest"),
+            "must be malformedRequest, not a lookup miss: {rendered}"
+        );
+        // Naming the character is the whole value: `…` is invisible enough in a
+        // terminal that "invalid character" alone would not land.
+        assert!(
+            rendered.contains("invalid character"),
+            "the reason must name what is wrong with the argument: {rendered}"
+        );
+    }
+
+    /// Other ways an argument fails to be a DID, each refused here rather than
+    /// deeper.
+    #[test]
+    fn other_non_dids_are_refused_too() {
+        for bad in [
+            "",
+            "not-a-did",
+            "did:webvh:has space",
+            "did:webvh:tab\tchar",
+        ] {
+            assert!(
+                reject_malformed_did(&doc(bad), bad).is_some(),
+                "`{bad}` must be refused"
+            );
+        }
+    }
+
+    /// A real DID passes through untouched — the guard must not become a
+    /// second, stricter DID grammar that rejects things the store holds.
+    #[test]
+    fn a_well_formed_did_is_not_refused() {
+        for good in [
+            "did:webvh:QmbsoTcwkMjqaezmeFW4c6yth2sKDGtDiaGrzS1e3BvdZX:webvh.storm.ws:hurdle-surface",
+            "did:key:z6MkhBYkvHQSLDmhVQWoy6ZiQc2VU3EFYjLz2KQ2YQDQ77Ag",
+            "did:web:example.com%3A8443:path",
+        ] {
+            assert!(
+                reject_malformed_did(&doc(good), good).is_none(),
+                "`{good}` must pass"
+            );
+        }
+    }
+}

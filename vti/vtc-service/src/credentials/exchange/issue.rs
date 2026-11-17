@@ -1,0 +1,244 @@
+//! OID4VCI issuer gate: holder key-binding proof verification +
+//! credential issuance + offer construction (split out of `exchange.rs`, P2.3).
+
+use super::jwt::{aud_matches, decode_segment};
+use affinidi_openid4vci::issuer::{
+    create_credential_offer, create_credential_response, validate_credential_request,
+};
+use affinidi_openid4vci::{CredentialOffer, CredentialRequest, CredentialResponse};
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use vta_sdk::jws::JwsKey;
+use vti_common::error::AppError;
+
+/// OID4VCI proof-JWT `typ` header (OID4VCI §7.2.1).
+pub(super) const OID4VCI_PROOF_TYP: &str = "openid4vci-proof+jwt";
+
+/// Freshness window for a key-binding proof — a proof whose `iat` is older than
+/// this (or implausibly in the future) is rejected. Mirrors the 60s DIDComm
+/// envelope window's intent with a little more slack for wallet clock drift.
+pub(super) const PROOF_MAX_AGE_SECS: i64 = 300;
+/// Tolerance for a proof `iat` slightly ahead of the issuer's clock.
+const PROOF_FUTURE_SKEW_SECS: i64 = 60;
+
+/// A holder key-binding proof that [`verify_oid4vci_proof`] has cryptographically
+/// verified: the signature checked out under the key named by the proof's `kid`.
+#[derive(Debug, Clone)]
+pub struct ProvenHolderProof {
+    /// The DID whose key signed the proof (the `kid` with any fragment
+    /// stripped). The requester demonstrably controls this DID's key.
+    pub holder_did: String,
+    /// The issuer-supplied freshness nonce the proof committed to, if any
+    /// (the OID4VCI `c_nonce`). A later wiring slice uses this to correlate the
+    /// request back to a single-use pending offer.
+    pub nonce: Option<String>,
+}
+
+/// A key-binding proof's parts, structurally checked but not yet verified.
+struct ProofParts<'a> {
+    jwt: &'a str,
+    kid: String,
+    holder_did: String,
+}
+
+/// Split a key-binding proof JWT and check its header: compact JWS, `typ`
+/// `openid4vci-proof+jwt`, a `kid`. Nothing is trusted yet, and the `alg` is
+/// not read here: the key the `kid` names decides it (EdDSA for Ed25519, ES256
+/// for P-256, ES256K for secp256k1 — #1988), and [`verify_with_key`] refuses a
+/// header naming any other.
+fn proof_parts(proof_jwt: &str) -> Result<ProofParts<'_>, AppError> {
+    let mut parts = proof_jwt.split('.');
+    let h_b64 = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(_), Some(_), None) => h,
+        _ => {
+            return Err(AppError::Validation(
+                "key-binding proof is not a compact JWS (header.payload.signature)".into(),
+            ));
+        }
+    };
+
+    let header = decode_segment(h_b64, "proof header")?;
+    if header.get("typ").and_then(Value::as_str) != Some(OID4VCI_PROOF_TYP) {
+        return Err(AppError::Validation(format!(
+            "key-binding proof `typ` must be `{OID4VCI_PROOF_TYP}`"
+        )));
+    }
+    let kid = header
+        .get("kid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Validation("key-binding proof header has no `kid`".into()))?
+        .to_string();
+    // The holder DID is the `kid` with any VM fragment stripped.
+    let holder_did = kid.split('#').next().unwrap_or(&kid).to_string();
+    Ok(ProofParts {
+        jwt: proof_jwt,
+        kid,
+        holder_did,
+    })
+}
+
+/// Verify the signature under `key` — the header's `alg` must be that key's,
+/// and a `crit` header is refused — then the bound claims: `aud` names this
+/// issuer and `iat` is fresh.
+fn verify_with_key(
+    parts: ProofParts<'_>,
+    key: &JwsKey,
+    expected_aud: &str,
+    now: DateTime<Utc>,
+) -> Result<ProvenHolderProof, AppError> {
+    let payload = key.verify_compact(parts.jwt).map_err(|e| match e {
+        vta_sdk::jws::JwsError::BadSignature => {
+            AppError::Validation("key-binding proof signature did not verify".into())
+        }
+        other => AppError::Validation(format!("key-binding proof refused: {other}")),
+    })?;
+
+    // Signature is good — now the bound claims.
+    if !aud_matches(payload.get("aud"), expected_aud) {
+        return Err(AppError::Validation(format!(
+            "key-binding proof `aud` does not name this issuer ({expected_aud})"
+        )));
+    }
+    let iat = payload
+        .get("iat")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Validation("key-binding proof has no numeric `iat`".into()))?;
+    let now_secs = now.timestamp();
+    if iat > now_secs + PROOF_FUTURE_SKEW_SECS {
+        return Err(AppError::Validation(
+            "key-binding proof `iat` is in the future".into(),
+        ));
+    }
+    if now_secs - iat > PROOF_MAX_AGE_SECS {
+        return Err(AppError::Validation(format!(
+            "key-binding proof is stale (older than {PROOF_MAX_AGE_SECS}s)"
+        )));
+    }
+
+    let nonce = payload
+        .get("nonce")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(ProvenHolderProof {
+        holder_did: parts.holder_did,
+        nonce,
+    })
+}
+
+/// Verify an OID4VCI key-binding proof JWT whose `kid` is a `did:key`, with no
+/// resolver: the key is in the DID itself.
+///
+/// Checks, in order: the compact JWT is well-formed; `typ` is
+/// `openid4vci-proof+jwt`; the `kid` names a `did:key`; the signature verifies
+/// under that key, in its curve's algorithm; the `aud` names this issuer;
+/// and the `iat` is fresh. For a holder of any other method use
+/// [`verify_oid4vci_proof_resolved`].
+pub fn verify_oid4vci_proof(
+    proof_jwt: &str,
+    expected_aud: &str,
+    now: DateTime<Utc>,
+) -> Result<ProvenHolderProof, AppError> {
+    let parts = proof_parts(proof_jwt)?;
+    if !parts.holder_did.starts_with("did:key:") {
+        return Err(AppError::Validation(format!(
+            "key-binding proof `kid` ({}) is not a `did:key` — use the resolving verifier",
+            parts.holder_did
+        )));
+    }
+    let key = JwsKey::from_did_key(&parts.holder_did).map_err(|e| {
+        AppError::Validation(format!(
+            "holder `{}` is not a usable did:key: {e}",
+            parts.holder_did
+        ))
+    })?;
+    verify_with_key(parts, &key, expected_aud, now)
+}
+
+/// [`verify_oid4vci_proof`] for a holder of any DID method: the `kid` is
+/// resolved to its verification method through `resolver` — locally for a
+/// `did:key`, through the DID resolver for `did:webvh` / `did:web` and the
+/// rest. A `vtc/invitations/deliver` offer releases its credential only to a
+/// key of the invited DID, whatever method that DID uses.
+pub async fn verify_oid4vci_proof_resolved(
+    proof_jwt: &str,
+    expected_aud: &str,
+    now: DateTime<Utc>,
+    resolver: &crate::credentials::vm_resolver::DidVmResolver,
+) -> Result<ProvenHolderProof, AppError> {
+    let parts = proof_parts(proof_jwt)?;
+    let key = resolver
+        // A key-binding proof demonstrates control of the holder DID.
+        .resolve_jws_key(&parts.kid, vti_common::auth::ProofPurpose::Authentication)
+        .await
+        .map_err(|e| {
+            AppError::Validation(format!(
+                "key-binding proof `kid` did not resolve to an authentication key: {e}"
+            ))
+        })?;
+    verify_with_key(parts, &key, expected_aud, now)
+}
+
+/// Issue a credential in response to an OID4VCI credential request.
+///
+/// `credential` is the credential the VTC has already decided to issue (a
+/// minted VMC / VAC / VIC, opaque here); `expected_holder_did` is the subject
+/// it is bound to. The request's key-binding proof must verify *and* prove
+/// control of exactly `expected_holder_did` — so only the rightful subject,
+/// demonstrating key possession, can redeem the credential. Returns the OID4VCI
+/// [`CredentialResponse`] to wrap in a `credential-exchange/issue` body.
+pub async fn issue_on_request(
+    request: &CredentialRequest,
+    credential: Value,
+    expected_holder_did: &str,
+    issuer_id: &str,
+    now: DateTime<Utc>,
+    resolver: &crate::credentials::vm_resolver::DidVmResolver,
+) -> Result<CredentialResponse, AppError> {
+    // Structural validation (format present, vct/doctype for the format,
+    // proof envelope well-formed) from the OID4VCI crate.
+    validate_credential_request(request)
+        .map_err(|e| AppError::Validation(format!("invalid credential request: {e}")))?;
+
+    let proof = request.proof.as_ref().ok_or_else(|| {
+        AppError::Validation(
+            "credential request carries no key-binding proof — issuance requires \
+             proof of holder key possession"
+                .into(),
+        )
+    })?;
+    if proof.proof_type != "jwt" {
+        return Err(AppError::Validation(format!(
+            "unsupported key-binding proof type `{}` (expected `jwt`)",
+            proof.proof_type
+        )));
+    }
+
+    let proven = verify_oid4vci_proof_resolved(&proof.jwt, issuer_id, now, resolver).await?;
+    if proven.holder_did != expected_holder_did {
+        // Forbidden, not Validation: the proof is valid, but it binds a
+        // different DID than the credential's subject — a redemption-by-the-
+        // wrong-party attempt, not a malformed request.
+        return Err(AppError::Forbidden(format!(
+            "key-binding proof proves control of {} but the credential is bound to {}",
+            proven.holder_did, expected_holder_did
+        )));
+    }
+
+    Ok(create_credential_response(credential, None, None))
+}
+
+/// Build an OID4VCI pre-authorized-code credential offer for `config_ids`.
+///
+/// Thin wrapper over [`create_credential_offer`] that documents the VTC's
+/// stance: issuance is always pre-authorized (the community has already decided
+/// to issue — via a ceremony / approval — before the offer goes out), never the
+/// interactive OAuth authorization-code flow. `pre_authorized_code` is the
+/// single-use redemption token (a later slice persists the pending offer keyed
+/// by it).
+pub fn credential_offer(
+    issuer_id: &str,
+    config_ids: Vec<String>,
+    pre_authorized_code: String,
+) -> CredentialOffer {
+    create_credential_offer(issuer_id, config_ids, Some(pre_authorized_code))
+}

@@ -1,0 +1,1103 @@
+//! In-process HTTP smoke test for did-hosting-server's assembled router.
+//!
+//! Builds the same `AppState` shape `did-hosting-daemon` constructs, mounts the
+//! full server router with the public-DID fallback, seeds a single DID
+//! into the fjall store, and exercises:
+//!
+//! 1. `GET /<mnemonic>/did.jsonl` returns 200 with the seeded body.
+//! 2. The response sets `Cache-Control: public, max-age=...` (proves
+//!    public DID resolution opts out of the global `no-store` middleware).
+//! 3. `GET /unknown-mnemonic/did.jsonl` returns 404 (proves the
+//!    fallback handler runs and the error mapper produces a clean
+//!    response shape).
+//!
+//! This is the smallest end-to-end smoke test that covers the daemon's
+//! public DID surface in-process. End-to-end DIDComm flows need a fake
+//! mediator and are tracked separately.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use did_hosting_common::did_ops::{DidRecord, content_log_key, did_key};
+use did_hosting_common::server::config::{
+    AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+};
+use did_hosting_common::server::domain::{
+    DomainEntry, DomainStatus, DomainUrlScheme, create_domain,
+};
+use did_hosting_common::server::store::Store;
+use did_hosting_common::server::store::{KS_DIDS, KS_DOMAINS};
+use did_hosting_server::cache::{ContentCache, GateCache};
+use did_hosting_server::config::{AppConfig, LimitsConfig, StatsConfig};
+use did_hosting_server::server::AppState;
+use std::time::Duration;
+use tower::ServiceExt; // for `oneshot`
+
+async fn make_state() -> (AppState, tempfile::TempDir) {
+    make_state_with(ServerConfig::default()).await
+}
+
+async fn make_state_with(server: ServerConfig) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_config = StoreConfig {
+        data_dir: PathBuf::from(dir.path()),
+        ..StoreConfig::default()
+    };
+    let store = Store::open(&store_config).await.expect("open store");
+    let dids_ks = store.keyspace(KS_DIDS).expect("dids ks");
+
+    let config = AppConfig {
+        features: FeaturesConfig::default(),
+        server_did: Some("did:webvh:test:server.example.com".into()),
+        mediator_did: None,
+        public_url: Some("http://localhost:8530".into()),
+        server,
+        log: LogConfig::default(),
+        store: store_config.clone(),
+        fjall: Default::default(),
+        auth: AuthConfig::default(),
+        hosting: did_hosting_common::server::config::HostingConfig::default(),
+        secrets: SecretsConfig::default(),
+        limits: LimitsConfig::default(),
+        replication: Default::default(),
+        stats: StatsConfig::default(),
+        control_did: None,
+        vta: VtaConfig::default(),
+        identity: Default::default(),
+        replay: Default::default(),
+        config_path: PathBuf::new(),
+    };
+
+    let state = AppState {
+        store: store.clone(),
+        dids_ks,
+        config: Arc::new(config),
+        did_resolver: None,
+        trust_tasks_verifier: None,
+        secrets_resolver: None,
+        identity: None,
+        didcomm_service: std::sync::Arc::new(std::sync::OnceLock::new()),
+        stats_collector: None,
+        did_cache: Arc::new(ContentCache::new(Duration::from_secs(60))),
+        gate_cache: None,
+        trusted_proxy_cidrs: Arc::new(Vec::new()),
+        replication: Arc::new(did_hosting_server::replication::ReplicationStatus::new(
+            did_hosting_common::server::auth::session::now_epoch(),
+        )),
+        client_ips: Default::default(),
+        trust_tasks_rate_limiter: Arc::new(
+            did_hosting_common::server::rate_limit::IpRateLimiter::new(
+                did_hosting_common::server::rate_limit::TRUST_TASKS_RATE_LIMIT_NAME,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_MAX_PER_WINDOW,
+                did_hosting_common::server::rate_limit::TRUST_TASKS_WINDOW_SECS,
+            ),
+        ),
+        sync_locks: Default::default(),
+        replay_cache: std::sync::Arc::new(did_hosting_common::server::replay::ReplayCache::new()),
+    };
+    (state, dir)
+}
+
+/// Seed both the raw content and its `DidRecord` for `mnemonic` — the pair
+/// register/publish always write together in one commit. `serve_content`
+/// refuses before ever consulting the cache when the record alone is
+/// missing, so a test that wants a 200 must seed both, not content alone.
+async fn seed_did(state: &AppState, mnemonic: &str, did_id: &str, body: &str) {
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .expect("seed did log");
+    state
+        .dids_ks
+        .insert(
+            did_key(mnemonic),
+            &DidRecord {
+                owner: "did:example:owner".into(),
+                mnemonic: mnemonic.into(),
+                created_at: 0,
+                updated_at: 0,
+                version_count: 1,
+                did_id: Some(did_id.into()),
+                content_size: body.len() as u64,
+                disabled: false,
+                disabled_by_admin: false,
+                deleted_at: None,
+                method: "webvh".into(),
+                domain: String::new(),
+                services: None,
+                agent_names: Vec::new(),
+            },
+        )
+        .await
+        .expect("seed DidRecord");
+}
+
+#[tokio::test]
+async fn public_did_resolution_round_trip() {
+    let (state, _dir) = make_state().await;
+
+    // Seed a DID log under mnemonic "alice".
+    let mnemonic = "alice";
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ));
+
+    // 1. Hit the seeded mnemonic — 200, content matches, cacheable.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let cc = response
+        .headers()
+        .get("cache-control")
+        .expect("cache-control header present")
+        .to_str()
+        .unwrap();
+    assert!(
+        cc.contains("public") && cc.contains("max-age"),
+        "expected public DID response to be cacheable; got cache-control={cc}",
+    );
+
+    // CSP / X-Frame-Options / X-Content-Type-Options are inherited from the
+    // global security_headers middleware.
+    let headers = response.headers();
+    assert!(headers.contains_key("x-content-type-options"));
+    assert!(headers.contains_key("x-frame-options"));
+    assert!(headers.contains_key("content-security-policy"));
+
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], body.as_bytes());
+
+    // 2. Hit an unknown mnemonic — 404, no panic, no leaked Cache-Control.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/ghost/did.jsonl")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // 404s should fall back to the global no-store default — proves the
+    // middleware's "leave existing Cache-Control alone" branch doesn't
+    // accidentally inherit the cacheable header onto error responses.
+    let cc = response
+        .headers()
+        .get("cache-control")
+        .expect("cache-control header present on 404")
+        .to_str()
+        .unwrap();
+    assert_eq!(cc, "no-store", "404 must not be cached");
+}
+
+/// Regression: a deleted DID must stop resolving immediately, not up to the
+/// content cache's TTL later. `did/delete` (the control plane) removes the
+/// `DidRecord` outright rather than soft-deleting it — a hard delete, not a
+/// disable — so a resolver reading a warm cache entry with no record behind
+/// it any more must refuse before ever consulting that cache.
+#[tokio::test]
+async fn a_deleted_did_stops_resolving_at_once_even_with_a_warm_cache() {
+    let (state, _dir) = make_state().await;
+
+    let mnemonic = "alice";
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+
+    // Warm the content cache.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "precondition: cache is warm"
+    );
+
+    // A hard delete: the record goes, exactly like `did/delete`. Left
+    // deliberately WITHOUT invalidating the cache and without removing the
+    // raw content bytes — this isolates the `serve_content` guard itself
+    // (a missing record refuses before the cache is ever consulted) from
+    // whether some call site remembered to invalidate.
+    state
+        .dids_ks
+        .remove(did_key(mnemonic))
+        .await
+        .expect("remove record");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a deleted DID must not be served from a warm cache"
+    );
+}
+
+/// With a gate cache (the daemon), a warm resolve reads nothing from the
+/// store: the record, the domains and the log all come from memory. What
+/// keeps that safe is the forget calls the daemon's control plane makes
+/// after each commit; this checks each one takes effect at once.
+#[tokio::test]
+async fn a_gate_cache_serves_warm_resolves_from_memory_until_told_of_a_change() {
+    let (mut state, _dir) = make_state().await;
+    let gate = Arc::new(GateCache::new(&state.store, Duration::from_secs(60)).unwrap());
+    state.gate_cache = Some(gate.clone());
+
+    let mnemonic = "alice";
+    let did_id = "did:webvh:Q1:domain-a.example:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+    let domains = state.store.keyspace(KS_DOMAINS).unwrap();
+    let put_domain = async |status| {
+        domains
+            .insert("domain-a.example", &domain("domain-a.example", status))
+            .await
+            .unwrap();
+    };
+    put_domain(DomainStatus::Active).await;
+    let set_disabled = async |disabled: bool| {
+        let mut record: DidRecord = state.dids_ks.get(did_key(mnemonic)).await.unwrap().unwrap();
+        record.disabled = disabled;
+        state
+            .dids_ks
+            .insert(did_key(mnemonic), &record)
+            .await
+            .unwrap();
+    };
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+    let resolve = async || {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{mnemonic}/did.jsonl"))
+                    .header("host", "domain-a.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    };
+
+    assert_eq!(resolve().await, StatusCode::OK, "cold resolve");
+
+    // Take everything out of the store behind the caches' back: a resolve
+    // that read any of it would now fail.
+    let record: DidRecord = state.dids_ks.get(did_key(mnemonic)).await.unwrap().unwrap();
+    state.dids_ks.remove(did_key(mnemonic)).await.unwrap();
+    state
+        .dids_ks
+        .remove(content_log_key(mnemonic))
+        .await
+        .unwrap();
+    domains.remove("domain-a.example").await.unwrap();
+    assert_eq!(
+        resolve().await,
+        StatusCode::OK,
+        "warm resolve reads nothing"
+    );
+
+    // Put it back with the DID disabled: the cached record still says
+    // enabled until the control plane's hook names this DID.
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &record)
+        .await
+        .unwrap();
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .unwrap();
+    put_domain(DomainStatus::Active).await;
+    set_disabled(true).await;
+    gate.forget_did(mnemonic);
+    assert_eq!(resolve().await, StatusCode::NOT_FOUND, "disabled DID");
+
+    set_disabled(false).await;
+    gate.forget_did(mnemonic);
+    assert_eq!(resolve().await, StatusCode::OK, "re-enabled DID");
+
+    // A disabled domain, likewise, once the hook reports a domain change.
+    put_domain(DomainStatus::Disabled).await;
+    assert_eq!(resolve().await, StatusCode::OK, "cached domain state");
+    gate.forget_domains();
+    assert_eq!(
+        resolve().await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "disabled domain"
+    );
+}
+
+/// did:web's `did.json` is cached only behind a gate cache (the daemon),
+/// where the control plane's hook clears it; an edge reads the store every
+/// time, so a change made elsewhere shows on the next resolve.
+#[tokio::test]
+async fn a_did_web_document_is_cached_only_behind_a_gate_cache() {
+    let mnemonic = "alice";
+    let did_web = did_hosting_common::did::build_did_web_id("http://localhost:8530", mnemonic)
+        .expect("did:web id");
+    let did_id = "did:webvh:Q1:localhost%3A8530:alice";
+    let body = format!(
+        "{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\",\"alsoKnownAs\":[\"{did_web}\"]}}}}"
+    );
+
+    for with_gate in [false, true] {
+        let (mut state, _dir) = make_state().await;
+        let gate = Arc::new(GateCache::new(&state.store, Duration::from_secs(60)).unwrap());
+        if with_gate {
+            state.gate_cache = Some(gate.clone());
+        }
+        seed_did(&state, mnemonic, did_id, &body).await;
+        let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+        let resolve = async || {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/{mnemonic}/did.json"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(resolve().await, StatusCode::OK, "with_gate={with_gate}");
+
+        // The log goes from the store without anyone telling the caches.
+        state
+            .dids_ks
+            .remove(content_log_key(mnemonic))
+            .await
+            .unwrap();
+        let expected = if with_gate {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        assert_eq!(resolve().await, expected, "with_gate={with_gate}");
+
+        if with_gate {
+            // What the daemon's hook does on a change to the DID.
+            state.did_cache.invalidate_did(mnemonic);
+            gate.forget_did(mnemonic);
+            assert_eq!(resolve().await, StatusCode::NOT_FOUND);
+        }
+    }
+}
+
+/// T25: with both `method-webvh` and `method-web` enabled, the
+/// per-method dispatchers must not swallow specific routes like
+/// `/api/health` or other non-DID paths. The dispatchers' suffix
+/// checks (`/did.jsonl`, `/did.json`) only trigger on actual artifact
+/// URLs; anything else falls through to the eventual 404 (or the
+/// daemon's SPA fallback).
+#[tokio::test]
+async fn route_ordering_specific_routes_beat_method_dispatchers() {
+    let (state, _dir) = make_state().await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state)
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ));
+
+    // `/api/trust-tasks` is a specific route; a malformed body must reach
+    // its handler (400), not be swallowed by the catch-all fallback (which
+    // would 404).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/trust-tasks")
+                .body(Body::from("not a document"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "/api/trust-tasks must reach its handler, not be swallowed by method dispatchers"
+    );
+
+    // A URL with no DID suffix and no specific route — both
+    // dispatchers should `Skip`, and the fallback returns 404.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/some/random/path")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "non-DID, non-API URL must 404 through the fallback"
+    );
+
+    // Without a seeded did:web record on `.well-known`, the
+    // `/.well-known/did.json` specific route still returns 404 — but
+    // it must hit the WEB handler, not be intercepted by the WEBVH
+    // dispatcher (which would return 404 for a different reason).
+    // Either way, the test just confirms the specific route reaches a
+    // handler and doesn't 500.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/did.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::OK,
+        "/.well-known/did.json must reach the did:web handler, got {}",
+        response.status()
+    );
+}
+
+fn domain(name: &str, status: DomainStatus) -> DomainEntry {
+    DomainEntry {
+        name: name.into(),
+        label: None,
+        scheme: DomainUrlScheme::Https,
+        status,
+        created_at: 0,
+        default_domain: false,
+        branding: None,
+        witnesses: None,
+        watchers: None,
+        quota: None,
+        well_known_enabled: false,
+        disabled_at: None,
+        purge_at: None,
+    }
+}
+
+/// T21: a request arriving on a different domain than the DID was
+/// issued on must NOT resolve the DID — return 404, not the content.
+/// The disabled-domain case must surface as 503.
+#[tokio::test]
+async fn resolve_side_safety_blocks_cross_domain_and_disabled_domain() {
+    let (state, _dir) = make_state().await;
+
+    // Seed a DID issued on domain-a.example.
+    let mnemonic = "alice";
+    let did_id = "did:webvh:Q1:domain-a.example:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    state
+        .dids_ks
+        .insert_raw(content_log_key(mnemonic), body.as_bytes().to_vec())
+        .await
+        .expect("seed did log");
+    let record = DidRecord {
+        owner: "did:example:owner".into(),
+        mnemonic: mnemonic.into(),
+        created_at: 0,
+        updated_at: 0,
+        version_count: 1,
+        did_id: Some(did_id.into()),
+        content_size: body.len() as u64,
+        disabled: false,
+        disabled_by_admin: false,
+        deleted_at: None,
+        method: "webvh".into(),
+        domain: "domain-a.example".into(),
+        services: None,
+        agent_names: Vec::new(),
+    };
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &record)
+        .await
+        .expect("seed DidRecord");
+
+    // Two active domains; resolution against either is in-policy on
+    // its own DIDs but not on the other's.
+    create_domain(
+        &state.store,
+        &domain("domain-a.example", DomainStatus::Active),
+    )
+    .await
+    .unwrap();
+    create_domain(
+        &state.store,
+        &domain("domain-b.example", DomainStatus::Active),
+    )
+    .await
+    .unwrap();
+
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state.clone());
+
+    // Cross-domain: domain-b is configured, but the DID belongs to
+    // domain-a — must 404, never serve the body.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .header("host", "domain-b.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "cross-domain resolve must 404"
+    );
+
+    // Same-domain happy path: the DID's home domain serves it.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .header("host", "domain-a.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], body.as_bytes());
+
+    // Disable domain-a — same request, same Host, now 503 (not 404).
+    did_hosting_common::server::domain::disable_domain(
+        &state.store,
+        "domain-a.example",
+        0,
+        86_400,
+        "did:example:smoke",
+    )
+    .await
+    .expect("disable domain-a");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .header("host", "domain-a.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "disabled domain must 503"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body_str = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        body_str.contains("disabled") && body_str.contains("domain-a.example"),
+        "503 body should carry maintenance info, got: {body_str}"
+    );
+}
+
+/// Public DID resolution must be reachable from browser-based resolvers on any
+/// origin, so the assembled router advertises `Access-Control-Allow-Origin: *`.
+#[tokio::test]
+async fn public_did_resolution_sets_cors_header() {
+    let (state, _dir) = make_state().await;
+
+    let mnemonic = "alice";
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+
+    // Assemble the router exactly as `run_rest_thread` does: security headers
+    // then the public-resolution CORS layer.
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ))
+        .layer(did_hosting_common::server::public_resolution_cors());
+
+    // A cross-origin browser fetch carries an Origin header.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .header("origin", "https://wallet.example.org")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let acao = response
+        .headers()
+        .get("access-control-allow-origin")
+        .expect("access-control-allow-origin header present")
+        .to_str()
+        .unwrap();
+    assert_eq!(acao, "*", "public DID resolution must allow any origin");
+}
+
+/// The router `run_rest_thread` assembles — resolution, the Trust Task
+/// listener, the DID-serving fallback, then the layers and a trailing
+/// `/api/health` — serves `/{mnemonic}/did.jsonl` through `serve_public` ->
+/// `resolve_webvh::dispatch` -> `serve_content` rather than the default 404
+/// (the regression an upgraded v0.6 -> v0.7 server once hit), and exposes no
+/// management surface: every former `/api/*` route is gone, and only
+/// `POST /api/trust-tasks` answers under `/api`.
+#[tokio::test]
+async fn the_edge_router_serves_resolution_and_no_management_surface() {
+    let (state, _dir) = make_state().await;
+
+    let mnemonic = "mediator";
+    let did_id = "did:webvh:Q1:server.example.com:mediator";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, mnemonic, did_id, &body).await;
+
+    // The EXACT layer/route ordering run_rest_thread assembles: base +
+    // fallback, .with_state, TraceLayer, security_headers,
+    // public_resolution_cors, then a trailing .route("/api/health", ...)
+    // added AFTER the layers.
+    let app = did_hosting_server::routes::router(1 << 20)
+        .with_state(state)
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ))
+        .layer(did_hosting_common::server::public_resolution_cors())
+        // `receive` requires a real `ConnectInfo<SocketAddr>`; a router
+        // driven directly via `.oneshot()` carries no real connection, so
+        // this test supplies the mock the production `MockConnectInfo`
+        // layer used to bake into the router itself.
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ))
+        // Stand-in health handler; only the route SHAPE matters for
+        // reproducing the layering/ordering bug, not the body.
+        .route("/api/health", axum::routing::get(|| async { "ok" }));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/{mnemonic}/did.jsonl"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the edge router must serve /{{mnemonic}}/did.jsonl via the fallback"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], body.as_bytes());
+
+    // The former management routes answer nothing that would act.
+    for (method, uri) in [
+        ("POST", "/api/auth/challenge"),
+        ("POST", "/api/auth/"),
+        ("GET", "/api/dids"),             // retired-name-ok
+        ("PUT", "/api/dids/mediator"),    // retired-name-ok
+        ("DELETE", "/api/dids/mediator"), // retired-name-ok
+        ("PUT", "/api/witness/mediator"),
+        ("GET", "/api/log/mediator"),
+        ("GET", "/api/raw/mediator"),
+        ("PUT", "/api/disable/mediator"),
+        ("PUT", "/api/enable/mediator"),
+        ("GET", "/api/services"),
+        ("GET", "/api/stats"),
+        ("GET", "/api/config"),
+        ("GET", "/api/acl"),
+        ("POST", "/api/acl"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{method} {uri} answered {}",
+            response.status()
+        );
+    }
+
+    // The Trust Task listener is there: a body that is not a document is a
+    // 400, not a 404.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/trust-tasks")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// REGRESSION (v0.6 → v0.7 upgrade parity with the daemon):
+/// `run_first_boot_init` must (1) seed `KS_DOMAINS` from
+/// `public_url` when `bootstrap_domains` is empty, (2) seed
+/// `KS_ASSIGNMENTS` from the same tier chain, and (3) run the M-01
+/// migration so legacy `DidRecord` records with `domain == ""` get
+/// their host backfilled from the embedded `did_id`.
+///
+/// Without this wire-up, an upgraded standalone server emits a
+/// per-resolve "domains keyspace is empty — skipping resolve-side
+/// safety check" warn-log and never enforces the multi-domain
+/// host-match safety check.
+#[tokio::test]
+async fn first_boot_init_seeds_domain_and_backfills_legacy_records() {
+    use did_hosting_common::did_ops::did_key;
+
+    let (state, _dir) = make_state().await;
+
+    // Plant a v0.6-shape DidRecord: `domain` empty, `did_id`
+    // populated so M-01 can derive the host from it.
+    let mnemonic = "mediator";
+    let did_id = "did:webvh:Q1:webvh.example.com:mediator";
+    let legacy = DidRecord {
+        owner: "did:example:owner".into(),
+        mnemonic: mnemonic.into(),
+        created_at: 0,
+        updated_at: 0,
+        version_count: 1,
+        did_id: Some(did_id.into()),
+        content_size: 0,
+        disabled: false,
+        disabled_by_admin: false,
+        deleted_at: None,
+        method: "webvh".into(),
+        domain: String::new(), // legacy state
+        services: None,        // legacy state
+        agent_names: Vec::new(),
+    };
+    state
+        .dids_ks
+        .insert(did_key(mnemonic), &legacy)
+        .await
+        .expect("seed legacy DidRecord");
+
+    // Build a config that mirrors what an upgraded standalone server
+    // looks like: no bootstrap_domains, only the legacy public_url.
+    // The seed should fall through to tier 2 (public_url host).
+    let mut config = (*state.config).clone();
+    config.public_url = Some("https://webvh.example.com".into());
+    config.hosting.bootstrap_domains = Vec::new();
+
+    did_hosting_server::server::run_first_boot_init(
+        &state.store,
+        &config,
+        did_hosting_common::server::migrations::registry(),
+        did_hosting_server::server::FirstBoot::Lenient,
+    )
+    .await
+    .unwrap();
+
+    // 1. KS_DOMAINS now has one entry for the public_url host.
+    let domains = did_hosting_common::server::domain::list_domains(&state.store)
+        .await
+        .expect("list domains");
+    assert_eq!(domains.len(), 1, "exactly one domain seeded");
+    assert_eq!(domains[0].name, "webvh.example.com");
+
+    // 2. KS_ASSIGNMENTS has the matching assignment.
+    let assignments = did_hosting_common::server::assignment::list(&state.store)
+        .await
+        .expect("list assignments");
+    assert_eq!(assignments.len(), 1, "exactly one assignment seeded");
+    assert_eq!(assignments[0].domain, "webvh.example.com");
+
+    // 3. The legacy DidRecord got its `domain` field filled from
+    //    the embedded `did_id` host.
+    let migrated: DidRecord = state
+        .dids_ks
+        .get(did_key(mnemonic))
+        .await
+        .expect("get migrated record")
+        .expect("record present");
+    assert_eq!(migrated.domain, "webvh.example.com");
+
+    // 4. Idempotent: a second invocation is a no-op (markers in
+    //    `meta` keyspace short-circuit the migration; existing
+    //    KS_DOMAINS / KS_ASSIGNMENTS rows make the seeds report
+    //    AlreadySeeded). Just verify no panic / data drift.
+    did_hosting_server::server::run_first_boot_init(
+        &state.store,
+        &config,
+        did_hosting_common::server::migrations::registry(),
+        did_hosting_server::server::FirstBoot::Lenient,
+    )
+    .await
+    .unwrap();
+    let domains = did_hosting_common::server::domain::list_domains(&state.store)
+        .await
+        .expect("list domains after replay");
+    assert_eq!(domains.len(), 1, "second run must be a no-op");
+}
+
+/// `[server.resolve_cache]` reaches the wire: an operator's policy replaces
+/// the default on a successful resolve, and a 404 still says `no-store`.
+#[tokio::test]
+async fn resolve_cache_policy_is_configurable() {
+    let server = ServerConfig {
+        resolve_cache: did_hosting_common::server::config::ResolveCacheConfig {
+            max_age_secs: 30,
+            shared_max_age_secs: Some(600),
+            stale_while_revalidate_secs: Some(60),
+        },
+        ..ServerConfig::default()
+    };
+    let (state, _dir) = make_state_with(server).await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, "alice", did_id, &body).await;
+
+    let app = did_hosting_server::routes::router(1024 * 1024)
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(
+            did_hosting_common::server::security_headers,
+        ));
+
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    let response = get("/alice/did.jsonl").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["cache-control"],
+        "public, max-age=30, s-maxage=600, stale-while-revalidate=60"
+    );
+
+    let response = get("/ghost/did.jsonl").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+}
+
+/// `[server.resolve_rate_limit]` reaches the wire: past the limit a client
+/// address gets 429 with Retry-After on both the DID-serving fallback and the
+/// `.well-known` routes, another address is still served, and the Trust Task
+/// listener is not counted.
+#[tokio::test]
+async fn resolve_rate_limit_refuses_one_address_past_the_limit() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    let server = ServerConfig {
+        resolve_rate_limit: did_hosting_common::server::config::ResolveRateLimitConfig {
+            max_per_window: Some(2),
+            window_secs: 60,
+        },
+        ..ServerConfig::default()
+    };
+    let (state, _dir) = make_state_with(server).await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!("{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\"}}}}");
+    seed_did(&state, "alice", did_id, &body).await;
+
+    let limit = std::sync::Arc::new(
+        did_hosting_common::server::rate_limit::ResolveRateLimiter::new(
+            &state.config.server,
+            &state.client_ips,
+        ),
+    );
+    let app = did_hosting_server::routes::router_with_resolve_limit(1024 * 1024, limit)
+        .with_state(state.clone());
+
+    let send = |method: &'static str, uri: &'static str, peer: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            app.oneshot(request).await.unwrap()
+        }
+    };
+
+    assert_eq!(
+        send("GET", "/alice/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_ne!(
+        send("GET", "/.well-known/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let refused = send("GET", "/alice/did.jsonl", "203.0.113.1:1000").await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(refused.headers().contains_key("retry-after"));
+    assert_eq!(
+        send("GET", "/.well-known/did.jsonl", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    assert_eq!(
+        send("GET", "/alice/did.jsonl", "203.0.113.2:1000")
+            .await
+            .status(),
+        StatusCode::OK,
+        "another address keeps its own budget"
+    );
+    assert_ne!(
+        send("POST", "/api/trust-tasks", "203.0.113.1:1000")
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the Trust Task listener is not counted against resolution"
+    );
+}
+
+/// Resolution answers with a strong ETag, `304` to a matching
+/// `If-None-Match` (weakly compared, lists and `*` included), and compresses
+/// for a client that accepts it — weakening the tag on the encoded form,
+/// which still revalidates.
+#[tokio::test]
+async fn resolution_has_etags_conditional_gets_and_compression() {
+    let (state, _dir) = make_state().await;
+    let did_id = "did:webvh:test:server.example.com:alice";
+    let body = format!(
+        "{{\"versionId\":\"1-test\",\"state\":{{\"id\":\"{did_id}\",\"pad\":\"{}\"}}}}",
+        "x".repeat(4096)
+    );
+    seed_did(&state, "alice", did_id, &body).await;
+    let app = did_hosting_server::routes::router(1024 * 1024).with_state(state);
+    let get = |headers: &[(&str, &str)]| {
+        let mut request = Request::builder().uri("/alice/did.jsonl");
+        for (k, v) in headers {
+            request = request.header(*k, *v);
+        }
+        app.clone().oneshot(request.body(Body::empty()).unwrap())
+    };
+
+    let response = get(&[]).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let tag = response.headers()["etag"].to_str().unwrap().to_string();
+    assert!(tag.starts_with('"'), "strong: {tag}");
+
+    for inm in [
+        tag.clone(),
+        format!("W/{tag}"),
+        format!("\"other\", {tag}"),
+        "*".to_string(),
+    ] {
+        let response = get(&[("if-none-match", &inm)]).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{inm}");
+        assert_eq!(response.headers()["etag"].to_str().unwrap(), tag);
+        assert!(response.headers().contains_key("cache-control"));
+    }
+    let response = get(&[("if-none-match", "\"stale\"")]).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = get(&[("accept-encoding", "gzip")]).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    let weak = response.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(weak, format!("W/{tag}"));
+    let compressed = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert!(
+        compressed.len() < body.len() / 4,
+        "{} bytes",
+        compressed.len()
+    );
+    let response = get(&[("accept-encoding", "gzip"), ("if-none-match", &weak)])
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+}

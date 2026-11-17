@@ -1,0 +1,1156 @@
+# OpenVTC research mono-repo: one Cargo workspace holding the Predicate
+# Credential System (pcs/), the Verifiable Trust Infrastructure services the
+# vetting flows run on (vti/: the VTA, the VTC and their supporting crates) and
+# the OpenVTC client (openvtc/). Every crate in the graph that these projects
+# own is built from the source in this repository; see PROVENANCE.md.
+[workspace]
+members = [
+  "pcs",
+  "vti/cnm-cli",
+  "vti/pnm-cli",
+  "vti/vta-cli-common",
+  "vti/vta-config",
+  "vti/vta-keyspaces",
+  "vti/vta-audit",
+  "vti/vta-backup",
+  "vti/vta-keys",
+  "vti/vta-policy",
+  "vti/vta-sdk",
+  "vti/vta-signing",
+  "vti/vta-support",
+  "vti/vta-tee",
+  "vti/vta-sweepers",
+  "vti/vta-vault",
+  "vti/vta-external",
+  "vti/vta-webvh",
+  "vti/vta-persona",
+  "vti/vta-service",
+  "vti/vta-test-support",
+  "vti/vtc-audit",
+  "vti/vtc-client",
+  "vti/vtc-service",
+  "vti/vti-common",
+  "vti/vti-specs",
+  "vti/vti-specs-core",
+  "vti/vti-specs-rooms",
+  "vti/vti-specs-vta",
+  "vti/vti-specs-vtc",
+  "vti/vti-specs-vtn",
+  "vti/vti-rooms",
+  "vti/vti-rooms-dtg",
+  "vti/vti-rooms-host",
+  "vti/vti-vtn",
+  "vti/vti-trust-task-server",
+  "vti/vti-oob-server",
+  "vti/vti-secrets",
+  "vti/vti-webauthn",
+  "vti/vti-vetting-pcs",
+  "vti/vti-voting",
+  # Test-only: other crates' end-to-end tests run a real room host, witness and
+  # ballot box in process. Everything they depend on is already above.
+  "vti/room-host",
+  "vti/vti-witness",
+  "vti/vti-voting-service",
+  "openvtc/openvtc-core",
+  "openvtc/openvtc",
+]
+resolver = "3"
+
+[workspace.package]
+description = "OpenVTC research mono-repo: PCS, VTI (VTA, VTC) and OpenVTC"
+edition = "2024"
+publish = false
+authors = ["Glenn Gore <glenn@affinidi.com>"]
+rust-version = "1.95.0"
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/OpenVTC/verifiable-trust-infrastructure"
+
+[workspace.dependencies]
+
+# Foreign-language bindings for the mobile engine crate (`vta-mobile-core`).
+uniffi = "0.32"
+
+# Affinidi Trust Development Kit.
+# The enforced-authcrypt fix (affinidi-tdk-rs #671 — `unpack` rejects plaintext
+# / anoncrypt / forged-`from` envelopes by default) landed in 0.8.5, which is
+# why this once carried a minimum-patch pin. Every 0.9+ release is past it, so
+# the floor is now structural rather than a specific patch: do not move this
+# back below 0.9, and do not drop to a bare major.
+# 0.11 re-exports `affinidi-mdoc` 0.3 — see the coupling note on `coset` below.
+# 0.20 moves in lockstep with `trust-tasks-rs` 0.24 and `affinidi-messaging-sdk`
+# 0.30 (affinidi-tdk-rs #901/#902, the mediator-onto-Trust-Tasks-only cut).
+# 0.22 is the affinidi-data-integrity 0.8 / affinidi-bbs 0.4 cascade
+# (affinidi-tdk-rs #918), in lockstep with `affinidi-messaging-sdk` 0.32 and
+# `trust-tasks-rs` 0.26.
+# 0.23 moves in lockstep with `trust-tasks-rs` 0.27 and `affinidi-messaging-sdk`
+# 0.33: one `trust-tasks-rs` in the graph again.
+# 0.24 moves in lockstep with `trust-tasks-rs` 0.28 and `affinidi-messaging-sdk`
+# 0.34 (affinidi-tdk-rs #933).
+# 0.25 moves in lockstep with `trust-tasks-rs` 0.30 and `affinidi-messaging-sdk`
+# 0.35 (affinidi-tdk-rs #940).
+# 0.26 moves in lockstep with `trust-tasks-rs` 0.31 and `affinidi-messaging-sdk`
+# 0.36 (affinidi-tdk-rs #944).
+# 0.27 moves in lockstep with `trust-tasks-rs` 0.32 and `affinidi-messaging-sdk`
+# 0.37 (affinidi-tdk-rs #956).
+# 0.28 moves in lockstep with `trust-tasks-rs` 0.33 and `affinidi-messaging-sdk`
+# 0.38 (affinidi-tdk-rs #963); 0.29 re-exports `affinidi-mdoc` 0.4 (#961), so the
+# two move together (the coupling note on `coset` below).
+# 0.30 carries native did:scid resolution and DIDComm by did:scid identity
+# (affinidi-tdk-rs #965), which `vta_sdk::did_scid` and the create/1.2 path
+# rely on.
+# 0.33 moves in lockstep with `trust-tasks-rs` 0.35 and `affinidi-messaging-sdk`
+# 0.41 (affinidi-tdk-rs #975), and with mediator 0.46.
+# 0.35 goes with `affinidi-messaging-sdk` 0.43 and mediator 0.47.
+# 0.36 goes with `trust-tasks-rs` 0.36, `affinidi-messaging-sdk` 0.44 and
+# mediator 0.48 (affinidi-tdk-rs #978, affinidi-messaging-mediator #46).
+# 0.37 goes with `trust-tasks-rs` 0.37, `affinidi-messaging-sdk` 0.45 and
+# mediator 0.50 (affinidi-tdk-rs #983, affinidi-messaging-mediator #55).
+# 0.45 goes with `trust-tasks-rs` 0.39, `affinidi-messaging-sdk` 0.47 and
+# mediator 0.52. It moves `affinidi-crypto` to 0.3 (the `KeyType` that
+# affinidi-data-integrity 0.8.7 and did-common 0.4.7 carry in their public
+# API), `affinidi-vc` to 0.3, `affinidi-sd-jwt` to 0.2 and `affinidi-mdoc` to
+# 0.6; every one of those moves with it.
+affinidi-tdk = "0.45"
+# Raw crypto primitives (ed25519↔x25519 conversion, did:key helpers). Pulled
+# directly so sealed-transfer can use `affinidi_crypto::did_key::*` without
+# going through the higher-level Secret wrapper in secrets-resolver.
+affinidi-crypto = "0.3"
+# W3C VC Data Model 2.0 + Data Integrity proofs. Used by the
+# provision-integration flow (VP-framed bootstrap request, VC-issued
+# admin authorization). See CLAUDE.md "Authorization claims" principle.
+affinidi-vc = "0.3"
+# `ml-dsa` compiles the ML-DSA-44 cryptosuites (mldsa44-jcs-2024 /
+# -rdfc-2024). Without it `CryptoSuite::default_for_key_type` has no arm for
+# an ML-DSA key, returns `None`, and the signer falls back to Ed25519 — so a
+# post-quantum key cannot sign a credential at all, and says so by naming
+# Ed25519. The same trap was caught for `affinidi-secrets-resolver` (which
+# carries the feature below) and missed here.
+# 0.8 carries `affinidi-bbs` 0.4 in its public API, so the two move together
+# (the `=0.7.13` pin that held 0.7.14's patch-level bbs bump off is gone).
+# 0.8.7: its public `KeyType` is affinidi-crypto 0.3's.
+affinidi-data-integrity = { version = "0.8.7", features = ["ml-dsa"] }
+affinidi-status-list = "0.1.7"
+
+# Credential formats for the credential-centric VTI architecture
+# (docs/05-design-notes/vti-credential-architecture.md). All published on
+# crates.io and validated upstream in the TDK:
+#   - affinidi-sd-jwt-vc  — SD-JWT-VC issue/verify (IETF draft-ietf-oauth-sd-jwt-vc).
+#     Near-term credential path; runs on existing Ed25519/JOSE, no new curve.
+#   - affinidi-bbs        — BBS+ signatures over bls12_381_plus (IETF
+#     draft-irtf-cfrg-bbs-signatures). The unlinkable, selective-disclosure
+#     track. Gated on an independent security audit before signing real
+#     credentials (tasks §0.5).
+#   - affinidi-openid4vp  — OID4VP presentation exchange (DCQL lands upstream
+#     in a later task; this is the published base).
+#   - affinidi-mdoc       — ISO/IEC 18013-5 mdoc, the second credential format
+#     eIDAS 2.0 mandates alongside SD-JWT VC. 0.2.6 added the `IssuerSigned`
+#     CBOR wire codec without which a vault storing opaque bodies could never
+#     re-read what it held. `default-features = false` + `es256`: ISO 18013-5
+#     and the EUDI profiles mandate ES256, which the VTA already has via
+#     `KeyType::P256`, so no new curve enters the graph.
+# The `bbs-2023` Data Integrity cryptosuite lives behind the
+# `affinidi-data-integrity` `bbs-2023` feature, enabled per-consumer where the
+# BBS proof path is wired. If you path-override these to the local TDK for an
+# unreleased change (e.g. DCQL), override the whole interdependent set together
+# to avoid a duplicate-version split.
+affinidi-sd-jwt-vc = "0.3"
+affinidi-sd-jwt = "0.2"
+affinidi-bbs = "0.4"
+affinidi-openid4vp = "0.1.5"
+# The JOSE core under openid4vp: ECDH-ES response decryption (`jwe`) for the
+# VTC's OpenID4VP verifier (#1988).
+affinidi-oid4vc-core = { version = "0.1.11", default-features = false }
+affinidi-mdoc = { version = "0.6", default-features = false, features = ["es256"] }
+# Both already enter the graph through `affinidi-mdoc`; declared here because
+# the mdoc receive path names their types directly (`coset` for the COSE_Sign1
+# `alg` header, `time` for the `validityInfo` window) and depending on a
+# transitive is how a version bump elsewhere breaks an unrelated crate.
+#
+# `coset` and `affinidi-mdoc` move TOGETHER, and `affinidi-tdk` with them.
+# `coset` is in `affinidi-mdoc`'s public API — `IssuerSigned::issuer_auth` is a
+# `pub coset::CoseSign1` — and `affinidi-tdk` re-exports `affinidi-mdoc`. Moving
+# any one of the three alone puts two semver-incompatible copies of a shared
+# type in the graph, which fails as `E0308: mismatched types` in `vta-vault`
+# rather than as a version conflict. That is #1225, and this is what closing it
+# took.
+coset = "0.4"
+time = "0.3"
+# X.509 for the mdoc IACA trust path. `verify-aws` rather than the default
+# `verify` feature: that one pulls `ring`, which currently only reaches this
+# workspace through a dev-dependency, while `aws-lc-rs` is already a real
+# dependency (it replaced `rsa` for KMS CMS unwrap in 0.5). Same crypto, no new
+# production tree.
+x509-parser = { version = "0.18", features = ["verify-aws"] }
+affinidi-openid4vci = "0.2"
+affinidi-secrets-resolver = { version = "0.5.18", features = ["ml-dsa"] }
+# Reliable messaging delivery layer (durable outbox + drain + §5a confirmation)
+# over the MessageTransport contract — the D1 delivery layer the VTI cut-over
+# (D2) wires in. `VtiOutboxStore` (vti-common) backs its OutboxStore with fjall.
+#
+# 0.1.20 is the floor (affinidi-tdk-rs #927): each ack is bounded to 10 s and
+# parked for the retry pass when it runs long, where before one slow delete
+# stopped all inbound dispatch behind it — the node stopped collecting while
+# its socket stayed up. No API change.
+#
+# 0.2 is breaking: an outbox entry records its status scope (`Local` /
+# `Relayed`), a relayed entry with no receipt settles `NoEvidencePath`, and the
+# receipt packer (`AtmReceiptPacker`) emits receipts on request (#2553,
+# VTI-TRN-060 - 064).
+affinidi-messaging-delivery = "0.2.0"
+# Transport-agnostic messaging contract (`MessageTransport`, `Inbound`,
+# `ReceivedMessage`, `MessagingError`) the delivery layer builds on. Referenced
+# directly by services that demux `MessagingService::subscribe()` inbound.
+affinidi-messaging-core = "0.1.12"
+# The messaging SDK, taken directly (not only through `affinidi-tdk`) so a
+# member's `tsp` feature can turn on the SDK's own `tsp` ops (`atm.tsp()`),
+# which `affinidi-tdk/tsp` does not forward. One requirement here rather than a
+# literal per member: five members asked for it by hand, and a literal that
+# lags the others does not fail — it resolves, and the lag only shows when
+# `affinidi-tdk` next moves a minor and the graph splits.
+#
+# It moves in lockstep with `affinidi-tdk` and `trust-tasks-rs`: its public API
+# carries `trust_tasks_rs` types (`MediatorAcl` among them), so a graph holding
+# two `trust-tasks-rs` versions does not compile. `default-features = false` so
+# a member adds only what it needs; `tests/e2e` asks for `default` explicitly.
+#
+# 0.27.1 is a FLOOR: it is the release in which `record_incoming_control`
+# answers a mutual §7.3 cancellation itself (Keyring VTI-38), which is what the
+# VTA's and VTC's `handle_tsp_control` rely on when they stop answering it.
+#
+# 0.30.0 raises the floor again: it is the release that moves in lockstep with
+# `trust-tasks-rs` 0.24 (affinidi-tdk-rs #901/#902 — the mediator serves Trust
+# Tasks only now, its legacy bare `mediator/1.0/{admin,account,acl}-management`
+# protocols removed). A `0.29` copy here alongside `trust-tasks-rs` 0.24 splits
+# the graph on `MediatorAcl` exactly as the comment above describes.
+#
+# 0.32 is the affinidi-data-integrity 0.8 cascade (affinidi-tdk-rs #918); it
+# keeps 0.31.1's behaviour, which this workspace relies on (affinidi-tdk-rs #913):
+# it routes a
+# TSP relationship invite to a peer on another mediator through the mediator
+# the peer's DID document names, which `vti_common::tsp_route` now relies on
+# (VTI-56). And a request collected by Delivery-Request keeps its sender's
+# id, so a reply threads to it (VTI-49). On `^0.31` a lockfile resolving 0.31.0
+# would bring the cross-mediator refusal back with nothing here to catch it.
+#
+# 0.32.1 is the floor (affinidi-tdk-rs #921): before it, a message arriving
+# just after `live_stream_next`'s `wait` elapsed — or after a
+# `live_stream_get` gave up — went to a dropped receiver and was discarded,
+# already delivered by the mediator and never cached. 3–5% of single messages
+# under a 500 ms poll loop. No API change.
+#
+# 0.33.0 is the `trust-tasks-rs` 0.27 release: it shares the workspace's copy,
+# so `MediatorAcl` is one type again.
+#
+# 0.33.2 is the floor (affinidi-tdk-rs #927): `ATMProfile::receive_health()` and
+# `reconnect_websocket()`, which `vti_common::inbox` reports and drives; the
+# receive-leg probe; bounded inbound awaits; and the live stream deleting
+# DIDComm frames it cannot unpack (never one sent to a key we have not
+# loaded). `vti_common::inbox` relies on that last one: it no longer deletes
+# such frames itself, so on 0.33.1 they would stay in the inbox again.
+#
+# 0.34.0 is the `trust-tasks-rs` 0.28 release (affinidi-tdk-rs #933): it shares
+# the workspace's copy, so `MediatorAcl` stays one type. It carries 0.33.2.
+#
+# 0.34.1 is a correctness floor (affinidi-tdk-rs #936). Below it, the websocket
+# watchdog replayed heartbeat ticks missed while disconnected, so after any
+# disconnection longer than ~40 s each new socket was closed as `Missed Pong`
+# within milliseconds, and the VTA/VTC never received again until restarted
+# (VTI-70; seen 2026-10-11 after a DNS outage and after a mediator restart).
+#
+# 0.36.0 is the `trust-tasks-rs` 0.31 release (affinidi-tdk-rs #944), so
+# `MediatorAcl` stays one type. It carries 0.34.1's fix.
+# 0.37.0 is the `trust-tasks-rs` 0.32 release (affinidi-tdk-rs #956), and carries
+# 0.36.3's token-refresh reconnect fix (#955).
+# 0.38.1: a did:scid sender packs and unpacks as itself, `src` in its `skid`
+# (affinidi-tdk-rs #965, VTI-KEY-163).
+# 0.41 is the `trust-tasks-rs` 0.35 release (affinidi-tdk-rs #975), the one
+# mediator 0.46 is built on.
+# 0.43 speaks the `messaging/*` 0.2 tasks (ping, account/*, audit/list,
+# message/status), falling back to 0.1 for a mediator before 0.47
+# (affinidi-tdk-rs #977), and takes and returns its own generated types:
+# `affinidi_tdk::messaging::tasks`, not `trust_tasks_rs::specs::messaging`.
+# Mediator 0.47 serves 0.2 (affinidi-messaging-mediator #40).
+# 0.44 is on `trust-tasks-rs` 0.36 (affinidi-tdk-rs #978).
+# 0.45 is on `trust-tasks-rs` 0.37 (affinidi-tdk-rs #983).
+# 0.47 is on `trust-tasks-rs` 0.39 and delivery 0.2: application receipts,
+# the per-entry status scope and the `messaging/wake/*` client (#2553, #2663).
+# 0.47.2 is the release mediator 0.52 is built on.
+affinidi-messaging-sdk = { version = "0.47.2", default-features = false }
+# Async `Stream` combinators (`StreamExt`, `BoxStream`) for draining the
+# delivery layer's `subscribe()` inbound. Matches the `= "0.3"` pin the
+# services already use directly.
+futures-util = "0.3"
+
+# Decentralized Trust Graph Credentials
+dtg-credentials = "0.14"
+
+# JSON Schema validation (issue-time credentialSchema checks).
+#
+# `default-features = false` to drop `resolve-http` and `resolve-file`, which
+# 0.56 enables by default. Every schema we compile is caller-supplied — a
+# `credentialSchema` at schema registration, an endorsement type's
+# `claimSchema`, and both again at issuance — so with the resolvers on, an
+# external `$ref` makes the VTC fetch a URL or read a local file while
+# compiling it. Nothing we store uses an external `$ref`, and a schema that
+# needs one belongs inlined, so the resolvers buy nothing and cost an
+# admin-reachable SSRF / local-file read. Without them such a schema is
+# refused at compile, which is what `check_schema` and `validator_for` already
+# report to the caller.
+#
+# `idna` is kept: it is the `hostname`/`idn-hostname` format check, pure
+# computation and no I/O. `tls-aws-lc-rs` goes with `resolve-http` — it exists
+# only to fetch over HTTPS.
+jsonschema = { version = "0.60", default-features = false, features = ["idna"] }
+
+# Async runtime. 1.49 stabilised `runtime::Id`, which
+# `vta_sdk::resolver::shared_did_resolver` keys on.
+tokio = { version = "1.49", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "sync",
+  "signal",
+  "time",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+# Surfaces unknown/typo'd keys during deserialization without rejecting them
+# (config.rs unknown-key warning pass).
+serde_ignored = "0.1"
+
+# Error handling
+thiserror = "2"
+
+# Embedded key-value store
+fjall = "3"
+
+# Serialization (JSON)
+serde_json = "1"
+
+# Key derivation (BIP32)
+
+# Identifiers
+uuid = { version = "1.23", features = ["v4", "fast-rng", "serde"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random number generation
+rand = "0.10"
+
+# OpenPGP (rPGP). `cnm vetting bootstrap-pgp` reads a PGP web of trust: keyring
+# parsing, certification and cleartext-signature verification. Default features
+# off — the only default is bzip2 compressed-data support, which neither a
+# keyring nor a cleartext-signed message uses.
+pgp = { version = "0.21", default-features = false }
+
+# DID Web with Verifiable History
+#
+# 0.7 is a security floor, not a preference. Through 0.6.1 `resolve()` rejected
+# IP-literal hosts and nothing else: `did:webvh:{SCID}:localhost%3A<port>` was
+# fetched over plain `http://`, and any other name was fetched from whatever
+# address it resolved to — so a did:webvh DID naming an internal host, or a
+# public name whose A record points at 169.254.169.254, was a resolver-side SSRF
+# for every crate in this workspace that resolves a DID. 0.7 refuses non-public
+# hosts by default (`HostPolicy::PublicOnly`), vets DNS answers before
+# connecting, refuses redirects and ignores `HTTP(S)_PROXY`.
+#
+# A caret on "0.6" would let a resolve land back on 0.6.1 and reintroduce that,
+# which is why this is not a bare major.minor onto the old series.
+#
+# Local webvh stacks (`local-dev/vta-*-webvh-setup.toml`, which publish
+# `http://localhost:3000`) and tests that resolve a listener on 127.0.0.1 must
+# now opt in explicitly with `HostPolicy::AllowPrivate`.
+#
+# 0.8 is the affinidi-data-integrity 0.8 release (its proof types are 0.8's);
+# it moves with `affinidi-did-resolver-cache-sdk` 0.8.41, which resolves on it.
+# 0.8.1: `convert_scid_id_to_webvh_id` and `did_web::to_scid_did_document`, the
+# did:scid form of a log (VTI-KEY-160, VTI-KEY-161).
+didwebvh-rs = "0.8.1"
+
+# URL parsing
+url = "2"
+
+# Cryptography
+#
+# The five crates CLAUDE.md names as crypto deps — `ed25519-dalek`, `hpke`,
+# `jsonwebtoken`, `aes-gcm` and `aws-lc-rs` — carry a full `major.minor.patch`
+# floor, so a resolve can never land below a release we have built and tested
+# against (a CVE fix landing in a patch must not silently regress). Each floor is
+# the patch Cargo.lock held when it was set; raise it when the lock moves past a
+# security fix. They are declared here and nowhere else:
+# `scripts/check-workspace-version-reqs.py` fails on a bare `major` /
+# `major.minor` floor, and on a member declaring one outside the workspace.
+ed25519-dalek = "3.0.0"
+# HPKE for `sealed_transfer` (vta-sdk). The suite is hardcoded (CLAUDE.md,
+# "Sealed-transfer is the only secret-bearing wire format").
+hpke = "0.15.1"
+serde_json_canonicalizer = "0.4"
+sha2 = "0.11"
+# Constant-time byte equality. Used wherever we compare a
+# server-stored hash against a caller-supplied value (e.g.
+# backup-bundle bearer tokens). Already used by vtc-service.
+subtle = "2.6"
+# ULIDs for persona-store record identifiers: the leading 48 bits are a
+# timestamp, so a key-ordered scan is also creation-ordered.
+ulid = { version = "3", features = ["serde"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+multibase = "0.9"
+
+# JWT
+# Switched off `rust_crypto` (the all-algos bundle) because it pulls in
+# the `rsa` crate which is exposed to RUSTSEC-2023-0071 (Marvin Attack
+# timing sidechannel). We use jsonwebtoken only for EdDSA JWTs
+# (`Algorithm::EdDSA` in vti-common/auth/jwt.rs).
+#
+# Use the `aws_lc_rs` backend instead — it provides a single
+# `CryptoProvider` for every algorithm and is already in our dep tree
+# via `aws-sdk-kms`, so we don't add a new transitive. The backend is
+# the AWS-vetted libcrypto fork; same primitives, no `rsa` crate.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+
+# AWS-LC backend used directly by `vti-webauthn` for ECDSA P-256 WebAuthn
+# assertion verification. Already in our dep tree via `jsonwebtoken`'s
+# `aws_lc_rs` feature and via `aws-sdk-kms`; hoisting here so the
+# crypto-pin discipline (CLAUDE.md "Versioning & publishing") applies
+# uniformly. Pin minimum patch — CVE landings should not silently
+# regress.
+aws-lc-rs = "1.19.0"
+
+# Upper bound on `aws-smithy-types`, which we do not use directly.
+#
+# **This is here to constrain the resolver, not because anything calls it.**
+# `aws-smithy-types` 1.7.0 changed `Document::Object` from
+# `HashMap<String, Document>` to a new `DocumentObject`, and added a variant to
+# an enum that is `#[non_exhaustive]` — a breaking change shipped as a MINOR
+# bump. `aws-smithy-json` 0.63.0 declares `aws-smithy-types = "^1.6.1"`, which
+# admits 1.7.0 and then fails to compile against it:
+#
+#   error[E0308]: expected `DocumentObject`, found `HashMap<String, Document>`
+#   error[E0004]: non-exhaustive patterns: `&_` not covered
+#
+# Cargo unifies `aws-smithy-types` to one version across the graph but keeps
+# both `aws-smithy-json` 0.63 and 0.64 (0.x minors are incompatible majors), so
+# the two coexist and only the 0.63 copy breaks. We have both because
+# `aws-sdk-secretsmanager` 1.116.0 moved to json `^0.64.0` while `aws-config`
+# 1.12.0 — its newest release — still wants `^0.63.0`. Both reach us:
+# `vti-secrets` behind `aws-secrets`, and `vta-tee` unconditionally.
+#
+# The lockfile already held 1.6.3, so committed builds were fine and only a
+# fresh resolution broke — which is what `cargo install --path` does unless it
+# is given `--locked`. That is the more common way to meet this, and `--locked`
+# remains the right flag for an install; this bound is what keeps `cargo update`
+# and a lockless build honest too.
+#
+# **Remove this the moment `aws-config` ships a release on json 0.64.** The
+# bound is `< 1.7` rather than `= 1.6.3` so patch releases in the working line
+# are still picked up; it is an exclusion of the break, not a freeze.
+aws-smithy-types = ">=1.6.1, <1.10"
+
+# Trust-Tasks framework — wire-envelope for the trust-task migration
+# initiative (docs/05-design-notes/trust-task-uri-registry.md). On
+# crates.io; the `[patch.crates-io]` git pin that lived here through
+# the pre-publish window is gone. 0.2 adds `v0_2` spec modules
+# (camelCase wire enums + `/0.2` TYPE_URIs) alongside the retained
+# `v0_1` modules — the VTA dual-accepts both during the migration.
+# Bump in lockstep with affinidi-webvh-service when upstream publishes.
+#
+# Pinned to a minimum patch (not bare `0.11`) because 0.11.2 is the first
+# release carrying the `vta/app-state/*` schemas. `schema_index::schema_for`
+# is what `every_served_uri_has_a_published_spec_or_is_tracked_debt` consults,
+# so a resolve that landed on 0.11.0 or 0.11.1 would fail that harness rather
+# than fail quietly — but it would fail as "you are serving unspecced URIs",
+# which reads as an implementation fault instead of a stale dependency. The
+# pin makes the resolver say the true thing instead.
+# SPEC VERSIONS ARE PINNED IN THE `vti-specs-*` CRATES, not here. This entry is
+# the runtime only (`validate`, no prebuilt specification module: they are
+# deprecated, and `all-specs` was ~70 MB of generated Rust peaking at 10+ GB per
+# rustc). The Trust Task types and the Type URI index come from `vti-specs`
+# (`vta_sdk::specs`), generated by `trust-tasks-build` from the versions each
+# `vti-specs-*/trust-tasks.lock` pins — CLAUDE.md, "Pinning a task version".
+# Never turn a family feature back on here or in a crate: a prebuilt module and
+# a generated one are different types, and the index would not know the
+# prebuilt one's version.
+#
+# Until then the schemas the spine validates against came from this crate, so
+# the floors below were floors on schema content; they are history now — the
+# vendored bundles carry the schemas — kept for the incidents they record.
+# 0.18.3 is a FLOOR, not a preference: it is the first release whose
+# `provision/integration/0.3` schema carries `adminScope` and the `context` /
+# `adminScope` summary members. The dispatch spine validates outgoing responses
+# against this crate's embedded schema, so against 0.18.2 a provisioning that
+# fully succeeded comes back as a 500 `responseSchemaViolation` — the members
+# are emitted and the schema rejects them. A caret on "0.18" would let a
+# resolver pick 0.18.2 and reintroduce exactly that.
+#
+# 0.18.9 raises that floor for the same reason one version later: it is the
+# first release carrying the `persona/facet/*` schemas. The spine validates
+# outgoing responses against the embedded schema, so on 0.18.8 a facet write
+# that fully succeeded would come back 500 `responseSchemaViolation` — the
+# members are emitted and the schema has never heard of them. Same failure
+# shape as `adminScope` above, which is why the floor moves rather than the
+# feature being guarded.
+#
+# 0.20.5 raises it again, and this one is a floor on *serving at all* rather
+# than on a response member: it is the first release carrying the
+# `vta/webvh/dids/realign-keys/1.0` schema, and
+# `every_served_uri_has_a_published_spec_or_is_tracked_debt` fails on a
+# dispatched URI the registry has no schema for. Below it the task is not a
+# degraded feature, it is a build that does not pass.
+#
+# 0.21.11 raises it for the same reason: it is the first release carrying
+# `persona/profile/compose` and `persona/attribute/promote`; 0.21.12, of
+# `persona/profile/{retire,reinstate}` and binding `until`; 0.21.14, of
+# `persona/profile/{usage,timeline}` and face `reach`; 0.21.15, of `derived`
+# provenance, attribute `endorsements` and `vtc/invitations/deliver`.
+#
+# 0.22.3 raises it again: it is the first release carrying the `git-ns` family
+# (`trust_tasks_rs::specs::git_ns`), which `all-specs` enables. 0.22 as a whole
+# moved in lockstep with `affinidi-messaging-sdk` 0.27 — see that entry.
+#
+# 0.22.5 raises it for `git-ns/view` 0.2, `git-ns/drift/resolve` 0.1,
+# `git-ns/namespace/reseat` 0.1, `git-ns/bridge/job` 0.2 and `git-ns/bridge/event` 0.2.
+#
+# 0.23.1 raises it again: it is the first release whose `git-ns/view` 0.4
+# declares its proof REQUIRED rather than RECOMMENDED, matching 0.1-0.3
+# (`vtc-service/src/git_ns/tasks.rs`'s dispatch comment and its
+# `GitNsCtx::sender` fallback were written for the RECOMMENDED-era 0.4 and are
+# stale below this floor). `trust-tasks-capability-client` published its own
+# 0.23.1 alongside it — still on `trust-tasks-rs = "^0.23"`, so the bump does
+# not split the graph — and is pinned to match rather than left on the bare
+# `0.23` line.
+#
+# 0.23.4 raises it again: it is the first release carrying `git-ns/view/0.5`,
+# `git-ns/namespace/list/0.1` and `git-ns/repo/list/0.1`
+# (trustoverip/dtgwg-trust-tasks-tf#659), and `auth/passkey/admin-list/0.1`
+# (#658) — `vtc-service/src/git_ns/admin_reads.rs`'s hand-written stand-ins and
+# `trust_tasks::passkey_admin_list_v0_1` were written for the pre-0.23.4 gap
+# and are gone below this floor.
+#
+# 0.23.6 raises it for `vta/health/details` 0.1, `vta/restore/status` 0.1,
+# `auth/revoke-session` 0.2 and `keys/import-wrapping-key` 0.1 — the Trust
+# Tasks that replace `GET /health/details`, the `/auth/sessions` REST routes and
+# `GET /keys/import/wrapping-key`.
+#
+# 0.24 moves in lockstep with `affinidi-tdk` 0.20 / `affinidi-messaging-sdk`
+# 0.30 (the mediator serves Trust Tasks only now — affinidi-tdk-rs #901/#902).
+# 0.24.1 is a FLOOR, not a preference: it is the first release whose generated
+# `auth/passkey/{enroll,invite,update}` 0.1 and `auth/revoke-session` 0.2
+# structs carry the trust-tasks #667 sign-trust-task spec text and are
+# permissive (members `Option`) — a handler dispatching one MUST validate the
+# raw payload against the embedded schema itself
+# (`ValidatedPayload::validate_value` / `parse_spec_payload`) rather than
+# trusting the generated struct's shape.
+#
+# 0.24.2 raises it again: it is the first release carrying `vta/services/
+# rollback/1.1` (trust-tasks #671).
+#
+# 0.24.4 raises it again: it is the first release carrying
+# `trust-task-discovery/0.3` (trust-tasks #677), whose `acceptanceWindow` both
+# VTI nodes advertise (VTI-TRN-047, `vti_common::trust_task::discovery`).
+# `trust-tasks-capability-client` published its own 0.24.4 alongside it, still
+# on `trust-tasks-rs = "^0.24"`, and is pinned to match.
+#
+# 0.24.6 raises it again: it is the first release carrying
+# `vta/contexts/update-did/1.1` (trust-tasks #684), whose nullable `did` is how
+# a context's DID is cleared. Below it `TASK_CONTEXTS_UPDATE_DID_1_1` does not
+# compile, and the dispatch spine has no schema to hold `did: null` to.
+# `trust-tasks-capability-client` is pinned to match, as before.
+#
+# 0.24.7 raises it again: it is the first release carrying the six `git-ns`
+# administrator reads (trustoverip/dtgwg-trust-tasks-tf#686) —
+# `right/list/0.1`, `right/issued-by-departed/0.1`, `bridge/job/list/0.1`,
+# `projection/show/0.1`, `account/list/0.1` and `activity/list/0.1` — which
+# `vtc-service/src/git_ns/admin_reads.rs` serves in place of the REST routes
+# `routes/git_ns.rs` once carried for them.
+#
+# 0.24.8 raises it again: it is the first release carrying
+# `vtc/relationships/revoke/0.2` and `vtc/vetting/vetters/resend/0.2`
+# (trustoverip/dtgwg-trust-tasks-tf#689) — the last two member-facing VTC
+# verbs that kept a bearer-only REST door because no signed document could
+# reach the capacity it authorized: a pairwise relationship-DID revoke, and an
+# administrator resending another member's vetter grant. Both REST routes are
+# retired once these are on the spine (`vtc-service/src/trust_tasks/
+# member_tasks.rs`'s `handle_relationships_revoke_v0_2`, `mod.rs`'s
+# `handle_vetter_resend_v0_2`).
+#
+# 0.24.9 raises it again: it is the first release carrying
+# `vta/metrics/show/0.1`, `vta/attestation/mnemonic-status/0.2` and
+# `vtc/vetting/hidden/publish/0.1` — the last three REST-exception routes,
+# retired in `vta-service/src/routes/vta.rs` (`GET /metrics`),
+# `vta-service/src/routes/attestation.rs` (`GET /attestation/mnemonic`) and
+# `vtc-service`'s `POST /vetting/hidden` handler once these are on the spine.
+#
+# 0.25 is the DTG Credentials v1 release (trustoverip/dtgwg-trust-tasks-tf#691:
+# role VACs, vetted/1 statements, roleVac) and carries the 0.24.9 specs above.
+#
+# 0.25.3 raises it again: it is the first release carrying
+# `vtc/members/step-up-passkey-notice/0.1` (dtgwg-trust-tasks-tf#700) — the
+# notice `vtc-service/src/ceremony/step_up_passkey_notice.rs` sends.
+# `trust-tasks-capability-client` published its own 0.25.3 alongside it, still
+# on `trust-tasks-rs = "^0.25"`, and is pinned to match.
+#
+# 0.25.4 raises it again: it is the first release carrying
+# `vta/webvh/dids/create/1.1` (dtgwg-trust-tasks-tf#702), whose response states
+# `serverless` (Keyring VTI-20) and which `trust_tasks::webvh` serves.
+#
+# 0.26 is the affinidi-data-integrity 0.8 cascade (trust-tasks-tf #705) and
+# carries #702 too, so the floor above holds on this line.
+#
+# 0.26.1 raises it: it is the first release whose `join-requests/status/0.1`
+# carries `resendCredentials` and the delivery members of its response
+# (trust-tasks-tf #709), which `routes::join_requests::status` serves. 0.26.0's
+# generated schema refuses the request member.
+#
+# 0.26.2 raises it: it is the first release carrying
+# `auth/signing-key/enroll/0.2` and `auth/signing-key/authorize/0.1`
+# (trust-tasks-tf #712), which `trust_tasks::signing_key_tasks` serves.
+#
+# The same line carries `vtc/schemas/accepts/*/0.2`,
+# `vtc/join-requests/manifest/0.3` and `vtc/join-requests/submit/0.3`
+# (trust-tasks-tf #710, first released in 0.26.1) — join criteria that state
+# their own admission mode, which `vtc-service` decides by (Keyring VTI-13).
+#
+# 0.27.1 is a FLOOR: it carries `vtc/admin/actions/_shared/0.2` and its
+# list/show/cancel/acknowledge 0.2 (cooling-off actions),
+# `vtc/members/authority-reduction-pending-notice/0.1` and the record type
+# `vtc/operator/offline-write/0.1` (trust-tasks-tf #719). 0.27.0 made git-ns
+# `ActivityItem.source` a typed enum; the VTC builds that response from JSON,
+# so its wire is unchanged.
+#
+# 0.27.3 is a FLOOR: it carries `git-ns/bridge/event/0.4` (`pullRequestOpened`)
+# and `git-ns/bridge/job/0.5` (`closePullRequest`) (trust-tasks-tf #723), which
+# the VTC's pull-request gate (`git_ns::pr_gate`) serves and sends. 0.27.4
+# adds `git-ns/bridge/job/list/0.2` (trust-tasks-tf #727), whose rows carry
+# `closePullRequest` jobs and their pull request `number`. 0.27.5 adds
+# `vtc/vetting/hidden/{withdraw,show}/0.1` and publish/0.1's approver codes
+# (trust-tasks-tf #729), which the VTC's hidden vetting serves. 0.27.6 adds
+# `keys/sign-sshsig/0.1` and the `signSshsig` device capability
+# (trust-tasks-tf #732), which the VTA serves for git commit signing. 0.27.7
+# makes a `pcs-tokens` tick a window of time (`tickNotYet`) and adds
+# publish/0.1's `tickLength`, `signerChanged` and `otherCriterion`
+# (trust-tasks-tf #734). 0.27.8 adds the `auth/oob/*` family (trust-tasks-tf
+# #738), room files — `rooms/blobs/*`, `rooms/records/{put,get,list}/0.2`,
+# `rooms/info`, `rooms/usage`, `rooms/keys/file-key` and the VTC's
+# `vtc/rooms/*` / `vtc/storage/*` (#739) — and the VTA's `external/*`
+# accounts (#740).
+#
+# 0.28.0 is a FLOOR and the breaking line: it is the first release whose
+# `DeclaredErrorCode` carries the specification's `detailsSchema`
+# (`check_details`, trust-tasks-tf #742), which the `rooms/keys/file-key`
+# handler tests check `unknownEpoch` against in place of a hand copy. It also
+# withdraws the rooms 0.1 `notAuthorized` codes in favour of the standard
+# `permissionDenied` (#743), which the room host already answers.
+#
+# 0.30.0 is a FLOOR and the breaking line: `rooms/info` and `rooms/usage`
+# require a proof (trust-tasks-tf #750), which the spine-proof census checks
+# against the rooms arm; below it the census needs an interim exemption for
+# `rooms/info`. 0.29 adds `keys/sign-jws` and `keys/sign-csr` (#749).
+# 0.30.2 is a FLOOR: it adds the `vta/pcs/*` hidden-vetting engine tasks
+# (trust-tasks-tf #756), which `trust_tasks::pcs` serves.
+#
+# 0.31.0 is the breaking line: a `vta-account` storage config names its
+# account's context (trust-tasks-tf #758), which the VTC sends to its VTA.
+# 0.31.1 is the FLOOR: `vtc/oid4vp/identities/list/0.1` (trust-tasks-tf #761),
+# which the VTC serves to its console's Wallet verifier page.
+# 0.31.2 is the FLOOR: `rooms/owner/group/{create,add}` (trust-tasks-tf #763,
+# #766), which `trust_tasks::room_owner_group` serves.
+# 0.31.4 is the FLOOR: rooms/keys/act (with its sealed-room mint refusal) and seal
+# 0.2 (trust-tasks-tf #771, #773).
+# 0.31.5 is the FLOOR: external/credentials/issue 0.2 — batched presigns for
+# direct uploads (trust-tasks-tf #775).
+# 0.31.7: `vta/witness/{open,present,accept}` and the `witness-request`
+# capability (trust-tasks-tf #779), which `trust_tasks::witness` serves.
+# 0.31.8: external/credentials/issue 0.3 — at most 64 presigns a batch,
+# `responseTooLarge` (trust-tasks-tf #781).
+# 0.31.9: `vtc/members/admit` and `vtc/members/make-membership`
+# (trust-tasks-tf #784), whose generated types `trust_tasks::admission_tasks`
+# serves.
+# 0.31.10: `rooms/keys/file-key/0.2` and `rooms/keys/open/0.2`
+# (`unknownEpoch` reason `removed`, trust-tasks-tf #786) and
+# `rooms/keys/act/0.2` (the member is the subject, trust-tasks-tf #787).
+# 0.31.11: `rooms/owner/group/add/0.2` (a repeated admission is
+# answered with its Welcome, trust-tasks-tf #795) and `rooms/keys/act/0.3`
+# (the offer types and `keyPackageNotHeld`, trust-tasks-tf #797).
+# 0.31.11 also: witness 0.2 — `witness/session{,/submit}/0.2` with
+# `memberPresentation`, `vtc/members/personhood/assert/0.2` with
+# `outcomeEvidence`, and `vta/witness/{open,present,accept}/0.2`
+# (trust-tasks-tf #799).
+# 0.31.12: `vta/witness/list/0.1`, reading back stored VWCs with their
+# outcome evidence (trust-tasks-tf #800).
+# 0.31.13: `vtc/registry/sync-jobs/retry/0.2` — a pending job
+# waiting out its backoff can be run now, a held one never (trust-tasks-tf
+# #802).
+# 0.31.14: room revocation (trust-tasks-tf #804) —
+# `rooms/revocations/{put,get}/0.1`, `rooms/owner/revoke/0.1`,
+# `rooms/owner/group/remove/0.2`, `vtc/rooms/community/members/remove/0.2` and
+# the `RevocationList` defs; `rooms/keys/label/0.1` and `rooms/keys/list/0.2` —
+# a member's own private label for each room they hold (trust-tasks-tf #806) —
+# and `vtc/rooms/community/update/0.1`, the 0.2 community-room reads and create,
+# and `vtc/rooms/offers/list/0.2` — a community-owned room's description and
+# tags (trust-tasks-tf #805).
+# 0.31.15: `rooms/keys/act/0.4`, which completes `vtc/rooms/offers/list/0.2`
+# (trust-tasks-tf #810).
+# 0.31.16: `vtc/rooms/memberships/list/0.1`,
+# `rooms/keys/key-package/0.2` and `rooms/keys/act/0.5` — every surface shows a
+# member the same rooms, and finishes an acceptance any other began
+# (trust-tasks-tf #813).
+# 0.32 is the FLOOR (a breaking minor, so every `trust-tasks-*` crate moves with it):
+# `rooms/owner/register/0.2` (the room's revocation list `inForce` / `pending` /
+# `refused`) and `rooms/owner/group/remove/0.3` (`earlierRemovalRefused`), both
+# trust-tasks-tf #821. Its breaks: `SealedRecord` gains `version` (#816, which
+# `pnm rooms file get` now reads), and the device `Capability` enum gains
+# `sign-document` (#819), which this VTA neither grants nor serves.
+# 0.32.1: `vtc/directory/disclosure/0.1` and `vtc/join-requests/manifest/0.4`,
+# which carries the directory's disclosure statement (trust-tasks-tf #823); and
+# `rooms/owner/group/add/0.3` and `rooms/owner/group/renew/0.2`, which settle a
+# pending removal like remove 0.3 (`earlierRemovalRefused`, `hostUnreachable`'s
+# `stage`; trust-tasks-tf #824).
+# 0.32.3: community voting — `voting/*`, `vtc/elections/*`, `vta/pcs/voter/*`
+# and `vta/pcs/vote` (trust-tasks-tf #834), and the `pcsVoter` capability
+# (appended, #835). 0.32.4: `pcs-voter` in device/_shared 0.1 too (#836).
+# 0.32.7: the encrypted levels — `voting/trustees/*`, `voting/ballot/cast-encrypted`,
+# `vta/pcs/{trustee/*,vote-encrypted}` and `pcsTrustee` (#845, #847). 0.32.8:
+# trustees read their ceremony on any board; `vtc/elections/show` carries the
+# election key (#852). 0.32.9: each trustee step on the board is the trustee's
+# signed request, `trusteeStep` (#853). 0.32.10: `vta/pcs/trustee/read`, and
+# trustees read `voting/election/show` on any board (#855).
+# 0.32.3: the `vtc/groups/*` family — create, update, delete, list, show,
+# members/{add,remove,list}, join, leave, requests/{list,decide} and
+# managers/{add,remove} (trust-tasks-tf #831, #833).
+# 0.32.6: vtc/rooms/offers/list/0.3 (renewals of the admissions a member holds),
+# rooms/keys/act/0.6 (completes it) and vtc/groups/bindings/add's
+# `kindNotServed` (trust-tasks-tf #843).
+# 0.32.8: vtc/config/did-hosting/list/0.1 (trust-tasks-tf #849) — the VTA's
+# hosting servers the console offers for `dids.webvh_server`.
+# 0.33.2: vault/credentials/present/0.1 and the `credentialPresent` capability
+# (trust-tasks-tf #871); vta/webvh/dids/create/1.2 — `didMethod` and
+# `scidAlsoKnownAs` (trust-tasks-tf #862).
+# 0.35.3: the lowerCamelCase registry/* versions with record validity windows
+# (trust-tasks-tf #925), and transports that no longer switch every spec family
+# on (#939).
+# 0.36.1: vta/contexts/delete/1.1 (trust-tasks-tf #967). 0.36 marks every
+# prebuilt spec module deprecated in favour of `trust-tasks-build`.
+# 0.36.2: rooms/owner/group/remove/0.4 (trust-tasks-tf #975) and
+# vtc/install/claim/passkey/{start,finish}/0.1 (#976, #978), and `type_index`,
+# which the generated indexes' entries are.
+# 0.37: a stated `expiresAt` replaces the maximum age, up to an expiry horizon
+# (trust-tasks-tf #1021; VTI-OPS-024, VTI-OPS-028). Breaking in behaviour as
+# well as API: a consumer must keep its replay record to `record_expiry`, not
+# `issuedAt + max_age` (`vti_common::trust_task::acceptance::retain_until`).
+# 0.37.2: trust-task-discovery/0.4 (trust-tasks-tf #1030), whose acceptance
+# window carries the expiry horizon every VTI responder advertises
+# (`vti_common::trust_task::discovery::respond_v0_4`). 0.3 is superseded there,
+# and still answered.
+# Only `validate` here, and no crate adds a spec family (see "SPEC VERSIONS ARE
+# PINNED IN THE `vti-specs-*` CRATES" above).
+# 0.39: one copy with `affinidi-messaging-sdk` 0.47 across the boundary, and
+# `validate::SchemaValidator`, a compiled schema the caller keeps (#2622).
+trust-tasks-rs = { version = "0.39.0", default-features = false, features = [
+  "validate",
+] }
+trust-tasks-capability-client = "0.39"
+# The build-time generator behind the `vti-specs-*` crates: each one's build.rs
+# turns the versions its `trust-tasks.lock` pins into Rust types and a Type URI
+# index (`.index(true)`). 0.1.3 is the floor: the first with the index.
+# trust-tasks-rs 0.36.2 above is the runtime that index's entries need
+# (`trust_tasks_rs::type_index`).
+trust-tasks-build = "0.1.3"
+trust-tasks-https = { version = "0.39", default-features = false, features = ["server", "client", "jwt"] }
+# The DIDComm binding. Carries `ENVELOPE_TYPE` — the one `type` every
+# Trust-Task DIDComm message must use, with the `TrustTask<P>` as its body —
+# and the `pack_trust_task`/`unpack_trust_task` pair that enforce it.
+#
+# Taken as a real dependency rather than copying the URI: four hand-written
+# copies had accumulated across this workspace, and the consent push was
+# hand-building its message with the *task* type instead of the envelope type.
+# A conformant peer rejects that, silently, because "not an envelope" is
+# indistinguishable from "not addressed to me". One constant, from the crate
+# that defines it.
+trust-tasks-didcomm = { version = "0.39", default-features = false }
+# The TSP binding. Carries `ENVELOPE_TYPE` — the payload wrapper every
+# Trust-Task TSP frame must use: `{"type": …, "document": …}`.
+#
+# The wrapper exists because TSP, unlike DIDComm, has no message `type` field of
+# its own to carry the binding in and no request path the way HTTPS does — so
+# the JSON payload carries it. That is the whole difference between the three
+# bindings, and the reason each is a crate rather than a convention.
+#
+# Taken as a dependency for the constant rather than writing the URI out, for
+# the same reason the DIDComm one above is: a binding URI written locally is a
+# private dialect the moment the binding moves — and this workspace has been
+# speaking one over TSP.
+#
+# Only the constant is used. The crate's `pack_trust_task*` takes a `PrivateVid`
+# (the sender's raw signing and decryption keys) and a VTA never holds its own
+# keys in that shape; it signs through `operations::keys::sign_payload`, where
+# the context gates live. Using the crate's sealing API needs a signer seam
+# upstream, of the shape `affinidi_data_integrity::Signer` already provides.
+trust-tasks-tsp = { version = "0.39", default-features = false }
+# 0.33.2: a did:scid key named with its `?src=` locator verifies (trust-tasks-tf #863).
+trust-tasks-proof = { version = "0.39.0", default-features = false, features = ["affinidi"] }
+
+# Axum extras (typed headers for Bearer auth)
+axum-extra = { version = "0.12", features = ["typed-header"] }
+
+# Base64 encoding
+base64 = "0.23"
+
+# HTTP client
+reqwest = { version = "0.13", features = ["json"] }
+
+# tonic 0.12.x forces `ring` on tokio-rustls; explicit dep lets main() install aws-lc-rs as the default provider.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+
+# Interactive prompts
+dialoguer = { version = "0.12", features = ["password"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+# Global allocator for the service binaries (their `jemalloc` feature).
+tikv-jemallocator = "0.7"
+# Shell completions for pnm / cnm (`completions <shell>`). Same 4.6 line as clap.
+clap_complete = "4.6"
+
+# Terminal UI
+ratatui = "0.30"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Hoisted to keep version pins consistent across the 3+ crates that use them.
+
+# Web framework — pinned at workspace level so vta-service and vtc-service
+# (and vti-common's axum extractors) never drift onto different majors.
+axum = "0.8"
+tower-http = "0.7"
+tokio-util = "0.7"
+
+ipnetwork = { version = "0.21", features = ["serde"] }
+
+# Local GeoIP lookups for the VTC member portal's wallet sign-in
+# (`vtc-service` `geoip`): reads DB-IP / MaxMind `.mmdb` files from disk, never
+# a network call (base design §12.6). No default features — the file is read
+# into memory, so `mmap` (and its `unsafe`) stays off.
+maxminddb = { version = "0.32", default-features = false }
+
+# OpenAPI 3.1 generation. `utoipa` derives schemas (ToSchema) + per-handler
+# path metadata; `utoipa-axum` (`OpenApiRouter`) makes the router the single
+# source of truth so the served `/openapi.json` can't drift from the routes.
+# The SDK gates its `ToSchema` derives behind its own `openapi` feature so the
+# published artifact stays slim; the services depend on utoipa unconditionally.
+utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.3"
+
+# Used by every CLI (operator config) and both services (config-from-toml).
+toml = "1"
+dirs = "7"
+
+# Hex encode/decode — sealed-transfer producer keys, key fingerprints, etc.
+hex = "0.4"
+
+# Symmetric crypto helpers used by sealed-transfer + storage encryption.
+aes-gcm = "0.11.1"
+hkdf = "0.13"
+
+# HMAC-SHA256 for vti-common's audit-log actor/target identifier
+# hashing. The key is per-community and rotated on RTBF, so a plain
+# SHA-256 over a DID would be reversible by enumeration — see spec
+# §11.1.
+hmac = "0.13"
+
+# Vsock-store deps shared by vti-common's vsock keyspace and the enclave
+# bootstrap; libc is also used by vta-service's vsock-bridge helpers.
+tokio-vsock = "0.7"
+# The blocking listener tokio-vsock wraps: vta-service binds the REST vsock
+# listener with it once at boot and clones it per soft restart, as with TCP.
+vsock = "0.5"
+libc = "0.2"
+
+# Azure secret-store deps shared across SDK + both services.
+azure_security_keyvault_secrets = "1.0"
+azure_identity = "1.0"
+
+# Kubernetes secret-store backend (feature `k8s-secrets`, off by default) for
+# both services. The seed/key material is stored as a hex string inside a
+# namespaced `Secret` resource. `Client::try_default()` auto-detects the
+# in-cluster ServiceAccount or a local kubeconfig, so no auth knobs are needed.
+# `default-features = false` + `rustls-tls` keeps OpenSSL out of the tree (the
+# rest of the workspace is rustls). `k8s-openapi`'s `latest` feature floats the
+# generated API version — fine here, the core/v1 `Secret` shape is long-stable.
+# `kube` and `k8s-openapi` move together: `kube` depends on a specific
+# `k8s-openapi` major, and two copies in the tree make *neither* resolve a
+# version feature — k8s-openapi's build script then panics with "None of the
+# v1_* features are enabled", naming the copy that has none rather than the
+# mismatch that produced it. kube 3.1 is on k8s-openapi 0.27, kube 4.2 on 0.28
+# and kube 5.0 on 0.29. Bumping one without the other is what makes that error
+# appear.
+kube = { version = "5.0", default-features = false, features = [
+  "client",
+  "rustls-tls",
+] }
+k8s-openapi = { version = "0.29", features = ["latest"] }
+
+# Hoist DID-resolver-cache feature drift: every crate uses 0.8 but a few
+# omit the `network` feature. The default here turns it on; dependents
+# that want the offline-only cache can opt out via `default-features = false`.
+#
+# Pinned to a minimum patch (not a bare "0.8") because 0.8.37 is the release
+# that moves did:webvh resolution onto `didwebvh-rs` 0.7 and its
+# `HostPolicy::PublicOnly` default — see the note on `didwebvh-rs` above. This
+# is the crate every DID resolution in the workspace goes through
+# (`DIDCacheClient`), so a resolve that landed on 0.8.36 would leave did:webvh
+# resolution reaching localhost and private addresses while the tree looked
+# current. 0.8.35 did the same for did:web; 0.8.37 makes one
+# `DIDCacheConfigBuilder::with_host_policy` setting govern both.
+# 0.8.39 is the floor: earlier releases resolve a deactivated did:webvh to its last document (SEC-4045 / VGI-04).
+# 0.8.42 resolves a did:scid to its own document, remembers its source per SCID
+# and refuses an older copy of its log (`scid_sources`, VTI-KEY-161/162).
+# 0.8.46 adds did:webs (`did-webs`): a peer's or contact's did:webs verifies
+# when its KERI key event log does (VTI-LNK-052), under the same host policy
+# as the other web methods. Earlier did:webs releases fetched any host the DID
+# named, so the floor is that release, not just the feature. did:webs is one
+# of the methods every node resolves (VTI-KEY-003).
+# 0.8.50 (did-webs 0.12): a recovery rotation supersedes the interaction events
+# after the last establishment event, and what only they anchored (a
+# designation, a revocation, a delegation) stops counting as the identifier's.
+# 0.8.52 resolves with did-webs 0.13; did-webs 0.13.3 resolves a deactivated
+# identifier without keys and bounds verification work per stream.
+affinidi-did-resolver-cache-sdk = { version = "0.8.53", features = ["network", "did-webs", "agent-names"] }
+# The local-only resolvers, for methods that carry their keys in the identifier. Not a
+# second resolver: the cache SDK already depends on this and uses the same types, but does
+# not re-export them, and a verifier promising "no I/O" needs to reach them directly.
+affinidi-did-resolver-traits = { version = "0.1" }
+# Creating and continuing a did:webs (docs/05-design-notes/did-webs-in-the-vta.md):
+# the controller side of affinidi-did-webs, the same release the resolver above
+# reads with. `create` pulls `affinidi-keri` without its LMDB store (did-webs
+# 0.13.1, affinidi-keri 0.8.1): the controller keeps the log in `keri.cesr`.
+affinidi-did-webs = { version = "0.13.4", features = ["create"] }
+affinidi-keri = { version = "0.8.1", default-features = false }
+affinidi-keri-core = "0.8"
+affinidi-keri-crypto = "0.8"
+
+# Agent names — human-memorable `example.com/@alice` shortcuts that resolve to
+# DIDs. Consumed by `vta_sdk::display_name` (feature `agent-names`) for the
+# *reverse* direction only: reading the names a DID's document claims via
+# `alsoKnownAs`, then round-tripping each claim to confirm it leads back to
+# that same DID. Nothing in this workspace publishes an `alsoKnownAs` entry
+# yet, so today this resolves nothing — it is wired so that minting names
+# (a separate piece of work, in `affinidi-webvh-service`) lights up every
+# operator surface without touching a display site.
+agent-names = "0.1.3"
+# The `Document` type `agent-names` and the resolver cache both speak. Only
+# needed where we hand a resolved document to `extract_agent_names`.
+# 0.4.4: the `scid` module, and lookups that match a did:scid key reference
+# by DID and fragment (VTI-KEY-163).
+affinidi-did-common = "0.4.7"
+
+# WebAuthn / passkey infrastructure. Used by vti-common's `passkey` feature
+# for shared enrolment + login ceremonies — both VTA (admin auth, later) and
+# VTC (install + admin login) consume it. The version pin matches what
+# `affinidi-webvh-service` ships against, since we adopt that crate's
+# passkey module pattern.
+webauthn-rs = { version = "0.5", features = [
+  "danger-allow-state-serialisation",
+] }
+
+# Rego (OPA policy language) interpreter. In-process — no OPA sidecar.
+# Used by `vtc-service`'s policy engine (Phase 2 M2.1). Defaults include
+# `arc` so `regorus::Engine` is `Send + Sync` and `full-opa` for the
+# stdlib builtins (regex, time, etc.) that real policies (`join.rego`,
+# `removal.rego`) lean on. Trim later if compile times bite.
+regorus = "0.14"
+
+# OS keyring API (replaces legacy `keyring` v3 crate). keyring-core 1.0 split
+# the API from the backend stores; each binary picks a platform-native store
+# and registers it once at startup via `vta_sdk::keyring_init::install_default_store`.
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", default-features = false, features = ["keychain"] }
+windows-native-keyring-store = "1"
+dbus-secret-service-keyring-store = { version = "1", default-features = false, features = ["crypto-rust"] }
+
+# ---------------------------------------------------------------------------
+# Shared by several members (#2657). One declaration per crate, so a
+# coordinated bump is one edit. A member inherits with `{ workspace = true }`
+# and adds only its own `features` / `optional`; where an entry turns default
+# features off, a member that wants them asks for `features = ["default"]`.
+# ---------------------------------------------------------------------------
+anyhow = "1"
+async-trait = "0.1"
+tempfile = "3"
+# `derive` and the rest are per member.
+zeroize = "1"
+getrandom = "0.4"
+tower = "0.5"
+http-body-util = "0.1"
+wiremock = "0.6"
+metrics = "0.24"
+schemars = "1"
+flate2 = "1"
+unicode-normalization = "0.1"
+ciborium = "0.2"
+# Argon2id: backup-password KDF (vta-backup), admin-invite claim secrets
+# (vtc-service), the passphrase KEK (vti-secrets).
+argon2 = "0.6"
+bip39 = "3"
+p256 = "0.14"
+k256 = "0.14"
+chacha20poly1305 = "0.11"
+# Off by default here: `vti-voting` builds it without the default set, and a
+# member cannot turn defaults off once the workspace entry has them on.
+curve25519-dalek = { version = "5", default-features = false }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Off by default here for the reason `curve25519-dalek` gives: `vtc-service`
+# builds it with `pem` only.
+rcgen = { version = "0.14", default-features = false }
+object_store = { version = "0.14", default-features = false }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+webauthn-rs-proto = "0.5"
+affinidi-rate-limit = "0.1.4"
+# Pinned to the patch every DIDComm decrypt path in the workspace was built
+# against (ECDH-ES+A256KW + A256CBC-HS512 JWEs from `vta-sdk`'s light client).
+affinidi-messaging-didcomm = "0.15.14"
+# The in-process mediator for end-to-end tests; always with its TSP arm.
+affinidi-messaging-test-mediator = { version = "0.52", features = ["tsp"] }
+openmls_rust_crypto = "0.6"
+# Hidden vetting and community voting (`vti-vetting-pcs`, `vti-voting`, and
+# their hosts).
+predicate-credential-system = { path = "pcs", version = "0.1" }
+ark-serialize = { version = "0.6.0", default-features = false, features = ["std"] }
+# Stays on the rand 0.8 line with `rand` 0.8 in those crates (dependabot.yml
+# says why).
+rand_chacha = "0.3"
+# MCP SDK for the `*-mcp` bridges; each member names its transports.
+rmcp = "3"
+# Source parsing for the census tests that read a crate's own code.
+syn = "3"
+
+# ── OpenVTC client (openvtc/) ────────────────────────────────────────────────
+# Only the client uses these. `vta-sdk` and `openvtc-core` are the in-repo
+# crates, so the client is built against exactly the VTA it is tested with.
+openvtc-core = { version = "0.8.0", path = "openvtc/openvtc-core", default-features = false }
+vta-sdk = { version = "0.90", path = "vti/vta-sdk", features = ["session", "client", "keyring", "didcomm", "acl-setup", "provision-client", "vetting", "tsp", "vp"] }
+affinidi-did-web = "0.1.5"
+affinidi-net-guard = "0.1.0"
+arbitrary = { version = "1", features = ["derive"] }
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+byteorder = "1.5"
+console = "0.16"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ed25519-dalek-bip32 = "0.3"
+linux-keyutils-keyring-store = "1"
+secrecy = { version = "0.10", features = ["serde"] }
+strum = "0.28"
+strum_macros = "0.28"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+tokio-stream = "0.1"
+tui-input = "0.15"
+openpgp-card = "0.7"
+card-backend-pcsc = "0.5"
+openpgp-card-rpgp = "0.8"
+
+[profile.dev]
+# macOS defaults this profile to `split-debuginfo = "unpacked"`, which leaves one
+# DWARF-bearing .o file per codegen unit in target/debug/deps. Across this
+# workspace's 903-crate graph that reached 746,803 loose object files and 372G,
+# at which point cargo's own fingerprint/GC pass cost 9m26s on a NO-OP
+# `cargo check` (12% CPU — all filesystem, no compilation). The same check in a
+# clean target dir is 0.21s. Keep debuginfo cheap so it cannot rebuild to that.
+debug = "line-tables-only"
+split-debuginfo = "packed"
+
+# Dependencies are not stepped through; their debug symbols were most of the bulk.
+#
+# They are also optimised. At opt-level 0 the test suites spent their CPU in
+# other people's code: vtc-service re-parses the default Rego policy bundle
+# (regorus) for every test's AppState, and vta-backup's tests derive Argon2id
+# keys at 64 MiB — 89s of one CI run for that crate alone. `"*"` matches only
+# non-workspace packages, so every workspace crate stays at opt-level 0 and an
+# edit-compile-test loop recompiles exactly what it did before; the optimised
+# dependencies are built once. Build scripts and proc macros keep the default
+# `build-override` (opt-level 0), which is right for code run once per build.
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# The browser member's artifact, which is downloaded rather than installed, so
+# its size is a page-load cost paid by every visitor. Separate from `release`
+# because these settings trade compile time and native performance for bytes,
+# which is the right trade for one wasm module and the wrong one for the
+# services.
+#
+# Build with `cargo build -p vti-rooms-wasm --profile wasm-release --target
+# wasm32-unknown-unknown`. `wasm-opt -Oz` on top is worth another slice again,
+# but it is a separate tool and not a cargo concern.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+
+# Workspace-wide lint policy. Every member inherits it with `[lints]
+# workspace = true`, and `scripts/check-workspace-lints.py` fails CI on one that
+# does not. Per-item `#[allow(...)]` overrides are still possible but visible in
+# review.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+# No `unsafe` unless a crate says why it needs it (#2658). `forbid` cannot be
+# lowered by an inner `#[allow]`, so the few crates that do need it (an FFI
+# call, an ioctl, an `env::set_var` in a test) carry their own `[lints]` table
+# — this one, with `unsafe_code = "deny"` — and put `#[allow(unsafe_code)]` on
+# the one item that needs it. `scripts/check-workspace-lints.py` holds those
+# tables to this one in every other respect and keeps their list short.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Style/escape-hatch fences. Crates that want the broader clippy::all
+# default still get it via the `cargo clippy -- -D warnings` CI gate.
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+# There is deliberately no `[patch.crates-io]` here any more.
+#
+# One used to live at this spot, forcing the workspace copy of `vta-sdk` to be
+# the only one in the graph. A transitive dev-dependency pulled our own crate
+# back in from crates.io —
+#
+#   vtc-service [dev-dependencies]
+#     -> affinidi-messaging-test-mediator
+#       -> affinidi-messaging-mediator
+#         -> vta-sdk   (registry, NOT the workspace path copy)
+#
+# — so Cargo.lock carried two `vta-sdk` nodes, and the registry one went stale
+# the instant we published. `cargo publish --locked` verifies dependents against
+# it, so a dependent got built against the PREVIOUS release's source, silently,
+# while the workspace's own path-dep build stayed green. That is how pnm-cli
+# 0.11.2 was verified against vta-sdk 0.19.11 minutes after 0.19.12 shipped, and
+# sat unpublished for three releases.
+#
+# The patch deleted that second node rather than chasing it — but only while the
+# workspace copy satisfied the mediator's requirement on `vta-sdk`. Under 0.x
+# semver a minor bump does not, so the patch silently stopped applying and the
+# node came back, at 0.20 (#797), 0.21 (#887) and 0.22 (#950). Each time the fix
+# was an upstream release widening a requirement, which buys one version of
+# headroom and leaves the cycle in place.
+#
+# affinidi/affinidi-tdk-rs#703 removed the last hop instead. `vta-sdk` is now
+# optional in `affinidi-messaging-mediator` (0.18.13+) behind a default-on `vta`
+# feature, and `affinidi-messaging-test-mediator` already depends on that crate
+# with `default-features = false`, so the chain above no longer reaches
+# `vta-sdk` at all. Nothing pulls a registry copy in, so there is nothing to
+# patch out.
+#
+# `scripts/check-lockfile-self-pins.sh` stays. Its job is to notice a NEW
+# self-pin — some other dev-dependency chain reaching one of our crates. If it
+# ever reports one, the fix is the same choice we faced here: patch it (fast,
+# and it will break again on the next minor bump) or cut the dependency edge
+# upstream (slower, permanent).

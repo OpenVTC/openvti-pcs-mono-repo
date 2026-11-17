@@ -1,0 +1,386 @@
+//! `device/*` slice trust-task handlers.
+//!
+//! A `DeviceBinding` is the device-facing half of an `AclEntry`; these handlers
+//! attach/refresh it on the caller's existing ACL entry. Auth: the caller
+//! (`auth.did`, JWT-authenticated) acts on its **own** binding — registration
+//! requires the DID to already be in the ACL (provision-integration +
+//! acl/swap-key). See dtgwg `device/*`.
+
+use super::helpers::TrustTaskOutcome;
+use serde_json::Value;
+use trust_tasks_rs::TrustTask;
+use vti_specs::device::disable::v0_1 as disable_spec;
+use vti_specs::device::heartbeat::v0_3 as heartbeat_spec;
+use vti_specs::device::list::v0_3 as list_spec;
+use vti_specs::device::register::v0_2 as register_spec;
+use vti_specs::device::set_wake::v0_2 as set_wake_spec;
+use vti_specs::device::wipe::v0_2 as wipe_spec;
+
+use crate::auth::AuthClaims;
+use crate::operations;
+use crate::server::AppState;
+
+use super::helpers::{
+    TRANSPORT_TRUST_TASK, app_error_to_reject, parse_payload, reject_with, success_response,
+};
+use trust_tasks_rs::RejectReason;
+
+/// `device/register/0.2` — the caller claims its DeviceBinding. The DID must
+/// already be in the ACL; re-registration is refused.
+pub(super) async fn handle_register(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let payload: register_spec::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let consumer_kind = match operations::device::wire_kind_to_internal(&payload.consumer_kind) {
+        Ok(k) => k,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let display_name = payload.display_name.to_string();
+    let hpke_public_key = payload.hpke_public_key.as_ref().map(|k| k.to_string());
+    // `attestation` and `keyCustody` are accepted but not yet acted on (spec:
+    // policy input, not gate; verification is a follow-up).
+    //
+    // The UV key rides in `ext` (`org.openvtc.uv-key`) until the registry's
+    // `device/register` carries one; a malformed one refuses the registration.
+    let uv_key = match operations::device::extension_uv_key(
+        payload
+            .ext
+            .iter()
+            .flat_map(|e| e.iter().map(|(k, v)| (k.as_str(), v))),
+    ) {
+        Ok(k) => k,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    if let Err(e) = require_remote_approver(state, auth, uv_key.as_ref()).await {
+        return app_error_to_reject(&doc, e);
+    }
+
+    match operations::device::register_device(
+        &state.acl_ks,
+        &state.audit_sink,
+        auth,
+        consumer_kind,
+        display_name,
+        payload.platform,
+        hpke_public_key,
+        uv_key,
+        TRANSPORT_TRUST_TASK,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// A `remoteApprover` enrolment must name an approver this device may name
+/// (`operations::device::uv_approver_eligible`).
+async fn require_remote_approver(
+    state: &AppState,
+    auth: &AuthClaims,
+    uv_key: Option<&vta_sdk::protocols::device_management::UvKeyEnrolment>,
+) -> Result<(), crate::error::AppError> {
+    use vta_sdk::protocols::device_management::UvKeyMaterial;
+    if !matches!(
+        uv_key.map(|k| &k.key),
+        Some(UvKeyMaterial::RemoteApprover { .. })
+    ) {
+        return Ok(());
+    }
+    let named = super::policy_gate::all_named_approvers(state).await?;
+    operations::device::require_uv_approver_permitted(
+        &state.acl_ks,
+        &auth.did,
+        uv_key,
+        &named,
+        now_unix(),
+    )
+    .await
+}
+
+fn now_unix() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
+}
+
+/// `device/heartbeat/0.3` — periodic check-in; refreshes `lastSeenAt` (and
+/// `platform` or `displayName` if changed) and returns server time + queued
+/// operations.
+///
+/// Two `ext` members ride here because `device/*` has no UV-key task of its
+/// own: `org.openvtc.uv-key` (+ `org.openvtc.uv-key-change` to replace a PIN)
+/// enrols or replaces the UV key, and `org.openvtc.uv-approvers` asks which
+/// DIDs this device may name as its `remoteApprover`; the response then carries
+/// `ext["org.openvtc.uv-approvers"] = { approvers: [...] }`.
+pub(super) async fn handle_heartbeat(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use vta_sdk::protocols::device_management::EXT_UV_APPROVERS;
+    let payload: heartbeat_spec::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    // A malformed key is refused here exactly as `heartbeat_device` would.
+    let uv_key = match operations::device::extension_uv_key(
+        payload
+            .ext
+            .iter()
+            .flat_map(|e| e.iter().map(|(k, v)| (k.as_str(), v))),
+    ) {
+        Ok(k) => k,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let wants_approvers = payload
+        .ext
+        .as_ref()
+        .is_some_and(|e| e.iter().any(|(k, _)| k.as_str() == EXT_UV_APPROVERS));
+    if let Err(e) = require_remote_approver(state, auth, uv_key.as_ref()).await {
+        return app_error_to_reject(&doc, e);
+    }
+
+    let mut body = match operations::device::heartbeat_device_checked(
+        &state.acl_ks,
+        &state.audit_sink,
+        auth,
+        payload.platform.clone(),
+        payload.ext.as_ref(),
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(operations::device::HeartbeatError::UvKeyChange {
+            code,
+            message,
+            details,
+        }) => {
+            return reject_with(
+                &doc,
+                RejectReason::TaskFailed {
+                    reason: format!("device/heartbeat:{code} — {message}"),
+                    details: Some(details),
+                },
+            );
+        }
+        Err(operations::device::HeartbeatError::App(e)) => return app_error_to_reject(&doc, e),
+    };
+
+    if wants_approvers {
+        let named = match super::policy_gate::all_named_approvers(state).await {
+            Ok(n) => n,
+            Err(e) => return app_error_to_reject(&doc, e),
+        };
+        let approvers =
+            match operations::device::uv_approvers(&state.acl_ks, &auth.did, &named, now_unix())
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+        if !body.get("ext").is_some_and(Value::is_object) {
+            body["ext"] = serde_json::json!({});
+        }
+        body["ext"][EXT_UV_APPROVERS] = serde_json::json!({ "approvers": approvers });
+    }
+    success_response(&doc, body)
+}
+
+/// `device/list/0.3` — list the maintainer's registered devices (filtered,
+/// paged by `limit` and `nextCursor`).
+pub(super) async fn handle_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let payload: list_spec::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    match operations::device::list_devices(&state.acl_ks, auth, &payload).await {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `device/disable/0.1` — disable a device by `deviceId`.
+pub(super) async fn handle_disable(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let payload: disable_spec::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let device_id = payload.device_id.to_string();
+    match operations::device::disable_device(&state.acl_ks, &state.audit_sink, auth, &device_id)
+        .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `device/wipe/0.2` — issue a remote wipe for a device by `deviceId`. Marks the
+/// binding wiped + disabled and records the `reason`/`scope`.
+pub(super) async fn handle_wipe(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let payload: wipe_spec::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let device_id = payload.device_id.to_string();
+    let reason = payload.reason.to_string();
+    let scope = payload.scope.to_string();
+    match operations::device::wipe_device(
+        &state.acl_ks,
+        &state.audit_sink,
+        auth,
+        &device_id,
+        &reason,
+        &scope,
+    )
+    .await
+    {
+        Ok(body) => success_response(&doc, body),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// `device/set-wake/0.2` — the device conveys its opaque push WakeHandle; the
+/// VTA records it and computes/returns the trigger allowlist.
+pub(super) async fn handle_set_wake(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let payload: set_wake_spec::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let wake = payload
+        .wake_handle
+        .map(|h| (h.gateway.to_string(), h.handle.to_string()));
+    let suggested = payload
+        .suggested_triggers
+        .unwrap_or_default()
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>();
+    let vta_did = state.config.read().await.vta_did.clone();
+    // Captured before the move into set_wake_device so the (DIDComm-only)
+    // best-effort gateway provisioning below can use them.
+    #[cfg(feature = "didcomm")]
+    let provision_inputs = (wake.clone(), vta_did.clone());
+    match operations::device::set_wake_device(
+        &state.acl_ks,
+        &state.audit_sink,
+        auth,
+        wake,
+        suggested,
+        vta_did,
+    )
+    .await
+    {
+        Ok(body) => {
+            // Best-effort: provision the wake handle's allowlist to the gateway
+            // over DIDComm. Spawned so the device's set-wake returns without
+            // blocking on the gateway round-trip; failure is logged, not
+            // surfaced (the VTA holds the authoritative wake state — a reconcile
+            // pass can re-provision). Only when DIDComm is built and the
+            // `gateway` is a DID (a URL gateway is provisioned over HTTPS —
+            // follow-up).
+            #[cfg(feature = "didcomm")]
+            provision_gateway(state, &provision_inputs.0, &provision_inputs.1, &body);
+            success_response(&doc, body)
+        }
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// The unsigned `push/provision/0.2` request [`provision_gateway`] signs and
+/// sends: `id`, `issuedAt`, `issuer` (this VTA), `recipient` (the gateway).
+#[cfg(feature = "didcomm")]
+pub(crate) fn push_provision_document(
+    vta_did: Option<&str>,
+    gateway: &str,
+    handle: &str,
+    allowed_triggers: Value,
+) -> Value {
+    serde_json::json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": "https://trusttasks.org/spec/push/provision/0.2",
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "issuer": vta_did,
+        "recipient": gateway,
+        "payload": { "handle": handle, "policy": { "allowedTriggers": allowed_triggers } },
+    })
+}
+
+/// Send a `push/provision` to the gateway DID over DIDComm (spawned,
+/// best-effort) carrying the VTA-owned allowlist the set-wake just computed.
+/// The document carries this VTA's Data Integrity proof (`proofPurpose:
+/// authentication`); the gateway does not rely on the DIDComm sender.
+#[cfg(feature = "didcomm")]
+fn provision_gateway(
+    state: &AppState,
+    wake: &Option<(String, String)>,
+    vta_did: &Option<String>,
+    body: &Value,
+) {
+    // Only the DIDComm sends below name this envelope type; TSP's binding has
+    // its own (`vta_sdk::tsp_binding`), so this is unused when the DIDComm
+    // binding is compiled out.
+    #[cfg(feature = "didcomm")]
+    use trust_tasks_didcomm::ENVELOPE_TYPE as TRUST_TASK_ENVELOPE_TYPE;
+
+    let Some((gateway, handle)) = wake.clone() else {
+        return;
+    };
+    if !gateway.starts_with("did:") {
+        return; // URL gateway → HTTPS provisioning (follow-up), not this path.
+    }
+    let Some(triggers) = body
+        .get("triggerPolicy")
+        .and_then(|p| p.get("allowedTriggers"))
+        .cloned()
+    else {
+        return;
+    };
+    let mut provision = push_provision_document(vta_did.as_deref(), &gateway, &handle, triggers);
+    let state = state.clone();
+    tokio::spawn(async move {
+        if !super::sign_outbound_request(&state, &mut provision).await {
+            tracing::warn!(gateway = %gateway, "gateway provision not sent: it could not be signed");
+            return;
+        }
+        match state
+            .didcomm_bridge
+            .send_and_wait(
+                &gateway,
+                TRUST_TASK_ENVELOPE_TYPE,
+                provision,
+                TRUST_TASK_ENVELOPE_TYPE,
+                vta_sdk::protocols::PROBLEM_REPORT_TYPE,
+                15,
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(gateway = %gateway, "push gateway allowlist provisioned"),
+            Err(e) => {
+                tracing::warn!(error = %e, gateway = %gateway, "gateway provision failed (best-effort)")
+            }
+        }
+    });
+}

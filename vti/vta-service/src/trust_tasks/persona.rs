@@ -1,0 +1,4292 @@
+//! Persona trust-task slice (`spec/persona/*`) — authorization.
+//!
+//! The holder's own identity: the attribute pool, the profiles that project
+//! over it, the bindings that assign a profile to a persona DID, and the
+//! contacts peers disclose.
+//!
+//! # The boundary is one-way, and this module is where it is enforced
+//!
+//! The pool and profiles are **agent-scoped**, above every trust context.
+//! Bindings, contacts and disclosure records are **context-scoped**. Nothing
+//! inside a context may read the pool: the holder pushes a materialised
+//! projection down, and a context never pulls.
+//!
+//! That is a rule about *direction* rather than a permission, because the
+//! permission form invites the wrong implementation. An access-control failure
+//! over a readable pool discloses everything; a pool no context can address has
+//! nothing to disclose. `vta-persona`'s key layout provides the second half —
+//! separately addressable prefixes — and [`Reach`] below provides the first.
+//!
+//! # The trap this module exists to avoid
+//!
+//! A guard written as *"is this caller an administrator"* **passes for an
+//! administrator scoped to a single context**, who would then read and write
+//! identity data belonging to every other context. An admin in one context must
+//! be as powerless over the pool as an application in that context.
+//!
+//! The correct gate is [`AuthClaims::require_super_admin`] — `Admin` **and**
+//! unrestricted scope. `vti-common`'s own `act_scope` documentation warns about
+//! the same edge from the other side: an empty context list means *unrestricted*
+//! for `Admin` and *nothing at all* for every other role, so a call site testing
+//! `is_empty()` without the role gets one of the two backwards.
+
+use serde_json::{Value, json};
+use trust_tasks_rs::{ErrorPayload, StandardCode, TrustTask, TrustTaskCode};
+use vta_sdk::trust_tasks as uris;
+use vti_common::error::AppError;
+
+use crate::audit;
+use crate::auth::AuthClaims;
+use crate::server::AppState;
+
+use super::helpers::{
+    TrustTaskOutcome, error_response, parse_payload, reject_with_code, success_response,
+};
+
+/// The family namespace for codes shared across the slice. A proper path prefix
+/// of each task slug, which SPEC §8.5 permits so a family-wide meaning is
+/// defined once.
+const FAMILY_SLUG: &str = "persona";
+
+fn slug_from_doc(doc: &TrustTask<Value>) -> String {
+    doc.type_uri
+        .to_string()
+        .strip_prefix("https://trusttasks.org/spec/")
+        .and_then(|rest| rest.rsplit_once('/'))
+        .map(|(slug, _ver)| slug.to_string())
+        .unwrap_or_else(|| FAMILY_SLUG.to_string())
+}
+
+fn ext(slug: &str, local: &str) -> TrustTaskCode {
+    TrustTaskCode::new_extended(slug, local).expect("persona extended code is grammar-valid")
+}
+
+/// Which side of the boundary a task sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// Reachable only by an **unscoped holder** — `Admin` with unrestricted
+    /// scope. A context-scoped caller is refused whatever its role.
+    Holder,
+    /// Reachable from inside a context, and confined to the caller's own.
+    Context,
+    /// Reachable by any authenticated caller, scoped or not.
+    ///
+    /// One task sits here, and it is not a hole. `renderers/list` returns a
+    /// compile-time constant — the renderer ids this build ships and what each
+    /// one discards — and carries nothing about the holder, any context, or
+    /// any stored state at all.
+    ///
+    /// It needs its own variant because both of the others are wrong for it in
+    /// opposite directions. `Context` refuses the unscoped holder: the payload
+    /// schema has no `contextId`, so there is no context to name, and a
+    /// handler that supplies one from the caller's own claims refuses the
+    /// *most* privileged caller — an `Admin` with an unrestricted (empty)
+    /// context list — while admitting every scoped one. `Holder` would refuse
+    /// the callers who most need it: `disclosure/preview` is context-scoped
+    /// and takes a renderer name, so an application that cannot list renderers
+    /// cannot choose one, and choosing blind is how a holder ends up disclosing
+    /// through a format that silently drops provenance.
+    Any,
+}
+
+/// Every task in the family, paired with the side of the boundary it sits on.
+///
+/// Exhaustive by test. A task cannot join the family without someone deciding
+/// which side it is on, because the census below fails until it appears here —
+/// and defaulting a new task to `Context` is precisely how a pool read would
+/// become reachable from inside one.
+pub const REACH: &[(&str, Reach)] = &[
+    // ── Agent-scoped: the holder's own, above every context ───────────────
+    (uris::TASK_PERSONA_ATTRIBUTE_PUT_1_1, Reach::Holder),
+    (uris::TASK_PERSONA_ATTRIBUTE_GET_1_0, Reach::Holder),
+    (uris::TASK_PERSONA_ATTRIBUTE_LIST_1_0, Reach::Holder),
+    (uris::TASK_PERSONA_ATTRIBUTE_DELETE_1_0, Reach::Holder),
+    (
+        uris::TASK_PERSONA_ATTRIBUTE_PURGE_VERSION_1_0,
+        Reach::Holder,
+    ),
+    // Widens a context's value into the pool; a context that could trigger it
+    // could spread what it was told into everything the holder composes later.
+    (uris::TASK_PERSONA_ATTRIBUTE_PROMOTE_1_1, Reach::Holder),
+    // Can reach the pool (a `share: pool` or held claim) and can bind — even a
+    // compose whose every claim is local. The context-callable way to make a
+    // local face is `local/profile/put`, which cannot reach the pool at all.
+    (uris::TASK_PERSONA_PROFILE_COMPOSE_1_1, Reach::Holder),
+    // Take a face off every context, or make one wearable again — the holder's
+    // decision about their own identity, including for a context-local face.
+    (uris::TASK_PERSONA_PROFILE_RETIRE_1_0, Reach::Holder),
+    (uris::TASK_PERSONA_PROFILE_REINSTATE_1_0, Reach::Holder),
+    // Where a face is worn, and what it has done: the map of which personas
+    // are one face, across every context.
+    (uris::TASK_PERSONA_PROFILE_USAGE_1_0, Reach::Holder),
+    (uris::TASK_PERSONA_PROFILE_TIMELINE_1_1, Reach::Holder),
+    (uris::TASK_PERSONA_PROFILE_PUT_1_1, Reach::Holder),
+    (uris::TASK_PERSONA_PROFILE_GET_1_0, Reach::Holder),
+    (uris::TASK_PERSONA_PROFILE_LIST_1_0, Reach::Holder),
+    (uris::TASK_PERSONA_PROFILE_DELETE_1_0, Reach::Holder),
+    // A world states which of the holder's identities are, to them, parts of
+    // one life — the linkage map the whole family exists to keep from being
+    // assembled by anyone else, written down by the only person entitled to
+    // write it. A context-scoped caller reading one would learn how the holder
+    // arranges every *other* context.
+    (uris::TASK_PERSONA_WORLD_PUT_1_1, Reach::Holder),
+    (uris::TASK_PERSONA_WORLD_LIST_1_0, Reach::Holder),
+    (uris::TASK_PERSONA_WORLD_DELETE_1_0, Reach::Holder),
+    // The critical gate. An application able to call this could bind any
+    // profile to a persona it controls and read the result back through a
+    // disclosure it requests of itself. Every other read leaks; this one is
+    // directly exploitable.
+    (uris::TASK_PERSONA_BINDING_SET_1_0, Reach::Holder),
+    // Reads across every context, so it cannot be context-callable.
+    (uris::TASK_PERSONA_DISCLOSURE_HISTORY_1_0, Reach::Holder),
+    // Returns the linkage map between the holder's identities — the artifact
+    // the whole family exists to keep from being assembled by anyone else.
+    (uris::TASK_PERSONA_CORRELATION_ANALYZE_1_2, Reach::Holder),
+    // ── Context-scoped: confined to the caller's own context ──────────────
+    // Thin by construction: whether a profile is bound, its label, a claim
+    // count. Never contents.
+    (uris::TASK_PERSONA_BINDING_GET_1_0, Reach::Context),
+    (uris::TASK_PERSONA_BINDING_LIST_1_0, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_DELETE_1_0, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_PUT_1_2, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_GET_1_1, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_LIST_1_1, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_LISTS_PUT_1_1, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_LISTS_LIST_1_0, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_LISTS_SHOW_1_0, Reach::Context),
+    (uris::TASK_PERSONA_CONTACT_LISTS_DELETE_1_0, Reach::Context),
+    // The only path by which claim values reach an application — after a
+    // human-visible summary. Being inside a context confers no privilege over
+    // identity data: an application is a verifier, taking the same path as a
+    // stranger's web page.
+    (uris::TASK_PERSONA_DISCLOSURE_PREVIEW_1_0, Reach::Context),
+    (uris::TASK_PERSONA_DISCLOSURE_PRESENT_1_0, Reach::Context),
+    // ── Neither side: the agent's own advertised capabilities ─────────────
+    (uris::TASK_PERSONA_RENDERERS_LIST_1_0, Reach::Any),
+    (uris::TASK_PERSONA_CLAIM_TYPES_LIST_1_0, Reach::Any),
+    // Authoring below the boundary is safe; the rule stops reading across it.
+    (uris::TASK_PERSONA_LOCAL_PROFILE_PUT_1_1, Reach::Context),
+    (uris::TASK_PERSONA_LOCAL_PROFILE_GET_1_0, Reach::Context),
+    (uris::TASK_PERSONA_LOCAL_PROFILE_LIST_1_0, Reach::Context),
+    (uris::TASK_PERSONA_LOCAL_PROFILE_DELETE_1_0, Reach::Context),
+    // Safely context-callable — unlike `binding/set` — because both objects it
+    // names live below the boundary. Its one load-bearing obligation is at the
+    // handler: a `profileId` naming a POOL profile must be refused.
+    (uris::TASK_PERSONA_LOCAL_BINDING_SET_1_0, Reach::Context),
+];
+
+/// The reach of a task, or `None` if this build does not know the URI.
+///
+/// Returning `None` rather than defaulting is deliberate. A task nobody
+/// recognises must not be assumed safe to serve a context-scoped caller, and a
+/// default of `Context` is exactly the shape of the leak this module prevents.
+#[must_use]
+pub fn reach_of(uri: &str) -> Option<Reach> {
+    REACH.iter().find(|(u, _)| *u == uri).map(|(_, r)| *r)
+}
+
+/// Whether this caller has been granted holder authority by name.
+///
+/// Read from the ACL entry per call rather than from the access token, and the
+/// direction matters: a *grant* carried in a JWT outlives its revocation for the
+/// life of the token, so revoking holder authority would leave a window in which
+/// the pool is still readable. (The capability *narrowing* gate reads per call
+/// for the mirror-image reason — see `helpers::require_capability`.)
+///
+/// A store error is not a grant. It is logged with the real reason and answered
+/// as "no", because the alternative — treating an unreadable ACL as permission —
+/// turns a database blip into a boundary crossing.
+/// Whether the caller acts for the holder — the same test [`authorize`] applies
+/// to a holder-reach task, for the members of a context-reach response that
+/// only the holder may read.
+async fn is_holder(state: &AppState, claims: &AuthClaims) -> bool {
+    holder_capability_granted(state, claims).await
+}
+
+async fn holder_capability_granted(state: &AppState, claims: &AuthClaims) -> bool {
+    match vti_common::acl::get_acl_entry(&state.acl_ks, &claims.did).await {
+        Ok(Some(entry)) => vti_common::acl::entry_has_capability(
+            &entry,
+            vti_common::acl::Capability::PersonaHolder,
+        ),
+        // No entry, no grant. Unlike the narrowing gate, there is no role to
+        // fall back to: no role derives this capability.
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!(
+                error = %e, did = %claims.did,
+                "could not read the ACL entry for a persona holder check; refusing"
+            );
+            false
+        }
+    }
+}
+
+/// Gate a persona task on the reach its URI declares.
+///
+/// `Holder` is satisfied exactly one way: an entry granted
+/// [`Capability::PersonaHolder`](vti_common::acl::Capability::PersonaHolder) by
+/// name. A context-scoped admin is refused, and so is an unscoped one — **no
+/// role implies this capability, including super-admin**.
+///
+/// That last part used to be untrue, and the exception was the one credential
+/// most likely to be sitting in a script: a super-admin passed every holder
+/// task without an ACL entry saying so. The capability's whole premise is that
+/// no role carries it, so inheriting it from the broadest role there is left
+/// the premise true only of the roles nobody uses for automation.
+///
+/// A super-admin can of course grant itself the capability — it is the same
+/// credential that grants — so this is not a boundary it cannot cross. It is
+/// the difference between crossing it and crossing it *on purpose*: the grant
+/// is an ACL write, which is audited, reviewable, and revocable on its own,
+/// while the inherited form left no trace that the pool had been read by
+/// something that never asked for it.
+///
+/// The ACL read happens only where it can change the answer — a `Holder` task —
+/// so the context-scoped tasks cost exactly what they did.
+pub async fn authorize(
+    state: &AppState,
+    claims: &AuthClaims,
+    uri: &str,
+    context_id: Option<&str>,
+) -> Result<(), AppError> {
+    let granted = matches!(reach_of(uri), Some(Reach::Holder))
+        && holder_capability_granted(state, claims).await;
+    decide(claims, uri, context_id, granted)
+}
+
+/// The decision itself, given whether the caller holds the capability.
+///
+/// Split from [`authorize`] so the whole matrix — every URI against every role
+/// and scope — is testable without standing up a store. The reach table is the
+/// thing most likely to be got wrong, and a test that needs an `AppState` to
+/// ask about it is a test nobody extends when they add a task.
+fn decide(
+    claims: &AuthClaims,
+    uri: &str,
+    context_id: Option<&str>,
+    holder_granted: bool,
+) -> Result<(), AppError> {
+    match reach_of(uri) {
+        None => Err(AppError::Forbidden(format!(
+            "unknown persona task {uri}: refusing rather than defaulting a reach"
+        ))),
+        Some(Reach::Holder) => {
+            if holder_granted {
+                return Ok(());
+            }
+            Err(AppError::Forbidden(
+                "this task reads or writes the holder's attribute pool, which sits above every \
+                 trust context. It requires an ACL entry granted the `persona-holder` \
+                 capability, and no role carries it — not even super-admin, which is what a \
+                 credential that administers every context does NOT get to read by default. \
+                 Grant it deliberately: `pnm acl update <did> --capabilities \
+                 persona-holder`. An administrator scoped to a context is refused here exactly \
+                 as an application would be."
+                    .into(),
+            ))
+        }
+        Some(Reach::Context) => match context_id {
+            Some(ctx) => claims.require_context(ctx),
+            None => Err(AppError::Validation(
+                "a context-scoped persona task must name the context it acts in".into(),
+            )),
+        },
+        // Authentication is the whole gate. See `Reach::Any` for why this task
+        // does not belong on either side of the boundary, and why supplying a
+        // context on its behalf was a bug rather than a convenience.
+        Some(Reach::Any) => Ok(()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Handlers
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Request and response types come straight from `trust-tasks-rs` rather than
+// hand-written SDK mirrors. `parse_payload` is generic over serde, so the
+// generated types work as-is — and a mirror would be a second definition of the
+// same contract, free to drift from the published schema without anything
+// noticing. The generated types cannot.
+
+use vta_persona::{
+    Listing, PersonaStore, ReleaseRequirement, Sensitivity, ValueType, ValueVisibility,
+    new_attribute,
+};
+use vti_specs::persona as spec;
+
+/// Open the store for this request.
+///
+/// The correlation key is derived per agent and lives beside the at-rest key;
+/// it never leaves the agent, which is what makes the blinded index blinded.
+pub(super) fn store(state: &AppState) -> PersonaStore {
+    PersonaStore::new(state.persona_ks.clone(), state.persona_correlation_key).with_credentials(
+        std::sync::Arc::new(VaultCredentials {
+            vault: state.vault_ks.clone(),
+            resolver: state.trust_task_vm_resolver(),
+        }),
+    )
+}
+
+/// The credential vault, as the persona store derives credential-backed values
+/// from it (`vta_persona::derive`).
+///
+/// A credential backs a value only while it is held, active, not revoked or
+/// expired, inside its validity window, and carries the path. Anything else
+/// is stale — fail closed, and with the reason the holder is shown. A body
+/// that no longer reads, or whose signature no longer verifies, is stale too:
+/// a value nothing can vouch for is not presented as though something did.
+struct VaultCredentials {
+    vault: vti_common::store::KeyspaceHandle,
+    /// Re-verifies an SD-JWT-VC's issuer before its claims are read — a
+    /// `did:web` / `did:webvh` issuer through the DID cache.
+    resolver: vti_common::auth::TrustTaskVmResolver,
+}
+
+#[async_trait::async_trait]
+impl vta_persona::CredentialSource for VaultCredentials {
+    async fn derive(
+        &self,
+        credential_id: &str,
+        claim_path: &str,
+    ) -> Result<vta_persona::Derived, AppError> {
+        use vta_persona::{Derived, StaleReason};
+        use vti_common::vault::VaultStatus;
+
+        let Some(cred) = crate::vault::storage::get(&self.vault, credential_id).await? else {
+            return Ok(Derived::Stale(StaleReason::NotFound));
+        };
+        match cred.lifecycle {
+            VaultStatus::Deleted => return Ok(Derived::Stale(StaleReason::Deleted)),
+            VaultStatus::Archived => return Ok(Derived::Stale(StaleReason::Archived)),
+            VaultStatus::Active => {}
+            // `VaultStatus` is `#[non_exhaustive]`: anything but Active is not a
+            // source to derive from.
+            _ => return Ok(Derived::Stale(StaleReason::Archived)),
+        }
+        match cred.status {
+            crate::vault::CredentialStatus::Revoked => {
+                return Ok(Derived::Stale(StaleReason::Revoked));
+            }
+            crate::vault::CredentialStatus::Expired => {
+                return Ok(Derived::Stale(StaleReason::Expired));
+            }
+            // `Unknown` is the state every credential is stored in until its
+            // status list is read; treating it as withdrawn would make every
+            // credential-backed attribute stale on arrival.
+            crate::vault::CredentialStatus::Valid | crate::vault::CredentialStatus::Unknown => {}
+            // `CredentialStatus` is `#[non_exhaustive]`: a status not known to
+            // leave the credential usable is read as withdrawn.
+            _ => return Ok(Derived::Stale(StaleReason::Revoked)),
+        }
+        let now = chrono::Utc::now();
+        let parse = |t: &Option<String>| {
+            t.as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        };
+        if parse(&cred.valid_until).is_some_and(|u| u <= now) {
+            return Ok(Derived::Stale(StaleReason::Expired));
+        }
+        // Not yet valid: nothing can be derived from it yet.
+        if parse(&cred.valid_from).is_some_and(|f| f > now) {
+            return Ok(Derived::Stale(StaleReason::NotFound));
+        }
+        let Ok(claims) = crate::vault::receive::stored_claims(&cred, &self.resolver).await else {
+            return Ok(Derived::Stale(StaleReason::NotFound));
+        };
+        Ok(match claims.pointer(claim_path) {
+            Some(v) => Derived::Value(v.clone()),
+            None => Derived::Stale(StaleReason::NotFound),
+        })
+    }
+}
+
+/// Insert `key` into a response body only when `value` is `Some`.
+///
+/// `json!` renders a `None` as `null`, and every optional member in this
+/// family's response schemas is typed `string`, `integer` or `date-time` —
+/// none of which accepts null. An unset optional must be **absent**.
+///
+/// This is the response-side twin of the rule `payload_null_census` pins on
+/// the request side in `vta-sdk`, and unlike that side it has no census: the
+/// response-conformance layer catches it at run time in debug builds, which is
+/// the only reason `disclosure/present`'s `credentialId` was ever noticed. Use
+/// this rather than naming an `Option` inside `json!`.
+fn put_opt<T: serde::Serialize>(body: &mut Value, key: &str, value: Option<T>) {
+    if let Some(v) = value {
+        body[key] = json!(v);
+    }
+}
+
+/// Audit a persona task.
+///
+/// `detail` is a short human-readable sentence saying what the operation
+/// *changed*, and it exists because the trail without one is unreadable. Every
+/// write in this family used to record action, actor, resource and outcome and
+/// nothing else, so an entire console audit pane read `persona.attribute.put`
+/// against an opaque ULID, twenty rows deep, with no way to tell a created
+/// attribute from an updated one or a cascade delete from a refused one. The
+/// console was never the problem: `AuditEnvelope` renders `detail` in full as
+/// `detail.reason`, and there was simply nothing to render.
+///
+/// # The attribute VALUE is never recorded — and the reason is LIFETIME
+///
+/// The obvious reading of that rule is an access-control one: that whoever
+/// reads the audit log is less trusted than whoever reads the pool. That
+/// reading is false here, and believing it leads to the wrong conclusion in
+/// both directions.
+///
+/// Persona rows are recorded with `context_id: None`, and
+/// [`crate::operations::audit`]'s `authorize` already refuses every entry not
+/// confined to a named context to anyone but an **unrestricted (super) admin**
+/// — precisely the caller [`Reach::Holder`] admits to `attribute/list`, which
+/// hands back the plaintext values on request. So a value written here would
+/// disclose nothing to anyone who could not already ask for it directly.
+/// Nobody gains a read.
+///
+/// What they gain is a **second copy with a different lifetime**. The audit
+/// keyspace is append-only and pruned on its own retention schedule
+/// (`vta_audit::cleanup_expired_logs`); the pool is deleted when the holder
+/// deletes an attribute. Copy a value across and `attribute/delete` quietly
+/// stops being a delete: the value outlives the record it came from, in a
+/// store the holder's delete does not reach and whose whole point is that it
+/// is not rewritten afterwards.
+///
+/// The distinction is spelled out because "don't log values", stated as a bare
+/// prohibition, is exactly the rule someone relaxes the first time an operator
+/// asks for a more useful trail — and the access-control argument, being
+/// false, does not survive that conversation. The lifetime argument does.
+///
+/// What `detail` may therefore carry: claim **types**, value *types*,
+/// provenance kinds, counts, versions, and identifiers. Each of those
+/// describes the shape of a change without being the personal data, and each
+/// is already reconstructible from the live record — so none of them acquires
+/// a life the record does not have.
+async fn audit_persona(
+    state: &AppState,
+    action: &str,
+    auth: &AuthClaims,
+    resource: Option<&str>,
+    context_id: Option<&str>,
+    detail: Option<&str>,
+) {
+    if let Err(e) = audit::record_with_detail(
+        &state.audit_sink,
+        action,
+        &auth.did,
+        resource,
+        "success",
+        Some(super::helpers::TRANSPORT_TRUST_TASK),
+        context_id,
+        detail,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, action = %action, "audit record failed for persona task");
+    }
+}
+
+/// The `kind` discriminant of a provenance, as the wire spells it.
+///
+/// Matched rather than serialised because only the tag is wanted: serialising
+/// a `CredentialBacked` provenance would carry `credentialId`, `claimPath` and
+/// `issuerDid` into the audit row alongside it, and a claim path is a
+/// description of what an issuer attested about the holder — an attribute with the
+/// same lifetime problem as the value itself.
+fn provenance_kind(p: &vta_persona::Provenance) -> &'static str {
+    match p {
+        vta_persona::Provenance::SelfAsserted => "selfAsserted",
+        vta_persona::Provenance::CredentialBacked { .. } => "credentialBacked",
+        vta_persona::Provenance::Generated { .. } => "generated",
+        vta_persona::Provenance::Derived { .. } => "derived",
+    }
+}
+
+/// The wire spelling of a string-valued enum — `string`, `date`, `high`, …
+///
+/// Via serde rather than a second `match` per enum, so a variant added to
+/// `ValueType` or `Sensitivity` cannot end up spelled one way in a response and
+/// another in the audit row.
+fn wire_name<T: serde::Serialize>(v: T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|j| j.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Map a storage error onto the published error taxonomy.
+///
+/// Authorization failures use the framework's **standard** `permissionDenied`
+/// rather than a task-namespaced synonym: the framework already names this
+/// failure, and a duplicate would tell a client switching on the standard code
+/// that something else went wrong.
+fn reject(doc: &TrustTask<Value>, e: AppError) -> TrustTaskOutcome {
+    let slug = slug_from_doc(doc);
+    let message = e.to_string();
+    let (code, details): (TrustTaskCode, Option<Value>) = match &e {
+        AppError::Forbidden(_) | AppError::Unauthorized(_) => {
+            (StandardCode::PermissionDenied.into(), None)
+        }
+        AppError::NotFound(_) => (ext(&slug, "notFound"), None),
+        // The conflict carries the maintainer's view WITH the rejection. A bare
+        // rejection obliges the caller to re-read, and between the rejection and
+        // the re-read the record can change again — the pattern has no fixed
+        // point under contention.
+        AppError::Conflict(reason) => (
+            ext(&slug, "versionConflict"),
+            Some(json!({ "reason": reason })),
+        ),
+        AppError::Validation(reason) => (
+            StandardCode::MalformedRequest.into(),
+            Some(json!({ "reason": reason })),
+        ),
+        AppError::Gone(_) => (ext(&slug, "revisionReaped"), None),
+        _ => (StandardCode::InternalError.into(), None),
+    };
+
+    let mut payload = ErrorPayload::new(code).with_message(message);
+    if let Some(d) = details {
+        payload = payload.with_details(d);
+    }
+    error_response(doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
+}
+
+/// Refuse a disclosure for want of a fresh approval, with the code
+/// `persona/disclosure/present/1.0` rule 6 declares.
+///
+/// A **specification-extended** code rather than `taskFailed`, because the two
+/// say different things to a client. `taskFailed` means "attempted and could
+/// not complete", and the whole point of this refusal is that nothing was
+/// attempted: the preview is intact and the same request succeeds once the
+/// holder approves. A client that cannot tell those apart cannot offer the
+/// retry, which is the only useful thing it can do here.
+///
+/// The slug comes from the document, like every other extended code in this
+/// slice, so the code and the task it refuses cannot drift into two spellings.
+fn step_up_required(doc: &TrustTask<Value>, details: Value) -> TrustTaskOutcome {
+    let payload = ErrorPayload::new(ext(&slug_from_doc(doc), "stepUpRequired"))
+        .with_message("a claim in this preview requires a fresh approval")
+        .with_details(details);
+    error_response(doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
+}
+
+pub(super) async fn handle_attribute_put(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::attribute::put::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_ATTRIBUTE_PUT_1_1, None).await {
+        return reject(&doc, e);
+    }
+
+    let value_type = match serde_json::to_string(&req.value_type)
+        .ok()
+        .and_then(|s| serde_json::from_str::<ValueType>(&s).ok())
+    {
+        Some(v) => v,
+        None => {
+            return reject(&doc, AppError::Validation("unrecognised valueType".into()));
+        }
+    };
+
+    let provenance: vta_persona::Provenance = match serde_json::to_value(&req.provenance)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+    {
+        Some(p) => p,
+        None => return reject(&doc, AppError::Validation("unrecognised provenance".into())),
+    };
+
+    // Read the discriminant before the value moves into the attribute. Only the
+    // tag survives into the audit row; `provenance_kind` says why the rest of a
+    // `CredentialBacked` provenance must not.
+    let provenance_kind = provenance_kind(&provenance);
+
+    // The holder's own decision, and only where they made one. Absent is not
+    // `normal`: it records that nothing was decided, so the default resolves
+    // from the claim-type registry at every read and a later tightening of that
+    // registry protects the attributes already in the pool.
+    //
+    // Through the wire spelling rather than a match, for the reason `valueType`
+    // above takes the same route: the generated enum is `#[non_exhaustive]`, so
+    // a match needs a wildcard arm, and a wildcard arm is where a variant added
+    // upstream would land silently.
+    let sensitivity: Option<Sensitivity> = match req.sensitivity.as_ref() {
+        None => None,
+        Some(s) => match serde_json::to_value(s)
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok())
+        {
+            Some(parsed) => Some(parsed),
+            None => {
+                return reject(
+                    &doc,
+                    AppError::Validation("unrecognised sensitivity".into()),
+                );
+            }
+        },
+    };
+
+    // Same route as `sensitivity` above, and for the same reason: through the
+    // wire spelling rather than a match, because the generated enum is
+    // `#[non_exhaustive]` and a wildcard arm is where a variant added upstream
+    // would land silently.
+    let release: Option<ReleaseRequirement> = match req.release.as_ref() {
+        None => None,
+        Some(r) => match serde_json::to_value(r)
+            .ok()
+            .and_then(|v| serde_json::from_value(v).ok())
+        {
+            Some(parsed) => Some(parsed),
+            None => {
+                return reject(&doc, AppError::Validation("unrecognised release".into()));
+            }
+        },
+    };
+
+    let mut attribute = new_attribute(
+        req.type_.to_string(),
+        value_type,
+        req.value.clone(),
+        provenance,
+    );
+    if let Some(id) = &req.attribute_id {
+        attribute.attribute_id = id.to_string();
+    }
+    attribute.label = req.label.as_ref().map(|l| (**l).clone());
+    attribute.sensitivity = sensitivity;
+    attribute.release = release;
+
+    // An endorsement the holder cannot produce is not one: every id must name
+    // a credential the vault holds (a soft-deleted one does not count). It
+    // never touches provenance — see `Attribute::endorsements`.
+    let endorsements: Vec<String> = req
+        .endorsements
+        .iter()
+        .flatten()
+        .map(|e| e.to_string())
+        .collect();
+    let mut missing = Vec::new();
+    for id in &endorsements {
+        match crate::vault::storage::get(&state.vault_ks, id).await {
+            Ok(Some(c)) if c.lifecycle != vti_common::vault::VaultStatus::Deleted => {}
+            Ok(_) => missing.push(id.clone()),
+            Err(e) => return reject(&doc, e),
+        }
+    }
+    if !missing.is_empty() {
+        return reject_with_code(
+            &doc,
+            ext(&slug_from_doc(&doc), "endorsementNotFound"),
+            format!(
+                "{} endorsement(s) name a credential the vault does not hold",
+                missing.len()
+            ),
+            Some(json!({ "credentialIds": missing })),
+        );
+    }
+    attribute.endorsements = endorsements;
+
+    let attribute_id = attribute.attribute_id.clone();
+    let s = store(state);
+
+    // A credential-backed attribute names a credential the vault must hold in a
+    // state its value can be derived from; one it cannot is refused with the
+    // specification's code, before anything is written (rule 3). The store
+    // makes the same check, so no other path can store one.
+    match s.credential_refusal(&attribute.provenance).await {
+        Ok(Some(reason)) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug_from_doc(&doc), "credentialNotFound"),
+                format!(
+                    "the credential behind this attribute cannot back it ({})",
+                    wire_name(reason)
+                ),
+                None,
+            );
+        }
+        Ok(None) => {}
+        Err(e) => return reject(&doc, e),
+    }
+
+    let written = match s.put(attribute, req.expected_version.map(|v| *v)).await {
+        Ok(w) => w,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // Advisory, and computed after the write because the write has already
+    // applied — a maintainer must not refuse on correlation grounds. The
+    // holder decides. Read back rather than taken from the request: a
+    // credential-backed value is the credential's, which the store wrote in
+    // place of the one supplied.
+    let value = s
+        .get(&attribute_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|a| a.value);
+    let shared = match &value {
+        Some(v) => s.correlation_count(v, &attribute_id).await.unwrap_or(0),
+        None => 0,
+    };
+
+    // A sensitivity override points either way — `normal` on a card is a
+    // holder deciding their own tooling may show it — so the row records the
+    // decision and not merely that a write happened. Without it a holder
+    // reviewing the trail cannot see when the withholding stopped.
+    let sensitivity_note = match sensitivity {
+        Some(s) => format!(", sensitivity {} set by the holder", wire_name(s)),
+        None => String::new(),
+    };
+
+    // Recorded for the same reason, and it matters more here: `release` decides
+    // what it takes to let the value LEAVE, so a holder relaxing their own card
+    // from `stepUp` to `consent` is the single most consequential thing this
+    // task can do. A trail that showed only "attribute updated" would not let
+    // them find the moment the gate came off.
+    let release_note = match release {
+        Some(r) => format!(", release {} set by the holder", wire_name(r)),
+        None => String::new(),
+    };
+
+    // Type, value TYPE, provenance kind and version — never `value`. See
+    // `audit_persona` for why that line is drawn on lifetime rather than on
+    // who may read the row.
+    let detail = format!(
+        "{} attribute {attribute_id}: claim type {}, valueType {}, provenance {}{}{}, now at \
+         version {}",
+        if written.created {
+            "created"
+        } else {
+            "updated"
+        },
+        req.type_.as_str(),
+        wire_name(value_type),
+        provenance_kind,
+        sensitivity_note,
+        release_note,
+        written.version,
+    );
+    audit_persona(
+        state,
+        "persona.attribute.put",
+        auth,
+        Some(&attribute_id),
+        None,
+        Some(&detail),
+    )
+    .await;
+
+    // Where the edit landed. Nothing references a brand-new attribute, so a
+    // create has nothing to report and the scan is skipped.
+    let reach = if written.created {
+        vta_persona::AttributeReach::default()
+    } else {
+        s.attribute_reach(&attribute_id).await.unwrap_or_default()
+    };
+
+    let mut body = serde_json::json!({
+        "attributeId": attribute_id,
+        "version": written.version,
+        "wasCreated": written.created,
+        "updatedAt": chrono::Utc::now().to_rfc3339(),
+        "correlation": {
+            "severity": if shared > 0 { "high" } else { "none" },
+            "sharedWithProfileCount": shared,
+        },
+    });
+    if !reach.refreshed.is_empty() {
+        body["refreshed"] = reach
+            .refreshed
+            .iter()
+            .take(256)
+            .map(|r| {
+                json!({
+                    "profileId": r.profile_id,
+                    "contextId": r.context_id,
+                    "personaDid": r.persona_did,
+                })
+            })
+            .collect();
+    }
+    if !reach.held_by_pin.is_empty() {
+        body["heldByPin"] = reach
+            .held_by_pin
+            .iter()
+            .take(256)
+            .map(|h| json!({ "profileId": h.profile_id, "pinVersion": h.pin_version }))
+            .collect();
+    }
+    success_response(&doc, body)
+}
+
+/// `persona/attribute/get/1.0` — one attribute, by identifier.
+///
+/// The narrow read. Its absence is why a client wanting one value called
+/// `attribute/list` with a type prefix and filtered the answer: revealing one
+/// email address decrypted every email address the holder has, and the audit
+/// trail recorded a listing of the pool rather than a decision about one fact.
+pub(super) async fn handle_attribute_get(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::attribute::get::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_ATTRIBUTE_GET_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    let attribute_id = req.attribute_id.to_string();
+    let visibility = ValueVisibility::from_flags(req.include_value, req.include_sensitive);
+    let read = match store(state)
+        .get_attribute(&attribute_id, req.version.map(|v| v.0.get()), visibility)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return reject(&doc, e),
+    };
+
+    let (attribute, withheld) = match read {
+        vta_persona::AttributeRead::Found {
+            attribute,
+            withheld,
+        } => (attribute, withheld),
+        vta_persona::AttributeRead::NotFound => {
+            return reject_with_code(
+                &doc,
+                ext(&slug_from_doc(&doc), "notFound"),
+                "no attribute at that identifier",
+                None,
+            );
+        }
+        // Distinct from `notFound` on purpose: the attribute is there and its
+        // current value is readable. Answering a question about the past with
+        // the present would be the one thing `version` exists to prevent.
+        vta_persona::AttributeRead::RetainedGone => {
+            return reject_with_code(
+                &doc,
+                ext(&slug_from_doc(&doc), "versionPurged"),
+                "that version is no longer held — the holder purged it",
+                Some(json!({ "attributeId": attribute_id })),
+            );
+        }
+    };
+
+    // Audited like a listing, and for the same reason: this reads the holder's
+    // identity. The row says whether plaintext left, which is the question a
+    // holder reviewing the trail actually has — and never the value.
+    let detail = format!(
+        "read {} at version {}; value {}",
+        attribute.r#type,
+        attribute.version,
+        match (attribute.value.is_some(), withheld) {
+            (true, _) => "returned",
+            (false, true) => "withheld as sensitive",
+            (false, false) => "not requested",
+        }
+    );
+    audit_persona(
+        state,
+        "persona.attribute.get",
+        auth,
+        Some(&attribute_id),
+        None,
+        Some(&detail),
+    )
+    .await;
+
+    let mut body = json!({ "attribute": attribute });
+    if withheld {
+        body["valueWithheld"] = json!(true);
+    }
+    // Names versions, never their values — what a holder needs to see before
+    // deciding to purge, which otherwise asks them to act blind.
+    let retained: Vec<u64> = attribute
+        .retained_versions
+        .iter()
+        .map(|r| r.version)
+        .chain(std::iter::once(attribute.version))
+        .collect();
+    if !retained.is_empty() {
+        body["retainedVersions"] = json!(retained);
+    }
+    success_response(&doc, body)
+}
+
+pub(super) async fn handle_attribute_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::attribute::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_ATTRIBUTE_LIST_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    // Values are withheld unless asked for: the common case — rendering a
+    // picker — needs type and label, not plaintext. `includeSensitive` widens
+    // that request and can never be the member that introduces plaintext on its
+    // own, so the two collapse into one visibility here rather than travelling
+    // as a pair every reader has to remember the fourth state of.
+    let visibility = ValueVisibility::from_flags(req.include_values, req.include_sensitive);
+    let s = store(state);
+    let prefix = req.type_prefix.as_ref().map(|p| p.as_str());
+    let listing = match s.list_attributes(prefix, visibility).await {
+        Ok(l) => l,
+        Err(e) => return reject(&doc, e),
+    };
+
+    let detail = list_detail(&listing, visibility, prefix);
+    audit_persona(
+        state,
+        "persona.attribute.list",
+        auth,
+        None,
+        None,
+        Some(&detail),
+    )
+    .await;
+    success_response(
+        &doc,
+        serde_json::json!({ "attributes": listing.attributes }),
+    )
+}
+
+/// What a listing did, for the audit trail.
+///
+/// A read is audited at all because this one enumerates the holder's identity;
+/// what makes the row worth keeping is which of the three listings it was. A
+/// trail in which "showed me the names" and "handed a process every card
+/// number" are the same row cannot answer the question a holder reviewing it
+/// actually has.
+///
+/// Counts, a claim-type prefix and the visibility — never a value. See
+/// [`audit_persona`] for why that line is drawn on lifetime rather than on who
+/// may read the row: `attribute/list` hands the values themselves to exactly
+/// the caller who can read the audit log, so a value here would disclose
+/// nothing new and would outlive the record it came from.
+fn list_detail(listing: &Listing, visibility: ValueVisibility, prefix: Option<&str>) -> String {
+    let scope = match prefix {
+        Some(p) => format!(" under {p}"),
+        None => String::new(),
+    };
+    let plaintext = match visibility {
+        ValueVisibility::Metadata => "metadata only, no values".to_string(),
+        ValueVisibility::Ordinary => format!(
+            "values included, {} sensitive value(s) withheld",
+            listing.withheld_sensitive
+        ),
+        ValueVisibility::All => "values included, sensitive values included".to_string(),
+    };
+    format!(
+        "listed {} attribute(s){scope}: {plaintext}",
+        listing.attributes.len()
+    )
+}
+
+pub(super) async fn handle_attribute_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::attribute::delete::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_ATTRIBUTE_DELETE_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    let id = req.attribute_id.to_string();
+    let out = match store(state).delete(&id, req.cascade).await {
+        Ok(o) => o,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // `existed` is the half a reader cannot reconstruct afterwards: the record
+    // is gone either way, so a row that only says "delete" cannot distinguish a
+    // removal from a no-op against a typo'd id.
+    let detail = format!(
+        "attribute {id} {}; cascade {}; removed from {} profile(s)",
+        if out.existed {
+            "deleted"
+        } else {
+            "did not exist"
+        },
+        req.cascade,
+        out.referring_profiles.len(),
+    );
+    audit_persona(
+        state,
+        "persona.attribute.delete",
+        auth,
+        Some(&id),
+        None,
+        Some(&detail),
+    )
+    .await;
+    success_response(
+        &doc,
+        serde_json::json!({
+            "attributeId": id,
+            "existed": out.existed,
+            "removedFromProfiles": out.referring_profiles,
+        }),
+    )
+}
+
+pub(super) async fn handle_attribute_purge_version(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::attribute::purge_version::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // Holder-only: it destroys pool data, and pool data is not any context's.
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_ATTRIBUTE_PURGE_VERSION_1_0,
+        None,
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+
+    let id = req.attribute_id.to_string();
+    let versions: Option<Vec<u64>> = req
+        .versions
+        .as_ref()
+        .map(|vs| vs.iter().map(|v| v.get()).collect());
+    let s = store(state);
+
+    // The current value is `delete`'s, never this task's. Checked here so the
+    // refusal carries the specification's code; the store refuses it too.
+    if let (Some(asked), Ok(Some(current))) = (&versions, s.get(&id).await)
+        && asked.contains(&current.version)
+    {
+        return reject_with_code(
+            &doc,
+            ext(&slug_from_doc(&doc), "currentVersion"),
+            format!(
+                "version {} is the current value; remove it with persona/attribute/delete",
+                current.version
+            ),
+            None,
+        );
+    }
+
+    let out = match s.purge_versions(&id, versions.as_deref()).await {
+        Ok(o) => o,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // Versions and face ids, never values: what was destroyed must not be
+    // re-recorded in a store the purge does not reach.
+    let detail = format!(
+        "attribute {id}: purged {} kept version(s) {:?}; {} face(s) left presenting that \
+         entry as stale",
+        out.purged.len(),
+        out.purged,
+        out.stale_pins.len(),
+    );
+    audit_persona(
+        state,
+        "persona.attribute.purge_version",
+        auth,
+        Some(&id),
+        None,
+        Some(&detail),
+    )
+    .await;
+
+    let mut body = json!({ "attributeId": id, "purged": out.purged });
+    if !out.stale_pins.is_empty() {
+        body["stalePins"] = out
+            .stale_pins
+            .iter()
+            .take(256)
+            .map(|h| json!({ "profileId": h.profile_id, "pinVersion": h.pin_version }))
+            .collect();
+    }
+    success_response(&doc, body)
+}
+
+// ─── Profiles ────────────────────────────────────────────────────────────
+
+pub(super) async fn handle_profile_put(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::put::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_PUT_1_1, None).await {
+        return reject(&doc, e);
+    }
+
+    // Entries round-trip through JSON into our own model. The generated
+    // ProfileEntry and ours describe the same four shapes; going through the
+    // wire form means the untagged discrimination is exercised exactly as a
+    // peer's document would exercise it, rather than by a hand-written match
+    // that could disagree with the schema.
+    let entries: Vec<vta_persona::ProfileEntry> = match serde_json::to_value(&req.entries)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+    {
+        Some(e) => e,
+        None => {
+            return reject(
+                &doc,
+                AppError::Validation("unrecognised profile entry".into()),
+            );
+        }
+    };
+
+    // A slot answers one question with one entry, so a face repeating one is
+    // refused whole, naming the slot. Checked here to carry the spec's code;
+    // the store refuses it too, so no other write path can store one.
+    if let Some(slot) = vta_persona::model::duplicate_slot(&entries) {
+        return reject_with_code(
+            &doc,
+            ext(&slug_from_doc(&doc), "duplicateSlot"),
+            format!("two entries of this face both claim the slot {slot}"),
+            Some(json!({ "slot": slot })),
+        );
+    }
+
+    // A pin to a version this VTA neither holds nor kept presents nothing from
+    // the moment it is written. Refused with the specification's code, naming
+    // the pins, so a caller can repin rather than guess.
+    match store(state).unavailable_pins(&entries).await {
+        Ok(missing) if !missing.is_empty() => {
+            return reject_with_code(
+                &doc,
+                ext(&slug_from_doc(&doc), "pinnedVersionUnavailable"),
+                format!(
+                    "{} pin(s) name a version this VTA does not hold",
+                    missing.len()
+                ),
+                Some(json!({
+                    "pins": missing
+                        .iter()
+                        .map(|(a, v)| json!({ "attributeId": a, "pinVersion": v }))
+                        .collect::<Vec<_>>(),
+                })),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return reject(&doc, e),
+    }
+
+    let mut profile = vta_persona::new_profile(req.name.to_string(), entries);
+    if let Some(id) = &req.profile_id {
+        profile.profile_id = id.to_string();
+    }
+    profile.credential_refs = req.credential_refs.iter().map(|c| (**c).clone()).collect();
+    // Through the wire spelling: the generated enum is `#[non_exhaustive]`,
+    // and a reach this build cannot read must be refused, not widened to
+    // anywhere.
+    //
+    // Absent keeps the face's current reach — the one member a put does not
+    // reset by omission. A reach is a restriction the holder set, and a client
+    // written before it existed would otherwise lift it with every edit.
+    match &req.reach {
+        Some(r) => match serde_json::to_value(r)
+            .ok()
+            .and_then(|v| serde_json::from_value::<vta_persona::FaceReach>(v).ok())
+        {
+            Some(reach) => profile.reach = reach,
+            None => return reject(&doc, AppError::Validation("unrecognised reach".into())),
+        },
+        None => match store(state).get_profile(&profile.profile_id).await {
+            Ok(Some(existing)) => profile.reach = existing.reach,
+            Ok(None) => {}
+            Err(e) => return reject(&doc, e),
+        },
+    }
+    let profile_id = profile.profile_id.clone();
+    let entry_count = profile.entries.len();
+    match store(state)
+        .reach_would_exclude(&profile_id, &profile.reach)
+        .await
+    {
+        Ok(excluded) if !excluded.is_empty() => {
+            return reject_with_code(
+                &doc,
+                ext(&slug_from_doc(&doc), "boundOutsideReach"),
+                format!(
+                    "the new reach excludes {} context(s) this face is worn in",
+                    excluded.len()
+                ),
+                Some(json!({ "contextIds": excluded })),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return reject(&doc, e),
+    }
+
+    let written = match store(state)
+        .put_profile(profile, req.expected_version.map(|v| *v))
+        .await
+    {
+        Ok(w) => w,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // The entry COUNT, not the entries. An entry is either a pool reference —
+    // an identifier, safe — or an inline value, which is a claim value under
+    // another name and carries the whole lifetime problem with it.
+    let detail = format!(
+        "{} profile {profile_id} with {} entr{}, now at version {}",
+        if written.created {
+            "created"
+        } else {
+            "updated"
+        },
+        entry_count,
+        if entry_count == 1 { "y" } else { "ies" },
+        written.version,
+    );
+    audit_persona(
+        state,
+        "persona.profile.put",
+        auth,
+        Some(&profile_id),
+        None,
+        Some(&detail),
+    )
+    .await;
+    success_response(
+        &doc,
+        json!({
+            "profileId": profile_id,
+            "version": written.version,
+            "wasCreated": written.created,
+            "updatedAt": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+}
+
+/// `persona/profile/compose` — a face made where it is asked for, local by
+/// default, and optionally worn in the same act. Design note
+/// `persona-context-first.md` §5.3.
+pub(super) async fn handle_profile_compose(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::compose::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_COMPOSE_1_1, None).await {
+        return reject(&doc, e);
+    }
+
+    use spec::profile::compose::v1_1 as wire;
+    let mut claims = Vec::with_capacity(req.claims.len());
+    for claim in &req.claims {
+        claims.push(match claim {
+            wire::ComposeClaim::HeldClaim(h) => vta_persona::ComposeClaim::Held {
+                attribute_id: h.attribute_id.to_string(),
+                slot: h.slot.as_ref().map(|s| s.to_string()),
+            },
+            wire::ComposeClaim::NewClaim(n) => {
+                // Through the wire spelling, as `attribute/put` does: the
+                // generated enum is `#[non_exhaustive]`, and a wildcard arm is
+                // where a variant added upstream would land silently.
+                let Some(value_type) = serde_json::to_value(n.value_type)
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<ValueType>(v).ok())
+                else {
+                    return reject(&doc, AppError::Validation("unrecognised valueType".into()));
+                };
+                let share = match n.share {
+                    wire::NewClaimShare::Local => vta_persona::Share::Local,
+                    wire::NewClaimShare::Pool => vta_persona::Share::Pool,
+                    // A sharing mode this build does not know must not be
+                    // read as either of the two it does: `local` would keep a
+                    // value the holder meant to share, `pool` would widen one
+                    // they meant to keep.
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        return reject(&doc, AppError::Validation("unrecognised share".into()));
+                    }
+                };
+                vta_persona::ComposeClaim::New {
+                    r#type: n.type_.to_string(),
+                    value_type,
+                    value: n.value.clone(),
+                    label: n.label.as_ref().map(|l| l.to_string()),
+                    slot: n.slot.as_ref().map(|s| s.to_string()),
+                    share,
+                }
+            }
+            #[allow(unreachable_patterns)]
+            _ => return reject(&doc, AppError::Validation("unrecognised claim".into())),
+        });
+    }
+    let request = vta_persona::ComposeRequest {
+        context_id: req.context_id.to_string(),
+        name: req.name.to_string(),
+        claims,
+        persona_did: req.persona_did.as_ref().map(|d| d.to_string()),
+        wear: req.wear,
+        label: req.label.as_ref().map(|l| l.to_string()),
+        until: req.until.map(|u| u.to_rfc3339()),
+    };
+
+    let s = store(state);
+    // Checked here to carry the specification's code for each refusal; the
+    // store runs the same check, so no other path can skip it.
+    let slug = slug_from_doc(&doc);
+    match s.compose_refusal(&request).await {
+        Ok(None) => {}
+        Ok(Some(vta_persona::ComposeRefusal::UnresolvedReference(ids))) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug, "unresolvedReference"),
+                format!(
+                    "the face draws on {} attribute(s) the pool does not hold",
+                    ids.len()
+                ),
+                Some(json!({ "attributeIds": ids })),
+            );
+        }
+        Ok(Some(vta_persona::ComposeRefusal::DuplicateSlot(slot))) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug, "duplicateSlot"),
+                format!("two claims of this face both claim the slot {slot}"),
+                Some(json!({ "slot": slot })),
+            );
+        }
+        Ok(Some(vta_persona::ComposeRefusal::LabelWithoutPersona)) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug, "labelWithoutPersona"),
+                "a label names the face to the context it is worn in; give a personaDid or \
+                 leave the label off",
+                None,
+            );
+        }
+        Ok(Some(vta_persona::ComposeRefusal::WearAndPersona)) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug, "wearAndPersona"),
+                "wear and personaDid are two ways to say who wears the face; give one",
+                None,
+            );
+        }
+        Ok(Some(vta_persona::ComposeRefusal::NoPersonaHere)) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug, "noPersonaHere"),
+                "you have no persona in this context yet; make one first, then wear it here",
+                None,
+            );
+        }
+        Ok(Some(vta_persona::ComposeRefusal::PersonaAmbiguous(dids))) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug, "personaAmbiguous"),
+                format!("you use {} personas in this context; say which", dids.len()),
+                Some(json!({ "personaDids": dids })),
+            );
+        }
+        Ok(Some(vta_persona::ComposeRefusal::UntilNotFuture)) => {
+            return reject_with_code(
+                &doc,
+                ext(&slug, "untilNotFuture"),
+                "`until` must be in the future, and needs a personaDid to wear the face",
+                None,
+            );
+        }
+        Ok(Some(other)) => {
+            return reject(&doc, AppError::Validation(format!("{other:?}")));
+        }
+        Err(e) => return reject(&doc, e),
+    }
+
+    let claim_count = request.claims.len();
+    let context_id = request.context_id.clone();
+    let composed = match s.compose(request).await {
+        Ok(c) => c,
+        Err(e) => return reject(&doc, e),
+    };
+
+    let scope = match composed.scope {
+        vta_persona::FaceScope::Local => "local",
+        vta_persona::FaceScope::Pool => "pool",
+    };
+    // Counts, scope and identifiers; never a value — see `audit_persona`.
+    let detail = format!(
+        "composed {scope} face {} for context {context_id} with {claim_count} claim(s), {} \
+         pooled ({} created){}",
+        composed.profile_id,
+        composed.pooled.len(),
+        composed.pooled.iter().filter(|p| p.created).count(),
+        composed
+            .binding
+            .as_ref()
+            .map_or_else(String::new, |b| format!(", worn by {}", b.persona_did)),
+    );
+    audit_persona(
+        state,
+        "persona.profile.compose",
+        auth,
+        Some(&composed.profile_id),
+        Some(&context_id),
+        Some(&detail),
+    )
+    .await;
+
+    let mut body = json!({
+        "profileId": composed.profile_id,
+        "scope": scope,
+        "version": composed.version,
+        "correlation": {
+            "severity": if composed.shared_count > 0 { "high" } else { "none" },
+            "sharedAttributeCount": composed.shared_count,
+        },
+    });
+    if !composed.pooled.is_empty() {
+        body["pooled"] = composed
+            .pooled
+            .iter()
+            .map(|p| json!({ "attributeId": p.attribute_id, "wasCreated": p.created }))
+            .collect();
+    }
+    if let Some(b) = &composed.binding {
+        body["binding"] = json!({
+            "personaDid": b.persona_did,
+            "version": b.version,
+            "alsoBoundPersonaCount": b.also_bound_persona_count,
+        });
+    }
+    success_response(&doc, body)
+}
+
+/// `persona/attribute/promote` — the deliberate widening of a local value.
+/// One-way; design note `persona-context-first.md` §2.1.
+pub(super) async fn handle_attribute_promote(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::attribute::promote::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_ATTRIBUTE_PROMOTE_1_1, None).await {
+        return reject(&doc, e);
+    }
+
+    let context_id = req.context_id.to_string();
+    let profile_id = req.profile_id.to_string();
+    let expected = u64::from(req.expected_version.0);
+    let positions: Vec<usize> = req
+        .entries
+        .iter()
+        .map(|p| usize::try_from(*p).unwrap_or(usize::MAX))
+        .collect();
+    let s = store(state);
+
+    // Checked here for the specification's codes; the store checks both again
+    // under the same read, so no other path can skip them.
+    match s.get_local_profile(&context_id, &profile_id).await {
+        Ok(Some(face)) => {
+            let slug = slug_from_doc(&doc);
+            if face.version != expected {
+                return reject_with_code(
+                    &doc,
+                    ext(&slug, "versionConflict"),
+                    format!(
+                        "expectedVersion {expected} does not match current version {}",
+                        face.version
+                    ),
+                    Some(json!({ "currentVersion": face.version })),
+                );
+            }
+            if positions.iter().any(|&p| p >= face.entries.len()) {
+                return reject_with_code(
+                    &doc,
+                    ext(&slug, "entryOutOfRange"),
+                    format!("the face has {} entries", face.entries.len()),
+                    Some(json!({ "entryCount": face.entries.len() })),
+                );
+            }
+        }
+        Ok(None) => {
+            return reject(
+                &doc,
+                AppError::NotFound(format!(
+                    "{profile_id} is not a context-local face in {context_id}"
+                )),
+            );
+        }
+        Err(e) => return reject(&doc, e),
+    }
+
+    let promoted = match s
+        .promote(&context_id, &profile_id, &positions, expected)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return reject(&doc, e),
+    };
+
+    let detail = format!(
+        "promoted {} entr{} of face {profile_id} from context {context_id} into the pool ({} \
+         attribute(s) created); {} persona(s) rebound, now at version {}",
+        promoted.promoted.len(),
+        if promoted.promoted.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        promoted.promoted.iter().filter(|p| p.created).count(),
+        promoted.rebound_persona_dids.len(),
+        promoted.version,
+    );
+    audit_persona(
+        state,
+        "persona.attribute.promote",
+        auth,
+        Some(&profile_id),
+        Some(&context_id),
+        Some(&detail),
+    )
+    .await;
+
+    let mut body = json!({
+        "profileId": promoted.profile_id,
+        "version": promoted.version,
+        "promoted": promoted
+            .promoted
+            .iter()
+            .map(|p| json!({ "entry": p.entry, "attributeId": p.attribute_id, "wasCreated": p.created }))
+            .collect::<Vec<_>>(),
+    });
+    if !promoted.rebound_persona_dids.is_empty() {
+        body["reboundPersonaDids"] = json!(promoted.rebound_persona_dids);
+    }
+    success_response(&doc, body)
+}
+
+/// `persona/profile/retire` — stop wearing a face anywhere, and keep it.
+/// Design note `persona-context-first.md` §9.4.
+pub(super) async fn handle_profile_retire(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::retire::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_RETIRE_1_0, None).await {
+        return reject(&doc, e);
+    }
+    let id = req.profile_id.to_string();
+    let ctx = req.context_id.as_ref().map(|c| c.to_string());
+    let retired = match store(state)
+        .retire_profile(&id, ctx.as_deref(), req.expected_version.map(|v| *v))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return reject(&doc, e),
+    };
+    let detail = format!(
+        "retired {}face {id}; {} binding(s) cleared, now at version {}",
+        if ctx.is_some() { "context-local " } else { "" },
+        retired.unbound.len(),
+        retired.version,
+    );
+    audit_persona(
+        state,
+        "persona.profile.retire",
+        auth,
+        Some(&id),
+        ctx.as_deref(),
+        Some(&detail),
+    )
+    .await;
+    let mut body = json!({
+        "profileId": id,
+        "version": retired.version,
+        "retiredAt": retired.retired_at,
+    });
+    if !retired.unbound.is_empty() {
+        body["unbound"] = retired
+            .unbound
+            .iter()
+            .take(256)
+            .map(|(c, p)| json!({ "contextId": c, "personaDid": p }))
+            .collect();
+    }
+    success_response(&doc, body)
+}
+
+/// `persona/profile/reinstate` — make a retired face wearable again. Binds
+/// nothing.
+pub(super) async fn handle_profile_reinstate(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::reinstate::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_REINSTATE_1_0, None).await {
+        return reject(&doc, e);
+    }
+    let id = req.profile_id.to_string();
+    let ctx = req.context_id.as_ref().map(|c| c.to_string());
+    let version = match store(state)
+        .reinstate_profile(&id, ctx.as_deref(), req.expected_version.map(|v| *v))
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return reject(&doc, e),
+    };
+    let detail = format!("reinstated face {id}, worn nowhere, now at version {version}");
+    audit_persona(
+        state,
+        "persona.profile.reinstate",
+        auth,
+        Some(&id),
+        ctx.as_deref(),
+        Some(&detail),
+    )
+    .await;
+    success_response(&doc, json!({ "profileId": id, "version": version }))
+}
+
+/// `persona/profile/usage` — where one face is worn now. Design note
+/// `persona-context-first.md` §5.4.
+pub(super) async fn handle_profile_usage(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::usage::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_USAGE_1_0, None).await {
+        return reject(&doc, e);
+    }
+    let id = req.profile_id.to_string();
+    let ctx = req.context_id.as_ref().map(|c| c.to_string());
+    let (reach, usage) = match store(state).face_usage(&id, ctx.as_deref()).await {
+        Ok(u) => u,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(state, "persona.profile.usage", auth, Some(&id), None, None).await;
+    let mut body = json!({
+        "profileId": id,
+        "usage": usage
+            .iter()
+            .take(1024)
+            .map(|u| {
+                let mut row = json!({
+                    "contextId": u.context_id,
+                    "personaDid": u.persona_did,
+                    "boundAt": u.bound_at,
+                });
+                put_opt(&mut row, "until", u.until.clone());
+                row
+            })
+            .collect::<Vec<_>>(),
+    });
+    put_opt(&mut body, "reach", reach);
+    success_response(&doc, body)
+}
+
+/// `persona/profile/timeline` — one face's history, oldest first, with no
+/// value and no private label in it. Design note `persona-context-first.md`
+/// §9.6.
+pub(super) async fn handle_profile_timeline(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::timeline::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_TIMELINE_1_1, None).await {
+        return reject(&doc, e);
+    }
+    let id = req.profile_id.to_string();
+    let ctx = req.context_id.as_ref().map(|c| c.to_string());
+    let since = req.since.map(|t| t.to_rfc3339());
+    let limit = usize::try_from(req.limit.get()).unwrap_or(100).min(500);
+    let page = match store(state)
+        .face_timeline(
+            &id,
+            ctx.as_deref(),
+            since.as_deref(),
+            req.cursor.as_ref().map(|c| c.as_str()),
+            limit,
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(
+        state,
+        "persona.profile.timeline",
+        auth,
+        Some(&id),
+        None,
+        None,
+    )
+    .await;
+    let mut body = json!({ "profileId": id, "events": page.events });
+    put_opt(&mut body, "nextCursor", page.next_cursor);
+    success_response(&doc, body)
+}
+
+pub(super) async fn handle_profile_get(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::get::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_GET_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    let id = req.profile_id.to_string();
+    let s = store(state);
+    let Some(profile) = (match s.get_profile(&id).await {
+        Ok(p) => p,
+        Err(e) => return reject(&doc, e),
+    }) else {
+        // Not an empty success: a caller that cannot tell "absent" from "empty"
+        // treats a typo as a profile that discloses nothing.
+        return reject(&doc, AppError::NotFound(format!("profile {id}")));
+    };
+
+    // Resolution is opt-in because it is the expensive AND the disclosing
+    // answer — it decrypts values and re-derives credential-backed ones.
+    let resolved = if req.resolve {
+        match s.resolve_profile(&id).await {
+            Ok(r) => Some(r),
+            Err(e) => return reject(&doc, e),
+        }
+    } else {
+        None
+    };
+
+    // How far this face has spoken — what a holder is shown before deleting it,
+    // because a delete does not un-tell anyone.
+    let disclosed = match s.disclosed_to(&id).await {
+        Ok(d) => d,
+        Err(e) => return reject(&doc, e),
+    };
+
+    audit_persona(state, "persona.profile.get", auth, Some(&id), None, None).await;
+    let mut body = json!({
+        "profile": profile,
+        "disclosedTo": {
+            "partyCount": disclosed.party_count,
+            "contextCount": disclosed.context_count,
+        },
+    });
+    if let Some(r) = resolved {
+        // A resolved entry is a `ResolvedClaim`, not the pool `Attribute`, so an
+        // INLINE entry is describable: `attributeId`, `version` and `updatedAt`
+        // are optional there, and their absence is what says "this value lives
+        // only in this profile".
+        //
+        // Until trust-tasks-rs 0.18 the array was typed as `Attribute`, which
+        // required all three, and this handler refused rather than answer
+        // non-conformantly — a synthesised `attributeId` would have been a lie
+        // about where a value lives, and omitting the entry would have returned
+        // a profile that appears to present less than it does. The schema is
+        // fixed upstream (dtgwg-trust-tasks-tf#370) and the refusal is gone.
+        body["resolved"] = json!(
+            r.iter()
+                .map(|c| {
+                    let mut row = json!({
+                        "type": c.r#type,
+                        "value": c.value,
+                        "valueType": c.value_type,
+                        "provenance": c.provenance,
+                        "stale": c.stale,
+                    });
+                    // Absent, not null — see `put_opt`.
+                    put_opt(&mut row, "attributeId", c.attribute_id.clone());
+                    put_opt(&mut row, "label", c.label.clone());
+                    put_opt(&mut row, "slot", c.slot.clone());
+                    put_opt(&mut row, "version", c.version);
+                    put_opt(&mut row, "updatedAt", c.updated_at.clone());
+                    row
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    success_response(&doc, body)
+}
+
+pub(super) async fn handle_profile_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_LIST_1_0, None).await {
+        return reject(&doc, e);
+    }
+    // No resolve option, deliberately: resolving every profile at once would
+    // decrypt the holder's entire pool to answer a question about names.
+    let profiles: Vec<_> = match store(state).list_profiles().await {
+        // A retired face is one the holder has stopped being; offering it back
+        // in a picker would undo that by accident.
+        Ok(p) => p
+            .into_iter()
+            .filter(|f| req.include_retired || f.status.is_active())
+            .collect(),
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(state, "persona.profile.list", auth, None, None, None).await;
+    success_response(&doc, json!({ "profiles": profiles }))
+}
+
+pub(super) async fn handle_profile_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::profile::delete::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_PROFILE_DELETE_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    let id = req.profile_id.to_string();
+    let s = store(state);
+
+    // Refuse while a persona is bound unless the holder said unbind. A persona
+    // that silently stopped presenting anything is a failure they discover from
+    // the other side of a disclosure that did not happen.
+    let bound = match s.personas_bound_to_anywhere(&id).await {
+        Ok(b) => b,
+        Err(e) => return reject(&doc, e),
+    };
+    if !bound.is_empty() && !req.unbind {
+        let mut payload = ErrorPayload::new(ext(&slug_from_doc(&doc), "bound")).with_message(
+            format!("{} persona(s) are bound to this profile", bound.len()),
+        );
+        payload = payload.with_details(json!({ "personaDids": bound }));
+        return error_response(
+            doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload),
+        );
+    }
+    // Read before the delete. The records outlive it — a delete does not
+    // un-tell anyone — and the response says so in numbers.
+    let disclosed = match s.disclosed_to(&id).await {
+        Ok(d) => d,
+        Err(e) => return reject(&doc, e),
+    };
+    if req.unbind
+        && let Err(e) = s.unbind_everywhere(&id).await
+    {
+        return reject(&doc, e);
+    }
+
+    let existed = match s.delete_profile(&id).await {
+        Ok(e) => e,
+        Err(e) => return reject(&doc, e),
+    };
+    // How many personas were left presenting nothing is the consequence a
+    // holder most needs to find later, and it is the one fact that survives
+    // nowhere else: the bindings it describes have already been cleared.
+    let detail = format!(
+        "profile {id} {}; {}; {} persona(s) unbound",
+        if existed { "deleted" } else { "did not exist" },
+        if req.unbind {
+            "unbind requested"
+        } else {
+            "no unbind requested"
+        },
+        bound.len(),
+    );
+    audit_persona(
+        state,
+        "persona.profile.delete",
+        auth,
+        Some(&id),
+        None,
+        Some(&detail),
+    )
+    .await;
+    let mut body = json!({ "profileId": id, "existed": existed, "unboundPersonas": bound });
+    if existed {
+        body["disclosedTo"] = json!({
+            "partyCount": disclosed.party_count,
+            "contextCount": disclosed.context_count,
+        });
+    }
+    success_response(&doc, body)
+}
+
+// ─── Bindings ────────────────────────────────────────────────────────────
+
+pub(super) async fn handle_binding_set(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::binding::set::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // Holder-only, and the critical gate: an application able to call this
+    // could bind any profile to a persona it controls and read the result back
+    // through a disclosure it requests of itself.
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_BINDING_SET_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    let ctx = req.context_id.to_string();
+    let profile_id = req.profile_id.as_ref().map(|p| p.to_string());
+    let public = req.public_entries.iter().map(|e| e.to_string()).collect();
+    let until = req.until.map(|u| u.to_rfc3339());
+    let s = store(state);
+    // Named, or the persona the holder already uses here (§9.7). Never minted:
+    // a DID has a lifecycle of its own, and a write that could half-create one
+    // would leave a published identity nobody holds.
+    let persona = match req.persona_did.as_ref() {
+        Some(d) => d.to_string(),
+        None => match s.persona_here(&ctx).await {
+            Ok(vta_persona::PersonaHere::One(did)) => did,
+            Ok(vta_persona::PersonaHere::None) => {
+                return reject_with_code(
+                    &doc,
+                    ext(&slug_from_doc(&doc), "noPersonaHere"),
+                    "you have no persona in this context yet; make one first, then wear it here",
+                    None,
+                );
+            }
+            Ok(vta_persona::PersonaHere::Several(dids)) => {
+                return reject_with_code(
+                    &doc,
+                    ext(&slug_from_doc(&doc), "personaAmbiguous"),
+                    format!("you use {} personas in this context; say which", dids.len()),
+                    Some(json!({ "personaDids": dids })),
+                );
+            }
+            Err(e) => return reject(&doc, e),
+        },
+    };
+    if let Some(refused) = refuse_binding(
+        &doc,
+        &s,
+        &ctx,
+        None,
+        profile_id.as_deref(),
+        until.as_deref(),
+    )
+    .await
+    {
+        return refused;
+    }
+
+    let bound = match s
+        .set_binding(
+            &ctx,
+            &persona,
+            profile_id.as_deref(),
+            public,
+            req.label.as_ref().map(|l| l.to_string()),
+            until.clone(),
+            req.expected_version.map(|v| *v),
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // The materialised claim count is what changed on the far side of the
+    // boundary: this write is a PUSH into a context, and the count is how much
+    // that context can now present. "unbound" is spelled out rather than left
+    // as an absent profileId, because a binding cleared and a binding never
+    // made read identically otherwise.
+    let detail = format!(
+        "persona {persona} in context {ctx} bound to {}; {} claim(s) materialised, now at \
+         version {}",
+        profile_id
+            .as_deref()
+            .map_or_else(|| "unbound".to_string(), |p| format!("profile {p}")),
+        bound.materialised_claim_count,
+        bound.version,
+    );
+    audit_persona(
+        state,
+        "persona.binding.set",
+        auth,
+        Some(&persona),
+        Some(&ctx),
+        Some(&detail),
+    )
+    .await;
+    let mut body = json!({
+        "contextId": ctx,
+        "personaDid": persona,
+        "profileId": profile_id,
+        "version": bound.version,
+        "materialisedClaimCount": bound.materialised_claim_count,
+        "correlation": {
+            // Binding one profile to a second persona makes them the same
+            // person by construction, and no later narrowing undoes it.
+            "severity": if bound.also_bound_persona_count > 0 { "high" } else { "none" },
+            "alsoBoundPersonaCount": bound.also_bound_persona_count,
+        },
+        "boundAt": chrono::Utc::now().to_rfc3339(),
+    });
+    // Absent, not null — see `put_opt`.
+    put_opt(&mut body, "until", until);
+    success_response(&doc, body)
+}
+
+/// Refuse a binding the specification says must not be written, with its
+/// code: a retired face (`profileRetired`), or an `until` in the past or on a
+/// cleared binding (`untilNotFuture`). `context_id` is the context of a
+/// context-local face; `None` looks in the pool.
+///
+/// The store refuses both too, so no other path can write one; this is where
+/// the refusal gets the code a client can act on.
+async fn refuse_binding(
+    doc: &TrustTask<Value>,
+    s: &PersonaStore,
+    bind_context: &str,
+    context_id: Option<&str>,
+    profile_id: Option<&str>,
+    until: Option<&str>,
+) -> Option<TrustTaskOutcome> {
+    let slug = slug_from_doc(doc);
+    if let Some(u) = until {
+        let future = chrono::DateTime::parse_from_rfc3339(u).is_ok_and(|t| t > chrono::Utc::now());
+        if profile_id.is_none() || !future {
+            return Some(reject_with_code(
+                doc,
+                ext(&slug, "untilNotFuture"),
+                "`until` must be in the future, and ends a face being worn — a cleared binding \
+                 has none",
+                None,
+            ));
+        }
+    }
+    let id = profile_id?;
+    let face = match context_id {
+        None => s.get_profile(id).await,
+        Some(ctx) => s.get_local_profile(ctx, id).await,
+    };
+    match face {
+        Ok(Some(f)) if !f.status.is_active() => Some(reject_with_code(
+            doc,
+            ext(&slug, "profileRetired"),
+            format!("profile {id} is retired; reinstate it before wearing it"),
+            None,
+        )),
+        // A local face has no reach; it is worn in its context by construction.
+        Ok(Some(f)) if context_id.is_none() && !f.reach.admits(bind_context) => {
+            Some(reject_with_code(
+                doc,
+                ext(&slug, "outsideReach"),
+                format!("profile {id} may not be worn in {bind_context}"),
+                None,
+            ))
+        }
+        _ => None,
+    }
+}
+
+pub(super) async fn handle_binding_get(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::binding::get::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_BINDING_GET_1_0, Some(&ctx)).await {
+        return reject(&doc, e);
+    }
+
+    let persona = req.persona_did.to_string();
+    let sum = match store(state).binding_summary(&ctx, &persona).await {
+        Ok(s) => s,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(
+        state,
+        "persona.binding.get",
+        auth,
+        Some(&persona),
+        Some(&ctx),
+        None,
+    )
+    .await;
+    // Thin by construction: whether bound, the label, a claim count. Never
+    // contents — those reach an application only through the disclosure path.
+    //
+    // Four of the seven members are absent for an *unbound* persona, and
+    // absent is not null — see `put_opt`. The bound case conformed; the
+    // unbound one emitted four nulls and failed schema validation, which is
+    // the reading a caller most needs to be able to trust: "nobody is bound
+    // here" is an answer, not an error.
+    let mut body = json!({
+        "contextId": ctx,
+        "personaDid": sum.persona_did,
+        "bound": sum.bound,
+        // Not optional, and 0 for an unbound persona — a count of nothing is
+        // still a count.
+        "claimCount": sum.claim_count,
+    });
+    put_opt(&mut body, "profileId", sum.profile_id);
+    put_opt(&mut body, "label", sum.label);
+    // The holder's OWN name for the face, which a context-scoped caller must
+    // not be handed: it is their filing ("the divorce"), and wearing a face in
+    // a context is not consent to tell the context what they call it. The
+    // context reads `label`, the name the holder chose for it.
+    if is_holder(state, auth).await {
+        put_opt(&mut body, "profileName", sum.profile_name);
+    }
+    put_opt(&mut body, "boundAt", sum.bound_at);
+    put_opt(&mut body, "until", sum.until);
+    success_response(&doc, body)
+}
+
+pub(super) async fn handle_binding_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::binding::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_BINDING_LIST_1_0, Some(&ctx)).await {
+        return reject(&doc, e);
+    }
+
+    let sums = match store(state).list_binding_summaries(&ctx).await {
+        Ok(s) => s,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(state, "persona.binding.list", auth, None, Some(&ctx), None).await;
+    // See `handle_binding_get`: the face's own name is the holder's alone.
+    let holder = is_holder(state, auth).await;
+    let personas: Vec<Value> = sums
+        .iter()
+        .map(|s| {
+            let mut row = json!({
+                "personaDid": s.persona_did,
+                "bound": s.bound,
+                "claimCount": s.claim_count,
+            });
+            put_opt(&mut row, "label", s.label.clone());
+            put_opt(&mut row, "until", s.until.clone());
+            if holder {
+                put_opt(&mut row, "profileName", s.profile_name.clone());
+            }
+            row
+        })
+        .collect();
+    success_response(&doc, json!({ "personas": personas }))
+}
+
+// ─── Contacts ────────────────────────────────────────────────────────────
+
+pub(super) async fn handle_contact_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::contact::delete::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_CONTACT_DELETE_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let id = req.contact_id.to_string();
+
+    let (existed, removed, retained) = match store(state).delete_contact(&ctx, &id).await {
+        Ok(o) => o,
+        Err(e) => return reject(&doc, e),
+    };
+
+    audit_persona(
+        state,
+        "persona.contact.delete",
+        auth,
+        Some(&id),
+        Some(&ctx),
+        None,
+    )
+    .await;
+    success_response(
+        &doc,
+        json!({
+            "contactId": id,
+            "existed": existed,
+            "revisionsRemoved": removed,
+            // Reported rather than glossed: an incomplete erasure the holder
+            // believes is complete is worse than one they know about.
+            "retainedForDisclosure": retained,
+        }),
+    )
+}
+
+// ─── Disclosure history, correlation, renderers ──────────────────────────
+
+pub(super) async fn handle_disclosure_history(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::disclosure::history::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // Holder-only: omitting contextId queries across every context, which only
+    // the holder may do and is the reason this sits above the boundary.
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_DISCLOSURE_HISTORY_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    let ctx = req.context_id.as_ref().map(|c| c.to_string());
+    let verifier = req.verifier_did.as_ref().map(|v| v.to_string());
+    let claim = req.attribute_type.as_ref().map(|t| t.to_string());
+    let since = req.since.map(|s| s.to_rfc3339());
+
+    let records = match store(state)
+        .disclosure_history(&vta_persona::HistoryQuery {
+            context_id: ctx.as_deref(),
+            verifier_did: verifier.as_deref(),
+            claim_type: claim.as_deref(),
+            since: since.as_deref(),
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // Built member by member against the published row rather than by
+    // serialising `DisclosureRecord`, whose shape is the store's: its `claims`
+    // pairs and `citedContactRevisions` are not members of the row, which is
+    // `additionalProperties: false`, so a non-empty history failed validation
+    // whole. It went unnoticed because the only test read an empty one.
+    let s = store(state);
+    let mut rows = Vec::with_capacity(records.len());
+    for r in &records {
+        let currency = match s.claim_currency(r).await {
+            Ok(c) => c,
+            Err(e) => return reject(&doc, e),
+        };
+        let mut row = json!({
+            "disclosureId": r.disclosure_id,
+            "contextId": r.context_id,
+            "verifierDid": r.verifier_did,
+            "personaDid": r.persona_did,
+            "claimTypes": r.claims.iter().map(|c| c.r#type.clone()).collect::<Vec<_>>(),
+            "rungs": r.claims.iter().map(|c| c.rung).collect::<Vec<_>>(),
+            "claimCurrency": currency,
+            "disclosedAt": r.disclosed_at,
+        });
+        put_opt(&mut row, "subject", r.subject.clone());
+        put_opt(&mut row, "purpose", r.purpose.clone());
+        put_opt(&mut row, "renderer", r.renderer.clone());
+        put_opt(
+            &mut row,
+            "durableCredentialId",
+            r.durable_credential_id.clone(),
+        );
+        rows.push(row);
+    }
+
+    audit_persona(
+        state,
+        "persona.disclosure.history",
+        auth,
+        None,
+        ctx.as_deref(),
+        None,
+    )
+    .await;
+    success_response(&doc, json!({ "disclosures": rows }))
+}
+
+pub(super) async fn handle_correlation_analyze(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::correlation::analyze::v1_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // Holder-only: the response is the linkage map between the holder's own
+    // identities — the artifact the family exists to keep from being assembled
+    // by anyone else.
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_CORRELATION_ANALYZE_1_2,
+        None,
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+
+    let s = store(state);
+    let attribute_id = req.attribute_id.as_ref().map(|a| a.to_string());
+    let candidate = req
+        .candidate
+        .as_ref()
+        .and_then(|c| serde_json::to_value(&c.value).ok());
+
+    // `profileId` names a face to analyse. It was accepted and ignored before
+    // this, so `pnm persona correlate --profile-id` analysed the whole pool and
+    // reported it as the face.
+    let mut findings = Vec::new();
+    if let Some(profile_id) = &req.profile_id {
+        match s.analyze_face_correlation(&profile_id.to_string()).await {
+            Ok(f) => findings.extend(f),
+            Err(e) => return reject(&doc, e),
+        }
+    }
+    // The whole store is analysed only when nothing narrower was named.
+    if req.profile_id.is_none() || attribute_id.is_some() || candidate.is_some() {
+        match s
+            .analyze_correlation(attribute_id.as_deref(), candidate.as_ref())
+            .await
+        {
+            Ok(f) => findings.extend(f),
+            Err(e) => return reject(&doc, e),
+        }
+    }
+    findings.truncate(256);
+
+    audit_persona(state, "persona.correlation.analyze", auth, None, None, None).await;
+    let findings = findings
+        .iter()
+        .map(|f| serde_json::to_value(f).unwrap_or_else(|_| json!({})))
+        .collect::<Vec<Value>>();
+    success_response(&doc, json!({ "findings": findings }))
+}
+
+pub(super) async fn handle_renderers_list(
+    // Unused: this task describes the agent's declared capabilities, which are
+    // a compile-time constant, not stored state. Taking the parameter anyway
+    // keeps every handler one shape for the dispatch table.
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let _req: spec::renderers::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // `Reach::Any`: authentication is the gate. This response is a
+    // compile-time constant and names nothing the caller does not already know
+    // about themselves.
+    //
+    // This used to pass `auth.allowed_contexts.first()` as the context, on the
+    // reasoning that a caller should name one so the request is attributable.
+    // That reasoning was wrong twice over. The context did not come from the
+    // request, so it attributed nothing; and reading the caller's own list
+    // inverted the gate — an `Admin` with an unrestricted (empty) list is the
+    // most privileged caller there is, and was the only one refused.
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_RENDERERS_LIST_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    // Two renderers ship. Lossiness is DECLARED rather than discovered, so a
+    // preview can tell the holder what a format will not carry before they
+    // decide. Sourced from vta_persona::RENDERERS so this response and the
+    // negotiation that enforces it cannot disagree.
+    success_response(
+        &doc,
+        json!({
+            "renderers": vta_persona::present::RENDERERS.iter().map(|r| json!({
+                "id": r.id,
+                "canonical": r.canonical,
+                "drops": if r.carries_provenance { vec![] } else { vec!["provenance"] },
+                "canCarryPredicates": r.carries_predicates,
+            })).collect::<Vec<_>>()
+        }),
+    )
+}
+
+/// Serve the claim-type registry this agent resolves against.
+pub(super) async fn handle_claim_types_list(
+    // Unused for the same reason as `handle_renderers_list`: the table is a
+    // compile-time constant, not stored state.
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let _req: spec::claim_types::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // `Reach::Any`, and neither of the other two would do. An unscoped holder
+    // only would refuse the application that needs this most — one inside a
+    // context, deciding how to render a preview it was just shown. A context
+    // requirement would refuse the holder's own tooling, which has no context
+    // to name. The response describes a vocabulary and carries nothing about
+    // the holder, any context, or any stored state.
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_CLAIM_TYPES_LIST_1_0, None).await {
+        return reject(&doc, e);
+    }
+
+    // Sourced from `vta_persona::claim_types` — the same table `defaults_for`
+    // resolves against — so what is served and what is enforced cannot
+    // disagree. That is the task's central MUST, and building the response
+    // from a second literal here would break it on day one.
+    let l = vta_persona::claim_types::registry_listing();
+    let axes = |a: &vta_persona::Axes| {
+        json!({
+            "sensitivity": wire_name(a.sensitivity),
+            "release": wire_name(a.release),
+            "mask": wire_name(a.mask),
+        })
+    };
+    // What this deployment declared and the agent would not apply.
+    //
+    // Carried under `ext`, the specification's vendor-namespaced member
+    // (SPEC §4.5.1), because the response's own members are fixed and this is
+    // not registry data — it is this *agent* reporting on its own
+    // configuration. A client that does not know the key ignores it, which is
+    // the correct behaviour for one that cannot act on it.
+    //
+    // It is here at all because a refused row is invisible otherwise: the token
+    // resolves from the core table exactly as it would have with no file, and
+    // the operator's intended tightening is quietly not in force. A log line is
+    // where that goes to be missed — this is where a person is looking.
+    let rejected = vta_persona::claim_types::rejected_extensions();
+    let file_error = vta_persona::claim_types::extension_file_error();
+    let mut body = json!({
+        "registryVersion": l.registry_version,
+        "entries": l.entries.iter().map(|r| {
+            let mut e = axes(&r.axes);
+            e["type"] = json!(r.claim_type);
+            e
+        }).collect::<Vec<_>>(),
+        "unregistered": axes(&l.unregistered),
+        "strictness": {
+            "sensitivity": l.strictness.sensitivity.iter().map(|v| wire_name(*v)).collect::<Vec<_>>(),
+            "release": l.strictness.release.iter().map(|v| wire_name(*v)).collect::<Vec<_>>(),
+            "mask": l.strictness.mask.iter().map(|v| wire_name(*v)).collect::<Vec<_>>(),
+        },
+    });
+    if !rejected.is_empty() || file_error.is_some() {
+        let mut report = serde_json::Map::new();
+        if !rejected.is_empty() {
+            report.insert(
+                "rejected".into(),
+                json!(
+                    rejected
+                        .iter()
+                        .map(|r| json!({ "type": r.token, "reason": r.why }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        if let Some(e) = file_error {
+            report.insert("fileError".into(), json!(e));
+        }
+        body["ext"] = json!({ "org.openvtc.claim-types": report });
+    }
+    success_response(&doc, body)
+}
+
+// ─── Context-local surface ───────────────────────────────────────────────
+//
+// Authoring BELOW the boundary is safe; the rule exists to stop reading ACROSS
+// it. These are context-callable for that reason, and the store keeps them in
+// their own address space so a scan here cannot reach a pool profile.
+
+pub(super) async fn handle_local_profile_put(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::local::profile::put::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_LOCAL_PROFILE_PUT_1_1,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+
+    // The schema admits only inline entries, so a reference is unrepresentable
+    // rather than rejected. The store re-checks anyway: two independent guards
+    // on the property that keeps a context-authored object from acquiring pool
+    // reach.
+    //
+    // **A context-local entry carries no `provenance`, and the store's does.**
+    // The published local shape is `{type, valueType, value, label?}` — narrower
+    // than a pool profile's inline entry, which requires `provenance` — so the
+    // two types are mapped member by member here rather than round-tripped
+    // through JSON. The round-trip is what this used to do, and because
+    // `InlineValue::provenance` has no default it failed for *every* valid
+    // request, rejecting them all as "unrecognised local entry". Nothing caught
+    // it: the only test of this task asserted that an invalid entry is refused,
+    // which a handler that refuses everything also passes.
+    //
+    // `SelfAsserted` is the only honest answer, not a placeholder. A
+    // credential-backed provenance names a `credentialId` and a `claimPath`,
+    // and the local shape has nowhere to put either — so a value authored
+    // inside a context cannot be attested, and presenting one as though it were
+    // would let a context assert an issuer's authority over a value that issuer
+    // never saw. That is the same boundary the missing `ref` forms enforce,
+    // one field along.
+    let entries: Option<Vec<vta_persona::ProfileEntry>> = req
+        .entries
+        .iter()
+        .map(|e| {
+            // Same JSON round-trip the pool handler uses for `valueType`: the
+            // two enums serialise to identical strings, and going through serde
+            // keeps the mapping honest if either side ever gains a variant the
+            // other lacks.
+            let value_type = serde_json::to_string(&e.inline.value_type)
+                .ok()
+                .and_then(|s| serde_json::from_str::<ValueType>(&s).ok())?;
+            Some(vta_persona::ProfileEntry::Inline {
+                inline: vta_persona::InlineValue {
+                    // Generated newtypes `Deref` to `String` but do not impl
+                    // `Display`, so a method call auto-derefs where a function
+                    // path does not.
+                    r#type: e.inline.type_.to_string(),
+                    value_type,
+                    value: e.inline.value.clone(),
+                    label: e.inline.label.as_ref().map(|l| l.to_string()),
+                    provenance: vta_persona::Provenance::SelfAsserted,
+                },
+                slot: e.slot.as_ref().map(|s| s.to_string()),
+            })
+        })
+        .collect();
+    let Some(entries) = entries else {
+        return reject(&doc, AppError::Validation("unrecognised valueType".into()));
+    };
+
+    // A slot answers one question with one entry, so a face repeating one is
+    // refused whole, naming the slot. Checked here to carry the spec's code;
+    // the store refuses it too, so no other write path can store one.
+    if let Some(slot) = vta_persona::model::duplicate_slot(&entries) {
+        return reject_with_code(
+            &doc,
+            ext(&slug_from_doc(&doc), "duplicateSlot"),
+            format!("two entries of this face both claim the slot {slot}"),
+            Some(json!({ "slot": slot })),
+        );
+    }
+
+    let mut profile = vta_persona::new_profile(req.name.to_string(), entries);
+    if let Some(id) = &req.profile_id {
+        profile.profile_id = id.to_string();
+    }
+    let profile_id = profile.profile_id.clone();
+    let entry_count = profile.entries.len();
+    let s = store(state);
+
+    let written = match s
+        .put_local_profile(&ctx, profile, req.expected_version.map(|v| *v))
+        .await
+    {
+        Ok(w) => w,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // Local profiles ARE correlation-indexed. The naive implementation skips
+    // them — "they are local, they do not matter" — and loses the guard exactly
+    // where a human most needs it: a throwaway identity is precisely where
+    // somebody reuses a real value.
+    //
+    // Computed for the audit row whoever asked, and told back only to the
+    // holder — see the response below.
+    let matches_pool = match s.get_local_profile(&ctx, &profile_id).await {
+        Ok(Some(p)) => {
+            let mut found = false;
+            for entry in &p.entries {
+                if let vta_persona::ProfileEntry::Inline { inline, .. } = entry
+                    && s.correlation_count(&inline.value, "").await.unwrap_or(0) > 0
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+        _ => false,
+    };
+
+    // `matchesPoolValue` is carried because it is the reason this task is
+    // correlation-indexed at all: a throwaway identity is precisely where
+    // somebody reuses a real value, and a holder auditing that later needs to
+    // see WHICH local write raised the flag, not merely that one did. The flag
+    // is a boolean about a value, never the value.
+    let detail = format!(
+        "{} context-local profile {profile_id} in context {ctx} with {} entr{}, now at version \
+         {}; matches a pool value: {matches_pool}",
+        if written.created {
+            "created"
+        } else {
+            "updated"
+        },
+        entry_count,
+        if entry_count == 1 { "y" } else { "ies" },
+        written.version,
+    );
+    audit_persona(
+        state,
+        "persona.local.profile.put",
+        auth,
+        Some(&profile_id),
+        Some(&ctx),
+        Some(&detail),
+    )
+    .await;
+    // `correlation` answers the agent-wide index, and this task is
+    // context-scoped: a caller authorized in one context that reads
+    // `matchesPoolValue` has a yes/no on any value it cares to guess, one guess
+    // per write, against the holder's whole pool. No value crosses the boundary
+    // and none needs to — for a name, an address or a date of birth,
+    // confirmation IS disclosure, and the guesser is inside a single context
+    // learning about all of them.
+    //
+    // So the member is for the holder's own client and nobody else. Omitted
+    // rather than softened: a coarser signal is still an oracle, only a slower
+    // one. The holder still learns it — the audit row above records it, and
+    // `persona/correlation/analyze` answers it properly. Conditional by the
+    // specification as well as here (`persona/local/profile/put/1.1`).
+    let mut body = json!({
+        "profileId": profile_id,
+        "version": written.version,
+        "wasCreated": written.created,
+    });
+    if is_holder(state, auth).await {
+        body["correlation"] = json!({
+            "severity": if matches_pool { "high" } else { "none" },
+            "matchesPoolValue": matches_pool,
+        });
+    }
+    success_response(&doc, body)
+}
+
+pub(super) async fn handle_local_profile_get(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::local::profile::get::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_LOCAL_PROFILE_GET_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let id = req.profile_id.to_string();
+    // Resolves nothing against the pool, because a local profile references
+    // nothing there.
+    match store(state).get_local_profile(&ctx, &id).await {
+        Ok(Some(p)) => {
+            audit_persona(
+                state,
+                "persona.local.profile.get",
+                auth,
+                Some(&id),
+                Some(&ctx),
+                None,
+            )
+            .await;
+            // Built member by member rather than serialising the stored
+            // `Profile`. The local response schema closes the object to
+            // `{profileId, name, entries, version}`, and the stored shape also
+            // carries `createdAt`/`updatedAt` — serialising it whole failed
+            // response conformance with "Additional properties are not allowed".
+            //
+            // The narrower shape is right: those timestamps are pool-record
+            // metadata, and a context-local profile is not a pool record.
+            success_response(
+                &doc,
+                json!({
+                    "profile": {
+                        "profileId": p.profile_id,
+                        "name": p.name,
+                        "entries": p.entries,
+                        "version": p.version,
+                    }
+                }),
+            )
+        }
+        Ok(None) => reject(&doc, AppError::NotFound(format!("local profile {id}"))),
+        Err(e) => reject(&doc, e),
+    }
+}
+
+pub(super) async fn handle_local_profile_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::local::profile::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_LOCAL_PROFILE_LIST_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let profiles = match store(state).list_local_profiles(&ctx).await {
+        Ok(p) => p,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(
+        state,
+        "persona.local.profile.list",
+        auth,
+        None,
+        Some(&ctx),
+        None,
+    )
+    .await;
+    success_response(
+        &doc,
+        json!({
+            "profiles": profiles.iter().map(|p| json!({
+                "profileId": p.profile_id,
+                "name": p.name,
+                "entryCount": p.entries.len(),
+            })).collect::<Vec<_>>()
+        }),
+    )
+}
+
+pub(super) async fn handle_local_profile_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::local::profile::delete::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_LOCAL_PROFILE_DELETE_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let id = req.profile_id.to_string();
+    let s = store(state);
+
+    let mut unbound = 0usize;
+    if req.unbind {
+        // Clear every persona bound to this profile in this context.
+        //
+        // This used to call `set_local_binding(&ctx, "", None)` — with an
+        // *empty* persona DID, which clears the binding of nobody. `--unbind`
+        // therefore unbound nothing, and the delete either failed on the
+        // still-bound personas or left them pointing at a profile that no
+        // longer exists. It went unnoticed because nothing exercised the local
+        // family beyond asserting that an invalid entry is refused.
+        //
+        // Leaves those personas presenting nothing, which is legal and which
+        // the holder is told about rather than discovering from the other side.
+        let bound = match s.personas_bound_to(&ctx, &id).await {
+            Ok(p) => p,
+            Err(e) => return reject(&doc, e),
+        };
+        unbound = bound.len();
+        for persona_did in bound {
+            if let Err(e) = s
+                .set_local_binding(&ctx, &persona_did, None, None, None)
+                .await
+            {
+                return reject(&doc, e);
+            }
+        }
+    }
+
+    let existed = match s.delete_local_profile(&ctx, &id).await {
+        Ok(e) => e,
+        Err(e) => return reject(&doc, e),
+    };
+    // The unbind count is the only surviving trace of the silent-unbind bug
+    // this handler used to have: `--unbind` cleared nobody, and nothing said
+    // so. A row reading "0 persona(s) unbound" against a profile that had
+    // bindings is now visible after the fact rather than only reproducible.
+    let detail = format!(
+        "context-local profile {id} in context {ctx} {}; {unbound} persona(s) unbound",
+        if existed { "deleted" } else { "did not exist" },
+    );
+    audit_persona(
+        state,
+        "persona.local.profile.delete",
+        auth,
+        Some(&id),
+        Some(&ctx),
+        Some(&detail),
+    )
+    .await;
+    success_response(&doc, json!({ "profileId": id, "existed": existed }))
+}
+
+pub(super) async fn handle_local_binding_set(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::local::binding::set::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    // Safely context-callable — unlike binding/set — because both objects it
+    // names live below the boundary.
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_LOCAL_BINDING_SET_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+
+    let persona = req.persona_did.to_string();
+    let profile_id = req.profile_id.as_ref().map(|p| p.to_string());
+    let until = req.until.map(|u| u.to_rfc3339());
+    let s = store(state);
+    if let Some(refused) = refuse_binding(
+        &doc,
+        &s,
+        &ctx,
+        Some(&ctx),
+        profile_id.as_deref(),
+        until.as_deref(),
+    )
+    .await
+    {
+        return refused;
+    }
+
+    // The store refuses an identifier naming a POOL profile. That refusal is
+    // the whole distinction from binding/set, and it lives in one place so this
+    // handler cannot forget it.
+    let version = match s
+        .set_local_binding(
+            &ctx,
+            &persona,
+            profile_id.as_deref(),
+            req.label.as_ref().map(|l| l.to_string()),
+            until,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // No materialised count here, unlike `binding/set`: a context-local entry
+    // IS its own value, so there is no pool projection to count — the store
+    // takes the profile's inline entries as the claims directly. Saying so is
+    // better than reporting a count that would mean something different from
+    // the one on the pool task with the same name.
+    let detail = format!(
+        "persona {persona} in context {ctx} bound to {}, now at version {version}",
+        profile_id.as_deref().map_or_else(
+            || "unbound".to_string(),
+            |p| format!("context-local profile {p}")
+        ),
+    );
+    audit_persona(
+        state,
+        "persona.local.binding.set",
+        auth,
+        Some(&persona),
+        Some(&ctx),
+        Some(&detail),
+    )
+    .await;
+    success_response(
+        &doc,
+        json!({
+            "contextId": ctx,
+            "personaDid": persona,
+            "profileId": profile_id,
+            "version": version,
+        }),
+    )
+}
+
+// ─── Disclosure: preview, then present ───────────────────────────────────
+
+pub(super) async fn handle_disclosure_preview(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::disclosure::preview::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_DISCLOSURE_PREVIEW_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+
+    let requested: Option<Vec<String>> = if req.requested_claims.is_empty() {
+        None
+    } else {
+        Some(req.requested_claims.iter().map(|c| c.to_string()).collect())
+    };
+
+    let preview = match store(state)
+        .create_preview(
+            &ctx,
+            &req.persona_did.to_string(),
+            &req.verifier_did.to_string(),
+            req.purpose.as_ref().map(|p| p.to_string()).as_deref(),
+            requested.as_deref(),
+            req.renderer.as_ref().map(|r| r.to_string()).as_deref(),
+        )
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return reject(&doc, e),
+    };
+
+    // Recorded even though nothing was disclosed: a pattern of previews the
+    // holder declined is itself something they may want to see.
+    audit_persona(
+        state,
+        "persona.disclosure.preview",
+        auth,
+        Some(&preview.preview_id),
+        Some(&ctx),
+        None,
+    )
+    .await;
+
+    success_response(
+        &doc,
+        json!({
+            "previewId": preview.preview_id,
+            "subject": preview.subject,
+            "claims": preview.claims,
+            "renderer": { "id": preview.renderer_id, "drops": preview.renderer_drops },
+            "expiresAt": preview.expires_at,
+        }),
+    )
+}
+
+pub(super) async fn handle_disclosure_present(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::disclosure::present::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_DISCLOSURE_PRESENT_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+
+    let durable = req.mint.as_ref().is_some_and(|m| m.durable);
+    let preview_id = req.preview_id.to_string();
+
+    // The step-up gate runs BEFORE the preview is taken.
+    //
+    // `present` consumes the preview as its first act, so a refusal after that
+    // point would cost the holder the decision they already made — and the one
+    // refusal that is *retryable* is this one. It is retryable precisely
+    // because the preview survives it: the holder obtains an approval and
+    // presents the same preview again.
+    //
+    // A peek rather than a read-modify-write: nothing here mutates, and the
+    // consume below re-reads under the store's own lock.
+    match store(state).peek_preview(&preview_id).await {
+        Ok(Some(preview)) => {
+            if PersonaStore::requires_step_up(&preview) && preview.approved_at.is_none() {
+                let claim_types: Vec<String> =
+                    preview.claims.iter().map(|c| c.r#type.clone()).collect();
+                return match super::step_up::initiate_disclosure_step_up(
+                    state,
+                    auth,
+                    &preview_id,
+                    &preview.verifier_did,
+                    preview.purpose.as_deref(),
+                    &claim_types,
+                )
+                .await
+                {
+                    Ok(details) => step_up_required(&doc, details),
+                    Err(reason) => super::helpers::reject_with(&doc, reason),
+                };
+            }
+        }
+        // Absent is not this gate's business. The consume below distinguishes
+        // unknown from consumed from expired and has the error vocabulary for
+        // it; guessing here would give two paths for one answer.
+        Ok(None) => {}
+        Err(e) => return reject(&doc, e),
+    }
+
+    // The store consumes the preview, refuses an expired one, refuses whole on
+    // a stale claim, and writes the disclosure record BEFORE returning the
+    // artifact — a crash between signing and recording would release data the
+    // holder could never afterwards discover they had released.
+    let (artifact, record) = match store(state)
+        .present(
+            &preview_id,
+            req.challenge.as_ref().map(|c| c.to_string()).as_deref(),
+            durable,
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return reject(&doc, e),
+    };
+
+    audit_persona(
+        state,
+        "persona.disclosure.present",
+        auth,
+        Some(&record.disclosure_id),
+        Some(&ctx),
+        None,
+    )
+    .await;
+
+    // `credentialId` is present only when the holder asked for the disclosure
+    // to be minted as a self-issued credential. It is built member-by-member
+    // rather than with `json!`, because `json!` renders a `None` as `null` and
+    // the schema types the member `string` — the same defect
+    // `payload_null_census` guards against on the request side, where an unset
+    // optional must be *absent* rather than null. There is no equivalent
+    // census for responses; the response-conformance layer catches it at run
+    // time instead, which is how this one was found.
+    let mut body = json!({
+        "disclosureId": record.disclosure_id,
+        "artifact": artifact,
+        "subject": record.subject,
+        "disclosedAt": record.disclosed_at,
+    });
+    put_opt(
+        &mut body,
+        "credentialId",
+        record.durable_credential_id.clone(),
+    );
+    success_response(&doc, body)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────
+
+// ── Worlds: the holder's own arrangement of their own identity ──────────────
+
+pub(super) async fn handle_world_put(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::world::put::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_WORLD_PUT_1_1, None).await {
+        return reject(&doc, e);
+    }
+
+    let s = store(state);
+    // `.map(|u| u.to_string())` rather than `.map(ToString::to_string)`: the
+    // generated `Ulid` is a newtype with `Deref` and no `Display`, so the
+    // method call auto-derefs to `String` while the function path does not.
+    let face_ids: Vec<String> = req.face_ids.iter().map(|u| u.to_string()).collect();
+    let attribute_ids: Vec<String> = req.attribute_ids.iter().map(|u| u.to_string()).collect();
+    let Some(colour) = colour_of(&req.colour) else {
+        return reject_with_code(
+            &doc,
+            ext(&slug_from_doc(&doc), "unsupportedColour"),
+            "this agent does not know that colour",
+            Some(json!({ "colour": req.colour.to_string() })),
+        );
+    };
+    let mut world = vta_persona::new_world(
+        req.name.to_string(),
+        colour,
+        req.icon.as_ref().map(|i| i.to_string()),
+        face_ids,
+        attribute_ids,
+    );
+    // A supplied id addresses an existing record; an absent one keeps the
+    // minted ULID, which is what makes a create idempotent under retry only
+    // when the producer chose the id itself.
+    if let Some(id) = req.world_id.as_ref() {
+        world.world_id = id.to_string();
+    }
+    let world_id = world.world_id.clone();
+
+    // The exclusivity refusal is its own extended code rather than a validation
+    // string, because the details are what make it actionable: told only that
+    // the write failed, a consumer can do nothing but send the holder off to
+    // find where the face already is.
+    let clash = match s
+        .placement_conflicts(&world.face_ids, Some(&world_id))
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return reject(&doc, e),
+    };
+    if !clash.placed.is_empty() {
+        return reject_with_code(
+            &doc,
+            ext(&slug_from_doc(&doc), "faceAlreadyPlaced"),
+            "one or more faces already belong to another world",
+            Some(json!({ "placed": clash.placed })),
+        );
+    }
+
+    let written = match s
+        .put_world(world, req.expected_version.map(u64::from))
+        .await
+    {
+        Ok(w) => w,
+        Err(e) => return reject(&doc, e),
+    };
+    // The name is the most revealing member in the record and never reaches an
+    // audit line: "Work" discloses nothing and "the divorce" discloses a great
+    // deal, and a holder naming a part of their life is not thinking about logs.
+    audit_persona(state, "persona.world.put", auth, None, None, None).await;
+    success_response(
+        &doc,
+        json!({
+            "worldId": world_id,
+            "version": written.version,
+            "wasCreated": written.created,
+            "updatedAt": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+}
+
+pub(super) async fn handle_world_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let _req: spec::world::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_WORLD_LIST_1_0, None).await {
+        return reject(&doc, e);
+    }
+    let worlds = match store(state).list_worlds().await {
+        Ok(f) => f,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(state, "persona.world.list", auth, None, None, None).await;
+    // No `nextCursor`: this maintainer returns every world in one page. The
+    // member is absent rather than null, which is what says the listing is
+    // complete — a consumer following the cursor sees exactly one page.
+    success_response(&doc, json!({ "worlds": worlds }))
+}
+
+pub(super) async fn handle_world_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::world::delete::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_WORLD_DELETE_1_0, None).await {
+        return reject(&doc, e);
+    }
+    // Touches no profile and no attribute. There is no cascading form of this
+    // call because there is no cascading form of the idea: a world is an
+    // arrangement, not a container.
+    let (existed, released) = match store(state)
+        .delete_world(
+            &req.world_id.to_string(),
+            req.expected_version.map(u64::from),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(state, "persona.world.delete", auth, None, None, None).await;
+    success_response(
+        &doc,
+        json!({ "existed": existed, "releasedFaces": released }),
+    )
+}
+
+fn colour_of(c: &spec::world::put::v1_1::WorldColour) -> Option<vta_persona::WorldColour> {
+    use spec::world::put::v1_1::WorldColour as W;
+    use vta_persona::WorldColour as S;
+    Some(match c {
+        W::Slate => S::Slate,
+        W::Indigo => S::Indigo,
+        W::Teal => S::Teal,
+        W::Moss => S::Moss,
+        W::Sand => S::Sand,
+        W::Clay => S::Clay,
+        W::Rose => S::Rose,
+        W::Plum => S::Plum,
+        _ => return None,
+    })
+}
+
+// ─── Contacts: the holder's annotations, and their lists ─────────────────
+
+/// A refusal with one of the task's own declared codes.
+fn declared(
+    doc: &TrustTask<Value>,
+    local: &str,
+    message: String,
+    details: Option<Value>,
+) -> TrustTaskOutcome {
+    let mut payload = ErrorPayload::new(ext(&slug_from_doc(doc), local)).with_message(message);
+    if let Some(d) = details {
+        payload = payload.with_details(d);
+    }
+    error_response(doc.reject_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
+}
+
+/// The annotation changes a `contact/put/1.2` payload names (item 6): each
+/// given replaces, each `removeX` removes, each absent is unchanged.
+fn annotation_change(p: &Value) -> vta_persona::AnnotationChange {
+    use vta_persona::Change;
+    fn change<T>(
+        p: &Value,
+        key: &str,
+        remove: &str,
+        read: impl Fn(&Value) -> Option<T>,
+    ) -> Change<T> {
+        if p.get(remove).and_then(Value::as_bool) == Some(true) {
+            Change::Remove
+        } else {
+            match p.get(key).and_then(&read) {
+                Some(v) => Change::Set(v),
+                None => Change::Keep,
+            }
+        }
+    }
+    let text = |v: &Value| v.as_str().map(str::to_string);
+    vta_persona::AnnotationChange {
+        starred: p.get("starred").and_then(Value::as_bool),
+        petname: change(p, "petname", "removePetname", text),
+        lists: change(p, "lists", "removeLists", |v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect()
+            })
+        }),
+        directory_ref: change(p, "directoryRef", "removeDirectoryRef", |v| {
+            serde_json::from_value::<vta_persona::DirectoryRef>(v.clone()).ok()
+        }),
+        notes: change(p, "notes", "removeNotes", text),
+    }
+}
+
+fn annotate_refusal(doc: &TrustTask<Value>, e: vta_persona::AnnotateError) -> TrustTaskOutcome {
+    use vta_persona::AnnotateError;
+    match e {
+        AnnotateError::NotFound => reject(doc, AppError::NotFound("contact".into())),
+        AnnotateError::ListUnknown(ids) => declared(
+            doc,
+            "listUnknown",
+            "a list named in `lists` is not one of this context's; nothing was changed. Create it \
+             with persona/contact/lists/put first"
+                .into(),
+            Some(json!({ "listIds": ids.into_iter().take(64).collect::<Vec<_>>() })),
+        ),
+        AnnotateError::Store(e) => reject(doc, e),
+        other => reject(doc, AppError::Internal(format!("{other:?}"))),
+    }
+}
+
+/// The annotation members of a contact as get and list answer them: `starred`
+/// always; `lists` only lists this context still holds.
+fn put_annotations(
+    body: &mut Value,
+    a: &vta_persona::ContactAnnotations,
+    held: &std::collections::BTreeSet<String>,
+) {
+    body["starred"] = json!(a.starred);
+    put_opt(body, "petname", a.petname.clone());
+    let lists: Vec<&String> = a.lists.iter().filter(|l| held.contains(*l)).collect();
+    if !lists.is_empty() {
+        body["lists"] = json!(lists);
+    }
+    put_opt(body, "directoryRef", a.directory_ref.clone());
+}
+
+async fn held_lists(
+    state: &AppState,
+    ctx: &str,
+) -> Result<std::collections::BTreeSet<String>, AppError> {
+    Ok(store(state)
+        .contact_lists(ctx)
+        .await?
+        .into_iter()
+        .map(|v| v.list.list_id)
+        .collect())
+}
+
+pub(super) async fn handle_contact_put(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::contact::put::v1_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_CONTACT_PUT_1_2, Some(&ctx)).await {
+        return reject(&doc, e);
+    }
+    let change = annotation_change(&doc.payload);
+    let s = store(state);
+
+    // The annotating form: no revision, no `rev` movement (item 7).
+    if let Some(contact_id) = req.contact_id.as_ref().map(|c| c.to_string()) {
+        let changed = match s.annotate_contact(&ctx, &contact_id, &change).await {
+            Ok(c) => c,
+            Err(e) => return annotate_refusal(&doc, e),
+        };
+        let rev = match s.get_contact(&ctx, &contact_id).await {
+            Ok(Some(c)) => c.rev,
+            Ok(None) => return reject(&doc, AppError::NotFound("contact".into())),
+            Err(e) => return reject(&doc, e),
+        };
+        audit_persona(
+            state,
+            "persona.contact.annotate",
+            auth,
+            Some(&contact_id),
+            Some(&ctx),
+            None,
+        )
+        .await;
+        return success_response(
+            &doc,
+            json!({
+                "contactId": contact_id,
+                "rev": rev,
+                "wasCreated": false,
+                "annotationsChanged": changed,
+            }),
+        );
+    }
+
+    // The linking form (item 4): a directory member whose DID the holder was
+    // not shown.
+    if req.subject_did.is_none()
+        && let (Some(persona), Some(dref)) = (
+            &req.known_by_persona,
+            doc.payload
+                .get("directoryRef")
+                .and_then(|v| serde_json::from_value::<vta_persona::DirectoryRef>(v.clone()).ok()),
+        )
+    {
+        let (contact_id, rev, created, changed) = match s
+            .link_contact(&ctx, &dref, &persona.to_string(), &change)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return annotate_refusal(&doc, e),
+        };
+        audit_persona(
+            state,
+            "persona.contact.link",
+            auth,
+            Some(&contact_id),
+            Some(&ctx),
+            None,
+        )
+        .await;
+        return success_response(
+            &doc,
+            json!({
+                "contactId": contact_id,
+                "rev": rev,
+                "wasCreated": created,
+                "annotationsChanged": changed,
+            }),
+        );
+    }
+
+    // The filing form.
+    let (Some(subject), Some(persona), Some(document)) =
+        (&req.subject_did, &req.known_by_persona, &req.document)
+    else {
+        return reject(
+            &doc,
+            AppError::Validation("a filing names subjectDid, knownByPersona and document".into()),
+        );
+    };
+    let document = match serde_json::to_value(document)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+    {
+        Some(d) => d,
+        None => {
+            return reject(
+                &doc,
+                AppError::Validation("unrecognised contact document".into()),
+            );
+        }
+    };
+    let (filed, changed) = match s
+        .file_contact_annotated(
+            &ctx,
+            &subject.to_string(),
+            &persona.to_string(),
+            document,
+            req.credential_refs.iter().map(|c| c.to_string()).collect(),
+            &change,
+        )
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => return annotate_refusal(&doc, e),
+    };
+    audit_persona(
+        state,
+        "persona.contact.put",
+        auth,
+        Some(&filed.contact_id),
+        Some(&ctx),
+        None,
+    )
+    .await;
+    success_response(
+        &doc,
+        json!({
+            "contactId": filed.contact_id,
+            "rev": filed.rev,
+            "wasCreated": filed.created,
+            "annotationsChanged": changed,
+            "changedClaims": filed.changed_claims,
+        }),
+    )
+}
+
+pub(super) async fn handle_contact_get(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::contact::get::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_CONTACT_GET_1_1, Some(&ctx)).await {
+        return reject(&doc, e);
+    }
+    let id = req.contact_id.to_string();
+    let s = store(state);
+    let Some(contact) = (match s.get_contact(&ctx, &id).await {
+        Ok(c) => c,
+        Err(e) => return reject(&doc, e),
+    }) else {
+        return reject(&doc, AppError::NotFound(format!("contact {id}")));
+    };
+    let document = match req.rev {
+        None => serde_json::to_value(&contact.document).unwrap_or(Value::Null),
+        Some(rev) => match s.get_contact_revision(&ctx, &id, rev.get()).await {
+            Ok(r) => serde_json::to_value(&r.document).unwrap_or(Value::Null),
+            Err(e) => return reject(&doc, e),
+        },
+    };
+    let history = if req.include_history {
+        match s.contact_history(&ctx, &id).await {
+            Ok(h) => Some(
+                h.iter()
+                    .map(|(rev, at, cited)| json!({ "rev": rev, "receivedAt": at, "cited": cited }))
+                    .collect::<Vec<_>>(),
+            ),
+            Err(e) => return reject(&doc, e),
+        }
+    } else {
+        None
+    };
+    // The current annotations, with any revision.
+    let (annotations, held) = match (
+        s.contact_annotations(&ctx, &id).await,
+        held_lists(state, &ctx).await,
+    ) {
+        (Ok(a), Ok(h)) => (a, h),
+        (Err(e), _) | (_, Err(e)) => return reject(&doc, e),
+    };
+    audit_persona(
+        state,
+        "persona.contact.get",
+        auth,
+        Some(&id),
+        Some(&ctx),
+        None,
+    )
+    .await;
+    let mut body = json!({
+        "contactId": contact.contact_id,
+        "knownByPersona": contact.known_by_persona,
+        "rev": req.rev.map_or(contact.rev, std::num::NonZeroU64::get),
+        "document": document,
+        "credentialRefs": contact.credential_refs,
+    });
+    // A linked contact has none (put 1.2 linking form).
+    if !contact.subject_did.is_empty() {
+        body["subjectDid"] = json!(contact.subject_did);
+    }
+    put_annotations(&mut body, &annotations, &held);
+    put_opt(&mut body, "notes", contact.notes.clone());
+    if let Some(h) = history {
+        body["history"] = json!(h);
+    }
+    success_response(&doc, body)
+}
+
+/// A listing cursor bound to the filters it was minted for: `c1.<digest>.<offset>`.
+fn list_cursor(filters: &Value, offset: usize) -> String {
+    format!("c1.{}.{offset}", filter_digest(filters))
+}
+
+fn filter_digest(filters: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json_canonicalizer::to_vec(filters).unwrap_or_default();
+    hex::encode(&Sha256::digest(bytes)[..8])
+}
+
+/// The offset a cursor resumes at, or `None` for one these filters were not
+/// given.
+fn open_cursor(cursor: &str, filters: &Value) -> Option<usize> {
+    let mut parts = cursor.splitn(3, '.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("c1"), Some(d), Some(o)) if d == filter_digest(filters) => o.parse().ok(),
+        _ => None,
+    }
+}
+
+pub(super) async fn handle_contact_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::contact::list::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(state, auth, uris::TASK_PERSONA_CONTACT_LIST_1_1, Some(&ctx)).await {
+        return reject(&doc, e);
+    }
+    let p = &doc.payload;
+    let persona = p.get("knownByPersona").and_then(Value::as_str);
+    let since = p
+        .get("changedSince")
+        .and_then(Value::as_str)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    let starred = p.get("starred").and_then(Value::as_bool);
+    let list_id = p.get("listId").and_then(Value::as_str);
+    let vtc = p.get("directoryVtcDid").and_then(Value::as_str);
+    let limit = p
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(100, |l| l.clamp(1, 500) as usize);
+    let filters = json!({
+        "c": ctx, "p": persona, "s": p.get("changedSince"), "st": starred, "l": list_id, "v": vtc,
+    });
+    let start = match p.get("cursor").and_then(Value::as_str) {
+        None => 0,
+        Some(c) => match open_cursor(c, &filters) {
+            Some(o) => o,
+            None => {
+                return declared(
+                    &doc,
+                    "cursorInvalid",
+                    "the cursor was not issued for these filters".into(),
+                    None,
+                );
+            }
+        },
+    };
+    let s = store(state);
+    let held = match held_lists(state, &ctx).await {
+        Ok(h) => h,
+        Err(e) => return reject(&doc, e),
+    };
+    if let Some(l) = list_id
+        && !held.contains(l)
+    {
+        return declared(
+            &doc,
+            "listUnknown",
+            "no list in this context has that id".into(),
+            None,
+        );
+    }
+    let (contacts, annotations) = match (
+        s.list_contacts(&ctx, persona).await,
+        s.context_annotations(&ctx).await,
+    ) {
+        (Ok(c), Ok(a)) => (c, a),
+        (Err(e), _) | (_, Err(e)) => return reject(&doc, e),
+    };
+    let none = vta_persona::ContactAnnotations::default();
+    let mut matching: Vec<(&vta_persona::Contact, &vta_persona::ContactAnnotations)> = contacts
+        .iter()
+        .map(|c| (c, annotations.get(&c.contact_id).unwrap_or(&none)))
+        .filter(|(c, a)| {
+            // A contact filed before its receipt was recorded may have changed.
+            since.is_none_or(|t| {
+                c.received_at
+                    .as_deref()
+                    .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+                    .is_none_or(|r| r > t)
+            }) && starred.is_none_or(|st| a.starred == st)
+                && list_id.is_none_or(|l| a.lists.iter().any(|x| x == l))
+                && vtc.is_none_or(|v| a.directory_ref.as_ref().is_some_and(|d| d.vtc_did == v))
+        })
+        .collect();
+    // Stable across the pages of one enumeration.
+    matching.sort_by(|a, b| a.0.contact_id.cmp(&b.0.contact_id));
+    let page: Vec<Value> = matching
+        .iter()
+        .skip(start)
+        .take(limit)
+        .map(|(c, a)| {
+            let mut v = json!({
+                "contactId": c.contact_id,
+                "knownByPersona": c.known_by_persona,
+                "rev": c.rev,
+                "claimCount": c.document.claims.len(),
+                "receivedAt": c.received_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                "hasUnreviewedChange": c.has_unreviewed_change,
+            });
+            if !c.subject_did.is_empty() {
+                v["subjectDid"] = json!(c.subject_did);
+            }
+            // The contact's own disclosed name — never the DID or the petname.
+            if let Some(name) = c
+                .document
+                .claims
+                .iter()
+                .find(|cl| cl.r#type == "name.display")
+                .and_then(|cl| cl.value.as_str())
+            {
+                v["displayName"] = json!(name.chars().take(256).collect::<String>());
+            }
+            put_annotations(&mut v, a, &held);
+            v
+        })
+        .collect();
+    let next = start + page.len();
+    audit_persona(state, "persona.contact.list", auth, None, Some(&ctx), None).await;
+    let mut body = json!({ "contacts": page });
+    if next < matching.len() {
+        body["nextCursor"] = json!(list_cursor(&filters, next));
+    }
+    success_response(&doc, body)
+}
+
+fn list_wire(v: &vta_persona::ListView) -> Value {
+    let mut out = json!({
+        "listId": v.list.list_id,
+        "name": v.list.name,
+        "order": v.list.order,
+        "contactCount": v.contact_count,
+        "createdAt": v.list.created_at,
+        "updatedAt": v.list.updated_at,
+    });
+    put_opt(&mut out, "colour", v.list.colour.clone());
+    out
+}
+
+pub(super) async fn handle_contact_lists_put(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use vta_persona::{Change, ListError};
+    let req: spec::contact::lists::put::v1_1::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_CONTACT_LISTS_PUT_1_1,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let p = &doc.payload;
+    let change = vta_persona::ListChange {
+        name: p.get("name").and_then(Value::as_str).map(str::to_string),
+        colour: if p.get("removeColour").and_then(Value::as_bool) == Some(true) {
+            Change::Remove
+        } else {
+            match p.get("colour").and_then(Value::as_str) {
+                Some(c) => Change::Set(c.to_string()),
+                None => Change::Keep,
+            }
+        },
+        order: p
+            .get("order")
+            .and_then(Value::as_u64)
+            .and_then(|o| u32::try_from(o).ok()),
+    };
+    let list_id = p.get("listId").and_then(Value::as_str);
+    let (view, created, changed) = match store(state).put_contact_list(&ctx, list_id, change).await
+    {
+        Ok(r) => r,
+        Err(ListError::NotFound) => return reject(&doc, AppError::NotFound("list".into())),
+        Err(ListError::NameTaken) => {
+            return declared(
+                &doc,
+                "nameTaken",
+                "another list in this context has that name".into(),
+                None,
+            );
+        }
+        Err(ListError::TooManyLists(limit)) => {
+            return declared(
+                &doc,
+                "tooManyLists",
+                format!("this context already holds {limit} lists"),
+                Some(json!({ "limit": limit })),
+            );
+        }
+        Err(ListError::Store(e)) => return reject(&doc, e),
+        Err(other) => return reject(&doc, AppError::Internal(format!("{other:?}"))),
+    };
+    // Never the list's name (lists/put item 7).
+    audit_persona(
+        state,
+        "persona.contact.lists.put",
+        auth,
+        Some(&view.list.list_id),
+        Some(&ctx),
+        None,
+    )
+    .await;
+    success_response(
+        &doc,
+        json!({ "list": list_wire(&view), "wasCreated": created, "changed": changed }),
+    )
+}
+
+pub(super) async fn handle_contact_lists_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::contact::lists::list::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_CONTACT_LISTS_LIST_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let p = &doc.payload;
+    let limit = p
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(100, |l| l.clamp(1, 500) as usize);
+    let filters = json!({ "c": ctx, "lists": true });
+    let start = match p.get("cursor").and_then(Value::as_str) {
+        None => 0,
+        Some(c) => match open_cursor(c, &filters) {
+            Some(o) => o,
+            None => {
+                return declared(
+                    &doc,
+                    "cursorInvalid",
+                    "the cursor was not issued here".into(),
+                    None,
+                );
+            }
+        },
+    };
+    let lists = match store(state).contact_lists(&ctx).await {
+        Ok(l) => l,
+        Err(e) => return reject(&doc, e),
+    };
+    let page: Vec<Value> = lists
+        .iter()
+        .skip(start)
+        .take(limit)
+        .map(list_wire)
+        .collect();
+    let next = start + page.len();
+    audit_persona(
+        state,
+        "persona.contact.lists.list",
+        auth,
+        None,
+        Some(&ctx),
+        None,
+    )
+    .await;
+    let mut body = json!({ "lists": page });
+    if next < lists.len() {
+        body["nextCursor"] = json!(list_cursor(&filters, next));
+    }
+    success_response(&doc, body)
+}
+
+pub(super) async fn handle_contact_lists_show(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::contact::lists::show::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_CONTACT_LISTS_SHOW_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let id = req.list_id.to_string();
+    match store(state).contact_list(&ctx, &id).await {
+        Ok(Some(v)) => {
+            audit_persona(
+                state,
+                "persona.contact.lists.show",
+                auth,
+                Some(&id),
+                Some(&ctx),
+                None,
+            )
+            .await;
+            success_response(&doc, json!({ "list": list_wire(&v) }))
+        }
+        Ok(None) => reject(&doc, AppError::NotFound("list".into())),
+        Err(e) => reject(&doc, e),
+    }
+}
+
+pub(super) async fn handle_contact_lists_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: spec::contact::lists::delete::v1_0::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let ctx = req.context_id.to_string();
+    if let Err(e) = authorize(
+        state,
+        auth,
+        uris::TASK_PERSONA_CONTACT_LISTS_DELETE_1_0,
+        Some(&ctx),
+    )
+    .await
+    {
+        return reject(&doc, e);
+    }
+    let id = req.list_id.to_string();
+    let (existed, updated) = match store(state).delete_contact_list(&ctx, &id).await {
+        Ok(r) => r,
+        Err(e) => return reject(&doc, e),
+    };
+    audit_persona(
+        state,
+        "persona.contact.lists.delete",
+        auth,
+        Some(&id),
+        Some(&ctx),
+        None,
+    )
+    .await;
+    // Never the list's name or its contacts (lists/delete item 4).
+    success_response(
+        &doc,
+        json!({ "listId": id, "existed": existed, "contactsUpdated": updated }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vti_common::acl::Role;
+
+    fn claims(role: Role, contexts: &[&str]) -> AuthClaims {
+        AuthClaims {
+            role,
+            allowed_contexts: contexts.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The census. A task cannot join the family without someone deciding which
+    /// side of the boundary it is on.
+    #[test]
+    fn every_persona_task_declares_a_reach() {
+        let classified: std::collections::HashSet<&str> = REACH.iter().map(|(u, _)| *u).collect();
+        let missing: Vec<&&str> = uris::ALL_URIS
+            .iter()
+            .filter(|u| u.starts_with("https://trusttasks.org/spec/persona/"))
+            .filter(|u| !classified.contains(*u))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these persona tasks declare no reach — add them to REACH. When unsure, \
+             `Holder` is the conservative answer: it refuses too much rather than \
+             disclosing the pool to a context. {missing:#?}"
+        );
+    }
+
+    #[test]
+    fn no_reach_without_a_task() {
+        let catalog: std::collections::HashSet<&str> = uris::ALL_URIS.iter().copied().collect();
+        let orphans: Vec<&&str> = REACH
+            .iter()
+            .map(|(u, _)| u)
+            .filter(|u| !catalog.contains(*u))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "reach entries for tasks that do not exist: {orphans:#?}"
+        );
+    }
+
+    /// The trap, asserted directly. This is the test that would have caught a
+    /// guard written as `role == Admin`.
+    #[test]
+    fn a_context_scoped_admin_is_refused_every_holder_task() {
+        let scoped_admin = claims(Role::Admin, &["ctx-work"]);
+        for (uri, reach) in REACH {
+            if *reach != Reach::Holder {
+                continue;
+            }
+            let err = decide(&scoped_admin, uri, Some("ctx-work"), false).unwrap_err();
+            assert!(
+                matches!(err, AppError::Forbidden(_)),
+                "{uri} admitted an admin scoped to one context — an admin in ctx-work must be \
+                 as powerless over the pool as an application in ctx-work"
+            );
+        }
+    }
+
+    /// **No role reaches the pool, including super-admin.**
+    ///
+    /// An unrestricted admin is the broadest credential the agent issues and
+    /// the one most likely to be sitting in a script; it passed every holder
+    /// task without an ACL entry saying so, which left the capability's premise
+    /// — that no role carries it — true only of the roles nobody automates
+    /// with. A super-admin can still grant itself the capability, so this is
+    /// not a boundary it cannot cross; it is the difference between crossing it
+    /// and crossing it deliberately, with an audited ACL write to show for it.
+    #[test]
+    fn no_role_reaches_the_pool_without_the_grant() {
+        for role in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            let unscoped = claims(role.clone(), &[]);
+            for (uri, reach) in REACH {
+                if *reach != Reach::Holder {
+                    continue;
+                }
+                let err = decide(&unscoped, uri, None, false).unwrap_err();
+                assert!(
+                    matches!(err, AppError::Forbidden(_)),
+                    "{uri} admitted an unscoped {role:?} who was granted nothing"
+                );
+            }
+        }
+    }
+
+    /// And the grant is what admits them — whatever their scope.
+    #[test]
+    fn the_grant_reaches_the_pool() {
+        let holder = claims(Role::Admin, &[]);
+        for (uri, reach) in REACH {
+            if *reach == Reach::Holder {
+                decide(&holder, uri, None, true).unwrap_or_else(|e| {
+                    panic!("{uri} refused a granted holder: {e:?}");
+                });
+            }
+        }
+    }
+
+    /// The refusal names the command that fixes it, because an operator who
+    /// reads "forbidden" against their own agent's own pool has no way to guess
+    /// that a capability they have never heard of is what they are missing.
+    #[test]
+    fn the_refusal_says_how_to_grant_it() {
+        let err = decide(
+            &claims(Role::Admin, &[]),
+            uris::TASK_PERSONA_ATTRIBUTE_LIST_1_0,
+            None,
+            false,
+        )
+        .unwrap_err();
+        let AppError::Forbidden(message) = err else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("persona-holder"), "{message}");
+        assert!(message.contains("pnm acl update"), "{message}");
+    }
+
+    /// The capability's whole reason to exist: a context-scoped admin reaches
+    /// the pool **only** where holder authority was granted by name.
+    ///
+    /// Before it there was one way in — an admin with unrestricted scope — so
+    /// managing your own identity from a client meant handing that client every
+    /// context on the agent.
+    #[test]
+    fn a_granted_scoped_admin_reaches_the_pool() {
+        let scoped_admin = claims(Role::Admin, &["ctx-work"]);
+        for (uri, reach) in REACH {
+            if *reach != Reach::Holder {
+                continue;
+            }
+            assert!(
+                decide(&scoped_admin, uri, Some("ctx-work"), false).is_err(),
+                "{uri} admitted a scoped admin who was granted nothing"
+            );
+            decide(&scoped_admin, uri, Some("ctx-work"), true)
+                .unwrap_or_else(|e| panic!("{uri} refused a granted holder: {e:?}"));
+        }
+    }
+
+    /// The grant is not a role promotion. It opens the holder-scoped tasks and
+    /// changes nothing else — a reader granted it is still a reader everywhere
+    /// a role is what decides.
+    #[test]
+    fn the_grant_does_not_widen_a_context_task() {
+        let app = claims(Role::Application, &["ctx-a"]);
+        assert!(
+            decide(
+                &app,
+                uris::TASK_PERSONA_BINDING_GET_1_0,
+                Some("ctx-b"),
+                true
+            )
+            .is_err(),
+            "holder authority must not carry a caller into a context it has no claim to"
+        );
+    }
+
+    /// An unknown task is refused whatever the caller holds. A grant is not a
+    /// reason to guess at a reach.
+    #[test]
+    fn a_granted_holder_is_still_refused_an_unclassified_task() {
+        let holder = claims(Role::Admin, &["ctx-work"]);
+        // Built rather than written: the produced-URI census sweeps this file's
+        // source text, and a literal that looks like a spec URI is reported as
+        // a task shipped without a schema. The neighbouring unknown-task test
+        // does the same.
+        let unknown = format!("https://trusttasks.org/spec/persona/{}/9.9", "not-a-task");
+        assert!(decide(&holder, &unknown, None, true).is_err());
+    }
+
+    /// No role reaches the pool by being itself — not even one whose empty
+    /// context list looks like an unrestricted admin's.
+    ///
+    /// "Refused" here means *ungranted*. Holder authority is granted by name
+    /// and is deliberately not tied to a role: a personal agent running as
+    /// `application` can be given it, by a super admin, on purpose. What this
+    /// pins is that none of them arrive holding it.
+    #[test]
+    fn every_non_admin_role_is_refused_the_pool() {
+        // An empty context list means *unrestricted* for Admin and *nothing at
+        // all* for every other role. A gate testing emptiness without the role
+        // gets one of those backwards, so both halves are asserted.
+        for role in [
+            Role::Application,
+            Role::Reader,
+            Role::Initiator,
+            Role::Monitor,
+        ] {
+            let label = format!("{role:?}");
+            let c = claims(role, &[]);
+            let err = decide(&c, uris::TASK_PERSONA_ATTRIBUTE_LIST_1_0, None, false).unwrap_err();
+            assert!(
+                matches!(err, AppError::Forbidden(_)),
+                "{label} reached the pool"
+            );
+        }
+    }
+
+    #[test]
+    fn a_context_task_is_confined_to_its_own_context() {
+        let app = claims(Role::Application, &["ctx-a"]);
+        decide(
+            &app,
+            uris::TASK_PERSONA_BINDING_GET_1_0,
+            Some("ctx-a"),
+            false,
+        )
+        .expect("own context");
+        assert!(
+            decide(
+                &app,
+                uris::TASK_PERSONA_BINDING_GET_1_0,
+                Some("ctx-b"),
+                false
+            )
+            .is_err(),
+            "a caller scoped to ctx-a must not learn about ctx-b"
+        );
+    }
+
+    #[test]
+    fn an_unknown_task_is_refused_rather_than_defaulted() {
+        let app = claims(Role::Application, &["ctx"]);
+        // Built rather than written as a literal, deliberately. `produced_census`
+        // scans this crate's source for spec-URI literals and asks who publishes
+        // each one — correctly, because a produced document with no schema has
+        // validation on neither side. This fixture never goes on a wire, so it
+        // takes the `format!` shape the census already documents as "not a URI
+        // that goes on a wire", rather than being allowlisted as produced.
+        let unknown = format!("https://trusttasks.org/spec/persona/{}/9.9", "made-up");
+        let err = decide(&app, &unknown, Some("ctx"), false).unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn binding_set_is_holder_only_and_local_binding_set_is_not() {
+        // The pair that most invites being collapsed. One crosses the boundary
+        // and one does not.
+        assert_eq!(
+            reach_of(uris::TASK_PERSONA_BINDING_SET_1_0),
+            Some(Reach::Holder)
+        );
+        assert_eq!(
+            reach_of(uris::TASK_PERSONA_LOCAL_BINDING_SET_1_0),
+            Some(Reach::Context)
+        );
+    }
+}

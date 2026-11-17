@@ -1,0 +1,179 @@
+//! The edge's HTTP routers: public DID resolution (per-method dispatch,
+//! `.well-known`, agent-name redirects) and the HTTPS binding of its Trust
+//! Task listener, `POST /api/trust-tasks`. There are no management routes.
+
+pub mod did_public;
+pub mod health;
+pub mod resolve_agent_name;
+mod resolve_shared;
+#[cfg(feature = "method-web")]
+pub mod resolve_web;
+// No `.well-known` route: a did:webs identifier always carries its AID
+// as the final path segment, so the method has no root form. Everything
+// it serves goes through the fallback dispatcher.
+#[cfg(feature = "method-webs")]
+pub mod resolve_webs;
+#[cfg(feature = "method-webvh")]
+pub mod resolve_webvh;
+pub mod trust_tasks;
+
+use std::sync::Arc;
+
+use axum::Extension;
+use axum::Router;
+use axum::routing::{get, post};
+use did_hosting_common::server::rate_limit::ResolveRateLimiter;
+
+use crate::server::AppState;
+
+/// Agent-name redirect routes (`/@`, `/@{name}` and `/@{name}/{*context}`).
+///
+/// Registered on both the full and public-only routers because a redirect is a
+/// public read, like `.well-known`. The routes are always present; the handler
+/// gates on `features.agent_names` at request time and 404s when the feature is
+/// off, so a disabled deployment is indistinguishable from one with no names.
+/// This keeps the runtime flag out of router *construction*, which is otherwise
+/// compile-time.
+///
+/// `/@` — the community name — needs its own route: the router will not bind
+/// an empty path parameter in the final segment, so `/@{name}` does not cover
+/// it and the request would otherwise fall through to the DID-serving fallback
+/// and be read as a mnemonic.
+///
+/// It is deliberately *not* paired with a `/@/{*context}` route — the
+/// community name takes no path. Note that omitting the route is not by itself
+/// enough: the router *will* bind an empty parameter when a wildcard follows
+/// it, so `/@/context` still reaches `serve` with `name = ""`. `serve` rejects
+/// an empty name for exactly that reason; see the note there.
+fn agent_name_routes() -> Router<AppState> {
+    Router::new()
+        .route("/@", get(resolve_agent_name::serve_community))
+        .route("/@{name}", get(resolve_agent_name::serve))
+        .route("/@{name}/{*context}", get(resolve_agent_name::serve))
+}
+
+/// The largest Trust Task document the edge's HTTPS binding reads. A
+/// `sync/batch` carries up to 512 KiB of logs (the control plane's cap), and a
+/// single `sync/update` a whole log; this leaves room for the envelope.
+pub const TRUST_TASKS_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// The HTTPS binding of the Trust Task listener, `POST /trust-tasks` (mounted
+/// under `/api`). Never smaller than [`TRUST_TASKS_BODY_LIMIT_BYTES`], so the
+/// control plane's largest batch always fits.
+fn trust_task_routes(body_limit: usize) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/trust-tasks",
+            // `receive` reads the body itself, after its rate limit, bounded
+            // in size by this and in time by the listener's body timeout.
+            post(trust_tasks::receive).layer(Extension(trust_tasks::BodyLimit(
+                body_limit.max(TRUST_TASKS_BODY_LIMIT_BYTES),
+            ))),
+        )
+        // `receive`'s rate limiter reads `ConnectInfo<SocketAddr>`, supplied
+        // per real connection in production by
+        // `into_make_service_with_connect_info`. There is deliberately no
+        // `MockConnectInfo` layer here: production must never silently fall
+        // back to a shared address, so a router driven directly (`.oneshot()`
+        // in tests) with no real connection behind it has to supply its own
+        // mock, or `receive`'s extractor fails the request closed with a 500.
+        // This layer only logs that case; it never masks it.
+        .layer(axum::middleware::from_fn(
+            trust_tasks::log_missing_connect_info,
+        ))
+}
+
+/// `POST /api/trust-tasks` on its own, for a server that serves resolution
+/// and its Trust Task listener only.
+pub fn trust_task_listener(body_limit: usize) -> Router<AppState> {
+    Router::new().nest("/api", trust_task_routes(body_limit))
+}
+
+/// Public DID-serving routes only (`.well-known` and the agent-name
+/// redirects), without the Trust Task listener.
+///
+/// The daemon mounts this: its control plane runs the one listener, on the
+/// authoritative store the embedded server reads.
+pub fn router_public_only() -> Router<AppState> {
+    #[allow(unused_mut)]
+    let mut router = Router::new();
+    #[cfg(feature = "method-webvh")]
+    {
+        router = router
+            .route(
+                "/.well-known/did.jsonl",
+                get(resolve_webvh::serve_root_did_log),
+            )
+            .route(
+                "/.well-known/did-witness.json",
+                get(resolve_webvh::serve_root_witness),
+            );
+    }
+    #[cfg(feature = "method-web")]
+    {
+        router = router.route(
+            "/.well-known/did.json",
+            get(resolve_web::serve_root_did_web),
+        );
+    }
+    router.merge(agent_name_routes())
+}
+
+/// [`router_public_only`] with `resolve_limit` on every route: what the
+/// daemon mounts.
+pub fn router_public_only_with_resolve_limit(
+    resolve_limit: Arc<ResolveRateLimiter>,
+) -> Router<AppState> {
+    with_compression(router_public_only()).layer(resolve_limit.layer())
+}
+
+/// Compress resolution responses (gzip or brotli, as the client accepts):
+/// DID logs are JSON lines that shrink several-fold. A compressed response is
+/// a different representation of the same content, so its `ETag` is marked
+/// weak (`W/`); `If-None-Match` compares weakly, so revalidation still hits.
+pub fn with_compression(router: Router<AppState>) -> Router<AppState> {
+    router
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(axum::middleware::map_response(weaken_encoded_etag))
+}
+
+async fn weaken_encoded_etag(mut response: axum::response::Response) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    if response.headers().contains_key(header::CONTENT_ENCODING)
+        && let Some(tag) = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+        && !tag.starts_with("W/")
+        && let Ok(weak) = HeaderValue::from_str(&format!("W/{tag}"))
+    {
+        response.headers_mut().insert(header::ETAG, weak);
+    }
+    response
+}
+
+/// The edge's full router, with the DID-serving fallback and no resolution
+/// limit: [`router_with_resolve_limit`] with a disabled limiter.
+pub fn router(body_limit: usize) -> Router<AppState> {
+    router_with_resolve_limit(body_limit, Arc::new(ResolveRateLimiter::disabled()))
+}
+
+/// The edge's full router: public resolution (`/.well-known/*`, the
+/// agent-name redirects and the DID-serving fallback), with `resolve_limit` on
+/// all of it, and the HTTPS binding of the Trust Task listener, which keeps
+/// its own limiter.
+///
+/// There is no management surface. Every write reaches an edge as a Trust
+/// Task signed by its control plane, over TSP, DIDComm or `POST
+/// /api/trust-tasks` alike; the edge holds no sessions and no ACL of its own.
+pub fn router_with_resolve_limit(
+    body_limit: usize,
+    resolve_limit: Arc<ResolveRateLimiter>,
+) -> Router<AppState> {
+    // No Prometheus `/metrics`: an edge's metrics are read by its control
+    // plane as `did-management/server/metrics/0.1`, authenticated like any
+    // other directive.
+    with_compression(router_public_only().fallback(did_public::serve_public))
+        .layer(resolve_limit.layer())
+        .merge(trust_task_listener(body_limit))
+}

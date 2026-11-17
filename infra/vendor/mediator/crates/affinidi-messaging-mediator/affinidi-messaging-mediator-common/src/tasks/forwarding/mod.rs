@@ -1,0 +1,44 @@
+//! Forwarding processor — reads queued messages off `FORWARD_Q` and
+//! delivers them to remote mediators via REST POST or WebSocket.
+//!
+//! Consumed by both the in-process mediator (which spawns the
+//! processor as a tokio task) and the standalone
+//! `forwarding_processor` binary in `mediator-processors` (for
+//! horizontal scaling on dedicated hosts). Both consumers construct
+//! the same [`ForwardingProcessor`] over `Arc<dyn MediatorStore>`.
+
+pub mod config;
+pub use config::{ForwardingConfig, RelayMode};
+
+// The `relay-ack` subprotocol: the per-frame acknowledgement that gives
+// WebSocket relay the same delivery semantics as the status-checked REST
+// path. Shared with the mediator, which answers these frames.
+pub mod relay_ack;
+pub use relay_ack::{RELAY_ACK_SUBPROTOCOL, RELAY_ACK_TYPE, RelayAck, frame_id};
+
+// What a peer mediator sends back (a refusal body, a relay-ack reason) is
+// read bounded and escaped before it is logged or kept.
+pub mod peer_text;
+
+// The mediator's own outbound packing, injected rather than implemented
+// here — see the module docs for why this crate can't pack for itself.
+pub mod packer;
+pub use packer::SystemMessagePacker;
+
+// The processor reports each forward's fate (relayed, retrying, abandoned,
+// expired) to an injected observer — the mediator's traffic monitor.
+pub mod observer;
+pub use observer::{ForwardOutcome, ForwardTransport, ForwardingObserver};
+
+// `ForwardingProcessor` is backend-agnostic: it consumes the
+// `forward_queue_*` methods on `Arc<dyn MediatorStore>`, which every
+// backend implements (Redis via Streams consumer groups; Fjall and
+// Memory via an in-process pending-claim emulation of the same
+// semantics). Its HTTP/WS delivery deps (`reqwest`,
+// `tokio-tungstenite`) ride on the `server` umbrella feature, which
+// also gates the parent `tasks` module — so no extra cfg is needed.
+// Multi-process scaling (the standalone `forwarding_processor`
+// binary) still requires the Redis backend; Fjall and Memory queues
+// are single-process.
+pub mod processor;
+pub use processor::ForwardingProcessor;

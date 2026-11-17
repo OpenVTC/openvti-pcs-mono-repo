@@ -1,0 +1,431 @@
+use crate::error_codes;
+use std::time::Instant;
+
+use super::Database;
+use super::cluster_scripts::{
+    DELETE_LEASE_MS, ENQUEUE_INBOX, ENQUEUE_OUTBOX, RECORD_QUEUE_IDS, STORE_LEASE_MS, STORE_MESSAGE,
+};
+use crate::database::RedisConnection;
+use crate::database::keys::Keys;
+use crate::errors::MediatorError;
+
+// Mirror of the metric names declared in the mediator's
+// `common::metrics::names` module — kept as raw strings here so this
+// `database/` impl can live in mediator-common without depending on
+// the mediator's metrics registry.
+mod names {
+    pub const MESSAGE_STORE_DURATION_SECONDS: &str = "message_store_duration_seconds";
+    pub const MESSAGES_STORED_TOTAL: &str = "messages_stored_total";
+}
+use sha256::digest;
+use tracing::{Instrument, Level, debug, event, info, span, warn};
+
+/// A message's metadata, as the store trait reports it.
+pub use crate::store::types::MessageMetaData;
+
+impl Database {
+    /// Stores a message in the database
+    /// Returns the message_id (hash of the message)
+    /// - expires_at: The timestamp at which the message expires (since epoch in seconds)
+    /// - `from_hash`: The hash of the DID of the sender
+    /// - `queue_maxlen`: Max entries per RECEIVE_Q/SEND_Q stream (0 = unlimited)
+    pub async fn store_message(
+        &self,
+        session_id: &str,
+        message: &str,
+        to_did_hash: &str,
+        from_hash: Option<&str>,
+        expires_at: u64,
+        queue_maxlen: usize,
+    ) -> Result<String, MediatorError> {
+        let _span = span!(Level::DEBUG, "store_message", session_id = session_id);
+        async move {
+            let message_hash = digest(message.as_bytes());
+
+            let from_hash = from_hash.filter(|s| !s.is_empty()).unwrap_or("ANONYMOUS");
+            debug!(
+                "trying to store msg_id({}), from_hash({:?}) to_hash({}), bytes({})",
+                message_hash,
+                from_hash,
+                to_did_hash,
+                message.len()
+            );
+
+            let start = Instant::now();
+            let mut conn = self.get_connection().await?;
+            let stored = if self.keys().cluster_mode() {
+                self.store_message_in_steps(
+                    &mut conn,
+                    &message_hash,
+                    message,
+                    expires_at,
+                    to_did_hash,
+                    from_hash,
+                    queue_maxlen,
+                )
+                .await
+            } else {
+                let mut cmd = redis::cmd("FCALL");
+                cmd.arg("store_message")
+                    .arg(1)
+                    .arg(&message_hash)
+                    .arg(message)
+                    .arg(expires_at)
+                    .arg(message.len())
+                    .arg(to_did_hash)
+                    .arg(from_hash);
+                if queue_maxlen > 0 {
+                    cmd.arg(queue_maxlen);
+                }
+                match cmd.query_async::<String>(&mut conn).await {
+                    // This build's library answers `STORED`. `OK` is the
+                    // library of an earlier build, loaded over this one by an
+                    // instance of that build: the message is stored, in the
+                    // per-id layout this build still reads, so it is not
+                    // stored again — only this build's library is loaded
+                    // again for the calls that follow.
+                    Ok(reply) if reply == "OK" => {
+                        self.handler.ensure_library(&mut conn).await;
+                        Ok(())
+                    }
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            };
+            stored.map_err(|err| {
+                event!(Level::ERROR, "Couldn't store message in database: {}", err);
+                MediatorError::database_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    session_id.into(),
+                    &err,
+                    format!("Couldn't store message in database: {err}"),
+                )
+            })?;
+
+            metrics::histogram!(names::MESSAGE_STORE_DURATION_SECONDS)
+                .record(start.elapsed().as_secs_f64());
+            metrics::counter!(names::MESSAGES_STORED_TOTAL).increment(1);
+
+            info!(
+                "Message hash({}) from({}) to({}) stored in database",
+                message_hash, from_hash, to_did_hash
+            );
+
+            Ok(message_hash)
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// `store_message` for cluster mode, as single-slot steps ordered so a
+    /// failure part-way is harmless or repaired by a retry:
+    ///
+    /// 1. the expiry index, so the sweeper can reach the message from here on
+    ///    (an entry for a message that never gets stored is dropped by the
+    ///    sweeper as already gone);
+    /// 2. body, metadata and sender, marked `STORING:<token>` for this store
+    ///    so no delete can run until step 4 (nothing to do if already stored
+    ///    for this recipient; refused while a delete holds the message). A
+    ///    delete that died or stalled past its lease is taken over, and the
+    ///    entries it claimed are released first;
+    /// 3. the recipient's inbox and the sender's outbox, concurrently;
+    /// 4. the queue ids on the metadata, clearing this store's mark: the
+    ///    message is deletable once no store holds it. Refused if a delete
+    ///    took the message over, which fails the store and releases what
+    ///    step 3 queued;
+    /// 5. the global counters, best-effort, only for a newly written message
+    ///    so a retry or a concurrent identical store counts it once.
+    ///
+    /// Steps 1–4 are idempotent by message, so a retry or the same message
+    /// stored twice at once queues and counts it once.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_message_in_steps(
+        &self,
+        conn: &mut RedisConnection,
+        message_hash: &str,
+        message: &str,
+        expires_at: u64,
+        to_did_hash: &str,
+        from_hash: &str,
+        queue_maxlen: usize,
+    ) -> redis::RedisResult<()> {
+        let keys = self.keys();
+        let bytes = message.len();
+        let token = uuid::Uuid::new_v4().to_string();
+        // This recipient's record; see `Keys::msg`.
+        let member = Keys::record_member(message_hash, Some(to_did_hash));
+
+        // Index before the message: a failure part-way then leaves at most an
+        // index entry for a message that isn't there, which the sweeper drops
+        // as already gone. Body first would leak the body and metadata for good
+        // when the index write fails and the sender doesn't retry. Index
+        // before bucket: an empty bucket in the index is passed over.
+        let bucket = format!("MSG_EXPIRY:{expires_at}");
+        redis::cmd("ZADD")
+            .arg("MSG_EXPIRY")
+            .arg("NX")
+            .arg(expires_at)
+            .arg(&bucket)
+            .exec_async(conn)
+            .await?;
+        redis::cmd("SADD")
+            .arg(&bucket)
+            .arg(&member)
+            .exec_async(conn)
+            .await?;
+
+        let stored: Vec<String> = STORE_MESSAGE
+            .key(keys.msg(message_hash, Some(to_did_hash)))
+            .key(keys.msg_meta(message_hash, Some(to_did_hash)))
+            .key(keys.msg_meta(message_hash, None))
+            .key(keys.msg_recipients(message_hash))
+            .arg(message)
+            .arg(bytes)
+            .arg(to_did_hash)
+            .arg(from_hash)
+            .arg(DELETE_LEASE_MS)
+            .arg(&token)
+            .arg(STORE_LEASE_MS)
+            .arg(expires_at)
+            .invoke_async(conn)
+            .await?;
+        let [
+            written,
+            release_to,
+            release_from,
+            release_bytes,
+            release_receive_id,
+            release_send_id,
+        ] = <[String; 6]>::try_from(stored).map_err(|reply| {
+            redis::RedisError::from((
+                redis::ErrorKind::Client,
+                "STORE_MESSAGE reply",
+                format!("expected 6 fields, got {reply:?}"),
+            ))
+        })?;
+        if written == "0" {
+            return Ok(());
+        }
+
+        // A delete that died or stalled part-way was taken over: release the
+        // entries it claimed before queueing again, so the message gets new
+        // entries and the stalled delete, if it resumes, releases nothing.
+        if !release_to.is_empty() {
+            self.handler
+                .release_queues(
+                    conn,
+                    &member,
+                    &release_to,
+                    &release_from,
+                    &release_bytes,
+                    &release_receive_id,
+                    &release_send_id,
+                )
+                .await?;
+        }
+
+        let mut inbox_conn = conn.clone();
+        let inbox = async {
+            ENQUEUE_INBOX
+                .key(keys.did(to_did_hash))
+                .key(keys.receive_q(to_did_hash))
+                .key(keys.receive_ids(to_did_hash))
+                .arg(message_hash)
+                .arg(bytes)
+                .arg(from_hash)
+                .arg(queue_maxlen)
+                .arg(&member)
+                .invoke_async::<String>(&mut inbox_conn)
+                .await
+        };
+        let mut outbox_conn = conn.clone();
+        let outbox = async {
+            if from_hash == "ANONYMOUS" {
+                return Ok(None);
+            }
+            ENQUEUE_OUTBOX
+                .key(keys.did(from_hash))
+                .key(keys.peer_q(from_hash))
+                .key(keys.send_q(from_hash))
+                .key(keys.send_ids(from_hash))
+                .arg(message_hash)
+                .arg(bytes)
+                .arg(to_did_hash)
+                .arg(queue_maxlen)
+                .arg(&member)
+                .invoke_async::<String>(&mut outbox_conn)
+                .await
+                .map(Some)
+        };
+        let (receive_id, send_id) = futures_util::future::try_join(inbox, outbox).await?;
+
+        let mut ids = vec!["RECEIVE_ID".to_string(), receive_id];
+        if let Some(send_id) = send_id {
+            ids.extend(["SEND_ID".to_string(), send_id]);
+        }
+        let recorded: i64 = RECORD_QUEUE_IDS
+            .key(keys.msg_meta(message_hash, Some(to_did_hash)))
+            .arg(&token)
+            .arg(&ids)
+            .invoke_async(conn)
+            .await?;
+        if recorded == 0 {
+            // A delete took the message over (this store outlived its lease).
+            // The message isn't stored, so release what this store queued;
+            // the delete may release the same entries, and each goes once.
+            if let Err(err) = self
+                .handler
+                .release_queues(
+                    conn,
+                    &member,
+                    to_did_hash,
+                    if from_hash == "ANONYMOUS" {
+                        ""
+                    } else {
+                        from_hash
+                    },
+                    &bytes.to_string(),
+                    &ids[1],
+                    ids.get(3).map_or("", String::as_str),
+                )
+                .await
+            {
+                warn!("Couldn't release the queue entries of message {message_hash}: {err}");
+            }
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::Client,
+                "DELETED_WHILE_STORING",
+                format!("message {message_hash} was deleted before its store completed"),
+            )));
+        }
+        if written != "1" {
+            return Ok(());
+        }
+
+        // One key, so no MULTI: it would only add commands.
+        let mut counted = redis::pipe();
+        counted
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("RECEIVED_BYTES")
+            .arg(bytes)
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("RECEIVED_COUNT")
+            .arg(1);
+        if let Err(err) = counted.exec_async(conn).await {
+            warn!("Couldn't count stored message {message_hash}: {err}");
+        }
+        Ok(())
+    }
+
+    /// Retrieves the metadata of the record of `message_hash` held for
+    /// `recipient` — its per-recipient record, else a legacy per-id record
+    /// whose TO is `recipient`.
+    pub async fn get_message_metadata(
+        &self,
+        recipient: &str,
+        message_hash: &str,
+    ) -> Result<MessageMetaData, MediatorError> {
+        let session_id = "NA";
+        let _span = span!(
+            Level::DEBUG,
+            "get_message_metadata",
+            recipient = recipient,
+            message_hash = message_hash
+        );
+        async move {
+            if !crate::store::ops::is_message_id(message_hash) {
+                return Err(MediatorError::DatabaseError(
+                    error_codes::DB_METADATA_PARSE_ERROR,
+                    session_id.into(),
+                    format!("No usable metadata for message {message_hash}"),
+                ));
+            }
+            // The `store_message` Lua function keeps a message's metadata in
+            // the hash `MSG:META:{id}`: BYTES, TO, TIMESTAMP (unix ms), and
+            // FROM when the sender is known. (This read used to look for a
+            // `MESSAGE_STORE` hash field that nothing writes, so it could
+            // never succeed.)
+            let mut conn = self.get_connection().await?;
+            let (own, legacy): (
+                std::collections::HashMap<String, String>,
+                std::collections::HashMap<String, String>,
+            ) = redis::pipe()
+                .hgetall(self.keys().msg_meta(message_hash, Some(recipient)))
+                .hgetall(self.keys().msg_meta(message_hash, None))
+                .query_async(&mut conn)
+                .await
+                .map_err(|err| {
+                    event!(
+                        Level::ERROR,
+                        "Couldn't get message metadata from database: {}",
+                        err
+                    );
+                    MediatorError::database_from_redis(
+                        error_codes::DB_OPERATION_ERROR,
+                        session_id.into(),
+                        &err,
+                        format!("Couldn't get message metadata from database: {err}"),
+                    )
+                })?;
+            let fields = if !own.is_empty() {
+                own
+            } else if legacy.get("TO").map(String::as_str) == Some(recipient) {
+                legacy
+            } else {
+                Default::default()
+            };
+            let metadata = metadata_from_fields(&fields).ok_or_else(|| {
+                MediatorError::DatabaseError(
+                    error_codes::DB_METADATA_PARSE_ERROR,
+                    session_id.into(),
+                    format!("No usable metadata for message {message_hash}"),
+                )
+            })?;
+
+            Ok(metadata)
+        }
+        .instrument(_span)
+        .await
+    }
+}
+
+/// A `MSG:META:{id}` hash as [`MessageMetaData`]; `None` when the message is
+/// gone (an empty hash) or a required field is missing or malformed.
+fn metadata_from_fields(
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<MessageMetaData> {
+    Some(MessageMetaData {
+        bytes: fields.get("BYTES")?.parse().ok()?,
+        to_did_hash: fields.get("TO")?.clone(),
+        from_did_hash: fields.get("FROM").cloned(),
+        timestamp: fields.get("TIMESTAMP")?.parse().ok()?,
+    })
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn a_message_meta_hash_parses_and_an_empty_one_is_absent() {
+        let fields: std::collections::HashMap<String, String> = [
+            ("BYTES", "42"),
+            ("TO", "bob"),
+            ("FROM", "alice"),
+            ("TIMESTAMP", "1700000000123"),
+            ("RECEIVE_ID", "1-0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let meta = metadata_from_fields(&fields).unwrap();
+        assert_eq!(meta.bytes, 42);
+        assert_eq!(meta.to_did_hash, "bob");
+        assert_eq!(meta.from_did_hash.as_deref(), Some("alice"));
+        assert_eq!(meta.timestamp, 1_700_000_000_123);
+
+        assert!(metadata_from_fields(&Default::default()).is_none());
+    }
+}

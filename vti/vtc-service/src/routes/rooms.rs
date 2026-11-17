@@ -1,0 +1,104 @@
+//! Operator read surface for the rooms this community hosts.
+//!
+//! # What an operator may see, and why it is not a contradiction
+//!
+//! A host cannot read a room's records and holds no member list — both by construction, and
+//! the rest of the rooms design exists to keep it that way. What it *does* hold about each
+//! room it stores is exactly what operating one requires: who is accountable for it, which
+//! tier it was created at, which epoch it is on, and where it sits on the lifecycle clock.
+//!
+//! Invariant I1 makes the owner visible at **every** tier, including `private`, for this
+//! reason: a room whose contents nobody here can read still has a party this operator must
+//! be able to reach about quota, abuse, and the reclamation notice §9 obliges them to send.
+//! An operator who cannot list their rooms cannot send it.
+//!
+//! So this returns the row and nothing derived from the room's contents. There is no
+//! endpoint here that returns records, and there is no member list to return.
+
+use serde::Serialize;
+use vti_common::error::AppError;
+
+use crate::server::AppState;
+
+/// One room, as its host can honestly describe it.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedRoom {
+    pub room_id: String,
+    /// The accountable party — visible at every tier, which is what makes the
+    /// lifecycle notice deliverable.
+    pub owner_did: String,
+    pub visibility: String,
+    /// Whether the room keeps its history readable across a membership change.
+    pub retention_policy: String,
+    pub epoch: u32,
+    /// Where the room sits on the lifecycle clock: `live`, `lapsed`, `dormant`
+    /// or `reclaimable`. Computed, never stored — minting an epoch *is* the
+    /// renewal, so a stored state would be a second thing to keep true.
+    pub lifecycle: String,
+    /// When the current epoch expires, as an RFC 3339 instant. Absent means the
+    /// room never lapses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch_expires_at: Option<String>,
+    pub retention_days: u32,
+    /// Present when this host serves a read-only copy rather than the room
+    /// itself, naming the primary it pulls from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_of: Option<String>,
+    /// RFC 3339, as every instant from `vtc/_shared/0.3/room-storage`'s `HostedRoom` on.
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// `GET /v1/rooms` — every room this community hosts.
+pub(crate) async fn hosted_rooms(state: &AppState) -> Result<Vec<HostedRoom>, AppError> {
+    let now = now_secs();
+    let rooms = vti_rooms::storage::list_rooms(&state.rooms_ks).await?;
+    Ok(rooms.into_iter().map(|r| hosted(r, now)).collect())
+}
+
+/// One room this community hosts (`notFound` when it hosts no such room).
+pub(crate) async fn hosted_room(state: &AppState, room_id: &str) -> Result<HostedRoom, AppError> {
+    let room = vti_rooms::storage::get_room(&state.rooms_ks, room_id).await?;
+    Ok(hosted(room, now_secs()))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub(crate) fn hosted(r: vti_rooms::Room, now: u64) -> HostedRoom {
+    HostedRoom {
+        lifecycle: r.lifecycle(now).as_str().to_string(),
+        room_id: r.room_id,
+        owner_did: r.owner_did,
+        visibility: match r.visibility {
+            vti_rooms::Visibility::Open => "open",
+            vti_rooms::Visibility::Attributed => "attributed",
+            vti_rooms::Visibility::Private => "private",
+        }
+        .to_string(),
+        retention_policy: match r.retention_policy {
+            vti_rooms::RetentionPolicy::Chained => "chained",
+            vti_rooms::RetentionPolicy::FromJoin => "fromJoin",
+        }
+        .to_string(),
+        epoch: r.epoch,
+        epoch_expires_at: r.epoch_expires_at.map(rfc3339),
+        retention_days: r.retention_days,
+        mirror_of: r.mirror_of,
+        created_at: rfc3339(r.created_at),
+        updated_at: rfc3339(r.updated_at),
+    }
+}
+
+/// Unix seconds as an RFC 3339 instant, to the second.
+fn rfc3339(secs: u64) -> String {
+    let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}

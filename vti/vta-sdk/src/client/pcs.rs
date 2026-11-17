@@ -1,0 +1,545 @@
+//! Hidden-vetting PCS engine client methods (`vta/pcs/*/0.1`) — the VTA holds its principal's
+//! PCS keys and runs every member-side hidden-vetting operation; the caller carries messages
+//! between the VTA, the community and the other party, and never holds a key.
+//!
+//! This is how a client with no PCS implementation (a mobile wallet) takes part in hidden
+//! vetting. The applicant's round:
+//!
+//! 1. [`VtaClient::pcs_applications_create`] — the application's PCS identifier, which goes in
+//!    each `vetting/request`'s `ext` under the community's hidden-vetting namespace;
+//! 2. [`VtaClient::pcs_verify_attestation`] — each `vetting/attestation` a vetter sends;
+//! 3. [`VtaClient::pcs_prove`] — after `vtc/vetting/pcs-challenge`, the proof that goes in the
+//!    join submission's `extensions.hiddenVetting`.
+//!
+//! A vetter's: [`VtaClient::pcs_root_request`] / [`VtaClient::pcs_root_accept`] around
+//! `vtc/vetting/vetters/pcs-root`, [`VtaClient::pcs_tokens_request`] /
+//! [`VtaClient::pcs_tokens_accept`] (or [`VtaClient::pcs_tokens_abandon`]) around each tick of
+//! `vtc/vetting/vetters/pcs-tokens`, and [`VtaClient::pcs_attest`] after a session. When the
+//! community refuses a root request with `identifierRebound`, [`VtaClient::pcs_vetter_recover`]
+//! restores the key it bound.
+//!
+//! Every method takes the task's generated payload type and returns its generated response
+//! type (`vti_specs::vta::pcs`), so a caller cannot build a request the schema would
+//! refuse.
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use vti_specs::vta::pcs;
+
+use super::VtaClient;
+use crate::error::VtaError;
+use crate::trust_tasks;
+
+/// Round-trip timeout (seconds). Proving and attesting are pairing-heavy, so they get more.
+const PCS_TT_TIMEOUT: u64 = 30;
+const PCS_PROOF_TIMEOUT: u64 = 90;
+
+impl VtaClient {
+    async fn pcs_call<P: Serialize, R: DeserializeOwned>(
+        &self,
+        uri: &str,
+        payload: &P,
+        timeout: u64,
+    ) -> Result<R, VtaError> {
+        let payload = serde_json::to_value(payload)
+            .map_err(|e| VtaError::Validation(format!("{uri} request: {e}")))?;
+        let answer = self.dispatch_trust_task(uri, payload, timeout).await?;
+        serde_json::from_value(answer).map_err(|e| {
+            VtaError::Protocol(format!("{uri} response does not match its schema: {e}"))
+        })
+    }
+
+    /// `vta/pcs/applications/create/0.1` — start a hidden-vetting application.
+    pub async fn pcs_applications_create(
+        &self,
+        req: &pcs::applications::create::v0_1::Payload,
+    ) -> Result<pcs::applications::create::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_APPLICATIONS_CREATE_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/applications/show/0.1`.
+    pub async fn pcs_applications_show(
+        &self,
+        req: &pcs::applications::show::v0_1::Payload,
+    ) -> Result<pcs::applications::show::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_APPLICATIONS_SHOW_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/applications/delete/0.1` — destroys the application's key and attestations.
+    pub async fn pcs_applications_delete(
+        &self,
+        req: &pcs::applications::delete::v0_1::Payload,
+    ) -> Result<pcs::applications::delete::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_APPLICATIONS_DELETE_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/verify-attestation/0.1` — take in an attestation a vetter sent.
+    pub async fn pcs_verify_attestation(
+        &self,
+        req: &pcs::verify_attestation::v0_1::Payload,
+    ) -> Result<pcs::verify_attestation::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VERIFY_ATTESTATION_0_1,
+            req,
+            PCS_PROOF_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/prove/0.1` — the proof a hidden-vetting join submission carries.
+    pub async fn pcs_prove(
+        &self,
+        req: &pcs::prove::v0_1::Payload,
+    ) -> Result<pcs::prove::v0_1::Response, VtaError> {
+        self.pcs_call(trust_tasks::TASK_VTA_PCS_PROVE_0_1, req, PCS_PROOF_TIMEOUT)
+            .await
+    }
+
+    /// `vta/pcs/root-request/0.1` — a vetter's blinded enrolment request.
+    pub async fn pcs_root_request(
+        &self,
+        req: &pcs::root_request::v0_1::Payload,
+    ) -> Result<pcs::root_request::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_ROOT_REQUEST_0_1,
+            req,
+            PCS_PROOF_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/root-accept/0.1` — unblind the community's answer into a class credential.
+    pub async fn pcs_root_accept(
+        &self,
+        req: &pcs::root_accept::v0_1::Payload,
+    ) -> Result<pcs::root_accept::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_ROOT_ACCEPT_0_1,
+            req,
+            PCS_PROOF_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/tokens/request/0.1` — one draw of the token drip.
+    pub async fn pcs_tokens_request(
+        &self,
+        req: &pcs::tokens::request::v0_1::Payload,
+    ) -> Result<pcs::tokens::request::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TOKENS_REQUEST_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/tokens/accept/0.1` — take the community's answer to a draw into the wallet.
+    pub async fn pcs_tokens_accept(
+        &self,
+        req: &pcs::tokens::accept::v0_1::Payload,
+    ) -> Result<pcs::tokens::accept::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TOKENS_ACCEPT_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/tokens/abandon/0.1` — discard a draw the community refused.
+    pub async fn pcs_tokens_abandon(
+        &self,
+        req: &pcs::tokens::abandon::v0_1::Payload,
+    ) -> Result<pcs::tokens::abandon::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TOKENS_ABANDON_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/attest/0.1` — spend a token and attest for an applicant, after the human check.
+    pub async fn pcs_attest(
+        &self,
+        req: &pcs::attest::v0_1::Payload,
+    ) -> Result<pcs::attest::v0_1::Response, VtaError> {
+        self.pcs_call(trust_tasks::TASK_VTA_PCS_ATTEST_0_1, req, PCS_PROOF_TIMEOUT)
+            .await
+    }
+
+    /// `vta/pcs/vetter/show/0.1`.
+    pub async fn pcs_vetter_show(
+        &self,
+        req: &pcs::vetter::show::v0_1::Payload,
+    ) -> Result<pcs::vetter::show::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VETTER_SHOW_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/vetter/recover/0.1` — restore the vetter key the community bound the member to
+    /// (`boundId`, from `vtc/vetting/vetters/pcs-binding/show`), when the community refuses a
+    /// root request with `pcs-root:identifierRebound`. The VTA searches the keys it can derive for
+    /// the context, so this gets the longer timeout.
+    pub async fn pcs_vetter_recover(
+        &self,
+        req: &pcs::vetter::recover::v0_1::Payload,
+    ) -> Result<pcs::vetter::recover::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VETTER_RECOVER_0_1,
+            req,
+            PCS_PROOF_TIMEOUT,
+        )
+        .await
+    }
+
+    /// One `vta/pcs/*` task with the payload and the answer as JSON, carried exactly as given
+    /// and as received.
+    async fn pcs_call_json(
+        &self,
+        uri: &str,
+        payload: serde_json::Value,
+        timeout: u64,
+    ) -> Result<serde_json::Value, VtaError> {
+        self.dispatch_trust_task(uri, payload, timeout).await
+    }
+
+    /// [`Self::pcs_voter_register`], with the payload and the answer as JSON.
+    ///
+    /// # Why the voter tasks have JSON forms
+    ///
+    /// The typed voter methods round-trip through generated structs that hold timestamps as
+    /// chrono `DateTime`s, and that changes bytes. A manifest the community published with
+    /// `votingOpensAt: "2027-01-01T00:00:00.000Z"` reaches the VTA as `…T00:00:00Z` — another
+    /// manifest, whose digest is not the community's, so the ticket is refused. A signed read, a
+    /// cast or a ticket request coming back through a typed response is re-serialised the same
+    /// way, and is no longer the bytes its proof covers.
+    ///
+    /// A caller carrying documents between the community, the VTA and the ballot box should use
+    /// the `_json` forms: [`Self::pcs_voter_read_json`], [`Self::pcs_voter_register_json`],
+    /// [`Self::pcs_voter_accept_json`], [`Self::pcs_vote_json`],
+    /// [`Self::pcs_vote_encrypted_json`] and [`Self::pcs_voter_receipt_json`]. Each is checked
+    /// against its pinned schema before it is sent, as the typed forms are.
+    pub async fn pcs_voter_register_json(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        self.pcs_call_json(
+            trust_tasks::TASK_VTA_PCS_VOTER_REGISTER_0_5,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::pcs_voter_read`], with the payload and the answer as JSON: the answer's
+    /// `document` is the signed read to send to the community unchanged. See
+    /// [`Self::pcs_voter_register_json`] for why.
+    ///
+    /// A `tombstone` read goes as `vta/pcs/voter/read/0.7`, the first version that signs one
+    /// (VTI-BRD-009); `list` and `show` still go as 0.6, so a VTA from before 0.7 keeps
+    /// answering them.
+    pub async fn pcs_voter_read_json(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        let task = if req["read"] == "tombstone" {
+            trust_tasks::TASK_VTA_PCS_VOTER_READ_0_7
+        } else {
+            #[allow(deprecated)] // superseded by 0.7, which only a newer VTA serves
+            trust_tasks::TASK_VTA_PCS_VOTER_READ_0_6
+        };
+        self.pcs_call_json(task, req, PCS_TT_TIMEOUT).await
+    }
+
+    /// [`Self::pcs_voter_accept`], with the payload and the answer as JSON. See
+    /// [`Self::pcs_voter_register_json`] for why.
+    pub async fn pcs_voter_accept_json(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        self.pcs_call_json(
+            trust_tasks::TASK_VTA_PCS_VOTER_ACCEPT_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::pcs_vote`], with the payload and the answer as JSON: the answer's
+    /// `castDocument` is the bytes to post to the ballot box. See
+    /// [`Self::pcs_voter_register_json`] for why.
+    pub async fn pcs_vote_json(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        self.pcs_call_json(trust_tasks::TASK_VTA_PCS_VOTE_0_4, req, PCS_PROOF_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::pcs_vote_encrypted`], with the payload and the answer as JSON. See
+    /// [`Self::pcs_voter_register_json`] for why.
+    pub async fn pcs_vote_encrypted_json(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        self.pcs_call_json(
+            trust_tasks::TASK_VTA_PCS_VOTE_ENCRYPTED_0_5,
+            req,
+            PCS_PROOF_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::pcs_voter_receipt`], with the payload and the answer as JSON: the ballot box's
+    /// receipt goes in exactly as it answered. See [`Self::pcs_voter_register_json`] for why.
+    pub async fn pcs_voter_receipt_json(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        self.pcs_call_json(
+            trust_tasks::TASK_VTA_PCS_VOTER_RECEIPT_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::pcs_voter_receipts_list`], with the answer as JSON: each receipt exactly as the
+    /// ballot box signed it, to hand back to [`Self::pcs_voter_receipt_json`] unchanged.
+    pub async fn pcs_voter_receipts_list_json(
+        &self,
+        req: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        self.pcs_call_json(
+            trust_tasks::TASK_VTA_PCS_VOTER_RECEIPTS_LIST_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/voter/register/0.5` — this election's voter key and the blinded ticket request
+    /// to carry to `vtc/elections/tickets/issue/0.3`; under a credential roll, with `member` and
+    /// `membershipCredential`, the `ticketDocument` carries the member's presentation of that
+    /// credential (VTI-VOT-025). A community that answers it `indeterminate` is sent the same
+    /// document again, after any `retryAfter` and with backoff.
+    ///
+    /// Re-serialises timestamps; to carry signed documents byte for byte use
+    /// [`Self::pcs_voter_register_json`].
+    pub async fn pcs_voter_register(
+        &self,
+        req: &pcs::voter::register::v0_5::Payload,
+    ) -> Result<pcs::voter::register::v0_5::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VOTER_REGISTER_0_5,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/voter/read/0.6` — `vtc/elections/list/0.5` or `vtc/elections/show/0.6`, signed as
+    /// the member, to send to the community unchanged; a `show` with `membershipCredential`
+    /// carries the member's presentation of it, issued by `memberOf` where that is named
+    /// (VTI-VOT-015, VTI-VOT-016).
+    ///
+    /// Re-serialises timestamps; to carry signed documents byte for byte use
+    /// [`Self::pcs_voter_read_json`].
+    #[allow(deprecated)] // superseded by 0.7, which only a newer VTA serves
+    pub async fn pcs_voter_read(
+        &self,
+        req: &pcs::voter::read::v0_6::Payload,
+    ) -> Result<pcs::voter::read::v0_6::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VOTER_READ_0_6,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/voter/accept/0.1` — unblind the community's answer into the ticket.
+    ///
+    /// Re-serialises timestamps; to carry signed documents byte for byte use
+    /// [`Self::pcs_voter_accept_json`].
+    pub async fn pcs_voter_accept(
+        &self,
+        req: &pcs::voter::accept::v0_1::Payload,
+    ) -> Result<pcs::voter::accept::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VOTER_ACCEPT_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/vote/0.4` — the signed cast document. Send it to the ballot box yourself, from
+    /// your own connection, and resend that same document if the answer is lost.
+    ///
+    /// Re-serialises timestamps; to carry signed documents byte for byte use
+    /// [`Self::pcs_vote_json`].
+    pub async fn pcs_vote(
+        &self,
+        req: &pcs::vote::v0_4::Payload,
+    ) -> Result<pcs::vote::v0_4::Response, VtaError> {
+        self.pcs_call(trust_tasks::TASK_VTA_PCS_VOTE_0_4, req, PCS_PROOF_TIMEOUT)
+            .await
+    }
+
+    /// `vta/pcs/voter/receipt/0.1` — keep a receipt, and check its inclusion in a head the
+    /// community kept.
+    ///
+    /// Re-serialises timestamps; to carry signed documents byte for byte use
+    /// [`Self::pcs_voter_receipt_json`].
+    pub async fn pcs_voter_receipt(
+        &self,
+        req: &pcs::voter::receipt::v0_1::Payload,
+    ) -> Result<pcs::voter::receipt::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VOTER_RECEIPT_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/voter/receipts/list/0.1` — the ballot box and every receipt the VTA keeps for an
+    /// election, to check each after close: fetch its `voting/board/inclusion` from the ballot
+    /// box yourself, from your own connection, and pass it with the head the community kept to
+    /// [`Self::pcs_voter_receipt`] (VTI-VOT-053).
+    ///
+    /// Re-serialises the receipts; to hand them back byte for byte use
+    /// [`Self::pcs_voter_receipts_list_json`].
+    pub async fn pcs_voter_receipts_list(
+        &self,
+        req: &pcs::voter::receipts::list::v0_1::Payload,
+    ) -> Result<pcs::voter::receipts::list::v0_1::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VOTER_RECEIPTS_LIST_0_1,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/vote-encrypted/0.5` — the signed `voting/ballot/cast-encrypted` document for a
+    /// sealed or tallied-encrypted election, under the election key `voting/trustees/status`
+    /// reports. Send it as [`Self::pcs_vote`]'s.
+    ///
+    /// Re-serialises timestamps; to carry signed documents byte for byte use
+    /// [`Self::pcs_vote_encrypted_json`].
+    pub async fn pcs_vote_encrypted(
+        &self,
+        req: &pcs::vote_encrypted::v0_5::Payload,
+    ) -> Result<pcs::vote_encrypted::v0_5::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_VOTE_ENCRYPTED_0_5,
+            req,
+            PCS_PROOF_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/trustee/enrol/0.4` — the trustee's transport key, and its signed enrolment.
+    pub async fn pcs_trustee_enrol(
+        &self,
+        req: &pcs::trustee::enrol::v0_4::Payload,
+    ) -> Result<pcs::trustee::enrol::v0_4::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TRUSTEE_ENROL_0_4,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/trustee/deal/0.5` — the trustee's dealing, signed.
+    pub async fn pcs_trustee_deal(
+        &self,
+        req: &pcs::trustee::deal::v0_5::Payload,
+    ) -> Result<pcs::trustee::deal::v0_5::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TRUSTEE_DEAL_0_5,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/trustee/keys/0.5` — check the shares dealt and confirm; with the formed election
+    /// key, keep the trustee's share of it.
+    pub async fn pcs_trustee_keys(
+        &self,
+        req: &pcs::trustee::keys::v0_5::Payload,
+    ) -> Result<pcs::trustee::keys::v0_5::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TRUSTEE_KEYS_0_5,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/trustee/justify/0.5` — answer a complaint with the share that was dealt.
+    pub async fn pcs_trustee_justify(
+        &self,
+        req: &pcs::trustee::justify::v0_5::Payload,
+    ) -> Result<pcs::trustee::justify::v0_5::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TRUSTEE_JUSTIFY_0_5,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/trustee/decrypt/0.1` — the trustee's partial decryptions, signed.
+    pub async fn pcs_trustee_decrypt(
+        &self,
+        req: &pcs::trustee::decrypt::v0_2::Payload,
+    ) -> Result<pcs::trustee::decrypt::v0_2::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TRUSTEE_DECRYPT_0_2,
+            req,
+            PCS_PROOF_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `vta/pcs/trustee/read/0.4` — `voting/trustees/status` or `voting/election/show`, signed as
+    /// the trustee, to send to the ballot box yourself: a private board answers them only to a
+    /// trustee.
+    pub async fn pcs_trustee_read(
+        &self,
+        req: &pcs::trustee::read::v0_4::Payload,
+    ) -> Result<pcs::trustee::read::v0_4::Response, VtaError> {
+        self.pcs_call(
+            trust_tasks::TASK_VTA_PCS_TRUSTEE_READ_0_4,
+            req,
+            PCS_TT_TIMEOUT,
+        )
+        .await
+    }
+}

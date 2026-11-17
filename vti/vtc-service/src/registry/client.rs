@@ -1,0 +1,732 @@
+//! `TrustRegistryClient` trait + in-memory mock.
+//!
+//! The trait covers both transports the upstream
+//! `affinidi-trust-registry-rs` exposes:
+//!
+//! - **Reads** — TRQP v2.0 queries (`recognise`, `authorize`) go
+//!   over HTTP. Used by M3.10's cross-community session-mint
+//!   path.
+//! - **Writes** — admin operations (publish / update / delete
+//!   member record) go over DIDComm against the upstream's
+//!   `tr-admin/1.0/*` message types. Used by M3.4's
+//!   `MembershipSyncer`.
+//!
+//! M3.1 lands the **trait shape + `MockRegistryClient`** for
+//! tests; the live HTTP / DIDComm wiring lands alongside its
+//! consumers (M3.2 + M3.4 for writes, M3.10 for reads).
+//!
+//! ## Why one trait, two transports
+//!
+//! The transports are opaque to consumers — the syncer never
+//! asks "should this go over HTTP or DIDComm?", it just calls
+//! `publish_member()`. Keeping that abstraction means future
+//! upstream changes (e.g. an HTTP admin API materialising)
+//! land in one place, not at every call site.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use thiserror::Error;
+use tokio::sync::Mutex;
+
+use super::model::RegistryRecord;
+
+/// Errors the trust-registry client surfaces. Mapped to
+/// [`vti_common::error::AppError::Internal`] at the call site
+/// — the registry is a downstream dependency, never operator
+/// input.
+#[derive(Debug, Clone, Error)]
+pub enum RegistryError {
+    /// Transient — the next retry will likely succeed. The
+    /// syncer's backoff schedule kicks in.
+    #[error("transient registry failure: {0}")]
+    Transient(String),
+    /// Permanent — the registry rejected the request shape.
+    /// Manual operator intervention required; the syncer flips
+    /// the job to `Failed` immediately rather than retrying.
+    #[error("permanent registry failure: {0}")]
+    Permanent(String),
+    /// The registry is unreachable. Caller's circuit breaker
+    /// should open after enough of these in a row.
+    #[error("registry unreachable: {0}")]
+    Unreachable(String),
+    /// The registry answered, but does not route the Trust Task URI we
+    /// sent (`unsupportedType`) — a **version skew** between this VTC and
+    /// the deployed registry, not a fault in the request.
+    ///
+    /// Split out of [`Self::Permanent`] because the two need opposite
+    /// handling on the health signal. A `permissionDenied` proves the
+    /// registry's dispatcher is alive and working — it read our document,
+    /// routed it, and refused it — so the liveness probe may count it as
+    /// healthy. An `unsupportedType` on the probe's own task proves the
+    /// opposite: the registry cannot serve the contract this VTC depends
+    /// on, and reporting that as `active` is how a community can sit for
+    /// weeks publishing nothing while its dashboard stays green.
+    ///
+    /// Not retriable — a redeploy of the peer is what clears it, and the
+    /// answer is stable until then, so spinning the backoff schedule for
+    /// ~18 hours only delays the operator seeing it.
+    #[error("registry incompatible: {0}")]
+    Incompatible(String),
+    /// A record enumeration was still paginating after the page limit, so
+    /// the client refused to answer from a partial list.
+    ///
+    /// Retriable, like [`Self::Transient`] (whose wording it keeps), but its
+    /// own variant so a caller can tell it apart without reading the message
+    /// (#2578): unlike a flaky registry it never resolves by itself, and the
+    /// git-ns projection says so where an operator will see it.
+    #[error("transient registry failure: {0}")]
+    PaginationExhausted(String),
+}
+
+impl RegistryError {
+    /// `true` when the error is worth retrying. Used by the
+    /// syncer to distinguish "back off + retry" from "give up
+    /// immediately".
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transient(_) | Self::Unreachable(_) | Self::PaginationExhausted(_)
+        )
+    }
+
+    /// `true` when the registry answered but cannot serve the task we sent.
+    /// Distinct from [`Self::is_retriable`]: an incompatible registry is not
+    /// worth retrying, but — unlike every other terminal failure — it is a
+    /// statement about the *registry*, not about this job, so the liveness
+    /// probe must not count it as proof of health.
+    pub fn is_incompatible(&self) -> bool {
+        matches!(self, Self::Incompatible(_))
+    }
+}
+
+impl From<RegistryError> for vti_common::error::AppError {
+    /// Preserve the retriable/permanent semantics at the HTTP
+    /// boundary instead of collapsing every registry failure into an
+    /// opaque 500 (house rule on typed errors). A reachable-but-flaky
+    /// or unreachable registry is **503** (try again later); a
+    /// registry that rejected the request shape is an upstream fault
+    /// surfaced as **502**.
+    fn from(e: RegistryError) -> Self {
+        use axum::http::StatusCode;
+        match e {
+            RegistryError::Transient(msg)
+            | RegistryError::Unreachable(msg)
+            | RegistryError::PaginationExhausted(msg) => {
+                vti_common::error::AppError::ServiceError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: format!("trust registry unavailable: {msg}"),
+                }
+            }
+            RegistryError::Permanent(msg) => vti_common::error::AppError::ServiceError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("trust registry rejected request: {msg}"),
+            },
+            RegistryError::Incompatible(msg) => vti_common::error::AppError::ServiceError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("trust registry is incompatible: {msg}"),
+            },
+        }
+    }
+}
+
+/// Abstraction over the upstream trust-registry transport.
+/// Production binds [`UpstreamTrustRegistryClient`] (lands in
+/// M3.2 + M3.10); tests bind [`MockRegistryClient`].
+#[async_trait]
+pub trait TrustRegistryClient: Send + Sync {
+    /// Publish (or republish) a member record. Maps onto the
+    /// upstream's `tr-admin/1.0/create-record` (M3.4) or
+    /// `update-record` DIDComm message — the trait doesn't
+    /// distinguish; the implementation chooses based on
+    /// whether the record already exists. Phase-3 sentry:
+    /// every call is idempotent.
+    async fn publish_member(&self, record: &RegistryRecord) -> Result<(), RegistryError>;
+
+    /// Delete a member record (RTBF / Purge disposition).
+    /// Maps onto `tr-admin/1.0/delete-record`.
+    async fn delete_member(&self, member_did: &str) -> Result<(), RegistryError>;
+
+    /// Read a member's current record. `Ok(None)` when the
+    /// registry has no row for this DID. Used by the syncer
+    /// at boot to reconcile drift, and by M3.10 to check that
+    /// a foreign issuer is recognised.
+    async fn read_member(&self, member_did: &str) -> Result<Option<RegistryRecord>, RegistryError>;
+
+    /// Connectivity probe. Returns `Ok(())` iff the registry
+    /// is reachable. Drives the `registry_status` flip on
+    /// `GET /v1/community/profile` (M3.2).
+    async fn health(&self) -> Result<(), RegistryError>;
+
+    /// TRQP `recognise` query (M3.9 + M3.10): "is this foreign
+    /// community's issuer DID present in the recognition
+    /// graph?". Returns `Ok(true)` when the registry confirms
+    /// the issuer is recognised, `Ok(false)` for a clean
+    /// not-found, and `Err` for transport / parse failures.
+    ///
+    /// **Called per-mint, never cached** (spec §8.4 + plan
+    /// D5): a peer community removed from the recognition
+    /// graph mid-session loses access on the next mint /
+    /// refresh, not when a TTL elapses.
+    async fn recognise(&self, foreign_issuer_did: &str) -> Result<bool, RegistryError>;
+
+    /// Every record the registry holds under this community's authority.
+    ///
+    /// Used only by the drift check ([`super::drift`]), which compares the
+    /// answer against the local mirror. Pages internally and returns the whole
+    /// set, because a partial enumeration compared against a complete mirror
+    /// would report every unreached member as a lost write — the exact false
+    /// alarm the check exists to avoid raising.
+    ///
+    /// Defaults to [`super::drift::unsupported`] so a transport that cannot
+    /// enumerate reports "not supported here" rather than an outage, and so a
+    /// test double need not implement it.
+    async fn list_records(&self) -> Result<Vec<RegistryRecord>, RegistryError> {
+        Err(super::drift::unsupported())
+    }
+
+    /// How this client is reaching the registry, for operator diagnostics.
+    ///
+    /// Defaults to "nothing known", so a test double need not implement it.
+    fn transport(&self) -> RegistryTransport {
+        RegistryTransport::default()
+    }
+
+    /// Write one TRQP authorization record under this community's authority
+    /// (`registry/record/put/0.3`, 0.1 to an older registry) — the git-namespace projection's write.
+    ///
+    /// Distinct from [`Self::publish_member`], which writes the one
+    /// recognition record a member has, and from the `git-trust/grant`
+    /// capability, which hard-codes its action to `git.commit.sign`: a git
+    /// right is published under its own action string, and the projection
+    /// needs to write all five. `record` is the TRQP `TrustRecord`; its
+    /// `authority_id` is this community's DID.
+    ///
+    /// Defaults to a `Permanent` refusal so a transport that cannot write
+    /// records says so rather than pretending.
+    async fn put_trust_record(&self, _record: &serde_json::Value) -> Result<(), RegistryError> {
+        Err(RegistryError::Permanent(
+            "this registry transport cannot write authorization records".into(),
+        ))
+    }
+
+    /// Every record the registry holds under this community's authority for
+    /// one `action` (`registry/record/query/0.3`, paged to the end) — what the
+    /// git-namespace projection verifies itself against. Defaults to a
+    /// `Permanent` refusal: a transport that cannot enumerate says so.
+    async fn list_trust_records(
+        &self,
+        _action: &str,
+    ) -> Result<Vec<serde_json::Value>, RegistryError> {
+        Err(RegistryError::Permanent(
+            "this registry transport cannot enumerate authorization records".into(),
+        ))
+    }
+
+    /// Every record the registry holds under this community's authority, of
+    /// any action (`registry/record/query/0.3` keyed by `authorityId` alone,
+    /// paged to the end) — membership recognitions and git-namespace
+    /// authorizations alike, as the registry states them. What the operator's
+    /// records list (`vtc/registry/records/list/0.2`, `source: registry`)
+    /// shows.
+    ///
+    /// Defaults to [`super::drift::unsupported`], as [`Self::list_records`]
+    /// does, so a transport that cannot enumerate says "not supported here".
+    async fn list_all_trust_records(&self) -> Result<Vec<serde_json::Value>, RegistryError> {
+        Err(super::drift::unsupported())
+    }
+
+    /// Delete one record by its TRQP key (`registry/record/delete/0.2`),
+    /// under this community's authority. A record that is already absent is
+    /// success: the effect wanted is its absence.
+    async fn delete_trust_record(
+        &self,
+        _entity_id: &str,
+        _action: &str,
+        _resource: &str,
+    ) -> Result<(), RegistryError> {
+        Err(RegistryError::Permanent(
+            "this registry transport cannot delete authorization records".into(),
+        ))
+    }
+
+    /// Project one capability-module decision to the registry, as its
+    /// administrator: `governance/capability/enable/0.1` or `/disable/0.1`
+    /// ([`crate::capability_modules`]).
+    ///
+    /// The VTC is the source of truth for which capability modules a
+    /// community has enabled; the registry's enablement is a projection of
+    /// it, and only switches which record families the registry accepts.
+    /// Convergent: an `alreadyEnabled` answer to an enable, or a `notEnabled`
+    /// answer to a disable, is the state wanted, so it is success.
+    ///
+    /// Defaults to a `Permanent` refusal so a transport with no write surface
+    /// says so rather than pretending.
+    async fn project_capability_module(
+        &self,
+        _change: &CapabilityModuleChange,
+    ) -> Result<(), RegistryError> {
+        Err(RegistryError::Permanent(
+            "this registry transport cannot enable or disable capability modules".into(),
+        ))
+    }
+}
+
+/// One capability-module decision, as the registry is told it
+/// ([`TrustRegistryClient::project_capability_module`]).
+///
+/// "Capability" is a pluggable governance module (`git-trust`), never an ACL
+/// capability on an administrator's entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilityModuleChange {
+    /// The module's slug, e.g. `git-trust`.
+    pub capability: String,
+    /// The module version the community enabled.
+    pub version: String,
+    /// `true` for `governance/capability/enable`, `false` for `/disable`.
+    pub enabled: bool,
+    /// The enablement config (`config.authority`, for a record-writing
+    /// module). Ignored on a disable.
+    pub config: Option<serde_json::Value>,
+    /// The operator's reason on a disable.
+    pub reason: Option<String>,
+}
+
+/// How the VTC reaches its trust registry, as an operator sees it.
+///
+/// The two protocol fields answer different questions, and reporting only one
+/// of them is what made the old `registry_status` misleading:
+///
+/// - `advertised` — what the registry's **DID document** says it speaks. Read
+///   from the document, which is the authority (CLAUDE.md), so an operator can
+///   see the registry's own claim without resolving the DID by hand.
+/// - `active` — what the last selection actually **chose**, which is the
+///   highest-preference protocol present in both parties' documents. Empty
+///   until the first call; `error` says why if selection failed.
+///
+/// Advertised without active means the two sides have no transport in common,
+/// or nothing has tried yet — a distinction a single "protocol" field cannot
+/// express, and precisely the state that leaves a registry looking configured
+/// while nothing can reach it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct RegistryTransport {
+    /// The registry's DID, when it is addressed by one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    /// The registry's REST base URL, when one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Protocols the registry's DID document advertises, in preference order
+    /// (`tsp`, `didcomm`, `rest`). Empty when the DID has not been resolved
+    /// yet, or when the registry is addressed by URL alone.
+    pub advertised: Vec<String>,
+    /// The protocol the last selection chose. `None` before the first call, or
+    /// when selection failed — see `error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    /// Why the last selection failed, if it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// MockRegistryClient — in-memory test double
+// ---------------------------------------------------------------------------
+
+/// In-memory `TrustRegistryClient` for tests. Tracks per-call
+/// counts so tests can assert against the upstream surface
+/// without needing a docker-backed registry.
+///
+/// Cheap to clone — the inner state is an `Arc<Mutex<...>>`.
+#[derive(Debug, Clone, Default)]
+pub struct MockRegistryClient {
+    inner: Arc<Mutex<MockState>>,
+}
+
+#[derive(Debug, Default)]
+struct MockState {
+    pub records: std::collections::HashMap<String, RegistryRecord>,
+    /// Set of foreign-issuer DIDs the mock will return
+    /// `Ok(true)` for on `recognise`. Tests seed this directly
+    /// via [`MockRegistryClient::set_recognised`].
+    pub recognised_issuers: std::collections::HashSet<String>,
+    pub publish_calls: usize,
+    pub delete_calls: usize,
+    pub read_calls: usize,
+    pub health_calls: usize,
+    pub recognise_calls: usize,
+    /// When set, the next call of the matching kind returns
+    /// the queued error instead of succeeding. Tests inject
+    /// these to exercise the failure branches.
+    pub next_publish_error: Option<RegistryError>,
+    pub next_delete_error: Option<RegistryError>,
+    pub next_read_error: Option<RegistryError>,
+    pub next_health_error: Option<RegistryError>,
+    pub next_recognise_error: Option<RegistryError>,
+    /// Authorization records written through [`TrustRegistryClient::
+    /// put_trust_record`], keyed `entity|action|resource`.
+    pub trust_records: std::collections::BTreeMap<String, serde_json::Value>,
+    pub trust_record_deletes: usize,
+    pub next_trust_record_error: Option<RegistryError>,
+    /// Capability-module projections received, in order.
+    pub capability_module_changes: Vec<CapabilityModuleChange>,
+    pub next_capability_module_error: Option<RegistryError>,
+}
+
+impl MockRegistryClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the call counts. Useful for `assert_eq!` in
+    /// tests without cloning the full state.
+    pub async fn call_counts(&self) -> MockCallCounts {
+        let s = self.inner.lock().await;
+        MockCallCounts {
+            publish: s.publish_calls,
+            delete: s.delete_calls,
+            read: s.read_calls,
+            health: s.health_calls,
+            recognise: s.recognise_calls,
+        }
+    }
+
+    /// Queue an error for the next `publish_member` call.
+    pub async fn fail_next_publish(&self, err: RegistryError) {
+        self.inner.lock().await.next_publish_error = Some(err);
+    }
+
+    /// Queue an error for the next `delete_member` call.
+    pub async fn fail_next_delete(&self, err: RegistryError) {
+        self.inner.lock().await.next_delete_error = Some(err);
+    }
+
+    /// Queue an error for the next `read_member` call.
+    pub async fn fail_next_read(&self, err: RegistryError) {
+        self.inner.lock().await.next_read_error = Some(err);
+    }
+
+    /// Queue an error for the next `health` call.
+    pub async fn fail_next_health(&self, err: RegistryError) {
+        self.inner.lock().await.next_health_error = Some(err);
+    }
+
+    /// Mark `foreign_issuer_did` as recognised — the next
+    /// `recognise` call returns `Ok(true)` for it.
+    pub async fn set_recognised(&self, foreign_issuer_did: impl Into<String>) {
+        self.inner
+            .lock()
+            .await
+            .recognised_issuers
+            .insert(foreign_issuer_did.into());
+    }
+
+    /// Queue an error for the next `recognise` call.
+    pub async fn fail_next_recognise(&self, err: RegistryError) {
+        self.inner.lock().await.next_recognise_error = Some(err);
+    }
+
+    /// Read the upstream state directly. Tests assert against
+    /// this to confirm a call landed.
+    pub async fn snapshot(&self) -> std::collections::HashMap<String, RegistryRecord> {
+        self.inner.lock().await.records.clone()
+    }
+
+    /// The authorization records written by the git-namespace projection,
+    /// keyed `entity|action|resource`.
+    pub async fn trust_records(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        self.inner.lock().await.trust_records.clone()
+    }
+
+    /// Change the registry behind the projection's back: remove a record, as
+    /// a registry reset or an operator would.
+    pub async fn forget_trust_record(&self, key: &str) {
+        self.inner.lock().await.trust_records.remove(key);
+    }
+
+    /// Plant a record the projection did not write.
+    pub async fn plant_trust_record(&self, record: serde_json::Value) {
+        let field = |k: &str| record.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        let key = format!(
+            "{}|{}|{}",
+            field("entity_id"),
+            field("action"),
+            field("resource")
+        );
+        self.inner.lock().await.trust_records.insert(key, record);
+    }
+
+    /// Queue an error for the next authorization-record write or delete.
+    pub async fn fail_next_trust_record(&self, err: RegistryError) {
+        self.inner.lock().await.next_trust_record_error = Some(err);
+    }
+
+    /// Every capability-module projection the registry received, in order.
+    pub async fn capability_module_changes(&self) -> Vec<CapabilityModuleChange> {
+        self.inner.lock().await.capability_module_changes.clone()
+    }
+
+    /// Queue an error for the next capability-module projection.
+    pub async fn fail_next_capability_module(&self, err: RegistryError) {
+        self.inner.lock().await.next_capability_module_error = Some(err);
+    }
+}
+
+/// Per-call counters surfaced by [`MockRegistryClient::call_counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockCallCounts {
+    pub publish: usize,
+    pub delete: usize,
+    pub read: usize,
+    pub health: usize,
+    pub recognise: usize,
+}
+
+#[async_trait]
+impl TrustRegistryClient for MockRegistryClient {
+    async fn publish_member(&self, record: &RegistryRecord) -> Result<(), RegistryError> {
+        let mut s = self.inner.lock().await;
+        s.publish_calls += 1;
+        if let Some(err) = s.next_publish_error.take() {
+            return Err(err);
+        }
+        s.records.insert(record.member_did.clone(), record.clone());
+        Ok(())
+    }
+
+    async fn delete_member(&self, member_did: &str) -> Result<(), RegistryError> {
+        let mut s = self.inner.lock().await;
+        s.delete_calls += 1;
+        if let Some(err) = s.next_delete_error.take() {
+            return Err(err);
+        }
+        s.records.remove(member_did);
+        Ok(())
+    }
+
+    async fn read_member(&self, member_did: &str) -> Result<Option<RegistryRecord>, RegistryError> {
+        let mut s = self.inner.lock().await;
+        s.read_calls += 1;
+        if let Some(err) = s.next_read_error.take() {
+            return Err(err);
+        }
+        Ok(s.records.get(member_did).cloned())
+    }
+
+    async fn health(&self) -> Result<(), RegistryError> {
+        let mut s = self.inner.lock().await;
+        s.health_calls += 1;
+        if let Some(err) = s.next_health_error.take() {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn recognise(&self, foreign_issuer_did: &str) -> Result<bool, RegistryError> {
+        let mut s = self.inner.lock().await;
+        s.recognise_calls += 1;
+        if let Some(err) = s.next_recognise_error.take() {
+            return Err(err);
+        }
+        Ok(s.recognised_issuers.contains(foreign_issuer_did))
+    }
+
+    async fn put_trust_record(&self, record: &serde_json::Value) -> Result<(), RegistryError> {
+        let mut s = self.inner.lock().await;
+        if let Some(err) = s.next_trust_record_error.take() {
+            return Err(err);
+        }
+        let field = |k: &str| record.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+        let key = format!(
+            "{}|{}|{}",
+            field("entity_id"),
+            field("action"),
+            field("resource")
+        );
+        s.trust_records.insert(key, record.clone());
+        Ok(())
+    }
+
+    async fn list_trust_records(
+        &self,
+        action: &str,
+    ) -> Result<Vec<serde_json::Value>, RegistryError> {
+        let s = self.inner.lock().await;
+        Ok(s.trust_records
+            .values()
+            .filter(|r| r.get("action").and_then(|a| a.as_str()) == Some(action))
+            .cloned()
+            .collect())
+    }
+
+    /// The records written through `put_trust_record`. Members published
+    /// through `publish_member` are not listed: the mock keeps them as
+    /// [`RegistryRecord`]s and does not know the authority to render them
+    /// under.
+    async fn list_all_trust_records(&self) -> Result<Vec<serde_json::Value>, RegistryError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .trust_records
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_trust_record(
+        &self,
+        entity_id: &str,
+        action: &str,
+        resource: &str,
+    ) -> Result<(), RegistryError> {
+        let mut s = self.inner.lock().await;
+        if let Some(err) = s.next_trust_record_error.take() {
+            return Err(err);
+        }
+        s.trust_record_deletes += 1;
+        s.trust_records
+            .remove(&format!("{entity_id}|{action}|{resource}"));
+        Ok(())
+    }
+
+    async fn project_capability_module(
+        &self,
+        change: &CapabilityModuleChange,
+    ) -> Result<(), RegistryError> {
+        let mut s = self.inner.lock().await;
+        if let Some(err) = s.next_capability_module_error.take() {
+            return Err(err);
+        }
+        s.capability_module_changes.push(change.clone());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::model::RegistryStatus;
+    use chrono::Utc;
+
+    fn fresh_record(did: &str) -> RegistryRecord {
+        RegistryRecord {
+            member_did: did.into(),
+            status: RegistryStatus::Active,
+            active_from: Utc::now(),
+            active_to: None,
+            last_synced_at: Utc::now(),
+            directory_card: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_tracks_call_counts() {
+        let m = MockRegistryClient::new();
+        m.publish_member(&fresh_record("did:key:zA")).await.unwrap();
+        m.publish_member(&fresh_record("did:key:zB")).await.unwrap();
+        m.read_member("did:key:zA").await.unwrap();
+        m.delete_member("did:key:zB").await.unwrap();
+        m.health().await.unwrap();
+
+        let counts = m.call_counts().await;
+        assert_eq!(counts.publish, 2);
+        assert_eq!(counts.read, 1);
+        assert_eq!(counts.delete, 1);
+        assert_eq!(counts.health, 1);
+    }
+
+    #[tokio::test]
+    async fn mock_persists_published_records() {
+        let m = MockRegistryClient::new();
+        m.publish_member(&fresh_record("did:key:zX")).await.unwrap();
+        let got = m.read_member("did:key:zX").await.unwrap().expect("present");
+        assert_eq!(got.member_did, "did:key:zX");
+        // Absent DID returns None.
+        let none = m.read_member("did:key:zMissing").await.unwrap();
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn fail_next_publish_consumes_a_single_call() {
+        let m = MockRegistryClient::new();
+        m.fail_next_publish(RegistryError::Transient("flaky".into()))
+            .await;
+        let err = m
+            .publish_member(&fresh_record("did:key:zA"))
+            .await
+            .expect_err("queued error must surface");
+        assert!(err.is_retriable());
+        // Second call succeeds — error queue is one-shot.
+        m.publish_member(&fresh_record("did:key:zA")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_removes_from_snapshot() {
+        let m = MockRegistryClient::new();
+        m.publish_member(&fresh_record("did:key:zKeep"))
+            .await
+            .unwrap();
+        m.publish_member(&fresh_record("did:key:zDrop"))
+            .await
+            .unwrap();
+        m.delete_member("did:key:zDrop").await.unwrap();
+        let snap = m.snapshot().await;
+        assert!(snap.contains_key("did:key:zKeep"));
+        assert!(!snap.contains_key("did:key:zDrop"));
+    }
+
+    #[tokio::test]
+    async fn recognise_returns_true_for_seeded_issuer() {
+        let m = MockRegistryClient::new();
+        m.set_recognised("did:webvh:peer.example.com:abc").await;
+        assert!(m.recognise("did:webvh:peer.example.com:abc").await.unwrap());
+        // Unseeded DID returns false (clean not-found).
+        assert!(!m.recognise("did:webvh:stranger.example").await.unwrap());
+        assert_eq!(m.call_counts().await.recognise, 2);
+    }
+
+    #[tokio::test]
+    async fn recognise_propagates_transport_errors() {
+        let m = MockRegistryClient::new();
+        m.fail_next_recognise(RegistryError::Unreachable("dns".into()))
+            .await;
+        let err = m
+            .recognise("did:webvh:peer.example")
+            .await
+            .expect_err("queued error must surface");
+        assert!(err.is_retriable());
+    }
+
+    #[test]
+    fn registry_error_retriable_classification() {
+        assert!(RegistryError::Transient("x".into()).is_retriable());
+        assert!(RegistryError::Unreachable("x".into()).is_retriable());
+        assert!(!RegistryError::Permanent("x".into()).is_retriable());
+    }
+
+    #[test]
+    fn registry_error_maps_to_typed_http_status() {
+        use axum::http::StatusCode;
+        use vti_common::error::AppError;
+
+        let status = |e: RegistryError| match AppError::from(e) {
+            AppError::ServiceError { status, .. } => status,
+            other => panic!("expected ServiceError, got {other:?}"),
+        };
+        // Retriable failures → 503 (try again later), never an opaque 500.
+        assert_eq!(
+            status(RegistryError::Transient("x".into())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(RegistryError::Unreachable("x".into())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // A registry that rejected the request shape → 502 (upstream fault).
+        assert_eq!(
+            status(RegistryError::Permanent("x".into())),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+}

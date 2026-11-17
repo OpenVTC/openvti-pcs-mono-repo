@@ -1,0 +1,1534 @@
+//! Tests for the credential-exchange submodules. Driven through the
+//! re-exported public surface (`use super::*`).
+
+/// `did:key` resolves locally, so these tests need no DID resolver.
+static NO_RESOLVER: std::sync::LazyLock<crate::credentials::vm_resolver::DidVmResolver> =
+    std::sync::LazyLock::new(|| crate::credentials::vm_resolver::DidVmResolver::new(None));
+
+use super::*;
+// Names the original single-file test module reached via `use super::*` when
+// the parent (exchange.rs) still held all the imports + private consts.
+use super::issue::{OID4VCI_PROOF_TYP, PROOF_MAX_AGE_SECS};
+use affinidi_openid4vci::{CredentialRequest, CredentialRequestProof, FORMAT_SD_JWT_VC};
+use affinidi_sd_jwt::error::SdJwtError;
+use affinidi_sd_jwt::hasher::Sha256Hasher;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{Duration, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use serde_json::{Value, json};
+use vti_common::error::AppError;
+use vti_common::store::KeyspaceHandle;
+
+const ISSUER: &str = "did:web:vtc.example";
+
+/// A holder identity: an Ed25519 key + its `did:key`.
+struct Holder {
+    key: SigningKey,
+    did: String,
+}
+impl Holder {
+    fn new(seed: u8) -> Self {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let did = affinidi_crypto::did_key::ed25519_pub_to_did_key(key.verifying_key().as_bytes());
+        Self { key, did }
+    }
+
+    /// Build an OID4VCI proof JWT (`openid4vci-proof+jwt`) signed by this
+    /// holder, with the given `aud` / `iat` / `nonce`.
+    fn proof_jwt(&self, aud: &str, iat: i64, nonce: Option<&str>) -> String {
+        let header = json!({
+            "typ": OID4VCI_PROOF_TYP,
+            "alg": "EdDSA",
+            // A did:key names one method: its own key id.
+            "kid": format!("{}#{}", self.did, self.did.trim_start_matches("did:key:")),
+        });
+        let mut payload = json!({ "iss": self.did, "aud": aud, "iat": iat });
+        if let Some(n) = nonce {
+            payload["nonce"] = json!(n);
+        }
+        let h = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let p = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let signing_input = format!("{h}.{p}");
+        let sig: Signature = self.key.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+}
+
+fn request_with(proof_jwt: String) -> CredentialRequest {
+    CredentialRequest {
+        format: FORMAT_SD_JWT_VC.to_string(),
+        vct: Some("https://openvtc.org/credentials/MembershipCredential".into()),
+        doctype: None,
+        proof: Some(CredentialRequestProof {
+            proof_type: "jwt".into(),
+            jwt: proof_jwt,
+        }),
+        credential_identifier: None,
+    }
+}
+
+fn a_credential() -> Value {
+    json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2"],
+        "type": ["VerifiableCredential", "MembershipCredential"],
+        "issuer": ISSUER,
+        "credentialSubject": { "id": "did:example:member" }
+    })
+}
+
+#[test]
+fn verifies_a_fresh_holder_proof() {
+    let holder = Holder::new(7);
+    let now = Utc::now();
+    let jwt = holder.proof_jwt(ISSUER, now.timestamp(), Some("n-1"));
+    let proven = verify_oid4vci_proof(&jwt, ISSUER, now).expect("verify proof");
+    assert_eq!(proven.holder_did, holder.did);
+    assert_eq!(proven.nonce.as_deref(), Some("n-1"));
+}
+
+#[tokio::test]
+async fn issues_to_the_bound_holder() {
+    let holder = Holder::new(11);
+    let now = Utc::now();
+    let req = request_with(holder.proof_jwt(ISSUER, now.timestamp(), None));
+    let resp = issue_on_request(&req, a_credential(), &holder.did, ISSUER, now, &NO_RESOLVER)
+        .await
+        .expect("issue to bound holder");
+    assert_eq!(resp.credential, Some(a_credential()));
+}
+
+#[tokio::test]
+async fn refuses_when_the_proof_binds_a_different_holder() {
+    let bound = Holder::new(1);
+    let attacker = Holder::new(2);
+    let now = Utc::now();
+    // The attacker signs a perfectly valid proof — for *their own* DID.
+    let req = request_with(attacker.proof_jwt(ISSUER, now.timestamp(), None));
+    let err = issue_on_request(&req, a_credential(), &bound.did, ISSUER, now, &NO_RESOLVER)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AppError::Forbidden(_)),
+        "wrong-holder redemption must be Forbidden, got {err:?}"
+    );
+}
+
+#[test]
+fn refuses_a_proof_for_another_audience() {
+    let holder = Holder::new(3);
+    let now = Utc::now();
+    let jwt = holder.proof_jwt("did:web:other.example", now.timestamp(), None);
+    let err = verify_oid4vci_proof(&jwt, ISSUER, now).unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("aud")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn refuses_a_stale_proof() {
+    let holder = Holder::new(4);
+    let now = Utc::now();
+    let stale = now.timestamp() - (PROOF_MAX_AGE_SECS + 60);
+    let err =
+        verify_oid4vci_proof(&holder.proof_jwt(ISSUER, stale, None), ISSUER, now).unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("stale")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn refuses_a_tampered_signature() {
+    let holder = Holder::new(5);
+    let now = Utc::now();
+    let mut jwt = holder.proof_jwt(ISSUER, now.timestamp(), None);
+    // Flip the last signature character.
+    let last = jwt.pop().unwrap();
+    jwt.push(if last == 'A' { 'B' } else { 'A' });
+    let err = verify_oid4vci_proof(&jwt, ISSUER, now).unwrap_err();
+    assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn refuses_a_request_with_no_proof() {
+    let now = Utc::now();
+    let req = CredentialRequest {
+        format: FORMAT_SD_JWT_VC.to_string(),
+        vct: Some("https://openvtc.org/credentials/MembershipCredential".into()),
+        doctype: None,
+        proof: None,
+        credential_identifier: None,
+    };
+    let err = issue_on_request(
+        &req,
+        a_credential(),
+        "did:key:zHolder",
+        ISSUER,
+        now,
+        &NO_RESOLVER,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("no key-binding proof")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn refuses_a_non_did_key_holder_proof_for_now() {
+    // A structurally-valid proof whose kid is a did:web — resolver deferred.
+    let now = Utc::now();
+    let header =
+        json!({ "typ": OID4VCI_PROOF_TYP, "alg": "EdDSA", "kid": "did:web:holder.example#k" });
+    let payload = json!({ "aud": ISSUER, "iat": now.timestamp() });
+    let h = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let p = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    // Signature is irrelevant — the kid is rejected before verification.
+    let jwt = format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode([0u8; 64]));
+    let err = verify_oid4vci_proof(&jwt, ISSUER, now).unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("did:key")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn offer_is_pre_authorized() {
+    let offer = credential_offer(
+        ISSUER,
+        vec!["MembershipCredential".into()],
+        "code-xyz".into(),
+    );
+    assert_eq!(offer.credential_issuer, ISSUER);
+    assert_eq!(
+        offer.credential_configuration_ids,
+        vec!["MembershipCredential"]
+    );
+    let grant = offer.grants.unwrap().pre_authorized_code.unwrap();
+    assert_eq!(grant.pre_authorized_code, "code-xyz");
+}
+
+// ── pending-offer store + redeem flow ──
+
+fn fresh_ks() -> (tempfile::TempDir, vti_common::store::Store, KeyspaceHandle) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = vti_common::store::Store::open(&vti_common::config::StoreConfig {
+        data_dir: dir.path().to_path_buf(),
+    })
+    .unwrap();
+    let ks = store.keyspace("join_requests").unwrap();
+    (dir, store, ks)
+}
+
+#[tokio::test]
+async fn make_offer_then_redeem_delivers_and_consumes() {
+    let (_d, _s, ks) = fresh_ks();
+    let holder = Holder::new(30);
+    let now = Utc::now();
+
+    let (offer, code) = make_offer(
+        &ks,
+        ISSUER,
+        vec!["MembershipCredential".into()],
+        a_credential(),
+        &holder.did,
+        DEFAULT_OFFER_TTL,
+        now,
+    )
+    .await
+    .expect("make offer");
+    // The offer advertises the same pre-authorized code we persisted.
+    assert_eq!(
+        offer
+            .grants
+            .unwrap()
+            .pre_authorized_code
+            .unwrap()
+            .pre_authorized_code,
+        code
+    );
+
+    // Holder redeems: proof nonce == the pre-authorized code.
+    let req = request_with(holder.proof_jwt(ISSUER, now.timestamp(), Some(&code)));
+    let resp = redeem(&ks, &req, now, &NO_RESOLVER).await.expect("redeem");
+    assert_eq!(resp.credential, Some(a_credential()));
+
+    // Single-use: the offer is consumed.
+    let again = redeem(&ks, &req, now, &NO_RESOLVER).await.unwrap_err();
+    assert!(matches!(again, AppError::NotFound(_)), "{again:?}");
+}
+
+#[tokio::test]
+async fn sweep_expired_pending_removes_only_expired() {
+    let (_d, _s, ks) = fresh_ks();
+    let holder = Holder::new(40);
+    let now = Utc::now();
+    // Expired offer: made an hour ago with the 30-min TTL.
+    make_offer(
+        &ks,
+        ISSUER,
+        vec!["MembershipCredential".into()],
+        a_credential(),
+        &holder.did,
+        DEFAULT_OFFER_TTL,
+        now - Duration::hours(1),
+    )
+    .await
+    .expect("expired offer");
+    // Fresh offer: made now → survives.
+    make_offer(
+        &ks,
+        ISSUER,
+        vec!["MembershipCredential".into()],
+        a_credential(),
+        &holder.did,
+        DEFAULT_OFFER_TTL,
+        now,
+    )
+    .await
+    .expect("fresh offer");
+
+    let purged = sweep_expired_pending(&ks, now).await.unwrap();
+    assert_eq!(purged, 1, "only the expired offer should be purged");
+
+    let remaining = ks
+        .prefix_iter_raw(b"credx-pending:".to_vec())
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(remaining, 1, "the fresh offer survives");
+}
+
+#[tokio::test]
+async fn redeem_rejects_unknown_code() {
+    let (_d, _s, ks) = fresh_ks();
+    let holder = Holder::new(31);
+    let now = Utc::now();
+    let req = request_with(holder.proof_jwt(ISSUER, now.timestamp(), Some("pac_missing")));
+    let err = redeem(&ks, &req, now, &NO_RESOLVER).await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn redeem_rejects_an_expired_offer() {
+    let (_d, _s, ks) = fresh_ks();
+    let holder = Holder::new(32);
+    let issued = Utc::now();
+    let (_offer, code) = make_offer(
+        &ks,
+        ISSUER,
+        vec!["m".into()],
+        a_credential(),
+        &holder.did,
+        Duration::seconds(1),
+        issued,
+    )
+    .await
+    .unwrap();
+
+    let later = issued + Duration::seconds(30);
+    let req = request_with(holder.proof_jwt(ISSUER, later.timestamp(), Some(&code)));
+    let err = redeem(&ks, &req, later, &NO_RESOLVER).await.unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("expired")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn redeem_refuses_wrong_holder_without_burning_the_offer() {
+    let (_d, _s, ks) = fresh_ks();
+    let bound = Holder::new(33);
+    let attacker = Holder::new(34);
+    let now = Utc::now();
+    let (_offer, code) = make_offer(
+        &ks,
+        ISSUER,
+        vec!["m".into()],
+        a_credential(),
+        &bound.did,
+        DEFAULT_OFFER_TTL,
+        now,
+    )
+    .await
+    .unwrap();
+
+    // Attacker signs a valid proof for *their own* DID, echoing the code.
+    let bad = request_with(attacker.proof_jwt(ISSUER, now.timestamp(), Some(&code)));
+    let err = redeem(&ks, &bad, now, &NO_RESOLVER).await.unwrap_err();
+    assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+
+    // The legitimate offer was NOT consumed — the real holder still redeems.
+    let good = request_with(bound.proof_jwt(ISSUER, now.timestamp(), Some(&code)));
+    assert!(redeem(&ks, &good, now, &NO_RESOLVER).await.is_ok());
+}
+
+// ── verify_presentation (task 3.4) ──
+
+const MEMBERSHIP_VCT: &str = "https://openvtc.org/credentials/MembershipCredential";
+
+/// An Ed25519 SD-JWT signer (issuer or holder).
+struct SdSigner {
+    key: SigningKey,
+    kid: String,
+}
+impl affinidi_sd_jwt::signer::JwtSigner for SdSigner {
+    fn algorithm(&self) -> &str {
+        "EdDSA"
+    }
+    fn key_id(&self) -> Option<&str> {
+        Some(&self.kid)
+    }
+    fn sign_jwt(&self, header: &Value, payload: &Value) -> Result<String, SdJwtError> {
+        let h = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(header).map_err(|e| SdJwtError::Verification(e.to_string()))?,
+        );
+        let p = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(payload).map_err(|e| SdJwtError::Verification(e.to_string()))?,
+        );
+        let input = format!("{h}.{p}");
+        let sig: Signature = self.key.sign(input.as_bytes());
+        Ok(format!(
+            "{input}.{}",
+            URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        ))
+    }
+}
+
+fn okp_jwk(vk: &VerifyingKey) -> Value {
+    json!({ "kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(vk.to_bytes()) })
+}
+
+/// Issue an SD-JWT-VC (issuer seed 9, holder seed 5, `givenName` disclosable)
+/// and present it. Returns `(issuer_did, vp_token)`. With `with_kb`, the
+/// presentation carries a holder kb-jwt bound to `aud` + `nonce`.
+fn make_presentation(aud: &str, nonce: &str, iat: u64, exp: i64, with_kb: bool) -> (String, Value) {
+    make_presentation_kb_at(aud, nonce, iat, exp, with_kb, iat)
+}
+
+/// [`make_presentation`] with the kb-jwt made at `kb_iat` rather than at the
+/// credential's `iat`.
+fn make_presentation_kb_at(
+    aud: &str,
+    nonce: &str,
+    iat: u64,
+    exp: i64,
+    with_kb: bool,
+    kb_iat: u64,
+) -> (String, Value) {
+    use affinidi_sd_jwt::holder::{KbJwtInput, present, select_disclosures};
+
+    let issuer = SigningKey::from_bytes(&[9u8; 32]);
+    let issuer_did =
+        affinidi_crypto::did_key::ed25519_pub_to_did_key(issuer.verifying_key().as_bytes());
+    let issuer_signer = SdSigner {
+        key: SigningKey::from_bytes(&[9u8; 32]),
+        kid: format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:")),
+    };
+
+    let holder = SigningKey::from_bytes(&[5u8; 32]);
+    let holder_vk = holder.verifying_key();
+    let holder_did = affinidi_crypto::did_key::ed25519_pub_to_did_key(holder_vk.as_bytes());
+    let holder_signer = SdSigner {
+        key: SigningKey::from_bytes(&[5u8; 32]),
+        kid: format!(
+            "{holder_did}#{}",
+            holder_did.strip_prefix("did:key:").unwrap()
+        ),
+    };
+
+    let claims = json!({
+        "iss": issuer_did, "sub": holder_did, "vct": MEMBERSHIP_VCT,
+        "iat": iat, "exp": exp, "givenName": "Alice"
+    });
+    let frame = json!({ "_sd": ["givenName"] });
+    let hasher = Sha256Hasher;
+    let holder_jwk = okp_jwk(&holder_vk);
+    let sd =
+        affinidi_sd_jwt::issuer::issue(&claims, &frame, &issuer_signer, &hasher, Some(&holder_jwk))
+            .unwrap();
+    let selected = select_disclosures(&sd, &["givenName"]);
+    let kb = KbJwtInput {
+        audience: aud,
+        nonce,
+        signer: &holder_signer,
+        iat: kb_iat,
+    };
+    let presentation = present(
+        &sd,
+        &selected,
+        if with_kb { Some(&kb) } else { None },
+        &hasher,
+    )
+    .unwrap();
+    (issuer_did, json!(presentation.serialize()))
+}
+
+/// Like [`make_presentation`] but parameterized on the holder seed + `vct`,
+/// returning the holder DID too. Lets a test build a multi-credential
+/// `vp_token` and exercise the holder-consistency check.
+fn make_presentation_holder(
+    holder_seed: u8,
+    vct: &str,
+    aud: &str,
+    nonce: &str,
+    iat: u64,
+    exp: i64,
+) -> (String, String, Value) {
+    use affinidi_sd_jwt::holder::{KbJwtInput, present, select_disclosures};
+
+    let issuer = SigningKey::from_bytes(&[9u8; 32]);
+    let issuer_did =
+        affinidi_crypto::did_key::ed25519_pub_to_did_key(issuer.verifying_key().as_bytes());
+    let issuer_signer = SdSigner {
+        key: SigningKey::from_bytes(&[9u8; 32]),
+        kid: format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:")),
+    };
+
+    let holder = SigningKey::from_bytes(&[holder_seed; 32]);
+    let holder_vk = holder.verifying_key();
+    let holder_did = affinidi_crypto::did_key::ed25519_pub_to_did_key(holder_vk.as_bytes());
+    let holder_signer = SdSigner {
+        key: SigningKey::from_bytes(&[holder_seed; 32]),
+        kid: format!(
+            "{holder_did}#{}",
+            holder_did.strip_prefix("did:key:").unwrap()
+        ),
+    };
+
+    let claims = json!({
+        "iss": issuer_did, "sub": holder_did, "vct": vct,
+        "iat": iat, "exp": exp, "givenName": "Alice"
+    });
+    let frame = json!({ "_sd": ["givenName"] });
+    let hasher = Sha256Hasher;
+    let holder_jwk = okp_jwk(&holder_vk);
+    let sd =
+        affinidi_sd_jwt::issuer::issue(&claims, &frame, &issuer_signer, &hasher, Some(&holder_jwk))
+            .unwrap();
+    let selected = select_disclosures(&sd, &["givenName"]);
+    let kb = KbJwtInput {
+        audience: aud,
+        nonce,
+        signer: &holder_signer,
+        iat,
+    };
+    let presentation = present(&sd, &selected, Some(&kb), &hasher).unwrap();
+    (issuer_did, holder_did, json!(presentation.serialize()))
+}
+
+/// Emit valid seed-corpus fixtures for the credential-exchange parser fuzz
+/// targets (issue #439, item 6): an SD-JWT-VC presentation, the OID4VP DCQL
+/// `vp_token` shapes (bare string + map), and an OID4VCI key-binding proof
+/// JWT. The sealed-transfer-armor + bootstrap-request seeds come from the
+/// sibling `vta-sdk/examples/gen_fuzz_seeds.rs` generator.
+///
+/// `#[ignore]`d so it never runs in normal CI — invoke it on demand to
+/// regenerate the committed seeds:
+/// ```bash
+/// VTC_SKIP_ADMIN_UI_BUILD=1 cargo test -p vtc-service \
+///     --lib credentials::exchange::tests::gen_fuzz_seed_corpus -- --ignored
+/// ```
+#[test]
+#[ignore = "fixture generator — run on demand to refresh fuzz/seeds"]
+fn gen_fuzz_seed_corpus() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("vtc-service has a parent (the workspace root)")
+        .join("fuzz")
+        .join("seeds");
+    let sd_dir = root.join("sd-jwt-presentation");
+    let vp_dir = root.join("vp-token");
+    let proof_dir = root.join("oid4vci-proof");
+    for d in [&sd_dir, &vp_dir, &proof_dir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let aud = "did:web:vtc.example";
+    let nonce = "fuzz-seed-nonce";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+
+    // A single SD-JWT-VC presentation: the compact string (for the
+    // `parse_sd_jwt_presentation` target) and the bare-string `vp_token`
+    // JSON (for the `flatten_vp_token` / `verify_vp_token` target).
+    let (_issuer, vp) = make_presentation(aud, nonce, iat, exp, true);
+    let compact = vp.as_str().unwrap();
+    std::fs::write(sd_dir.join("membership.sdjwt"), compact).unwrap();
+    std::fs::write(
+        vp_dir.join("single-presentation.json"),
+        serde_json::to_vec(&vp).unwrap(),
+    )
+    .unwrap();
+
+    // A DCQL `vp_token` map: two presentations from the same holder under
+    // distinct query ids.
+    let (_i1, _h1, vp_membership) =
+        make_presentation_holder(5, MEMBERSHIP_VCT, aud, nonce, iat, exp);
+    let (_i2, _h2, vp_invitation) = make_presentation_holder(
+        5,
+        "https://openvtc.org/credentials/Invitation",
+        aud,
+        nonce,
+        iat,
+        exp,
+    );
+    let dcql = json!({ "membership": vp_membership, "invitation": vp_invitation });
+    std::fs::write(
+        vp_dir.join("dcql-map.json"),
+        serde_json::to_vec(&dcql).unwrap(),
+    )
+    .unwrap();
+
+    // An OID4VCI key-binding proof JWT (the `verify_oid4vci_proof` target).
+    let holder = Holder::new(7);
+    let proof = holder.proof_jwt(ISSUER, now.timestamp(), Some("fuzz-seed-cnonce"));
+    std::fs::write(proof_dir.join("holder-proof.jwt"), proof).unwrap();
+
+    eprintln!(
+        "wrote credential-exchange fuzz seeds under {}",
+        root.display()
+    );
+}
+
+#[tokio::test]
+async fn verify_vp_token_verifies_a_dcql_map() {
+    let aud = "did:web:vtc.example";
+    let nonce = "verifier-nonce-multi";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+
+    // Two presentations from the SAME holder under different query ids.
+    let (_i1, holder_did, vp_membership) =
+        make_presentation_holder(5, MEMBERSHIP_VCT, aud, nonce, iat, exp);
+    let (_i2, _h2, vp_invitation) = make_presentation_holder(
+        5,
+        "https://openvtc.org/credentials/InvitationCredential",
+        aud,
+        nonce,
+        iat,
+        exp,
+    );
+    let vp_token = json!({ "membership": vp_membership, "invitation": vp_invitation });
+
+    let set = verify_vp_token(&vp_token, aud, nonce, None, now)
+        .await
+        .expect("verify map");
+    assert_eq!(set.holder, holder_did);
+    assert_eq!(set.presentations.len(), 2);
+    assert_eq!(set.presentations[0].claims["givenName"], "Alice");
+}
+
+#[tokio::test]
+async fn verify_vp_token_accepts_a_bare_string() {
+    let aud = "did:web:vtc.example";
+    let nonce = "n";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (_did, vp) = make_presentation(aud, nonce, iat, exp, true);
+
+    let set = verify_vp_token(&vp, aud, nonce, None, now)
+        .await
+        .expect("verify bare string");
+    assert_eq!(set.presentations.len(), 1);
+}
+
+#[tokio::test]
+async fn verify_vp_token_rejects_mixed_holders() {
+    let aud = "did:web:vtc.example";
+    let nonce = "n";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+
+    // Two presentations from DIFFERENT holders (seeds 5 and 6).
+    let (_i1, _h1, vp_a) = make_presentation_holder(5, MEMBERSHIP_VCT, aud, nonce, iat, exp);
+    let (_i2, _h2, vp_b) = make_presentation_holder(6, MEMBERSHIP_VCT, aud, nonce, iat, exp);
+    let vp_token = json!({ "a": vp_a, "b": vp_b });
+
+    let err = verify_vp_token(&vp_token, aud, nonce, None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("disagree on the holder")),
+        "{err:?}"
+    );
+}
+
+/// Build a holder-bound W3C Data-Integrity VP (the shape the VTA's
+/// `present_di_vc` produces): a single `eddsa-jcs-2022`-signed VC wrapped in a
+/// VP carrying `nonce` + `domain`, signed by the holder with `proofPurpose`
+/// `authentication`. Returns `(holder_did, issuer_did, vp_object)`.
+async fn build_di_vp(
+    holder_seed: u8,
+    issuer_seed: u8,
+    aud: &str,
+    nonce: &str,
+) -> (String, String, Value) {
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions, crypto_suites::CryptoSuite};
+    use affinidi_secrets_resolver::secrets::Secret;
+
+    let issuer_did = affinidi_crypto::did_key::ed25519_pub_to_did_key(
+        &SigningKey::from_bytes(&[issuer_seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let issuer_vm = format!(
+        "{issuer_did}#{}",
+        issuer_did.strip_prefix("did:key:").unwrap()
+    );
+    let issuer_secret = Secret::generate_ed25519(Some(&issuer_vm), Some(&[issuer_seed; 32]));
+
+    let holder_did = affinidi_crypto::did_key::ed25519_pub_to_did_key(
+        &SigningKey::from_bytes(&[holder_seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let holder_vm = format!(
+        "{holder_did}#{}",
+        holder_did.strip_prefix("did:key:").unwrap()
+    );
+    let holder_secret = Secret::generate_ed25519(Some(&holder_vm), Some(&[holder_seed; 32]));
+
+    // Issuer-signed VC.
+    let mut vc = json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2"],
+        "type": ["VerifiableCredential", "MembershipCredential"],
+        "issuer": issuer_did,
+        "validFrom": "2020-01-01T00:00:00Z",
+        "credentialSubject": { "id": holder_did, "givenName": "Alice" }
+    });
+    let vc_proof = DataIntegrityProof::sign(
+        &vc,
+        &issuer_secret,
+        SignOptions::new()
+            .with_proof_purpose("assertionMethod")
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+    )
+    .await
+    .unwrap();
+    vc["proof"] = serde_json::to_value(&vc_proof).unwrap();
+
+    // Holder-signed VP carrying nonce + domain.
+    let mut vp = json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2"],
+        "type": ["VerifiablePresentation"],
+        "holder": holder_did,
+        "verifiableCredential": [vc],
+        "nonce": nonce,
+        "domain": aud,
+    });
+    let vp_proof = DataIntegrityProof::sign(
+        &vp,
+        &holder_secret,
+        SignOptions::new()
+            .with_proof_purpose("authentication")
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+    )
+    .await
+    .unwrap();
+    vp["proof"] = serde_json::to_value(&vp_proof).unwrap();
+
+    (holder_did, issuer_did, vp)
+}
+
+#[tokio::test]
+async fn verify_vp_token_verifies_a_w3c_di_vp() {
+    let aud = "did:web:vtc.example";
+    let nonce = "verifier-nonce-di";
+    let now = Utc::now();
+    let (holder_did, issuer_did, vp) = build_di_vp(5, 9, aud, nonce).await;
+    let vp_token = json!({ "membership": vp });
+
+    let set = verify_vp_token(&vp_token, aud, nonce, None, now)
+        .await
+        .expect("verify DI VP");
+    assert_eq!(set.holder, holder_did);
+    assert_eq!(set.presentations.len(), 1);
+    assert_eq!(set.presentations[0].issuer_did, issuer_did);
+    assert_eq!(
+        set.presentations[0].vct.as_deref(),
+        Some("MembershipCredential")
+    );
+    assert_eq!(set.presentations[0].claims["givenName"], "Alice");
+}
+
+#[tokio::test]
+async fn verify_vp_token_rejects_a_di_vp_with_a_wrong_nonce() {
+    let aud = "did:web:vtc.example";
+    let now = Utc::now();
+    let (_h, _i, vp) = build_di_vp(5, 9, aud, "right-nonce").await;
+    let vp_token = json!({ "membership": vp });
+
+    // The VP's holder proof is valid, but it binds a different nonce.
+    let err = verify_vp_token(&vp_token, aud, "wrong-nonce", None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("nonce")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_vp_token_rejects_a_di_vp_with_a_tampered_claim() {
+    let aud = "did:web:vtc.example";
+    let nonce = "n";
+    let now = Utc::now();
+    let (_h, _i, mut vp) = build_di_vp(5, 9, aud, nonce).await;
+    // Tamper a credential subject claim. The embedded VC is covered by the
+    // holder's VP proof, so the tamper is caught at the holder-proof stage —
+    // defence in depth (no presentation with any altered byte verifies).
+    vp["verifiableCredential"][0]["credentialSubject"]["givenName"] = json!("Mallory");
+    let vp_token = json!({ "membership": vp });
+
+    let err = verify_vp_token(&vp_token, aud, nonce, None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("did not verify")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_vp_token_rejects_a_di_vc_signed_outside_its_issuer() {
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions, crypto_suites::CryptoSuite};
+    use affinidi_secrets_resolver::secrets::Secret;
+
+    let aud = "did:web:vtc.example";
+    let nonce = "n";
+    let now = Utc::now();
+    let (_h, _i, mut vp) = build_di_vp(5, 9, aud, nonce).await;
+    // Re-label the VC `issuer` to a DID that did not sign the VC's proof, then
+    // re-sign the VP so the holder proof stays valid — the issuer-binding
+    // check must then refuse it.
+    vp["verifiableCredential"][0]["issuer"] = json!("did:web:attacker.example");
+    let holder_did = vp["holder"].as_str().unwrap().to_string();
+    let holder_vm = format!(
+        "{holder_did}#{}",
+        holder_did.strip_prefix("did:key:").unwrap()
+    );
+    let holder_secret = Secret::generate_ed25519(Some(&holder_vm), Some(&[5u8; 32]));
+    let mut unsigned = vp.clone();
+    unsigned.as_object_mut().unwrap().remove("proof");
+    let proof = DataIntegrityProof::sign(
+        &unsigned,
+        &holder_secret,
+        SignOptions::new()
+            .with_proof_purpose("authentication")
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+    )
+    .await
+    .unwrap();
+    vp["proof"] = serde_json::to_value(&proof).unwrap();
+    let vp_token = json!({ "membership": vp });
+
+    let err = verify_vp_token(&vp_token, aud, nonce, None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("not under the credential's issuer")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_vp_token_rejects_an_empty_object() {
+    let now = Utc::now();
+    let err = verify_vp_token(&json!({}), "did:web:vtc.example", "n", None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("empty object")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_vp_token_propagates_a_wrong_nonce() {
+    let aud = "did:web:vtc.example";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (_i, _h, vp) = make_presentation_holder(5, MEMBERSHIP_VCT, aud, "right", iat, exp);
+    let vp_token = json!({ "membership": vp });
+
+    // A presentation bound to a different nonce than the verifier expects.
+    assert!(
+        verify_vp_token(&vp_token, aud, "wrong", None, now)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn verifies_a_well_formed_presentation() {
+    let aud = "did:web:vtc.example";
+    let nonce = "verifier-nonce-1";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (issuer_did, vp) = make_presentation(aud, nonce, iat, exp, true);
+
+    let verified = verify_presentation(&vp, aud, nonce, None, now)
+        .await
+        .expect("verify");
+    assert_eq!(verified.issuer_did, issuer_did);
+    assert_eq!(verified.vct.as_deref(), Some(MEMBERSHIP_VCT));
+    assert_eq!(verified.claims["givenName"], "Alice");
+}
+
+#[test]
+fn parse_core_extracts_a_well_formed_presentation_without_io() {
+    // `parse_sd_jwt_presentation` is the sync, resolver-free fuzz target —
+    // it must extract the structural projection of a valid presentation
+    // (the proven holder DID, issuer binding) with no clock and no network.
+    let aud = "did:web:vtc.example";
+    let nonce = "n";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (issuer_did, vp) = make_presentation(aud, nonce, iat, exp, true);
+
+    let parsed = parse_sd_jwt_presentation(vp.as_str().unwrap()).expect("parse");
+    assert_eq!(parsed.issuer_did, issuer_did);
+    assert!(parsed.holder_did.starts_with("did:key:"));
+    // The issuer VM sits under `iss`.
+    assert_eq!(
+        parsed
+            .issuer_vm
+            .as_deref()
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap(),
+        parsed.issuer_did
+    );
+}
+
+#[test]
+fn parse_core_refuses_an_unbound_presentation() {
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (_did, vp) = make_presentation("did:web:vtc.example", "n", iat, exp, false);
+
+    let err = parse_sd_jwt_presentation(vp.as_str().unwrap()).unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("kb-jwt")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn parse_core_rejects_garbage_without_panicking() {
+    // The fuzz target's whole point: arbitrary bytes return an error, never
+    // a panic.
+    for junk in ["", "~", "not.a.jwt", "a~b~c", "\u{0}\u{1}\u{2}"] {
+        assert!(parse_sd_jwt_presentation(junk).is_err(), "junk: {junk:?}");
+    }
+}
+
+#[test]
+fn flatten_vp_token_shreds_the_dcql_envelope_shapes() {
+    // Bare string → one entry.
+    assert_eq!(flatten_vp_token(&json!("compact-sd-jwt")).unwrap().len(), 1);
+    // Object with scalar + array values → flattened across query ids.
+    let dcql = json!({ "q1": "p1", "q2": ["p2", "p3"] });
+    assert_eq!(flatten_vp_token(&dcql).unwrap().len(), 3);
+    // Empty object and non-string/object scalars are refused.
+    assert!(flatten_vp_token(&json!({})).is_err());
+    assert!(flatten_vp_token(&json!(42)).is_err());
+    assert!(flatten_vp_token(&json!(null)).is_err());
+}
+
+#[tokio::test]
+async fn rejects_a_wrong_nonce_or_audience() {
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (_did, vp) = make_presentation("did:web:vtc.example", "right-nonce", iat, exp, true);
+
+    assert!(
+        verify_presentation(&vp, "did:web:vtc.example", "wrong-nonce", None, now)
+            .await
+            .is_err()
+    );
+    assert!(
+        verify_presentation(&vp, "did:web:attacker.example", "right-nonce", None, now)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn rejects_an_expired_presentation() {
+    let now = Utc::now();
+    let iat = (now - Duration::hours(3)).timestamp() as u64;
+    let exp = (now - Duration::hours(2)).timestamp();
+    // A fresh kb-jwt over an expired credential: the credential's own window
+    // is what refuses it.
+    let (_did, vp) = make_presentation_kb_at(
+        "did:web:vtc.example",
+        "n",
+        iat,
+        exp,
+        true,
+        now.timestamp() as u64,
+    );
+
+    let err = verify_presentation(&vp, "did:web:vtc.example", "n", None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("expired")),
+        "{err:?}"
+    );
+}
+
+/// RFC 9901 §7.3: a kb-jwt made long before it reached us is refused, however
+/// valid the credential (affinidi-sd-jwt 0.2's `KbFreshness`; 600 s here).
+#[tokio::test]
+async fn rejects_a_stale_kb_jwt() {
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let stale = (now - Duration::minutes(11)).timestamp() as u64;
+    let (_did, vp) = make_presentation_kb_at("did:web:vtc.example", "n", iat, exp, true, stale);
+    let err = verify_presentation(&vp, "did:web:vtc.example", "n", None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("KB-JWT is older")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_an_unbound_presentation_without_a_kb_jwt() {
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (_did, vp) = make_presentation("did:web:vtc.example", "n", iat, exp, false);
+
+    let err = verify_presentation(&vp, "did:web:vtc.example", "n", None, now)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("kb-jwt")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_a_tampered_issuer_signature() {
+    let aud = "did:web:vtc.example";
+    let nonce = "n";
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let exp = (now + Duration::hours(1)).timestamp();
+    let (_did, vp) = make_presentation(aud, nonce, iat, exp, true);
+
+    // Flip the last char of the issuer JWS (the segment before the first `~`)
+    // — its signature no longer covers the header.payload bytes.
+    let compact = vp.as_str().unwrap();
+    let tilde = compact.find('~').unwrap();
+    let mut chars: Vec<char> = compact.chars().collect();
+    let i = tilde - 1;
+    chars[i] = if chars[i] == 'A' { 'B' } else { 'A' };
+    let tampered: String = chars.into_iter().collect();
+
+    assert!(
+        verify_presentation(&json!(tampered), aud, nonce, None, now)
+            .await
+            .is_err()
+    );
+}
+
+// ---- bbs-2023 verifier (feature `bbs`) ------------------------------
+
+#[cfg(feature = "bbs")]
+fn bbs_derived_presentation(nonce: &str, subject: &str, disclose: &[&str]) -> (Value, String) {
+    use affinidi_bbs as bbs;
+    use affinidi_data_integrity::bbs_2023_transform::{create_derived_proof, sign_base_document};
+
+    let sk = bbs::keygen(b"vtc-bbs-verify-key-material-32by", b"").unwrap();
+    let pk = bbs::sk_to_pk(&sk);
+    let issuer_did = affinidi_crypto::bls12381::g2_pub_to_did_key(&pk.to_bytes());
+    let vc = json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            "https://www.w3.org/ns/credentials/examples/v2"
+        ],
+        "type": ["VerifiableCredential", "MembershipCredential"],
+        "issuer": issuer_did,
+        "validFrom": "2020-01-01T00:00:00Z",
+        "validUntil": "2100-01-01T00:00:00Z",
+        "credentialSubject": { "id": subject, "memberLevel": "gold", "secret": "hidden" }
+    });
+    let mandatory = ["/@context", "/type", "/issuer", "/credentialSubject/id"];
+    let base = sign_base_document(
+        &vc,
+        &mandatory,
+        &format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:")),
+        "2020-01-01T00:00:00Z",
+        &sk,
+        &pk,
+        b"vtc-bbs-test-hmac-key-32-bytes!!",
+    )
+    .unwrap();
+    let derived = create_derived_proof(&base, disclose, nonce.as_bytes(), &pk).unwrap();
+    (derived, issuer_did)
+}
+
+#[cfg(feature = "bbs")]
+#[tokio::test]
+async fn verify_vp_token_accepts_a_bbs_2023_presentation() {
+    let nonce = "vtc-challenge-xyz";
+    let subject = "did:key:zApplicant";
+    let (derived, issuer_did) =
+        bbs_derived_presentation(nonce, subject, &["/credentialSubject/memberLevel"]);
+
+    // vp_token is the DCQL map keyed by query id → the derived VC.
+    let vp_token = json!({ "membership": derived });
+    let set = verify_vp_token(&vp_token, "did:web:vtc.example", nonce, None, Utc::now())
+        .await
+        .expect("a valid bbs-2023 presentation must verify");
+
+    assert_eq!(set.holder, subject, "holder is the disclosed subject id");
+    assert_eq!(set.presentations.len(), 1);
+    let p = &set.presentations[0];
+    assert_eq!(p.issuer_did, issuer_did);
+    assert_eq!(p.vct.as_deref(), Some("MembershipCredential"));
+    assert_eq!(p.claims["memberLevel"], "gold");
+    assert!(
+        p.claims.get("secret").is_none(),
+        "an undisclosed claim must not appear"
+    );
+    assert!(
+        !p.holder_bound,
+        "a basic bbs-2023 proof is possession-based, not holder-bound"
+    );
+}
+
+/// A bbs-2023 **pseudonym** (holder-bound) presentation bound to `verifier_id`.
+#[cfg(feature = "bbs")]
+fn bbs_pseudonym_presentation(
+    nonce: &str,
+    subject: &str,
+    verifier_id: &str,
+    disclose: &[&str],
+) -> (Value, String) {
+    use affinidi_bbs as bbs;
+    use affinidi_data_integrity::bbs_2023_transform as tx;
+
+    let sk = bbs::keygen(b"vtc-nym-verify-key-material-32by", b"").unwrap();
+    let pk = bbs::sk_to_pk(&sk);
+    let issuer_did = affinidi_crypto::bls12381::g2_pub_to_did_key(&pk.to_bytes());
+    let vc = json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2",
+            "https://www.w3.org/ns/credentials/examples/v2"
+        ],
+        "type": ["VerifiableCredential", "MembershipCredential"],
+        "issuer": issuer_did,
+        "validFrom": "2020-01-01T00:00:00Z",
+        "validUntil": "2100-01-01T00:00:00Z",
+        "credentialSubject": { "id": subject, "memberLevel": "gold", "secret": "hidden" }
+    });
+    let mandatory = ["/@context", "/type", "/issuer", "/credentialSubject/id"];
+
+    // Holder commits a link secret; issuer blind-signs the pseudonym base.
+    let prover_nym_bytes = [0x11u8; 32];
+    let prover_nym = bbs::hash::scalar_from_bytes(&prover_nym_bytes).unwrap();
+    let (commitment, secret_prover_blind) =
+        bbs::nym_commit(prover_nym, &[], bbs::Ciphersuite::default()).unwrap();
+    let blind_bytes = bbs::hash::scalar_to_bytes(&secret_prover_blind);
+    let proof_config = json!({
+        "type": "DataIntegrityProof",
+        "cryptosuite": "bbs-2023",
+        "created": "2020-01-01T00:00:00Z",
+        "verificationMethod": format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:")),
+        "proofPurpose": "assertionMethod",
+        "@context": vc["@context"].clone(),
+    });
+    let proof_value = tx::create_pseudonym_base_proof_value(
+        &vc,
+        &proof_config,
+        &mandatory,
+        &sk,
+        &pk,
+        b"vtc-nym-test-hmac-key-32-bytes!!",
+        &commitment,
+        &[0x22u8; 32],
+    )
+    .unwrap();
+    let mut proof = proof_config;
+    let obj = proof.as_object_mut().unwrap();
+    obj.remove("@context");
+    obj.insert("proofValue".into(), json!(proof_value));
+    let mut base = vc.clone();
+    base.as_object_mut().unwrap().insert("proof".into(), proof);
+
+    // Holder derives a per-verifier pseudonym proof bound to `verifier_id`.
+    let derived = tx::create_pseudonym_derived_proof(
+        &base,
+        disclose,
+        nonce.as_bytes(),
+        &pk,
+        &prover_nym_bytes,
+        &blind_bytes,
+        verifier_id,
+    )
+    .unwrap();
+    (derived, issuer_did)
+}
+
+#[cfg(feature = "bbs")]
+#[tokio::test]
+async fn verify_vp_token_accepts_a_holder_bound_bbs_pseudonym() {
+    let nonce = "vtc-challenge-xyz";
+    let subject = "did:key:zApplicant";
+    let aud = "did:web:vtc.example";
+    let (derived, _issuer) =
+        bbs_pseudonym_presentation(nonce, subject, aud, &["/credentialSubject/memberLevel"]);
+    let vp_token = json!({ "membership": derived });
+
+    // Verifies and is reported as holder-bound when aud matches the verifier id.
+    let set = verify_vp_token(&vp_token, aud, nonce, None, Utc::now())
+        .await
+        .expect("a holder-bound bbs-2023 pseudonym must verify");
+    assert_eq!(set.holder, subject);
+    assert!(
+        set.presentations[0].holder_bound,
+        "a pseudonym proof must be reported holder-bound"
+    );
+
+    // ... and is REJECTED for a different verifier (per-verifier binding):
+    // `aud` is the pseudonym `verifier_id`, so a different VTC can't accept it.
+    assert!(
+        verify_vp_token(
+            &vp_token,
+            "did:web:other-vtc.example",
+            nonce,
+            None,
+            Utc::now()
+        )
+        .await
+        .is_err(),
+        "a pseudonym proof must not verify for a different verifier id"
+    );
+}
+
+#[cfg(feature = "bbs")]
+#[tokio::test]
+async fn verify_vp_token_rejects_a_bbs_presentation_with_a_wrong_nonce() {
+    let (derived, _issuer) = bbs_derived_presentation(
+        "the-real-nonce",
+        "did:key:zApplicant",
+        &["/credentialSubject/memberLevel"],
+    );
+    let vp_token = json!({ "membership": derived });
+    // The verifier expects a different challenge than the proof was bound to.
+    assert!(
+        verify_vp_token(
+            &vp_token,
+            "did:web:vtc.example",
+            "a-different-nonce",
+            None,
+            Utc::now()
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[cfg(feature = "bbs")]
+#[tokio::test]
+async fn verify_vp_token_rejects_a_tampered_bbs_disclosed_claim() {
+    let nonce = "vtc-challenge-xyz";
+    let (mut derived, _issuer) = bbs_derived_presentation(
+        nonce,
+        "did:key:zApplicant",
+        &["/credentialSubject/memberLevel"],
+    );
+    derived["credentialSubject"]["memberLevel"] = json!("platinum");
+    let vp_token = json!({ "membership": derived });
+    assert!(
+        verify_vp_token(&vp_token, "did:web:vtc.example", nonce, None, Utc::now())
+            .await
+            .is_err()
+    );
+}
+
+/// Keyring VTI-21/32: an invitation is redeemed by a key of the invited DID,
+/// whatever method that DID uses. A `did:web` holder's `kid` resolves through
+/// the DID resolver — here preloaded with its document — where the old
+/// verifier refused anything but a `did:key`.
+#[tokio::test]
+async fn a_did_web_holder_redeems_through_the_resolver() {
+    use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+
+    let key = SigningKey::from_bytes(&[23; 32]);
+    let did = "did:web:holder.example";
+    let multikey = affinidi_crypto::did_key::ed25519_pub_to_did_key(key.verifying_key().as_bytes())
+        .trim_start_matches("did:key:")
+        .to_string();
+    let doc = json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "verificationMethod": [{
+            "id": format!("{did}#key-0"), "type": "Multikey", "controller": did,
+            "publicKeyMultibase": multikey,
+        }],
+        "authentication": [format!("{did}#key-0")],
+    });
+    let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        .await
+        .expect("local DID cache");
+    client
+        .add_did_document(did, serde_json::from_value(doc).expect("fixture document"))
+        .await;
+    let resolver = crate::credentials::vm_resolver::DidVmResolver::new(Some(client));
+
+    let now = Utc::now();
+    let header = json!({ "typ": OID4VCI_PROOF_TYP, "alg": "EdDSA", "kid": format!("{did}#key-0") });
+    let payload = json!({ "iss": did, "aud": ISSUER, "iat": now.timestamp(), "nonce": "n-web" });
+    let h = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let p = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let sig: Signature = key.sign(format!("{h}.{p}").as_bytes());
+    let jwt = format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+
+    let resp = issue_on_request(
+        &request_with(jwt.clone()),
+        a_credential(),
+        did,
+        ISSUER,
+        now,
+        &resolver,
+    )
+    .await
+    .expect("a did:web holder proving its own key redeems");
+    assert!(resp.credential.is_some());
+
+    // The did:key-only verifier still refuses it, rather than guessing.
+    assert!(verify_oid4vci_proof(&jwt, ISSUER, now).is_err());
+    // And the same proof does not redeem a credential bound to someone else.
+    let err = issue_on_request(
+        &request_with(jwt),
+        a_credential(),
+        "did:web:other.example",
+        ISSUER,
+        now,
+        &resolver,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, AppError::Forbidden(_)), "{err}");
+}
+
+// ── ES256 issuers and P-256 holders (#1988) ──
+
+/// An ES256 (P-256) SD-JWT signer — the swiyu / EUDI shape — whose header may
+/// claim another `alg` to exercise the algorithm binding.
+struct Es256Signer {
+    private: Vec<u8>,
+    kid: Option<String>,
+    alg: &'static str,
+}
+impl affinidi_sd_jwt::signer::JwtSigner for Es256Signer {
+    fn algorithm(&self) -> &str {
+        self.alg
+    }
+    fn key_id(&self) -> Option<&str> {
+        self.kid.as_deref()
+    }
+    fn sign_jwt(&self, header: &Value, payload: &Value) -> Result<String, SdJwtError> {
+        let enc = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+        let input = format!("{}.{}", enc(header), enc(payload));
+        let sig = affinidi_crypto::p256::sign(&self.private, input.as_bytes())
+            .map_err(|e| SdJwtError::Verification(e.to_string()))?;
+        Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)))
+    }
+}
+
+/// A P-256 key pair's private scalar, its public JWK, and its `did:key`.
+fn p256(seed: u8) -> (Vec<u8>, Value, String) {
+    let kp = affinidi_crypto::p256::generate(Some(&[seed; 32])).unwrap();
+    let mut jwk = serde_json::to_value(&kp.jwk).unwrap();
+    jwk.as_object_mut().unwrap().remove("d");
+    let did = vta_sdk::jws::JwsKey::from_jwk(&jwk).unwrap().did_key();
+    (kp.private_bytes.clone(), jwk, did)
+}
+
+/// An SD-JWT-VC from `iss` (signed by a P-256 key, header `kid` = `issuer_kid`),
+/// bound to a P-256 holder, with a kb-jwt whose header claims `holder_alg`.
+/// Returns `(holder_did, vp_token)`.
+fn make_p256_presentation(
+    iss: &str,
+    issuer_kid: Option<String>,
+    aud: &str,
+    nonce: &str,
+    holder_alg: &'static str,
+) -> (String, Value) {
+    use affinidi_sd_jwt::holder::{KbJwtInput, present, select_disclosures};
+
+    let now = Utc::now();
+    let iat = now.timestamp() as u64;
+    let (issuer_priv, _, _) = p256(0x81);
+    let (holder_priv, holder_jwk, holder_did) = p256(0x82);
+    let issuer = Es256Signer {
+        private: issuer_priv,
+        kid: issuer_kid,
+        alg: "ES256",
+    };
+    let holder = Es256Signer {
+        private: holder_priv,
+        kid: Some(holder_did.clone()),
+        alg: holder_alg,
+    };
+    let claims = json!({
+        "iss": iss, "sub": holder_did, "vct": MEMBERSHIP_VCT,
+        "iat": iat, "exp": (now + Duration::hours(1)).timestamp(), "givenName": "Alice"
+    });
+    let hasher = Sha256Hasher;
+    let sd = affinidi_sd_jwt::issuer::issue(
+        &claims,
+        &json!({ "_sd": ["givenName"] }),
+        &issuer,
+        &hasher,
+        Some(&holder_jwk),
+    )
+    .unwrap();
+    let selected = select_disclosures(&sd, &["givenName"]);
+    let kb = KbJwtInput {
+        audience: aud,
+        nonce,
+        signer: &holder,
+        iat,
+    };
+    let presentation = present(&sd, &selected, Some(&kb), &hasher).unwrap();
+    (holder_did, json!(presentation.serialize()))
+}
+
+/// The P-256 `did:key` issuer of [`make_p256_presentation`].
+fn p256_issuer_did() -> String {
+    p256(0x81).2
+}
+
+/// #1988: an ES256 issuer and a P-256 `cnf.jwk` holder verify end to end, and
+/// the proven holder is the P-256 key's `did:key`.
+#[tokio::test]
+async fn verifies_an_es256_presentation_with_a_p256_holder() {
+    let (aud, nonce) = ("did:web:vtc.example", "n-es256");
+    let iss = p256_issuer_did();
+    let (holder_did, vp) =
+        make_p256_presentation(&iss, Some(format!("{iss}#key-0")), aud, nonce, "ES256");
+    let verified = verify_presentation(&vp, aud, nonce, None, Utc::now())
+        .await
+        .expect("ES256 issuer + P-256 holder");
+    assert_eq!(verified.issuer_did, iss);
+    assert_eq!(verified.holder_did, holder_did);
+    assert!(
+        verified.holder_did.starts_with("did:key:zDn"),
+        "{}",
+        verified.holder_did
+    );
+    assert!(verified.holder_bound);
+    assert_eq!(verified.claims["givenName"], "Alice");
+
+    // The wrong audience still fails the binding.
+    assert!(
+        verify_presentation(&vp, "did:web:other.example", nonce, None, Utc::now())
+            .await
+            .is_err()
+    );
+}
+
+/// The holder's algorithm comes from its `cnf.jwk`: a kb-jwt claiming EdDSA
+/// for a P-256 binding key is refused, whatever its signature.
+#[tokio::test]
+async fn a_kb_jwt_alg_that_disagrees_with_the_cnf_key_is_refused() {
+    let (aud, nonce) = ("did:web:vtc.example", "n-alg");
+    let iss = p256_issuer_did();
+    let (_, vp) = make_p256_presentation(&iss, None, aud, nonce, "EdDSA");
+    let err = verify_presentation(&vp, aud, nonce, None, Utc::now())
+        .await
+        .expect_err("alg must match the cnf key");
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("does not match")),
+        "{err:?}"
+    );
+}
+
+/// A `did:web` issuer that names no `kid` is refused at parse, before any
+/// resolution — the #1988 vector has this shape.
+#[test]
+fn a_did_web_issuer_without_a_kid_is_refused_at_parse() {
+    let (_, vp) = make_p256_presentation("did:web:validant.ai", None, "a", "n", "ES256");
+    let err = parse_sd_jwt_presentation(vp.as_str().unwrap()).unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("DID-URL kid")),
+        "{err:?}"
+    );
+}
+
+/// An OID4VCI key-binding proof JWT signed ES256 by the P-256 key `seed`
+/// derives, whose header claims `alg`.
+fn p256_proof_jwt(seed: u8, aud: &str, iat: i64, alg: &str) -> (String, String) {
+    let (private, _, did) = p256(seed);
+    let header = json!({
+        "typ": OID4VCI_PROOF_TYP,
+        "alg": alg,
+        "kid": format!("{did}#{}", did.trim_start_matches("did:key:")),
+    });
+    let payload = json!({ "iss": did, "aud": aud, "iat": iat });
+    let enc = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+    let input = format!("{}.{}", enc(&header), enc(&payload));
+    let sig = affinidi_crypto::p256::sign(&private, input.as_bytes()).unwrap();
+    (format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)), did)
+}
+
+/// #1988: a P-256 holder proves possession with an ES256 key-binding proof,
+/// and the VTC issues to it — through the `did:key` verifier and the resolving
+/// one alike.
+#[tokio::test]
+async fn issues_to_a_p256_holder() {
+    let now = Utc::now();
+    let (jwt, did) = p256_proof_jwt(0x91, ISSUER, now.timestamp(), "ES256");
+    assert!(did.starts_with("did:key:zDn"), "{did}");
+    let proven = verify_oid4vci_proof(&jwt, ISSUER, now).expect("ES256 proof");
+    assert_eq!(proven.holder_did, did);
+
+    let resp = issue_on_request(
+        &request_with(jwt),
+        a_credential(),
+        &did,
+        ISSUER,
+        now,
+        &NO_RESOLVER,
+    )
+    .await
+    .expect("issue to the P-256 holder");
+    assert_eq!(resp.credential, Some(a_credential()));
+}
+
+/// The key decides the algorithm: a P-256 holder's proof whose header claims
+/// `EdDSA` is refused before any signature work.
+#[test]
+fn refuses_a_proof_whose_alg_is_not_its_keys() {
+    let now = Utc::now();
+    let (jwt, _) = p256_proof_jwt(0x92, ISSUER, now.timestamp(), "EdDSA");
+    let err = verify_oid4vci_proof(&jwt, ISSUER, now).unwrap_err();
+    assert!(
+        matches!(&err, AppError::Validation(m) if m.contains("alg")),
+        "{err:?}"
+    );
+}

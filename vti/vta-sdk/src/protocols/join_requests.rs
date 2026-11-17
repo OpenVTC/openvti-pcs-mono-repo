@@ -1,0 +1,746 @@
+//! Trust Task wire types for the VTC join-request ceremony family.
+//!
+//! Each body below is a [`trust_tasks_rs::TrustTask`] **payload**; the
+//! document `type` is one of the `JOIN_REQUEST_*_TYPE` URIs. The success
+//! reply is a framework `#response` document carrying a [`VerdictResponse`]
+//! (the `request`/`submit` verb) or a read body (manifest/status);
+//! failures are framework `trust-task-error` documents, never DIDComm
+//! problem-reports.
+//!
+//! ## URI shape (canonical registry)
+//!
+//! ```text
+//! https://trusttasks.org/spec/vtc/join-requests/{verb}/{maj}.{min}
+//! ```
+//!
+//! These moved off the private `trusttasks.org/openvtc/vtc` authority
+//! (SPEC §6.5) and onto the canonical registry, where the ceremony's
+//! tasks are published as `spec/vtc/join-requests/*`. The path keeps the
+//! `/spec/<slug>/<maj.min>` shape the framework requires, so the URIs
+//! still parse as [`trust_tasks_rs::TypeUri`].
+//!
+//! The two `*_RECEIPT_TYPE` consts stay on the old authority on purpose:
+//! a receipt is a fire-and-forget ack rather than a Trust Task response,
+//! and the registry publishes no receipt task — emitting a canonical URI
+//! for one would name a spec that does not exist. The success-response
+//! variant is the same URI with a `#response` fragment (the
+//! `*_RESPONSE_TYPE` consts), minted by `TrustTask::respond_with`.
+//!
+//! ## Transports
+//!
+//! - **REST**: the request body is the TrustTask document; routing is by
+//!   the document `type`. The holder identity is the document `issuer` +
+//!   `proof`; replay binding is `recipient` (= the VTC DID) + `expiresAt`.
+//! - **DIDComm**: the message `type` IS the Trust Task URL and the message
+//!   body is the TrustTask document; the authcrypt sender authenticates
+//!   the holder (no separate signature needed).
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use uuid::Uuid;
+
+/// The generated `vtc/join-requests/submit` module.
+pub use vti_specs::vtc::join_requests::submit;
+
+/// Trust Task `type` for a join-request submission (the ceremony `request`
+/// verb): `vtc/join-requests/submit/0.3`, which decides a submission under one
+/// of the community's published criteria. Payload [`JoinRequestSubmitBody`];
+/// response [`VerdictResponse`].
+pub const JOIN_REQUEST_SUBMIT_TYPE: &str =
+    <submit::v0_3::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// `#response` variant of [`JOIN_REQUEST_SUBMIT_TYPE`] — the type of the
+/// success document `respond_with` mints; carries a [`VerdictResponse`].
+pub const JOIN_REQUEST_SUBMIT_RESPONSE_TYPE: &str =
+    <submit::v0_3::Response as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Reply `type` used by the **credential-exchange** join close-the-loop
+/// (`credential-exchange/present`), which results in a join and echoes this
+/// receipt. Distinct from the Trust Task `submit` conversion above; retained
+/// for that not-yet-converted path. Carries a [`JoinRequestSubmitReceiptBody`].
+/// Async acknowledgement sent by the VTC after a submit. Deliberately
+/// still on the `openvtc/vtc/` authority: the canonical registry has no
+/// receipt task — the ceremony's canonical surface is
+/// submit/status/manifest plus their `#response` forms, and a
+/// receipt is a separate fire-and-forget ack, not a Trust Task response.
+/// Inventing `spec/vtc/join-requests/submit-receipt` here would mean
+/// emitting a URI that resolves to nothing in the registry.
+pub const JOIN_REQUEST_SUBMIT_RECEIPT_TYPE: &str =
+    "https://trusttasks.org/spec/vtc/join-requests/submit-receipt/0.1";
+
+/// Body of the credential-exchange join receipt (see
+/// [`JOIN_REQUEST_SUBMIT_RECEIPT_TYPE`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestSubmitReceiptBody {
+    pub request_id: Uuid,
+    /// Status string — e.g. `"pending"` / `"approved"`.
+    pub status: String,
+}
+
+/// Payload of the submit document. The applicant DID is the TrustTask
+/// `issuer` (REST: document proof; DIDComm: authcrypt sender), not a body
+/// field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestSubmitBody {
+    pub vp: JsonValue,
+    /// The `requirementsDigest` of the criterion this submission is made
+    /// under, as `vtc/join-requests/manifest/0.4` published it. Absent: the
+    /// community decides it under the first criterion, in the order it
+    /// publishes them, that the submission meets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion: Option<String>,
+    #[serde(default)]
+    pub registry_consent: bool,
+    /// Omitted rather than sent as `null` when unset. The payload schema
+    /// types this `object`, so a `null` is a type error and not an empty
+    /// value; `extensions` is not required, so absent is how a client says
+    /// it has none. A bare `#[serde(default)]` `JsonValue` serialises
+    /// `Value::Null`, which is what a minimal client sent until #1099 — the
+    /// same null-into-`Option` class that shipped `keys/create/0.1` broken.
+    #[serde(default, skip_serializing_if = "JsonValue::is_null")]
+    pub extensions: JsonValue,
+    /// Answers to the manifest's `requestedAttributes`: what the applicant
+    /// tells the community about themselves. Self-asserted, bound to the
+    /// applicant by the document proof. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<JoinRequestAttribute>,
+}
+
+/// One answer to a requested attribute on
+/// `vtc/join-requests/submit/0.3` — a claim type and the value the applicant
+/// gives for it.
+///
+/// No `deny_unknown_fields`, and no `ext` either, because the published item
+/// is closed and defines neither: an `ext` here would let a client send a
+/// member the schema refuses. The dispatcher validates the whole payload
+/// against that schema before this type is read, and that is what refuses an
+/// extra member.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestAttribute {
+    #[serde(rename = "type")]
+    pub claim_type: String,
+    pub value: JsonValue,
+}
+
+// ---------------------------------------------------------------------------
+// (Accept is gone. `join-requests/accept/0.1` was retired upstream, superseded
+// by `vtc/members/vmc/0.1` with an optional `requestId` — the member closes
+// their approved join by delivering their reciprocal VMC through the one
+// credential-delivery path. See `protocols::members::MemberVmcBody`.)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Manifest — pre-submit discovery (join-requests/manifest/1.0)
+// ---------------------------------------------------------------------------
+
+/// The published `vtc/join-requests/manifest` types, generated from the
+/// specification. [`manifest::v0_4`] is the version a VTC serves first: each
+/// criterion states its `admission` and the requirements it has, in the order
+/// the community decides by, with a `requirementsDigest`, and the response
+/// carries the community's directory disclosure statement. Its `Payload` and
+/// `Response` are the manifest's wire types; nothing in this crate restates
+/// them.
+///
+/// `manifest::v0_4::CommunityBranding` is also the body of the VTC's admin
+/// `GET`/`PUT /v1/community/branding`: what an admin stores is exactly what the
+/// manifest publishes.
+pub use vti_specs::vtc::join_requests::manifest;
+
+/// The generated `vtc/join-requests/withdraw` module.
+///
+/// Re-exported rather than mirrored by hand: the payload has a generated module
+/// (`trust-tasks-rs` 0.21.5, from spec PR #518), and the workspace rule is that
+/// a task with one never gets a local copy — `vta-sdk`'s
+/// `generated_wire_types_census` enforces it. `SelfRemoveBody` and its
+/// neighbours below are hand-written because they predate their generated
+/// modules; that list only shrinks.
+pub use vti_specs::vtc::join_requests::withdraw;
+
+/// Trust Task `type` for withdrawing a join request: the applicant closes
+/// their own open request.
+///
+/// Taken from the generated type rather than written as a literal, so the
+/// constant cannot drift from the spec that defines it.
+pub const JOIN_REQUEST_WITHDRAW_TYPE: &str =
+    <withdraw::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Trust Task `type` for the withdraw response.
+pub const JOIN_REQUEST_WITHDRAW_RESPONSE_TYPE: &str =
+    <withdraw::v0_1::Response as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// The generated `vtc/join-requests/supplement` module.
+///
+/// Re-exported rather than mirrored by hand, for the same reason
+/// [`withdraw`] is: the task has a generated module (`trust-tasks-rs` 0.21.6,
+/// from spec PR #526).
+pub use vti_specs::vtc::join_requests::supplement;
+
+/// Trust Task `type` for supplementing a join request: the applicant answers a
+/// community's request for more evidence against the request they already have
+/// open, rather than opening a second one.
+pub const JOIN_REQUEST_SUPPLEMENT_TYPE: &str =
+    <supplement::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Trust Task `type` for the supplement response. The payload is the same
+/// `{requestId, verdict}` [`VerdictResponse`] a submission returns — a
+/// supplement has exactly the outcomes a submission has.
+pub const JOIN_REQUEST_SUPPLEMENT_RESPONSE_TYPE: &str =
+    <supplement::v0_1::Response as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// The generated `vtc/join-requests/wallet-session` modules: an applicant
+/// opens an OpenID4VP presentation session so a swiyu or EUDI wallet — which
+/// signs no Trust Task — can present evidence for their join, and reads the
+/// session's outcome (#1988).
+pub use vti_specs::vtc::join_requests::wallet_session;
+
+/// Trust Task `type` for opening a wallet presentation session.
+pub const JOIN_REQUEST_WALLET_SESSION_START_TYPE: &str =
+    <wallet_session::start::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Trust Task `type` for reading a wallet presentation session.
+pub const JOIN_REQUEST_WALLET_SESSION_STATUS_TYPE: &str =
+    <wallet_session::status::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Extended error code: no criterion the community publishes, or still
+/// honours, has the supplied `requirementsDigest`.
+pub const WALLET_SESSION_START_ERR_CRITERION_NOT_FOUND: &str =
+    wallet_session::start::v0_1::error_codes::CRITERION_NOT_FOUND.code;
+
+/// Extended error code: the criterion asks for no credential a wallet can
+/// present over OpenID4VP.
+pub const WALLET_SESSION_START_ERR_NO_WALLET_PRESENTATION: &str =
+    wallet_session::start::v0_1::error_codes::NO_WALLET_PRESENTATION.code;
+
+/// Extended error code: the community holds no verifier identity for the
+/// requested client identifier prefix (or for any, when none was requested).
+pub const WALLET_SESSION_START_ERR_VERIFIER_NOT_CONFIGURED: &str =
+    wallet_session::start::v0_1::error_codes::VERIFIER_NOT_CONFIGURED.code;
+
+/// Extended error code: no join request by that id, or not the signer's —
+/// the same code for both.
+pub const WALLET_SESSION_START_ERR_REQUEST_NOT_FOUND: &str =
+    wallet_session::start::v0_1::error_codes::REQUEST_NOT_FOUND.code;
+
+/// Extended error code: the signer's join request is decided or withdrawn.
+pub const WALLET_SESSION_START_ERR_REQUEST_CLOSED: &str =
+    wallet_session::start::v0_1::error_codes::REQUEST_CLOSED.code;
+
+/// Extended error code: the applicant holds as many open sessions as the
+/// community allows.
+pub const WALLET_SESSION_START_ERR_TOO_MANY_SESSIONS: &str =
+    wallet_session::start::v0_1::error_codes::TOO_MANY_SESSIONS.code;
+
+/// Extended error code: no session by that id, or not opened by the signer —
+/// the same code for both.
+pub const WALLET_SESSION_STATUS_ERR_NOT_FOUND: &str =
+    wallet_session::status::v0_1::error_codes::NOT_FOUND.code;
+
+/// Extended error code: the caller has no open request to supplement.
+///
+/// Also the answer when a supplied `requestId` names somebody else's request —
+/// conflated deliberately, so the task cannot be used to probe which request
+/// ids exist on this community.
+pub const JOIN_REQUEST_SUPPLEMENT_ERR_NOT_FOUND: &str =
+    supplement::v0_1::error_codes::NOT_FOUND.code;
+
+/// Extended error code: the request is open, but the community has asked this
+/// applicant for nothing — it is queued for a decision the community owes.
+///
+/// Distinct from [`JOIN_REQUEST_SUPPLEMENT_ERR_NOT_FOUND`] because the request
+/// does exist and is theirs; the applicant simply has no question to answer
+/// yet. Accepting evidence into it would replace what a maintainer is
+/// mid-review on.
+pub const JOIN_REQUEST_SUPPLEMENT_ERR_NOT_AWAITING_EVIDENCE: &str =
+    supplement::v0_1::error_codes::NOT_AWAITING_EVIDENCE.code;
+
+/// Extended error code: the request has been approved, rejected or withdrawn,
+/// so there is no open decision left to supplement.
+pub const JOIN_REQUEST_SUPPLEMENT_ERR_ALREADY_DECIDED: &str =
+    supplement::v0_1::error_codes::ALREADY_DECIDED.code;
+
+/// Extended error code: the applicant already has an open request, so this
+/// submit is a duplicate rather than a new application.
+///
+/// Consumer-minted, not declared by `vtc/join-requests/submit` — SPEC.md §8.5
+/// permits a consumer to mint a namespaced code for an invariant the spec did
+/// not enumerate, and the namespace is the slug of the request being
+/// processed. A client that does not recognise it treats the error as
+/// `taskFailed` by the same rule, so adding it breaks no existing caller.
+///
+/// The error carries a `details` annex of `{requestId, status}`: `status` is
+/// what tells the applicant whether the open request is waiting on the
+/// community (`pending`) or on them (`deferred`), and `requestId` is what they
+/// pass to [`JOIN_REQUEST_WITHDRAW_TYPE`] to clear it.
+///
+/// A literal, like the hidden-vetting challenge codes below: because the
+/// specification does not declare it, there is no generated `error_codes`
+/// constant to read. The VTC's error-code census lists every such code as
+/// consumer-minted and fails the day the specification declares one, asking
+/// for the generated constant instead.
+pub const JOIN_REQUEST_SUBMIT_ERR_REQUEST_ALREADY_OPEN: &str =
+    "vtc/join-requests/submit:requestAlreadyOpen";
+
+/// Extended error code: the applicant is already a current member of the
+/// community, so there is nothing to apply for — the client should sign in.
+///
+/// Consumer-minted under the same SPEC.md §8.5 rule as
+/// [`JOIN_REQUEST_SUBMIT_ERR_REQUEST_ALREADY_OPEN`]; a client that does not
+/// recognise it reads `taskFailed`. "Current" means present in the community's
+/// ACL: a departed member may apply again.
+pub const JOIN_REQUEST_SUBMIT_ERR_ALREADY_MEMBER: &str = "vtc/join-requests/submit:alreadyMember";
+
+// ─── Hidden-vetting challenge refusals ──────────────────────────────────────
+//
+// A hidden-vetting proof is bound to a single-use challenge the community
+// issued over `vtc/vetting/pcs-challenge/0.1`, and the community spends that
+// challenge when the proof arrives. These codes say which of the four ways the
+// spend failed, so a client can tell the applicant what happened rather than
+// "the submission was malformed". The remedy is the same for all four — ask
+// for a fresh challenge, build the proof over it, and send it again — but the
+// explanation is not, and only one of them (`challengeMismatch`) points at a
+// client bug rather than at timing.
+//
+// Declared by `vtc/join-requests/submit/0.3` and `vtc/join-requests/supplement/0.1`
+// since trust-tasks-tf #790, so each constant is the generated code, not a literal.
+// `details.reason` still carries the generic marker
+// ([`super::trust_task_reject_reasons`]) for a client that does not know the code.
+// The submission's challenge is spent whichever code is sent.
+
+/// `vtc/join-requests/submit:challengeNotIssued` — the community holds no
+/// challenge for this applicant: none was asked for, or the one asked for
+/// expired and has since been cleared. `details.reason` is `not_found`.
+pub const JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_NOT_ISSUED: &str =
+    vti_specs::vtc::join_requests::submit::v0_3::error_codes::CHALLENGE_NOT_ISSUED.code;
+
+/// `vtc/join-requests/submit:challengeAlreadyUsed` — the challenge was spent
+/// by an earlier submission; each is accepted once. `details.reason` is
+/// `gone`.
+pub const JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_ALREADY_USED: &str =
+    vti_specs::vtc::join_requests::submit::v0_3::error_codes::CHALLENGE_ALREADY_USED.code;
+
+/// `vtc/join-requests/submit:challengeExpired` — the challenge's window
+/// (`expiresAt` on the `pcs-challenge` response) had passed. `details` carries
+/// `expiredAt` (RFC 3339); `details.reason` is `gone`.
+pub const JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_EXPIRED: &str =
+    vti_specs::vtc::join_requests::submit::v0_3::error_codes::CHALLENGE_EXPIRED.code;
+
+/// `vtc/join-requests/submit:challengeMismatch` — the proof is bound to a
+/// challenge other than the one the community holds for this applicant:
+/// usually an older one, replaced when a newer challenge was asked for.
+/// `details.reason` is `conflict`.
+pub const JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_MISMATCH: &str =
+    vti_specs::vtc::join_requests::submit::v0_3::error_codes::CHALLENGE_MISMATCH.code;
+
+/// [`JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_NOT_ISSUED`], answering a supplement.
+pub const JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_NOT_ISSUED: &str =
+    vti_specs::vtc::join_requests::supplement::v0_1::error_codes::CHALLENGE_NOT_ISSUED.code;
+
+/// [`JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_ALREADY_USED`], answering a supplement.
+pub const JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_ALREADY_USED: &str =
+    vti_specs::vtc::join_requests::supplement::v0_1::error_codes::CHALLENGE_ALREADY_USED.code;
+
+/// [`JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_EXPIRED`], answering a supplement.
+pub const JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_EXPIRED: &str =
+    vti_specs::vtc::join_requests::supplement::v0_1::error_codes::CHALLENGE_EXPIRED.code;
+
+/// [`JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_MISMATCH`], answering a supplement.
+pub const JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_MISMATCH: &str =
+    vti_specs::vtc::join_requests::supplement::v0_1::error_codes::CHALLENGE_MISMATCH.code;
+
+/// `vtc/join-requests/submit:attributesMissing` — a required requested
+/// attribute was not answered. `details.types` names them.
+pub const JOIN_REQUEST_SUBMIT_ERR_ATTRIBUTES_MISSING: &str =
+    submit::v0_3::error_codes::ATTRIBUTES_MISSING.code;
+
+/// `vtc/join-requests/submit:attributesUnrequested` — an answer named a type
+/// the manifest does not request; refused, not stored. `details.types` names
+/// them.
+pub const JOIN_REQUEST_SUBMIT_ERR_ATTRIBUTES_UNREQUESTED: &str =
+    submit::v0_3::error_codes::ATTRIBUTES_UNREQUESTED.code;
+
+/// `vtc/join-requests/submit:presentationInvalid` — the presentation is not
+/// the applicant's own.
+pub const JOIN_REQUEST_SUBMIT_ERR_PRESENTATION_INVALID: &str =
+    submit::v0_3::error_codes::PRESENTATION_INVALID.code;
+
+/// `vtc/join-requests/submit:notAccepting` — the community publishes no
+/// criteria, so it accepts no applications at present.
+pub const JOIN_REQUEST_SUBMIT_ERR_NOT_ACCEPTING: &str =
+    submit::v0_3::error_codes::NOT_ACCEPTING.code;
+
+/// `vtc/join-requests/submit:criterionUnknown` — the submission's `criterion`
+/// names no criterion the community publishes, nor an earlier version still
+/// within its `requirementsGrace`. Read the manifest again and resubmit.
+pub const JOIN_REQUEST_SUBMIT_ERR_CRITERION_UNKNOWN: &str =
+    submit::v0_3::error_codes::CRITERION_UNKNOWN.code;
+
+/// Extended error code: the caller has no open request to withdraw.
+///
+/// Also the answer when a supplied `requestId` names a request belonging to
+/// somebody else. The spec conflates the two deliberately — distinguishing
+/// them would let a caller probe whether a given id exists on this community —
+/// and the code's own registry entry records that reasoning.
+pub const JOIN_REQUEST_WITHDRAW_ERR_NOT_FOUND: &str = withdraw::v0_1::error_codes::NOT_FOUND.code;
+
+/// Extended error code: the request has already been approved, rejected or
+/// withdrawn, so there is nothing left to close.
+///
+/// Distinct from [`JOIN_REQUEST_WITHDRAW_ERR_NOT_FOUND`] because an applicant
+/// *is* entitled to the outcome of their own request, and because no retry
+/// will change it.
+pub const JOIN_REQUEST_WITHDRAW_ERR_ALREADY_DECIDED: &str =
+    withdraw::v0_1::error_codes::ALREADY_DECIDED.code;
+
+/// Trust Task `type` for a join-request manifest request
+/// (`vtc/join-requests/manifest/0.4`): discover the community's join criteria
+/// and what its member directory would disclose about a member
+/// (`directoryDisclosure`). Public read; empty payload.
+pub const JOIN_REQUEST_MANIFEST_TYPE: &str =
+    <manifest::v0_4::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// `#response` variant of [`JOIN_REQUEST_MANIFEST_TYPE`] — carries a
+/// [`manifest::v0_4::Response`].
+pub const JOIN_REQUEST_MANIFEST_RESPONSE_TYPE: &str =
+    <manifest::v0_4::Response as trust_tasks_rs::Payload>::TYPE_URI;
+
+// ---------------------------------------------------------------------------
+// Status — applicant poll (join-requests/status/1.0)
+// ---------------------------------------------------------------------------
+
+/// Trust Task `type` for an applicant status poll. The applicant DID is
+/// the TrustTask `issuer` (DIDComm authcrypt sender / REST document proof).
+pub const JOIN_REQUEST_STATUS_TYPE: &str =
+    "https://trusttasks.org/spec/vtc/join-requests/status/0.1";
+
+/// `#response` variant of [`JOIN_REQUEST_STATUS_TYPE`] — carries a
+/// [`JoinRequestStatusResponseBody`].
+pub const JOIN_REQUEST_STATUS_RESPONSE_TYPE: &str =
+    "https://trusttasks.org/spec/vtc/join-requests/status/0.1#response";
+
+/// Body of the status message (DIDComm). Over REST the `{id}` is the
+/// path segment; over DIDComm it travels here.
+///
+/// `request_id` is **optional**: omit it to ask "what is my open request?"
+/// and the community resolves it from the authenticated applicant.
+///
+/// That is not a convenience. The id an applicant polls with is the
+/// community's, minted on submit and learned from the first correlated
+/// reply — so an applicant whose reply was lost holds only its own
+/// placeholder and cannot name the request at all. Requiring the id made
+/// this poll unusable in exactly the case it exists for: a join whose
+/// answer went missing. The response always carries `request_id`, so one
+/// id-less poll also repairs the applicant's record for every poll after.
+///
+/// At most one request per applicant is open at a time (the submit
+/// dedup), so "my open request" is unambiguous.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestStatusBody {
+    /// The community's request id, when the applicant knows it. `None`
+    /// asks the community to resolve the applicant's open request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<Uuid>,
+    /// Ask the community to deliver again the credentials it already issued
+    /// for an `approved` request whose membership credential has not arrived.
+    ///
+    /// Set it only after a response of `approved` with
+    /// `credentials_delivered: Some(false)` and a reasonable wait: the
+    /// community rate-limits it, and answers in
+    /// [`JoinRequestStatusResponseBody::credential_resend`]. It never issues
+    /// new credentials in response.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resend_credentials: bool,
+}
+
+/// The community's answer to
+/// [`JoinRequestStatusBody::resend_credentials`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum CredentialResend {
+    /// A re-delivery of the credentials already issued is queued.
+    Queued,
+    /// The community already holds the applicant's acknowledgement.
+    NotNeeded,
+    /// A re-delivery was honoured too recently; see `retry_after`.
+    RateLimited,
+}
+
+/// Status response: the request's lifecycle, plus (when `deferred`) what
+/// the applicant must present next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct JoinRequestStatusResponseBody {
+    pub request_id: Uuid,
+    /// `pending` | `deferred` | `approved` | `rejected` | `withdrawn`.
+    pub status: String,
+    /// Outstanding requirements — present only for a `deferred` request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// The DCQL the applicant should answer over `present` — present only
+    /// for a `deferred` request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_definition: Option<JsonValue>,
+    /// Stable refusal code — present only for a `rejected` request.
+    ///
+    /// A policy auto-deny carries the `code` the `join.rego` `deny` verdict
+    /// returned; an admin reject carries [`ADMIN_REJECT_CODE`], since there is
+    /// no policy verdict to source one from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Human-readable elaboration of the refusal — present only for a
+    /// `rejected` request, and only when the decider supplied one (the policy's
+    /// optional `reason`, or the operator's words on an admin reject).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// When the decision was taken.
+    ///
+    /// Deliberately **not** the response document's `issuedAt`, which is when
+    /// *this* document was produced. For an admin reject the two diverge
+    /// arbitrarily — the applicant may poll days after the decision — so the
+    /// decision's own timestamp has to travel with it.
+    ///
+    /// `None` on a request decided before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// Whether the community holds the applicant's acknowledgement that the
+    /// membership credential arrived. Present only for an `approved` request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_delivered: Option<bool>,
+    /// The answer to `resend_credentials`. Present only when it was set and
+    /// the request is `approved`; absent then means the community does not
+    /// support re-delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_resend: Option<CredentialResend>,
+    /// The earliest time the community will honour another
+    /// `resend_credentials`. Present only with
+    /// [`CredentialResend::RateLimited`], and absent there when no further
+    /// re-delivery will be honoured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<DateTime<Utc>>,
+}
+
+/// The refusal code on the **admin** reject path.
+///
+/// A policy auto-deny sources its code from the `deny` verdict `join.rego`
+/// returned. An admin reject has no verdict behind it — the decision is the
+/// operator's — so the code is this constant and the operator's words ride in
+/// `reason`. Clients switch on it to tell "the community's rules refused you"
+/// (retry once you satisfy them) from "a human refused you" (retrying changes
+/// nothing).
+pub const ADMIN_REJECT_CODE: &str = "admin-reject";
+
+// ---------------------------------------------------------------------------
+// Verdict — the shared `request`/`present` response envelope
+// (docs/05-design-notes/vtc-ceremony-protocol.md §3)
+// ---------------------------------------------------------------------------
+
+/// The policy effect of a ceremony decision. A `deny` means the policy
+/// **refused** a well-formed, verified request — it is NOT how framework
+/// errors (invalid VIC, expired, malformed) are signalled; those are
+/// `trust-task-error` documents (see the module docs).
+/// Serialises **lowerCamelCase** — `requestMore`, not `request_more` — because
+/// a verdict effect is a specification-defined decision value, which
+/// SPEC §4.10 rule 4 says is lowerCamelCase, and
+/// `vtc/_shared/0.1/ceremony#VerdictEffect` enumerates it that way.
+///
+/// The snake_case form is kept as a deserialisation alias on purpose. Rego is
+/// where verdicts are *authored* — operator-written policy returns
+/// `{"effect": "request_more", …}` — and snake_case is that language's idiom,
+/// not a mistake to correct. The two vocabularies are allowed to differ; this
+/// type is the boundary where the policy's spelling becomes the wire's, the
+/// same split `EndorsementRow` and `GenerationRow` draw between storage and
+/// wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum VerdictEffect {
+    /// Admitted. `with` carries the granted role + obligations and the
+    /// host-added `bundleRef` (sealed credential pointer) where issuance
+    /// occurred.
+    Allow,
+    /// Policy refused. `with` carries `code` + `reason`.
+    Deny,
+    /// Parked for a human/quorum decision. `with` carries `queue` + `reason`.
+    Refer,
+    /// More evidence required. `with` carries `needs` +
+    /// `presentationDefinition`; the applicant continues over `present`.
+    #[serde(alias = "request_more")]
+    RequestMore,
+}
+
+/// The effect-dependent detail of a [`Verdict`]. Modelled as one flat
+/// struct with optional fields (rather than an enum) so the wire object is
+/// stable and additive across ceremonies; only the fields relevant to the
+/// `effect` are populated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct VerdictWith {
+    // effect = allow
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligations: Option<JsonValue>,
+    /// The issued Verifiable Membership Credential, returned inline on an
+    /// auto-admit `allow` over REST (over DIDComm it is delivered in a
+    /// follow-up message and this is omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmc: Option<JsonValue>,
+    /// The issued role credential — a community VAC conferring `role:<name>`
+    /// at the community's DID — same delivery story as [`Self::vmc`]. The wire
+    /// member is `roleVac`, as in vtc/join-requests/decide/0.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_vac: Option<JsonValue>,
+    /// Sealed-transfer pointer to the issued credential bundle — added by
+    /// the host on issuing ceremonies that seal, not emitted by the policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_ref: Option<JsonValue>,
+    // effect = deny
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    // effect = refer
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    // effect = request_more
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_definition: Option<JsonValue>,
+}
+
+/// A ceremony decision: the policy `effect` plus its effect-dependent
+/// detail. Shared by every `request`/`present` response across ceremony
+/// families.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Verdict {
+    pub effect: VerdictEffect,
+    pub with: VerdictWith,
+}
+
+/// The `request`/`present` success-response **payload** (rides inside the
+/// `#response` TrustTask document, whose `threadId` carries the ceremony
+/// thread). `requestId` is the persisted `JoinRequest` id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct VerdictResponse {
+    pub request_id: Uuid,
+    pub verdict: Verdict,
+}
+
+impl VerdictResponse {
+    /// `allow` verdict for an auto-admitted applicant, with the issued
+    /// credentials returned inline (REST) or omitted (DIDComm follow-up).
+    pub fn allow(
+        request_id: Uuid,
+        role: Option<String>,
+        vmc: Option<JsonValue>,
+        role_vac: Option<JsonValue>,
+    ) -> Self {
+        Self {
+            request_id,
+            verdict: Verdict {
+                effect: VerdictEffect::Allow,
+                with: VerdictWith {
+                    role,
+                    vmc,
+                    role_vac,
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    /// `deny` verdict — the policy refused a well-formed, verified request.
+    ///
+    /// `code` is the policy's stable refusal code; `reason` its optional
+    /// elaboration. A constructor rather than a hand-assembled struct because
+    /// this shape now has two producers — the correlated ceremony reply and the
+    /// status poll's projection — and hand-assembling it in both is how they
+    /// drift.
+    pub fn deny(request_id: Uuid, code: impl Into<String>, reason: Option<String>) -> Self {
+        Self {
+            request_id,
+            verdict: Verdict {
+                effect: VerdictEffect::Deny,
+                with: VerdictWith {
+                    code: Some(code.into()),
+                    reason,
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    /// `refer` verdict — the request was persisted `Pending` for a human
+    /// admin decision (`approve`/`reject`).
+    pub fn refer(request_id: Uuid, queue: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            verdict: Verdict {
+                effect: VerdictEffect::Refer,
+                with: VerdictWith {
+                    queue: Some(queue.into()),
+                    reason: Some(reason.into()),
+                    ..Default::default()
+                },
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Self-remove (M1.11.1 DIDComm twin)
+// ---------------------------------------------------------------------------
+
+/// DIDComm `type` for a member-side self-removal.
+pub const MEMBER_SELF_REMOVE_TYPE: &str = "https://trusttasks.org/spec/vtc/members/self-remove/0.1";
+
+/// VTC's reply with the resolved disposition + audit hint.
+/// Async acknowledgement for a self-remove. Stays on `openvtc/vtc/`
+/// for the same reason as [`JOIN_REQUEST_SUBMIT_RECEIPT_TYPE`] — no
+/// canonical receipt task exists.
+pub const MEMBER_SELF_REMOVE_RECEIPT_TYPE: &str =
+    "https://trusttasks.org/spec/vtc/members/self-remove-receipt/0.1";
+
+/// Body of the self-remove message. `did` comes from the DIDComm
+/// `from` field — the caller's authcrypt sender authenticates
+/// them. Disposition optional; falls back to the Member's stored
+/// `departure_preference` and then to PolicyDefault→Tombstone.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SelfRemoveBody {
+    /// Absent when unset, never `null`. `vtc/members/self-remove/0.1` types
+    /// `disposition` as a `"string"` constrained to the disposition enum, so a
+    /// serialized `None` is rejected as malformed instead of falling through to
+    /// the stored preference the way an omitted member does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SelfRemoveReceiptBody {
+    pub did: String,
+    /// Resolved disposition (`"purge"` | `"tombstone"` |
+    /// `"historical"`). `policydefault` is never returned —
+    /// the daemon resolves it before responding.
+    pub disposition: String,
+    pub removed: bool,
+}

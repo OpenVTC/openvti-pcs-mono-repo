@@ -1,0 +1,2167 @@
+use crate::{
+    SharedData,
+    builder::{MediatorHandle, StartOpts, TlsMode, TracingMode},
+    common::{
+        config::{
+            Config, LimitsConfig,
+            helpers::{join_api_path, preload_self_did},
+            init,
+        },
+        did_rate_limiter::DidRateLimiter,
+        error_codes, http_server,
+        metrics::{
+            self, MetricsAccess, metrics_access, metrics_handler,
+            names::WS_SEND_BUFFER_AVAILABLE_BYTES,
+        },
+        request_id::RequestIdLayer,
+        ws_budget::WsSendBudget,
+    },
+    handlers::{application_routes, health_checker_handler, liveness_handler, readiness_handler},
+    tasks::{
+        queue_survey::QueueSnapshotCell, statistics::statistics_with_live_limits,
+        supervisor::TaskSupervisor, websocket_streaming::StreamingTask,
+    },
+};
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+#[cfg(feature = "redis-backend")]
+use affinidi_messaging_mediator_common::database::DatabaseHandler;
+use affinidi_messaging_mediator_common::errors::MediatorError;
+use affinidi_messaging_mediator_common::store::MediatorStore;
+use affinidi_messaging_mediator_common::tasks::forwarding::ForwardingProcessor;
+#[cfg(feature = "didcomm")]
+use affinidi_messaging_sdk::protocols::discover_features::DiscoverFeatures;
+use affinidi_rate_limit::{ClientIpExtractor, IpNet, RateLimitLayer, RateLimiterState, Refusal};
+use axum::{Router, routing::get};
+use std::{
+    collections::HashSet, env, net::SocketAddr, sync::Arc, sync::atomic::AtomicUsize,
+    time::Duration,
+};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::trace::TraceLayer;
+use tracing::{Level, error, info, warn};
+use tracing_subscriber::EnvFilter;
+use url::Url;
+
+/// Resolve `[storage.fjall]` into the store's typed tuning.
+///
+/// A free function rather than a `TryFrom` impl because the raw type lives in
+/// the config crate and the target type in the store — the same orphan-rule
+/// dance as `database_config_from_raw`.
+///
+/// Absent section => [`FjallTuning::default`], which is the point: an operator
+/// who never writes `[storage.fjall]` still gets the tuned defaults, not Fjall's
+/// stock ones (64 MiB of memtable per keyspace x 14 keyspaces).
+#[cfg(feature = "fjall-backend")]
+fn fjall_tuning_from_raw(
+    raw: Option<&affinidi_messaging_mediator_config::FjallConfig>,
+) -> crate::store::FjallTuning {
+    use crate::store::{FjallDurability, FjallTuning};
+
+    let defaults = FjallTuning::default();
+    let Some(raw) = raw else { return defaults };
+
+    let parse = |field: &str, value: &str, fallback: u64| -> u64 {
+        value.parse().unwrap_or_else(|_| {
+            warn!("Could not parse storage.fjall.{field} ('{value}'), using default: {fallback}");
+            fallback
+        })
+    };
+
+    // An unrecognised durability falls back to the *stronger* setting: a typo
+    // in a request for durability must not quietly weaken it.
+    let durability = match raw.durability.trim().to_ascii_lowercase().as_str() {
+        "buffered" => FjallDurability::Buffered,
+        "sync" => FjallDurability::Sync,
+        other => {
+            warn!("Could not parse storage.fjall.durability ('{other}'), using \"sync\"");
+            FjallDurability::Sync
+        }
+    };
+
+    FjallTuning {
+        block_cache: parse("block_cache", &raw.block_cache, defaults.block_cache),
+        write_buffer: parse("write_buffer", &raw.write_buffer, defaults.write_buffer),
+        max_journal: parse("max_journal", &raw.max_journal, defaults.max_journal),
+        durability,
+    }
+}
+
+/// Run the mediator HTTP server from a TOML config path.
+///
+/// This is the historical CLI entry point and remains the primary path
+/// for the mediator binary. Internally it loads the TOML, installs the
+/// production tracing subscriber via [`init`], and then delegates to
+/// [`serve_internal`] (the same code path that backs
+/// [`MediatorBuilder::start`](crate::builder::MediatorBuilder::start)).
+///
+/// `config_path` resolves relative to the current working directory —
+/// `conf/mediator.toml` is the historical default. Embedded callers
+/// should use [`MediatorBuilder`](crate::builder::MediatorBuilder)
+/// instead so they can construct config in-memory and avoid CWD coupling.
+pub async fn start(config_path: &str) -> Result<(), MediatorError> {
+    let ansi = env::var("LOCAL").is_ok();
+
+    if ansi {
+        print_banner();
+    }
+
+    println!("[Loading Affinidi Secure Messaging Mediator configuration]");
+
+    // `init` reads the TOML, installs the global tracing subscriber,
+    // and returns a fully resolved Config. It also pulls operating keys
+    // from the secrets backend (and the VTA, when configured).
+    let config = init(config_path, ansi).await.map_err(|e| {
+        error!("Couldn't initialize mediator: {e}");
+        e
+    })?;
+    // For `config/reload`: the file this mediator's limits come from.
+    crate::common::config::overrides::record_config_path(config_path);
+
+    // Build the matching StartOpts for the binary path. TLS comes from
+    // the TOML; tracing is already installed by `init`; the binary
+    // owns signal handling.
+    let tls = if config.security.use_ssl {
+        info!("This mediator is using SSL/TLS for secure communication.");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let cert_file = config
+            .security
+            .ssl_certificate_file
+            .clone()
+            .ok_or_else(|| {
+                error!("SSL Certificate file must be specified in the config");
+                MediatorError::ConfigError(
+                    error_codes::CONFIG_ERROR,
+                    "NA".into(),
+                    "SSL Certificate file must be specified in the config".into(),
+                )
+            })?;
+        let key_file = config.security.ssl_key_file.clone().ok_or_else(|| {
+            error!("SSL Certificate key file must be specified in the config");
+            MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                "SSL Certificate key file must be specified in the config".into(),
+            )
+        })?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_file, key_file)
+                .await
+                .map_err(|e| {
+                    error!("Invalid TLS certificate/key: {e}");
+                    MediatorError::ConfigError(
+                        error_codes::CONFIG_ERROR,
+                        "NA".into(),
+                        format!("Invalid TLS certificate/key: {e}"),
+                    )
+                })?;
+        TlsMode::Rustls(rustls_config)
+    } else {
+        warn!("**** WARNING: Running without SSL/TLS ****");
+        TlsMode::Plain
+    };
+
+    let opts = StartOpts {
+        tls,
+        // Tracing is already installed by `init` above.
+        tracing: TracingMode::External,
+        install_signal_handlers: true,
+        // The TOML/binary path binds its own listener from config.
+        listener: None,
+    };
+
+    // Honour the optional `[storage]` section. When the operator
+    // picked `fjall` via the wizard (or hand-edited `mediator.toml`),
+    // build a `FjallStore` here and hand it to the inner serve path
+    // so the Redis bootstrap is skipped.
+    let pre_built_store: Option<Arc<dyn affinidi_messaging_mediator_common::store::MediatorStore>> =
+        match config.storage.as_ref().map(|s| s.backend.as_str()) {
+            Some("fjall") => {
+                #[cfg(feature = "fjall-backend")]
+                {
+                    let data_dir = config
+                        .storage
+                        .as_ref()
+                        .and_then(|s| s.data_dir.clone())
+                        .ok_or_else(|| {
+                            MediatorError::ConfigError(
+                                error_codes::CONFIG_ERROR,
+                                "NA".into(),
+                                "[storage] backend = \"fjall\" requires `data_dir`".into(),
+                            )
+                        })?;
+                    let tuning = fjall_tuning_from_raw(
+                        config.storage.as_ref().and_then(|s| s.fjall.as_ref()),
+                    );
+                    info!(
+                        "Opening Fjall data directory at {data_dir} \
+                         (block_cache={} MiB, write_buffer={} MiB, max_journal={} MiB)",
+                        tuning.block_cache / (1024 * 1024),
+                        tuning.write_buffer / (1024 * 1024),
+                        tuning.max_journal / (1024 * 1024),
+                    );
+                    let store = crate::store::FjallStore::open_with_tuning(
+                        &data_dir,
+                        config.database.circuit_breaker_threshold,
+                        config.database.circuit_breaker_recovery_secs,
+                        tuning,
+                    )
+                    .map_err(|e| {
+                        error!("Failed to open Fjall data directory: {e}");
+                        e
+                    })?
+                    .with_pubsub_capacity(config.limits.pubsub_capacity());
+                    Some(Arc::new(store) as Arc<_>)
+                }
+                #[cfg(not(feature = "fjall-backend"))]
+                {
+                    return Err(MediatorError::ConfigError(
+                        error_codes::CONFIG_ERROR,
+                        "NA".into(),
+                        "[storage] backend = \"fjall\" but the `fjall-backend` feature \
+                     is not compiled in. Rebuild the mediator with --features \
+                     fjall-backend or switch to backend = \"redis\""
+                            .into(),
+                    ));
+                }
+            }
+            Some("redis") | None => None,
+            Some(other) => {
+                return Err(MediatorError::ConfigError(
+                    error_codes::CONFIG_ERROR,
+                    "NA".into(),
+                    format!(
+                        "[storage] backend = \"{other}\" is not supported. \
+                     Use \"redis\" or \"fjall\"."
+                    ),
+                ));
+            }
+        };
+
+    let secrets_backend = config.secrets_backend.clone();
+    let shutdown_token = CancellationToken::new();
+    let handle = serve_internal(
+        config,
+        opts,
+        shutdown_token,
+        pre_built_store,
+        Arc::new(affinidi_messaging_mediator_common::types::clock::SystemClock),
+    )
+    .await?;
+    info!("Mediator listening on {}", handle.bound_addr);
+    // The configuration loaded and the listener bound from the secrets
+    // as they are now. Only that proves a migration into the single
+    // secret works, so only now are the per-key secrets it replaced
+    // deleted. Failing leaves them (and an older mediator) working.
+    if let Err(e) = secrets_backend.confirm_cutover().await {
+        error!("Secret store migration could not be completed; stopping: {e}");
+        handle.shutdown();
+        let _ = handle.join().await;
+        return Err(MediatorError::ConfigError(
+            error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("secret store migration could not be completed: {e}"),
+        ));
+    }
+    handle.join().await
+}
+
+/// The actual server start path. Used by both [`start`] (the binary)
+/// and [`MediatorBuilder::start`](crate::builder::MediatorBuilder::start)
+/// (embedded callers).
+///
+/// Does NOT install a tracing subscriber by default — that's controlled
+/// via `opts.tracing`. Does NOT install signal handlers by default —
+/// `opts.install_signal_handlers` controls that. The caller passes a
+/// [`CancellationToken`] that drives graceful shutdown; cancelling it
+/// (or `MediatorHandle::shutdown`) tells the server to drain.
+///
+/// Returns once the listener is bound. The actual server runs in a
+/// `tokio::spawn`-ed task whose handle lives on [`MediatorHandle`].
+pub async fn serve_internal(
+    mut config: Config,
+    opts: StartOpts,
+    shutdown_token: CancellationToken,
+    pre_built_store: Option<Arc<dyn affinidi_messaging_mediator_common::store::MediatorStore>>,
+    clock: Arc<dyn affinidi_messaging_mediator_common::types::clock::Clock>,
+) -> Result<MediatorHandle, MediatorError> {
+    if let TracingMode::InstallProduction {
+        log_json,
+        log_level,
+        ansi,
+    } = &opts.tracing
+    {
+        install_production_tracing(*ansi, *log_json, *log_level)?;
+    }
+
+    let BuiltStore {
+        store,
+        #[cfg(feature = "redis-backend")]
+        lua_integrity,
+    } = build_store(&config, pre_built_store).await?;
+
+    // Optional signal handler — cancels the same token the caller
+    // provided so the embedded path's caller-driven cancellation and
+    // the binary's signal-driven cancellation share a code path.
+    if opts.install_signal_handlers {
+        let signal_token = shutdown_token.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("Shutdown signal received, initiating graceful shutdown...");
+            signal_token.cancel();
+        });
+    }
+
+    let metrics_handle = metrics::init_metrics();
+
+    // All long-lived background tasks run under a supervisor: a task that
+    // errors or panics is restarted with capped backoff (never fail-fast —
+    // the mediator keeps serving and the fault is logged + surfaced via
+    // /readyz), and each task's health is published for the readiness probe.
+    // The supervisor owns cancellation, so the task bodies below are plain
+    // loops with no shutdown `select!` — it aborts them on shutdown.
+    let supervisor = TaskSupervisor::new(shutdown_token.clone());
+
+    #[cfg(feature = "redis-backend")]
+    report_lua_integrity(&supervisor, lua_integrity.as_ref());
+
+    // The mediator's own account and the configured root admin, on every
+    // backend. The Redis bootstrap has always seeded them in
+    // `initialize_redis`; a Fjall or memory store, or one an embedding
+    // application passes in, never was. So the configured `admin_did`
+    // authenticated as a standard account, and had none of its rights.
+    // Idempotent: an existing account keeps its ACLs and only has its role set.
+    seed_privileged_accounts(store.as_ref(), &config).await?;
+
+    let live_limits = apply_stored_overrides(store.as_ref(), &mut config).await;
+
+    // The traffic monitor, shared by the data plane (through `SharedData`),
+    // the streaming task's inbox redelivery, the forwarding processor and the
+    // expiry sweep below.
+    let monitor = crate::monitor::TrafficMonitor::new();
+
+    let Background {
+        queue_snapshot,
+        streaming_task,
+    } = spawn_background(
+        &supervisor,
+        &store,
+        &config,
+        &clock,
+        &live_limits,
+        &monitor,
+        &shutdown_token,
+    );
+
+    let did_resolver = build_did_resolver(&mut config).await?;
+
+    // did:scid floors survive a restart (VTI-KEY-162): seed what was stored,
+    // before any connection is accepted, then persist every change for an
+    // account's did:scid (or our own) as the resolver verifies it.
+    crate::scid_sources::seed(&*store, &did_resolver).await?;
+    let _scid_source_writer = crate::scid_sources::persist(
+        store.clone(),
+        &did_resolver,
+        &config.mediator_did,
+        shutdown_token.clone(),
+    );
+
+    spawn_forwarding(&supervisor, &store, &config, &monitor, &did_resolver);
+
+    #[cfg(feature = "didcomm")]
+    // The advertised set is the mediator's public protocol contract and lives in
+    // one place, next to the tests that pin it. Notably it carries no
+    // coordinate-mediation entry: v2 routing is DID-addressed and needs no
+    // keylist (issue affinidi-tdk-rs#755, `docs/mediation-and-routing.md`).
+    let discover_features = Arc::new(DiscoverFeatures {
+        protocols: crate::messages::protocols::discover_features::ADVERTISED_PROTOCOLS
+            .iter()
+            .map(|p| p.to_string())
+            .collect(),
+        ..Default::default()
+    });
+
+    let did_rate_limiter = did_rate_limiter(&config);
+    did_rate_limiter.spawn_gc(shutdown_token.clone());
+    log_rate_limits(&config, &did_rate_limiter);
+
+    let mediator_did = config.mediator_did.clone();
+    let admin_did = config.admin_did.clone();
+    let api_prefix = config.api_prefix.clone();
+
+    let self_authorities = local_authorities(&config);
+
+    let shared_state = SharedData {
+        live_limits,
+        config: Arc::new(config.clone()),
+        service_start_timestamp: chrono::Utc::now(),
+        did_resolver,
+        database: store,
+        mux: Default::default(),
+        streaming_task,
+        #[cfg(feature = "didcomm")]
+        discover_features,
+        active_websocket_count: Arc::new(AtomicUsize::new(0)),
+        ws_connections_per_did: Arc::new(dashmap::DashMap::new()),
+        relay_connections_per_ip: Arc::new(dashmap::DashMap::new()),
+        relay_client_ip: relay_client_ip_extractor(&config.trust_xff_cidrs)?,
+        readiness: Arc::new(crate::handlers::readiness::ReadinessCache::new(
+            crate::handlers::readiness::REFRESH_INTERVAL,
+        )),
+        did_rate_limiter,
+        shutdown_token: shutdown_token.clone(),
+        self_authorities: Arc::new(self_authorities),
+        trust_task_keys: Default::default(),
+        component_health: supervisor.registry(),
+        clock,
+        queue_snapshot,
+        monitor,
+        activity: Default::default(),
+        #[cfg(feature = "tsp")]
+        tsp_identity: Arc::new(tokio::sync::OnceCell::new()),
+        #[cfg(feature = "didcomm-v1")]
+        didcomm_v1_identity: Arc::new(tokio::sync::OnceCell::new()),
+        wake: Default::default(),
+    };
+
+    start_mux(&shared_state, &supervisor)?;
+    // Armed wake requests are evaluated again every few seconds, for a
+    // message another instance stored; a message stored here wakes them at
+    // once. Holds nothing durable, so a restart only drops armed requests.
+    if shared_state.config.processors.wake.enabled {
+        tokio::spawn(crate::wake::request::rearm_loop(
+            shared_state.clone(),
+            shutdown_token.clone(),
+        ));
+    }
+    #[cfg(feature = "didcomm-v1")]
+    check_didcomm_v1(&shared_state).await?;
+
+    // What the server task waits for after the HTTP server has stopped (see
+    // `wait_for_shutdown`).
+    let open_sockets = shared_state.active_websocket_count.clone();
+    let task_health = shared_state.component_health.clone();
+
+    let app = build_router(
+        &config,
+        &api_prefix,
+        shared_state,
+        metrics_handle,
+        &shutdown_token,
+    )?;
+    let (std_listener, bound_addr) = bind_listener(&config, opts.listener)?;
+    let (server_task, scheme, ws_scheme) = serve(
+        app,
+        std_listener,
+        opts.tls,
+        &config.limits,
+        &shutdown_token,
+        open_sockets,
+        task_health,
+    )?;
+    let (http_endpoint, ws_endpoint) = endpoints(scheme, ws_scheme, bound_addr, &api_prefix)?;
+
+    Ok(MediatorHandle::__from_internals(
+        http_endpoint,
+        ws_endpoint,
+        bound_addr,
+        mediator_did,
+        admin_did,
+        shutdown_token,
+        server_task,
+    ))
+}
+
+/// The store the mediator runs on, initialised, and (on Redis) the outcome of
+/// the stored-function integrity check, for `/readyz`.
+struct BuiltStore {
+    store: Arc<dyn MediatorStore>,
+    #[cfg(feature = "redis-backend")]
+    lua_integrity: Option<crate::common::lua_integrity::LuaIntegrity>,
+}
+
+/// Initialise the caller's store, or bootstrap a Redis one from
+/// `config.database`.
+async fn build_store(
+    #[cfg_attr(not(feature = "redis-backend"), allow(unused_variables))] config: &Config,
+    pre_built_store: Option<Arc<dyn MediatorStore>>,
+) -> Result<BuiltStore, MediatorError> {
+    // When the caller supplies a pre-built store (Memory, Fjall, or
+    // any future backend), skip the Redis-specific bootstrap entirely
+    // and let the trait-based code path own the lifecycle. Background
+    // tasks (statistics, expiry sweep, forwarding processor, websocket
+    // streaming) all consume `Arc<dyn MediatorStore>`, so they run
+    // unchanged regardless of which backend is in use.
+    // Outcome of the stored-function integrity check, published to `/readyz`
+    // once the supervisor that owns the health registry exists. `None` on any
+    // build or backend where there are no stored functions to check.
+    #[cfg(feature = "redis-backend")]
+    let mut lua_integrity_outcome: Option<crate::common::lua_integrity::LuaIntegrity> = None;
+    let store: Arc<dyn MediatorStore> = if let Some(store) = pre_built_store {
+        // Initialise the store (no-op for Memory; opens partitions
+        // for Fjall; loads Lua + runs migrations for Redis if a
+        // RedisStore was passed in directly).
+        store.initialize().await.map_err(|e| {
+            error!("Store initialize failed: {e}");
+            e
+        })?;
+        store
+    } else {
+        // Bootstrap a Redis-backed store from `config.database`. When
+        // the binary is built without `redis-backend`, this branch is
+        // unreachable and we fail at config-load time with a clearer
+        // error.
+        #[cfg(feature = "redis-backend")]
+        {
+            use crate::store::RedisStore;
+
+            let handler = match tokio::time::timeout(
+                Duration::from_secs(30),
+                DatabaseHandler::new(&config.database),
+            )
+            .await
+            {
+                Ok(Ok(h)) => h,
+                Ok(Err(err)) => {
+                    error!("Error opening database: {err}");
+                    return Err(MediatorError::DatabaseError(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".into(),
+                        format!("Error opening database: {err}"),
+                    ));
+                }
+                Err(_) => {
+                    error!("Database connection timed out after 30 seconds");
+                    return Err(MediatorError::DatabaseError(
+                        error_codes::DB_OPERATION_ERROR,
+                        "NA".into(),
+                        "Database connection timed out after 30 seconds".into(),
+                    ));
+                }
+            };
+
+            let store = RedisStore::new(
+                handler,
+                config.database.circuit_breaker_threshold,
+                config.database.circuit_breaker_recovery_secs,
+                config.database.functions_file.clone(),
+            )
+            .with_pubsub_capacity(config.limits.pubsub_capacity());
+            let init_cfg = affinidi_messaging_mediator_common::store::redis::RedisInitConfig {
+                mediator_did_hash: config.mediator_did_hash.clone(),
+                admin_did: config.admin_did.clone(),
+                global_acl_default: config.security.global_acl_default.clone(),
+            };
+            store.initialize_redis(&init_cfg).await.map_err(|e| {
+                error!("Error initializing database: {e}");
+                e
+            })?;
+            // The stored-function library: the one compiled into this build,
+            // unless `functions_file` names another. An override older than
+            // the built-in library is a stale copy (the failure this used to
+            // invite: it loads cleanly and does less than this build
+            // expects), so the built-in library is loaded in its place.
+            // `load_library` then keeps a newer library already on the
+            // server, so an older instance restarting in a rolling deploy
+            // cannot replace the functions newer instances run.
+            let built_in = crate::common::lua_integrity::BUILT_AGAINST;
+            let functions_file = config
+                .database
+                .functions_file
+                .as_deref()
+                .filter(|path| !path.trim().is_empty());
+            let (library, origin) = match functions_file {
+                Some(functions_file) => {
+                    let source = std::fs::read_to_string(functions_file).map_err(|err| {
+                        error!("Couldn't read database.functions_file ({functions_file}): {err}");
+                        MediatorError::ConfigError(
+                            error_codes::CONFIG_ERROR,
+                            "NA".into(),
+                            format!(
+                                "Couldn't read database.functions_file ({functions_file}). Reason: {err}"
+                            ),
+                        )
+                    })?;
+                    let theirs = affinidi_messaging_mediator_common::store::redis::library_version_of(&source);
+                    let ours = affinidi_messaging_mediator_common::store::redis::library_version_of(built_in);
+                    if theirs < ours {
+                        error!(
+                            "database.functions_file ({functions_file}) holds stored-function library version {theirs}, older than this build's version {ours}; loading the built-in library instead. Remove functions_file, or point it at this release's conf/atm-functions.lua"
+                        );
+                        None
+                    } else {
+                        // Held for `/readyz` — the supervisor that owns the
+                        // health registry does not exist yet at this point.
+                        // Cluster mode never loads the library, so a
+                        // mismatched file there is harmless and must not mark
+                        // the mediator degraded.
+                        if !config.database.cluster_mode {
+                            lua_integrity_outcome = Some(
+                                crate::common::lua_integrity::check_and_report(functions_file),
+                            );
+                        }
+                        Some((source, functions_file.to_string()))
+                    }
+                }
+                None => None,
+            }
+            .unwrap_or_else(|| {
+                if !config.database.cluster_mode {
+                    lua_integrity_outcome =
+                        Some(crate::common::lua_integrity::report_built_in());
+                }
+                (built_in.to_string(), "the built-in library".to_string())
+            });
+            store.load_library(&library, &origin).await.map_err(|e| {
+                error!("Failed to load LUA scripts: {e}");
+                e
+            })?;
+            let s: Arc<dyn MediatorStore> = Arc::new(store);
+            s
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            return Err(MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                "no pre-built store supplied and `redis-backend` feature is disabled — \
+                 either enable `redis-backend` or pass MediatorBuilder::store(...)"
+                    .into(),
+            ));
+        }
+    };
+
+    Ok(BuiltStore {
+        store,
+        #[cfg(feature = "redis-backend")]
+        lua_integrity: lua_integrity_outcome,
+    })
+}
+
+/// Log the per-DID and per-socket message rate limits in force.
+fn log_rate_limits(config: &Config, did_rate_limiter: &DidRateLimiter) {
+    if did_rate_limiter.is_enabled() {
+        info!(
+            "Per-DID rate limiting enabled: {} req/s per DID, burst: {}. Charged per \
+             authenticated HTTP request (including the /ws upgrade) and per message on an \
+             established WebSocket. The mediator and admin DIDs are exempt.",
+            config.limits.did_rate_limit_per_second, config.limits.did_rate_limit_burst,
+        );
+    }
+    if config.limits.ws_messages_per_second > 0 {
+        info!(
+            "WebSocket message rate: {} msg/s per authenticated socket, burst: {}; a socket \
+             over it is read more slowly, and closed (1008) after {} s over it (0 = never). \
+             The mediator and admin DIDs are exempt.",
+            config.limits.ws_messages_per_second,
+            config.limits.ws_message_burst,
+            config.limits.ws_message_throttle_close_secs,
+        );
+    } else {
+        warn!(
+            "WebSocket message rate limiting is OFF (limits.ws_messages_per_second = 0): \
+             messages on an authenticated WebSocket are not rate limited per socket."
+        );
+    }
+}
+
+/// Publish a failed stored-function integrity check on `/readyz`.
+#[cfg(feature = "redis-backend")]
+fn report_lua_integrity(
+    supervisor: &TaskSupervisor,
+    lua_integrity_outcome: Option<&crate::common::lua_integrity::LuaIntegrity>,
+) {
+    // Surface the stored-function integrity check on `/readyz`.
+    //
+    // `load_bearing: false` is the whole argument for checking rather than
+    // refusing: this reports a *fairness* control being inert, not an
+    // authorization one, so the instance stays in rotation (200 `degraded`)
+    // and an operator sees the condition on a dashboard. A `Restarting` state
+    // is the registry's only way to say "not healthy" for something that is
+    // not a restartable task; the `last_error` beside it says what it means.
+    if let Some(outcome) = lua_integrity_outcome
+        && !outcome.is_healthy()
+    {
+        use crate::tasks::supervisor::{ComponentHealth, ComponentState};
+        supervisor.registry().insert(
+            crate::common::lua_integrity::COMPONENT.to_string(),
+            ComponentHealth {
+                name: crate::common::lua_integrity::COMPONENT.to_string(),
+                load_bearing: false,
+                state: ComponentState::Restarting,
+                restarts: 0,
+                last_error: Some(match outcome {
+                    crate::common::lua_integrity::LuaIntegrity::Mismatch { found, expected } => {
+                        format!(
+                            "stored-function library does not match this build \
+                             (found {found}, expected {expected})"
+                        )
+                    }
+                    crate::common::lua_integrity::LuaIntegrity::Unknown { reason } => {
+                        format!("stored-function library could not be checked: {reason}")
+                    }
+                    crate::common::lua_integrity::LuaIntegrity::Match => unreachable!(),
+                }),
+                since: chrono::Utc::now(),
+            },
+        );
+    }
+}
+
+/// Layer the stored `config/patch` overrides over the file/env limits, and
+/// return the live limits that later patches update.
+async fn apply_stored_overrides(
+    store: &dyn MediatorStore,
+    config: &mut Config,
+) -> crate::common::config::overrides::LiveLimits {
+    // Stored `config/patch` overrides, layered over the file/env limits before
+    // anything below reads them. A stale override is logged and skipped, never
+    // fatal.
+    let baseline_limits = config.limits.clone();
+    match store.config_overrides_get().await {
+        Ok(stored) => {
+            let overrides = crate::common::config::overrides::parse_stored(stored.as_deref());
+            if !overrides.is_empty() {
+                let skipped =
+                    crate::common::config::overrides::overlay(&mut config.limits, &overrides);
+                info!(
+                    "Applied {} stored configuration override(s)",
+                    overrides.len() - skipped.len()
+                );
+                for (key, reason) in skipped {
+                    warn!("Stored configuration override {key} skipped: {reason}");
+                }
+            }
+        }
+        Err(e) => warn!("Couldn't read stored configuration overrides: {e}"),
+    }
+    crate::common::config::overrides::LiveLimits::new(baseline_limits, config.limits.clone())
+}
+
+/// What the background tasks hand the data plane.
+struct Background {
+    queue_snapshot: QueueSnapshotCell,
+    streaming_task: Option<StreamingTask>,
+}
+
+/// Spawn the supervised background tasks that need nothing but the store:
+/// statistics, the expiry sweeps, the VTA secrets refresh and the streaming
+/// task.
+fn spawn_background(
+    supervisor: &TaskSupervisor,
+    store: &Arc<dyn MediatorStore>,
+    config: &Config,
+    clock: &Arc<dyn affinidi_messaging_mediator_common::types::clock::Clock>,
+    live_limits: &crate::common::config::overrides::LiveLimits,
+    monitor: &crate::monitor::TrafficMonitor,
+    #[cfg_attr(not(feature = "vta"), allow(unused_variables))] shutdown_token: &CancellationToken,
+) -> Background {
+    // Statistics task — non-load-bearing (metrics only). Runs against any
+    // backend via the trait. It also publishes each queue survey for the
+    // `messaging/queue/list` and `messaging/stats/show` Trust Tasks.
+    let queue_snapshot = QueueSnapshotCell::default();
+    {
+        let queue_snapshot = queue_snapshot.clone();
+        let store = store.clone();
+        let tags = config.tags.clone();
+        let stats_clock = clock.clone();
+        // Defaults the queue survey measures an account against when it has
+        // set no limit of its own — the same fallback the gates themselves
+        // apply in `messages::queue_limits`, so saturation reaching 1.0 means
+        // the account is at the depth where it starts being refused.
+        // Read from the live limits on every survey, so a patched soft limit
+        // is what the next survey measures against.
+        let live_limits = live_limits.clone();
+        supervisor.spawn("statistics", false, move || {
+            let store = store.clone();
+            let tags = tags.clone();
+            let clock = stats_clock.clone();
+            let queue_snapshot = queue_snapshot.clone();
+            let live_limits = live_limits.clone();
+            async move {
+                statistics_with_live_limits(store, tags, clock, live_limits, queue_snapshot)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        });
+    }
+
+    // Message expiry sweep — non-load-bearing housekeeping. Runs against
+    // any backend via `MessageStore::sweep_expired_messages`. The
+    // standalone `message_expiry_cleanup` binary in mediator-processors
+    // keeps its own direct-Redis loop for distributed deployments. Sweep
+    // errors are logged and the next tick retries; the supervisor restarts
+    // the loop only if it panics.
+    if config.processors.message_expiry_cleanup.enabled {
+        let store = store.clone();
+        let admin_did_hash = config.mediator_did_hash.clone();
+        let monitor = monitor.clone();
+        // `E` is pinned explicitly: the loop never returns `Err`, so the
+        // error type is otherwise unconstrained.
+        supervisor.spawn::<_, _, String>("message_expiry_sweep", false, move || {
+            let store = store.clone();
+            let admin_did_hash = admin_did_hash.clone();
+            let monitor = monitor.clone();
+            async move {
+                let observe = |msg_id: &str, meta: &affinidi_messaging_mediator_common::store::types::MessageMetaData| {
+                    monitor.expired(msg_id, meta)
+                };
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+                    // Each message's metadata is read only while someone watches.
+                    let on_expired = monitor.is_active().then_some(
+                        &observe as affinidi_messaging_mediator_common::store::OnExpired<'_>,
+                    );
+                    match store
+                        .sweep_expired_messages_observed(now_secs, &admin_did_hash, on_expired)
+                        .await
+                    {
+                        Ok(report) if report.expired > 0 || report.timeslots_swept > 0 => {
+                            info!(
+                                event_type = "ExpirySweep",
+                                timeslots_swept = report.timeslots_swept,
+                                expired = report.expired,
+                                already_deleted = report.already_deleted,
+                                "expiry sweep drained {} messages across {} timeslots",
+                                report.expired,
+                                report.timeslots_swept,
+                            );
+                        }
+                        Ok(_) => {} // nothing to sweep
+                        Err(err) => {
+                            warn!("Message expiry sweep error: {err}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Session expiry sweep — non-load-bearing housekeeping. Reclaims
+    // expired session records on backends without native TTL (Fjall,
+    // memory). On Redis the trait default is a no-op, so this loop just
+    // ticks and finds nothing. Sessions expire over 15-minute / 24-hour
+    // horizons, so a coarse cadence is plenty.
+    if config.processors.session_expiry_cleanup.enabled {
+        let store = store.clone();
+        supervisor.spawn::<_, _, String>("session_expiry_sweep", false, move || {
+            let store = store.clone();
+            async move {
+                const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+                let mut tick = tokio::time::interval(SESSION_SWEEP_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+                    match store.sweep_expired_sessions(now_secs).await {
+                        Ok(report) if report.expired > 0 => {
+                            info!(
+                                event_type = "SessionExpirySweep",
+                                scanned = report.scanned,
+                                expired = report.expired,
+                                "session expiry sweep reclaimed {} of {} sessions",
+                                report.expired,
+                                report.scanned,
+                            );
+                        }
+                        Ok(_) => {} // nothing expired
+                        Err(err) => {
+                            warn!("Session expiry sweep error: {err}");
+                        }
+                    }
+                    // The Trust Task duplicate-execution record lives a few
+                    // minutes per entry; drop lapsed ones on the same cadence.
+                    // A no-op on Redis, which expires the keys itself.
+                    if let Err(err) = store.sweep_expired_trust_task_claims(now_secs).await {
+                        warn!("Trust Task claim sweep error: {err}");
+                    }
+                }
+            }
+        });
+    }
+
+    // VTA secrets refresh — load-bearing when present (a stale operating
+    // secret means the mediator silently fails to decrypt its own inbound
+    // DIDComm). Only spawned for VTA-linked deployments. `run` honours the
+    // shutdown token itself; the supervisor's abort is a backstop.
+    #[cfg(feature = "vta")]
+    if let Some(refresher) = config.vta_refresher.clone() {
+        let refresh_token = shutdown_token.clone();
+        supervisor.spawn("vta_refresh", true, move || {
+            let refresher = refresher.clone();
+            let refresh_token = refresh_token.clone();
+            async move {
+                refresher.run(refresh_token).await;
+                Ok::<(), String>(())
+            }
+        });
+    }
+
+    // Streaming task: subscribes via the trait, so it runs on any
+    // backend. RedisStore bridges Redis pub/sub into a tokio
+    // broadcast; Memory and Fjall feed the broadcast directly. Supervised
+    // (restart-and-degrade) rather than spawned detached, so a panic or a
+    // transient startup error restarts it instead of silently killing live
+    // delivery. Not load-bearing — clients fall back to message-pickup polling.
+    // Global byte pool shared by every WebSocket send queue. Bounds the
+    // aggregate at `limits.ws_send_buffer` regardless of connection count.
+    let ws_send_budget = WsSendBudget::new(config.limits.ws_send_buffer);
+    // `metrics` is shadowed here by `crate::common::metrics`, so reach for the
+    // crate explicitly.
+    ::metrics::gauge!(WS_SEND_BUFFER_AVAILABLE_BYTES).set(ws_send_budget.total_bytes() as f64);
+
+    let streaming_task = if config.streaming_enabled {
+        Some(StreamingTask::spawn_supervised(
+            supervisor,
+            store.clone(),
+            &config.streaming_uuid,
+            ws_send_budget.clone(),
+            config.streaming_liveness,
+        ))
+    } else {
+        None
+    };
+
+    Background {
+        queue_snapshot,
+        streaming_task,
+    }
+}
+
+/// The DID resolver, with the mediator's own document preloaded. On a TSP
+/// build the document is first made to advertise the TSP endpoint.
+async fn build_did_resolver(config: &mut Config) -> Result<DIDCacheClient, MediatorError> {
+    let mut did_resolver = DIDCacheClient::new(config.did_resolver_config.clone())
+        .await
+        .map_err(|e| {
+            error!("Failed to create DID resolver: {e}");
+            MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!("Failed to create DID resolver: {e}"),
+            )
+        })?;
+
+    // If TSP is enabled, make sure our served DID document advertises a
+    // `TSPTransport` service so peers can discover our TSP endpoint. Runs here, on the
+    // owned `config`, so it covers both the config-file and builder paths before the
+    // document is preloaded + served below.
+    #[cfg(feature = "tsp")]
+    crate::common::config::apply_tsp_did_advertisement(config);
+
+    // Inverse guard for TSP-less builds: some DID templates advertise a
+    // `TSPTransport` service unconditionally, which would mislead peers into
+    // routing TSP to a mediator that can't handle it. Warn if so.
+    #[cfg(not(feature = "tsp"))]
+    crate::common::config::warn_if_tsp_advertised_without_feature(config);
+
+    // Preload the mediator's own DID document so it can pack/unpack DIDComm
+    // messages without hitting the network (did:web/did:webvh self-resolution
+    // needs HTTPS, which may be unreachable from the mediator's own network).
+    // `from_raw` already parsed the document and handed us the typed form;
+    // builder-constructed configs set only the served JSON, so fall back to
+    // parsing that — logging, rather than silently dropping, a parse failure.
+    if let Some(ref doc) = config.mediator_did_document {
+        preload_self_did(&mut did_resolver, &config.mediator_did, doc).await;
+    } else if let Some(ref did_doc_json) = config.mediator_did_doc {
+        match serde_json::from_str::<affinidi_did_common::Document>(did_doc_json) {
+            Ok(doc) => preload_self_did(&mut did_resolver, &config.mediator_did, &doc).await,
+            Err(e) => warn!(
+                "Mediator DID document failed to parse for resolver preload; \
+                 self-resolution will fall back to the network: {e}"
+            ),
+        }
+    }
+
+    Ok(did_resolver)
+}
+
+/// Spawn the forwarding processor, when external forwarding is enabled.
+fn spawn_forwarding(
+    supervisor: &TaskSupervisor,
+    store: &Arc<dyn MediatorStore>,
+    config: &Config,
+    monitor: &crate::monitor::TrafficMonitor,
+    #[cfg_attr(not(feature = "didcomm"), allow(unused_variables))] did_resolver: &DIDCacheClient,
+) {
+    // Forwarding processor — load-bearing (the cross-mediator delivery
+    // path). Runs against any backend via the `forward_queue_*` trait
+    // methods (Redis: Streams consumer groups; Fjall/Memory: in-process
+    // pending-claim emulation). Fjall queues survive a restart (pending
+    // claims recovered via autoclaim), Memory queues are lost with the
+    // process. Multi-process forwarding (the standalone
+    // `forwarding_processor` binary) remains Redis-only.
+    //
+    // Spawned here, after the DID resolver is built and the mediator's own
+    // document is preloaded, because the processor now packs its abandonment
+    // problem reports as the mediator — which resolves both ends.
+    if config.processors.forwarding.enabled && config.processors.forwarding.external_forwarding {
+        let store = store.clone();
+        let fwd_config = config.processors.forwarding.clone();
+        let observer: Arc<
+            dyn affinidi_messaging_mediator_common::tasks::forwarding::ForwardingObserver,
+        > = Arc::new(monitor.clone());
+        // A DIDComm-less build has no `pack_encrypted` to offer; the processor
+        // logs the abandonment instead of storing a report nobody can read.
+        #[cfg(feature = "didcomm")]
+        let packer: Arc<
+            dyn affinidi_messaging_mediator_common::tasks::forwarding::SystemMessagePacker,
+        > = Arc::new(crate::tasks::system_packer::MediatorSystemPacker::new(
+            config.mediator_did.clone(),
+            did_resolver.clone(),
+            config.security.mediator_secrets.clone(),
+        ));
+        supervisor.spawn("forwarding_processor", true, move || {
+            let store = store.clone();
+            let fwd_config = fwd_config.clone();
+            let observer = observer.clone();
+            #[cfg(feature = "didcomm")]
+            let packer = packer.clone();
+            async move {
+                let processor = ForwardingProcessor::new(fwd_config, store)
+                    .map_err(|e| e.to_string())?
+                    .with_observer(observer);
+                #[cfg(feature = "didcomm")]
+                let processor = processor.with_system_packer(packer);
+                processor.start().await.map_err(|e| e.to_string())
+            }
+        });
+    }
+}
+
+/// The authorities this mediator answers on, which the forward handler
+/// treats as local; warns when a wildcard bind leaves the set unmatched.
+fn local_authorities(config: &Config) -> HashSet<(String, u16)> {
+    let self_authorities = compute_self_authorities(config);
+    if !self_authorities.is_empty() {
+        info!(
+            "Routing 2.0 forward handler will treat {} authority/authorities as local: {:?}",
+            self_authorities.len(),
+            self_authorities
+        );
+    }
+
+    // Wildcard binds (`0.0.0.0` / `::`) almost never appear as a literal
+    // host in a peer's DID Doc service endpoint. When the bind is wildcard
+    // and the operator hasn't declared any `local_endpoints` aliases, the
+    // self-authority set will never match an inbound forward → loopback
+    // delivery silently devolves to "remote" forwarding. Surface this so
+    // the operator notices before they ship.
+    if let Ok(addr) = config.listen_address.parse::<SocketAddr>()
+        && addr.ip().is_unspecified()
+        && config.local_endpoints.is_empty()
+    {
+        warn!(
+            "listen_address is bound to wildcard {} and no `local_endpoints` are configured — \
+             Routing 2.0 self-loopback delivery will not match any DID-Doc URI. \
+             Add the mediator's public service URL(s) to `local_endpoints` (e.g. \
+             `local_endpoints = [\"https://mediator.example.com\"]`) to enable local routing.",
+            addr.ip()
+        );
+    }
+
+    self_authorities
+}
+
+/// DID multiplexing startup: refuse a setting that cannot be honoured, and
+/// spawn the cross-instance sync tasks.
+fn start_mux(shared_state: &SharedData, supervisor: &TaskSupervisor) -> Result<(), MediatorError> {
+    // DID multiplexing startup checks. Mux is off unless an operator enables
+    // it (design §5.8); when they do, refuse to start rather than run with a
+    // setting that silently means less than its name (R5.2).
+    if shared_state.config.limits.mux.enabled {
+        if !shared_state.database.supports_mux() {
+            return Err(MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                "[limits.mux] enabled = \"true\" but the configured storage backend does not \
+                 implement DID multiplexing grants"
+                    .into(),
+            ));
+        }
+        // Members are carried by live delivery; without the streaming task a
+        // mux connection would carry nothing.
+        if shared_state.streaming_task.is_none() {
+            return Err(MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                "[limits.mux] enabled = \"true\" but live streaming is disabled; DID \
+                 multiplexing needs it"
+                    .into(),
+            ));
+        }
+        info!(
+            "DID multiplexing enabled: DIDComm clients may open mux connections with the \
+             `didcomm-mux` WebSocket subprotocol"
+        );
+        // Grant changes handled by other instances sharing the store reach
+        // this one's connections within one pub/sub hop rather than at the
+        // next periodic re-check (design §7.4). Not load-bearing: the re-check
+        // is the backstop while it is down.
+        let state = shared_state.clone();
+        supervisor.spawn("mux_sync", false, move || {
+            let state = state.clone();
+            async move { crate::mux::sync::run(state).await }
+        });
+        // Membership monitor events from every instance reach every
+        // instance's subscribers. Not load-bearing: while it is down each
+        // instance's subscribers see that instance's events only.
+        if shared_state.database.spans_processes() {
+            let state = shared_state.clone();
+            supervisor.spawn("monitor_fanout", false, move || {
+                let state = state.clone();
+                async move { crate::monitor::fanout::run(state).await }
+            });
+        }
+    }
+    Ok(())
+}
+
+/// DIDComm v1 startup checks.
+#[cfg(feature = "didcomm-v1")]
+async fn check_didcomm_v1(shared_state: &SharedData) -> Result<(), MediatorError> {
+    // DIDComm v1 startup checks. Both run before the listener binds, so a
+    // misconfiguration is a refusal to start rather than traffic the mediator
+    // accepts and then silently drops.
+    if shared_state.config.didcomm_v1.enabled {
+        // The routing-key index is what turns a forward's `to` verkey into an
+        // account. A backend without it would accept v1 forwards and fail every
+        // lookup, so refuse rather than serve a protocol we cannot route.
+        if !shared_state.database.supports_v1_routing_keys() {
+            return Err(MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                "[didcomm_v1] is enabled but the configured storage backend does not implement \
+                 the v1 routing-key index; DIDComm v1 forwards could not be routed"
+                    .into(),
+            ));
+        }
+
+        // Derive eagerly so a missing Ed25519 authentication key fails at
+        // startup rather than on the first inbound forward, and so the routing
+        // verkey can be logged: v1 predates DID documents as a discovery
+        // mechanism, so an operator has to hand this to clients out of band and
+        // has nowhere else to read it from.
+        let identity = shared_state.didcomm_v1_identity().await?;
+        info!(
+            "DIDComm v1 enabled. Routing verkey (give this to v1 clients as their routingKey): {}",
+            identity.verkey().to_base58()
+        );
+        if shared_state
+            .config
+            .didcomm_v1
+            .allow_unauthenticated_forwards
+        {
+            warn!(
+                "DIDComm v1: allow_unauthenticated_forwards is ON. Anonymous callers may submit \
+                 v1 forwards to this mediator (recipient ACLs, message-size limits and per-IP \
+                 rate limiting still apply). This matches Aries mediator behaviour and is \
+                 required for stock Credo wallets; it does NOT open anonymous DIDComm v2 inbound."
+            );
+        }
+        if shared_state.config.didcomm_v1.allow_unproven_routing_keys {
+            warn!(
+                "DIDComm v1: allow_unproven_routing_keys is ON. keylist-update registers any key \
+                 a client lists, with no proof it holds that key; the first account to list a \
+                 key receives forwards addressed to it until the key's holder takes it over by \
+                 registering it with a request that key authenticates. Required for stock \
+                 Aries wallets. Each account holds at most {} routing keys.",
+                shared_state.config.didcomm_v1.max_routing_keys_per_account
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The application router with its layers, the probe routes and, when
+/// metrics are on, `/metrics`.
+fn build_router(
+    config: &Config,
+    api_prefix: &str,
+    shared_state: SharedData,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    shutdown_token: &CancellationToken,
+) -> Result<Router, MediatorError> {
+    let app: Router = application_routes(api_prefix, &shared_state);
+
+    let rate_limiter = ip_rate_limiter(&config.limits);
+    rate_limiter.spawn_gc(shutdown_token.clone());
+    log_ip_rate_limiter(&rate_limiter, &config.limits, &config.trust_xff_cidrs);
+    let rate_limit_layer = ip_rate_limit_layer(rate_limiter, &config.trust_xff_cidrs)?;
+
+    let app = Router::new()
+        .merge(app)
+        // Innermost layer: runs inside routing (so `MatchedPath` is set) and
+        // after the request-id layer has stamped the id. Emits the
+        // `http_requests_*` metrics + a structured access-log line per request.
+        .layer(axum::middleware::from_fn(
+            crate::common::request_metrics::track_request,
+        ))
+        .layer(config.security.cors_allow_origin.clone())
+        // A span per request, so whatever a handler logs carries the request
+        // id, method and path. It logs nothing itself: the access log is
+        // `track_request`'s one line, and failures are logged where they
+        // happen. The query string is left out (see `request_span`).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(request_span)
+                .on_request(())
+                .on_response(())
+                .on_failure(()),
+        )
+        .layer(RequestBodyLimitLayer::new(config.limits.http_size))
+        .layer(rate_limit_layer)
+        .layer(RequestIdLayer::new())
+        .merge(probe_routes(
+            api_prefix,
+            shared_state,
+            config.security.cors_allow_origin.clone(),
+        ));
+
+    // `/metrics` sits outside the per-IP limiter (a scraper must not compete
+    // with traffic) but behind its own address/token check and request budget.
+    let app = if let Some(handle) = metrics_handle {
+        let access = Arc::new(MetricsAccess::new(
+            config.metrics_allow_cidrs.clone(),
+            config.metrics_bearer_token.as_ref().map(|t| t.0.clone()),
+            client_ip_extractor(&config.trust_xff_cidrs)?,
+            config.limits.metrics_requests_per_second,
+        ));
+        info!(
+            allow = %config
+                .metrics_allow_cidrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            bearer_token = config.metrics_bearer_token.is_some(),
+            requests_per_second = config.limits.metrics_requests_per_second,
+            "/metrics access"
+        );
+        if config.trust_xff_cidrs.is_empty()
+            && config.metrics_allow_cidrs == crate::common::config::default_metrics_allow_cidrs()
+        {
+            warn!(
+                "/metrics admits private addresses and server.trust_xff_cidrs is empty: behind a \
+                 load balancer or reverse proxy every request appears to come from the proxy, \
+                 so clients reaching the mediator through it can read /metrics. Set \
+                 trust_xff_cidrs to the proxy's ranges, or narrow server.metrics_allow_cidrs."
+            );
+        }
+        app.route(
+            join_api_path(api_prefix, "metrics").as_str(),
+            get(metrics_handler)
+                .with_state(handle)
+                .layer(axum::middleware::from_fn_with_state(access, metrics_access)),
+        )
+    } else {
+        app
+    };
+
+    Ok(app)
+}
+
+/// The listener to serve on — the caller's, or `listen_address` bound now —
+/// and the address it is bound to.
+fn bind_listener(
+    config: &Config,
+    listener: Option<std::net::TcpListener>,
+) -> Result<(std::net::TcpListener, SocketAddr), MediatorError> {
+    // Bind synchronously with std so we can extract the actual port
+    // before async work begins. `from_tcp` then takes the listener as
+    // input — this is how the embedded path can hand the bound URL
+    // back to the caller while the server runs in a spawned task.
+    let configured_addr = config.listen_address.parse::<SocketAddr>().map_err(|e| {
+        error!("Invalid listen_address '{}': {e}", config.listen_address);
+        MediatorError::ConfigError(
+            error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("Invalid listen_address '{}': {e}", config.listen_address),
+        )
+    })?;
+    // A caller that needed the port before startup (to mint a DID whose
+    // service endpoint embeds the URL, say) can bind it themselves and
+    // hand the listener over. Re-binding an address they had already
+    // bound and released leaves a window for another process to claim
+    // it — taking the listener means the port is never released.
+    let std_listener = match listener {
+        Some(listener) => listener,
+        None => std::net::TcpListener::bind(configured_addr).map_err(|e| {
+            error!("Failed to bind {}: {e}", configured_addr);
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "NA".into(),
+                format!("Failed to bind {configured_addr}: {e}"),
+            )
+        })?,
+    };
+    std_listener.set_nonblocking(true).map_err(|e| {
+        MediatorError::InternalError(
+            error_codes::INTERNAL_ERROR,
+            "NA".into(),
+            format!("Failed to set listener nonblocking: {e}"),
+        )
+    })?;
+    let bound_addr = std_listener.local_addr().map_err(|e| {
+        MediatorError::InternalError(
+            error_codes::INTERNAL_ERROR,
+            "NA".into(),
+            format!("Failed to read bound listener address: {e}"),
+        )
+    })?;
+
+    Ok((std_listener, bound_addr))
+}
+
+/// The server task serving `app` on `std_listener`, plain or TLS, and the
+/// URL schemes it answers on. The task drains on `shutdown_token` and then
+/// waits for the open sockets and supervised tasks (`wait_for_shutdown`).
+fn serve(
+    app: Router,
+    std_listener: std::net::TcpListener,
+    tls: TlsMode,
+    limits: &LimitsConfig,
+    shutdown_token: &CancellationToken,
+    open_sockets: Arc<AtomicUsize>,
+    task_health: crate::tasks::supervisor::HealthRegistry,
+) -> Result<ServerTask, MediatorError> {
+    // Graceful shutdown: when the token cancels, signal axum_server to
+    // drain. 30s drain matches the previous (TOML-only) behaviour.
+    let server_handle = axum_server::Handle::new();
+    let drain_handle = server_handle.clone();
+    let server_shutdown_token = shutdown_token.clone();
+    tokio::spawn(async move {
+        server_shutdown_token.cancelled().await;
+        info!("Gracefully shutting down HTTP server...");
+        drain_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+    });
+
+    let app_with_state = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    let (server_task, scheme, ws_scheme) = match tls {
+        TlsMode::Plain => {
+            // `axum_server::from_tcp` returns `io::Result<Server>` —
+            // wrap the std listener now (errors here mean the listener
+            // we just bound is somehow unusable, which would be a bug).
+            let mut server = axum_server::from_tcp(std_listener)
+                .map_err(|e| {
+                    error!("Failed to wrap TCP listener: {e}");
+                    MediatorError::InternalError(
+                        error_codes::INTERNAL_ERROR,
+                        "NA".into(),
+                        format!("Failed to wrap TCP listener: {e}"),
+                    )
+                })?
+                .map(|plain| connection_limit(plain, limits));
+            http_server::configure(server.http_builder(), limits);
+            let task: JoinHandle<Result<(), MediatorError>> = tokio::spawn(async move {
+                server
+                    .handle(server_handle)
+                    .serve(app_with_state)
+                    .await
+                    .map_err(|e| {
+                        error!("HTTP server error: {e}");
+                        MediatorError::InternalError(
+                            error_codes::INTERNAL_ERROR,
+                            "NA".into(),
+                            format!("HTTP server error: {e}"),
+                        )
+                    })?;
+                wait_for_shutdown(&open_sockets, &task_health).await;
+                info!("Mediator shutdown complete.");
+                Ok(())
+            });
+            (task, "http", "ws")
+        }
+        TlsMode::Rustls(rustls_config) => {
+            // The cap wraps TLS, so a connection over it is closed before a
+            // handshake is spent on it.
+            let mut server = axum_server::from_tcp_rustls(std_listener, rustls_config)
+                .map_err(|e| {
+                    error!("Failed to wrap TCP listener with TLS: {e}");
+                    MediatorError::InternalError(
+                        error_codes::INTERNAL_ERROR,
+                        "NA".into(),
+                        format!("Failed to wrap TCP listener with TLS: {e}"),
+                    )
+                })?
+                .map(|tls| connection_limit(tls, limits));
+            http_server::configure(server.http_builder(), limits);
+            let task: JoinHandle<Result<(), MediatorError>> = tokio::spawn(async move {
+                server
+                    .handle(server_handle)
+                    .serve(app_with_state)
+                    .await
+                    .map_err(|e| {
+                        error!("HTTPS server error: {e}");
+                        MediatorError::InternalError(
+                            error_codes::INTERNAL_ERROR,
+                            "NA".into(),
+                            format!("HTTPS server error: {e}"),
+                        )
+                    })?;
+                wait_for_shutdown(&open_sockets, &task_health).await;
+                info!("Mediator shutdown complete.");
+                Ok(())
+            });
+            (task, "https", "wss")
+        }
+    };
+
+    Ok((server_task, scheme, ws_scheme))
+}
+
+/// The server task and its HTTP and WebSocket URL schemes.
+type ServerTask = (
+    JoinHandle<Result<(), MediatorError>>,
+    &'static str,
+    &'static str,
+);
+
+/// The published HTTP and WebSocket endpoints for `bound_addr`.
+fn endpoints(
+    scheme: &str,
+    ws_scheme: &str,
+    bound_addr: SocketAddr,
+    api_prefix: &str,
+) -> Result<(Url, Url), MediatorError> {
+    // `api_prefix` is canonical (`""` or `"/foo"` with no trailing
+    // slash). The published `http_endpoint` is documented as a base URL
+    // that callers can concatenate suffixes onto (and that `Url::join`
+    // can resolve relative paths against), so it always ends with `/`.
+    // The WS endpoint is built via `join_api_path` for the same
+    // slash-safety guarantee.
+    let http_endpoint =
+        Url::parse(&format!("{scheme}://{bound_addr}{api_prefix}/")).map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "NA".into(),
+                format!("Failed to build http endpoint URL: {e}"),
+            )
+        })?;
+    let ws_path = join_api_path(api_prefix, "ws");
+    let ws_endpoint = Url::parse(&format!("{ws_scheme}://{bound_addr}{ws_path}")).map_err(|e| {
+        MediatorError::InternalError(
+            error_codes::INTERNAL_ERROR,
+            "NA".into(),
+            format!("Failed to build ws endpoint URL: {e}"),
+        )
+    })?;
+
+    Ok((http_endpoint, ws_endpoint))
+}
+
+/// The health and readiness routes.
+///
+/// Kept outside the rate limiter and the body limit — an orchestrator probing
+/// a busy mediator must not be refused as if it were traffic — but **inside the
+/// CORS policy**. They used to be added after the CORS layer, and a route added
+/// after `.layer()` is not wrapped by it, so they never sent
+/// `Access-Control-Allow-Origin`: a browser client whose origin the mediator
+/// allows everywhere else could authenticate, hold a WebSocket and run Trust
+/// Tasks, yet could not read `readyz` (the release a console reports) and saw
+/// only "Failed to fetch". A probe without an `Origin`
+/// header is answered exactly as before.
+fn probe_routes(
+    api_prefix: &str,
+    shared_state: SharedData,
+    cors: tower_http::cors::CorsLayer,
+) -> Router {
+    Router::new()
+        .route(
+            join_api_path(api_prefix, "healthchecker").as_str(),
+            get(health_checker_handler).with_state(shared_state.clone()),
+        )
+        .route(
+            join_api_path(api_prefix, "readyz").as_str(),
+            get(readiness_handler).with_state(shared_state),
+        )
+        .route(
+            join_api_path(api_prefix, "livez").as_str(),
+            get(liveness_handler),
+        )
+        .layer(cors)
+}
+
+fn install_production_tracing(
+    ansi: bool,
+    log_json: bool,
+    log_level: tracing_subscriber::filter::LevelFilter,
+) -> Result<(), MediatorError> {
+    let filter = if env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new(log_level.to_string())
+    };
+
+    let subscriber = tracing_subscriber::fmt()
+        .compact()
+        .with_file(false)
+        .with_line_number(false)
+        .with_thread_ids(false)
+        .with_target(true)
+        .with_ansi(ansi)
+        .with_env_filter(filter);
+
+    if log_json {
+        let subscriber = subscriber.json().finish();
+        // Errors here mean a subscriber is already installed — that's
+        // fine for embedded callers who switched modes mid-process.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    } else {
+        let subscriber = subscriber.finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
+    Ok(())
+}
+
+fn print_banner() {
+    println!();
+    println!(
+        r#"        db          ad88     ad88  88               88           88  88     88b           d88                       88  88"#
+    );
+    println!(
+        r#"       d88b        d8"      d8"    ""               ""           88  ""     888b         d888                       88  ""                ,d"#
+    );
+    println!(
+        r#"      d8'`8b       88       88                                   88         88`8b       d8'88                       88                    88"#
+    );
+    println!(
+        r#"     d8'  `8b    MM88MMM  MM88MMM  88  8b,dPPYba,   88   ,adPPYb,88  88     88 `8b     d8' 88   ,adPPYba,   ,adPPYb,88  88  ,adPPYYba,  MM88MMM  ,adPPYba,   8b,dPPYba,"#
+    );
+    println!(
+        r#"    d8YaaaaY8b     88       88     88  88P'   `"8a  88  a8"    `Y88  88     88  `8b   d8'  88  a8P_____88  a8"    `Y88  88  ""     `Y8    88    a8"     "8a  88P'   "Y8"#
+    );
+    println!(
+        r#"   d8""""""""8b    88       88     88  88       88  88  8b       88  88     88   `8b d8'   88  8PP"""""""  8b       88  88  ,adPPPPP88    88    8b       d8  88"#
+    );
+    println!(
+        r#"  d8'        `8b   88       88     88  88       88  88  "8a,   ,d88  88     88    `888'    88  "8b,   ,aa  "8a,   ,d88  88  88,    ,88    88,   "8a,   ,a8"  88"#
+    );
+    println!(
+        r#" d8'          `8b  88       88     88  88       88  88   `"8bbdP"Y8  88     88     `8'     88   `"Ybbd8"'   `"8bbdP"Y8  88  `"8bbdP"Y8    "Y888  `"YbbdP"'   88"#
+    );
+    println!();
+}
+
+/// How long a stopping mediator waits for its WebSockets to close and its
+/// background tasks to stop, once the HTTP server has.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
+
+/// After the HTTP server has stopped, wait (up to [`SHUTDOWN_DRAIN`]) for
+/// every WebSocket to have closed and every supervised task to have stopped.
+///
+/// The server's graceful shutdown does not track upgraded connections, so it
+/// can finish while sockets are still closing: each closes with 1001 on the
+/// shutdown token, deregisters and records its close, and a process that
+/// exits as soon as `join` returns would cut that short, leaving clients to
+/// infer the drop (R6.2). A component still `Restarting` is not a running
+/// task (the supervisor stops those at once on shutdown), so only `Running`
+/// ones are waited for.
+async fn wait_for_shutdown(
+    open_sockets: &AtomicUsize,
+    task_health: &crate::tasks::supervisor::HealthRegistry,
+) {
+    use crate::tasks::supervisor::ComponentState;
+    let settled = || {
+        open_sockets.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && !task_health
+                .iter()
+                .any(|c| c.state == ComponentState::Running)
+    };
+    let waited = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+        while !settled() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if waited.is_err() {
+        let running: Vec<String> = task_health
+            .iter()
+            .filter(|c| c.state == ComponentState::Running)
+            .map(|c| c.name.clone())
+            .collect();
+        warn!(
+            open_websockets = open_sockets.load(std::sync::atomic::Ordering::Relaxed),
+            ?running,
+            "shutdown: gave up waiting for WebSockets to close and tasks to stop after {}s",
+            SHUTDOWN_DRAIN.as_secs()
+        );
+    }
+}
+
+/// The listener's connection cap and first-bytes deadline (`limits`), around
+/// `inner`.
+fn connection_limit<A>(inner: A, limits: &LimitsConfig) -> http_server::ConnectionLimit<A> {
+    http_server::ConnectionLimit::new(
+        inner,
+        limits.max_http_connections,
+        Duration::from_secs(limits.http_header_read_timeout_secs),
+    )
+}
+
+/// The tracing span for one HTTP request: method, path and request id.
+///
+/// The query string is deliberately left out. `GET /oob?_oobid=<id>` carries
+/// an invitation id that is all it takes to fetch the invitation, and the
+/// default span recorded the whole URI at INFO.
+fn request_span<B>(request: &http::Request<B>) -> tracing::Span {
+    let request_id = request
+        .extensions()
+        .get::<crate::common::request_id::RequestId>()
+        .map(|id| id.0.as_str())
+        .unwrap_or_default();
+    tracing::span!(
+        Level::INFO,
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        request_id = %request_id,
+    )
+}
+
+/// Wait for a shutdown signal (SIGINT or SIGTERM).
+///
+/// If a handler fails to install, log it and stay pending on that
+/// branch so the other handler can still trigger shutdown. If both
+/// fail, the mediator only stops on SIGKILL.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(err) => {
+                error!("Failed to install Ctrl+C handler: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                error!("Failed to install SIGTERM handler: {err}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// Compute the `(host, port)` authorities the routing 2.0 forward
+/// handler should treat as local for this mediator instance. Combines
+/// `config.listen_address` (always included) with any operator-declared
+/// aliases in `config.local_endpoints`.
+///
+/// Hostnames are lower-cased for case-insensitive comparison; ports
+/// fall back to the URL-scheme defaults (80/443/80/443 for
+/// http/https/ws/wss) when the URL omits an explicit port.
+///
+/// Malformed entries are skipped with a `warn!` log rather than
+/// causing startup to fail — a typo'd alias should not block the
+/// mediator from booting.
+pub(crate) fn compute_self_authorities(config: &Config) -> HashSet<(String, u16)> {
+    compute_self_authorities_from(&config.listen_address, &config.local_endpoints)
+}
+
+/// Field-level core of [`compute_self_authorities`] — kept separate so
+/// unit tests can exercise it without standing up a full [`Config`].
+pub(crate) fn compute_self_authorities_from(
+    listen_address: &str,
+    local_endpoints: &[String],
+) -> HashSet<(String, u16)> {
+    let mut out = HashSet::new();
+
+    // Bind address: parse as a SocketAddr and record (ip, port). When
+    // the bind is `0.0.0.0` or `::` we still record the literal —
+    // operators relying on `INADDR_ANY` should declare their public
+    // hostname(s) via `local_endpoints` for the comparison to match.
+    if let Ok(addr) = listen_address.parse::<SocketAddr>() {
+        out.insert((normalize_host(&addr.ip().to_string()), addr.port()));
+    }
+
+    for raw in local_endpoints {
+        match Url::parse(raw) {
+            Ok(url) => match (url.host_str(), default_port_for(&url)) {
+                (Some(host), Some(port)) => {
+                    out.insert((normalize_host(host), port));
+                }
+                _ => warn!(
+                    "Skipping local_endpoints entry {:?}: missing host or port",
+                    raw
+                ),
+            },
+            Err(e) => warn!(
+                "Skipping local_endpoints entry {:?}: not a valid URL ({})",
+                raw, e
+            ),
+        }
+    }
+
+    out
+}
+
+/// Parse `uri` and return `true` when its `(host, port)` matches any entry in
+/// `self_authorities` — i.e. the URI points back at this mediator instance.
+///
+/// Hostnames are normalized via [`normalize_host`] (strips outer `[ ]` from IPv6
+/// literals, lowercases) so the lookup matches the form inserted by
+/// [`compute_self_authorities`], and the port falls back to the scheme default
+/// via [`default_port_for`]. Returns `false` for unparseable URIs and for
+/// schemes without a default port — including `did:`, which parses as a URL but
+/// names an identity, not an authority.
+///
+/// Lives here, next to the authority set it consults, because both forwarding
+/// paths need it: the DIDComm relay (`protocols::routing`) and the TSP relay
+/// (`messages::inbound`), and the latter compiles in builds where the DIDComm
+/// module does not exist.
+pub(crate) fn uri_points_at_self(uri: &str, self_authorities: &HashSet<(String, u16)>) -> bool {
+    let Ok(url) = Url::parse(uri) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let Some(port) = default_port_for(&url) else {
+        return false;
+    };
+    self_authorities.contains(&(normalize_host(host), port))
+}
+
+/// Normalize a host string for self-authority comparison.
+///
+/// `Url::host_str()` returns IPv6 literals wrapped in `[ ]` (e.g. `"[::1]"`)
+/// while `std::net::SocketAddr::ip().to_string()` returns them bare
+/// (`"::1"`). Strip the outer brackets so the two paths produce the same
+/// key, and lowercase for case-insensitive matching.
+pub(crate) fn normalize_host(host: &str) -> String {
+    let stripped = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    stripped.to_ascii_lowercase()
+}
+
+/// Resolve the effective port for a URL, falling back to the
+/// scheme-specific default when the URL omits an explicit port.
+pub(crate) fn default_port_for(url: &Url) -> Option<u16> {
+    if let Some(port) = url.port() {
+        return Some(port);
+    }
+    match url.scheme() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    }
+}
+
+/// The name the mediator's limiter puts in `x-rate-limit-source`. Clients match
+/// on it to tell the mediator's refusals from a VTA's (`vta`), a VTC's (`vtc`),
+/// a DID host's (`did-host`) or an unlabelled proxy's.
+pub const RATE_LIMIT_SOURCE: &str = "mediator";
+
+/// The per-IP limiter, labelled as the mediator's.
+///
+/// It wraps every application route — REST, the websocket upgrade (`/ws`) and
+/// DIDComm/TSP ingress (`/inbound`) — so this is the one place a mediator `429`
+/// is produced, and every one of them says who refused.
+///
+/// Every refusal is counted: a quota refusal in `rate_limited_total`
+/// (`scope = ip`), and a request the limiter could not attribute to a client in
+/// `rate_limit_attribution_failures_total` (`reason = invalid_forwarded_for |
+/// no_client_ip`). The latter moving means a proxy or listener is misconfigured,
+/// not that a client is noisy.
+fn ip_rate_limiter(limits: &LimitsConfig) -> RateLimiterState {
+    use crate::common::metrics::names::{
+        RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL, RATE_LIMITED_TOTAL,
+    };
+
+    RateLimiterState::new(limits.rate_limit_per_ip, limits.rate_limit_burst)
+        .with_source(RATE_LIMIT_SOURCE)
+        .on_refused(|refusal| match refusal {
+            Refusal::RateLimited { .. } => {
+                ::metrics::counter!(RATE_LIMITED_TOTAL, "scope" => "ip").increment(1);
+            }
+            Refusal::InvalidForwardedFor => {
+                ::metrics::counter!(
+                    RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL,
+                    "reason" => "invalid_forwarded_for"
+                )
+                .increment(1);
+            }
+            Refusal::NoClientIp => {
+                ::metrics::counter!(
+                    RATE_LIMIT_ATTRIBUTION_FAILURES_TOTAL,
+                    "reason" => "no_client_ip"
+                )
+                .increment(1);
+            }
+            _ => {}
+        })
+}
+
+/// The layer applying [`ip_rate_limiter`], reading `X-Forwarded-For` only from
+/// the reverse proxies in `trust_xff_cidrs` (see
+/// `affinidi_rate_limit::RateLimitLayer::trusted_proxies`).
+///
+/// Config validation already refuses a catch-all range; the error here is the
+/// backstop for a `Config` built in code.
+fn ip_rate_limit_layer(
+    limiter: RateLimiterState,
+    trust_xff_cidrs: &[IpNet],
+) -> Result<RateLimitLayer, MediatorError> {
+    RateLimitLayer::new(limiter)
+        .trusted_proxies(trust_xff_cidrs.to_vec())
+        .map_err(|e| {
+            MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!("server.trust_xff_cidrs: {e}"),
+            )
+        })
+}
+
+/// The client-address resolver shared by the relay admission check and the
+/// `/metrics` gate: the same attribution the per-IP limiter uses.
+fn client_ip_extractor(trust_xff_cidrs: &[IpNet]) -> Result<ClientIpExtractor, MediatorError> {
+    ClientIpExtractor::trusted_proxies(trust_xff_cidrs.to_vec()).map_err(|e| {
+        MediatorError::ConfigError(
+            error_codes::CONFIG_ERROR,
+            "NA".into(),
+            format!("server.trust_xff_cidrs: {e}"),
+        )
+    })
+}
+
+/// The key relay WebSockets are counted under: [`client_ip_extractor`], with
+/// an IPv6 client masked to its /64. A host is normally given a whole /64, so
+/// counting each address separately would let one host hold every relay slot.
+pub(crate) fn relay_client_ip_extractor(
+    trust_xff_cidrs: &[IpNet],
+) -> Result<ClientIpExtractor, MediatorError> {
+    client_ip_extractor(trust_xff_cidrs)?
+        .ipv6_prefix(64)
+        .map_err(|e| {
+            MediatorError::InternalError(
+                error_codes::INTERNAL_ERROR,
+                "NA".into(),
+                format!("relay client key: {e}"),
+            )
+        })
+}
+
+/// Say at startup how the per-IP limiter will attribute requests, so an
+/// operator can see from the log alone whether `X-Forwarded-For` is in play.
+fn log_ip_rate_limiter(limiter: &RateLimiterState, limits: &LimitsConfig, trusted: &[IpNet]) {
+    let trusted_list = || {
+        trusted
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !limiter.is_enabled() {
+        if !trusted.is_empty() {
+            warn!(
+                "server.trust_xff_cidrs is set ({}) but per-IP rate limiting is disabled \
+                 (limits.rate_limit_per_ip = 0): X-Forwarded-For is not read and malformed \
+                 chains are not rejected",
+                trusted_list()
+            );
+        }
+        return;
+    }
+    info!(
+        "Rate limiting enabled: {} req/s per IP, burst: {}",
+        limits.rate_limit_per_ip, limits.rate_limit_burst,
+    );
+    if trusted.is_empty() {
+        info!("Per-IP rate limiting keys on the socket peer (server.trust_xff_cidrs is empty)");
+    } else {
+        info!(
+            "Per-IP rate limiting reads X-Forwarded-For from trusted proxies: {}",
+            trusted_list()
+        );
+    }
+}
+
+/// Give the mediator's own DID the `Mediator` role (with the same locked-down
+/// ACLs the Redis bootstrap uses) and the configured `admin_did` the `RootAdmin`
+/// role, creating either account if it does not exist.
+pub(crate) async fn seed_privileged_accounts(
+    store: &dyn affinidi_messaging_mediator_common::store::MediatorStore,
+    config: &Config,
+) -> Result<(), MediatorError> {
+    use affinidi_messaging_mediator_common::types::accounts::AccountType;
+    use affinidi_messaging_mediator_common::types::acls::MediatorACLSet;
+
+    let mediator_acl =
+        MediatorACLSet::from_string_ruleset("DENY_ALL,LOCAL,BLOCKED").map_err(|e| {
+            MediatorError::ConfigError(
+                error_codes::CONFIG_ERROR,
+                "NA".into(),
+                format!("Hardcoded mediator ACL ruleset is invalid: {e}"),
+            )
+        })?;
+    store
+        .setup_admin_account(
+            &config.mediator_did_hash,
+            AccountType::Mediator,
+            &mediator_acl,
+        )
+        .await?;
+    if !config.admin_did.is_empty() {
+        let admin_hash =
+            affinidi_messaging_mediator_common::did_identity::did_hash(&config.admin_did);
+        store
+            .setup_admin_account(
+                &admin_hash,
+                AccountType::RootAdmin,
+                &config.security.global_acl_default,
+            )
+            .await?;
+        info!("Root admin account: {} ({admin_hash})", config.admin_did);
+    }
+    Ok(())
+}
+
+/// The per-DID limiter, exempting the mediator's own DID and the configured
+/// admin DID.
+///
+/// Forwarded traffic needs no exemption here: an inter-mediator hop is posted
+/// anonymously, and anonymous sessions are never charged (they carry no DID).
+/// A forward a *client* submits is charged to that client, which is the
+/// authenticated sender.
+fn did_rate_limiter(config: &Config) -> DidRateLimiter {
+    DidRateLimiter::new(
+        config.limits.did_rate_limit_per_second,
+        config.limits.did_rate_limit_burst,
+    )
+    .with_exempt_did_hashes([
+        config.mediator_did_hash.clone(),
+        if config.admin_did.is_empty() {
+            String::new()
+        } else {
+            affinidi_messaging_mediator_common::did_identity::did_hash(&config.admin_did)
+        },
+    ])
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use affinidi_messaging_sdk::errors::{ATMError, HttpStatusError};
+    use axum::{body::Body, extract::ConnectInfo};
+    use http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    #[test]
+    fn relay_sockets_from_one_ipv6_64_share_a_key() {
+        let extractor = relay_client_ip_extractor(&[]).unwrap();
+        let none = http::HeaderMap::new();
+        let key = |ip: &str| extractor.client_key(ip.parse().unwrap(), &none).unwrap();
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_ne!(key("192.0.2.1"), key("192.0.2.2"), "IPv4 is per address");
+    }
+
+    fn limits(per_second: u32, burst: u32) -> LimitsConfig {
+        LimitsConfig {
+            rate_limit_per_ip: per_second,
+            rate_limit_burst: burst,
+            ..LimitsConfig::default()
+        }
+    }
+
+    fn request(uri: &str) -> Request<Body> {
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 5000))));
+        request
+    }
+
+    fn request_via(peer: [u8; 4], forwarded: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri("/ws")
+            .header("x-forwarded-for", forwarded)
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((peer, 5000))));
+        request
+    }
+
+    /// Behind a trusted proxy each forwarded client gets its own bucket, while
+    /// an untrusted peer cannot choose its bucket by sending the header.
+    #[tokio::test]
+    async fn trusted_proxy_buckets_clients_by_forwarded_address() {
+        let app = Router::new()
+            .route("/ws", get(|| async { "upgrade" }))
+            .layer(
+                ip_rate_limit_layer(
+                    ip_rate_limiter(&limits(1, 1)),
+                    &["10.0.0.0/8".parse().unwrap()],
+                )
+                .unwrap(),
+            );
+        let status = |app: Router, req: Request<Body>| async move {
+            app.oneshot(req).await.unwrap().status()
+        };
+
+        assert_eq!(
+            status(app.clone(), request_via([10, 0, 0, 1], "203.0.113.1")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(app.clone(), request_via([10, 0, 0, 1], "203.0.113.2")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(app.clone(), request_via([10, 0, 0, 1], "203.0.113.1")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Untrusted peer: the header is ignored, so rotating it does not help.
+        assert_eq!(
+            status(app.clone(), request_via([192, 0, 2, 9], "198.51.100.1")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(app.clone(), request_via([192, 0, 2, 9], "198.51.100.2")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        // An unreadable chain from the trusted proxy is refused as the
+        // mediator's, without charging any bucket.
+        let refused = app
+            .oneshot(request_via([10, 0, 0, 1], "203.0.113.3, unknown"))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refused.headers()["x-rate-limit-source"], RATE_LIMIT_SOURCE);
+    }
+
+    #[test]
+    fn a_catch_all_trusted_range_is_a_config_error() {
+        let Err(err) = ip_rate_limit_layer(
+            ip_rate_limiter(&limits(1, 1)),
+            &["0.0.0.0/0".parse().unwrap()],
+        ) else {
+            panic!("a catch-all range must be refused");
+        };
+        assert!(err.to_string().contains("0.0.0.0/0"), "{err}");
+    }
+
+    /// A mediator `429` carries the attribution contract, and the SDK reads it
+    /// back as a typed rate-limit refusal naming the mediator. Both ends of the
+    /// contract in one test, so neither can drift from the other.
+    #[tokio::test]
+    async fn mediator_429_is_attributed_and_the_sdk_reads_it() {
+        let app = Router::new()
+            .route("/inbound", axum::routing::post(|| async { "accepted" }))
+            .route("/ws", get(|| async { "upgrade" }))
+            .layer(ip_rate_limit_layer(ip_rate_limiter(&limits(1, 1)), &[]).unwrap());
+
+        assert_eq!(
+            app.clone().oneshot(request("/ws")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let refused = app.oneshot(request("/ws")).await.unwrap();
+
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let source = refused.headers()["x-rate-limit-source"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(source, "mediator");
+        let retry_after = refused.headers()[header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "rate_limited");
+        assert_eq!(body["limiter"], "mediator");
+        assert_eq!(
+            body["retryAfterSecs"].as_u64().unwrap().to_string(),
+            retry_after
+        );
+
+        let err = ATMError::from(HttpStatusError::from_parts(
+            "WebSocket connection refused",
+            429,
+            Some(&source),
+            Some(&retry_after),
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        ));
+        assert!(err.is_rate_limited());
+        let status = err.http_status().unwrap();
+        assert_eq!(status.rate_limit_source.as_deref(), Some(RATE_LIMIT_SOURCE));
+        assert_eq!(
+            status.retry_after_secs,
+            Some(retry_after.parse::<u64>().unwrap())
+        );
+    }
+
+    #[test]
+    fn the_limiter_is_labelled_even_when_disabled() {
+        assert_eq!(
+            ip_rate_limiter(&limits(0, 0)).source(),
+            Some(RATE_LIMIT_SOURCE)
+        );
+    }
+}
+
+#[cfg(all(test, feature = "fjall-backend"))]
+mod fjall_tuning_tests {
+    use super::fjall_tuning_from_raw;
+    use crate::store::FjallDurability;
+    use affinidi_messaging_mediator_config::FjallConfig;
+
+    fn durability(value: &str) -> FjallDurability {
+        let raw = FjallConfig {
+            durability: value.to_string(),
+            ..FjallConfig::default()
+        };
+        fjall_tuning_from_raw(Some(&raw)).durability
+    }
+
+    #[test]
+    fn durability_defaults_to_buffered() {
+        assert_eq!(
+            fjall_tuning_from_raw(None).durability,
+            FjallDurability::Buffered
+        );
+        assert_eq!(durability("buffered"), FjallDurability::Buffered);
+    }
+
+    #[test]
+    fn durability_sync_is_recognised_case_insensitively() {
+        assert_eq!(durability("sync"), FjallDurability::Sync);
+        assert_eq!(durability(" SYNC "), FjallDurability::Sync);
+    }
+
+    /// A typo in a request for durability must not quietly weaken it.
+    #[test]
+    fn an_unrecognised_durability_is_treated_as_sync() {
+        assert_eq!(durability("fsync"), FjallDurability::Sync);
+        assert_eq!(durability(""), FjallDurability::Sync);
+    }
+}

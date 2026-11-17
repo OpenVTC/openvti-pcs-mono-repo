@@ -1,0 +1,1856 @@
+//! `MessagingRegistryClient` — the trust-registry client that addresses the
+//! registry by **DID**, over TSP or DIDComm, using the canonical `registry/*`
+//! Trust Tasks.
+//!
+//! ## Why this exists
+//!
+//! [`UpstreamRegistryClient`](super::upstream::UpstreamRegistryClient) reaches
+//! the registry at a configured `registry.url` over HTTP. That works for the
+//! two TRQP *reads* the upstream exposes on its HTTP surface, but:
+//!
+//! - every **write** was a `Permanent` stub, so membership never synced;
+//! - a URL is not always available — a registry is named by DID in the
+//!   community's DID document (`#trust-registry` referral), and a deployment
+//!   may publish nothing else;
+//! - `health()` was an HTTP `GET /.well-known/did.json`, which stays green
+//!   while every write fails (R6.2: a health flag must be driven by a signal
+//!   that can go false again — this one could not).
+//!
+//! This client closes all three. It speaks the registry's Trust Tasks —
+//! `registry/record/{put,delete,query}` and `registry/recognition` — over the
+//! transport both parties advertise, and derives liveness from a real
+//! round-trip rather than from a URL being up.
+//!
+//! Membership records are written with `registry/record/put/0.3` and read with
+//! `registry/record/query/0.3`, the lowerCamelCase versions whose records carry
+//! a validity window (`validFrom` / `validUntil`). A registry that predates
+//! them answers `unsupportedVersion`, and is then sent the 0.1 versions (see
+//! [`MessagingRegistryClient::round_trip_versioned`]). Every other read and
+//! write goes the same way: `registry/record/delete/0.2` and
+//! `registry/recognition/0.2` first, 0.1 to a registry that predates them. The
+//! fallback stays while released trust registries (affinidi-trust-registry-rs
+//! 0.28 and earlier) answer only 0.1. Records travel lowerCamelCase on the
+//! newer versions; [`record_to_v0_3`] and [`record_from_v0_3`] convert at the
+//! wire so the git-namespace projection keeps one shape.
+//!
+//! ## Transport selection
+//!
+//! Per CLAUDE.md the DID document is authoritative and the preference order is
+//! TSP > DIDComm > REST, matched on the service **`type`** (never the `#id`
+//! fragment). We resolve the registry's DID, read its
+//! [`ServiceCapabilities`], intersect with what this build can speak, and take
+//! the highest-preference overlap. An empty intersection is a typed error, not
+//! a silent downgrade — [`select_protocol`] returns `NoMatchingProtocol`
+//! carrying both advertised sets so the operator can see which side is missing
+//! what.
+//!
+//! REST remains reachable as the last-resort arm: when the match lands on
+//! `Protocol::Rest` we delegate to the HTTP client, which is why
+//! `registry.url` stays meaningful for a registry that advertises `TRQPRest`
+//! and nothing else.
+//!
+//! ## Replies
+//!
+//! Both messaging transports are one-way sends; the answer arrives back on the
+//! inbound listener as a separate frame. We register a waiter keyed by the
+//! request document id **before** sending (so a fast reply cannot be lost) and
+//! the inbound demux completes it by `threadId` — the same
+//! [`PendingReplies`] the git-trust hook writer uses, which is why a registry
+//! reply needs no new inbound plumbing on the DIDComm side.
+//!
+//! R1.1 discipline throughout: a send returning `Ok` means "accepted locally",
+//! never "delivered". A call is complete only when a correlated reply arrives;
+//! no reply within the window is `Transient`, which the syncer retries.
+//!
+//! ## The TSP envelope
+//!
+//! TSP frames to the registry are wrapped in the `trust-tasks-tsp` binding
+//! envelope (`{"type": <ENVELOPE_TYPE>, "document": <TrustTask>}`). This is
+//! **not** what the rest of this workspace does over TSP — VTI sends bare
+//! Trust-Task document bytes (see `vta_sdk::session::DIDCommSession::
+//! send_document` and `messaging::handle_tsp`) — but the registry's TSP
+//! binding rejects a payload without the envelope, and the envelope is the
+//! published binding. We therefore emit the envelope and accept **either**
+//! shape inbound.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use async_trait::async_trait;
+use serde_json::{Value, json};
+use tokio::sync::OnceCell;
+use tracing::debug;
+use trust_tasks_rs::TrustTask;
+use vta_sdk::protocol::matching::{Protocol, ServiceCapabilities, select_protocol};
+
+use vti_common::capability_client::build_document;
+
+use crate::credentials::LocalSigner;
+use crate::hooks::PendingReplies;
+use crate::messaging::VtcMessaging;
+
+use super::client::{
+    CapabilityModuleChange, RegistryError, RegistryTransport, TrustRegistryClient,
+};
+use super::model::{RegistryRecord, RegistryStatus};
+use super::upstream::UpstreamRegistryClient;
+use super::{RECOGNISE_ACTION, TRUST_GRAPH_RESOURCE};
+
+/// Canonical `registry/*` Trust Task type URIs.
+const RECORD_PUT: &str = "https://trusttasks.org/spec/registry/record/put/0.1";
+const RECORD_DELETE: &str = "https://trusttasks.org/spec/registry/record/delete/0.1";
+const RECORD_QUERY: &str = "https://trusttasks.org/spec/registry/record/query/0.1";
+const RECOGNITION: &str = "https://trusttasks.org/spec/registry/recognition/0.1";
+/// The lowerCamelCase versions, whose records carry a validity window.
+const RECORD_PUT_0_3: &str = "https://trusttasks.org/spec/registry/record/put/0.3";
+const RECORD_QUERY_0_3: &str = "https://trusttasks.org/spec/registry/record/query/0.3";
+const RECORD_DELETE_0_2: &str = "https://trusttasks.org/spec/registry/record/delete/0.2";
+const RECOGNITION_0_2: &str = "https://trusttasks.org/spec/registry/recognition/0.2";
+
+/// The registry/* 0.1 members renamed lowerCamelCase from 0.2/0.3 (registry
+/// `_shared/0.2`). Everything else keeps its name.
+const RENAMED: [(&str, &str); 3] = [
+    ("entity_id", "entityId"),
+    ("authority_id", "authorityId"),
+    ("record_type", "recordType"),
+];
+
+/// A 0.1-shaped record (or key) as `registry/record/put/0.3` and
+/// `record/delete/0.2` spell it.
+fn record_to_v0_3(v: &Value) -> Value {
+    let mut out = v.clone();
+    if let Some(map) = out.as_object_mut() {
+        for (old, new) in RENAMED {
+            if let Some(x) = map.remove(old) {
+                map.insert(new.to_string(), x);
+            }
+        }
+    }
+    out
+}
+
+/// A `registry/record/query/0.3` record in the 0.1 shape callers of the
+/// projection read.
+fn record_from_v0_3(v: &Value) -> Value {
+    let mut out = v.clone();
+    if let Some(map) = out.as_object_mut() {
+        for (old, new) in RENAMED {
+            if let Some(x) = map.remove(new) {
+                map.insert(old.to_string(), x);
+            }
+        }
+    }
+    out
+}
+/// `governance/capability/{enable,disable}/0.1`, read off the generated types.
+const CAPABILITY_ENABLE: &str =
+    <vti_specs::governance::capability::enable::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+const CAPABILITY_DISABLE: &str = <vti_specs::governance::capability::disable::v0_1::Payload as trust_tasks_rs::Payload>::TYPE_URI;
+
+/// Default wait for the registry's reply before a call is deemed transient.
+/// Matches the hook writer's window — same mediator, same round trip.
+pub const DEFAULT_REPLY_TIMEOUT_SECONDS: u64 = 60;
+
+/// Trust-registry client addressing the registry by DID over TSP / DIDComm,
+/// with the HTTP client as the REST arm.
+pub struct MessagingRegistryClient {
+    /// DID of the community's trust registry — the recipient of every task.
+    registry_did: String,
+    /// Our own DID: the TRQP `authority_id` on every record we write or query,
+    /// and the issuer of every document we sign. `None` before setup completes,
+    /// in which case every call refuses rather than writing a half-keyed record.
+    authority_did: Option<String>,
+    /// Messaging handle. Empty until the listener is up — a not-yet-running
+    /// messaging is transient, not permanent.
+    didcomm: Arc<OnceCell<Arc<VtcMessaging>>>,
+    /// The VTC's assertion signer (`{vtc_did}#key-0`), the same identity that
+    /// mints VMC/VAC. The community is the authority its records are written
+    /// under, so this is the right key — and its canonical form already
+    /// verifies at the registry (proven by the git-trust path).
+    signer: Arc<LocalSigner>,
+    /// Shared with the inbound demux; completed by `threadId`.
+    replies: PendingReplies,
+    /// Resolver for the registry's DID document (transport selection).
+    did_resolver: Option<DIDCacheClient>,
+    reply_timeout: Duration,
+    /// REST arm — present when `registry.url` is configured.
+    http: Option<UpstreamRegistryClient>,
+    /// What the last transport selection saw and chose, for the diagnostics
+    /// surface.
+    ///
+    /// Written on every [`select`](Self::select) rather than cached at boot,
+    /// because the selection is itself per-call: a registry that adds `#tsp`
+    /// mid-life changes this without a restart, and an operator looking at the
+    /// page needs the answer for the call that just ran, not the one at boot.
+    ///
+    /// A `std::sync::RwLock` and not a tokio one on purpose — every critical
+    /// section here is a field assignment with no `await` inside it (R1.3).
+    transport: Arc<RwLock<RegistryTransport>>,
+    /// The registry's TSP mediator — its `#tsp` endpoint — as the last
+    /// selection read it from the DID document. A TSP send routes through it
+    /// when it is not ours (VTI-56, `vti_common::tsp_route`). Same lock
+    /// discipline as `transport`.
+    tsp_mediator: RwLock<Option<String>>,
+    /// Set once the registry has answered a lowerCamelCase `registry/*` task
+    /// with `unsupportedVersion`: it predates them, and later calls go
+    /// straight to 0.1 instead of paying the extra round trip every time.
+    pre_0_3_registry: AtomicBool,
+}
+
+impl std::fmt::Debug for MessagingRegistryClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessagingRegistryClient")
+            .field("registry_did", &self.registry_did)
+            .field("authority_did", &self.authority_did)
+            .field("http_arm", &self.http.is_some())
+            .finish()
+    }
+}
+
+impl MessagingRegistryClient {
+    pub fn new(
+        registry_did: String,
+        authority_did: Option<String>,
+        didcomm: Arc<OnceCell<Arc<VtcMessaging>>>,
+        signer: Arc<LocalSigner>,
+        replies: PendingReplies,
+        did_resolver: Option<DIDCacheClient>,
+        http: Option<UpstreamRegistryClient>,
+    ) -> Self {
+        let transport = Arc::new(RwLock::new(RegistryTransport {
+            did: Some(registry_did.clone()),
+            url: http.as_ref().map(|c| c.base_url().to_string()),
+            ..RegistryTransport::default()
+        }));
+        Self {
+            registry_did,
+            authority_did,
+            didcomm,
+            signer,
+            replies,
+            did_resolver,
+            reply_timeout: Duration::from_secs(DEFAULT_REPLY_TIMEOUT_SECONDS),
+            http,
+            transport,
+            tsp_mediator: RwLock::new(None),
+            pre_0_3_registry: AtomicBool::new(false),
+        }
+    }
+
+    /// Shorten the reply window. Test-only: the production window is a
+    /// deliberate 60s, and the silence case would otherwise take that long to
+    /// assert.
+    #[cfg(any(test, feature = "transport-harness"))]
+    pub fn with_reply_timeout(mut self, timeout: Duration) -> Self {
+        self.reply_timeout = timeout;
+        self
+    }
+
+    /// Our own DID as TRQP authority, or a `Permanent` refusal.
+    fn authority(&self) -> Result<&str, RegistryError> {
+        self.authority_did.as_deref().ok_or_else(|| {
+            RegistryError::Permanent(
+                "vtc_did not configured — cannot address the trust registry (complete `vtc setup` \
+                 first)"
+                    .into(),
+            )
+        })
+    }
+
+    /// Which transport to use for the registry, this call.
+    ///
+    /// Re-evaluated per call rather than cached at boot: a registry that adds
+    /// `#tsp` mid-life should be reached over TSP on the next attempt, and the
+    /// resolver's own cache keeps this cheap.
+    async fn select(&self) -> Result<Protocol, RegistryError> {
+        match self.select_inner().await {
+            Ok((protocol, advertised)) => {
+                self.record_selection(advertised, Some(protocol), None);
+                Ok(protocol)
+            }
+            Err((e, advertised)) => {
+                // Record the failure *with* whatever we learned about the peer.
+                // "Advertised [tsp], active none, error: no transport in common"
+                // is a diagnosis; "unreachable" on its own is not.
+                self.record_selection(advertised, None, Some(e.to_string()));
+                Err(e)
+            }
+        }
+    }
+
+    /// [`select`](Self::select) without the bookkeeping. Returns the peer's
+    /// advertised set alongside either outcome so the failure path can report
+    /// it too.
+    async fn select_inner(
+        &self,
+    ) -> Result<(Protocol, Vec<Protocol>), (RegistryError, Vec<Protocol>)> {
+        let Some(resolver) = self.did_resolver.as_ref() else {
+            // No resolver configured: we cannot read the peer's document, and
+            // guessing is exactly the failure mode CLAUDE.md forbids.
+            return Err((
+                RegistryError::Permanent(
+                    "no DID resolver configured — cannot read the trust registry's advertised \
+                     transports"
+                        .into(),
+                ),
+                Vec::new(),
+            ));
+        };
+        let resolved = resolver.resolve(&self.registry_did).await.map_err(|e| {
+            // Resolution failure is a network-shaped condition (the DID host or
+            // the resolver sidecar is down), so it is retriable.
+            (
+                RegistryError::Unreachable(format!(
+                    "could not resolve trust-registry DID {}: {e}",
+                    self.registry_did
+                )),
+                Vec::new(),
+            )
+        })?;
+        let doc = serde_json::to_value(&resolved.doc).map_err(|e| {
+            (
+                RegistryError::Transient(format!(
+                    "could not read the registry's DID document: {e}"
+                )),
+                Vec::new(),
+            )
+        })?;
+        let theirs = ServiceCapabilities::from_did_document(&doc);
+        if let Ok(mut slot) = self.tsp_mediator.write() {
+            slot.clone_from(&theirs.tsp);
+        }
+        let advertised = theirs.advertised();
+        let ours = self.our_capabilities();
+        let matched = select_protocol(&ours, &theirs, &self.registry_did).map_err(|e| {
+            (
+                classify_no_match(&ours, &advertised, e.to_string()),
+                advertised.clone(),
+            )
+        })?;
+        debug!(
+            registry_did = %self.registry_did,
+            protocol = %matched.protocol.as_str(),
+            "selected trust-registry transport",
+        );
+        Ok((matched.protocol, advertised))
+    }
+
+    /// Publish what the last selection saw, for the diagnostics surface.
+    fn record_selection(
+        &self,
+        advertised: Vec<Protocol>,
+        active: Option<Protocol>,
+        error: Option<String>,
+    ) {
+        let mut slot = match self.transport.write() {
+            Ok(slot) => slot,
+            // A poisoned lock means a panic while holding it. Diagnostics are
+            // not worth propagating that into a registry call, so drop the
+            // update rather than unwrap.
+            Err(_) => return,
+        };
+        slot.advertised = advertised.iter().map(|p| p.as_str().to_string()).collect();
+        slot.active = active.map(|p| p.as_str().to_string());
+        slot.error = error;
+    }
+
+    /// What *this* VTC can speak to a peer, as a capability set.
+    ///
+    /// Not our advertised document: this is the **client** side. TSP and
+    /// DIDComm need our mediator (hence the messaging handle), REST needs only
+    /// an HTTP client, which we always have when a URL is configured. The
+    /// endpoint strings are never read for our own side — [`select_protocol`]
+    /// only tests presence — so they carry our identity for readability.
+    fn our_capabilities(&self) -> ServiceCapabilities {
+        let messaging_up = self.didcomm.get().is_some();
+        ServiceCapabilities {
+            tsp: (messaging_up && cfg!(feature = "tsp")).then(|| self.registry_did.clone()),
+            didcomm: messaging_up.then(|| self.registry_did.clone()),
+            rest: self.http.is_some().then(|| "rest-client".to_string()),
+        }
+    }
+
+    /// Build and sign one task: issued by this VTC's authority, addressed to
+    /// the registry, stamped with `issuedAt` and a fresh `id`, and signed with
+    /// the operational key (`proofPurpose: authentication`). Every registry
+    /// task is signed — the registry gates reads (`record/query`,
+    /// `recognition`) as it gates writes.
+    async fn signed_document(
+        &self,
+        type_uri: &str,
+        payload: Value,
+    ) -> Result<TrustTask<Value>, RegistryError> {
+        let issuer = self.authority()?.to_string();
+        let doc = build_document(&issuer, &self.registry_did, type_uri, payload);
+        let mut as_value = serde_json::to_value(&doc)
+            .map_err(|e| RegistryError::Transient(format!("serialise document: {e}")))?;
+        self.signer
+            .sign_operational_doc(&mut as_value)
+            .await
+            .map_err(|e| RegistryError::Transient(format!("sign document: {e}")))?;
+        serde_json::from_value(as_value)
+            .map_err(|e| RegistryError::Transient(format!("reparse signed document: {e}")))
+    }
+
+    /// Build, sign, send, and await the reply for one task.
+    async fn round_trip(
+        &self,
+        type_uri: &str,
+        payload: Value,
+        protocol: Protocol,
+    ) -> Result<TrustTask<Value>, RegistryError> {
+        self.authority()?;
+        let messaging = self.didcomm.get().ok_or_else(|| {
+            RegistryError::Transient("VTC messaging is not running yet".to_string())
+        })?;
+
+        let doc = self.signed_document(type_uri, payload).await?;
+
+        // Register before sending: a reply can land while the send is still
+        // returning.
+        let receiver = self.replies.register(&doc.id, &self.registry_did);
+        // Whether this send rode TSP — read before the move-y `match protocol`
+        // below, and used by the D4 reply-timeout reset (§7.2.2 recovery). Only
+        // the `tsp` build has a relationship to repair.
+        #[cfg(feature = "tsp")]
+        let is_tsp = matches!(&protocol, Protocol::Tsp);
+        let send = match protocol {
+            Protocol::Tsp => self.send_tsp(messaging, &doc).await,
+            Protocol::Didcomm => self.send_didcomm(messaging, &doc).await,
+            // Handled by the callers, which delegate to the HTTP arm before
+            // ever reaching a round trip.
+            Protocol::Rest => Err(RegistryError::Permanent(
+                "REST transport does not use the Trust-Task round trip".into(),
+            )),
+        };
+        if let Err(e) = send {
+            self.replies.abandon(&doc.id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(self.reply_timeout, receiver).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_closed)) => {
+                self.replies.abandon(&doc.id);
+                Err(RegistryError::Transient("reply channel closed".to_string()))
+            }
+            Err(_elapsed) => {
+                self.replies.abandon(&doc.id);
+                // D4 (design note `tsp-relationship-recovery.md`): a §7.2.2 drop
+                // by the registry — it holds no relationship with us after a
+                // fresh/reset store — is silent and looks exactly like a lost
+                // round-trip. When we sent over TSP, reset our local half so the
+                // syncer's *next* attempt re-invites (`send_tsp`'s
+                // `send_reestablishing` then reads `SendReadiness::Reestablish`
+                // and forms the relationship before sending). Without this a
+                // durable "related" half never re-invites and every send times
+                // out forever. The reset is safe against a false positive — if
+                // the registry actually kept its half, our fresh invite
+                // reconciles via D2 rather than erroring. This is the registry
+                // client's analogue of `VtaClient`'s self-repair (#1544), which
+                // does not reach this client. We only repair state and never
+                // resend here — the syncer's backoff stays the one retry owner,
+                // so a mutation is never double-executed.
+                #[cfg(feature = "tsp")]
+                if is_tsp
+                    && let Err(e) = messaging
+                        .atm
+                        .tsp()
+                        .reset_relationship(&messaging.profile, &self.registry_did)
+                        .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "could not reset the TSP relationship after a registry reply timeout",
+                    );
+                }
+                // The registry may simply be slow, or the frame may have been
+                // dropped in a reconnect. Either way the syncer's backoff owns
+                // the retry — this is never a delivery confirmation.
+                Err(RegistryError::Unreachable(format!(
+                    "no reply from the trust registry within {}s",
+                    self.reply_timeout.as_secs()
+                )))
+            }
+        }
+    }
+
+    /// Pack the document in the DIDComm trust-task envelope and hand it to the
+    /// delivery layer.
+    ///
+    /// The packing is `crate::outbound`'s, shared with the hook writer, which
+    /// held a byte-identical copy of it until now.
+    async fn send_didcomm(
+        &self,
+        messaging: &VtcMessaging,
+        doc: &TrustTask<Value>,
+    ) -> Result<(), RegistryError> {
+        use crate::outbound::OutboundError;
+        crate::outbound::send_trust_task_didcomm(messaging, &self.registry_did, doc)
+            .await
+            .map_err(|e| match e {
+                OutboundError::Serialise(_) => RegistryError::Transient(e.to_string()),
+                OutboundError::Pack(_) | OutboundError::Send(_) => {
+                    RegistryError::Unreachable(e.to_string())
+                }
+            })
+    }
+
+    /// Seal the document in the `trust-tasks-tsp` binding envelope and route it
+    /// to the registry over the existing mediator socket.
+    #[cfg(feature = "tsp")]
+    async fn send_tsp(
+        &self,
+        messaging: &VtcMessaging,
+        doc: &TrustTask<Value>,
+    ) -> Result<(), RegistryError> {
+        let body = tsp_envelope(doc)?;
+        // TSP send is an HTTP post through the same profile the pickup socket
+        // is bound to — no second websocket (the mediator permits one per DID).
+        // A registry on another mediator is reached through it (VTI-56).
+        let registry_mediator = self.tsp_mediator.read().ok().and_then(|m| m.clone());
+        // Recovery-aware send (Rev 3 §7.2.2). The registry drops an application
+        // frame from a VID it holds no relationship with, so a bare send is
+        // silently discarded on first contact — or after the registry restarts
+        // and forgets its half. `send_reestablishing` forms the relationship
+        // (sends an invite) when readiness says we must; the payload rides after
+        // it (§3.6) rather than waiting for the accept. Idempotent once related.
+        //
+        // TODO(#2705, D4): on a *reply* timeout (a silent §7.2.2 drop on the peer looks
+        // exactly like a lost network round-trip), the caller's correlated-reply
+        // waiter should `reset_relationship` and retry through here, so a stale
+        // local half re-invites. Wired at the wait site, not here, where there is
+        // no reply to time out.
+        vti_common::tsp_route::send_reestablishing(
+            &messaging.atm,
+            &messaging.profile,
+            &messaging.mediator_did,
+            &self.registry_did,
+            registry_mediator.as_deref(),
+            &body,
+        )
+        .await
+        .map_err(|e| RegistryError::Unreachable(format!("TSP send failed: {e}")))?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "tsp"))]
+    async fn send_tsp(
+        &self,
+        _messaging: &VtcMessaging,
+        _doc: &TrustTask<Value>,
+    ) -> Result<(), RegistryError> {
+        // Unreachable in practice: `our_capabilities` never offers TSP without
+        // the feature, so the match can't land here. Kept as a typed refusal
+        // rather than an `unreachable!` so a future caller can't panic a daemon.
+        Err(RegistryError::Permanent(
+            "this build has no `tsp` feature and cannot send TSP frames".into(),
+        ))
+    }
+
+    /// The TRQP record key for one member of this community.
+    ///
+    /// The four parts must match [`UpstreamRegistryClient::recognise`]'s query
+    /// tuple exactly, or we publish records nobody looks up — a silent,
+    /// green-status failure. Both sides read the same constants.
+    /// Send the lowerCamelCase version of a task, or the 0.1 version to a
+    /// registry that predates it. Returns the reply and whether it answered
+    /// the new version.
+    ///
+    /// Only `unsupportedVersion` (the registry knows the task but not this
+    /// version: SPEC §8.3's signal to downgrade) moves to 0.1. Any other answer,
+    /// rejection included, is the registry's answer to what was asked. The
+    /// downgrade is remembered for this client.
+    ///
+    /// Downgrading a membership write loses nothing while `trust_record` also
+    /// carries the dates in `context`, which a 0.1 record keeps. Removing that
+    /// copy means removing this fallback for writes too, or a 0.1 registry
+    /// would silently get records without their end date.
+    async fn round_trip_versioned(
+        &self,
+        new: (&str, Value),
+        old: (&str, Value),
+        protocol: Protocol,
+    ) -> Result<(TrustTask<Value>, bool), RegistryError> {
+        if !self.pre_0_3_registry.load(Ordering::Relaxed) {
+            let reply = self.round_trip(new.0, new.1, protocol).await?;
+            if !is_unsupported_version(&reply) {
+                return Ok((reply, true));
+            }
+            self.pre_0_3_registry.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                registry = %self.registry_did,
+                task = new.0,
+                "the trust registry does not answer the lowerCamelCase registry/* tasks; using \
+                 0.1, where a membership record's dates travel in its context only"
+            );
+        }
+        Ok((self.round_trip(old.0, old.1, protocol).await?, false))
+    }
+
+    fn record_key(&self, member_did: &str) -> Result<(String, String), RegistryError> {
+        Ok((member_did.to_string(), self.authority()?.to_string()))
+    }
+}
+
+/// Is an empty transport intersection a configuration fault, or are we just not
+/// ready yet?
+///
+/// The distinction is load-bearing and was got wrong at first: at boot the
+/// registry client exists before the messaging listener has published its
+/// handle, so `our_capabilities` is momentarily **empty** and every peer looks
+/// like "no transport in common". Reported as `Permanent` — which is what an
+/// empty intersection normally means — that transient startup window would park
+/// the first sync jobs in `Failed`, where the syncer never retries them. The
+/// health probe recovered on its next tick and looked fine; the queue would not
+/// have.
+///
+/// So: if *we* can currently speak nothing, this is our own startup race and it
+/// is retriable. Only an intersection that is empty while we do have a
+/// transport available is the operator's configuration to fix.
+fn classify_no_match(
+    ours: &ServiceCapabilities,
+    theirs: &[Protocol],
+    detail: String,
+) -> RegistryError {
+    if ours.advertised().is_empty() {
+        return RegistryError::Transient(format!(
+            "no transport available yet to reach the trust registry (VTC messaging is still \
+             starting, and no REST arm is configured); the registry advertises {theirs:?}",
+        ));
+    }
+    RegistryError::Permanent(detail)
+}
+
+/// Wrap a document in the `trust-tasks-tsp` binding envelope.
+fn tsp_envelope(doc: &TrustTask<Value>) -> Result<Vec<u8>, RegistryError> {
+    crate::outbound::seal_trust_task_tsp(doc).map_err(|e| RegistryError::Transient(e.to_string()))
+}
+
+/// Whether `reply` is the registry's declared "no such record" refusal of a
+/// `registry/record/delete` — read from the reply's `code`, as the
+/// specification declares it, never from the wording of a message (#2578).
+/// The code is the same at 0.1 and 0.2; both are compared so a re-pin that
+/// changed one would not go unnoticed.
+fn is_delete_not_found(reply: &TrustTask<Value>) -> bool {
+    use vti_specs::registry::record::delete::{v0_1, v0_2};
+    reply.type_uri.slug() == "trust-task-error"
+        && reply
+            .payload
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| {
+                code == v0_1::error_codes::NOT_FOUND.code
+                    || code == v0_2::error_codes::NOT_FOUND.code
+            })
+}
+
+/// Whether `reply` is a registry saying it knows this task but not this
+/// version of it.
+fn is_unsupported_version(reply: &TrustTask<Value>) -> bool {
+    reply.type_uri.slug() == "trust-task-error"
+        && reply.payload.get("code").and_then(Value::as_str) == Some("unsupportedVersion")
+}
+
+/// Classify a reply document into "the task succeeded" or a typed failure.
+///
+/// The split that matters is retriable versus not: an `internalError` or
+/// `unavailable` is worth another attempt, whereas `permissionDenied` (the
+/// VTC's DID is not in the registry's `admin_dids`) or `proofInvalid` needs an
+/// operator and must not spin.
+///
+/// `unsupportedType` is a third thing and gets its own variant. It does not
+/// mean the request was wrong; it means the registry does not route this URI
+/// at all — the deployed registry is older (or newer) than this VTC. The
+/// distinction is load-bearing for [`MessagingRegistryClient::health`], which
+/// counts an ordinary rejection as proof of life but must not count this one.
+fn classify(doc: &TrustTask<Value>, expect_slug: &str) -> Result<(), RegistryError> {
+    let slug = doc.type_uri.slug();
+    if slug == "trust-task-error" {
+        let code = doc
+            .payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = doc
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let detail = format!("registry rejected {expect_slug}: {code}");
+        let detail = if message.is_empty() {
+            detail
+        } else {
+            format!("{detail} ({message})")
+        };
+        return match code {
+            "internalError" | "unavailable" => Err(RegistryError::Transient(detail)),
+            "unsupportedType" => Err(RegistryError::Incompatible(detail)),
+            _ => Err(RegistryError::Permanent(detail)),
+        };
+    }
+    if !doc.type_uri.is_response() || slug != expect_slug {
+        // A correlated reply of the wrong type is a contract bug on one side or
+        // the other. Retrying cannot fix it, but calling it permanent would
+        // strand a job that a redeploy would fix — transient and loud.
+        return Err(RegistryError::Transient(format!(
+            "expected a {expect_slug} response, got `{}`",
+            doc.type_uri
+        )));
+    }
+    Ok(())
+}
+
+/// Classify the registry's answer to a `governance/capability/enable|disable`.
+///
+/// Convergent on purpose: the projector re-sends the community's decision
+/// until the registry holds it, so the registry already being in the wanted
+/// state is success, not a failure. The spec declares those answers as
+/// `governance/capability/enable:alreadyEnabled` and
+/// `governance/capability/disable:notEnabled`; registries that predate the
+/// extended codes send `taskFailed` with an `already_enabled:` / `not_enabled:`
+/// message prefix, which is accepted for the same reason.
+fn classify_capability_toggle(
+    reply: &TrustTask<Value>,
+    slug: &str,
+    enabled: bool,
+) -> Result<(), RegistryError> {
+    if reply.type_uri.slug() == "trust-task-error" {
+        let code = reply
+            .payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message = reply
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (extended, legacy) = if enabled {
+            (
+                vti_specs::governance::capability::enable::v0_1::error_codes::ALREADY_ENABLED.code,
+                "already_enabled",
+            )
+        } else {
+            (
+                vti_specs::governance::capability::disable::v0_1::error_codes::NOT_ENABLED.code,
+                "not_enabled",
+            )
+        };
+        if code == extended || (code == "taskFailed" && message.starts_with(legacy)) {
+            return Ok(());
+        }
+    }
+    classify(reply, slug)
+}
+
+/// The membership `context` a record carries, in either version.
+///
+/// `activeFrom` / `activeTo` duplicate the 0.3 record's `validFrom` /
+/// `validUntil`. They stay for one release, so that readers of 0.1 records and
+/// registries that predate 0.3 still see the dates.
+fn membership_context(record: &RegistryRecord) -> Value {
+    let recognised = matches!(record.status, RegistryStatus::Active);
+    let mut context = json!({
+        "status": if recognised { "active" } else { "departed" },
+        "activeFrom": record.active_from.to_rfc3339(),
+    });
+    if let Some(active_to) = record.active_to {
+        context["activeTo"] = json!(active_to.to_rfc3339());
+    }
+    // Only on a record that says the member belongs: a departure withdraws the
+    // card before anything else (VTI-DIR-120).
+    if let (true, Some(card)) = (recognised, &record.directory_card) {
+        context["directoryCard"] = card.wire();
+    }
+    context
+}
+
+/// Build the 0.1 TRQP record for a member as this community asserts it.
+///
+/// The 0.1 `TrustRecord` carries no validity window, so the membership dates
+/// ride in `context` only. `recognized` is the machine-readable half: an
+/// active member is recognised, a departed one is not, which is what a TRQP
+/// verifier reads.
+fn trust_record(authority_did: &str, record: &RegistryRecord) -> Value {
+    json!({
+        "entity_id": record.member_did,
+        "authority_id": authority_did,
+        "action": RECOGNISE_ACTION,
+        "resource": TRUST_GRAPH_RESOURCE,
+        "record_type": "recognition",
+        "recognized": matches!(record.status, RegistryStatus::Active),
+        "context": membership_context(record),
+    })
+}
+
+/// Build the 0.3 record: lowerCamelCase, with the membership dates as the
+/// record's validity window, so the registry answers recognition for the
+/// period the member actually belongs.
+///
+/// `validUntil` is sent only when it is after `validFrom`. The registry
+/// refuses an empty or inverted window, and that refusal would park the sync
+/// job; such a record is a departed member's, which already answers
+/// `recognized: false`.
+fn trust_record_v0_3(authority_did: &str, record: &RegistryRecord) -> Value {
+    let mut out = json!({
+        "entityId": record.member_did,
+        "authorityId": authority_did,
+        "action": RECOGNISE_ACTION,
+        "resource": TRUST_GRAPH_RESOURCE,
+        "recordType": "recognition",
+        "recognized": matches!(record.status, RegistryStatus::Active),
+        "context": membership_context(record),
+        "validFrom": record.active_from.to_rfc3339(),
+    });
+    if let Some(active_to) = record.active_to.filter(|to| *to > record.active_from) {
+        out["validUntil"] = json!(active_to.to_rfc3339());
+    }
+    out
+}
+
+/// Rebuild a [`RegistryRecord`] from a TRQP record returned by the registry,
+/// in either spelling (0.3 lowerCamelCase or 0.1 snake_case).
+///
+/// The dates come from the record's validity window when it has one, and
+/// otherwise from the `activeFrom` / `activeTo` its context carries (a 0.1
+/// record, or one written before the window existed).
+///
+/// Absence is read restrictively (R3.3): a record whose `recognized` is missing
+/// is not treated as an active member.
+fn registry_record_from(value: &Value) -> Option<RegistryRecord> {
+    let member_did = value
+        .get("entityId")
+        .or_else(|| value.get("entity_id"))?
+        .as_str()?
+        .to_string();
+    let recognised = value
+        .get("recognized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let context = value.get("context");
+    let parse = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    let window_or_context = |window: &str, ctx: &str| {
+        parse(value.get(window)).or_else(|| parse(context.and_then(|c| c.get(ctx))))
+    };
+    let now = chrono::Utc::now();
+    Some(RegistryRecord {
+        member_did,
+        status: if recognised {
+            RegistryStatus::Active
+        } else {
+            RegistryStatus::Departed
+        },
+        active_from: window_or_context("validFrom", "activeFrom").unwrap_or(now),
+        active_to: window_or_context("validUntil", "activeTo"),
+        last_synced_at: now,
+        directory_card: context.and_then(|c| c.get("directoryCard")).and_then(|d| {
+            Some(super::model::DirectoryCardPointer {
+                entry_id: d.get("entryId")?.as_str()?.to_string(),
+                card_digest: d.get("cardDigest")?.as_str()?.to_string(),
+            })
+        }),
+    })
+}
+
+#[async_trait]
+impl TrustRegistryClient for MessagingRegistryClient {
+    async fn publish_member(&self, record: &RegistryRecord) -> Result<(), RegistryError> {
+        let authority = self.authority()?.to_string();
+        match self.select().await? {
+            Protocol::Rest => self.rest()?.publish_member(record).await,
+            protocol => {
+                let (reply, _) = self
+                    .round_trip_versioned(
+                        (
+                            RECORD_PUT_0_3,
+                            json!({ "record": trust_record_v0_3(&authority, record) }),
+                        ),
+                        (
+                            RECORD_PUT,
+                            json!({ "record": trust_record(&authority, record) }),
+                        ),
+                        protocol,
+                    )
+                    .await?;
+                classify(&reply, "registry/record/put")
+            }
+        }
+    }
+
+    async fn delete_member(&self, member_did: &str) -> Result<(), RegistryError> {
+        let (entity_id, authority_id) = self.record_key(member_did)?;
+        match self.select().await? {
+            Protocol::Rest => self.rest()?.delete_member(member_did).await,
+            protocol => {
+                let payload = json!({
+                    "entity_id": entity_id,
+                    "authority_id": authority_id,
+                    "action": RECOGNISE_ACTION,
+                    "resource": TRUST_GRAPH_RESOURCE,
+                });
+                let (reply, _) = self
+                    .round_trip_versioned(
+                        (RECORD_DELETE_0_2, record_to_v0_3(&payload)),
+                        (RECORD_DELETE, payload),
+                        protocol,
+                    )
+                    .await?;
+                // Already absent is the effect a delete wants — the same
+                // tolerance `delete_trust_record` gives. Without it, a record
+                // already gone failed the job permanently.
+                if is_delete_not_found(&reply) {
+                    return Ok(());
+                }
+                classify(&reply, "registry/record/delete")
+            }
+        }
+    }
+
+    async fn read_member(&self, member_did: &str) -> Result<Option<RegistryRecord>, RegistryError> {
+        let (entity_id, authority_id) = self.record_key(member_did)?;
+        match self.select().await? {
+            Protocol::Rest => self.rest()?.read_member(member_did).await,
+            protocol => {
+                // Deliberately *not* a fully-keyed fetch: supplying all four key
+                // parts makes this an exact lookup that errors on a miss, and a
+                // missing member is a normal answer, not a failure. Three
+                // filters keep it an enumeration — empty list on a miss — and
+                // we match `resource` here.
+                let (reply, _) = self
+                    .round_trip_versioned(
+                        (
+                            RECORD_QUERY_0_3,
+                            json!({
+                                "entityId": entity_id,
+                                "authorityId": authority_id,
+                                "action": RECOGNISE_ACTION,
+                                "limit": 50,
+                            }),
+                        ),
+                        (
+                            RECORD_QUERY,
+                            json!({
+                                "entity_id": entity_id,
+                                "authority_id": authority_id,
+                                "action": RECOGNISE_ACTION,
+                                "limit": 50,
+                            }),
+                        ),
+                        protocol,
+                    )
+                    .await?;
+                classify(&reply, "registry/record/query")?;
+                let found = reply
+                    .payload
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|r| {
+                        r.get("resource").and_then(Value::as_str) == Some(TRUST_GRAPH_RESOURCE)
+                    })
+                    .and_then(registry_record_from);
+                Ok(found)
+            }
+        }
+    }
+
+    async fn list_records(&self) -> Result<Vec<RegistryRecord>, RegistryError> {
+        let authority = self.authority()?.to_string();
+        match self.select().await? {
+            // The REST arm is a TRQP query surface, not an enumeration one.
+            Protocol::Rest => Err(crate::registry::drift::unsupported()),
+            protocol => {
+                let mut out = Vec::new();
+                let mut cursor: Option<String> = None;
+                // Bounded so a registry that returns a cursor forever cannot
+                // pin this task. Exceeding it is reported rather than silently
+                // truncated: a short list compared against a complete mirror
+                // would invent lost writes for every member past the cap.
+                const MAX_PAGES: usize = 50;
+                const PAGE: u32 = 200;
+
+                for page in 0..MAX_PAGES {
+                    let mut new = json!({
+                        "authorityId": authority,
+                        "action": RECOGNISE_ACTION,
+                        "limit": PAGE,
+                    });
+                    let mut old = json!({
+                        "authority_id": authority,
+                        "action": RECOGNISE_ACTION,
+                        "limit": PAGE,
+                    });
+                    if let Some(c) = &cursor {
+                        new["cursor"] = json!(c);
+                        old["cursor"] = json!(c);
+                    }
+                    let (reply, _) = self
+                        .round_trip_versioned(
+                            (RECORD_QUERY_0_3, new),
+                            (RECORD_QUERY, old),
+                            protocol,
+                        )
+                        .await?;
+                    classify(&reply, "registry/record/query")?;
+
+                    out.extend(
+                        reply
+                            .payload
+                            .get("records")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|r| {
+                                r.get("resource").and_then(Value::as_str)
+                                    == Some(TRUST_GRAPH_RESOURCE)
+                            })
+                            .filter_map(registry_record_from),
+                    );
+
+                    cursor = reply
+                        .payload
+                        .get("nextCursor")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if cursor.is_none() {
+                        return Ok(out);
+                    }
+                    if page + 1 == MAX_PAGES {
+                        return Err(RegistryError::PaginationExhausted(format!(
+                            "the trust registry is still paginating after {MAX_PAGES} pages \
+                             ({} records); refusing to compare a partial enumeration",
+                            out.len()
+                        )));
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    async fn recognise(&self, foreign_issuer_did: &str) -> Result<bool, RegistryError> {
+        let authority = self.authority()?.to_string();
+        match self.select().await? {
+            Protocol::Rest => self.rest()?.recognise(foreign_issuer_did).await,
+            protocol => {
+                let payload = json!({
+                    "entity_id": foreign_issuer_did,
+                    "authority_id": authority,
+                    "action": RECOGNISE_ACTION,
+                    "resource": TRUST_GRAPH_RESOURCE,
+                });
+                let (reply, _) = self
+                    .round_trip_versioned(
+                        (RECOGNITION_0_2, record_to_v0_3(&payload)),
+                        (RECOGNITION, payload),
+                        protocol,
+                    )
+                    .await?;
+                classify(&reply, "registry/recognition")?;
+                // Absence is "not recognised", never "recognised" — the
+                // restrictive reading a missing scope field always gets
+                // (R3.3). This is also what makes the Trust-Task arm immune to
+                // the HTTP arm's `recognized`-optionality defect, where an
+                // omitted field parsed as a transport failure and surfaced as
+                // an indefinite 503.
+                Ok(reply
+                    .payload
+                    .get("recognized")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false))
+            }
+        }
+    }
+
+    async fn put_trust_record(&self, record: &Value) -> Result<(), RegistryError> {
+        // Refuse a record written under anyone else's authority: this client
+        // signs as the community, and a record naming another authority would
+        // be a statement the community did not make.
+        let authority = self.authority()?.to_string();
+        if record.get("authority_id").and_then(Value::as_str) != Some(authority.as_str()) {
+            return Err(RegistryError::Permanent(
+                "an authorization record must carry this community as its authority".into(),
+            ));
+        }
+        match self.select().await? {
+            // The REST arm is TRQP queries only; it has no write surface.
+            Protocol::Rest => Err(RegistryError::Permanent(
+                "the trust registry is reachable only over REST, which has no record-write \
+                 surface; the git-namespace projection needs TSP or DIDComm"
+                    .into(),
+            )),
+            protocol => {
+                let (reply, _) = self
+                    .round_trip_versioned(
+                        (RECORD_PUT_0_3, json!({ "record": record_to_v0_3(record) })),
+                        (RECORD_PUT, json!({ "record": record })),
+                        protocol,
+                    )
+                    .await?;
+                classify(&reply, "registry/record/put")
+            }
+        }
+    }
+
+    async fn list_trust_records(&self, action: &str) -> Result<Vec<Value>, RegistryError> {
+        self.query_all_records(Some(action)).await
+    }
+
+    async fn list_all_trust_records(&self) -> Result<Vec<Value>, RegistryError> {
+        self.query_all_records(None).await
+    }
+
+    async fn delete_trust_record(
+        &self,
+        entity_id: &str,
+        action: &str,
+        resource: &str,
+    ) -> Result<(), RegistryError> {
+        let authority = self.authority()?.to_string();
+        match self.select().await? {
+            Protocol::Rest => Err(RegistryError::Permanent(
+                "the trust registry is reachable only over REST, which has no record-delete \
+                 surface"
+                    .into(),
+            )),
+            protocol => {
+                let payload = json!({
+                    "entity_id": entity_id,
+                    "authority_id": authority,
+                    "action": action,
+                    "resource": resource,
+                });
+                let (reply, _) = self
+                    .round_trip_versioned(
+                        (RECORD_DELETE_0_2, record_to_v0_3(&payload)),
+                        (RECORD_DELETE, payload),
+                        protocol,
+                    )
+                    .await?;
+                // Already absent is the effect a delete wants.
+                if is_delete_not_found(&reply) {
+                    return Ok(());
+                }
+                classify(&reply, "registry/record/delete")
+            }
+        }
+    }
+
+    async fn project_capability_module(
+        &self,
+        change: &CapabilityModuleChange,
+    ) -> Result<(), RegistryError> {
+        use trust_tasks_rs::validate::ValidatedPayload;
+        use vti_specs::governance::capability::{disable::v0_1 as disable, enable::v0_1 as enable};
+        self.authority()?;
+        let (type_uri, slug, payload) = if change.enabled {
+            let mut payload = json!({
+                "capability": change.capability,
+                "version": change.version,
+            });
+            if let Some(config) = &change.config {
+                payload["config"] = config.clone();
+            }
+            (CAPABILITY_ENABLE, "governance/capability/enable", payload)
+        } else {
+            let mut payload = json!({ "capability": change.capability });
+            if let Some(reason) = &change.reason {
+                payload["reason"] = json!(reason);
+            }
+            (CAPABILITY_DISABLE, "governance/capability/disable", payload)
+        };
+        // Hold our own document to its published schema before it leaves: a
+        // payload the registry would refuse as malformed is a bug here, and
+        // retrying it would only spin (R3.5).
+        let checked = if change.enabled {
+            enable::Payload::validate_value(&payload)
+        } else {
+            disable::Payload::validate_value(&payload)
+        };
+        if let Err(e) = checked {
+            return Err(RegistryError::Permanent(format!(
+                "{slug} payload does not match its published schema: {e}"
+            )));
+        }
+        match self.select().await? {
+            // The registry's governance surface is admin-only and served over
+            // its messaging transports; REST is TRQP queries alone.
+            Protocol::Rest => Err(RegistryError::Permanent(
+                "the trust registry is reachable only over REST, which has no governance \
+                 surface; enabling a capability module there needs TSP or DIDComm"
+                    .into(),
+            )),
+            protocol => {
+                let reply = self.round_trip(type_uri, payload, protocol).await?;
+                classify_capability_toggle(&reply, slug, change.enabled)
+            }
+        }
+    }
+
+    fn transport(&self) -> RegistryTransport {
+        // A poisoned lock only happens if a writer panicked mid-update; report
+        // the address we were configured with rather than failing a diagnostics
+        // read over it.
+        self.transport
+            .read()
+            .map(|t| t.clone())
+            .unwrap_or_else(|_| RegistryTransport {
+                did: Some(self.registry_did.clone()),
+                ..RegistryTransport::default()
+            })
+    }
+
+    async fn health(&self) -> Result<(), RegistryError> {
+        match self.select().await? {
+            Protocol::Rest => self.rest()?.health().await,
+            protocol => {
+                // A read-only `record/query` round trip. It needs no proof and
+                // no admin ACL, so it works on a registry that would refuse our
+                // writes — but unlike an HTTP GET of a static document it
+                // exercises the whole path we actually depend on: mediator,
+                // transport, dispatcher, storage.
+                //
+                // A correlated reply proves liveness, **including a rejection**
+                // — the registry read our document, routed it, and refused it.
+                // Only silence is unhealthy, which is what makes this signal
+                // re-falsifiable (R6.2).
+                //
+                // With one exception, and it is the case this probe exists to
+                // catch. `unsupportedType` says the registry does not route
+                // `record/query` — a task it has served since
+                // affinidi-trust-registry-rs 0.10.0, whose cutover deliberately
+                // carried no dual-accept. A registry that cannot answer the
+                // read this VTC depends on cannot answer the writes either, and
+                // reporting that as `active` is precisely how a community
+                // published nothing for weeks while its dashboard stayed green
+                // and one job sat in `Failed` with no surface to see it.
+                //
+                // Still re-falsifiable: upgrade the registry and the next tick
+                // flips back to active on its own.
+                let payload = json!({ "limit": 1 });
+                let probe = self
+                    .round_trip_versioned(
+                        (RECORD_QUERY_0_3, payload.clone()),
+                        (RECORD_QUERY, payload),
+                        protocol,
+                    )
+                    .await
+                    .map(|(reply, _)| reply);
+                match probe {
+                    Ok(_) => Ok(()),
+                    Err(RegistryError::Permanent(e)) => {
+                        // A rejection still proves the registry is answering.
+                        debug!(error = %e, "registry health probe answered with a rejection");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+}
+
+impl MessagingRegistryClient {
+    /// Every record the registry holds under this community's authority,
+    /// for one `action` or (with `None`) for all of them, paged to the end
+    /// with `registry/record/query/0.3` (0.1 to a registry that predates it),
+    /// each in the 0.1 shape the projection reads.
+    ///
+    /// Bounded as `list_records` is, and for the same reason: a partial
+    /// enumeration compared against the mirror would invent missing tuples,
+    /// and one shown to an operator would hide records, so running out of
+    /// pages is an error rather than a short list.
+    async fn query_all_records(&self, action: Option<&str>) -> Result<Vec<Value>, RegistryError> {
+        let authority = self.authority()?.to_string();
+        match self.select().await? {
+            // The REST arm is a TRQP query surface, not an enumeration one.
+            Protocol::Rest => Err(crate::registry::drift::unsupported()),
+            protocol => {
+                let mut out = Vec::new();
+                let mut cursor: Option<String> = None;
+                const MAX_PAGES: usize = 50;
+                const PAGE: u32 = 200;
+                for page in 0..MAX_PAGES {
+                    let mut payload = json!({
+                        "authority_id": authority,
+                        "limit": PAGE,
+                    });
+                    if let Some(a) = action {
+                        payload["action"] = json!(a);
+                    }
+                    if let Some(c) = &cursor {
+                        payload["cursor"] = json!(c);
+                    }
+                    let (reply, current) = self
+                        .round_trip_versioned(
+                            (RECORD_QUERY_0_3, record_to_v0_3(&payload)),
+                            (RECORD_QUERY, payload),
+                            protocol,
+                        )
+                        .await?;
+                    classify(&reply, "registry/record/query")?;
+                    out.extend(
+                        reply
+                            .payload
+                            .get("records")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .map(|r| {
+                                if current {
+                                    record_from_v0_3(r)
+                                } else {
+                                    r.clone()
+                                }
+                            }),
+                    );
+                    cursor = reply
+                        .payload
+                        .get("nextCursor")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if cursor.is_none() {
+                        return Ok(out);
+                    }
+                    if page + 1 == MAX_PAGES {
+                        let what = action.map_or_else(
+                            || "this community's records".to_string(),
+                            |a| format!("`{a}`"),
+                        );
+                        return Err(RegistryError::PaginationExhausted(format!(
+                            "the trust registry is still paginating {what} after \
+                             {MAX_PAGES} pages; refusing to answer from a partial list"
+                        )));
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// The REST arm, or a `Permanent` refusal when the registry advertises
+    /// `TRQPRest` but no `registry.url` is configured.
+    fn rest(&self) -> Result<&UpstreamRegistryClient, RegistryError> {
+        self.http.as_ref().ok_or_else(|| {
+            RegistryError::Permanent(
+                "the trust registry advertises only REST, but `registry.url` is not configured — \
+                 set it, or advertise a messaging transport on the registry's DID"
+                    .into(),
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    /// The `#response` to `request_type`.
+    ///
+    /// Built from the whole request URI rather than by interpolating a slug
+    /// into a `trusttasks.org/spec/…` template: the canonical-task census
+    /// scans source for `spec/` literals and asserts the registry publishes
+    /// each one, so a templated URI reads to it as a bound task named
+    /// `{slug}`.
+    fn record_doc(request_type: &str, payload: Value) -> TrustTask<Value> {
+        TrustTask::new(
+            "urn:uuid:reply".to_string(),
+            format!("{request_type}#response").parse().unwrap(),
+            payload,
+        )
+    }
+
+    fn error_doc(code: &str) -> TrustTask<Value> {
+        // Takes the version from the emitter rather than naming one, so a
+        // framework bump moves this fixture with the code under test instead of
+        // stranding it a version behind. Backward acceptance of an *older*
+        // error document is covered deliberately, and separately, by
+        // `tests/registry_didcomm.rs`, which pins `0.1`.
+        TrustTask::new(
+            "urn:uuid:err".to_string(),
+            crate::trust_tasks::helpers::framework_error_type_uri(),
+            json!({ "code": code, "message": "nope" }),
+        )
+    }
+
+    // `tsp_envelope_type_matches_the_binding` is gone, and its absence is the
+    // point. It asserted one local literal equalled another local literal, so it
+    // passed whatever the published binding did — it could never have detected
+    // the drift its own comment described. The envelope type now comes from
+    // `vta_sdk::tsp_binding`, which re-exports `trust_tasks_tsp::ENVELOPE_TYPE`,
+    // so there is no local copy left to drift; `outbound::tests::
+    // the_tsp_seal_is_the_published_envelope` checks the seal against it.
+
+    /// The capability-module projection converges: the registry already
+    /// holding the decision — under the declared extended code or the older
+    /// `taskFailed` prefix — is success; any other refusal is not.
+    #[test]
+    fn a_capability_toggle_already_in_the_wanted_state_is_success() {
+        let enable = "governance/capability/enable";
+        let disable = "governance/capability/disable";
+        let with = |code: &str, message: &str| {
+            let mut doc = error_doc(code);
+            doc.payload["message"] = json!(message);
+            doc
+        };
+        assert!(
+            classify_capability_toggle(&record_doc(CAPABILITY_ENABLE, json!({})), enable, true)
+                .is_ok()
+        );
+        assert!(
+            classify_capability_toggle(
+                &error_doc("governance/capability/enable:alreadyEnabled"),
+                enable,
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            classify_capability_toggle(&with("taskFailed", "already_enabled: it is"), enable, true)
+                .is_ok()
+        );
+        assert!(
+            classify_capability_toggle(
+                &error_doc("governance/capability/disable:notEnabled"),
+                disable,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            classify_capability_toggle(
+                &with("taskFailed", "not_enabled: it is not"),
+                disable,
+                false
+            )
+            .is_ok()
+        );
+        // An enable's idempotent answer is not a disable's, and vice versa.
+        assert!(
+            classify_capability_toggle(
+                &error_doc("governance/capability/enable:alreadyEnabled"),
+                disable,
+                false
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            classify_capability_toggle(&error_doc("permissionDenied"), enable, true),
+            Err(RegistryError::Permanent(_))
+        ));
+        assert!(matches!(
+            classify_capability_toggle(&error_doc("unsupportedType"), enable, true),
+            Err(RegistryError::Incompatible(_))
+        ));
+        assert!(matches!(
+            classify_capability_toggle(&error_doc("internalError"), disable, false),
+            Err(RegistryError::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn tsp_envelope_wraps_the_document() {
+        let doc = build_document(
+            "did:webvh:vtc",
+            "did:webvh:registry",
+            RECORD_QUERY,
+            json!({ "limit": 1 }),
+        );
+        let bytes = tsp_envelope(&doc).unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["type"], vta_sdk::tsp_binding::ENVELOPE_TYPE);
+        assert_eq!(parsed["document"]["type"], RECORD_QUERY);
+    }
+
+    /// #2578: an absent record is tolerated on the delete's declared code,
+    /// never on words in a message — a refusal whose message happens to quote
+    /// the code is still a refusal.
+    #[test]
+    fn delete_not_found_is_read_from_the_code_not_the_message() {
+        assert!(is_delete_not_found(&error_doc(
+            "registry/record/delete:notFound"
+        )));
+        let quoted = TrustTask::new(
+            "urn:uuid:err".to_string(),
+            crate::trust_tasks::helpers::framework_error_type_uri(),
+            json!({
+                "code": "permissionDenied",
+                "message": "not registry/record/delete:notFound — you may not delete it",
+            }),
+        );
+        assert!(!is_delete_not_found(&quoted));
+        assert!(!is_delete_not_found(&error_doc("notFound")));
+    }
+
+    #[test]
+    fn permission_denied_is_permanent_and_internal_error_is_transient() {
+        // `permissionDenied` means the VTC's DID is not in the registry's
+        // `admin_dids`. Retrying cannot fix that, and a retry loop would hide
+        // it behind an ever-growing queue instead of surfacing a failed job.
+        let denied = classify(&error_doc("permissionDenied"), "registry/record/put").unwrap_err();
+        assert!(matches!(denied, RegistryError::Permanent(_)));
+        assert!(!denied.is_retriable());
+
+        let internal = classify(&error_doc("internalError"), "registry/record/put").unwrap_err();
+        assert!(internal.is_retriable());
+    }
+
+    /// `unsupportedType` is its own class, not a `Permanent` rejection.
+    ///
+    /// It says the registry does not route the task at all — a version skew,
+    /// resolved by upgrading the peer, with nothing wrong in the request. The
+    /// split matters because `health` counts an ordinary rejection as proof
+    /// the registry is alive and must not count this one: a registry that
+    /// cannot answer `record/query` cannot answer `record/put` either, and
+    /// reporting it `active` leaves an operator with a failed job, a green
+    /// status, and no `lastError`.
+    #[test]
+    fn unsupported_type_is_incompatible_not_a_rejection() {
+        let skew = classify(&error_doc("unsupportedType"), "registry/record/put").unwrap_err();
+        assert!(
+            matches!(skew, RegistryError::Incompatible(_)),
+            "got {skew:?}"
+        );
+        assert!(skew.is_incompatible());
+        // Not worth retrying — a redeploy of the peer is what clears it, and
+        // the answer is stable until then.
+        assert!(!skew.is_retriable());
+
+        // And the ordinary rejection stays on the other side of the split.
+        let denied = classify(&error_doc("permissionDenied"), "registry/record/put").unwrap_err();
+        assert!(!denied.is_incompatible());
+    }
+
+    #[test]
+    fn a_wrong_response_type_does_not_pass_as_success() {
+        let wrong = record_doc(RECORD_QUERY, json!({ "records": [] }));
+        assert!(classify(&wrong, "registry/record/put").is_err());
+        let right = record_doc(RECORD_PUT, json!({ "ok": true, "created": true }));
+        assert!(classify(&right, "registry/record/put").is_ok());
+    }
+
+    #[test]
+    fn published_record_carries_the_query_tuple_and_recognition() {
+        let mut record = RegistryRecord::fresh_active("did:key:zMember");
+        record.active_from = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let value = trust_record("did:webvh:vtc", &record);
+
+        // The four key parts must equal the tuple `recognise()` queries with,
+        // or we publish records that are never read.
+        assert_eq!(value["entity_id"], "did:key:zMember");
+        assert_eq!(value["authority_id"], "did:webvh:vtc");
+        assert_eq!(value["action"], RECOGNISE_ACTION);
+        assert_eq!(value["resource"], TRUST_GRAPH_RESOURCE);
+        assert_eq!(value["record_type"], "recognition");
+        assert_eq!(value["recognized"], true);
+        assert_eq!(value["context"]["status"], "active");
+        assert_eq!(value["context"]["activeFrom"], "2026-08-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn a_published_card_rides_the_recognition_as_a_pointer_and_nothing_more() {
+        let mut record = RegistryRecord::fresh_active("did:key:zMember");
+        record.directory_card = Some(super::super::model::DirectoryCardPointer {
+            entry_id: "dir_Q2xhcmFRMmxoY21GUk1t".into(),
+            card_digest: "zQmRtaiZdzghK4hrtHNZFU11qm134M72fmH7JzwwjnP7Rou".into(),
+        });
+        let value = trust_record("did:webvh:vtc", &record);
+        assert_eq!(
+            value["context"]["directoryCard"],
+            json!({
+                "purpose": "A member's own directory card, published at their request so that anyone may find it.",
+                "entryId": "dir_Q2xhcmFRMmxoY21GUk1t",
+                "cardDigest": "zQmRtaiZdzghK4hrtHNZFU11qm134M72fmH7JzwwjnP7Rou",
+                "readWith": "https://trusttasks.org/spec/vtc/directory/card/public/0.1",
+            })
+        );
+        // Read back, the mirror sees the same pointer.
+        assert_eq!(
+            registry_record_from(&value).unwrap().directory_card,
+            record.directory_card
+        );
+        // A departed record never points to a card.
+        let mut gone = RegistryRecord::departed("did:key:zMember", Utc::now(), None);
+        gone.directory_card = record.directory_card.clone();
+        assert!(
+            trust_record("did:webvh:vtc", &gone)["context"]
+                .get("directoryCard")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_departed_member_is_published_as_not_recognised() {
+        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let record = RegistryRecord::departed("did:key:zGone", from, Some(to));
+        let value = trust_record("did:webvh:vtc", &record);
+        assert_eq!(value["recognized"], false);
+        assert_eq!(value["context"]["status"], "departed");
+        assert_eq!(value["context"]["activeTo"], "2026-08-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn a_record_without_recognized_reads_as_departed() {
+        // Absence is read restrictively: a record we cannot confirm is a
+        // recognition is not treated as live membership.
+        let parsed = registry_record_from(&json!({
+            "entity_id": "did:key:zMember",
+            "authority_id": "did:webvh:vtc",
+            "action": RECOGNISE_ACTION,
+            "resource": TRUST_GRAPH_RESOURCE,
+            "record_type": "recognition",
+        }))
+        .unwrap();
+        assert_eq!(parsed.status, RegistryStatus::Departed);
+    }
+
+    #[test]
+    fn record_round_trips_through_the_wire_shape() {
+        let record = RegistryRecord::fresh_active("did:key:zMember");
+        let wire = trust_record("did:webvh:vtc", &record);
+        let back = registry_record_from(&wire).unwrap();
+        assert_eq!(back.member_did, record.member_did);
+        assert_eq!(back.status, RegistryStatus::Active);
+        assert_eq!(back.active_from.timestamp(), record.active_from.timestamp());
+    }
+
+    /// The projection's records keep their 0.1 shape on either side of the
+    /// wire: renamed going out to 0.3 / 0.2, renamed back coming in, and every
+    /// other member untouched.
+    #[test]
+    fn a_record_crosses_the_lower_camel_case_versions_and_back() {
+        let v1 = json!({
+            "entity_id": "did:key:zMember",
+            "authority_id": "did:web:community.example",
+            "action": "git.repo.own",
+            "resource": "git-ns:github.com/acme",
+            "record_type": "authorization",
+            "recognized": true,
+        });
+        let v3 = record_to_v0_3(&v1);
+        assert_eq!(v3["entityId"], "did:key:zMember");
+        assert_eq!(v3["authorityId"], "did:web:community.example");
+        assert_eq!(v3["recordType"], "authorization");
+        assert!(v3.get("entity_id").is_none(), "{v3}");
+        assert_eq!(v3["action"], "git.repo.own");
+        assert_eq!(record_from_v0_3(&v3), v1);
+    }
+
+    #[test]
+    fn the_0_3_record_carries_the_membership_period_as_its_window() {
+        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        let departed = RegistryRecord::departed("did:key:zGone", from, Some(to));
+        let value = trust_record_v0_3("did:webvh:vtc", &departed);
+        assert_eq!(value["entityId"], "did:key:zGone");
+        assert_eq!(value["authorityId"], "did:webvh:vtc");
+        assert_eq!(value["recordType"], "recognition");
+        assert_eq!(value["recognized"], false);
+        assert_eq!(value["validFrom"], "2026-01-01T00:00:00+00:00");
+        assert_eq!(value["validUntil"], "2026-08-01T00:00:00+00:00");
+        // Kept in the context too, for 0.1 readers, for this release.
+        assert_eq!(value["context"]["activeTo"], "2026-08-01T00:00:00+00:00");
+        assert!(
+            value.get("entity_id").is_none(),
+            "0.3 is lowerCamelCase: {value}"
+        );
+    }
+
+    /// The registry refuses an empty or inverted window, which would park the
+    /// sync job. Such a record is a departed member's, already not recognised,
+    /// so the end is left off instead.
+    #[test]
+    fn an_end_not_after_the_start_is_not_sent_as_valid_until() {
+        let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for to in [at, at - chrono::Duration::days(1)] {
+            let record = RegistryRecord::departed("did:key:zOdd", at, Some(to));
+            let value = trust_record_v0_3("did:webvh:vtc", &record);
+            assert!(value.get("validUntil").is_none(), "{value}");
+            assert_eq!(value["recognized"], false);
+        }
+    }
+
+    #[test]
+    fn a_0_3_record_reads_back_with_its_window() {
+        let record = RegistryRecord::departed(
+            "did:key:zMember",
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap()),
+        );
+        let back = registry_record_from(&trust_record_v0_3("did:webvh:vtc", &record)).unwrap();
+        assert_eq!(back.member_did, "did:key:zMember");
+        assert_eq!(back.status, RegistryStatus::Departed);
+        assert_eq!(back.active_from, record.active_from);
+        assert_eq!(back.active_to, record.active_to);
+    }
+
+    /// The window is the record's own statement of the period; the context copy
+    /// is only for 0.1 readers, so the window wins when both are present.
+    #[test]
+    fn the_window_wins_over_the_context_dates() {
+        let parsed = registry_record_from(&json!({
+            "entityId": "did:key:zMember",
+            "recognized": true,
+            "validFrom": "2026-02-01T00:00:00Z",
+            "context": { "activeFrom": "2025-01-01T00:00:00Z" },
+        }))
+        .unwrap();
+        assert_eq!(parsed.active_from.to_rfc3339(), "2026-02-01T00:00:00+00:00");
+    }
+
+    /// A client with no messaging, no resolver and no REST arm — enough to
+    /// exercise everything that happens before a transport is chosen.
+    fn client_with(authority_did: Option<&str>) -> MessagingRegistryClient {
+        MessagingRegistryClient::new(
+            "did:webvh:registry".into(),
+            authority_did.map(str::to_string),
+            Arc::new(OnceCell::new()),
+            Arc::new(LocalSigner::from_ed25519_seed(
+                "did:webvh:vtc".into(),
+                &[7u8; 32],
+            )),
+            PendingReplies::new(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn not_being_ready_is_transient_but_a_real_mismatch_is_permanent() {
+        // The boot race: the registry client is built before the messaging
+        // listener publishes its handle, so for a moment we can speak nothing
+        // and every peer reads as "no transport in common". Permanent there
+        // would park the first sync jobs in `Failed`, which the syncer never
+        // retries — the health probe would recover on its next tick and the
+        // queue would stay broken.
+        let not_ready = ServiceCapabilities::default();
+        let err = classify_no_match(&not_ready, &[Protocol::Didcomm], "no overlap".into());
+        assert!(err.is_retriable(), "got {err:?}");
+        assert!(
+            err.to_string().contains("still \nstarting")
+                || err.to_string().contains("still starting"),
+            "the message should name the startup race: {err}",
+        );
+
+        // We can speak DIDComm and the peer offers only TSP: a genuine
+        // configuration fault, and retrying it forever would hide it behind an
+        // ever-growing queue.
+        let ready = ServiceCapabilities {
+            didcomm: Some("did:webvh:mediator".into()),
+            ..ServiceCapabilities::default()
+        };
+        let err = classify_no_match(&ready, &[Protocol::Tsp], "no overlap".into());
+        assert!(!err.is_retriable(), "got {err:?}");
+    }
+
+    #[test]
+    fn the_transport_snapshot_carries_the_did_before_any_call() {
+        // The diagnostics surface must be able to name the registry from the
+        // moment it is configured. Waiting for the first successful call would
+        // leave the page blank in exactly the situation an operator opens it:
+        // nothing is working yet.
+        let client = client_with(None);
+        let snapshot = client.transport();
+        assert_eq!(snapshot.did.as_deref(), Some("did:webvh:registry"));
+        assert!(snapshot.advertised.is_empty());
+        assert_eq!(snapshot.active, None);
+    }
+
+    #[test]
+    fn a_failed_selection_records_the_peer_set_alongside_the_error() {
+        // "advertised [tsp], active none, error: no transport in common" is a
+        // diagnosis an operator can act on. Recording the error while dropping
+        // what the peer offered would leave them resolving the DID by hand to
+        // learn the half that matters.
+        let client = client_with(None);
+        client.record_selection(vec![Protocol::Tsp], None, Some("no overlap".into()));
+        let snapshot = client.transport();
+        assert_eq!(snapshot.advertised, vec!["tsp".to_string()]);
+        assert_eq!(snapshot.active, None);
+        assert_eq!(snapshot.error.as_deref(), Some("no overlap"));
+    }
+
+    #[test]
+    fn a_later_success_clears_the_earlier_error() {
+        // Selection is re-evaluated per call, so the snapshot has to be
+        // re-falsifiable in both directions (R6.2): a registry that adds the
+        // missing service must stop reading as broken without a restart.
+        let client = client_with(None);
+        client.record_selection(vec![], None, Some("no overlap".into()));
+        client.record_selection(vec![Protocol::Didcomm], Some(Protocol::Didcomm), None);
+        let snapshot = client.transport();
+        assert_eq!(snapshot.advertised, vec!["didcomm".to_string()]);
+        assert_eq!(snapshot.active.as_deref(), Some("didcomm"));
+        assert_eq!(snapshot.error, None);
+    }
+
+    #[test]
+    fn our_capabilities_offer_rest_only_with_a_url_and_messaging_only_when_up() {
+        let client = client_with(Some("did:webvh:vtc"));
+        let caps = client.our_capabilities();
+        // Messaging is not up (empty OnceCell) and no URL is configured, so we
+        // can speak nothing — `select_protocol` will say so rather than the
+        // client silently picking a transport it cannot use.
+        assert_eq!(caps.advertised(), Vec::<Protocol>::new());
+    }
+
+    #[tokio::test]
+    async fn every_call_refuses_before_setup() {
+        // No `vtc_did` means no TRQP authority: writing a half-keyed record
+        // would publish rows under an empty authority that nothing can query.
+        let client = client_with(None);
+        let err = client
+            .delete_member("did:key:zMember")
+            .await
+            .expect_err("refuses without an authority DID");
+        assert!(matches!(err, RegistryError::Permanent(_)));
+        assert!(err.to_string().contains("vtc_did"));
+    }
+
+    /// Reads are signed like writes: operational key, `authentication`,
+    /// addressed to the registry, issued by this VTC's authority.
+    #[tokio::test]
+    async fn a_record_query_is_signed_for_authentication() {
+        let client = client_with(Some("did:webvh:vtc"));
+        let doc = client
+            .signed_document(RECORD_QUERY, json!({ "limit": 1 }))
+            .await
+            .expect("signs");
+        let doc = serde_json::to_value(&doc).unwrap();
+        assert_eq!(doc["type"], RECORD_QUERY);
+        assert_eq!(doc["proof"]["proofPurpose"], "authentication", "{doc}");
+        assert_eq!(doc["issuer"], "did:webvh:vtc");
+        assert_eq!(doc["recipient"], client.registry_did.as_str());
+        assert!(doc.get("issuedAt").is_some(), "{doc}");
+        let other = client
+            .signed_document(RECORD_QUERY, json!({ "limit": 1 }))
+            .await
+            .unwrap();
+        assert_ne!(doc["id"], serde_json::to_value(&other).unwrap()["id"]);
+    }
+
+    #[tokio::test]
+    async fn a_write_is_transient_while_messaging_is_down() {
+        // Messaging comes up after the client is built; a call in that window
+        // must be retriable, not a permanent failure that parks the job.
+        let client =
+            client_with(Some("did:webvh:vtc")).with_reply_timeout(Duration::from_millis(50));
+        let err = client
+            .round_trip(RECORD_QUERY, json!({ "limit": 1 }), Protocol::Didcomm)
+            .await
+            .expect_err("messaging is not running");
+        assert!(err.is_retriable(), "got {err:?}");
+    }
+}

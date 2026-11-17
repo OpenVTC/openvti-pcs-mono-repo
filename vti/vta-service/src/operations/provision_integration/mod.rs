@@ -1,0 +1,3576 @@
+//! `provision-integration` — shared library function driven by both the
+//! VTA CLI (`vta bootstrap provision-integration`) and the
+//! `provision/integration` Trust Task.
+//!
+//! See `docs/02-vta/provision-integration.md` for the full design.
+//!
+//! Flow, at the broadest level:
+//! 1. Precondition checks — caller is admin of the target context;
+//!    context exists; template registered.
+//! 2. Orchestrate key minting + template rendering via
+//!    `super::did_webvh::create_did_webvh` — it already handles the
+//!    mint-keys, render-template, build-log, publish-if-not-serverless
+//!    flow end-to-end.
+//! 3. Read back the minted private key material via
+//!    `super::keys::get_key_secret` for inclusion in the sealed bundle.
+//! 4. Register the holder (`client_did`) as admin of the target context
+//!    via `super::acl::create_acl`.
+//! 5. Build + sign a `VtaAuthorizationCredential` (the VC type tag the
+//!    VTA issues; see [`vta_sdk::provision_integration::credential`])
+//!    using the VTA's `{vta_did}#key-0` signing key (see
+//!    `vta_keys::load_vta_vc_issuance_secret`).
+//! 6. Assemble the [`TemplateBootstrapPayload`](vta_sdk::provision_integration::TemplateBootstrapPayload)
+//!    and seal it to the holder's X25519 (derived from `client_did`)
+//!    via `sealed_transfer::seal_payload`. Producer assertion is
+//!    `DidSigned` by `{vta_did}#sealed-transfer-0` (a purpose-specific
+//!    key, distinct from `#key-0`) unless the caller overrides to
+//!    `PinnedOnly` via [`AssertionMode`](crate::operations::provision_integration::AssertionMode)
+//!    (dev-only escape hatch).
+//! 7. Armor and return, plus a summary for the CLI/HTTP response.
+//!
+//! Everything persistent (admin ACL row, minted key records, webvh log
+//! entry) lands atomically as part of the `create_did_webvh` +
+//! `create_acl` calls — the sealed bundle is derived from that state
+//! rather than being a separate source of truth.
+//!
+//! Internal layout:
+//! - `mod.rs` (this file) — public types, main orchestrator, tests
+//! - `mint` — admin/integration key minting via DID templates
+//! - `preconditions` — authz + context/template registration checks
+//! - `templates` — context → global → builtin resolution helpers
+//! - `vta_keys` — loading the VTA's own keys + building the DidSigned
+//!   producer assertion
+//! - `webvh` — `WEBVH_SERVER` / `WEBVH_PATH` template-var helpers
+
+mod mint;
+mod preconditions;
+mod seal;
+mod templates;
+mod vta_keys;
+mod webs;
+#[cfg(all(test, feature = "webs"))]
+mod webs_tests;
+mod webvh;
+
+pub(crate) use webs::{RegisteredWebsHosts, WebsHostSource};
+
+pub use preconditions::{
+    AmbiguousContext, ResolveContextError, ensure_target_context_or_create, infer_target_context,
+    resolve_target_context,
+};
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use chrono::Duration;
+use serde_json::Value;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
+
+use crate::acl::{Capability, Role, delete_acl_entry, get_acl_entry, store_acl_entry};
+use crate::audit::{self, audit};
+use crate::auth::AuthClaims;
+use crate::config::AppConfig;
+use crate::didcomm_bridge::DIDCommBridge;
+use crate::error::AppError;
+use crate::keys::seed_store::SeedStore;
+use crate::server::AppState;
+use crate::store::KeyspaceHandle;
+use vta_sdk::provision_integration::{
+    AdminOfClaim, OperatorOfClaim, VerifiedBootstrapRequest, VtaAuthorizationClaim,
+    credential::{VtaAuthorizationParams, issue_vta_authorization_credential},
+    http::AdminScope,
+};
+use vta_sdk::sealed_transfer::{
+    SealedPayloadV1,
+    template_bootstrap::{
+        DidKeyMaterial, DidKeyMaterialV2, KeyPair, SlotKeyPair, TemplateBootstrapConfig,
+        TemplateBootstrapPayload, TemplateBootstrapPayloadV2, TemplateOutput,
+    },
+};
+
+/// How the producer assertion on the returned sealed bundle should be
+/// constructed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AssertionMode {
+    /// Sign the producer assertion with the VTA's purpose-specific
+    /// `{vta_did}#sealed-transfer-0` key. Default for production.
+    /// See `vta_keys::load_vta_sealed_transfer_secret` (private to the
+    /// `provision_integration` module).
+    #[default]
+    DidSigned,
+    /// No in-band signature — consumer relies purely on the out-of-band
+    /// digest to anchor trust. Dev/test escape hatch, not for
+    /// production flows.
+    PinnedOnly,
+}
+
+/// Cloned subset of every keystore + handle [`provision_integration`]
+/// needs. Both the REST [`AppState`] and the DIDComm
+/// [`crate::messaging::router::VtaState`] expose the underlying handles
+/// (all `Clone` and Arc-backed); this struct lets the library function
+/// be called from either transport without taking on a
+/// transport-specific `*State` dependency. Construction is cheap — every
+/// field is `Clone` and Arc-shared, so cloning is two pointer bumps per
+/// keyspace.
+#[derive(Clone)]
+pub struct ProvisionIntegrationDeps {
+    pub keys_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    pub audit: vta_audit::SharedAuditSink,
+    pub contexts_ks: KeyspaceHandle,
+    pub did_templates_ks: KeyspaceHandle,
+    pub imported_ks: KeyspaceHandle,
+    pub webvh_ks: KeyspaceHandle,
+    /// A did:webs VTA's own key event log: where its keys by role and its
+    /// trust bundle are read from.
+    pub webs_ks: KeyspaceHandle,
+    /// Sealed-bundle nonce store, for replay protection.
+    pub sealed_nonces_ks: KeyspaceHandle,
+    pub seed_store: Arc<dyn SeedStore>,
+    pub config: Arc<RwLock<AppConfig>>,
+    pub did_resolver: Option<DIDCacheClient>,
+    pub didcomm_bridge: Arc<DIDCommBridge>,
+}
+
+impl From<&AppState> for ProvisionIntegrationDeps {
+    fn from(state: &AppState) -> Self {
+        Self {
+            keys_ks: state.keys_ks.clone(),
+            acl_ks: state.acl_ks.clone(),
+            audit: std::sync::Arc::clone(&state.audit_sink),
+            contexts_ks: state.contexts_ks.clone(),
+            did_templates_ks: state.did_templates_ks.clone(),
+            imported_ks: state.imported_ks.clone(),
+            webvh_ks: state.webvh_ks.clone(),
+            webs_ks: state.webs_ks.clone(),
+            sealed_nonces_ks: state.sealed_nonces_ks.clone(),
+            seed_store: state.seed_store.clone(),
+            config: state.config.clone(),
+            did_resolver: state.did_resolver.clone(),
+            #[cfg(any(feature = "didcomm", feature = "tsp"))]
+            didcomm_bridge: state.didcomm_bridge.clone(),
+            #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+            didcomm_bridge: std::sync::Arc::new(crate::didcomm_bridge::DIDCommBridge::placeholder()),
+        }
+    }
+}
+
+/// Caller-supplied inputs to [`provision_integration`].
+pub struct ProvisionIntegrationParams {
+    pub request: VerifiedBootstrapRequest,
+    /// The context the integration will live in. May be explicit (from
+    /// an operator `--context` flag) or match the `contextHint` on the
+    /// request. If both are present and disagree, the caller should
+    /// reject before calling us — we don't silently normalize.
+    pub context: String,
+    /// How wide the ACL entry written for the minted admin should be.
+    ///
+    /// Orthogonal to `context`, not an alternative spelling of it: `context`
+    /// is where the admin DID is minted and where its owner keeps its own
+    /// configuration, this is whether the resulting ACL entry names that
+    /// context or nothing at all. An operator console needs both — authority
+    /// everywhere, and one ordinary context to store its state in.
+    pub admin_scope: AdminScope,
+    /// See [`AssertionMode`].
+    pub assertion_mode: AssertionMode,
+    /// Override for the VC's `validUntil` window. Defaults to 1 hour
+    /// per [`vta_sdk::provision_integration::credential::DEFAULT_VALIDITY`].
+    pub vc_validity: Option<Duration>,
+}
+
+/// Output of [`provision_integration`] — the armored bundle plus the
+/// out-of-band digest the operator communicates to the integration's
+/// operator, plus a small summary for CLI display / HTTP response.
+pub struct ProvisionIntegrationOutput {
+    pub armored: String,
+    /// Lowercase hex — what an operator reads and what `--expect-digest` takes.
+    pub digest: String,
+    /// Multibase multihash — what `provision/integration/0.3` puts on the wire.
+    pub digest_multibase: String,
+    pub summary: ProvisionSummary,
+}
+
+#[derive(Debug)]
+pub struct ProvisionSummary {
+    /// Ephemeral DID that signed the VP and opens the sealed bundle.
+    pub client_did: String,
+    /// Long-term admin DID — `client_did` when no rollover, or the
+    /// VTA-minted DID when the request carried an `adminTemplate`
+    /// (or used the `AdminRotation` ask).
+    pub admin_did: String,
+    /// True when the VTA minted a fresh long-term admin DID for this
+    /// provisioning (i.e. `adminTemplate` was present in the VP, or
+    /// the request used the `AdminRotation` ask).
+    pub admin_rolled_over: bool,
+    /// Integration DID rendered from the integration template. `None`
+    /// for the `AdminRotation` ask — that flow only mints an admin
+    /// DID and does not produce an integration DID.
+    pub integration_did: Option<String>,
+    /// Name of the integration template that was rendered. `None`
+    /// for the `AdminRotation` ask.
+    pub template_name: Option<String>,
+    /// `kind` field of the integration template. `None` for the
+    /// `AdminRotation` ask.
+    pub template_kind: Option<String>,
+    /// Name of the admin template, when one was used (i.e. the
+    /// request used `adminTemplate` rollover *or* the `AdminRotation`
+    /// ask).
+    pub admin_template_name: Option<String>,
+    pub bundle_id_hex: String,
+    /// Number of minted secrets in the payload. For
+    /// `TemplateBootstrap`: 1 (integration only) or 2 (integration +
+    /// rolled admin). For `AdminRotation`: always 1 (admin only).
+    pub secret_count: usize,
+    /// Number of template-emitted side outputs. Always 0 for
+    /// `AdminRotation`; for `TemplateBootstrap` the count of webvh
+    /// logs / DIDComm services / generic outputs.
+    pub output_count: usize,
+    /// Resolved id of the registered webvh hosting server the VTA
+    /// published the integration's `did.jsonl` to. `None` when the
+    /// integration is self-hosted (no `WEBVH_SERVER` template var, or
+    /// it was explicitly null), or when the request was
+    /// `AdminRotation` (no integration mint at all).
+    pub webvh_server_id: Option<String>,
+    /// The context the integration was provisioned into. Echoed so a caller
+    /// that omitted `context` and let inference run learns where it landed
+    /// rather than re-deriving it from its own view of this VTA's layout.
+    pub context: String,
+    /// The scope of the ACL entry actually written for `admin_did` — what was
+    /// done, not what was asked for.
+    pub admin_scope: AdminScope,
+}
+
+/// The `allowed_contexts` an [`AdminScope`] means, as an ACL entry reads it.
+///
+/// An empty list is not "no contexts" for an admin — [`vti_common::acl`]'s
+/// `act_scope` reads it as `ActScope::All`, which is the whole mechanism
+/// behind a super-admin and the reason the empty case has to be written
+/// deliberately rather than reached by a `context` that happened to be blank.
+fn allowed_contexts_for(scope: AdminScope, context: &str) -> Vec<String> {
+    match scope {
+        AdminScope::Context => vec![context.to_string()],
+        AdminScope::Unrestricted => Vec::new(),
+    }
+}
+
+/// Main entry point. See module docs for the flow.
+pub async fn provision_integration(
+    state: &ProvisionIntegrationDeps,
+    auth: &AuthClaims,
+    params: ProvisionIntegrationParams,
+) -> Result<ProvisionIntegrationOutput, AppError> {
+    provision_integration_with(state, auth, params, &RegisteredWebsHosts).await
+}
+
+/// [`provision_integration`], publishing a `did:webs` integration DID through
+/// `webs_hosts` (the registered servers; a recording fake in tests).
+pub(crate) async fn provision_integration_with<W: WebsHostSource>(
+    state: &ProvisionIntegrationDeps,
+    auth: &AuthClaims,
+    params: ProvisionIntegrationParams,
+    webs_hosts: &W,
+) -> Result<ProvisionIntegrationOutput, AppError> {
+    let ProvisionIntegrationParams {
+        request,
+        context,
+        admin_scope,
+        assertion_mode,
+        vc_validity,
+    } = params;
+
+    let client_did = request.holder().to_string();
+    let bundle_id = request
+        .decode_nonce()
+        .map_err(|e| AppError::Validation(format!("bootstrap request nonce decode: {e}")))?;
+    let client_x25519_pub = request
+        .decode_client_x25519_pub()
+        .map_err(|e| AppError::Validation(format!("bootstrap request X25519 derivation: {e}")))?;
+
+    // ── 1. Preconditions ────────────────────────────────────────────
+    preconditions::preconditions(state, auth, &context, admin_scope, &request).await?;
+
+    // ── 2. Dispatch on the bootstrap intent ─────────────────────────
+    //
+    // `AdminRotation` is the lighter sibling of `TemplateBootstrap` —
+    // mints only the admin DID, no integration template render, and
+    // returns a `SealedPayloadV1::AdminRotation` envelope. Its flow
+    // shares preconditions + key-minting helpers but skips the
+    // integration mint entirely, so we branch here rather than
+    // littering the integration path with `if integration_template`
+    // checks.
+    if matches!(
+        request.ask(),
+        vta_sdk::provision_integration::BootstrapAsk::AdminRotation(_)
+    ) {
+        return provision_admin_rotation(
+            state,
+            auth,
+            &request,
+            &context,
+            admin_scope,
+            assertion_mode,
+            vc_validity,
+            bundle_id,
+            &client_did,
+            &client_x25519_pub,
+        )
+        .await;
+    }
+
+    // ── 3. Extract templates + vars from the ask ────────────────────
+    let (template_name, mut template_vars) = preconditions::extract_template(request.ask())?
+        .expect("TemplateBootstrap ask must yield an integration template");
+    let admin_template_ref = preconditions::extract_admin_template(request.ask());
+
+    // ── 3. Mint + render + publish via create_did_webvh ─────────────
+    //
+    // Templates ship with a `URL` required var that becomes the
+    // integration's own service endpoint inside the rendered DID
+    // document (mediator's DIDComm endpoint, webvh hosting URL, etc.).
+    // It is *content* of the DID document, separate from where the
+    // `did.jsonl` log itself gets published.
+    //
+    // Publication target is selected by the optional `WEBVH_SERVER`
+    // template var:
+    //
+    //   WEBVH_SERVER absent or null → serverless mode (VTA does not
+    //     publish; the integration self-hosts at the URL above).
+    //   WEBVH_SERVER set to a registered server id → VTA publishes
+    //     `did.jsonl` to that server via its WebVHHosting endpoint.
+    //
+    // The id is validated against the registered-server catalogue
+    // before any state mutation so a typo or stale id fails fast,
+    // before key minting writes anything.
+    //
+    // `URL` is optional at this layer — templates that need it declare
+    // it in `requiredVars` and the renderer enforces presence. Keeping
+    // it mandatory here would block templates (e.g. non-webvh
+    // integrations, tests, internal tooling) that legitimately don't
+    // ship a URL as document content.
+    let integration_url = template_vars
+        .get("URL")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let webvh_server_id = webvh::resolve_webvh_server(&template_vars, &state.webvh_ks).await?;
+
+    // Optional `WEBVH_PATH` template var: the *only* input to the DID's
+    // path. The service `URL` never influences the DID name — that
+    // derivation leaked the REST route (`…/mediator/v1`) into the
+    // identifier and, being deterministic, collided on every re-run.
+    // Removed from the map so the template renderer doesn't also see it —
+    // it is transport metadata, not document content.
+    //
+    // The value maps onto the total `WebvhPathMode` below: absent / empty
+    // → `AutoAssign` (the hosting server mints a random path),
+    // `.well-known` → `WellKnown` (root), any other label → `Explicit`.
+    // The mapping is mode-independent: serverless mode never reads
+    // `WEBVH_PATH` at all (the DID location comes straight from `URL`), so
+    // this only governs server-managed publication.
+    let webvh_path = webvh::take_webvh_path(&mut template_vars)?;
+
+    // Optional `WEBVH_DOMAIN` template var: when the webvh hosting server
+    // is multi-tenant, this pins which tenant domain the DID is allocated
+    // under. Absent → the remote runs its own resolution chain (caller's
+    // ACL default → system default). Removed from the map for the same
+    // reason as `WEBVH_PATH` — transport metadata, not document content.
+    let webvh_domain = webvh::take_webvh_domain(&mut template_vars)?;
+    // `DID_METHOD=webs`: a did:webs integration DID (design note
+    // did-webs-in-the-vta §4, S7). Taken first; any other `DID_METHOD` is the
+    // presentation of a webvh log.
+    let use_webs = webvh::take_webs_method(&mut template_vars);
+    let (did_method, scid_also_known_as) = webvh::take_did_presentation(&mut template_vars)?;
+    if use_webs && scid_also_known_as.is_some() {
+        return Err(AppError::Validation(
+            "SCID_ALSO_KNOWN_AS lists a did:webvh log's did:scid alias, and DID_METHOD=webs \
+             mints a did:webs, which has no such log. Omit SCID_ALSO_KNOWN_AS."
+                .into(),
+        ));
+    }
+
+    // Decide whether the minted DID should become the context's primary
+    // DID. First-integration wins: when the context has no DID yet, bind
+    // the newly-minted one so downstream operations (fetch_did_secrets_bundle,
+    // build_did_secrets_bundle) resolve without a separate update step.
+    // When the context already has a primary (e.g. provisioning a second
+    // mediator into the same context), leave it alone — we don't want a
+    // later integration silently displacing the first.
+    let ctx_before_mint = crate::contexts::get_context(&state.contexts_ks, &context)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "context '{context}' disappeared between precondition check and DID mint"
+            ))
+        })?;
+    let set_primary = ctx_before_mint.did.is_none();
+
+    // Peek at the template's `methods` field. Templates declaring only
+    // `["key"]` want a did:key integration (ephemeral / headless /
+    // signing-only — no hosted did.jsonl log); everything else stays
+    // on the webvh path. An empty `methods` list keeps the did:webvh
+    // default — `methods` is advisory, and most templates omit it.
+    let integration_template = templates::resolve_template_by_name(state, &context, &template_name)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::Validation(format!(
+                "integration template '{template_name}' is not registered on this VTA. \
+                 Register it via 'pnm did-templates create --file <path> --context {context}' (the file's \
+                 `name` must be '{template_name}') \
+                 then retry."
+            )),
+            other => other,
+        })?;
+    // A `methods` list containing `"peer"` selects the self-contained
+    // did:peer path (no WebVH hosting, no did.jsonl, no publish). Checked
+    // before the did:key / did:webvh dispatch.
+    let use_did_peer = templates::template_targets_did_peer(&integration_template);
+    let use_did_key = templates::template_targets_did_key_only(&integration_template);
+    if use_webs && (use_did_peer || use_did_key) {
+        return Err(AppError::Validation(format!(
+            "template '{template_name}' declares methods {:?}, a self-contained DID with \
+             nothing to publish, and DID_METHOD=webs asks for a did:webs published at a host. \
+             Omit DID_METHOD, or provision from a template that describes a hosted DID.",
+            integration_template.methods
+        )));
+    }
+    // did:key and did:peer mint their own signing + key-agreement pair; only
+    // a webvh template's slots decide what the bundle can carry. Refused
+    // before the mint, so a refusal leaves no DID behind.
+    if !use_did_peer && !use_did_key {
+        templates::require_bundle_shape(&template_name, &integration_template)?;
+    }
+
+    // When the did:key or did:peer path runs, we already hold the full
+    // `DidKeyMaterial` (signing + KA public/private) from the mint
+    // helper — there's no keystore round-trip for the KA key because
+    // X25519 is derived from the Ed25519 seed (did:key) or minted directly
+    // as the peer's `#key-2` (did:peer), not BIP-32 derived at its own
+    // path. Capture it here so the readback section below can skip
+    // `get_key_secret` on those branches.
+    let mut did_key_material: Option<DidKeyMaterial> = None;
+    // A did:webs integration's key event stream, shipped in place of a log.
+    let mut webs_keri_cesr: Option<String> = None;
+
+    let (integration_did, signing_key_id, ka_key_id, additional_key_ids, did_document, did_log) =
+        if use_webs {
+            // did:webs path — level 1, class `service`, from the template,
+            // published at the registered server `WEBVH_SERVER`. The keys are
+            // read back below exactly as the webvh path's are, through
+            // `get_key_secret`; their record ids are the ids the document
+            // gives them (`<did>#<CESR key>`).
+            let minted = webs::mint(
+                state,
+                auth,
+                webs_hosts,
+                &context,
+                &client_did,
+                &template_name,
+                &template_vars,
+                webs::WebsTarget {
+                    server_id: webvh_server_id.clone(),
+                    domain: webvh_domain.clone(),
+                    path: webvh_path.clone(),
+                },
+                set_primary,
+            )
+            .await?;
+            webs_keri_cesr = Some(minted.keri_cesr);
+            (
+                minted.did,
+                minted.signing_key_id,
+                minted.ka_key_id,
+                std::collections::BTreeMap::new(),
+                minted.did_document,
+                None,
+            )
+        } else if use_did_peer {
+            // did:peer path — self-contained. Mint an Ed25519 signing key +
+            // X25519 key-agreement key and encode them into a did:peer:2 with
+            // a DIDCommMessaging service on MEDIATOR_DID (matching how the
+            // `ai-agent` did:webvh template advertises DIDComm), so the agent
+            // reaches the VTA over the mediator identically. `WEBVH_SERVER` /
+            // `WEBVH_PATH` / `URL` are forbidden — there is nothing to host.
+            let (did, skid, kkid, doc, material) =
+                provision_did_peer(state, &template_vars).await?;
+            did_key_material = Some(material);
+            // did:peer mints its own fixed pair; a template declaring extra slots
+            // is refused before reaching here (`plan_key_slots` runs on the webvh
+            // path, and these branches have no seed-derived slot to mint from).
+            (
+                did,
+                skid,
+                kkid,
+                std::collections::BTreeMap::new(),
+                doc,
+                None,
+            )
+        } else if use_did_key {
+            // did:key path — no webvh publication. `WEBVH_SERVER` /
+            // `WEBVH_PATH` / `URL` are all irrelevant here; the template's
+            // `methods: ["key"]` is load-bearing metadata, not the URL.
+            let (did, skid, kkid, doc, log, material) =
+                mint::mint_integration_via_did_key_template(
+                    state,
+                    &context,
+                    &client_did,
+                    &template_name,
+                    &template_vars,
+                )
+                .await?;
+            did_key_material = Some(material);
+            (did, skid, kkid, std::collections::BTreeMap::new(), doc, log)
+        } else {
+            // did:webvh path — `create_did_webvh` takes exactly one of
+            // `server_id` / `url`.
+            // - WEBVH_SERVER set → `server_id` wins; `url` is unused by that
+            //   path, so we drop it even if supplied.
+            // - WEBVH_SERVER unset → serverless mode; we need a `url`. This is
+            //   the only path where an absent URL is a hard error; surface it
+            //   with guidance naming the `WEBVH_SERVER` alternative.
+
+            // Resolve the path request into the explicit, total path mode, and
+            // reject an explicit root request on a shared server before any
+            // state is written (see `reject_root_on_shared_server`).
+            let path_mode =
+                vta_sdk::protocols::did_management::create::WebvhPathMode::from(webvh_path);
+            webvh::reject_root_on_shared_server(&path_mode, webvh_server_id.is_some())?;
+
+            let (params_server_id, params_url) = match &webvh_server_id {
+                Some(id) => (Some(id.clone()), None),
+                None => {
+                    let url = integration_url.clone().ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "webvh DIDs need a publication target. Template '{template_name}' \
+                         resolved without a 'URL' or 'WEBVH_SERVER' template var. Pass either \
+                         `--var URL=https://...` (serverless mode — you publish did.jsonl \
+                         yourself) or `--var WEBVH_SERVER=<id>` (route through a webvh \
+                         hosting server registered with `vta did-mgmt servers add`). At least one \
+                         is required for any built-in that mints a did:webvh (e.g. \
+                         `did-host-http`, `did-host-http-didcomm`)."
+                        ))
+                    })?;
+                    (None, Some(url))
+                }
+            };
+
+            let template_vars_hashmap: std::collections::HashMap<String, Value> =
+                template_vars.clone().into_iter().collect();
+
+            let config = state.config.read().await;
+            let did_resolver = state
+                .did_resolver
+                .as_ref()
+                .ok_or_else(|| AppError::Internal("DID resolver not initialized".into()))?;
+            // `state` is a `ProvisionIntegrationDeps`, not an `AppState`, so build
+            // the create-deps by hand (it carries all the fields).
+            let create_deps = super::did_webvh::CreateDidWebvhDeps {
+                keys_ks: &state.keys_ks,
+                imported_ks: &state.imported_ks,
+                contexts_ks: &state.contexts_ks,
+                webvh_ks: &state.webvh_ks,
+                did_templates_ks: &state.did_templates_ks,
+                audit: &state.audit,
+                seed_store: &*state.seed_store,
+                config: &config,
+                did_resolver,
+                didcomm_bridge: &state.didcomm_bridge,
+                acl_ks: Some(&state.acl_ks),
+                // `ProvisionIntegrationDeps` carries no mediator socket, so the
+                // seam falls to DIDComm here. Provisioning is also the one moment
+                // the VTA has not yet learned anything about the host, so there is
+                // nothing this could be built from opportunistically.
+                #[cfg(feature = "tsp")]
+                tsp: None,
+            };
+            let create_result = super::did_webvh::create_did_webvh(
+                &create_deps,
+                auth,
+                super::did_webvh::CreateDidWebvhParams {
+                    context_id: context.clone(),
+                    server_id: params_server_id,
+                    url: params_url,
+                    // Absent `WEBVH_PATH` → `AutoAssign` (server mints a
+                    // random path); `.well-known` → `WellKnown` (root, already
+                    // rejected above on shared servers); a label → `Explicit`.
+                    path_mode,
+                    // Explicit tenant domain when the caller set
+                    // `WEBVH_DOMAIN` (multi-tenant hosting server); `None`
+                    // lets the remote resolve to its caller-default / system
+                    // default.
+                    domain: webvh_domain,
+                    label: Some(client_did.clone()),
+                    portable: true,
+                    add_mediator_service: false,
+                    add_tsp_service: Some(false),
+                    additional_services: None,
+                    pre_rotation_count: 0,
+                    did_document: None,
+                    did_log: None,
+                    set_primary,
+                    // Template rendering happens inside the operation, from the
+                    // keys it derives — nothing out here needs the document
+                    // first, so there is nothing to share.
+                    pre_derived: None,
+                    signing_key_id: None,
+                    ka_key_id: None,
+                    template: Some(template_name.clone()),
+                    // The same scope the template was found in above: context
+                    // first, then global, then built-in. `None` searched global
+                    // only, so a template registered in the context passed the
+                    // checks and then was not found here.
+                    template_context: Some(context.clone()),
+                    template_vars: template_vars_hashmap,
+                    // provision-integration always creates an integration DID,
+                    // never the VTA's own identity.
+                    is_vta_identity: false,
+                    did_method,
+                    scid_also_known_as,
+                },
+                "provision-integration",
+            )
+            .await?;
+
+            let did_document = create_result.did_document.clone().ok_or_else(|| {
+                AppError::Internal("create_did_webvh did not return did_document".into())
+            })?;
+            // The integration is handed its DID to present: a did:scid with the
+            // `src` a recipient needs (VTI-KEY-163); its keys are under the
+            // bare DID, which `select_secret_kid` publishes them as.
+            let integration_did = match (&create_result.did_method, &create_result.scid_did_url) {
+                (Some(vta_sdk::did_scid::DidMethod::Scid), Some(url)) => url.clone(),
+                _ => create_result.did.clone(),
+            };
+            (
+                integration_did,
+                create_result.signing_key_id.clone(),
+                create_result.ka_key_id.clone(),
+                create_result.additional_key_ids.clone(),
+                did_document,
+                create_result.log_entry.clone(),
+            )
+        };
+
+    // did:key / did:peer paths: set the minted DID as primary when the
+    // context has none. The webvh path already handles this inside
+    // create_did_webvh via `set_primary`.
+    if (use_did_key || use_did_peer) && set_primary {
+        let mut ctx = ctx_before_mint.clone();
+        ctx.did = Some(integration_did.clone());
+        ctx.updated_at = chrono::Utc::now();
+        crate::contexts::store_context(&state.contexts_ks, &ctx)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("set integration did:key as context primary: {e}"))
+            })?;
+    }
+
+    // ── 4. Read back minted secrets ─────────────────────────────────
+    //
+    // The did:key branch above already captured the full `DidKeyMaterial`
+    // at mint time (X25519 KA isn't BIP-32 derived at its own path, so
+    // `get_key_secret` can't recompute it). Skip the readback in that
+    // case; the webvh branch still goes through `get_key_secret` so it
+    // exercises the same authz surface as any export — `key-export`, scope,
+    // the exportability refusals and the durable `key.secret_export` row —
+    // sealed to the holder (VTI-VTA-030).
+    let mut secrets = BTreeMap::new();
+    // Extra signing keys, and the slot-tagged view of the pair they sit beside.
+    // Both stay empty on the did:key / did:peer branches and for every v1
+    // template — which is what decides the sealed variant below.
+    let mut additional_material: Vec<SlotKeyPair> = Vec::new();
+    let mut primary_slots: Option<(SlotKeyPair, SlotKeyPair)> = None;
+    if let Some(material) = did_key_material {
+        secrets.insert(material.did.clone(), material);
+    } else {
+        let signing_secret_resp = super::keys::get_key_secret(
+            &state.keys_ks,
+            &state.imported_ks,
+            &state.contexts_ks,
+            &state.acl_ks,
+            &state.seed_store,
+            &state.audit,
+            auth,
+            &signing_key_id,
+            super::keys::ExportChannel::Sealed("provision-integration"),
+        )
+        .await?;
+        let ka_secret_resp = super::keys::get_key_secret(
+            &state.keys_ks,
+            &state.imported_ks,
+            &state.contexts_ks,
+            &state.acl_ks,
+            &state.seed_store,
+            &state.audit,
+            auth,
+            &ka_key_id,
+            super::keys::ExportChannel::Sealed("provision-integration"),
+        )
+        .await?;
+
+        // The bundle's `key_id` strings must equal the `verificationMethod.id`
+        // entries in the *published* DID document. Built-in templates
+        // are aligned with the VTA's internal storage convention
+        // (`{did}#key-0` / `#key-1`), but operator-uploaded templates
+        // may declare arbitrary fragments. Look up the kid by matching
+        // publicKeyMultibase so each template gets bundle entries that
+        // match its own VM ids — a consumer storing the bundle verbatim
+        // can then resolve an inbound JWE's kid against the live document
+        // and find the matching private key.
+        //
+        // A did:webs document carries its keys as JWKs, each under the id the
+        // key itself makes (`<did>#<CESR key>`), and the key records are named
+        // by exactly that id; so there the record id is the kid, once the
+        // document is seen to list it.
+        let webs_kid = |key_id: &str| -> Result<String, AppError> {
+            lists_verification_method(&did_document, key_id)
+                .then(|| key_id.to_string())
+                .ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "the did:webs document of '{integration_did}' lists no verification \
+                         method {key_id}"
+                    ))
+                })
+        };
+        let signing_kid = if use_webs {
+            webs_kid(&signing_key_id)?
+        } else {
+            published_kid_for(&did_document, &signing_secret_resp.public_key_multibase).ok_or_else(
+                || {
+                    AppError::Internal(format!(
+                        "rendered DID document for '{integration_did}' has no \
+                 verificationMethod matching the minted signing publicKeyMultibase \
+                 — template '{template_name}' likely references a different \
+                 SIGNING_KEY_MB binding"
+                    ))
+                },
+            )?
+        };
+        let ka_kid = if use_webs {
+            webs_kid(&ka_key_id)?
+        } else {
+            published_kid_for(&did_document, &ka_secret_resp.public_key_multibase).ok_or_else(
+                || {
+                    AppError::Internal(format!(
+                        "rendered DID document for '{integration_did}' has no \
+                     verificationMethod matching the minted key-agreement \
+                     publicKeyMultibase — template '{template_name}' likely \
+                     references a different KA_KEY_MB binding"
+                    ))
+                },
+            )?
+        };
+
+        // A did:scid integration's document lists its keys under the bare
+        // did:scid DID (VTI-KEY-161), so the bundle names them there; the
+        // records (and `get_key_secret` below) keep the log's method ids.
+        let presented_kid = |kid: &str| {
+            vta_sdk::did_scid::presented_reference(&integration_did, kid)
+                .unwrap_or_else(|| kid.to_string())
+        };
+        let signing_kid = presented_kid(&signing_kid);
+        let ka_kid = presented_kid(&ka_kid);
+
+        // Signing keys beyond the primary, when the template declared extra
+        // slots. Read back the same way as the pair — through `get_key_secret`,
+        // so an extra key crosses exactly the authorization surface the other
+        // two do rather than a quieter one.
+        //
+        // The ids come from `create`, which read them off the *published*
+        // document. Deriving them here would be guessing at the fragment the
+        // template chose.
+        for (slot, key_id) in &additional_key_ids {
+            let resp = super::keys::get_key_secret(
+                &state.keys_ks,
+                &state.imported_ks,
+                &state.contexts_ks,
+                &state.acl_ks,
+                &state.seed_store,
+                &state.audit,
+                auth,
+                key_id,
+                super::keys::ExportChannel::Sealed("provision-integration"),
+            )
+            .await?;
+            additional_material.push(SlotKeyPair {
+                slot: slot.clone(),
+                // Carried from the stored record, not inferred from the
+                // multicodec. The record is where the truth about a key's
+                // algorithm lives.
+                key_type: resp.key_type.clone(),
+                key_id: presented_kid(key_id),
+                public_key_multibase: resp.public_key_multibase.clone(),
+                private_key_multibase: resp.private_key_multibase.clone(),
+            });
+        }
+
+        primary_slots = Some((
+            SlotKeyPair {
+                slot: vta_sdk::did_templates::SLOT_SIGNING.to_string(),
+                key_type: signing_secret_resp.key_type.clone(),
+                key_id: signing_kid.clone(),
+                public_key_multibase: signing_secret_resp.public_key_multibase.clone(),
+                private_key_multibase: signing_secret_resp.private_key_multibase.clone(),
+            },
+            SlotKeyPair {
+                slot: vta_sdk::did_templates::SLOT_KA.to_string(),
+                key_type: ka_secret_resp.key_type.clone(),
+                key_id: ka_kid.clone(),
+                public_key_multibase: ka_secret_resp.public_key_multibase.clone(),
+                private_key_multibase: ka_secret_resp.private_key_multibase.clone(),
+            },
+        ));
+
+        secrets.insert(
+            integration_did.clone(),
+            DidKeyMaterial {
+                did: integration_did.clone(),
+                signing_key: KeyPair {
+                    key_id: signing_kid,
+                    public_key_multibase: signing_secret_resp.public_key_multibase.clone(),
+                    private_key_multibase: signing_secret_resp.private_key_multibase.clone(),
+                },
+                ka_key: KeyPair {
+                    key_id: ka_kid,
+                    public_key_multibase: ka_secret_resp.public_key_multibase.clone(),
+                    private_key_multibase: ka_secret_resp.private_key_multibase.clone(),
+                },
+            },
+        );
+    }
+
+    // ── 4.5. Optional admin-DID rollover ───────────────────────────
+    //
+    // When the request carries an `adminTemplate`, the VTA mints a
+    // long-term admin DID under its own key custody and binds the VC
+    // subject + ACL row to that DID instead of `client_did`. The
+    // ephemeral `client_did` then has no authority at the VTA — it
+    // only opened the bundle. See `docs/02-vta/provision-integration.md`
+    // §"Admin-DID rollover" and CLAUDE.md "Use DID templates" /
+    // "Authorization claims … VC/VP".
+    let admin_did = if let Some(ref admin_ref) = admin_template_ref {
+        let minted = mint::mint_admin_via_template(state, &context, admin_ref).await?;
+        secrets.insert(minted.material.did.clone(), minted.material.clone());
+        minted.material.did
+    } else {
+        client_did.clone()
+    };
+
+    // ── 5. Register the (possibly rolled-over) admin as admin ──────
+    //
+    // ACL principal is `admin_did`: equals `client_did` when no
+    // rollover, equals the freshly-minted VTA-derived DID when
+    // rollover. The ephemeral `client_did` is never written to the
+    // ACL when rollover is in effect — its only role is opening the
+    // bundle.
+    register_admin(
+        state,
+        auth,
+        &client_did,
+        &admin_did,
+        request.label().map(str::to_string),
+        allowed_contexts_for(admin_scope, &context),
+        &context,
+    )
+    .await?;
+
+    // ── 5.5. Retire the ephemeral after admin rollover ──────────────
+    //
+    // When the request asked for an admin-DID rollover, the ephemeral
+    // `client_did` only existed to open the bundle. Its ACL row
+    // (granted by the operator before this call) is now stale —
+    // delete it and emit an `acl.swap` audit so the ephemeral →
+    // long-term hand-off is recorded the same shape as
+    // `operations::acl::swap_acl`. No-op when `admin_did == client_did`
+    // (no rollover requested) or when client_did has no ACL row
+    // (relayer ≠ holder flow — the ephemeral was never granted on
+    // this VTA).
+    retire_ephemeral_after_rollover(state, &client_did, &admin_did, &context).await?;
+
+    // ── 6. Build + sign the VTA authorization VC ────────────────────
+    let config = state.config.read().await;
+    let vta_did = config
+        .vta_did
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("VTA DID not configured".into()))?
+        .clone();
+    drop(config);
+
+    let template_kind =
+        templates::resolve_template_kind(&state.did_templates_ks, &template_name, &context)
+            .await
+            .unwrap_or_else(|_| "integration".to_string());
+
+    let claim = VtaAuthorizationClaim {
+        // Subject is the long-term admin DID — `client_did` when no
+        // rollover, the VTA-minted DID when an `adminTemplate` was
+        // requested. Holders verify this VC offline at bundle open
+        // and install the matching keys from the `secrets` map.
+        id: admin_did.clone(),
+        admin_of: AdminOfClaim {
+            vta: vta_did.clone(),
+            context: context.clone(),
+            role: "admin".into(),
+        },
+        operator_of: Some(OperatorOfClaim {
+            did: integration_did.clone(),
+            template: template_name.clone(),
+        }),
+    };
+    let mut vc_params = VtaAuthorizationParams::new(claim);
+    if let Some(validity) = vc_validity {
+        vc_params = vc_params.with_validity(validity);
+    }
+
+    // Split key-use: `#key-0` issues the VC's Data-Integrity proof;
+    // `#sealed-transfer-0` signs the sealed-transfer producer assertion
+    // below. Keeping them disjoint means a leak of one doesn't void the
+    // other and each can rotate independently.
+    let vc_issuer_secret = vta_keys::load_vta_vc_issuance_secret(state, &vta_did).await?;
+    let vc = issue_vta_authorization_credential(&vc_issuer_secret, vc_params)
+        .await
+        .map_err(|e| AppError::Internal(format!("issue VTA authorization VC: {e}")))?;
+    let vc_value =
+        serde_json::to_value(&vc).map_err(|e| AppError::Internal(format!("serialize VC: {e}")))?;
+
+    // ── 7. Build VtaTrustBundle — VTA DID doc + log ──────────────────
+    let vta_trust = vta_keys::load_vta_trust_bundle(state, &vta_did).await?;
+
+    // Template side outputs: today we always ship the webvh log for the
+    // integration DID if create_did_webvh produced one. Future template
+    // kinds (e.g., `webvh-hosting`) may emit additional outputs.
+    let mut outputs = Vec::new();
+    if let Some(log) = did_log {
+        outputs.push(TemplateOutput::WebvhLog {
+            did: integration_did.clone(),
+            log,
+        });
+    }
+    // A did:webs integration's key event stream. Emitted only for a did:webs,
+    // so every other bundle is byte-identical to what it was; an opener that
+    // predates the variant is refused it by name (`TemplateOutput` docs).
+    if let Some(keri_cesr) = webs_keri_cesr {
+        outputs.push(TemplateOutput::WebsKeriCesr {
+            did: integration_did.clone(),
+            keri_cesr,
+        });
+    }
+
+    // Snapshot counts before the payload is moved into the seal. The
+    // summary at the bottom of this fn (`secret_count`, `output_count`)
+    // must reflect what is actually in the bundle — hard-coding "1 or 2"
+    // based on `admin_rolled_over` silently lies when a future template
+    // mints pre-rotation keys or emits multiple side outputs.
+    let secret_count = secrets.len();
+    let output_count = outputs.len();
+
+    let config = TemplateBootstrapConfig {
+        template_name: template_name.clone(),
+        template_kind: template_kind.clone(),
+        did_document,
+        outputs,
+        vta_url: state.config.read().await.public_url.clone(),
+        vta_trust,
+    };
+
+    // ── The sealed shape follows the template ───────────────────────
+    //
+    // V2 only when this DID actually holds a signing key beyond the primary —
+    // which only a template declaring an extra slot produces. Every v1
+    // template, which is every built-in, keeps emitting `TemplateBootstrap`
+    // byte-identically, so no existing opener is affected until someone
+    // deliberately provisions from a template asking for keys that opener
+    // cannot install. It is then told so by name (`unknown variant
+    // template_bootstrap_v2`) rather than by a field error that reads like a
+    // corrupted bundle.
+    //
+    // The same no-migration property the proof rule has one layer up: the wire
+    // shape follows what is there, and nothing has a flag to set.
+    let payload = match (additional_material.is_empty(), primary_slots) {
+        (false, Some((signing_key, ka_key))) => {
+            let mut v2_secrets = BTreeMap::new();
+            v2_secrets.insert(
+                integration_did.clone(),
+                DidKeyMaterialV2 {
+                    did: integration_did.clone(),
+                    signing_key,
+                    ka_key,
+                    additional_signing_keys: additional_material,
+                },
+            );
+            // A rolled-over admin DID keeps the historical pair — admin
+            // authentication is not issuance, and nothing has asked it for a
+            // post-quantum key. Carried across so the bundle is still complete.
+            for (did, material) in &secrets {
+                if did == &integration_did {
+                    continue;
+                }
+                v2_secrets.insert(did.clone(), DidKeyMaterialV2::from_v1(material));
+            }
+            SealedPayloadV1::TemplateBootstrapV2(Box::new(TemplateBootstrapPayloadV2 {
+                authorization: vc_value,
+                secrets: v2_secrets,
+                config,
+            }))
+        }
+        _ => SealedPayloadV1::TemplateBootstrap(Box::new(TemplateBootstrapPayload {
+            authorization: vc_value,
+            secrets,
+            config,
+        })),
+    };
+
+    // ── 8. Seal ─────────────────────────────────────────────────────
+    let seal::SealedProvisionBundle {
+        armored,
+        digest,
+        digest_multibase,
+    } = seal::seal_provision_payload(
+        state,
+        &vta_did,
+        assertion_mode,
+        bundle_id,
+        &client_x25519_pub,
+        payload,
+    )
+    .await?;
+    let bundle_id_hex = hex_lower(&bundle_id);
+
+    let admin_rolled_over = admin_template_ref.is_some();
+    let admin_template_name = admin_template_ref.as_ref().map(|r| r.name.clone());
+
+    info!(
+        client_did = %client_did,
+        admin_did = %admin_did,
+        admin_rolled_over,
+        integration_did = %integration_did,
+        context = %context,
+        template = %template_name,
+        admin_template = ?admin_template_name,
+        bundle_id = %bundle_id_hex,
+        "provision-integration bundle sealed"
+    );
+
+    Ok(ProvisionIntegrationOutput {
+        armored,
+        digest,
+        digest_multibase,
+        summary: ProvisionSummary {
+            client_did,
+            admin_did,
+            admin_rolled_over,
+            integration_did: Some(integration_did),
+            template_name: Some(template_name),
+            template_kind: Some(template_kind),
+            admin_template_name,
+            bundle_id_hex,
+            secret_count,
+            output_count,
+            webvh_server_id,
+            context,
+            admin_scope,
+        },
+    })
+}
+
+use vta_sdk::hex::lower as hex_lower;
+
+/// Write the long-term admin's ACL row.
+///
+/// Two ways, chosen by who is asking:
+///
+/// - **The ephemeral itself, rolling over to a new DID, under a hand-off
+///   marker** (VTI-ACL-054): the successor is written and the ephemeral's row
+///   removed in one atomic step, bounded by the granter's recorded authority
+///   rather than by the ephemeral's own expiry
+///   ([`super::acl::exercise_handoff`]). It carries the ephemeral's capability
+///   narrowing, additive capabilities included.
+/// - **Anyone else** (an operator, a relayer, or an ephemeral with no marker):
+///   an ordinary grant, bounded by the caller's own entry (VTI-ACL-053). An
+///   expiring ephemeral without a marker is refused here (VTI-ACL-058), and
+///   the ephemeral is retired afterwards by
+///   [`retire_ephemeral_after_rollover`].
+async fn register_admin(
+    state: &ProvisionIntegrationDeps,
+    auth: &AuthClaims,
+    client_did: &str,
+    admin_did: &str,
+    label: Option<String>,
+    allowed_contexts: Vec<String>,
+    context: &str,
+) -> Result<(), AppError> {
+    let rolling_over_itself = admin_did != client_did && auth.did == client_did;
+    if rolling_over_itself && super::acl::holds_handoff(&state.acl_ks, client_did).await? {
+        let capabilities = get_acl_entry(&state.acl_ks, client_did)
+            .await?
+            .map(|e| e.capabilities)
+            .unwrap_or_default();
+        super::acl::exercise_handoff(
+            &state.acl_ks,
+            &state.audit,
+            &state.contexts_ks,
+            auth,
+            super::acl::HandOffSuccessor {
+                did: admin_did.to_string(),
+                role: Role::Admin,
+                label,
+                allowed_contexts,
+                capabilities,
+            },
+            "provision-integration",
+            Some(context),
+        )
+        .await?;
+        return Ok(());
+    }
+    if rolling_over_itself {
+        refuse_unmarked_expiring_rollover(state, client_did, context).await?;
+    }
+    // The admin is granted the writer's own purposes: within them by construction
+    // (VTI-ACL-107), where `any` — the default — would be refused to a writer whose
+    // entry lists purposes, leaving it unable to provision at all.
+    let purposes = get_acl_entry(&state.acl_ks, &auth.did)
+        .await?
+        .map(|me| me.purposes)
+        .unwrap_or_default();
+    match super::acl::create_acl(
+        &state.acl_ks,
+        &state.audit,
+        &state.contexts_ks,
+        auth,
+        super::acl::CreateAclParams {
+            did: admin_did.to_string(),
+            role: Role::Admin,
+            label,
+            allowed_contexts,
+            purposes,
+            ..Default::default()
+        },
+        "provision-integration",
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        // Re-running provision-integration against the same admin_did while
+        // its row already exists is a retry or an operator-driven refresh:
+        // carry on without bumping the row. Only here — a hand-off that lost a
+        // race is not a retry, and its successor was never written.
+        Err(AppError::Conflict(_)) => {
+            info!(
+                admin_did = %admin_did,
+                context = %context,
+                "ACL row already exists — reusing for provision-integration"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Refuse an ephemeral that rolls itself over with an expiring entry and no
+/// hand-off marker, with an error that names the fix.
+///
+/// The long-term row is permanent, so an ordinary grant from an expiring caller
+/// is refused by VTI-ACL-053 anyway, but its generic text ("give it an expiry
+/// no later than yours") points the operator at the wrong remedy: the
+/// successor must be permanent, and what is missing is the granter's one-time
+/// hand-off (VTI-ACL-054). The marker is set only at creation (VTI-ACL-055),
+/// so the fix is a re-grant, and the message prints it.
+async fn refuse_unmarked_expiring_rollover(
+    state: &ProvisionIntegrationDeps,
+    client_did: &str,
+    context: &str,
+) -> Result<(), AppError> {
+    let Some(entry) = get_acl_entry(&state.acl_ks, client_did).await? else {
+        return Ok(());
+    };
+    let Some(expires_at) = entry.expires_at else {
+        return Ok(());
+    };
+    // Re-grant exactly the scope it holds; an unrestricted admin takes no
+    // `--contexts`, and a row authorized nowhere is shown the context it
+    // asked to provision into.
+    let contexts = match entry.act_scope() {
+        vti_common::acl::ActScope::Contexts(cs) => format!(" --contexts {}", cs.join(",")),
+        vti_common::acl::ActScope::All => String::new(),
+        vti_common::acl::ActScope::None => format!(" --contexts {context}"),
+    };
+    // And the capabilities it holds: deleting the row drops them, so a
+    // re-grant that left them out would trade one refusal for another — a
+    // holder client (`--admin-holder`) would come back without
+    // `persona-holder`. Echoed from the row, never added, so an integration
+    // is not told to take holder authority it was never given.
+    let capabilities = if entry.capabilities.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = entry
+            .capabilities
+            .iter()
+            .filter_map(|c| serde_json::to_value(c).ok())
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        format!(" --capabilities {}", names.join(","))
+    };
+    // `pnm acl delete` takes the DID positionally; `pnm acl create` takes it
+    // as `--did`.
+    Err(AppError::Forbidden(format!(
+        "{client_did}'s entry expires at {expires_at} and carries no one-time hand-off, so \
+         it cannot roll over to the permanent long-term admin (VTI-ACL-053, VTI-ACL-054). \
+         The hand-off is set only when the entry is created — re-grant it, then retry: \
+         `pnm acl delete {client_did}` then `pnm acl create --did {client_did} \
+         --role admin{contexts} --expires 1h --handoff{capabilities}`"
+    )))
+}
+
+/// Retire the ephemeral `client_did`'s ACL row after the VTA has rolled
+/// the long-term admin over to a freshly-minted `admin_did`. Emits an
+/// `acl.swap` audit entry — same action tag + shape as
+/// [`super::acl::swap_acl`] — so audit consumers see a single uniform
+/// "ephemeral → long-term hand-off" trail regardless of which path
+/// performed the swap.
+///
+/// No-ops when:
+/// - `admin_did == client_did`: no rollover happened, the ephemeral IS
+///   the long-term DID, nothing to retire.
+/// - `client_did` has no ACL row: relayer ≠ holder flow, the ephemeral
+///   was never granted on this VTA, there's nothing to delete and
+///   "swap" wouldn't be an accurate label.
+///
+/// Closes the audit gap surfaced in the May 2026 review: previously the
+/// ephemeral row lingered until `acl_sweeper` cleaned it up at TTL
+/// expiry, with no record of why it had been superseded.
+async fn retire_ephemeral_after_rollover(
+    state: &ProvisionIntegrationDeps,
+    client_did: &str,
+    admin_did: &str,
+    context: &str,
+) -> Result<(), AppError> {
+    if admin_did == client_did {
+        return Ok(());
+    }
+    let Some(ephemeral) = get_acl_entry(&state.acl_ks, client_did).await? else {
+        return Ok(());
+    };
+    carry_additive_capabilities(state, &ephemeral, admin_did, context).await?;
+    delete_acl_entry(&state.acl_ks, client_did).await?;
+    info!(
+        from = %client_did,
+        to = %admin_did,
+        context = %context,
+        "provision-integration retired ephemeral ACL row after admin rollover"
+    );
+    audit!(
+        "acl.swap",
+        actor = client_did,
+        resource = admin_did,
+        outcome = "success"
+    );
+    audit::record_best_effort(
+        &state.audit,
+        "acl.swap",
+        client_did,
+        Some(admin_did),
+        "success",
+        Some("provision-integration"),
+        Some(context),
+    )
+    .await;
+    Ok(())
+}
+
+/// Which of the ephemeral's capabilities the successor is missing and cannot
+/// re-derive.
+///
+/// The whole decision, kept separate from the store I/O around it because this
+/// is the part that regressed: the successor's row is written with an empty
+/// capability list, which means "whatever the role implies" — and the additive
+/// ones are implied by no role at all.
+fn additive_to_carry(ephemeral: &[Capability], successor: &[Capability]) -> Vec<Capability> {
+    ephemeral
+        .iter()
+        .copied()
+        .filter(|cap| vti_common::acl::is_additive(*cap))
+        .filter(|cap| !successor.contains(cap))
+        .collect()
+}
+
+/// Move the ephemeral's **additive** capabilities onto its successor.
+///
+/// A rollover is a hand-off: the same authority, on a new DID, with the old row
+/// deleted in the same breath — which is why it audits as `acl.swap`. The
+/// self-service rotation that shares that event name already carries the whole
+/// capability list across ([`super::acl::swap_acl`]). This path did not, and
+/// built the successor's row from `CreateAclParams::default()` instead.
+///
+/// For most capabilities that made no difference, because an empty list means
+/// "whatever the role implies" and the successor gets the same `Role::Admin`.
+/// It is not true of the additive ones: [`vti_common::acl::ADDITIVE_CAPABILITIES`]
+/// exists precisely because **no role derives them**, so an empty list drops
+/// them and nothing re-derives them afterwards.
+///
+/// The consequence was silent and permanent. An operator onboarding a client is
+/// told to grant `--admin-holder` on the ephemeral; provisioning then wrote a
+/// successor without `persona-holder` and deleted the row that had it. Everything
+/// context-scoped kept working, so the loss surfaced much later as a refusal to
+/// read the holder's own attributes — with nothing in the audit trail saying a
+/// capability had been dropped, because nothing had decided to drop it.
+///
+/// # Why this is not a scoped admin conferring holder authority
+///
+/// `create_acl` refuses [`Capability::PersonaHolder`] from a context-scoped
+/// admin, and must keep doing so: that guard stops a scoped administrator
+/// *minting* authority over the holder's identity. This is not minting. The
+/// authority already exists, on a DID the same operator controls, and it is
+/// being retired in this same call — the grant moves rather than multiplies,
+/// and the total set of DIDs holding it does not grow.
+///
+/// Only additive capabilities are carried. A *narrowing* list is re-derivable
+/// from the role and is not lost by omission, and copying one would quietly
+/// reduce what existing deployments' successors can do — the same class of
+/// silent change, in the other direction.
+async fn carry_additive_capabilities(
+    state: &ProvisionIntegrationDeps,
+    ephemeral: &vti_common::acl::AclEntry,
+    admin_did: &str,
+    context: &str,
+) -> Result<(), AppError> {
+    if !ephemeral
+        .capabilities
+        .iter()
+        .any(|cap| vti_common::acl::is_additive(*cap))
+    {
+        return Ok(());
+    }
+    // The successor was written a moment ago by `create_acl`; a rollover whose
+    // successor is missing is a bug elsewhere, not something to paper over.
+    let Some(mut successor) = get_acl_entry(&state.acl_ks, admin_did).await? else {
+        warn!(
+            admin_did = %admin_did,
+            "rollover successor has no ACL row — additive capabilities not carried"
+        );
+        return Ok(());
+    };
+    let added = additive_to_carry(&ephemeral.capabilities, &successor.capabilities);
+    if added.is_empty() {
+        return Ok(());
+    }
+    successor.capabilities.extend(added.iter().copied());
+    store_acl_entry(&state.acl_ks, &successor).await?;
+    info!(
+        from = %ephemeral.did,
+        to = %admin_did,
+        context = %context,
+        carried = ?added,
+        "carried additive capabilities to the rollover successor"
+    );
+    // Audited under its own name rather than folded into the `acl.swap` below:
+    // a capability moving is the part a reviewer asks about, and it must be
+    // answerable without inferring it from two rows that no longer both exist.
+    audit!(
+        "acl.capabilities.carried",
+        actor = &ephemeral.did,
+        resource = admin_did,
+        outcome = "success"
+    );
+    audit::record_best_effort(
+        &state.audit,
+        "acl.capabilities.carried",
+        &ephemeral.did,
+        Some(admin_did),
+        "success",
+        Some("provision-integration"),
+        Some(context),
+    )
+    .await;
+    Ok(())
+}
+
+/// `BootstrapAsk::AdminRotation` flow — mints a fresh long-term admin
+/// DID via the requested admin template, writes its ACL row, issues
+/// the authorization VC (no `operator_of` claim — there's no
+/// integration to operate), and seals the result as a
+/// [`SealedPayloadV1::AdminRotation`] bundle.
+///
+/// Sibling to the integration-mint path inside [`provision_integration`].
+/// Shares preconditions + key-mint + sealing helpers; differs in that
+/// no integration template is rendered, no `did.jsonl` is published,
+/// and no integration secrets land in the bundle.
+#[allow(clippy::too_many_arguments)]
+async fn provision_admin_rotation(
+    state: &ProvisionIntegrationDeps,
+    auth: &AuthClaims,
+    request: &VerifiedBootstrapRequest,
+    context: &str,
+    admin_scope: AdminScope,
+    assertion_mode: AssertionMode,
+    vc_validity: Option<Duration>,
+    bundle_id: [u8; 16],
+    client_did: &str,
+    client_x25519_pub: &[u8; 32],
+) -> Result<ProvisionIntegrationOutput, AppError> {
+    // Extract the admin template ref (mandatory in this variant).
+    let admin_template_ref =
+        preconditions::extract_admin_template(request.ask()).ok_or_else(|| {
+            AppError::Internal(
+                "AdminRotation ask reached provision_admin_rotation without an admin template — \
+                 wiring bug; the wire shape requires it"
+                    .into(),
+            )
+        })?;
+
+    // ── 1. Mint admin DID under VTA custody ─────────────────────────
+    let minted = mint::mint_admin_via_template(state, context, &admin_template_ref).await?;
+    let admin_did = minted.material.did.clone();
+    let admin_template_name = admin_template_ref.name.clone();
+
+    // ── 2. Register admin in ACL ────────────────────────────────────
+    //
+    // Re-run safety: a second AdminRotation against the same admin_did
+    // hits a Conflict — same handling as the TemplateBootstrap path.
+    register_admin(
+        state,
+        auth,
+        client_did,
+        &admin_did,
+        request.label().map(str::to_string),
+        allowed_contexts_for(admin_scope, context),
+        context,
+    )
+    .await?;
+
+    // ── 2.5. Retire the ephemeral after admin rollover ──────────────
+    //
+    // AdminRotation always mints a fresh admin DID, so the ephemeral
+    // `client_did` is always being swapped out. Same shape as the
+    // TemplateBootstrap path — see the comment there for rationale.
+    retire_ephemeral_after_rollover(state, client_did, &admin_did, context).await?;
+
+    // ── 3. VTA identity ─────────────────────────────────────────────
+    let config = state.config.read().await;
+    let vta_did = config
+        .vta_did
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("VTA DID not configured".into()))?
+        .clone();
+    drop(config);
+
+    // ── 4. Build + sign the VTA authorization VC ────────────────────
+    //
+    // No `operator_of` — there is no integration DID to operate.
+    let claim = VtaAuthorizationClaim {
+        id: admin_did.clone(),
+        admin_of: AdminOfClaim {
+            vta: vta_did.clone(),
+            context: context.to_string(),
+            role: "admin".into(),
+        },
+        operator_of: None,
+    };
+    let mut vc_params = VtaAuthorizationParams::new(claim);
+    if let Some(validity) = vc_validity {
+        vc_params = vc_params.with_validity(validity);
+    }
+
+    let vc_issuer_secret = vta_keys::load_vta_vc_issuance_secret(state, &vta_did).await?;
+    let vc = issue_vta_authorization_credential(&vc_issuer_secret, vc_params)
+        .await
+        .map_err(|e| AppError::Internal(format!("issue VTA authorization VC: {e}")))?;
+    let vc_value =
+        serde_json::to_value(&vc).map_err(|e| AppError::Internal(format!("serialize VC: {e}")))?;
+
+    // ── 5. VTA trust bundle for offline VC verification at first boot
+    let vta_trust = vta_keys::load_vta_trust_bundle(state, &vta_did).await?;
+    let vta_url = state.config.read().await.public_url.clone();
+
+    // ── 6. Build payload ───────────────────────────────────────────
+    let payload = vta_sdk::sealed_transfer::AdminRotationPayload {
+        authorization: vc_value,
+        admin: minted.material.clone(),
+        vta_url,
+        vta_trust,
+    };
+
+    // ── 7. Seal ─────────────────────────────────────────────────────
+    let seal::SealedProvisionBundle {
+        armored,
+        digest,
+        digest_multibase,
+    } = seal::seal_provision_payload(
+        state,
+        &vta_did,
+        assertion_mode,
+        bundle_id,
+        client_x25519_pub,
+        SealedPayloadV1::AdminRotation(Box::new(payload)),
+    )
+    .await?;
+    let bundle_id_hex = hex_lower(&bundle_id);
+
+    info!(
+        client_did = %client_did,
+        admin_did = %admin_did,
+        context = %context,
+        admin_template = %admin_template_name,
+        bundle_id = %bundle_id_hex,
+        "provision-integration AdminRotation bundle sealed"
+    );
+
+    Ok(ProvisionIntegrationOutput {
+        armored,
+        digest,
+        digest_multibase,
+        summary: ProvisionSummary {
+            client_did: client_did.to_string(),
+            admin_did,
+            admin_rolled_over: true,
+            integration_did: None,
+            template_name: None,
+            template_kind: None,
+            admin_template_name: Some(admin_template_name),
+            bundle_id_hex,
+            secret_count: 1,
+            output_count: 0,
+            webvh_server_id: None,
+            context: context.to_string(),
+            admin_scope,
+        },
+    })
+}
+
+/// Step 2 of the flow for the `did:peer` method — the self-contained
+/// counterpart to `create_did_webvh` (webvh) / `mint_integration_via_did_key_template`
+/// (did:key). Steps 1/3/4/5 around it are DID-method-agnostic and run
+/// unchanged.
+///
+/// Mints an Ed25519 signing key + X25519 key-agreement key and encodes
+/// them into a `did:peer:2` whose only service is a `DIDCommMessaging`
+/// endpoint on `MEDIATOR_DID` (matching how the `ai-agent` did:webvh
+/// template advertises DIDComm), so the minted agent reaches the VTA over
+/// the mediator identically to a did:webvh agent. Nothing is hosted or
+/// published — the DID resolves locally.
+///
+/// Returns the tuple the caller destructures in place of the webvh /
+/// did:key branches: `(did, signing_key_id, ka_key_id, did_document,
+/// material)`. `did_log` is always `None` for did:peer (no did.jsonl).
+///
+/// Forbids `WEBVH_SERVER` / `URL` — a did:peer has no hosting target, so
+/// their presence is an operator error worth surfacing loudly rather than
+/// silently ignoring.
+async fn provision_did_peer(
+    state: &ProvisionIntegrationDeps,
+    template_vars: &BTreeMap<String, Value>,
+) -> Result<(String, String, String, Value, DidKeyMaterial), AppError> {
+    use crate::operations::did_peer::{
+        mediator_did_didcomm_service, mint_did_peer_with_services, peer_secrets_to_did_key_material,
+    };
+
+    // MEDIATOR_DID is required — it is the DIDComm service endpoint the
+    // agent routes through. Same var + role as the `ai-agent` did:webvh
+    // template's `requiredVars`.
+    let mediator_did = template_vars
+        .get("MEDIATOR_DID")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::Validation(
+                "did:peer agent template requires a non-empty 'MEDIATOR_DID' var — it becomes \
+                 the agent's DIDCommMessaging service endpoint. Pass `--var MEDIATOR_DID=<did>`."
+                    .into(),
+            )
+        })?
+        .to_string();
+
+    // A did:peer is self-contained: there is nothing to host, so webvh
+    // vars are meaningless here. Reject them rather than silently drop —
+    // their presence means the operator picked the wrong template.
+    for forbidden in [
+        "WEBVH_SERVER",
+        "URL",
+        "WEBVH_PATH",
+        "WEBVH_DOMAIN",
+        "DID_METHOD",
+        "SCID_ALSO_KNOWN_AS",
+    ] {
+        if template_vars.get(forbidden).is_some_and(|v| !v.is_null()) {
+            return Err(AppError::Validation(format!(
+                "did:peer agent template does not accept '{forbidden}' — a did:peer is \
+                 self-contained (no WebVH hosting, no did.jsonl, no publish). Remove it, or \
+                 use the did:webvh 'ai-agent' template if you need hosting."
+            )));
+        }
+    }
+
+    // ACCEPT / ROUTING_KEYS mirror the `ai-agent` template's DIDComm
+    // service optionals: string list of accepted media types, and DIDComm
+    // routing keys. Defaults match the template's `optionalVars`.
+    let accept =
+        string_list_var(template_vars, "ACCEPT").unwrap_or_else(|| vec!["didcomm/v2".into()]);
+    let routing_keys = string_list_var(template_vars, "ROUTING_KEYS").unwrap_or_default();
+
+    let services = mediator_did_didcomm_service(&mediator_did, accept, routing_keys);
+    let (did, secrets) = mint_did_peer_with_services(services)
+        .map_err(|e| AppError::Internal(format!("mint did:peer: {e}")))?;
+
+    let material = peer_secrets_to_did_key_material(&did, &secrets)
+        .map_err(|e| AppError::Internal(format!("map did:peer secrets: {e}")))?;
+
+    // Resolve the freshly-minted did:peer to its DID document for the
+    // sealed payload's `config.did_document`. did:peer resolves locally
+    // (no network), so this never leaves the process.
+    let resolver = state
+        .did_resolver
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("DID resolver not initialized".into()))?;
+    let resolved = resolver
+        .resolve(&did)
+        .await
+        .map_err(|e| AppError::Internal(format!("resolve minted did:peer '{did}': {e}")))?;
+    let did_document = serde_json::to_value(&resolved.doc)
+        .map_err(|e| AppError::Internal(format!("serialize did:peer document: {e}")))?;
+
+    info!(
+        did = %did,
+        mediator_did = %mediator_did,
+        "minted did:peer agent via provision-integration"
+    );
+
+    Ok((
+        did,
+        material.signing_key.key_id.clone(),
+        material.ka_key.key_id.clone(),
+        did_document,
+        material,
+    ))
+}
+
+/// Extract a template var as a `Vec<String>`: accepts a JSON array of
+/// strings (native shape) or a single string (coerced to a one-element
+/// vec). Returns `None` when absent / null / wrong-typed, letting the
+/// caller apply its default.
+fn string_list_var(vars: &BTreeMap<String, Value>, key: &str) -> Option<Vec<String>> {
+    match vars.get(key) {
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        Some(Value::String(s)) => Some(vec![s.clone()]),
+        _ => None,
+    }
+}
+
+/// Find a `verificationMethod.id` whose `publicKeyMultibase` matches
+/// `target_mb`. Used to align bundle `key_id` fields with the published
+/// DID document so a consumer storing the bundle verbatim can resolve
+/// the kid against the live document and find a matching private key.
+/// Whether `doc` lists a verification method with the absolute id `key_id`
+/// (a method's `id` may be relative, `#fragment`).
+fn lists_verification_method(doc: &Value, key_id: &str) -> bool {
+    let fragment = key_id.split_once('#').map(|(_, f)| f);
+    doc.get("verificationMethod")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|vm| vm.get("id").and_then(Value::as_str))
+        .any(|id| id == key_id || (id.starts_with('#') && Some(&id[1..]) == fragment))
+}
+
+fn published_kid_for(doc: &Value, target_mb: &str) -> Option<String> {
+    doc.get("verificationMethod")?
+        .as_array()?
+        .iter()
+        .find(|vm| {
+            vm.get("publicKeyMultibase")
+                .and_then(Value::as_str)
+                .is_some_and(|mb| mb == target_mb)
+        })
+        .and_then(|vm| vm.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preconditions::{extract_admin_template, extract_template, preconditions};
+    use super::templates::resolve_template_kind;
+    use super::webvh::{resolve_webvh_server, take_webvh_path};
+    use super::*;
+    use vta_sdk::provision_integration::{BootstrapAsk, DidTemplateRef, TemplateBootstrapAsk};
+
+    // ── the rollover carries what a role cannot re-derive ────────────────
+
+    /// The regression this exists for. An operator onboarding a client is told
+    /// to grant `--admin-holder` on the ephemeral; the rollover then wrote the
+    /// successor's row from defaults — an empty capability list, meaning
+    /// "whatever the role implies" — and deleted the row that had the grant.
+    /// `persona-holder` is implied by no role, so it was simply gone, and the
+    /// loss surfaced much later as a refusal to read the holder's own
+    /// attributes.
+    #[test]
+    fn an_additive_grant_survives_the_rollover() {
+        assert_eq!(
+            additive_to_carry(&[Capability::PersonaHolder], &[]),
+            vec![Capability::PersonaHolder]
+        );
+    }
+
+    /// Only the additive ones. A narrowing list is re-derivable from the role
+    /// and is not lost by omission; copying one would quietly reduce what
+    /// existing deployments' successors can do — the same silent change, in the
+    /// other direction.
+    #[test]
+    fn a_narrowing_capability_is_left_where_it_is() {
+        let carried = additive_to_carry(&[Capability::VaultRead, Capability::PersonaHolder], &[]);
+        assert_eq!(carried, vec![Capability::PersonaHolder]);
+        assert!(
+            !carried.contains(&Capability::VaultRead),
+            "the role already implies it"
+        );
+    }
+
+    /// Re-running provisioning must not stack duplicates onto a successor that
+    /// already carries the grant.
+    #[test]
+    fn a_grant_the_successor_already_has_is_not_carried_twice() {
+        assert!(
+            additive_to_carry(&[Capability::PersonaHolder], &[Capability::PersonaHolder])
+                .is_empty()
+        );
+    }
+
+    /// An ephemeral with nothing additive leaves the successor exactly as
+    /// `create_acl` wrote it.
+    #[test]
+    fn nothing_is_carried_when_there_was_nothing_additive() {
+        assert!(additive_to_carry(&[], &[]).is_empty());
+        assert!(additive_to_carry(&[Capability::VaultRead], &[]).is_empty());
+    }
+
+    fn sample_ask(template_name: &str, with_url: bool) -> BootstrapAsk {
+        let mut vars = BTreeMap::new();
+        if with_url {
+            vars.insert(
+                "URL".to_string(),
+                Value::String("https://mediator.example.com".into()),
+            );
+        }
+        BootstrapAsk::TemplateBootstrap(TemplateBootstrapAsk {
+            context_hint: Some("prod-mediator".into()),
+            template: DidTemplateRef {
+                name: template_name.into(),
+                vars,
+            },
+            admin_template: None,
+            note: None,
+        })
+    }
+
+    fn sample_ask_with_admin(template_name: &str, admin_template_name: &str) -> BootstrapAsk {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "URL".to_string(),
+            Value::String("https://mediator.example.com".into()),
+        );
+        BootstrapAsk::TemplateBootstrap(TemplateBootstrapAsk {
+            context_hint: Some("prod-mediator".into()),
+            template: DidTemplateRef {
+                name: template_name.into(),
+                vars,
+            },
+            admin_template: Some(DidTemplateRef {
+                name: admin_template_name.into(),
+                vars: BTreeMap::new(),
+            }),
+            note: None,
+        })
+    }
+
+    #[test]
+    fn extract_template_pulls_name_and_vars() {
+        let ask = sample_ask("didcomm-mediator", true);
+        let (name, vars) = extract_template(&ask)
+            .unwrap()
+            .expect("TemplateBootstrap ask should yield Some");
+        assert_eq!(name, "didcomm-mediator");
+        assert_eq!(
+            vars.get("URL").and_then(|v| v.as_str()),
+            Some("https://mediator.example.com")
+        );
+    }
+
+    #[test]
+    fn extract_admin_template_returns_none_when_absent() {
+        let ask = sample_ask("didcomm-mediator", true);
+        assert!(extract_admin_template(&ask).is_none());
+    }
+
+    #[test]
+    fn extract_admin_template_returns_some_when_present() {
+        let ask = sample_ask_with_admin("didcomm-mediator", "vta-admin");
+        let admin = extract_admin_template(&ask).expect("admin template");
+        assert_eq!(admin.name, "vta-admin");
+    }
+
+    #[test]
+    fn assertion_mode_default_is_did_signed() {
+        assert_eq!(AssertionMode::default(), AssertionMode::DidSigned);
+    }
+
+    // ── resolve_webvh_server ────────────────────────────────────────
+
+    use crate::config::StoreConfig;
+    use crate::store::Store;
+    use crate::test_support::{
+        bootstrap_test_vta, open_test_store, signed_request, signed_request_with_vars,
+        super_admin_claims, test_deps,
+    };
+    use chrono::Utc;
+    use vta_sdk::webvh::WebvhServerRecord;
+
+    /// Open a fresh tempdir-backed store and return its `webvh` keyspace
+    /// plus the dir guard so the caller can drop both at end-of-test.
+    async fn fresh_webvh_keyspace() -> (tempfile::TempDir, Store, crate::store::KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("open store");
+        let ks = store
+            .keyspace(crate::keyspaces::WEBVH)
+            .expect("open webvh ks");
+        (dir, store, ks)
+    }
+
+    fn sample_server_record(id: &str) -> WebvhServerRecord {
+        WebvhServerRecord {
+            id: id.into(),
+            did: format!("did:webvh:{id}"),
+            label: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_webvh_server_absent_returns_none() {
+        let (_dir, _store, ks) = fresh_webvh_keyspace().await;
+        let vars = BTreeMap::new();
+        assert_eq!(resolve_webvh_server(&vars, &ks).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_webvh_server_null_returns_none() {
+        let (_dir, _store, ks) = fresh_webvh_keyspace().await;
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_SERVER".into(), Value::Null);
+        assert_eq!(resolve_webvh_server(&vars, &ks).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_webvh_server_empty_string_returns_none() {
+        let (_dir, _store, ks) = fresh_webvh_keyspace().await;
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_SERVER".into(), Value::String("   ".into()));
+        assert_eq!(resolve_webvh_server(&vars, &ks).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_webvh_server_unknown_id_is_not_found() {
+        let (_dir, _store, ks) = fresh_webvh_keyspace().await;
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "WEBVH_SERVER".into(),
+            Value::String("never-registered".into()),
+        );
+        let err = resolve_webvh_server(&vars, &ks).await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("never-registered"), "got: {msg}");
+        assert!(msg.contains("vta did-mgmt servers add"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn resolve_webvh_server_registered_id_returns_some() {
+        let (_dir, _store, ks) = fresh_webvh_keyspace().await;
+        crate::webvh_store::store_server(&ks, &sample_server_record("hosted-edge-1"))
+            .await
+            .unwrap();
+
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_SERVER".into(), Value::String("hosted-edge-1".into()));
+        assert_eq!(
+            resolve_webvh_server(&vars, &ks).await.unwrap(),
+            Some("hosted-edge-1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_webvh_server_trims_whitespace() {
+        let (_dir, _store, ks) = fresh_webvh_keyspace().await;
+        crate::webvh_store::store_server(&ks, &sample_server_record("hosted-edge-1"))
+            .await
+            .unwrap();
+
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "WEBVH_SERVER".into(),
+            Value::String("  hosted-edge-1  ".into()),
+        );
+        assert_eq!(
+            resolve_webvh_server(&vars, &ks).await.unwrap(),
+            Some("hosted-edge-1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_webvh_server_wrong_type_is_validation_error() {
+        let (_dir, _store, ks) = fresh_webvh_keyspace().await;
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_SERVER".into(), Value::Bool(true));
+        let err = resolve_webvh_server(&vars, &ks).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+        assert!(err.to_string().contains("bool"), "got: {err}");
+    }
+
+    // ── take_webvh_path ─────────────────────────────────────────────
+
+    #[test]
+    fn take_webvh_path_absent_returns_none() {
+        let mut vars = BTreeMap::new();
+        vars.insert("URL".into(), Value::String("https://a".into()));
+        assert_eq!(take_webvh_path(&mut vars).unwrap(), None);
+        assert!(vars.contains_key("URL"), "unrelated keys must survive");
+    }
+
+    #[test]
+    fn take_webvh_path_null_returns_none_and_removes_key() {
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_PATH".into(), Value::Null);
+        assert_eq!(take_webvh_path(&mut vars).unwrap(), None);
+        assert!(
+            !vars.contains_key("WEBVH_PATH"),
+            "null WEBVH_PATH must still be removed so the renderer never sees it"
+        );
+    }
+
+    #[test]
+    fn take_webvh_path_string_returns_some_and_removes_key() {
+        let mut vars = BTreeMap::new();
+        vars.insert("URL".into(), Value::String("https://a".into()));
+        vars.insert("WEBVH_PATH".into(), Value::String("team/mediator".into()));
+        assert_eq!(
+            take_webvh_path(&mut vars).unwrap(),
+            Some("team/mediator".into())
+        );
+        assert!(
+            !vars.contains_key("WEBVH_PATH"),
+            "WEBVH_PATH must be removed so it can't reach the renderer"
+        );
+        assert!(vars.contains_key("URL"), "unrelated keys must survive");
+    }
+
+    #[test]
+    fn take_webvh_path_trims_whitespace() {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "WEBVH_PATH".into(),
+            Value::String("  team/mediator  ".into()),
+        );
+        assert_eq!(
+            take_webvh_path(&mut vars).unwrap(),
+            Some("team/mediator".into())
+        );
+    }
+
+    #[test]
+    fn take_webvh_path_empty_string_is_validation_error() {
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_PATH".into(), Value::String(String::new()));
+        let err = take_webvh_path(&mut vars).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("WEBVH_PATH"),
+            "error must name the offending var: {err}"
+        );
+    }
+
+    #[test]
+    fn take_webvh_path_whitespace_only_is_validation_error() {
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_PATH".into(), Value::String("   ".into()));
+        let err = take_webvh_path(&mut vars).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn take_webvh_path_non_string_is_validation_error() {
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_PATH".into(), Value::Bool(true));
+        let err = take_webvh_path(&mut vars).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+
+        let mut vars = BTreeMap::new();
+        vars.insert("WEBVH_PATH".into(), Value::Number(42.into()));
+        let err = take_webvh_path(&mut vars).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+    }
+
+    // ── preconditions / resolve_template_kind ───────────────────────
+    //
+    // Cover the three-tier template resolve (context → global → built-in)
+    // that both `preconditions` and `resolve_template_kind` share with
+    // `resolve_admin_template` and `did_webvh::resolve_template_for_render`.
+    // Built-ins like `didcomm-mediator` ship inside `vta_sdk::did_templates`
+    // and must resolve without an operator ever running
+    // `pnm did-templates create`.
+
+    use vta_sdk::did_templates::{DidTemplate, DidTemplateRecord, Scope};
+
+    // `TestStore`, `open_test_store`, `test_app_config`, `test_deps`,
+    // `super_admin_claims`, `signed_request{,_with_vars}`, and
+    // `bootstrap_test_vta` moved to `crate::test_support` so integration
+    // tests under `tests/` can share them via the `test-support`
+    // feature (review item 24).
+
+    fn mediator_template_vars() -> BTreeMap<String, Value> {
+        let mut vars = BTreeMap::new();
+        vars.insert("URL".into(), Value::String("https://mediator.test".into()));
+        vars.insert(
+            "WS_URL".into(),
+            Value::String("wss://mediator.test/ws".into()),
+        );
+        vars.insert("ROUTING_KEYS".into(), Value::Array(vec![]));
+        vars
+    }
+
+    /// The empty list is not "no contexts" — `act_scope` reads it as
+    /// `ActScope::All`. Pinned because the difference between the two arms is
+    /// the entire feature, and both are one `vec![]` away from each other.
+    #[test]
+    fn allowed_contexts_follows_the_scope() {
+        assert_eq!(
+            allowed_contexts_for(AdminScope::Context, "ctx-a"),
+            vec!["ctx-a".to_string()]
+        );
+        assert!(
+            allowed_contexts_for(AdminScope::Unrestricted, "ctx-a").is_empty(),
+            "an unrestricted admin names no context — including not the one it was \
+             provisioned into, which would silently scope it"
+        );
+    }
+
+    #[tokio::test]
+    async fn preconditions_accepts_builtin_integration_template() {
+        let ts = open_test_store().await;
+        crate::contexts::create_context(&ts.contexts_ks, "prod-mediator", "Prod Mediator")
+            .await
+            .expect("create context");
+
+        let deps = test_deps(&ts);
+        let auth = super_admin_claims();
+        let request = signed_request("didcomm-mediator", "prod-mediator").await;
+
+        preconditions(&deps, &auth, "prod-mediator", AdminScope::Context, &request)
+            .await
+            .expect("built-in didcomm-mediator should satisfy preconditions");
+    }
+
+    #[tokio::test]
+    async fn preconditions_rejects_unknown_template() {
+        let ts = open_test_store().await;
+        crate::contexts::create_context(&ts.contexts_ks, "prod-mediator", "Prod Mediator")
+            .await
+            .expect("create context");
+
+        let deps = test_deps(&ts);
+        let auth = super_admin_claims();
+        let request = signed_request("never-registered", "prod-mediator").await;
+
+        let err = preconditions(&deps, &auth, "prod-mediator", AdminScope::Context, &request)
+            .await
+            .expect_err("unknown template must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("never-registered"), "got: {msg}");
+        assert!(msg.contains("is not registered on this VTA"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn resolve_template_kind_resolves_builtin_when_no_stored_record() {
+        let ts = open_test_store().await;
+
+        let kind = resolve_template_kind(&ts.did_templates_ks, "didcomm-mediator", "prod-mediator")
+            .await
+            .expect("built-in kind lookup should succeed");
+        let expected = vta_sdk::did_templates::load_embedded("didcomm-mediator")
+            .expect("built-in template available")
+            .kind;
+        assert_eq!(kind, expected);
+    }
+
+    #[tokio::test]
+    async fn resolve_template_kind_prefers_stored_record_over_builtin() {
+        // A context-scoped record must shadow the built-in, matching the
+        // resolve order in `resolve_admin_template` and
+        // `did_webvh::resolve_template_for_render`.
+        let ts = open_test_store().await;
+        let mut tpl: DidTemplate =
+            vta_sdk::did_templates::load_embedded("didcomm-mediator").expect("built-in available");
+        "shadowed-kind".clone_into(&mut tpl.kind);
+        let record = DidTemplateRecord {
+            template: tpl,
+            scope: Scope::Context {
+                context_id: "prod-mediator".into(),
+            },
+            created_at: 0,
+            updated_at: 0,
+            created_by: "test".into(),
+        };
+        crate::did_templates::store_context_template(
+            &ts.did_templates_ks,
+            "prod-mediator",
+            &record,
+        )
+        .await
+        .expect("store context template");
+
+        let kind = resolve_template_kind(&ts.did_templates_ks, "didcomm-mediator", "prod-mediator")
+            .await
+            .expect("stored record resolves");
+        assert_eq!(kind, "shadowed-kind");
+    }
+
+    // ── Full-flow E2E tests ─────────────────────────────────────────
+    //
+    // Exercise the whole `provision_integration()` orchestration, not
+    // just individual helpers. These are the tests that would have
+    // caught the 3f4d832 regression (set_primary=false leaving ctx.did
+    // unset) and the recent count-bug fix (secret_count/output_count
+    // hardcoded instead of computed from the payload).
+
+    #[tokio::test]
+    async fn provision_integration_binds_minted_did_when_context_has_none() {
+        // This is the direct regression test for 3f4d832. Fresh context
+        // with ctx.did = None → after provision_integration, ctx.did
+        // must be populated with the newly-minted integration DID.
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "prod-mediator", "Prod Mediator")
+            .await
+            .expect("create context");
+
+        let ctx_before = crate::contexts::get_context(&ts.contexts_ks, "prod-mediator")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ctx_before.did.is_none(),
+            "precondition: fresh context has no DID"
+        );
+
+        let auth = super_admin_claims();
+        let request = signed_request_with_vars(
+            "didcomm-mediator",
+            "prod-mediator",
+            mediator_template_vars(),
+        )
+        .await;
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "prod-mediator".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration");
+
+        let ctx_after = crate::contexts::get_context(&ts.contexts_ks, "prod-mediator")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ctx_after.did.is_some(),
+            "context DID must be populated after provisioning a fresh context"
+        );
+        assert_eq!(
+            ctx_after.did.as_deref(),
+            output.summary.integration_did.as_deref(),
+            "bound DID must match the minted integration DID returned in the summary"
+        );
+    }
+
+    /// `swiyu-verifier` keeps its update key out of the document and has no
+    /// key agreement, so no integration bundle can describe it. It is refused
+    /// with the commands that do mint it, before anything is minted: the
+    /// context keeps no DID and no key is created.
+    #[tokio::test]
+    async fn a_template_no_bundle_can_carry_is_refused_before_the_mint() {
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "verifier", "Verifier")
+            .await
+            .expect("create context");
+        let keys_before = ts.keys_ks.prefix_iter_raw("").await.unwrap().len();
+
+        let request = signed_request_with_vars(
+            "swiyu-verifier",
+            "verifier",
+            BTreeMap::from([(
+                "URL".to_string(),
+                Value::String("https://identifier-reg.example/api/v1/did/abc".into()),
+            )]),
+        )
+        .await;
+        let refused = provision_integration(
+            &deps,
+            &super_admin_claims(),
+            ProvisionIntegrationParams {
+                request,
+                context: "verifier".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await;
+        let message = match refused {
+            Err(AppError::Validation(message)) => message,
+            Err(other) => panic!("expected a validation refusal, got {other:?}"),
+            Ok(_) => panic!("swiyu-verifier was provisioned"),
+        };
+        assert!(message.contains("cannot be provisioned"), "{message}");
+        assert!(
+            message
+                .contains("pnm did-mgmt dids create --context <context> --template swiyu-verifier"),
+            "{message}"
+        );
+        assert!(message.contains("vtc oid4vp attach"), "{message}");
+
+        let ctx = crate::contexts::get_context(&ts.contexts_ks, "verifier")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ctx.did.is_none(), "no DID was minted");
+        assert_eq!(
+            ts.keys_ks.prefix_iter_raw("").await.unwrap().len(),
+            keys_before,
+            "no key was created"
+        );
+    }
+
+    /// Every built-in webvh template but the verifier one is an integration a
+    /// bundle can carry.
+    #[test]
+    fn every_builtin_webvh_integration_template_has_the_bundle_shape() {
+        for name in vta_sdk::did_templates::BUILTIN_NAMES {
+            let template = vta_sdk::did_templates::load_embedded(name).unwrap();
+            if templates::template_targets_did_peer(&template)
+                || templates::template_targets_did_key_only(&template)
+            {
+                continue;
+            }
+            let shaped = templates::require_bundle_shape(name, &template);
+            assert_eq!(
+                shaped.is_ok(),
+                *name != "swiyu-verifier",
+                "{name}: {shaped:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_integration_preserves_existing_context_did() {
+        // The "first integration wins" invariant: a second provisioning
+        // into a context that already has a primary DID must NOT
+        // overwrite it. Without this guard a second mediator silently
+        // displaces the first.
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        let mut ctx = crate::contexts::create_context(&ts.contexts_ks, "prod-mediator", "Prod")
+            .await
+            .expect("create context");
+        let pre_existing_did = "did:webvh:pre-existing.example".to_string();
+        ctx.did = Some(pre_existing_did.clone());
+        crate::contexts::store_context(&ts.contexts_ks, &ctx)
+            .await
+            .expect("pre-populate context DID");
+
+        let auth = super_admin_claims();
+        let request = signed_request_with_vars(
+            "didcomm-mediator",
+            "prod-mediator",
+            mediator_template_vars(),
+        )
+        .await;
+
+        provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "prod-mediator".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration");
+
+        let ctx_after = crate::contexts::get_context(&ts.contexts_ks, "prod-mediator")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ctx_after.did.as_deref(),
+            Some(pre_existing_did.as_str()),
+            "existing primary DID must not be displaced by a later integration"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_integration_summary_counts_match_payload() {
+        // Regression test for the hardcoded `secret_count = if admin { 2 } else { 1 }`
+        // and `count_outputs_in_payload` = 1 bugs. The summary must
+        // report the actual counts derived from the sealed payload's
+        // contents.
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "prod-mediator", "Prod")
+            .await
+            .expect("create context");
+
+        let auth = super_admin_claims();
+        let request = signed_request_with_vars(
+            "didcomm-mediator",
+            "prod-mediator",
+            mediator_template_vars(),
+        )
+        .await;
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "prod-mediator".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration");
+
+        // Without admin_template rollover, exactly one DID's key material
+        // is sealed in (integration DID: signing + KA keys).
+        assert!(
+            !output.summary.admin_rolled_over,
+            "no admin rollover requested"
+        );
+        assert_eq!(
+            output.summary.secret_count, 1,
+            "exactly one minted integration DID should be in the payload's secrets map"
+        );
+        // Serverless webvh mint produces exactly one WebvhLog output.
+        assert_eq!(
+            output.summary.output_count, 1,
+            "exactly one webvh log output"
+        );
+        // And the armored bundle + OOB digest are present.
+        assert!(!output.armored.is_empty(), "armored bundle populated");
+        assert_eq!(
+            output.digest.len(),
+            64,
+            "SHA-256 digest is 32 bytes hex-encoded"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_integration_mints_did_key_when_template_methods_is_key() {
+        // Item 11b: a template declaring `methods: ["key"]` selects the
+        // did:key mint path — no webvh log, no WEBVH_SERVER / URL
+        // required, and the returned integration DID is self-resolving.
+        //
+        // Uses a context-scoped custom template (no built-in
+        // integration template with methods=["key"] exists today — the
+        // built-in `vta-admin` is kind="admin", used for rollover only).
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "signer-ctx", "Local signers")
+            .await
+            .expect("create context");
+
+        // Register a minimal did:key integration template scoped to
+        // this context. Only `methods: ["key"]` is load-bearing for the
+        // branch; the document shape is the canonical did:key minimal
+        // VM (one signing key).
+        let tpl_json = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "local-signer",
+            "kind": "signer",
+            "description": "Test: did:key integration template",
+            "methods": ["key"],
+            "requiredVars": [],
+            "optionalVars": {},
+            "defaults": {},
+            "document": {
+                "@context": [
+                    "https://www.w3.org/ns/did/v1",
+                    "https://w3id.org/security/multikey/v1"
+                ],
+                "id": "{DID}",
+                "verificationMethod": [{
+                    "id": "{DID}#{SIGNING_KEY_MB}",
+                    "type": "Multikey",
+                    "controller": "{DID}",
+                    "publicKeyMultibase": "{SIGNING_KEY_MB}"
+                }],
+                "authentication": ["{DID}#{SIGNING_KEY_MB}"],
+                "assertionMethod": ["{DID}#{SIGNING_KEY_MB}"]
+            }
+        });
+        let tpl = DidTemplate::from_json(tpl_json).expect("valid template");
+        let record = DidTemplateRecord {
+            template: tpl,
+            scope: Scope::Context {
+                context_id: "signer-ctx".into(),
+            },
+            created_at: 0,
+            updated_at: 0,
+            created_by: "test".into(),
+        };
+        crate::did_templates::store_context_template(&ts.did_templates_ks, "signer-ctx", &record)
+            .await
+            .expect("store context template");
+
+        let auth = super_admin_claims();
+        let request = signed_request_with_vars("local-signer", "signer-ctx", BTreeMap::new()).await;
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "signer-ctx".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration");
+
+        let integration_did = output
+            .summary
+            .integration_did
+            .as_deref()
+            .expect("TemplateBootstrap path must yield Some(integration_did)");
+        assert!(
+            integration_did.starts_with("did:key:"),
+            "integration DID must be a did:key for templates with methods=[\"key\"], got {integration_did}"
+        );
+        assert_eq!(
+            output.summary.output_count, 0,
+            "did:key path emits no webvh log — outputs should be empty"
+        );
+        assert_eq!(
+            output.summary.secret_count, 1,
+            "one minted integration DID in secrets (signing + KA keys for that DID)"
+        );
+
+        // Context's primary DID should be bound to the minted did:key.
+        let ctx_after = crate::contexts::get_context(&ts.contexts_ks, "signer-ctx")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ctx_after.did.as_deref(),
+            Some(integration_did),
+            "did:key path must set context primary when ctx.did was None"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_integration_mints_did_peer_when_template_methods_is_peer() {
+        // The did:peer path: a template declaring `methods: ["peer"]`
+        // yields a self-contained did:peer:2 agent — no WebVH hosting,
+        // no webvh log — whose DIDComm service routes through MEDIATOR_DID
+        // exactly like the did:webvh `ai-agent` template. Runs the SAME
+        // step 1/3/4/5 as the webvh path (VP precondition + holder ACL +
+        // seal); only step 2 (DID construction) differs.
+        use super::sealed_transfer_open::open_for_test;
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "agents", "Agents")
+            .await
+            .expect("create context");
+
+        // A plausible mediator DID — used only as the DIDCommMessaging
+        // service endpoint (a uri), so it need not resolve.
+        let mediator_did = "did:peer:2.Ez6LSbysY2xFMRpGMhb7tFTLMpeuPRaqaWM8m1jhSw9UZTQY.Vz6MkqRYqQ";
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "MEDIATOR_DID".into(),
+            Value::String(mediator_did.to_string()),
+        );
+
+        let auth = super_admin_claims();
+        let request = signed_request_with_vars("ai-agent-peer", "agents", vars).await;
+        let client_did = request.holder().to_string();
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "agents".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration did:peer");
+
+        let integration_did = output
+            .summary
+            .integration_did
+            .as_deref()
+            .expect("TemplateBootstrap path must yield Some(integration_did)");
+
+        // (1) The returned DID is a valid did:peer:2 with a DIDCommMessaging
+        //     service on MEDIATOR_DID.
+        assert!(
+            integration_did.starts_with("did:peer:2"),
+            "integration DID must be a did:peer:2, got {integration_did}"
+        );
+        assert_eq!(
+            output.summary.output_count, 0,
+            "did:peer path emits no webvh log — outputs must be empty"
+        );
+
+        // (2) The sealed bundle opens with the holder key to a
+        //     DidSecretsBundle-equivalent DidKeyMaterial carrying the
+        //     signing + key-agreement keys.
+        let payload = open_for_test(&output.armored, &output.digest, &[7u8; 32]);
+        assert_eq!(output.summary.secret_count, 1, "one minted did:peer");
+        let material = payload
+            .secrets
+            .get(integration_did)
+            .expect("did:peer secrets present in bundle");
+        assert_eq!(material.did, integration_did);
+        assert!(
+            material.signing_key.key_id.contains("#key-1"),
+            "signing key id: {}",
+            material.signing_key.key_id
+        );
+        assert!(!material.signing_key.private_key_multibase.is_empty());
+        assert!(
+            material.ka_key.key_id.contains("#key-2"),
+            "ka key id: {}",
+            material.ka_key.key_id
+        );
+        assert!(!material.ka_key.private_key_multibase.is_empty());
+
+        // The rendered did:peer document carries a DIDCommMessaging service
+        // whose endpoint is the MEDIATOR_DID.
+        // The resolved did:peer document expresses `service.type` as an
+        // array (`["DIDCommMessaging"]`) per did:peer resolution — match on
+        // the type appearing there, not on an exact string, and confirm the
+        // endpoint uri is the MEDIATOR_DID.
+        let doc = &payload.config.did_document;
+        let services = doc["service"].as_array().expect("service array");
+        let didcomm = services
+            .iter()
+            .find(|s| {
+                let t = &s["type"];
+                t == "DIDCommMessaging"
+                    || t.as_array()
+                        .is_some_and(|a| a.iter().any(|v| v == "DIDCommMessaging"))
+            })
+            .expect("DIDCommMessaging service present");
+        let endpoint_str = serde_json::to_string(&didcomm["serviceEndpoint"]).unwrap();
+        assert!(
+            endpoint_str.contains(mediator_did),
+            "DIDCommMessaging endpoint must route through MEDIATOR_DID; got {endpoint_str}"
+        );
+
+        // (3) A context-admin ACL entry exists for the holder (step 4 ran
+        //     unchanged — no admin rollover, so admin_did == client_did).
+        assert!(!output.summary.admin_rolled_over);
+        assert_eq!(output.summary.admin_did, client_did);
+        let acl = crate::acl::get_acl_entry(&ts.acl_ks, &client_did)
+            .await
+            .unwrap()
+            .expect("holder ACL entry created");
+        assert_eq!(acl.role, Role::Admin);
+        assert!(acl.allowed_contexts.contains(&"agents".to_string()));
+
+        // did:peer is self-contained → set as context primary when none.
+        let ctx_after = crate::contexts::get_context(&ts.contexts_ks, "agents")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx_after.did.as_deref(), Some(integration_did));
+    }
+
+    #[tokio::test]
+    async fn provision_integration_did_peer_rejects_webvh_vars() {
+        // A did:peer template must reject WEBVH_SERVER / URL — a did:peer
+        // is self-contained, so their presence is an operator error.
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "agents", "Agents")
+            .await
+            .expect("create context");
+
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "MEDIATOR_DID".into(),
+            Value::String("did:peer:2.Ez6LSm".into()),
+        );
+        vars.insert(
+            "URL".into(),
+            Value::String("https://should-not-be-here.example".into()),
+        );
+
+        let auth = super_admin_claims();
+        let request = signed_request_with_vars("ai-agent-peer", "agents", vars).await;
+
+        let result = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "agents".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("did:peer must reject URL"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+        assert!(err.to_string().contains("URL"), "got: {err}");
+    }
+
+    // ── The sealed shape follows the template ───────────────────────────────
+    //
+    // These mint through the real flow and open the real bundle, because the
+    // contract is *which variant the VTA chose* — which no amount of testing
+    // the payload types in isolation can show.
+
+    /// A hybrid `vtc-host`-shaped template: the historical pair plus a
+    /// post-quantum signing slot, published as a second assertion method.
+    fn hybrid_template() -> vta_sdk::did_templates::DidTemplate {
+        vta_sdk::did_templates::DidTemplate::from_json(serde_json::json!({
+            "schemaVersion": 2,
+            "name": "hybrid-host",
+            "kind": "vtc-host",
+            "methods": ["webvh"],
+            "requiredVars": ["URL"],
+            "keys": {
+                "signing":    { "purpose": "signing",      "algorithms": ["ed25519"] },
+                "ka":         { "purpose": "keyAgreement", "algorithms": ["x25519"] },
+                "pq-signing": { "purpose": "signing",      "algorithms": ["mldsa44"] },
+            },
+            "document": {
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": "{DID}",
+                "verificationMethod": [
+                    { "id": "{DID}#key-0", "type": "Multikey", "controller": "{DID}",
+                      "publicKeyMultibase": "{SIGNING_KEY_MB}" },
+                    { "id": "{DID}#key-1", "type": "Multikey", "controller": "{DID}",
+                      "publicKeyMultibase": "{KA_KEY_MB}" },
+                    { "id": "{DID}#key-2", "type": "Multikey", "controller": "{DID}",
+                      "publicKeyMultibase": "{PQ_SIGNING_KEY_MB}" },
+                ],
+                "assertionMethod": ["{DID}#key-0", "{DID}#key-2"],
+                "authentication": ["{DID}#key-0"],
+                "keyAgreement": ["{DID}#key-1"],
+                "service": [{ "id": "{DID}#rest", "type": "VTCRest", "serviceEndpoint": "{URL}" }],
+            }
+        }))
+        .expect("the hybrid template is valid")
+    }
+
+    /// **The bundle carries the post-quantum key, under the new variant.**
+    ///
+    /// This is the last link of the chain: template -> provisioning ->
+    /// sealed payload. Before it, nothing could hand a consumer a second
+    /// signing key at all — `DidKeyMaterial` has two fixed slots and
+    /// `deny_unknown_fields`, so there was no field to put one in and no way to
+    /// add one without breaking every existing opener.
+    #[tokio::test]
+    async fn a_template_with_an_extra_slot_seals_the_v2_variant() {
+        use super::sealed_transfer_open::open_raw_for_test;
+        use vta_sdk::sealed_transfer::SealedPayloadV1;
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "hybrid", "Hybrid")
+            .await
+            .expect("create context");
+        vta_support::did_templates::store_global_template(
+            &ts.did_templates_ks,
+            &vta_sdk::did_templates::DidTemplateRecord {
+                template: hybrid_template(),
+                scope: vta_sdk::did_templates::Scope::Global,
+                created_at: 0,
+                updated_at: 0,
+                created_by: "test".into(),
+            },
+        )
+        .await
+        .expect("store template");
+
+        let mut vars = BTreeMap::new();
+        vars.insert("URL".into(), Value::String("https://vtc.test".into()));
+        let request = signed_request_with_vars("hybrid-host", "hybrid", vars).await;
+
+        let output = provision_integration(
+            &deps,
+            &super_admin_claims(),
+            ProvisionIntegrationParams {
+                request,
+                context: "hybrid".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration");
+
+        let payload = open_raw_for_test(&output.armored, &output.digest, &[7u8; 32]);
+        let SealedPayloadV1::TemplateBootstrapV2(p) = payload else {
+            panic!("a template with an extra key slot must seal TemplateBootstrapV2");
+        };
+
+        let integration_did = output
+            .summary
+            .integration_did
+            .as_deref()
+            .expect("integration DID");
+        let material = p.secrets.get(integration_did).expect("integration secrets");
+
+        assert_eq!(
+            material.additional_signing_keys.len(),
+            1,
+            "the bundle must carry the post-quantum key the template asked for"
+        );
+        let pq = &material.additional_signing_keys[0];
+        assert_eq!(pq.slot, "pq-signing", "the slot names what asked for it");
+        assert_eq!(
+            pq.key_type,
+            vta_sdk::keys::KeyType::MlDsa44,
+            "carried from the stored record, not inferred"
+        );
+
+        // The kid must be a verification method the published document
+        // actually carries, or the holder installs a key nothing can address.
+        let published: Vec<&str> = p.config.did_document["verificationMethod"]
+            .as_array()
+            .expect("verificationMethod array")
+            .iter()
+            .filter_map(|vm| vm["id"].as_str())
+            .collect();
+        assert!(
+            published.contains(&pq.key_id.as_str()),
+            "the post-quantum kid {} is not published in {published:?}",
+            pq.key_id
+        );
+
+        // And the private half is really an ML-DSA seed, not an Ed25519 key
+        // relabelled: the `mldsa-44-priv-seed` multicodec is 0x9a 0x26.
+        let (_b, priv_bytes) =
+            multibase::decode(&pq.private_key_multibase).expect("private multibase");
+        assert_eq!(
+            &priv_bytes[..2],
+            &[0x9a, 0x26],
+            "the private half must carry the ML-DSA-44 seed multicodec"
+        );
+
+        // The classical key is untouched and still primary.
+        assert_eq!(material.signing_key.slot, "signing");
+        assert_eq!(
+            material.signing_key.key_type,
+            vta_sdk::keys::KeyType::Ed25519
+        );
+        assert_eq!(material.ka_key.key_type, vta_sdk::keys::KeyType::X25519);
+    }
+
+    /// **And the no-migration half: a v1 template still seals V1.**
+    ///
+    /// This is what contains the blast radius to zero. `didcomm-mediator` is
+    /// v1, so `mediator-setup` in affinidi-tdk-rs — a real cross-repo opener
+    /// that has never heard of the new variant — keeps receiving exactly what
+    /// it always did. If this ever flips, that tool breaks on its next
+    /// provisioning run with no other signal.
+    #[tokio::test]
+    async fn a_v1_template_still_seals_the_v1_variant() {
+        use super::sealed_transfer_open::open_raw_for_test;
+        use vta_sdk::sealed_transfer::SealedPayloadV1;
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "classic", "Classic")
+            .await
+            .expect("create context");
+
+        let request =
+            signed_request_with_vars("didcomm-mediator", "classic", mediator_template_vars()).await;
+
+        let output = provision_integration(
+            &deps,
+            &super_admin_claims(),
+            ProvisionIntegrationParams {
+                request,
+                context: "classic".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration");
+
+        let payload = open_raw_for_test(&output.armored, &output.digest, &[7u8; 32]);
+        assert!(
+            matches!(payload, SealedPayloadV1::TemplateBootstrap(_)),
+            "a v1 template must keep sealing TemplateBootstrap, or every existing \
+             opener breaks on its next provisioning run"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_integration_bundle_kids_match_published_did_document() {
+        // Regression test for the kid-numbering mismatch. The canonical
+        // `didcomm-mediator` template now publishes verificationMethod
+        // ids `#key-0` (signing) and `#key-1` (key-agreement) — matching
+        // the VTA's internal storage convention and the other built-in
+        // webvh templates (`did-host-http-didcomm` / `did-host-http` / `did-host-didcomm`).
+        // Earlier shapes (`#key-1` / `#key-2`) diverged from both, and
+        // consumers couldn't match an inbound JWE for `#key-2` to any
+        // private key.
+        //
+        // Asserts (a) the bundle's kids equal `#key-0` / `#key-1`
+        // exactly — the literal strings the canonical template declares
+        // — and (b) every kid in `payload.secrets` equals a
+        // `verificationMethod.id` in `payload.config.did_document`. The
+        // doc-derived lookup in `provision_integration` is still
+        // load-bearing for any future template that uses non-default
+        // fragment names.
+        use super::sealed_transfer_open::open_for_test;
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "prod-mediator", "Prod")
+            .await
+            .expect("create context");
+
+        let auth = super_admin_claims();
+        let request = signed_request_with_vars(
+            "didcomm-mediator",
+            "prod-mediator",
+            mediator_template_vars(),
+        )
+        .await;
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "prod-mediator".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration");
+
+        // Open the sealed bundle with the holder's seed (the same
+        // `[7u8; 32]` `signed_request_with_vars` signs with).
+        let payload = open_for_test(&output.armored, &output.digest, &[7u8; 32]);
+
+        let integration_did = output
+            .summary
+            .integration_did
+            .as_deref()
+            .expect("TemplateBootstrap path must yield Some(integration_did)");
+        let material = payload
+            .secrets
+            .get(integration_did)
+            .expect("integration DID secrets present");
+
+        // (a) Literal kid assertion. Spelled out so a future regression
+        // shows up directly in the diff.
+        let expected_signing_kid = format!("{integration_did}#key-0");
+        let expected_ka_kid = format!("{integration_did}#key-1");
+        assert_eq!(
+            material.signing_key.key_id, expected_signing_kid,
+            "signing kid must be the canonical didcomm-mediator template's \
+             `#key-0` to match the published DID doc"
+        );
+        assert_eq!(
+            material.ka_key.key_id, expected_ka_kid,
+            "key-agreement kid must be the canonical didcomm-mediator \
+             template's `#key-1` to match the published DID doc"
+        );
+
+        // (b) Every kid in the bundle must appear as a
+        // `verificationMethod.id` in the published doc — no off-by-one,
+        // no dangling references.
+        let doc = &payload.config.did_document;
+        let vm_ids: Vec<String> = doc["verificationMethod"]
+            .as_array()
+            .expect("verificationMethod array")
+            .iter()
+            .filter_map(|vm| vm["id"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            vm_ids.contains(&material.signing_key.key_id),
+            "signing kid {} not in published verificationMethod ids {:?}",
+            material.signing_key.key_id,
+            vm_ids
+        );
+        assert!(
+            vm_ids.contains(&material.ka_key.key_id),
+            "key-agreement kid {} not in published verificationMethod ids {:?}",
+            material.ka_key.key_id,
+            vm_ids
+        );
+    }
+
+    // ── BootstrapAsk::AdminRotation flow ────────────────────────────
+
+    use crate::test_support::signed_admin_rotation_request;
+
+    /// VTI-ACL-107: the admin a provisioner writes holds the provisioner's own purposes.
+    /// A provisioner whose entry lists purposes can provision, and the admin it writes is
+    /// within them rather than `any`.
+    #[tokio::test]
+    async fn vti_acl_107_the_provisioned_admin_holds_the_provisioners_purposes() {
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-1", "Test ctx")
+            .await
+            .expect("create context");
+        let auth = super_admin_claims();
+        let mut me = crate::acl::get_acl_entry(&deps.acl_ks, &auth.did)
+            .await
+            .unwrap()
+            .expect("the operator's entry");
+        let listed = vti_common::acl::PurposeScope::listed(["taskExecution"]).unwrap();
+        me.purposes = listed.clone();
+        crate::acl::store_acl_entry(&deps.acl_ks, &me)
+            .await
+            .unwrap();
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request: signed_admin_rotation_request("vta-admin", "ctx-1").await,
+                context: "ctx-1".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("a provisioner listing purposes provisions");
+        let admin = crate::acl::get_acl_entry(&deps.acl_ks, &output.summary.admin_did)
+            .await
+            .unwrap()
+            .expect("the admin's row");
+        assert_eq!(admin.purposes, listed);
+    }
+
+    #[tokio::test]
+    async fn provision_integration_admin_rotation_mints_fresh_admin_no_integration() {
+        // Pins the AdminRotation contract end-to-end against the real
+        // server flow:
+        //   1. Returns Some(integration_did=None) — no integration mint.
+        //   2. The summary's admin_did != client_did (rotation happened).
+        //   3. The sealed bundle is a SealedPayloadV1::AdminRotation
+        //      variant carrying the rotated admin DID's key material.
+        //   4. The freshly-minted admin DID is the one written to the
+        //      ACL row (admin role, in-context).
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-1", "Test ctx")
+            .await
+            .expect("create context");
+
+        let auth = super_admin_claims();
+        let request = signed_admin_rotation_request("vta-admin", "ctx-1").await;
+        let client_did = request.holder().to_string();
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "ctx-1".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration AdminRotation");
+
+        // (1) Summary contract.
+        assert!(
+            output.summary.integration_did.is_none(),
+            "AdminRotation must not produce an integration DID"
+        );
+        assert!(
+            output.summary.template_name.is_none(),
+            "AdminRotation has no integration template"
+        );
+        assert!(
+            output.summary.template_kind.is_none(),
+            "AdminRotation has no integration template kind"
+        );
+        assert!(output.summary.admin_rolled_over);
+        assert_eq!(output.summary.secret_count, 1, "admin DID only");
+        assert_eq!(output.summary.output_count, 0, "no template outputs");
+        assert_eq!(
+            output.summary.admin_template_name.as_deref(),
+            Some("vta-admin")
+        );
+
+        // (2) Rotation must produce a fresh DID.
+        assert_ne!(
+            output.summary.admin_did, client_did,
+            "AdminRotation must mint a fresh admin DID, not echo client_did"
+        );
+
+        // (3) Sealed payload variant + key material.
+        let payload_bytes = output.armored.clone();
+        let bundles =
+            vta_sdk::sealed_transfer::armor::decode(&payload_bytes).expect("armor decode");
+        assert_eq!(bundles.len(), 1, "single bundle");
+        let x_secret = vta_sdk::sealed_transfer::ed25519_seed_to_x25519_secret(&[7u8; 32]);
+        let opened =
+            vta_sdk::sealed_transfer::open_bundle(&x_secret, &bundles[0], Some(&output.digest))
+                .expect("open AdminRotation bundle");
+        let rotation_payload = match opened.payload {
+            vta_sdk::sealed_transfer::SealedPayloadV1::AdminRotation(boxed) => *boxed,
+            other => panic!("expected AdminRotation, got {other:?}"),
+        };
+        assert_eq!(rotation_payload.admin.did, output.summary.admin_did);
+        assert!(
+            rotation_payload
+                .admin
+                .signing_key
+                .private_key_multibase
+                .starts_with('z')
+        );
+
+        // (4) ACL row is written for the rotated DID.
+        let acl_entry = crate::acl::get_acl_entry(&deps.acl_ks, &output.summary.admin_did)
+            .await
+            .expect("ACL lookup")
+            .expect("ACL row exists for rotated admin DID");
+        assert_eq!(acl_entry.role, crate::acl::Role::Admin);
+        assert!(
+            acl_entry.allowed_contexts.iter().any(|c| c == "ctx-1"),
+            "ACL row contexts must include ctx-1, got {:?}",
+            acl_entry.allowed_contexts
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_integration_admin_rotation_retires_ephemeral_acl_and_emits_swap_audit() {
+        // Closes the May 2026 review gap: when the rotation mints a fresh
+        // long-term admin DID, the ephemeral `client_did` that opened the
+        // bundle has no further authority. Its ACL row (granted by the
+        // operator just before this call) must be removed AND an
+        // `acl.swap` audit entry must land, matching the
+        // `operations::acl::swap_acl` audit shape.
+        use crate::acl::{AclEntry, Role, store_acl_entry};
+        use vta_sdk::protocols::audit_management::list::AuditLogEntry;
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-swap", "Swap-audit ctx")
+            .await
+            .expect("create context");
+
+        // The ephemeral the operator would have granted before calling
+        // provision-integration. Hand-write the ACL row directly so the
+        // test doesn't depend on `acl::create_acl`'s validation surface
+        // (and doesn't need a separate auth ceremony for the grant).
+        let request = signed_admin_rotation_request("vta-admin", "ctx-swap").await;
+        let client_did = request.holder().to_string();
+        let ephemeral_row = AclEntry::new(client_did.clone(), Role::Admin, "test")
+            .with_label(Some("ephemeral".into()))
+            .with_contexts(vec!["ctx-swap".into()])
+            .with_created_at(0);
+        store_acl_entry(&deps.acl_ks, &ephemeral_row)
+            .await
+            .expect("seed ephemeral ACL row");
+
+        let auth = super_admin_claims();
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "ctx-swap".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration AdminRotation");
+
+        // Ephemeral row gone, long-term row present.
+        assert!(
+            crate::acl::get_acl_entry(&deps.acl_ks, &client_did)
+                .await
+                .expect("acl get ephemeral")
+                .is_none(),
+            "ephemeral ACL row must be retired after admin rollover"
+        );
+        assert!(
+            crate::acl::get_acl_entry(&deps.acl_ks, &output.summary.admin_did)
+                .await
+                .expect("acl get admin")
+                .is_some(),
+            "rotated admin ACL row must exist"
+        );
+
+        // Audit entry shape: action=acl.swap, actor=ephemeral,
+        // resource=long-term, outcome=success, channel=provision-integration,
+        // context_id=ctx-swap.
+        let entries: Vec<AuditLogEntry> = {
+            let raw = ts
+                .audit_ks
+                .prefix_iter_raw("log:")
+                .await
+                .expect("audit prefix scan");
+            raw.iter()
+                .filter_map(|(_, v)| serde_json::from_slice(v).ok())
+                .collect()
+        };
+        let swap_entries: Vec<&AuditLogEntry> =
+            entries.iter().filter(|e| e.action == "acl.swap").collect();
+        assert_eq!(
+            swap_entries.len(),
+            1,
+            "expected exactly one acl.swap audit entry, got: {:#?}",
+            swap_entries
+        );
+        let swap = swap_entries[0];
+        assert_eq!(swap.actor, client_did, "actor = swapped-from (ephemeral)");
+        assert_eq!(
+            swap.resource.as_deref(),
+            Some(output.summary.admin_did.as_str()),
+            "resource = swapped-to (rotated long-term admin)"
+        );
+        assert_eq!(swap.outcome, "success");
+        assert_eq!(swap.channel.as_deref(), Some("provision-integration"));
+        assert_eq!(swap.context_id.as_deref(), Some("ctx-swap"));
+    }
+
+    /// An ephemeral granted a time-boxed row (`pnm contexts create
+    /// --admin-expires 1h`) that is itself the authenticated caller cannot
+    /// roll over to a permanent successor: nothing it writes may outlive it
+    /// (VTI-ACL-053). The row carries no marker that tells a bootstrap
+    /// hand-off apart from any other time-boxed admin, and exempting the
+    /// rollover would let every time-boxed admin make itself permanent. The
+    /// grant is refused before anything is minted, and the ephemeral keeps its
+    /// row. Grant the ephemeral without an expiry (the rollover retires it), or
+    /// have an operator whose own entry does not expire run the provisioning.
+    #[tokio::test]
+    async fn an_expiring_ephemeral_cannot_roll_over_to_a_permanent_successor() {
+        use crate::acl::{AclEntry, Role, store_acl_entry};
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-eph", "Ephemeral ctx")
+            .await
+            .expect("create context");
+
+        let request = signed_admin_rotation_request("vta-admin", "ctx-eph").await;
+        let client_did = request.holder().to_string();
+        let expires = vti_common::auth::session::now_epoch() + 3600;
+        let ephemeral_row = AclEntry::new(client_did.clone(), Role::Admin, "operator")
+            .with_contexts(vec!["ctx-eph".into()])
+            .with_expires_at(Some(expires));
+        store_acl_entry(&deps.acl_ks, &ephemeral_row)
+            .await
+            .expect("seed ephemeral ACL row");
+
+        let auth = AuthClaims {
+            did: client_did.clone(),
+            allowed_contexts: vec!["ctx-eph".into()],
+            ..super_admin_claims()
+        };
+        let err = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "ctx-eph".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .err()
+        .expect("a permanent successor would outlive its granter");
+        assert!(
+            matches!(&err, AppError::Forbidden(m) if m.contains("VTI-ACL-053")),
+            "{err:?}"
+        );
+        // The refusal names the fix — the missing one-time hand-off, re-granted
+        // at creation — not the generic "give it an expiry" (#1738's bound).
+        let AppError::Forbidden(msg) = &err else {
+            unreachable!()
+        };
+        assert!(msg.contains("VTI-ACL-054"), "{msg}");
+        // `did` is positional on `pnm acl delete`; a `--did` there is
+        // rejected by clap before it reaches the VTA.
+        assert!(
+            msg.contains(&format!("pnm acl delete {client_did}`")),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "pnm acl create --did {client_did} --role admin --contexts ctx-eph --expires 1h --handoff`"
+            )),
+            "an entry with no capabilities is not told to take any: {msg}"
+        );
+
+        let kept = crate::acl::get_acl_entry(&deps.acl_ks, &client_did)
+            .await
+            .expect("acl get")
+            .expect("the ephemeral is not retired by a refused rollover");
+        assert_eq!(kept.expires_at, Some(expires));
+    }
+
+    /// A holder client's entry (`pnm contexts create --admin-holder`) carries
+    /// `persona-holder`. Deleting the row drops it, so the re-grant the refusal
+    /// prints must carry it back — or the retry succeeds and the client is then
+    /// refused the holder's attribute pool instead.
+    #[tokio::test]
+    async fn the_regrant_hint_carries_the_entrys_capabilities() {
+        use crate::acl::{AclEntry, Role, store_acl_entry};
+        use vti_common::acl::Capability;
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-eph", "Ephemeral ctx")
+            .await
+            .expect("create context");
+
+        let request = signed_admin_rotation_request("vta-admin", "ctx-eph").await;
+        let client_did = request.holder().to_string();
+        let expires = vti_common::auth::session::now_epoch() + 3600;
+        let ephemeral_row = AclEntry::new(client_did.clone(), Role::Admin, "operator")
+            .with_contexts(vec!["ctx-eph".into()])
+            .with_expires_at(Some(expires))
+            .with_capabilities(vec![Capability::PersonaHolder]);
+        store_acl_entry(&deps.acl_ks, &ephemeral_row)
+            .await
+            .expect("seed ephemeral ACL row");
+
+        let auth = AuthClaims {
+            did: client_did.clone(),
+            allowed_contexts: vec!["ctx-eph".into()],
+            ..super_admin_claims()
+        };
+        let err = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "ctx-eph".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .err()
+        .expect("an unmarked expiring ephemeral cannot roll over");
+        let AppError::Forbidden(msg) = &err else {
+            panic!("{err:?}")
+        };
+        assert!(
+            msg.contains(&format!(
+                "pnm acl create --did {client_did} --role admin --contexts ctx-eph --expires 1h \
+                 --handoff --capabilities persona-holder`"
+            )),
+            "{msg}"
+        );
+    }
+
+    /// The same flow with the granter's hand-off marker (VTI-ACL-054): the
+    /// ephemeral rolls over once to a permanent successor, and its own row is
+    /// consumed in the same step.
+    #[tokio::test]
+    async fn a_marked_ephemeral_rolls_over_once() {
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-eph", "Ephemeral ctx")
+            .await
+            .expect("create context");
+
+        let request = signed_admin_rotation_request("vta-admin", "ctx-eph").await;
+        let client_did = request.holder().to_string();
+        crate::operations::acl::create_acl(
+            &deps.acl_ks,
+            &deps.audit,
+            &deps.contexts_ks,
+            &super_admin_claims(),
+            crate::operations::acl::CreateAclParams {
+                did: client_did.clone(),
+                role: crate::acl::Role::Admin,
+                allowed_contexts: vec!["ctx-eph".into()],
+                expires_at: Some(vti_common::auth::session::now_epoch() + 3600),
+                handoff: true,
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .expect("the operator marks the ephemeral");
+
+        let auth = AuthClaims {
+            did: client_did.clone(),
+            allowed_contexts: vec!["ctx-eph".into()],
+            ..super_admin_claims()
+        };
+        let params = || ProvisionIntegrationParams {
+            request: request.clone(),
+            context: "ctx-eph".into(),
+            admin_scope: AdminScope::Context,
+            assertion_mode: AssertionMode::PinnedOnly,
+            vc_validity: None,
+        };
+        let output = provision_integration(&deps, &auth, params())
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .expect("the hand-off");
+
+        let successor = crate::acl::get_acl_entry(&deps.acl_ks, &output.summary.admin_did)
+            .await
+            .expect("acl get")
+            .expect("successor row");
+        assert_eq!(successor.expires_at, None, "the operator's expiry");
+        assert!(successor.handoff.is_none());
+        assert!(
+            crate::acl::get_acl_entry(&deps.acl_ks, &client_did)
+                .await
+                .expect("acl get")
+                .is_none(),
+            "the ephemeral's row is consumed"
+        );
+
+        // Once: the ephemeral no longer has standing to do it again.
+        assert!(provision_integration(&deps, &auth, params()).await.is_err());
+    }
+
+    /// `vta bootstrap provision-integration` runs offline as the synthesised
+    /// `cli:provision-integration` principal, which has no ACL entry. The
+    /// admin grant must still be written: v0.44.0 refused it with "has no ACL
+    /// entry of its own" (VTI-ACL-053 applied to a non-caller).
+    #[tokio::test]
+    async fn offline_cli_provision_integration_writes_the_admin_grant() {
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "webvh", "webvh")
+            .await
+            .expect("create context");
+
+        let auth = AuthClaims::unsafe_local_cli_super_admin("provision-integration");
+        let request = signed_admin_rotation_request("vta-admin", "webvh").await;
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "webvh".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("offline provision-integration");
+
+        let entry = crate::acl::get_acl_entry(&deps.acl_ks, &output.summary.admin_did)
+            .await
+            .expect("ACL lookup")
+            .expect("admin grant written");
+        assert_eq!(entry.role, crate::acl::Role::Admin);
+        assert_eq!(entry.created_by, "cli:provision-integration");
+    }
+
+    #[tokio::test]
+    async fn provision_integration_admin_rotation_swap_audit_skipped_when_no_ephemeral_row() {
+        // Relayer-mode flow: the holder ephemeral was never granted an
+        // ACL row on this VTA (the relayer's bearer is the auth context).
+        // The retirement helper must no-op silently — no spurious
+        // acl.swap audit, no error.
+        use vta_sdk::protocols::audit_management::list::AuditLogEntry;
+
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-relayer", "Relayer ctx")
+            .await
+            .expect("create context");
+
+        let auth = super_admin_claims();
+        let request = signed_admin_rotation_request("vta-admin", "ctx-relayer").await;
+        let client_did = request.holder().to_string();
+        // Deliberately do NOT seed an ACL row for client_did — this
+        // mirrors the relayer ≠ holder flow.
+
+        let output = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "ctx-relayer".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await
+        .expect("provision_integration AdminRotation (relayer mode)");
+
+        // Long-term ACL row still gets created (rollover succeeded).
+        assert_ne!(output.summary.admin_did, client_did);
+        assert!(
+            crate::acl::get_acl_entry(&deps.acl_ks, &output.summary.admin_did)
+                .await
+                .expect("acl get admin")
+                .is_some()
+        );
+
+        // No acl.swap audit — there was no swap to record.
+        let entries: Vec<AuditLogEntry> = {
+            let raw = ts
+                .audit_ks
+                .prefix_iter_raw("log:")
+                .await
+                .expect("audit prefix scan");
+            raw.iter()
+                .filter_map(|(_, v)| serde_json::from_slice(v).ok())
+                .collect()
+        };
+        let swap_count = entries.iter().filter(|e| e.action == "acl.swap").count();
+        assert_eq!(
+            swap_count, 0,
+            "no acl.swap entry expected when ephemeral has no ACL row"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_integration_admin_rotation_rejects_wrong_kind_template() {
+        // Admin rotation requires an admin-kind template. If the
+        // operator points us at e.g. didcomm-mediator (kind=mediator),
+        // mint_admin_via_template fails — confirms the kind check fires
+        // through this flow too.
+        let ts = open_test_store().await;
+        let (_vta_did, deps) = bootstrap_test_vta(&ts).await;
+        crate::contexts::create_context(&ts.contexts_ks, "ctx-2", "Test ctx 2")
+            .await
+            .expect("create context");
+
+        let auth = super_admin_claims();
+        let request = signed_admin_rotation_request("didcomm-mediator", "ctx-2").await;
+
+        let result = provision_integration(
+            &deps,
+            &auth,
+            ProvisionIntegrationParams {
+                request,
+                context: "ctx-2".into(),
+                admin_scope: AdminScope::Context,
+                assertion_mode: AssertionMode::PinnedOnly,
+                vc_validity: None,
+            },
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("non-admin template must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kind") && msg.contains("admin"),
+            "error must explain admin-kind requirement, got: {msg}"
+        );
+    }
+}
+
+/// Test-only helper: open a PinnedOnly armored bundle to a holder seed.
+/// Lives in a tiny submodule so the test that needs it can `use` the
+/// function directly without re-implementing armor decode + HPKE open.
+#[cfg(test)]
+mod sealed_transfer_open {
+    use vta_sdk::sealed_transfer::template_bootstrap::TemplateBootstrapPayload;
+    use vta_sdk::sealed_transfer::{
+        SealedPayloadV1, armor, ed25519_seed_to_x25519_secret, open_bundle,
+    };
+
+    pub fn open_for_test(
+        armored: &str,
+        digest: &str,
+        holder_seed: &[u8; 32],
+    ) -> TemplateBootstrapPayload {
+        let bundles = armor::decode(armored).expect("armor decode");
+        assert_eq!(bundles.len(), 1, "expected single bundle");
+        let x_secret = ed25519_seed_to_x25519_secret(holder_seed);
+        let opened = open_bundle(&x_secret, &bundles[0], Some(digest)).expect("open bundle");
+        match opened.payload {
+            SealedPayloadV1::TemplateBootstrap(boxed) => *boxed,
+            other => panic!("expected TemplateBootstrap, got {other:?}"),
+        }
+    }
+
+    /// As [`open_for_test`], but returning the raw payload so a test can assert
+    /// **which variant** the VTA chose. That choice is the contract this
+    /// workstream added, and a helper that unwraps one variant cannot check it.
+    pub fn open_raw_for_test(
+        armored: &str,
+        digest: &str,
+        holder_seed: &[u8; 32],
+    ) -> SealedPayloadV1 {
+        let bundles = armor::decode(armored).expect("armor decode");
+        assert_eq!(bundles.len(), 1, "expected single bundle");
+        let x_secret = ed25519_seed_to_x25519_secret(holder_seed);
+        open_bundle(&x_secret, &bundles[0], Some(digest))
+            .expect("open bundle")
+            .payload
+    }
+}

@@ -1,0 +1,59 @@
+[package]
+name = "vta-backup"
+description = "VTA backup/restore subsystem — encrypted full-state export/import, the sealed backup-bundle store, and its TTL sweeper"
+readme = "README.md"
+version = "0.43.0"
+edition.workspace = true
+# Published, because `vta-service` is — and a crate cannot go to crates.io
+# without its whole dependency closure there too. Not published for its own
+# sake: nothing outside this workspace is expected to depend on it directly.
+#
+# #938 set `publish = false` here on the finding that no external consumer
+# existed. That was wrong by one: `openvtc-core` dev-depends on `vta-service`
+# for `test_support::MockVta`, an in-process VTA the OpenVTC end-to-end tests
+# run against. See `vta-service/Cargo.toml` for what unpublishing it actually
+# broke. See RELEASING.md ("What gets published").
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Gates the webvh-keyspace field access on the shared `Keyspaces` bundle.
+webvh = ["vta-keyspaces/webvh"]
+# TEE config types. The enclave's restore commit (KMS sealing, the anchor
+# reservation) is injected by `vta-service` through `RestoreCommitter`.
+tee = ["vta-config/tee"]
+
+[dependencies]
+vti-common = { path = "../vti-common", version = "0.66" }
+# Nonce and bundle-id generation. Was reached through `aes_gcm::aead::OsRng`,
+# a re-export aes-gcm 0.11 dropped; this crate always needed a CSPRNG of its
+# own and was borrowing one from its cipher.
+rand = { workspace = true }
+vta-sdk = { path = "../vta-sdk", version = "0.90" }
+vta-keyspaces = { path = "../vta-keyspaces", version = "0.40" }
+vta-keys = { path = "../vta-keys", version = "0.44" }
+vta-config = { path = "../vta-config", version = "0.43", features = ["tee"] }
+vta-support = { path = "../vta-support", version = "0.41" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

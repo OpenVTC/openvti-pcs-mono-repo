@@ -1,0 +1,37 @@
+//! WebVH Witness — generates and signs cryptographic witness proofs for
+//! DID integrity verification.
+//!
+//! Every operation is a Trust Task ([`trust_tasks`]), served identically over
+//! TSP, DIDComm and `POST /api/trust-tasks`.
+//!
+//! # Stability
+//!
+//! Pre-1.0 — the public-module surface is intentionally wide so that
+//! `did-hosting-daemon` can compose this crate as a library. Treat every `pub`
+//! module as **unstable**; breaking changes can land in any minor version.
+//! Pin internal deps to the release's `major.minor` (a plain
+//! `"<major>.<minor>"` requirement, which for a pre-1.0 crate admits only
+//! that minor's patches).
+//!
+//! Notably stable: the [`signing::WitnessSigner`] trait is the documented
+//! extension point for plugging in remote-signing backends (HSM, KMS,
+//! VTA-managed keys). Its signature is async (returns a `BoxFuture`) and
+//! intended to remain stable within a release series.
+
+pub mod acl;
+pub mod config;
+pub mod error;
+pub mod health;
+pub mod identity_rotation;
+pub mod messaging;
+pub mod routes;
+pub mod secret_store;
+pub mod server;
+pub mod setup;
+pub mod setup_recipe;
+pub mod signing;
+pub mod store;
+pub mod trust_tasks;
+pub mod tsp;
+pub mod witness_keys;
+pub mod witness_ops;

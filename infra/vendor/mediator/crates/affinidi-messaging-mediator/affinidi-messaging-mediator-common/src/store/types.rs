@@ -1,0 +1,836 @@
+//! Shared types referenced by the [`MediatorStore`](super::MediatorStore) trait.
+//!
+//! These are the storage-layer types every backend must produce or accept.
+//! Public protocol types (`Account`, `MediatorACLSet`, `Folder`, `MessageList`,
+//! …) come from `affinidi-messaging-sdk` and are imported at use sites — not
+//! re-exported here, to keep the dependency direction one-way (sdk → store).
+//!
+//! Some types here intentionally duplicate definitions still living in
+//! `affinidi-messaging-mediator/src/database/*.rs` and `…/tasks/*`. The
+//! duplicates are removed in the call-site refactor commit; carrying them
+//! both during the transition keeps each commit small and reviewable.
+
+use crate::error_codes;
+use crate::errors::MediatorError;
+use crate::types::{accounts::AccountType, acls::MediatorACLSet};
+use ahash::AHashMap as HashMap;
+use num_format::{Locale, ToFormattedString};
+use serde::{Deserialize, Serialize};
+use std::fmt::{self, Display, Formatter};
+
+// ─── Sessions ────────────────────────────────────────────────────────────────
+
+/// Lifecycle state of an authentication session.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionState {
+    #[default]
+    Unknown,
+    ChallengeSent,
+    Authenticated,
+    Blocked,
+}
+
+impl std::fmt::Display for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl TryFrom<&String> for SessionState {
+    type Error = MediatorError;
+
+    fn try_from(value: &String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "ChallengeSent" => Ok(Self::ChallengeSent),
+            "Authenticated" => Ok(Self::Authenticated),
+            "Blocked" => Ok(Self::Blocked),
+            _ => Err(MediatorError::SessionError(
+                error_codes::SESSION_INVALID_STATE,
+                "NA".into(),
+                format!("Unknown session state: ({value})"),
+            )),
+        }
+    }
+}
+
+/// JWT claims embedded in session tokens.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionClaims {
+    pub aud: String,
+    pub sub: String,
+    pub session_id: String,
+    pub exp: u64,
+}
+
+/// An authentication session as stored by a backend.
+///
+/// The `session_id` is the storage key — backends must accept it on input
+/// and round-trip it on output. ACLs and account type are populated from
+/// the corresponding `DID:` record when the session is read; they are not
+/// persisted on the session record itself.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Session {
+    #[serde(skip)]
+    pub session_id: String,
+    pub challenge: String,
+    pub state: SessionState,
+    pub did: String,
+    pub did_hash: String,
+    pub authenticated: bool,
+    pub acls: MediatorACLSet,
+    pub account_type: AccountType,
+    /// Unix timestamp (seconds) at which the **access token** issued for
+    /// this session expires. The auth handler stamps it from the JWT's
+    /// `exp` so the authorization-response builder has the value to hand.
+    /// It is *not* the session's storage TTL and is informational on the
+    /// record.
+    ///
+    /// Session **storage** lifetime is controlled solely by the `ttl`
+    /// argument to `SessionStore::put_session`: Redis applies it via
+    /// `EXPIRE` (and doesn't even persist this field), while Fjall and
+    /// memory store their own expiry derived from that `ttl` and reclaim
+    /// lapsed records via lazy reads plus the background
+    /// `sweep_expired_sessions` task. No backend consults `expires_at`
+    /// to decide when a stored session expires, so mutating it will not
+    /// extend or shorten a session.
+    pub expires_at: u64,
+    /// Hash of the most recently issued refresh token. Used to enforce
+    /// one-time-use semantics on refresh: the handler hands the presented
+    /// token's hash and its replacement to
+    /// `SessionStore::rotate_refresh_token_hash`, which swaps them only if
+    /// the presented one is current. `None` until the first refresh token is
+    /// issued (i.e., for `ChallengeSent` sessions pre-auth).
+    pub refresh_token_hash: Option<String>,
+}
+
+/// Outcome of `SessionStore::rotate_refresh_token_hash`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshRotation {
+    /// The presented hash was the current one and has been replaced.
+    Rotated,
+    /// The session holds a different hash: the presented refresh token was
+    /// already exchanged. Nothing was written.
+    Mismatch,
+    /// No session, or a session with no refresh-token hash recorded. Nothing
+    /// was written.
+    Missing,
+}
+
+impl Session {
+    /// Construct a session from a flat key-value map. Used by the Redis
+    /// backend (HGETALL → `Session`) and by the memory/fjall backends to
+    /// keep on-disk shape uniform.
+    pub fn from_fields(session_id: &str, fields: &HashMap<String, String>) -> Option<Self> {
+        let challenge = fields.get("challenge")?.clone();
+        let state = match fields.get("state")?.as_str() {
+            "ChallengeSent" => SessionState::ChallengeSent,
+            "Authenticated" => SessionState::Authenticated,
+            "Blocked" => SessionState::Blocked,
+            _ => return None,
+        };
+        let did = fields.get("did")?.clone();
+        let did_hash = crate::did_identity::did_hash(did.as_str());
+
+        Some(Session {
+            session_id: session_id.to_string(),
+            challenge,
+            state,
+            did,
+            did_hash,
+            authenticated: matches!(state, SessionState::Authenticated),
+            ..Default::default()
+        })
+    }
+}
+
+// ─── Messages ────────────────────────────────────────────────────────────────
+
+/// Metadata associated with a stored message. Backends index this so
+/// `delete_message` can do its ownership check without deserialising the
+/// message body.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageMetaData {
+    pub bytes: usize,
+    pub to_did_hash: String,
+    pub from_did_hash: Option<String>,
+    /// Unix timestamp in milliseconds when the message was received.
+    pub timestamp: u128,
+}
+
+/// One stored copy of a message: the message id (`sha256` of the body) and
+/// the recipient it is held for.
+///
+/// # Why a message needs a recipient to be named
+///
+/// The id clients see is the hash of the body alone, and deployed SDKs derive
+/// it from the bytes they sent or received, so it cannot change. But the same
+/// bytes may be stored for more than one recipient — one multi-recipient
+/// message forwarded to two local recipients is the ordinary case — and
+/// ownership, queue entries, counters and expiry all belong to one recipient.
+/// So each recipient gets its own record, and the record is named by the pair.
+/// Storing the same bytes again for the **same** recipient is still one record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageRef {
+    /// The recipient the copy is held for.
+    pub to_did_hash: String,
+    /// The client-visible message id.
+    pub msg_id: String,
+}
+
+impl MessageRef {
+    pub fn new(to_did_hash: impl Into<String>, msg_id: impl Into<String>) -> Self {
+        MessageRef {
+            to_did_hash: to_did_hash.into(),
+            msg_id: msg_id.into(),
+        }
+    }
+}
+
+/// One copy a delete removed: the recipient it was held for and its sender
+/// (`None` for an anonymous one). A delete that withdraws several copies
+/// reports each, so callers can report each removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovedCopy {
+    pub to_did_hash: String,
+    pub from_did_hash: Option<String>,
+}
+
+/// Which of the records stored under one message id an operation acts on.
+///
+/// See [`MessageRef`] for why one id can name several records. A caller that
+/// knows the recipient names it; a caller that knows only the id says whose
+/// queues it is acting on, and the store resolves that the same way in every
+/// backend ([`ops::select_records`](crate::store::ops::select_records)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageScope<'a> {
+    /// Exactly the record held for this recipient.
+    Recipient(&'a str),
+    /// The records in this account's queues: the one held for it as
+    /// recipient when there is one; otherwise every record it sent under
+    /// the id (a sender withdrawing by id withdraws every copy it sent).
+    ///
+    /// Never use this to acknowledge a delivery: once the recipient's own
+    /// copy is gone it falls through to the copies it sent, which belong to
+    /// other recipients. Acknowledgements use [`Recipient`](Self::Recipient).
+    Party(&'a str),
+    /// Every record stored under the id. Only an admin acts on these; an
+    /// owner asking for `All` is treated as [`Party`](Self::Party) of itself.
+    All,
+}
+
+impl<'a> MessageScope<'a> {
+    /// The scope an id-only delete uses for `by`: an owner acts on its own
+    /// inbox copy only, an admin on every copy. Withdrawing what one sent is
+    /// always asked for explicitly, with [`Party`](Self::Party).
+    pub fn for_authority(by: &'a DeletionAuthority) -> Self {
+        match by {
+            DeletionAuthority::Owner { did_hash } => MessageScope::Recipient(did_hash),
+            DeletionAuthority::Admin { .. } => MessageScope::All,
+        }
+    }
+}
+
+/// Reply to a Message Pickup 3.0 status query for one DID.
+///
+/// Currently produced by the `get_status_reply` Lua function on Redis;
+/// non-Redis backends compute this in Rust against their own indices.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InboxStatusReply {
+    pub recipient_did: String,
+    pub message_count: u64,
+    pub total_bytes: u64,
+    /// Stream ID of the oldest message in the inbox, or `0` if empty.
+    pub oldest_received: String,
+    /// Stream ID of the newest message in the inbox, or `0` if empty.
+    pub newest_received: String,
+    /// Reported queue length from the storage backend.
+    pub queue_count: u64,
+    /// Whether the recipient has an active live-streaming subscription.
+    pub live_delivery: bool,
+}
+
+// ─── Forwarding queue ────────────────────────────────────────────────────────
+
+/// A message queued for forwarding to a remote mediator.
+///
+/// On Redis this maps 1:1 onto a `FORWARD_Q` stream entry. On Fjall it's a
+/// row in the `forward_queue` partition keyed by monotonic stream ID. On
+/// memory it's an entry in a `BTreeMap<StreamId, ForwardQueueEntry>`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardQueueEntry {
+    /// Backend-assigned stream ID (e.g., Redis "1700000000000-0"). Empty
+    /// when the entry is being constructed for enqueue; populated on read.
+    pub stream_id: String,
+    pub message: String,
+    pub to_did_hash: String,
+    pub from_did_hash: String,
+    pub from_did: String,
+    /// The destination VID in plaintext, for diagnostics and the abandonment
+    /// report. **Empty when the destination must not be retained.**
+    ///
+    /// TSP Rev 3 §5.3.3: an intermediary relaying an endpoint-to-endpoint
+    /// message "MUST NOT store `VID_a2` and `VID_b2` in any persistent
+    /// storage". This queue is persistent — it is a durable retry queue — so on
+    /// that path the destination is carried only as [`Self::to_did_hash`] and
+    /// [`Self::endpoint_url`], which is all delivery needs. Nothing routes on
+    /// this field; see [`crate::tasks::forwarding`] for the fallback label.
+    pub to_did: String,
+    pub endpoint_url: String,
+    pub received_at_ms: u128,
+    pub delay_milli: i64,
+    pub expires_at: u64,
+    pub retry_count: u32,
+    /// Hop counter for loop detection. The mediator increments on each
+    /// forward and rejects messages exceeding `max_hops`.
+    pub hop_count: u32,
+    /// Unix milliseconds before which no processor attempts this entry; `0`
+    /// means "as soon as it is read". Set on a retry, so the retry waits out
+    /// its backoff wherever it is picked up, not only on the processor that
+    /// saw the failure.
+    ///
+    /// Defaulted on decode so entries written before this field existed still
+    /// read; a processor that predates it ignores it and retries at once.
+    #[serde(default)]
+    pub not_before_ms: u128,
+}
+
+/// One page of a [`forward_queue_autoclaim`](crate::store::ForwardQueueStore::forward_queue_autoclaim)
+/// scan.
+#[derive(Clone, Debug, Default)]
+pub struct ForwardQueueClaimPage {
+    /// The idle entries this page reclaimed for the caller.
+    pub entries: Vec<ForwardQueueEntry>,
+    /// Where the next page starts, or `None` once the scan has covered the
+    /// whole pending list. A page can be empty and still have a next one:
+    /// each call examines a bounded stretch of the list.
+    pub next_cursor: Option<String>,
+}
+
+// ─── Live streaming pub/sub ─────────────────────────────────────────────────
+
+/// Payload published when a new message is delivered to a live-streaming
+/// recipient. Subscribers (the WebSocket task) decode this and forward to
+/// the connected client.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PubSubRecord {
+    pub did_hash: String,
+    pub message: String,
+    /// When `true`, deliver even if the client is not in the live-delivery
+    /// state (used to push status messages on live-delivery transitions).
+    pub force_delivery: bool,
+    /// When `true`, `message` is the frame itself and the socket sends it as
+    /// it is. When `false` (every ordinary delivery) it is a notification: a
+    /// raw-TSP socket ignores the body and drains the client's stored inbox
+    /// instead, which is the right move for a stored message and the wrong
+    /// one for a monitor batch, which is never stored.
+    ///
+    /// `#[serde(default)]`, so a record published by an instance that
+    /// predates this field still deserialises behind a shared Redis.
+    #[serde(default)]
+    pub verbatim: bool,
+    /// The stored message this notification is for, when it is for one. The
+    /// streaming task reports a `delivered` monitor event only for a tagged
+    /// record, and only once the notification is queued to the socket, so a
+    /// push that is dropped (or never published) is not reported as
+    /// delivered. Monitor batches and ephemeral pushes are untagged.
+    ///
+    /// `#[serde(default)]`: a record from an instance that predates this
+    /// field deserialises untagged, and an older instance ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored: Option<StoredMessageRef>,
+}
+
+/// Identifies a stored message carried by a [`PubSubRecord`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMessageRef {
+    pub msg_id: String,
+    /// The sender's DID hash, when the message has one.
+    pub from_did_hash: Option<String>,
+}
+
+// ─── Stats ───────────────────────────────────────────────────────────────────
+
+/// Snapshot of the mediator's global counters.
+///
+/// Backends maintain these counters in whatever shape suits them (Redis
+/// `GLOBAL` hash with `HINCRBY`, Fjall partition with atomic counters, etc.)
+/// and produce a snapshot on demand.
+#[derive(Clone, Debug, Default)]
+pub struct MetadataStats {
+    pub received_bytes: i64,
+    pub sent_bytes: i64,
+    pub deleted_bytes: i64,
+    pub received_count: i64,
+    pub sent_count: i64,
+    pub deleted_count: i64,
+    pub websocket_open: i64,
+    pub websocket_close: i64,
+    pub sessions_created: i64,
+    pub sessions_success: i64,
+    pub oob_invites_created: i64,
+    pub oob_invites_claimed: i64,
+}
+
+impl Display for MetadataStats {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            r#"
+    Message counts: recv({}) sent({}) deleted({}) queued({})
+    Storage: received({}), sent({}), deleted({}), current_queued({})
+    Connections: ws_open({}) ws_close({}) ws_current({}) :: sessions_created({}), sessions_authenticated({})
+    OOB Invites: created({}) claimed({})
+            "#,
+            self.received_count.to_formatted_string(&Locale::en),
+            self.sent_count.to_formatted_string(&Locale::en),
+            self.deleted_count.to_formatted_string(&Locale::en),
+            (self.received_count - self.deleted_count).to_formatted_string(&Locale::en),
+            self.received_bytes.to_formatted_string(&Locale::en),
+            self.sent_bytes.to_formatted_string(&Locale::en),
+            self.deleted_bytes.to_formatted_string(&Locale::en),
+            (self.received_bytes - self.deleted_bytes).to_formatted_string(&Locale::en),
+            self.websocket_open.to_formatted_string(&Locale::en),
+            self.websocket_close.to_formatted_string(&Locale::en),
+            (self.websocket_open - self.websocket_close).to_formatted_string(&Locale::en),
+            self.sessions_created.to_formatted_string(&Locale::en),
+            self.sessions_success.to_formatted_string(&Locale::en),
+            self.oob_invites_created.to_formatted_string(&Locale::en),
+            self.oob_invites_claimed.to_formatted_string(&Locale::en)
+        )
+    }
+}
+
+impl MetadataStats {
+    /// Per-tick delta vs a previously-captured snapshot. Used by the
+    /// statistics task to log "messages this period" rates without
+    /// interfering with the absolute counters in the backend.
+    pub fn delta(&self, previous: &MetadataStats) -> MetadataStats {
+        MetadataStats {
+            received_bytes: self.received_bytes - previous.received_bytes,
+            sent_bytes: self.sent_bytes - previous.sent_bytes,
+            deleted_bytes: self.deleted_bytes - previous.deleted_bytes,
+            received_count: self.received_count - previous.received_count,
+            sent_count: self.sent_count - previous.sent_count,
+            deleted_count: self.deleted_count - previous.deleted_count,
+            websocket_open: self.websocket_open - previous.websocket_open,
+            websocket_close: self.websocket_close - previous.websocket_close,
+            sessions_created: self.sessions_created - previous.sessions_created,
+            sessions_success: self.sessions_success - previous.sessions_success,
+            oob_invites_created: self.oob_invites_created - previous.oob_invites_created,
+            oob_invites_claimed: self.oob_invites_claimed - previous.oob_invites_claimed,
+        }
+    }
+}
+
+/// Counter that [`StatsStore::stats_increment`](crate::store::StatsStore::stats_increment) understands. Adding a
+/// variant requires teaching every backend to recognise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatCounter {
+    SentBytes,
+    SentCount,
+    WebsocketOpen,
+    WebsocketClose,
+    SessionsCreated,
+    SessionsSuccess,
+    OobInvitesCreated,
+    OobInvitesClaimed,
+}
+
+// ─── Authorisation context for destructive ops ─────────────────────────────
+
+/// Who is authorising a message deletion.
+///
+/// Replaces the prior `(did_hash, admin_did_hash)` parameter pair with a
+/// typed enum that makes the policy explicit at the call site.
+#[derive(Clone, Debug)]
+pub enum DeletionAuthority {
+    /// The requesting DID claims ownership (must be the message's TO or
+    /// FROM). Backends reject with `permission_denied` when the DID
+    /// doesn't match either side.
+    Owner { did_hash: String },
+    /// The requester is acting as the mediator admin. Bypasses ownership.
+    /// Used by the message expiry processor and account removal.
+    Admin { admin_did_hash: String },
+}
+
+impl DeletionAuthority {
+    pub fn principal_did_hash(&self) -> &str {
+        match self {
+            DeletionAuthority::Owner { did_hash } => did_hash,
+            DeletionAuthority::Admin { admin_did_hash } => admin_did_hash,
+        }
+    }
+}
+
+/// What the mediator knows about a queued message having been handed over.
+///
+/// # Why this exists
+///
+/// The mediator could say how many messages a DID had queued and how old the
+/// oldest was, and nothing at all about whether any of them had ever reached
+/// anyone. That gap is why a specific failure had no name: a recipient picks a
+/// message up, processes it, and does not acknowledge it — because the ack was
+/// dropped, or because the application declined the message terminally — and
+/// the message stays queued **against its sender**, counting toward that
+/// sender's depth limits, until expiry. From the mediator's side that is
+/// indistinguishable from a message nobody has collected.
+///
+/// They are not the same thing and they do not want the same treatment. A
+/// message nobody has collected should wait: the recipient may be offline and
+/// the whole point of the queue is to hold it. A message that has been
+/// collected several times and never released is either finished work or a
+/// poison message, and in both cases waiting longer achieves nothing.
+///
+/// # What it is not
+///
+/// Not proof of anything. It records that the mediator handed the bytes over,
+/// which is weaker than delivery and much weaker than processing — a recipient
+/// that crashes mid-handler still counts as delivered here. It is a signal for
+/// eviction and alerting, never authority for saying a message *was*
+/// delivered.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryState {
+    /// Unix milliseconds when this message was first handed to its recipient,
+    /// or `None` if it never has been.
+    pub first_delivered_at_ms: Option<u64>,
+    /// How many times it has been handed over — a **lower bound**, not a
+    /// count.
+    ///
+    /// Marking happens after the read rather than inside it, so a crash or a
+    /// failed write between the two loses an increment. That makes
+    /// `attempts >= n` sound evidence of at least `n` handovers, and
+    /// `attempts < n` no evidence of anything: a message may have been
+    /// delivered more often than this says, never fewer.
+    ///
+    /// So "this has been redelivered enough times to be poison" is a
+    /// conclusion this field can support, and "this looks healthy" is not. The
+    /// asymmetry is invisible at a call site that reads the number without
+    /// reading this, which is why it is stated on the field rather than in the
+    /// module docs.
+    ///
+    /// Above one means redelivery, which is normal once — a reconnect, a
+    /// restart — and suspicious when it keeps climbing while the message stays
+    /// queued.
+    ///
+    /// # It counts the recipient's behaviour, not the message's
+    ///
+    /// The recipient decides when to pick messages up, so a recipient that
+    /// fetches repeatedly without acknowledging can drive this as high as it
+    /// likes. **Anything built on a threshold here is therefore something a
+    /// recipient can trigger against a sender's messages**: poison-eviction
+    /// keyed on `attempts` alone would let a recipient cause a sender's traffic
+    /// to be destroyed, without the sender doing anything wrong.
+    ///
+    /// Nothing acts on this today, which is why it is recorded as a plain
+    /// observation. Before eviction or refusal is built on it, the threshold
+    /// must be **conjoined** with something the recipient does *not* control:
+    ///
+    /// ```text
+    /// attempts >= N  AND  age_since_first_delivery >= T     // safe
+    /// attempts >= N  OR   age_since_first_delivery >= T     // NOT safe
+    /// ```
+    ///
+    /// The `AND` gives the property this section is about — a recipient can at
+    /// most bring forward an outcome that age was going to reach anyway. The
+    /// `OR` hands the whole hazard straight back, because the term the
+    /// recipient controls fires on its own. That is one word in the
+    /// implementation and near-invisible in review, which is why it is written
+    /// out here rather than left as "paired with".
+    ///
+    /// # Unsafe alone in both directions, for different reasons
+    ///
+    /// It can be wrong **low by accident** — a lost update between the fetch
+    /// and the mark undercounts, which is the direction that fails safe — and
+    /// wrong **high on purpose**, which is not. A number that can drift down by
+    /// accident and up by intent is not a counter, and code that treats it as
+    /// one will be wrong in whichever direction matters at the time.
+    pub attempts: u32,
+}
+
+impl DeliveryState {
+    /// Whether the message has been handed over at least once.
+    pub fn delivered(&self) -> bool {
+        self.first_delivered_at_ms.is_some()
+    }
+
+    /// How long ago it was first handed over, in seconds, given `now_ms`.
+    ///
+    /// A stamp in the future — a clock that stepped backwards — reads as `0`
+    /// rather than wrapping to an enormous age.
+    pub fn since_first_delivery_secs(&self, now_ms: u64) -> Option<u64> {
+        self.first_delivered_at_ms
+            .map(|at| now_ms.saturating_sub(at) / 1_000)
+    }
+}
+
+/// Why a message left its sender's outbox (`messaging/message/status/0.1`).
+///
+/// # Why this exists
+///
+/// A message leaves the send queue in the same way whether its recipient took
+/// it, the mediator expired it, or its account was removed, and the delete
+/// leaves no trace. A sender watching its outbox could therefore only infer
+/// "gone", which cannot tell collection from loss — and a live recipient
+/// collects before any poll has seen the message queued, so a collected
+/// message often produced no evidence at all.
+///
+/// The reason is decided by **who removed the message**, never by the path
+/// the removal took ([`crate::store::ops::removal_reason`]). `Collected` must
+/// never be recorded for a removal the recipient did not make: a sender that
+/// settles delivery on it must never be told a lost message arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum RemovalReason {
+    /// The recipient removed it: acknowledged it after pickup, fetched it with
+    /// delete, or deleted or purged it.
+    Collected,
+    /// The sender removed it before the recipient did.
+    Withdrawn,
+    /// The mediator removed it before the recipient did: expiry, account
+    /// removal, or an administrator.
+    Discarded,
+}
+
+impl RemovalReason {
+    /// The stored and wire form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RemovalReason::Collected => "collected",
+            RemovalReason::Withdrawn => "withdrawn",
+            RemovalReason::Discarded => "discarded",
+        }
+    }
+
+    /// Parse [`as_str`](Self::as_str)'s output.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "collected" => Some(RemovalReason::Collected),
+            "withdrawn" => Some(RemovalReason::Withdrawn),
+            "discarded" => Some(RemovalReason::Discarded),
+            _ => None,
+        }
+    }
+}
+
+/// A receipt left for a message's sender when the message left the queue.
+///
+/// Keyed under the sender and nothing else, so no other account can read it,
+/// and kept for [`OUTBOX_RECEIPT_TTL`](crate::store::OUTBOX_RECEIPT_TTL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxReceipt {
+    pub reason: RemovalReason,
+    /// Unix milliseconds when the message was removed.
+    pub at_ms: u64,
+}
+
+impl OutboxReceipt {
+    /// The compact stored form, `<reason>:<at_ms>`.
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.reason.as_str(), self.at_ms)
+    }
+
+    /// Parse [`encode`](Self::encode)'s output. `None` for anything else, so a
+    /// corrupt or foreign value reads as no receipt rather than a wrong one.
+    pub fn decode(value: &str) -> Option<Self> {
+        let (reason, at_ms) = value.split_once(':')?;
+        Some(OutboxReceipt {
+            reason: RemovalReason::parse(reason)?,
+            at_ms: at_ms.parse().ok()?,
+        })
+    }
+}
+
+/// Where a message the requester sent now stands, as
+/// [`MessageStore::sent_message_states`](crate::store::MessageStore::sent_message_states)
+/// answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SentMessageState {
+    /// Held for the recipient and not yet handed over.
+    Queued,
+    /// Handed to the recipient and not yet removed by it.
+    Delivered { at_ms: u64 },
+    /// Removed, for the reason and at the time its receipt records.
+    Removed(OutboxReceipt),
+    /// Neither the message nor a receipt is held under the requester — never
+    /// sent by it, sent anonymously, never held here, or its receipt expired.
+    /// Not evidence of either delivery or loss.
+    Unknown,
+}
+
+/// The recipient-side facts a delivery gate needs, resolved in one lookup.
+///
+/// Returned by [`AclStore::delivery_decision`]. Existence is carried by
+/// the `Option` around this struct, so a caller that would otherwise call
+/// `account_exists` separately does not need to.
+///
+/// [`AclStore::delivery_decision`]: crate::store::AclStore::delivery_decision
+#[derive(Clone, Debug)]
+pub struct DeliveryDecision {
+    /// The recipient's stored ACL set — check capabilities against this.
+    pub acls: MediatorACLSet,
+    /// Whether the recipient's access list admits this particular sender,
+    /// already interpreted per the recipient's allowlist/denylist mode (and,
+    /// for an anonymous sender, per its `anon_receive` bit).
+    pub access_list_allows: bool,
+}
+
+// ─── Live streaming state ───────────────────────────────────────────────────
+
+/// What holds a DID's live stream on an instance: the DID's own socket, or
+/// a mux connection carrying it as a member. A direct socket outranks a mux
+/// entry across instances as it does within one (design §7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamingKind {
+    Direct,
+    Mux,
+}
+
+/// How [`StreamingStore::streaming_claim`](super::StreamingStore::streaming_claim)
+/// treats an entry another instance owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamingWrite {
+    /// A new registration: take the DID, the newest connection winning,
+    /// except that a mux entry never takes it from a direct socket.
+    Claim,
+    /// A live-delivery change on an existing registration: change the entry
+    /// only while this instance owns it, so a stale instance never overwrites
+    /// the current owner.
+    Update,
+}
+
+/// [`StreamingStore::streaming_claim`](super::StreamingStore::streaming_claim)'s
+/// answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamingClaim {
+    /// Whether this instance now holds the DID's entry. `false` when a direct
+    /// socket on another instance holds it (a mux claim), or another instance
+    /// owns it (an update).
+    pub held_here: bool,
+    /// A mux entry on another instance (its streaming uuid) that this claim
+    /// took the DID from. That instance must stand its entry by.
+    pub displaced_mux: Option<String>,
+}
+
+/// State of a live-streaming subscriber, set by the WebSocket task as
+/// clients connect, transition to live delivery, and disconnect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamingClientState {
+    /// Client has a WebSocket connection but has not yet enabled live
+    /// delivery. Messages still queue normally.
+    Registered,
+    /// Client has enabled live delivery; new messages are pushed instead
+    /// of (or in addition to) being queued.
+    Live,
+    /// Client has disconnected; remove all streaming state.
+    Deregistered,
+}
+
+// ─── Account roles ──────────────────────────────────────────────────────────
+
+// `AccountType` is re-exported from `affinidi-messaging-sdk`; the trait
+// uses it directly via `account_set_role` and the admin-account methods.
+
+// ─── Message expiry sweep ───────────────────────────────────────────────────
+
+/// Outcome of one full pass of the message expiry sweep.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExpiryReport {
+    /// Number of expiry timeslots inspected.
+    pub timeslots_swept: u32,
+    /// Number of messages successfully deleted.
+    pub expired: u32,
+    /// Number of messages found in expiry indices but already gone (the
+    /// normal-delete path beat the sweep). Difference between this and
+    /// `expired` is informational, not an error.
+    pub already_deleted: u32,
+}
+
+/// Outcome of one full pass of the session expiry sweep.
+///
+/// Only meaningful for backends without native TTL (Fjall, memory),
+/// which expire sessions lazily on read and so accumulate untouched
+/// expired records until swept. Native-TTL backends (Redis) report
+/// zero — their default sweep is a no-op.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionSweepReport {
+    /// Number of session records inspected.
+    pub scanned: u32,
+    /// Number of expired sessions removed this pass.
+    pub expired: u32,
+}
+
+// ─── Health ──────────────────────────────────────────────────────────────────
+
+/// Reported health of the storage backend, surfaced via `/readyz`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreHealth {
+    /// Backend is operational and accepting requests.
+    Healthy,
+    /// Backend is degraded but still serving requests (e.g., circuit
+    /// breaker in half-open state).
+    Degraded,
+    /// Backend is unavailable and short-circuiting requests.
+    Unavailable,
+}
+
+impl StoreHealth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StoreHealth::Healthy => "healthy",
+            StoreHealth::Degraded => "degraded",
+            StoreHealth::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// One change to an existing account, applied by
+/// [`AccountStore::account_update`](crate::store::AccountStore::account_update)
+/// as a single atomic step: every member lands, or none does.
+///
+/// A member left `None` is left unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct AccountUpdate {
+    /// Replace the ACL bitmask.
+    pub acls: Option<MediatorACLSet>,
+    /// The send-queue limit: `-1` unlimited, `-2` reset to the mediator
+    /// default, `n` an explicit cap.
+    pub send_queue_limit: Option<i32>,
+    /// The receive-queue limit, as [`send_queue_limit`](Self::send_queue_limit).
+    pub receive_queue_limit: Option<i32>,
+    /// Set the role, and admin-set membership with it: an admin role
+    /// ([`AccountType::is_admin`]) is listed as an admin, any other is not.
+    pub role: Option<AccountType>,
+}
+
+/// One change to an account's access list, applied by
+/// [`AclStore::access_list_update`](crate::store::AclStore::access_list_update)
+/// as a single atomic step in the fixed order `clear`, `add`, `remove`, so
+/// `clear` with `add` replaces the list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccessListUpdate {
+    /// Empty the list first.
+    pub clear: bool,
+    /// DID hashes to add, up to the access-list limit.
+    pub add: Vec<String>,
+    /// DID hashes to remove, after the additions.
+    pub remove: Vec<String>,
+}
+
+/// What an [`AccessListUpdate`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccessListUpdateOutcome {
+    /// The hashes from [`AccessListUpdate::add`] admitted under the limit, in
+    /// the order asked (including any already listed), as `access_list_add`
+    /// reports them.
+    pub added: Vec<String>,
+    /// Whether `add` was cut short by the limit.
+    pub truncated: bool,
+    /// The hashes from [`AccessListUpdate::remove`] that were listed and are
+    /// now gone, each once, in the order asked.
+    pub removed: Vec<String>,
+    /// Entries in the list after the update.
+    pub count: usize,
+}

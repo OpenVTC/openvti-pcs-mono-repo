@@ -1,0 +1,1482 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use dialoguer::{Confirm, Input, Select};
+use didwebvh_rs::url::WebVHURL;
+use serde_json::json;
+use url::Url;
+
+use vta_sdk::did_secrets::{DidSecretsBundle, SecretEntry};
+use vta_sdk::protocols::did_management::create::WebvhPathMode;
+
+use crate::acl::{AclEntry, Role, store_acl_entry};
+use crate::config::AppConfig;
+use crate::keys::seed_store::create_seed_store;
+use crate::operations;
+use crate::operations::did_webvh::CreateDidWebvhParams;
+use crate::setup;
+use crate::store::Store;
+use crate::webvh_cli::cli_super_admin;
+
+pub struct CreateDidWebvhArgs {
+    pub config_path: Option<PathBuf>,
+    pub context: String,
+    pub label: Option<String>,
+    /// Hosting URL. When `Some`, the command runs fully non-interactive.
+    pub url: Option<String>,
+    /// Emit the `DidSecretsBundle` JSON to stdout and skip interactive prompts.
+    pub export_secrets: bool,
+    /// Create an ACL admin entry for the new DID in the target context.
+    pub admin: bool,
+    /// Write the DID log (did.jsonl) to this file.
+    pub did_log_file: Option<PathBuf>,
+    /// How the DID is presented (VTI-VTA-036). `None` → `[dids]`.
+    pub did_method: Option<vta_sdk::did_scid::DidMethod>,
+    /// Whether the log lists its did:scid alias. `None` → `[dids]`.
+    pub scid_also_known_as: Option<bool>,
+}
+
+pub async fn run_create_did_webvh(
+    args: CreateDidWebvhArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(args.config_path)?;
+    let store = Store::open(&config.store)?;
+    let keys_ks = store.keyspace(crate::keyspaces::KEYS)?;
+    let imported_ks = store.keyspace(crate::keyspaces::IMPORTED_SECRETS)?;
+    let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS)?;
+    let webvh_ks = store.keyspace(crate::keyspaces::WEBVH)?;
+    let audit_ks = store.keyspace(crate::keyspaces::AUDIT)?;
+    let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+    let did_templates_ks = store.keyspace(crate::keyspaces::DID_TEMPLATES)?;
+
+    // Resolve context
+    let ctx = match crate::contexts::get_context(&contexts_ks, &args.context).await? {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Context '{}' does not exist.", args.context);
+            let name: String = Input::new()
+                .with_prompt("Create it with name")
+                .default(args.context.clone())
+                .interact_text()?;
+            let ctx = crate::contexts::create_context(&contexts_ks, &args.context, &name).await?;
+            eprintln!("Created context: {} ({})", ctx.id, ctx.base_path);
+            ctx
+        }
+    };
+
+    let label = args.label.as_deref().unwrap_or(&args.context);
+
+    // `--url` selects fully non-interactive mode: no hosting-URL prompt, no
+    // save-log prompt, no export-secrets confirm, and no DID-document
+    // edit/portability/pre-rotation prompts. Without it, behave interactively
+    // exactly as before.
+    let interactive = args.url.is_none();
+
+    // Resolve the hosting URL: from `--url` (non-interactive) or by prompting.
+    let webvh_url = match &args.url {
+        Some(raw) => {
+            let parsed = Url::parse(raw).map_err(|e| format!("invalid --url `{raw}`: {e}"))?;
+            WebVHURL::parse_url(&parsed)
+                .map_err(|e| format!("invalid did:webvh hosting URL `{raw}`: {e}"))?
+        }
+        None => setup::prompt_webvh_url(label)?,
+    };
+    let url_str = webvh_url
+        .get_http_url(None)
+        .map_err(|e| format!("{e}"))?
+        .to_string();
+
+    // Build base DID document using shared helper (without services)
+    let seed_store = create_seed_store(&config)?;
+    let seed = crate::keys::seeds::load_seed_bytes(
+        &keys_ks,
+        &*seed_store,
+        Some(
+            crate::keys::seeds::get_active_seed_id(&keys_ks)
+                .await
+                .map_err(|e| format!("{e}"))?,
+        ),
+    )
+    .await
+    .map_err(|e| format!("{e}"))?;
+
+    // In non-interactive mode, the operation derives keys and builds the
+    // document itself. In interactive mode we must render a document *first*,
+    // for the operator to inspect and edit — so the keys have to be derived
+    // out here, and then handed to the operation via `pre_derived` so it uses
+    // the same pair rather than allocating a second one. Deriving on both
+    // sides is what made the DID advertise keys the store could not sign
+    // with; `derive_entity_keys` allocates a fresh path index per call.
+    let (did_document, pre_derived) = if interactive {
+        let (doc, derived) =
+            build_interactive_did_document(&seed, &ctx.base_path, label, &config, &keys_ks).await?;
+        (Some(doc), Some(derived))
+    } else {
+        (None, None)
+    };
+
+    // Portability (interactive prompt; non-interactive uses the prompt default).
+    let portable = if interactive {
+        Confirm::new()
+            .with_prompt("Make this DID portable (can move to a different domain later)?")
+            .default(true)
+            .interact()?
+    } else {
+        true
+    };
+
+    // Pre-rotation count (interactive prompt; non-interactive uses the default).
+    let pre_rotation_count: u32 = if interactive {
+        Input::new()
+            .with_prompt("Number of pre-rotation keys (0 = none, recommended: 1-3)")
+            .default(1u32)
+            .interact_text()?
+    } else {
+        1
+    };
+
+    // Build params and call the operations layer
+    let auth = cli_super_admin();
+    let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await?;
+    let no_bridge: Arc<crate::didcomm_bridge::DIDCommBridge> =
+        Arc::new(crate::didcomm_bridge::DIDCommBridge::placeholder());
+
+    let params = CreateDidWebvhParams {
+        context_id: args.context.clone(),
+        server_id: None,
+        url: Some(url_str.clone()),
+        // Serverless (`server_id: None`) ignores `path_mode`.
+        path_mode: WebvhPathMode::default(),
+        domain: None,
+        label: Some(label.to_string()),
+        portable,
+        // Interactive builds the service into the document it passes (and
+        // the operator may have edited it), so the operation must not add a
+        // second one. Non-interactive passes no document, so the operation
+        // is the only thing that can advertise the mediator — without this,
+        // `--url` mints a DID with no `service` entry at all, which no peer
+        // can route to. `build_did_document` no-ops when `[messaging]` is
+        // absent, but say so here too: the flag reads as a claim about what
+        // this VTA can serve.
+        add_mediator_service: !interactive && config.messaging.is_some(),
+        add_tsp_service: Some(false),
+        additional_services: None,
+        pre_rotation_count,
+        did_document,
+        did_log: None,
+        set_primary: true,
+        pre_derived,
+        signing_key_id: None,
+        ka_key_id: None,
+        template: None,
+        template_context: None,
+        template_vars: std::collections::HashMap::new(),
+        // `vta create-did-webvh` is the runtime integration-DID CLI — not
+        // used to mint the VTA's own identity (that's setup wizard /
+        // setup --from / TEE autogen).
+        is_vta_identity: false,
+        did_method: args.did_method,
+        scid_also_known_as: args.scid_also_known_as,
+    };
+
+    let deps = operations::did_webvh::CreateDidWebvhDeps {
+        keys_ks: &keys_ks,
+        imported_ks: &imported_ks,
+        contexts_ks: &contexts_ks,
+        webvh_ks: &webvh_ks,
+        did_templates_ks: &did_templates_ks,
+        audit: &audit,
+        seed_store: &*seed_store,
+        config: &config,
+        did_resolver: &did_resolver,
+        didcomm_bridge: &no_bridge,
+        acl_ks: None,
+        // Offline: no mediator socket to lend, so the seam cannot choose
+        #[cfg(feature = "tsp")]
+        tsp: None,
+    };
+    let result = operations::did_webvh::create_did_webvh(&deps, &auth, params, "cli").await?;
+
+    let final_did = &result.did;
+    eprintln!("\x1b[1;32mCreated DID:\x1b[0m {final_did}");
+
+    // Optionally grant the new DID admin in the target context. Mirrors
+    // `create-did-key --admin` (`vta-service/src/did_key.rs`): same
+    // `AclEntry::new(..).with_label(..).with_contexts(..)` +
+    // `store_acl_entry` call, scoped to the target context.
+    if args.admin {
+        let acl_ks = store.keyspace(crate::keyspaces::ACL)?;
+        let entry = AclEntry::new(final_did.clone(), Role::Admin, "cli:create-did-webvh")
+            .with_label(args.label.clone())
+            .with_contexts(vec![args.context.clone()]);
+        store_acl_entry(&acl_ks, &entry).await?;
+        eprintln!(
+            "ACL entry created: {final_did} (admin, context: {})",
+            args.context
+        );
+    }
+
+    // Persist all writes (DID + optional ACL entry)
+    store.persist().await?;
+
+    // Save did.jsonl. Interactive: prompt for the filename (defaulting to
+    // `--did-log-file` if given). Non-interactive (`--url`): write to
+    // `--did-log-file` silently, or skip if not specified.
+    if let Some(ref log_entry) = result.log_entry {
+        if interactive {
+            let default_file = args
+                .did_log_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| format!("{label}-did.jsonl"));
+            let did_file: String = Input::new()
+                .with_prompt("Save DID log to file")
+                .default(default_file)
+                .interact_text()?;
+
+            std::fs::write(&did_file, log_entry)
+                .map_err(|e| format!("failed to write did.jsonl to {did_file}: {e}"))?;
+            eprintln!("  DID log saved to: {did_file}");
+            eprintln!("  Context '{}' updated with DID: {final_did}", args.context);
+            eprintln!();
+            eprintln!("  \x1b[2mTo self-host this DID, upload {did_file} to:");
+            eprintln!("  {url_str}\x1b[0m");
+        } else {
+            // Non-interactive (`--url`): stdout is reserved for the secrets
+            // bundle, so there's no prompt — `--did-log-file` is the only way
+            // to capture the log. Without it we just note where it belongs.
+            if let Some(ref path) = args.did_log_file {
+                std::fs::write(path, log_entry)
+                    .map_err(|e| format!("failed to write did.jsonl to {}: {e}", path.display()))?;
+                eprintln!("  DID log written to: {}", path.display());
+            }
+            eprintln!("  Context '{}' updated with DID: {final_did}", args.context);
+            if args.did_log_file.is_none() {
+                eprintln!(
+                    "  \x1b[2mDID log (did.jsonl) ready; pass --did-log-file <path> to save it. Self-host at: {url_str}\x1b[0m"
+                );
+            } else {
+                eprintln!("  \x1b[2mSelf-host the DID log at: {url_str}\x1b[0m");
+            }
+        }
+    }
+
+    // Optionally export secrets bundle. `--export-secrets` forces it
+    // unconditionally (no confirm); interactively, prompt. Non-interactive
+    // without the flag emits nothing on stdout.
+    let want_export = if args.export_secrets {
+        true
+    } else if interactive {
+        Confirm::new()
+            .with_prompt("Export DID secrets bundle?")
+            .default(false)
+            .interact()?
+    } else {
+        false
+    };
+    if want_export {
+        // Fetch key secrets via the operations layer — the same export gate
+        // as every transport. The CLI's synthesized super-admin has no ACL
+        // entry, so its role (admin) supplies `key-export`.
+        let acl_ks = store.keyspace(crate::keyspaces::ACL)?;
+        let signing_secret = crate::operations::keys::get_key_secret(
+            &keys_ks,
+            &imported_ks,
+            &contexts_ks,
+            &acl_ks,
+            &Arc::from(seed_store),
+            &audit,
+            &auth,
+            &result.signing_key_id,
+            crate::operations::keys::ExportChannel::Local("cli"),
+        )
+        .await
+        .map_err(|e| format!("failed to fetch signing key secret: {e}"))?;
+
+        let mut secrets = vec![SecretEntry {
+            key_id: result.signing_key_id.clone(),
+            key_type: vta_sdk::keys::KeyType::Ed25519,
+            private_key_multibase: signing_secret.private_key_multibase,
+        }];
+
+        if !result.ka_key_id.is_empty() {
+            let ka_secret = crate::operations::keys::get_key_secret(
+                &keys_ks,
+                &imported_ks,
+                &contexts_ks,
+                &acl_ks,
+                &Arc::from(create_seed_store(&config)?),
+                &audit,
+                &auth,
+                &result.ka_key_id,
+                crate::operations::keys::ExportChannel::Local("cli"),
+            )
+            .await
+            .map_err(|e| format!("failed to fetch KA key secret: {e}"))?;
+
+            secrets.push(SecretEntry {
+                key_id: result.ka_key_id.clone(),
+                key_type: vta_sdk::keys::KeyType::X25519,
+                private_key_multibase: ka_secret.private_key_multibase,
+            });
+        }
+
+        let bundle = DidSecretsBundle {
+            did: final_did.clone(),
+            secrets,
+        };
+        // Local operator export to stdout: JSON, not base64. The base64
+        // wrapper offered no integrity or confidentiality — the OS
+        // filesystem (for redirected output) or terminal scrollback is the
+        // only protection here. Pretty-printed JSON is easier to audit
+        // and indexes cleanly into secure storage.
+        let json = serde_json::to_string_pretty(&bundle)?;
+        eprintln!();
+        eprintln!("\x1b[1;33m╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  WARNING: The secrets bundle contains private keys.      ║");
+        eprintln!("║  Redirect to a file with restrictive permissions.        ║");
+        eprintln!("╚══════════════════════════════════════════════════════════╝\x1b[0m");
+        eprintln!();
+        println!("{json}");
+        eprintln!();
+    }
+
+    Ok(())
+}
+
+/// Interactive DID document builder: derives the entity keys, prompts for
+/// service endpoints, displays the document, and offers editor access.
+///
+/// Returns the document **and the keys it was built from**. The caller must
+/// hand those keys to the operation (`CreateDidWebvhParams::pre_derived`) —
+/// letting it derive its own pair would store keys this document does not
+/// name, which is precisely the mismatch the non-interactive path had.
+async fn build_interactive_did_document(
+    seed: &[u8],
+    base_path: &str,
+    label: &str,
+    config: &AppConfig,
+    keys_ks: &vti_common::store::KeyspaceHandle,
+) -> Result<(serde_json::Value, crate::keys::DerivedEntityKeys), Box<dyn std::error::Error>> {
+    let derived = crate::keys::derive_entity_keys(
+        seed,
+        base_path,
+        &format!("{label} signing key"),
+        &format!("{label} key-agreement key"),
+        keys_ks,
+    )
+    .await?;
+    let mut doc = operations::did_webvh::build_did_document(&derived, config, false, &None);
+
+    if let Some(ref msg) = config.messaging {
+        let service_options = &[
+            "DIDComm endpoint (references mediator DID for routing)",
+            "No service endpoints",
+        ];
+        let want_didcomm = Select::new()
+            .with_prompt("Service endpoints")
+            .items(service_options)
+            .default(0)
+            .interact()?
+            == 0;
+
+        if want_didcomm {
+            doc["service"] = json!([
+                {
+                    "id": "{DID}#vta-didcomm",
+                    "type": "DIDCommMessaging",
+                    "serviceEndpoint": [{
+                        "accept": ["didcomm/v2"],
+                        "uri": msg.mediator_did
+                    }]
+                }
+            ]);
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "\x1b[2mDID Document:\n{}\x1b[0m",
+        serde_json::to_string_pretty(&doc)?
+    );
+    eprintln!();
+
+    if Confirm::new()
+        .with_prompt("Edit DID document in your editor?")
+        .default(false)
+        .interact()?
+    {
+        doc = edit_did_document(doc)?;
+    }
+
+    Ok((doc, derived))
+}
+
+fn edit_did_document(
+    doc: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use std::process::Command;
+
+    let json = serde_json::to_string_pretty(&doc)?;
+
+    // Write to a named temp file with .json extension for editor syntax highlighting
+    let mut tmp = tempfile::Builder::new().suffix(".json").tempfile()?;
+    tmp.write_all(json.as_bytes())?;
+    tmp.flush()?;
+    let path = tmp.path().to_path_buf();
+
+    // Resolve editor: $VISUAL > $EDITOR > fallback
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    // Open editor and wait
+    let status = Command::new(&editor)
+        .arg(&path)
+        .status()
+        .map_err(|e| format!("failed to launch editor '{editor}': {e}"))?;
+
+    if !status.success() {
+        return Err(format!("editor exited with {status}").into());
+    }
+
+    // Read back and parse
+    let edited = std::fs::read_to_string(&path)?;
+    let new_doc: serde_json::Value =
+        serde_json::from_str(&edited).map_err(|e| format!("invalid JSON from editor: {e}"))?;
+
+    // Basic validation: must be an object with "id" field
+    if !new_doc.is_object() || !new_doc.get("id").is_some_and(|v| v.is_string()) {
+        return Err("DID document must be a JSON object with an \"id\" field".into());
+    }
+
+    // Show the updated document
+    eprintln!(
+        "\x1b[2mUpdated DID Document:\n{}\x1b[0m",
+        serde_json::to_string_pretty(&new_doc)?
+    );
+
+    Ok(new_doc)
+}
+
+#[cfg(all(test, feature = "config-seed"))]
+mod tests {
+    use super::*;
+    // Only the tests construct a resolver directly now: the production path
+    // takes the process-shared one so repeat resolutions hit one cache.
+    use crate::acl::get_acl_entry;
+    use crate::keys::seeds::{SeedRecord, save_seed_record, set_active_seed_id};
+    use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+    use vti_common::acl::Role;
+
+    /// `vta create-did-webvh --url <URL> --admin --export-secrets` must run
+    /// fully non-interactive and, in one shot:
+    ///   * mint a did:webvh with #key-0 (Ed25519 signing) + #key-1 (X25519
+    ///     key-agreement),
+    ///   * create an ACL **admin** entry for that DID, scoped to the context,
+    ///   * (export-secrets emits the bundle to stdout — verified by the
+    ///     vta-sdk `secrets_from_bundle` tests; here we assert the store-side
+    ///     effects that prove the non-interactive + ACL wiring).
+    ///
+    /// Gated on `config-seed` so the seed store is the in-config backend (no
+    /// OS keyring), making the test hermetic. Run with:
+    /// `cargo test -p vta-service --bin vta --features config-seed`.
+    #[tokio::test]
+    async fn create_did_webvh_url_admin_export_is_noninteractive_and_grants_admin() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        // Minimal config: local store + a config-seed backend carrying a
+        // fixed hex seed (dev/test only; selected ahead of keyring in the
+        // factory). No messaging, so the DID gets no DIDComm service.
+        let seed_hex = hex::encode([7u8; 64]);
+        std::fs::write(
+            &config_path,
+            format!(
+                "[store]\ndata_dir = \"{}\"\n\n[secrets]\nseed = \"{seed_hex}\"\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+
+        // Bootstrap the seed generation record (the bytes live in the
+        // config-seed backend); record generation 0 as active.
+        let config = AppConfig::load(Some(config_path.clone())).expect("load config");
+        let store = Store::open(&config.store).expect("open store");
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+
+        save_seed_record(
+            &keys_ks,
+            &SeedRecord {
+                id: 0,
+                seed_hex: None,
+                seed_enc: None,
+                created_at: chrono::Utc::now(),
+                retired_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        set_active_seed_id(&keys_ks, 0).await.unwrap();
+
+        // Create the target context up-front (so no "create context?" prompt).
+        crate::contexts::create_context(&contexts_ks, "agents", "Agents")
+            .await
+            .unwrap();
+        store.persist().await.unwrap();
+        // Release the fjall lock fully before the command opens its own Store.
+        drop(keys_ks);
+        drop(contexts_ks);
+        drop(store);
+
+        // Run fully non-interactive: --url set, --admin, --export-secrets.
+        let args = CreateDidWebvhArgs {
+            config_path: Some(config_path.clone()),
+            context: "agents".to_string(),
+            label: Some("agent-1".to_string()),
+            url: Some("https://example.com/agents/agent-1".to_string()),
+            export_secrets: true,
+            admin: true,
+            did_log_file: None,
+            did_method: None,
+            scid_also_known_as: None,
+        };
+        run_create_did_webvh(args).await.expect("create-did-webvh");
+
+        // Reopen the store and assert the side effects.
+        let store = Store::open(&config.store).expect("reopen store");
+        let webvh_ks = store.keyspace(crate::keyspaces::WEBVH).unwrap();
+        let acl_ks = store.keyspace(crate::keyspaces::ACL).unwrap();
+
+        // Exactly one did:webvh was created, with #key-0 + #key-1 records.
+        let dids = crate::webvh_store::list_dids(&webvh_ks).await.unwrap();
+        assert_eq!(dids.len(), 1, "one did:webvh minted");
+        let did = &dids[0].did;
+        assert!(did.starts_with("did:webvh:"), "got {did}");
+
+        let keys_ks2 = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let key0: Option<crate::keys::KeyRecord> = keys_ks2
+            .get(crate::keys::store_key(&format!("{did}#key-0")))
+            .await
+            .unwrap();
+        let key1: Option<crate::keys::KeyRecord> = keys_ks2
+            .get(crate::keys::store_key(&format!("{did}#key-1")))
+            .await
+            .unwrap();
+        assert!(key0.is_some(), "#key-0 (signing) record present");
+        assert!(key1.is_some(), "#key-1 (key-agreement) record present");
+        assert_eq!(key1.unwrap().key_type, crate::keys::KeyType::X25519);
+
+        // The ACL admin entry exists for the new DID, scoped to the context.
+        let entry = get_acl_entry(&acl_ks, did)
+            .await
+            .unwrap()
+            .expect("ACL entry created for the did:webvh");
+        assert_eq!(entry.role, Role::Admin);
+        assert_eq!(entry.allowed_contexts, vec!["agents".to_string()]);
+    }
+
+    /// `--did-log-file` writes the `did.jsonl` the command would otherwise
+    /// only mention. The target is an **absolute path outside the working
+    /// directory** on purpose — that is the whole point of the flag (publish
+    /// into a checkout of an external host, e.g. GitLab Pages), and the
+    /// operator is the one supplying it.
+    ///
+    /// Same `config-seed` gate + hermetic tempdir config as the test above.
+    #[tokio::test]
+    async fn did_log_file_writes_the_log_to_the_given_path() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let seed_hex = hex::encode([9u8; 64]);
+        std::fs::write(
+            &config_path,
+            format!(
+                "[store]\ndata_dir = \"{}\"\n\n[secrets]\nseed = \"{seed_hex}\"\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::load(Some(config_path.clone())).expect("load config");
+        let store = Store::open(&config.store).expect("open store");
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+
+        save_seed_record(
+            &keys_ks,
+            &SeedRecord {
+                id: 0,
+                seed_hex: None,
+                seed_enc: None,
+                created_at: chrono::Utc::now(),
+                retired_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        set_active_seed_id(&keys_ks, 0).await.unwrap();
+        crate::contexts::create_context(&contexts_ks, "agents", "Agents")
+            .await
+            .unwrap();
+        store.persist().await.unwrap();
+        drop(keys_ks);
+        drop(contexts_ks);
+        drop(store);
+
+        // Absolute, outside cwd, into a directory the operator nominated.
+        let publish_dir = dir.path().join("pages");
+        std::fs::create_dir_all(&publish_dir).unwrap();
+        let log_path = publish_dir.join("did.jsonl");
+
+        let args = CreateDidWebvhArgs {
+            config_path: Some(config_path.clone()),
+            context: "agents".to_string(),
+            label: Some("agent-1".to_string()),
+            url: Some("https://example.com/agents/agent-1".to_string()),
+            export_secrets: false,
+            admin: false,
+            did_log_file: Some(log_path.clone()),
+            did_method: None,
+            scid_also_known_as: None,
+        };
+        run_create_did_webvh(args).await.expect("create-did-webvh");
+
+        let written = std::fs::read_to_string(&log_path).expect("did.jsonl written");
+        assert!(!written.trim().is_empty(), "did.jsonl is not empty");
+
+        // It is the real log: the first line parses as JSON and carries the
+        // minted DID's version id.
+        let first = written.lines().next().expect("at least one log entry");
+        let entry: serde_json::Value = serde_json::from_str(first).expect("log entry is JSON");
+        assert!(
+            entry.get("versionId").is_some(),
+            "log entry carries versionId, got: {entry}"
+        );
+    }
+
+    /// Write a config + open a seeded store with one context, ready for a
+    /// `create-did-webvh`. `mediator_did` adds a `[messaging]` section — the
+    /// switch that decides whether the minted DID advertises DIDComm.
+    async fn setup_seeded_store(
+        dir: &tempfile::TempDir,
+        mediator_did: Option<&str>,
+    ) -> (AppConfig, std::path::PathBuf) {
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let seed_hex = hex::encode([42u8; 64]);
+        let messaging = mediator_did
+            .map(|did| format!("\n[messaging]\nmediator_did = \"{did}\"\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[store]\ndata_dir = \"{}\"\n\n[secrets]\nseed = \"{seed_hex}\"\n{messaging}",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::load(Some(config_path.clone())).expect("load config");
+        let store = Store::open(&config.store).expect("open store");
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+
+        save_seed_record(
+            &keys_ks,
+            &SeedRecord {
+                id: 0,
+                seed_hex: None,
+                seed_enc: None,
+                created_at: chrono::Utc::now(),
+                retired_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        set_active_seed_id(&keys_ks, 0).await.unwrap();
+        crate::contexts::create_context(&contexts_ks, "test-ctx", "Test")
+            .await
+            .unwrap();
+        store.persist().await.unwrap();
+        drop(keys_ks);
+        drop(contexts_ks);
+        drop(store);
+
+        (config, config_path)
+    }
+
+    /// Stand up a config + seeded store + context, run a non-interactive
+    /// `create-did-webvh`, and return the loaded config alongside the first
+    /// `did.jsonl` log entry.
+    ///
+    /// `mediator_did` adds a `[messaging]` section — the switch that decides
+    /// whether the minted DID advertises a DIDComm service.
+    async fn run_non_interactive_create(
+        dir: &tempfile::TempDir,
+        mediator_did: Option<&str>,
+    ) -> (AppConfig, serde_json::Value) {
+        let (config, config_path) = setup_seeded_store(dir, mediator_did).await;
+        // Create DID non-interactively with --did-log-file
+        let log_path = dir.path().join("did.jsonl");
+        let args = CreateDidWebvhArgs {
+            config_path: Some(config_path.clone()),
+            context: "test-ctx".to_string(),
+            label: Some("test".to_string()),
+            url: Some("https://example.com/test".to_string()),
+            export_secrets: false,
+            admin: false,
+            did_log_file: Some(log_path.clone()),
+            did_method: None,
+            scid_also_known_as: None,
+        };
+        run_create_did_webvh(args).await.expect("create-did-webvh");
+
+        let content = std::fs::read_to_string(&log_path).expect("did.jsonl");
+        let entry: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        (config, entry)
+    }
+
+    /// The DID document's `publicKeyMultibase` must match the key the VTA
+    /// serves via `get_key_secret`. This is the bug that caused the
+    /// "double-allocate path counter" mismatch: derivation happened twice
+    /// (once for preview, once in the operation), consuming different indices.
+    /// After the fix, non-interactive mode derives once — the document and
+    /// the store agree.
+    #[tokio::test]
+    async fn non_interactive_did_doc_key_matches_stored_key() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (config, entry) = run_non_interactive_create(&dir, None).await;
+
+        // Extract the public key from the DID document
+        let state = entry.get("state").expect("state field");
+        let vms = state
+            .get("verificationMethod")
+            .and_then(|v| v.as_array())
+            .expect("verificationMethod array");
+        // Find the Ed25519 key (multicodec prefix 0xed01)
+        let doc_pubkey: [u8; 32] = vms
+            .iter()
+            .filter_map(|vm| vm.get("publicKeyMultibase")?.as_str())
+            .filter_map(|mb| multibase::decode(mb).ok())
+            .filter_map(|(_, bytes)| {
+                if bytes.starts_with(&[0xed, 0x01]) && bytes.len() == 34 {
+                    <[u8; 32]>::try_from(&bytes[2..]).ok()
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("DID doc must have an Ed25519 key");
+
+        // Fetch the same key from the store (same path the VTA REST would use)
+        let store = Store::open(&config.store).expect("reopen store");
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let imported_ks = store.keyspace(crate::keyspaces::IMPORTED_SECRETS).unwrap();
+        let audit_ks = store.keyspace(crate::keyspaces::AUDIT).unwrap();
+        let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+        let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+        let seed_store = Arc::from(create_seed_store(&config).unwrap());
+        let auth = cli_super_admin();
+
+        let did = entry
+            .get("state")
+            .and_then(|s| s.get("id"))
+            .and_then(|v| v.as_str())
+            .expect("DID id");
+        let key_id = format!("{did}#key-0");
+
+        let acl_ks = store.keyspace(crate::keyspaces::ACL).unwrap();
+        let secret = crate::operations::keys::get_key_secret(
+            &keys_ks,
+            &imported_ks,
+            &contexts_ks,
+            &acl_ks,
+            &seed_store,
+            &audit,
+            &auth,
+            &key_id,
+            crate::operations::keys::ExportChannel::Local("test"),
+        )
+        .await
+        .expect("fetch key secret");
+
+        // Derive the public key from the secret
+        let secret_bytes =
+            multibase::decode(&secret.private_key_multibase).expect("decode secret multibase");
+        let signing_key =
+            ed25519_dalek::SigningKey::from_bytes(secret_bytes.1[2..].try_into().unwrap());
+        let store_pubkey = signing_key.verifying_key().to_bytes();
+
+        // The key in the DID document MUST match the key the store serves.
+        assert_eq!(
+            doc_pubkey, store_pubkey,
+            "DID doc key must match stored key — if this fails, the path \
+             counter was double-allocated (preview + operation derived separately)"
+        );
+    }
+
+    /// A DID minted with `--url` must still advertise the mediator when
+    /// `[messaging]` is configured.
+    ///
+    /// The pre-fix CLI built the service into a preview document it handed to
+    /// the operation. Dropping that document to fix the key mismatch also
+    /// dropped the only thing advertising DIDComm, and nothing caught it: the
+    /// service array had no coverage. A DID that advertises no transport has
+    /// an empty protocol intersection with every peer, so nothing can route
+    /// to it — the failure surfaces far from here, as an unreachable DID.
+    #[tokio::test]
+    async fn non_interactive_did_doc_advertises_the_mediator() {
+        const MEDIATOR_DID: &str = "did:key:z6MkiSEhwSnqRMjfsZnfoqCkVsao8SYaBwQ2HREh6F91R5wL";
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (_config, entry) = run_non_interactive_create(&dir, Some(MEDIATOR_DID)).await;
+
+        let services = entry
+            .get("state")
+            .and_then(|s| s.get("service"))
+            .and_then(|v| v.as_array())
+            .expect("DID doc must carry a service array when [messaging] is set");
+
+        let didcomm = services
+            .iter()
+            .find(|s| s.get("type").and_then(|t| t.as_str()) == Some("DIDCommMessaging"))
+            .expect("a DIDCommMessaging service must be advertised");
+
+        // Matched on `type`, not on the `#id` fragment — the fragment is an
+        // arbitrary label, and this assertion should not pin one.
+        let endpoint = serde_json::to_string(didcomm).expect("serialize service");
+        assert!(
+            endpoint.contains(MEDIATOR_DID),
+            "the DIDComm service must route via the configured mediator DID, got {didcomm}"
+        );
+    }
+
+    /// A caller that renders the DID document itself must get a DID whose
+    /// stored keys are the ones its document names.
+    ///
+    /// This is the interactive path in miniature. That path cannot be driven
+    /// from a test — it blocks on `dialoguer` prompts — so this exercises the
+    /// mechanism underneath it: derive once out here (as
+    /// `build_interactive_did_document` does), build a document from those
+    /// keys, and hand both to the operation. Before `pre_derived`, the
+    /// operation ignored the caller's derivation and allocated its own path
+    /// indices, so the document advertised `n, n+1` while the store held
+    /// `n+2, n+3` — a DID that cannot sign for the keys it publishes.
+    #[tokio::test]
+    async fn caller_rendered_document_names_the_keys_the_store_holds() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (config, _config_path) = setup_seeded_store(&dir, None).await;
+
+        let store = Store::open(&config.store).expect("open store");
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let imported_ks = store.keyspace(crate::keyspaces::IMPORTED_SECRETS).unwrap();
+        let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+        let webvh_ks = store.keyspace(crate::keyspaces::WEBVH).unwrap();
+        let audit_ks = store.keyspace(crate::keyspaces::AUDIT).unwrap();
+        let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+        let did_templates_ks = store.keyspace(crate::keyspaces::DID_TEMPLATES).unwrap();
+        let seed_store = create_seed_store(&config).unwrap();
+
+        let ctx = crate::contexts::get_context(&contexts_ks, "test-ctx")
+            .await
+            .unwrap()
+            .expect("context");
+        let seed = crate::keys::seeds::load_seed_bytes(&keys_ks, &*seed_store, Some(0))
+            .await
+            .expect("load seed");
+
+        // Derive once, exactly as the interactive preview does, and build the
+        // document from that pair.
+        let derived = crate::keys::derive_entity_keys(
+            &seed,
+            &ctx.base_path,
+            "test signing key",
+            "test key-agreement key",
+            &keys_ks,
+        )
+        .await
+        .expect("derive");
+        let preview_signing_pub = derived.signing_pub.clone();
+        let did_document =
+            operations::did_webvh::build_did_document(&derived, &config, false, &None);
+
+        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let no_bridge: Arc<crate::didcomm_bridge::DIDCommBridge> =
+            Arc::new(crate::didcomm_bridge::DIDCommBridge::placeholder());
+        let deps = operations::did_webvh::CreateDidWebvhDeps {
+            keys_ks: &keys_ks,
+            imported_ks: &imported_ks,
+            contexts_ks: &contexts_ks,
+            webvh_ks: &webvh_ks,
+            did_templates_ks: &did_templates_ks,
+            audit: &audit,
+            seed_store: &*seed_store,
+            config: &config,
+            did_resolver: &did_resolver,
+            didcomm_bridge: &no_bridge,
+            acl_ks: None,
+            // Offline: no mediator socket to lend, so the seam cannot choose
+            #[cfg(feature = "tsp")]
+            tsp: None,
+        };
+
+        let result = operations::did_webvh::create_did_webvh(
+            &deps,
+            &cli_super_admin(),
+            CreateDidWebvhParams {
+                context_id: "test-ctx".to_string(),
+                server_id: None,
+                url: Some("https://example.com/test".to_string()),
+                path_mode: WebvhPathMode::default(),
+                domain: None,
+                label: Some("test".to_string()),
+                portable: true,
+                add_mediator_service: false,
+                add_tsp_service: Some(false),
+                additional_services: None,
+                pre_rotation_count: 1,
+                did_document: Some(did_document),
+                did_log: None,
+                set_primary: true,
+                pre_derived: Some(derived),
+                signing_key_id: None,
+                ka_key_id: None,
+                template: None,
+                template_context: None,
+                template_vars: std::collections::HashMap::new(),
+                is_vta_identity: false,
+                did_method: None,
+                scid_also_known_as: None,
+            },
+            "test",
+        )
+        .await
+        .expect("create_did_webvh");
+
+        // What the store will serve for `#key-0`.
+        let secret = crate::operations::keys::get_key_secret(
+            &keys_ks,
+            &imported_ks,
+            &contexts_ks,
+            &store.keyspace(crate::keyspaces::ACL).unwrap(),
+            &Arc::from(create_seed_store(&config).unwrap()),
+            &audit,
+            &cli_super_admin(),
+            &format!("{}#key-0", result.did),
+            crate::operations::keys::ExportChannel::Local("test"),
+        )
+        .await
+        .expect("fetch key secret");
+        let secret_bytes =
+            multibase::decode(&secret.private_key_multibase).expect("decode secret multibase");
+        let signing_key =
+            ed25519_dalek::SigningKey::from_bytes(secret_bytes.1[2..].try_into().unwrap());
+        let store_pub_mb = multibase::encode(
+            multibase::Base::Base58Btc,
+            [
+                &[0xed, 0x01][..],
+                &signing_key.verifying_key().to_bytes()[..],
+            ]
+            .concat(),
+        );
+
+        assert_eq!(
+            store_pub_mb, preview_signing_pub,
+            "the store must hold the key the caller's document names — if this \
+             fails, the operation re-derived and allocated a second path index"
+        );
+    }
+
+    // ── The `keys` block, end to end ─────────────────────────────────────────
+    //
+    // These mint a DID and then read the **stored key record** back, rather
+    // than asserting that a preference list reaches a derivation function.
+    // `derive_entity_keys_with_preference` existed, was tested, and had no
+    // production caller: a template could declare `["mldsa44", "ed25519"]` and
+    // this VTA would mint Ed25519 and say nothing. A test that stopped at the
+    // plumbing would have passed throughout.
+
+    /// Run a serverless create against a template already in the store.
+    ///
+    /// Returns the `Result` rather than unwrapping, because half of what these
+    /// tests check is which requests are *refused* and what the refusal says.
+    async fn run_create_from_stored_template(
+        config: &crate::config::AppConfig,
+        store: &Store,
+        template_name: &str,
+    ) -> Result<(String, serde_json::Value, String), vti_common::error::AppError> {
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+        let imported_ks = store.keyspace(crate::keyspaces::IMPORTED_SECRETS).unwrap();
+        let contexts_ks = store.keyspace(crate::keyspaces::CONTEXTS).unwrap();
+        let webvh_ks = store.keyspace(crate::keyspaces::WEBVH).unwrap();
+        let audit_ks = store.keyspace(crate::keyspaces::AUDIT).unwrap();
+        let audit: vta_audit::SharedAuditSink = vta_audit::shared_keyspace_sink(audit_ks.clone());
+        let did_templates_ks = store.keyspace(crate::keyspaces::DID_TEMPLATES).unwrap();
+        let seed_store = create_seed_store(config).unwrap();
+
+        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .unwrap();
+        let no_bridge: Arc<crate::didcomm_bridge::DIDCommBridge> =
+            Arc::new(crate::didcomm_bridge::DIDCommBridge::placeholder());
+        let deps = operations::did_webvh::CreateDidWebvhDeps {
+            keys_ks: &keys_ks,
+            imported_ks: &imported_ks,
+            contexts_ks: &contexts_ks,
+            webvh_ks: &webvh_ks,
+            did_templates_ks: &did_templates_ks,
+            audit: &audit,
+            seed_store: &*seed_store,
+            config,
+            did_resolver: &did_resolver,
+            didcomm_bridge: &no_bridge,
+            acl_ks: None,
+            #[cfg(feature = "tsp")]
+            tsp: None,
+        };
+
+        let result = operations::did_webvh::create_did_webvh(
+            &deps,
+            &cli_super_admin(),
+            CreateDidWebvhParams {
+                context_id: "test-ctx".to_string(),
+                server_id: None,
+                url: Some("https://example.com/pqc".to_string()),
+                path_mode: WebvhPathMode::default(),
+                domain: None,
+                label: Some("pqc".to_string()),
+                portable: true,
+                add_mediator_service: false,
+                add_tsp_service: Some(false),
+                additional_services: None,
+                pre_rotation_count: 0,
+                did_document: None,
+                did_log: None,
+                set_primary: true,
+                pre_derived: None,
+                signing_key_id: None,
+                ka_key_id: None,
+                template: Some(template_name.to_string()),
+                template_context: None,
+                template_vars: std::collections::HashMap::new(),
+                is_vta_identity: false,
+                did_method: None,
+                scid_also_known_as: None,
+            },
+            "test",
+        )
+        .await?;
+
+        let document = result
+            .did_document
+            .clone()
+            .expect("create returns the published document");
+        let log = result
+            .log_entry
+            .clone()
+            .expect("create returns the log entry");
+        Ok((result.did.clone(), document, log))
+    }
+
+    /// Store a template, mint a DID from it, and hand back the created DID,
+    /// its published document, and the keyspace to read records out of.
+    async fn create_from_template(
+        dir: &tempfile::TempDir,
+        template: vta_sdk::did_templates::DidTemplate,
+    ) -> (
+        String,
+        serde_json::Value,
+        vti_common::store::KeyspaceHandle,
+        String,
+    ) {
+        let (config, _config_path) = setup_seeded_store(dir, None).await;
+        let store = Store::open(&config.store).expect("open store");
+        let did_templates_ks = store.keyspace(crate::keyspaces::DID_TEMPLATES).unwrap();
+        let keys_ks = store.keyspace(crate::keyspaces::KEYS).unwrap();
+
+        let name = template.name.clone();
+        vta_support::did_templates::store_global_template(
+            &did_templates_ks,
+            &vta_sdk::did_templates::DidTemplateRecord {
+                template,
+                scope: vta_sdk::did_templates::Scope::Global,
+                created_at: 0,
+                updated_at: 0,
+                created_by: "test".into(),
+            },
+        )
+        .await
+        .expect("store template");
+
+        let (did, document, log) = run_create_from_stored_template(&config, &store, &name)
+            .await
+            .expect("create_did_webvh");
+        (did, document, keys_ks, log)
+    }
+
+    /// A template whose slots are the historical pair plus one post-quantum
+    /// signing slot, published as a second `assertionMethod`.
+    fn pqc_template(name: &str, signing: Vec<&str>) -> vta_sdk::did_templates::DidTemplate {
+        use std::collections::BTreeMap;
+        use vta_sdk::did_templates::{KeyPurpose, KeySlot};
+
+        let mut keys = BTreeMap::from([
+            (
+                "signing".to_string(),
+                KeySlot {
+                    purpose: KeyPurpose::Signing,
+                    algorithms: signing.iter().map(|s| (*s).to_string()).collect(),
+                    publish: true,
+                },
+            ),
+            (
+                "ka".to_string(),
+                KeySlot {
+                    purpose: KeyPurpose::KeyAgreement,
+                    algorithms: vec!["x25519".into()],
+                    publish: true,
+                },
+            ),
+        ]);
+        let mut methods = vec![
+            serde_json::json!({
+                "id": "{DID}#key-0", "type": "Multikey", "controller": "{DID}",
+                "publicKeyMultibase": "{SIGNING_KEY_MB}"
+            }),
+            serde_json::json!({
+                "id": "{DID}#key-1", "type": "Multikey", "controller": "{DID}",
+                "publicKeyMultibase": "{KA_KEY_MB}"
+            }),
+        ];
+        let mut assertion = vec![serde_json::json!("{DID}#key-0")];
+
+        if name.contains("hybrid") {
+            keys.insert(
+                "pq-signing".to_string(),
+                KeySlot {
+                    purpose: KeyPurpose::Signing,
+                    algorithms: vec!["mldsa44".into()],
+                    publish: true,
+                },
+            );
+            methods.push(serde_json::json!({
+                "id": "{DID}#key-2", "type": "Multikey", "controller": "{DID}",
+                "publicKeyMultibase": "{PQ_SIGNING_KEY_MB}"
+            }));
+            assertion.push(serde_json::json!("{DID}#key-2"));
+        }
+
+        vta_sdk::did_templates::DidTemplate::from_json(serde_json::json!({
+            "schemaVersion": 2,
+            "name": name,
+            "kind": "vtc-host",
+            "methods": ["webvh"],
+            "keys": keys,
+            "document": {
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": "{DID}",
+                "verificationMethod": methods,
+                "assertionMethod": assertion,
+                "authentication": ["{DID}#key-0"],
+                "keyAgreement": ["{DID}#key-1"],
+            }
+        }))
+        .expect("template is valid")
+    }
+
+    /// Read the stored record for a verification-method id.
+    async fn stored_key_type(
+        keys_ks: &vti_common::store::KeyspaceHandle,
+        vm_id: &str,
+    ) -> vta_sdk::keys::KeyType {
+        operations::keys::get_key(keys_ks, &cli_super_admin(), vm_id, "test")
+            .await
+            .unwrap_or_else(|e| panic!("no key record stored for {vm_id}: {e}"))
+            .key_type
+    }
+
+    /// **A swiyu verifier identity mints to the Swiss Profile Anchor.**
+    ///
+    /// One P-256 key, published as a `JsonWebKey2020` `publicKeyJwk` under
+    /// `authentication` and `assertionMethod`; no `publicKeyMultibase`, no
+    /// `keyAgreement`, no `service`; the Ed25519 update key kept out of the
+    /// document and recorded under its `did:key`; the P-256 key recorded under
+    /// the id the document gives it. Each of these is a rule the swiyu Base
+    /// Registry or wallet enforces, so a drift here is a DID swiyu refuses.
+    #[tokio::test]
+    async fn the_swiyu_verifier_template_mints_to_the_swiss_profile_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut template =
+            vta_sdk::did_templates::load_embedded("swiyu-verifier").expect("builtin loads");
+        // Stored under its own name so `create` resolves it as a global
+        // template — the same render path a built-in takes.
+        template.name = "swiyu-verifier-test".into();
+        let (did, document, keys_ks, log) = create_from_template(&dir, template).await;
+
+        let methods = document["verificationMethod"]
+            .as_array()
+            .expect("verificationMethod");
+        assert_eq!(methods.len(), 1, "exactly the verifier key: {document}");
+        let vm = &methods[0];
+        let vm_id = format!("{did}#verifier-key-1");
+        assert_eq!(vm["id"], vm_id);
+        assert_eq!(vm["type"], "JsonWebKey2020");
+        assert_eq!(vm["controller"], did);
+        assert!(vm.get("publicKeyMultibase").is_none(), "{vm}");
+        let jwk = &vm["publicKeyJwk"];
+        assert_eq!(jwk["kty"], "EC", "{jwk}");
+        assert_eq!(jwk["crv"], "P-256", "{jwk}");
+        assert_eq!(jwk["alg"], "ES256", "{jwk}");
+        assert!(jwk["x"].is_string() && jwk["y"].is_string(), "{jwk}");
+        assert!(jwk.get("d").is_none(), "a public JWK never carries d");
+
+        assert_eq!(document["authentication"], serde_json::json!([vm_id]));
+        assert_eq!(document["assertionMethod"], serde_json::json!([vm_id]));
+        // What the Base Registry validates is the log entry's `state` — the
+        // document as signed. (A did:webvh resolver adds the implicit `#files`
+        // and `#whois` services to its *view*; they are not in the log.)
+        let entry: serde_json::Value = serde_json::from_str(&log).expect("log entry JSON");
+        let state = &entry["state"];
+        assert_eq!(state["verificationMethod"], document["verificationMethod"]);
+        for forbidden in ["keyAgreement", "service", "alsoKnownAs", "@context"] {
+            assert!(
+                state.get(forbidden).is_none(),
+                "the profile forbids {forbidden} in the signed document: {state}"
+            );
+        }
+        // `portable: false` is an Anchor rule too. The helper asks for a
+        // portable DID, as `pnm` does by default; the template's
+        // `defaults.portable: false` is binding and wins.
+        assert_eq!(entry["parameters"]["portable"], serde_json::json!(false));
+        assert_eq!(document["profile_version"], "swiss-profile-anchor:1.0.0");
+
+        assert_eq!(
+            stored_key_type(&keys_ks, &vm_id).await,
+            vta_sdk::keys::KeyType::P256
+        );
+        // The update key: recorded, under the name the log gives it.
+        let records = operations::keys::list_keys(
+            &keys_ks,
+            &cli_super_admin(),
+            operations::keys::ListKeysParams {
+                cursor: None,
+                limit: Some(100),
+                status: None,
+                context_id: None,
+            },
+            "test",
+        )
+        .await
+        .expect("list keys");
+        let update = records
+            .keys
+            .iter()
+            .find(|k| k.key_id.starts_with("did:key:z6Mk"))
+            .expect("the update key is recorded under its did:key");
+        assert_eq!(update.key_type, vta_sdk::keys::KeyType::Ed25519);
+        assert!(
+            !records
+                .keys
+                .iter()
+                .any(|k| k.key_type == vta_sdk::keys::KeyType::X25519),
+            "no key-agreement key is recorded for a document that publishes none"
+        );
+    }
+
+    /// **A `did:webvh` primary signing key cannot be post-quantum, and the
+    /// preference list is how a template survives that.**
+    ///
+    /// `didwebvh` 1.0 mandates `eddsa-jcs-2022` for log-entry proofs, and the
+    /// primary signing key is what signs the log. So a template asking for
+    /// ML-DSA *first* falls back to the Ed25519 it also named — the same
+    /// behaviour as an algorithm this build could not mint, which is exactly
+    /// what a preference list is for.
+    ///
+    /// This is the constraint that makes the additional-slot shape the only
+    /// one available, rather than a convenience: post-quantum signing on a
+    /// `did:webvh` is a *second* key, never a replacement for the first.
+    #[tokio::test]
+    async fn a_webvh_primary_signing_key_falls_back_past_ml_dsa_to_ed25519() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (did, document, keys_ks, _log) =
+            create_from_template(&dir, pqc_template("pq-primary", vec!["mldsa44", "ed25519"]))
+                .await;
+
+        assert_eq!(
+            stored_key_type(&keys_ks, &format!("{did}#key-0")).await,
+            vta_sdk::keys::KeyType::Ed25519,
+            "a did:webvh log entry can only be signed with ed25519, so the primary slot must \
+             fall back to it rather than minting a key the log cannot be signed with"
+        );
+
+        // 32 bytes + the 2-byte multicodec prefix: an Ed25519 key, not the
+        // 1312-byte ML-DSA-44 one the template preferred.
+        let published = document["verificationMethod"][0]["publicKeyMultibase"]
+            .as_str()
+            .expect("publicKeyMultibase");
+        let (_, bytes) = multibase::decode(published).expect("decode");
+        assert_eq!(
+            bytes.len(),
+            34,
+            "expected an Ed25519 key, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    /// And the other half: a primary slot naming **only** post-quantum
+    /// algorithms is refused here, by name, rather than failing inside
+    /// `didwebvh-rs` with a message about that crate's build features.
+    ///
+    /// Silently substituting Ed25519 for a list that never mentioned it would
+    /// be the quiet downgrade the `keys` block exists to prevent — a template
+    /// authored to be post-quantum, minting classical, saying nothing.
+    #[tokio::test]
+    async fn a_primary_slot_with_no_classical_fallback_is_refused_with_guidance() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (config, _config_path) = setup_seeded_store(&dir, None).await;
+        let store = Store::open(&config.store).expect("open store");
+        let did_templates_ks = store.keyspace(crate::keyspaces::DID_TEMPLATES).unwrap();
+
+        let template = pqc_template("pq-only", vec!["mldsa44"]);
+        vta_support::did_templates::store_global_template(
+            &did_templates_ks,
+            &vta_sdk::did_templates::DidTemplateRecord {
+                template,
+                scope: vta_sdk::did_templates::Scope::Global,
+                created_at: 0,
+                updated_at: 0,
+                created_by: "test".into(),
+            },
+        )
+        .await
+        .expect("store template");
+
+        let err = run_create_from_stored_template(&config, &store, "pq-only")
+            .await
+            .expect_err("a webvh DID cannot have a post-quantum primary signing key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ed25519") && msg.contains("additional signing slot"),
+            "the refusal must say why and what to do instead, got: {msg}"
+        );
+    }
+
+    /// The fallback half of the same list: an algorithm this build cannot mint
+    /// is skipped, not fatal, and the next one wins. One template has to serve
+    /// a fleet mid-migration or the list means nothing.
+    #[tokio::test]
+    async fn a_classical_only_preference_still_mints_ed25519() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (did, _document, keys_ks, _log) =
+            create_from_template(&dir, pqc_template("classical", vec!["ed25519"])).await;
+
+        assert_eq!(
+            stored_key_type(&keys_ks, &format!("{did}#key-0")).await,
+            vta_sdk::keys::KeyType::Ed25519
+        );
+    }
+
+    /// **The whole point of the workstream: two signing keys on one DID.**
+    ///
+    /// A third slot is minted at its own derivation path, published as a second
+    /// `assertionMethod`, and stored under the id the document gives it. That
+    /// is what lets the holder sign a credential with both keys — one proof a
+    /// classical verifier checks, one a post-quantum verifier checks.
+    #[tokio::test]
+    async fn a_third_slot_mints_a_second_signing_key_and_publishes_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (did, document, keys_ks, _log) =
+            create_from_template(&dir, pqc_template("hybrid", vec!["ed25519"])).await;
+
+        // The classical key is untouched — it must be, since the VTC derives
+        // its storage, install-token and audit keys from this seed.
+        assert_eq!(
+            stored_key_type(&keys_ks, &format!("{did}#key-0")).await,
+            vta_sdk::keys::KeyType::Ed25519
+        );
+        assert_eq!(
+            stored_key_type(&keys_ks, &format!("{did}#key-2")).await,
+            vta_sdk::keys::KeyType::MlDsa44
+        );
+
+        // Published, not just minted. A key the document does not carry is
+        // invisible to every verifier, which is the failure `check_key_slots`
+        // refuses at authoring time and this confirms at mint time.
+        let pq_published = document["verificationMethod"][2]["publicKeyMultibase"]
+            .as_str()
+            .expect("the third slot must be published");
+        let (_, bytes) = multibase::decode(pq_published).expect("decode");
+        assert!(
+            bytes.len() > 1000,
+            "not an ML-DSA-44 key: {} bytes",
+            bytes.len()
+        );
+
+        assert_eq!(
+            document["assertionMethod"][1],
+            format!("{did}#key-2"),
+            "the post-quantum key must be an assertion method, or a credential cannot carry a \
+             proof from it"
+        );
+
+        // Separate derivation paths. Sharing one would make the second key a
+        // deterministic function of the first at that index — the cross-
+        // algorithm reuse `derive_ml_dsa_44`'s domain separation exists to
+        // prevent, reintroduced one layer up.
+        let primary = operations::keys::get_key(
+            &keys_ks,
+            &cli_super_admin(),
+            &format!("{did}#key-0"),
+            "test",
+        )
+        .await
+        .unwrap();
+        let pq = operations::keys::get_key(
+            &keys_ks,
+            &cli_super_admin(),
+            &format!("{did}#key-2"),
+            "test",
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            primary.derivation_path, pq.derivation_path,
+            "the two signing keys must not share a derivation path"
+        );
+    }
+
+    /// The same DID, minted with no `[messaging]` configured, must advertise
+    /// no DIDComm service — the VTA cannot serve a transport it has no
+    /// mediator for, and advertising one fails two layers down.
+    #[tokio::test]
+    async fn non_interactive_did_doc_omits_didcomm_without_messaging() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (_config, entry) = run_non_interactive_create(&dir, None).await;
+
+        let has_didcomm = entry
+            .get("state")
+            .and_then(|s| s.get("service"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|services| {
+                services
+                    .iter()
+                    .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("DIDCommMessaging"))
+            });
+        assert!(
+            !has_didcomm,
+            "no [messaging] configured, so nothing should advertise DIDComm"
+        );
+    }
+}

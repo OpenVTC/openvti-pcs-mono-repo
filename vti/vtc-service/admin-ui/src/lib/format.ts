@@ -1,0 +1,217 @@
+// Shared formatting helpers used across plugins.
+//
+// Each helper was previously duplicated in 3–5 plugin files with
+// minor variations (some `formatIso`, some `formatEpoch`, some hand-
+// rolled `shortDid`). Consolidating here keeps the on-screen
+// presentation consistent and gives reviewers one place to change
+// when the formatting needs to evolve.
+
+/**
+ * Truncate a long opaque identifier (DID, session id, JTI, hash) so
+ * it fits in a table cell while still letting an operator visually
+ * compare two values. Keeps the first `head` and last `tail`
+ * characters and joins with `…`. Returns the input unchanged when
+ * it's shorter than the would-be truncation overhead.
+ */
+export function shorten(value: string, head = 8, tail = 4): string {
+  if (value.length <= head + tail + 1) return value;
+  return `${value.slice(0, head)}…${value.slice(-tail)}`;
+}
+
+/**
+ * Abbreviate a DID for table display by shrinking the long opaque middle
+ * segment — the `did:webvh` SCID (a content hash) or a `did:key` multibase —
+ * while keeping the method prefix and, crucially, the **full tail** (the domain
+ * and human-readable path, e.g. `…:webvh.storm.ws:glenn-vta`), which is the part
+ * that actually identifies the agent. Unlike a CSS `text-overflow` ellipsis
+ * (which clips the *end*), this keeps the end visible. The full DID stays
+ * available via a `title` tooltip / copy.
+ *
+ * - `did:webvh:<scid>:<domain>…:<path>` → SCID abbreviated to `keep` chars + `…`,
+ *   everything after it kept verbatim.
+ * - `did:key:<multibase>` (and other 3-segment DIDs) → middle-truncate the id,
+ *   keeping `keep` head + 6 tail chars.
+ * - Non-DID input and already-short DIDs are returned unchanged.
+ *
+ * ## Kept in step with Rust
+ *
+ * `vta_sdk::display_name::shorten_did` is a port of this function, used by
+ * `pnm`, `cnm` and the `vtc` CLI. An operator moves between a terminal and
+ * this console looking at the same community; if the two abbreviate
+ * differently, every DID has to be re-identified on the way across.
+ *
+ * The vectors below are asserted in `shorten_did_matches_shared_vectors`
+ * (`vta-sdk/src/display_name/mod.rs`), which is the authority. Change either
+ * implementation and check both:
+ *
+ *   "alice"                                        -> "alice"
+ *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:webvh.storm.ws:glenn-vta"
+ *                          -> "did:webvh:QmXkAbCdEf…:…storm.ws:glenn-vta"
+ *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:dids.firstperson.dev:stem-wall"
+ *                          -> "did:webvh:QmXkAbCdEf…:…firstperson.dev:stem-wall"
+ *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:dids.ic3.dev:fruit-feel"
+ *                          -> "did:webvh:QmXkAbCdEf…:dids.ic3.dev:fruit-feel"
+ *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:firstperson.network:a:b"
+ *                          -> "did:webvh:QmXkAbCdEf…:firstperson.network:a:b"
+ *   "did:web:QmXkAbCdEfGhIjKlMnOp:example.com"
+ *                                    -> "did:web:QmXkAbCdEf…:example.com"
+ *   "did:webvh:Qm123:example.com"           -> "did:webvh:Qm123:example.com"
+ *   "did:key:z6MkfrQjWzPQrTuVwXyZaBcDeFgHiJkLmNoPqRsTuVwXyZ4rT"
+ *                                       -> "did:key:z6MkfrQjWz…XyZ4rT"
+ *   "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp?src=webvh.storm.ws/glenn-vta"
+ *                       -> "did:scid:vh:1:QmXkAbCdEf…?src=…storm.ws/glenn-vta"
+ *   "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp"   -> "did:scid:vh:1:QmXkAbCdEf…"
+ *   "did:scid:vh:1:Qm123?src=example.com"  -> "did:scid:vh:1:Qm123?src=example.com"
+ *   "did:key:z6MkfrQjWz"                       -> "did:key:z6MkfrQjWz"
+ *   "did:webvh:QmXkAbCdEfGhIjKlMnOpQrSt" -> "did:webvh:QmXkAbCdEf…OpQrSt"
+ */
+export function shortenDid(did: string, keep = 10): string {
+  return shortenDidKeep(did, keep);
+}
+
+/** Hosts up to this many characters are shown whole. */
+const HOST_KEEP = 12;
+
+/** A host longer than `HOST_KEEP` with subdomains keeps its last two labels. */
+function shortenHost(host: string): string {
+  const labels = host.split(".");
+  return labels.length > 2 && host.length > HOST_KEEP ? `…${labels.slice(-2).join(".")}` : host;
+}
+
+function shortenDidKeep(did: string, keep: number): string {
+  if (!did.startsWith("did:")) return did;
+  // did:scid:vh:1:<scid>[?src=<host>[/<path>]] — the SCID abbreviated like a
+  // did:webvh's, and the `src` host like its host, the path kept.
+  if (did.startsWith("did:scid:vh:1:")) {
+    const rest = did.slice("did:scid:vh:1:".length);
+    const at = rest.indexOf("?src=");
+    const scid = at < 0 ? rest : rest.slice(0, at);
+    let out = "did:scid:vh:1:" + (scid.length > keep + 1 ? `${scid.slice(0, keep)}…` : scid);
+    if (at >= 0) {
+      const src = rest.slice(at + "?src=".length);
+      const slash = src.indexOf("/");
+      const host = slash < 0 ? src : src.slice(0, slash);
+      out += `?src=${shortenHost(host)}${slash < 0 ? "" : src.slice(slash)}`;
+    }
+    return out;
+  }
+  const parts = did.split(":");
+  if ((parts[1] === "webvh" || parts[1] === "web") && parts.length > 3) {
+    const scid = parts[2] ?? "";
+    if (scid.length > keep + 1) {
+      parts[2] = `${scid.slice(0, keep)}…`;
+    }
+    // The path tells two DIDs on one host apart, so a long host gives up its
+    // subdomains first (`webvh.storm.ws` → `…storm.ws`).
+    if (parts[1] === "webvh") parts[3] = shortenHost(parts[3] ?? "");
+    return parts.join(":");
+  }
+  // did:key and other `did:<method>:<id>` shapes: the id carries no human tail,
+  // so keep head + tail to aid visual comparison.
+  const id = parts.slice(2).join(":");
+  if (id.length > keep + 7) {
+    return `${parts[0]}:${parts[1]}:${id.slice(0, keep)}…${id.slice(-6)}`;
+  }
+  return did;
+}
+
+/**
+ * How every timestamp is shown (#2613). Dates as "Nov 12, 2026"; a moment as
+ * "Nov 12, 2026, 3:00 PM GMT+1" — always with its zone, since administrators
+ * in different zones approve the same action before the same deadline, and a
+ * bare "3:00 PM" does not say whose. Component options, not `dateStyle` /
+ * `timeStyle`, which cannot be combined with `timeZoneName`.
+ */
+const DATE_OPTIONS: Intl.DateTimeFormatOptions = { year: "numeric", month: "short", day: "numeric" };
+const DATE_TIME_OPTIONS: Intl.DateTimeFormatOptions = {
+  ...DATE_OPTIONS,
+  hour: "numeric",
+  minute: "2-digit",
+  timeZoneName: "short",
+};
+
+/** A timestamp as a `Date`: an RFC3339 string, epoch milliseconds or a
+ *  `Date`. `null` when it does not parse — `new Date("x")` does not throw, it
+ *  is an Invalid Date that formats as the string "Invalid Date". */
+export function parseTime(value: string | number | Date): Date | null {
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** A day: "Nov 12, 2026". An unparseable input is returned as given. */
+export function formatDate(value: string | number | Date): string {
+  const d = parseTime(value);
+  return d ? d.toLocaleDateString(undefined, DATE_OPTIONS) : String(value);
+}
+
+/** A moment, with its time zone: "Nov 12, 2026, 3:00 PM GMT+1". An
+ *  unparseable input is returned as given. */
+export function formatDateTime(value: string | number | Date): string {
+  const d = parseTime(value);
+  return d ? d.toLocaleString(undefined, DATE_TIME_OPTIONS) : String(value);
+}
+
+/**
+ * Format an RFC3339 / ISO-8601 timestamp as a moment, with its zone
+ * (`formatDateTime`). Used for `joinedAt`, `created_at`, `activated_at`,
+ * audit envelope timestamps, etc. Falls back to the raw input on
+ * parse failure so the cell never goes blank (or reads "Invalid Date").
+ */
+export function formatIso(iso: string): string {
+  return formatDateTime(iso);
+}
+
+/**
+ * How long ago an RFC3339 timestamp was, the way a person says it: "just
+ * now", "5 min ago", "2 h ago", "yesterday", "3 days ago"; past a week, the
+ * date. For lists scanned at a glance (the dashboard's "Waiting for you");
+ * the full timestamp belongs in a `title` beside it. A future time reads "just
+ * now" (clock skew), an unparseable one is returned as given.
+ */
+export function formatRelative(iso: string, now: number = Date.now()): string {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return iso;
+  const seconds = Math.max(0, Math.floor((now - at) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return "yesterday";
+  if (days < 7) return `${days} days ago`;
+  return formatDate(at);
+}
+
+/**
+ * Format an elapsed duration in seconds as a compact age (`45s`, `12m`,
+ * `3h 20m`, `2d 4h`).
+ *
+ * Used for staleness — "how long has the oldest sync job been waiting" — where
+ * the operator's question is scale, not precision: a queue 3 hours behind and
+ * one 3 hours and 12 minutes behind call for the same action. Seconds are shown
+ * only under a minute, where they are the whole signal.
+ */
+export function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    const rem = minutes % 60;
+    return rem ? `${hours}h ${rem}m` : `${hours}h`;
+  }
+  const days = Math.floor(hours / 24);
+  const rem = hours % 24;
+  return rem ? `${days}d ${rem}h` : `${days}d`;
+}
+
+/**
+ * Format a Unix-seconds epoch (i.e. `seconds since 1970-01-01 UTC`)
+ * into the operator's locale-string. Used by session / ACL rows
+ * that carry epochs rather than ISO strings.
+ */
+export function formatEpoch(epoch: number): string {
+  return Number.isFinite(epoch) ? formatDateTime(epoch * 1000) : String(epoch);
+}

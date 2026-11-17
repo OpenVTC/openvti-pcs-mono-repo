@@ -1,0 +1,1969 @@
+//! End-to-end orchestration of [`update_did_webvh`].
+//!
+//! Stages: SCID lookup → auth gate → input validation → load chain →
+//! optimistic-concurrency precondition → derive new keys → resolve
+//! signing key (pre-rotation aware) → call `didwebvh_rs::update_did`
+//! → CAS check → persist log + handles → publish to host → audit.
+
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+use chrono::Utc;
+use didwebvh_rs::log_entry::LogEntryMethods;
+use didwebvh_rs::multibase_type::Multibase;
+use didwebvh_rs::update::{UpdateDIDConfig, update_did};
+use vta_support::version_time::next_version_time;
+
+use super::errors::UpdateDidWebvhError;
+use super::keys::{
+    derive_secret_for_handle, install_derived_webvh_keys, load_active_update_key,
+    load_pre_rotation_signing_key, peek_webvh_keys,
+};
+use super::options::{UpdateDidWebvhOptions, UpdateDidWebvhResult};
+use super::plan::UpdatePlan;
+use super::scid_alias;
+use super::state::{find_record_by_scid, state_from_jsonl, state_to_jsonl};
+use super::validate::{validate_document_for_update, validate_watchers, validate_witnesses};
+use crate::audit;
+use crate::auth::AuthClaims;
+use crate::keys::paths::peek_path_counter;
+use crate::operations::did_webvh::concurrency::{DID_UPDATE_LOCKS, RecordSnapshot};
+use crate::operations::did_webvh::webvh_keys::{self, WebvhKeyHandle, WebvhKeyRole};
+use crate::webvh_store;
+
+/// Plan an update without performing it: run the real path up to — and not
+/// through — its first write, and report what it *would* do.
+///
+/// This exists so a human can be shown the consequences of an update before
+/// authorizing it. It must be the same code as the update itself: a separate
+/// implementation that described the update would drift, and a drifted
+/// description is worse than none, because it misinforms with a straight face.
+///
+/// Read-only. In particular the key derivation *peeks* the BIP-32 path counter
+/// rather than allocating from it — allocating here would both burn an index
+/// and, far worse, cause the subsequent real run to derive a **different** key
+/// than the one reported, which is exactly the deception the plan exists to
+/// prevent. Because a peek reserves nothing, the plan carries
+/// [`UpdatePlan::path_counter_pin`], and a caller that acts on the plan must
+/// re-check it.
+pub async fn plan_did_webvh_update(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    scid: &str,
+    opts: UpdateDidWebvhOptions,
+) -> Result<UpdatePlan, UpdateDidWebvhError> {
+    match run_update(
+        deps,
+        auth,
+        scid,
+        opts,
+        None,
+        "plan",
+        Mode::Plan,
+        PublishTarget::DidLog,
+        &mut Commit::NotCommitted,
+        None,
+    )
+    .await?
+    {
+        Outcome::Planned(plan) => Ok(plan),
+        Outcome::Executed(_) => Err(UpdateDidWebvhError::Library(
+            "plan mode committed an update".into(),
+        )),
+    }
+}
+
+/// Drive a webvh DID update end-to-end. See module docs.
+///
+/// - `vta_did` — the running VTA's DID (read from `AppConfig::vta_did` at the
+///   call site). `None` means "no VTA identity configured" — server-managed DID
+///   publishes fail loudly with `Publish("…")` rather than silently 401.
+pub async fn update_did_webvh(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    scid: &str,
+    opts: UpdateDidWebvhOptions,
+    vta_did: Option<&str>,
+    channel: &str,
+) -> Result<UpdateDidWebvhResult, UpdateDidWebvhError> {
+    match run_update(
+        deps,
+        auth,
+        scid,
+        opts,
+        vta_did,
+        channel,
+        Mode::Execute,
+        PublishTarget::DidLog,
+        &mut Commit::NotCommitted,
+        None,
+    )
+    .await?
+    {
+        Outcome::Executed(result) => Ok(result),
+        Outcome::Planned(_) => Err(UpdateDidWebvhError::Library(
+            "execute mode returned a plan".into(),
+        )),
+    }
+}
+
+/// Whether an update reached its commit point — the local log write — before
+/// it returned. Everything before that point is read-only; everything after it
+/// (handle installs, the record, the publish) can fail with the new entry
+/// already the DID's local head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commit {
+    /// Nothing was written: the DID's log is as it was.
+    NotCommitted,
+    /// The new log entry is the DID's local head, whatever failed after it.
+    Committed,
+}
+
+/// Work that must follow the local log write once that write has started,
+/// whether or not anyone is still waiting for the update.
+///
+/// The log write and this work run together in one spawned task, so dropping
+/// the request future (a client that disconnects, a transport timeout) after
+/// the write was issued cannot stop between the two: the store's blocking
+/// write finishes on its own, and without this the state the caller staged for
+/// the new entry would be left behind with nothing to finish it. It runs only
+/// when the write succeeds, and its error is reported as
+/// [`Commit::Committed`].
+pub(super) type OnCommit = Box<
+    dyn FnOnce() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), UpdateDidWebvhError>> + Send>,
+        > + Send,
+>;
+
+/// [`update_did_webvh`], reporting on failure whether the new entry was
+/// committed.
+///
+/// For a caller that tells an operator what a failed update left behind. A
+/// `Publish` error alone does not say: the reconcile step re-publishes an
+/// unconfirmed head *before* the commit point, so the same variant arrives
+/// both when nothing new was written and when the new entry is the local head.
+pub async fn update_did_webvh_reporting_commit(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    scid: &str,
+    opts: UpdateDidWebvhOptions,
+    vta_did: Option<&str>,
+    channel: &str,
+) -> Result<UpdateDidWebvhResult, (UpdateDidWebvhError, Commit)> {
+    update_did_webvh_tracked(deps, auth, scid, opts, vta_did, channel, None).await
+}
+
+/// [`update_did_webvh`], reporting on failure whether the new entry was
+/// committed. A caller that staged state for the update (rotate-keys' key
+/// records) passes the work that must follow the commit as `on_commit` (see
+/// [`OnCommit`]); on an error it may discard what it staged only when the
+/// entry was not committed — an error alone does not say which.
+pub(super) async fn update_did_webvh_tracked(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    scid: &str,
+    opts: UpdateDidWebvhOptions,
+    vta_did: Option<&str>,
+    channel: &str,
+    on_commit: Option<OnCommit>,
+) -> Result<UpdateDidWebvhResult, (UpdateDidWebvhError, Commit)> {
+    let mut commit = Commit::NotCommitted;
+    match run_update(
+        deps,
+        auth,
+        scid,
+        opts,
+        vta_did,
+        channel,
+        Mode::Execute,
+        PublishTarget::DidLog,
+        &mut commit,
+        on_commit,
+    )
+    .await
+    {
+        Ok(Outcome::Executed(result)) => Ok(result),
+        Ok(Outcome::Planned(_)) => Err((
+            UpdateDidWebvhError::Library("execute mode returned a plan".into()),
+            commit,
+        )),
+        Err(e) => Err((e, commit)),
+    }
+}
+
+/// Which agent-name operation [`agent_name_op`] performs.
+///
+/// The four verbs share one document-level behaviour — claim the name in
+/// `alsoKnownAs` or drop it — and differ in the registry effect the host
+/// applies. `claims_name` mirrors did-hosting's own
+/// `AgentNameOp::requires_claim` exactly; if the two ever disagree the host
+/// rejects the submitted document with `also_known_as_mismatch`, which is the
+/// invariant keeping the served state and the signed document from diverging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentNameVerb {
+    /// Bind the name to this DID.
+    Set,
+    /// Release the name for anyone to reclaim.
+    Remove,
+    /// Resume serving a parked name.
+    Enable,
+    /// Park the name: stops resolving, stays reserved to this DID.
+    Disable,
+}
+
+impl AgentNameVerb {
+    /// The verb's own name — operator-facing labels, logs, and the
+    /// `agent-name/{verb}/0.1` Trust Task the VTA *serves* to its clients.
+    ///
+    /// Deliberately not the host wire name: did-hosting collapsed
+    /// set/enable/disable into one declarative task (see [`Self::host_endpoint`]),
+    /// but the VTA's own inbound surface still has four verbs, and an operator
+    /// asking to park a name should see "disable", not "update".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Remove => "remove",
+            Self::Enable => "enable",
+            Self::Disable => "disable",
+        }
+    }
+
+    /// The host's endpoint segment / task verb — `POST /api/agent-names/{op}`
+    /// and `did-management/agent-name/{op}/0.1`.
+    ///
+    /// did-hosting 0.8.3 retired the `set` / `enable` / `disable` trio in
+    /// favour of one declarative `update` carrying [`Self::host_state`]
+    /// (affinidi-webvh-service#144). Three of our four verbs are therefore the
+    /// same host operation distinguished only by the desired state; `remove`
+    /// stays its own destructive task. Sending the retired names cost the
+    /// caller a silent 30s timeout on DIDComm and a 404 on REST, because the
+    /// host's DIDComm fallback drops an unrouted type without replying.
+    pub fn host_endpoint(self) -> &'static str {
+        match self {
+            Self::Set | Self::Enable | Self::Disable => "update",
+            Self::Remove => "remove",
+        }
+    }
+
+    /// The `state` field on `agent-name/update/0.1` — `None` for `remove`,
+    /// which carries no state.
+    ///
+    /// `active` and `parked` are the two values of did-hosting's
+    /// `AgentNameState`; they align with [`Self::claims_name`] by
+    /// construction, since a name is served exactly when the document claims
+    /// it.
+    pub fn host_state(self) -> Option<&'static str> {
+        match self {
+            Self::Set | Self::Enable => Some("active"),
+            Self::Disable => Some("parked"),
+            Self::Remove => None,
+        }
+    }
+
+    /// Whether the published document must claim the name.
+    pub fn claims_name(self) -> bool {
+        matches!(self, Self::Set | Self::Enable)
+    }
+}
+
+/// Resolve a hosted DID to `(record, server, domain)` for the read-only
+/// agent-name operations. Shares `agent_name_op`'s preconditions — the DID
+/// must exist, must not be serverless, and must have a resolvable host — so
+/// the read and write paths agree about which DIDs have agent names at all.
+///
+/// Enforces `require_context` like every other per-DID read
+/// (`get_did_webvh`, `get_did_webvh_log`). These reads are not public: the
+/// registry exposes *parked* names, which are deliberately absent from the
+/// published document, and `check` is a probe against the host. Neither is
+/// inferable from the DID log, so neither may be readable across contexts.
+async fn hosted_agent_name_context(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+) -> Result<
+    (
+        vta_sdk::webvh::WebvhDidRecord,
+        vta_sdk::webvh::WebvhServerRecord,
+        String,
+    ),
+    UpdateDidWebvhError,
+> {
+    let record = find_record_by_scid(deps.webvh_ks, did)
+        .await?
+        .ok_or_else(|| UpdateDidWebvhError::NotFound(format!("DID {did} not found")))?;
+
+    // Forbidden and NotFound both surface as 404, so this does not tell an
+    // unauthorized caller that the DID exists.
+    auth.require_context(&record.context_id)
+        .map_err(|e| UpdateDidWebvhError::Forbidden(e.to_string()))?;
+
+    if record.server_id == "serverless" {
+        // `InvalidDocument`, not `Publish`. `Publish` renders as
+        // `internalError` with `retryable: true`, which tells the producer to
+        // send the identical request again — and it will fail identically every
+        // time, because a serverless DID does not become hosted by waiting. The
+        // caller has to register it with a server first, which is an action, not
+        // a delay.
+        return Err(UpdateDidWebvhError::InvalidDocument(
+            "agent names require a hosted DID; this DID is serverless \
+             (register it with a server first)"
+                .to_string(),
+        ));
+    }
+
+    let server = webvh_store::get_server(deps.webvh_ks, &record.server_id)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_server: {e}")))?
+        .ok_or_else(|| {
+            UpdateDidWebvhError::Publish(format!(
+                "webvh server `{}` referenced by DID is missing",
+                record.server_id
+            ))
+        })?;
+
+    let domain = domain_from_webvh_did(&record.did).ok_or_else(|| {
+        UpdateDidWebvhError::Library(format!("cannot derive domain from DID {}", record.did))
+    })?;
+
+    Ok((record, server, domain))
+}
+
+/// Read a hosted DID's agent-name registry from the control plane.
+///
+/// The control plane is the source of record for agent names, and this is a
+/// live read of it — not a projection of the local DID record. That matters
+/// for one case in particular: a **parked** name is deliberately absent from
+/// the DID document (dropping the `alsoKnownAs` claim is *how* parking stops
+/// it resolving), so nothing derived from the document can show one. Without
+/// this call a client cannot offer "resume" without making the user retype
+/// the name from memory.
+pub async fn list_agent_names(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    vta_did: Option<&str>,
+) -> Result<(String, Vec<crate::webvh_host::AgentNameEntry>), UpdateDidWebvhError> {
+    let (record, server, domain) = hosted_agent_name_context(deps, auth, did).await?;
+    let vta_did = vta_did.ok_or_else(|| {
+        UpdateDidWebvhError::Library("no VTA DID configured for hosting auth".to_string())
+    })?;
+
+    let names = super::super::list_agent_names_on_server(
+        deps,
+        vta_did,
+        &server,
+        &record.mnemonic,
+        Some(&domain),
+    )
+    .await
+    .map_err(|e| UpdateDidWebvhError::publish_failed("list_agent_names", e))?;
+
+    Ok((record.did, names))
+}
+
+/// Ask the host whether `name` is free on this DID's domain.
+///
+/// Availability is domain-scoped, and the domain is the DID's own host — the
+/// same rule the mutating verbs follow. Answering this *before* the caller
+/// signs a new DID version is the point: otherwise the only way to discover a
+/// collision is to publish and have the bind rejected.
+pub async fn check_agent_name(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    name: &str,
+    vta_did: Option<&str>,
+) -> Result<crate::webvh_host::AgentNameAvailability, UpdateDidWebvhError> {
+    let (_record, server, domain) = hosted_agent_name_context(deps, auth, did).await?;
+    let vta_did = vta_did.ok_or_else(|| {
+        UpdateDidWebvhError::Library("no VTA DID configured for hosting auth".to_string())
+    })?;
+
+    super::super::check_agent_name_on_server(deps, vta_did, &server, name, Some(&domain))
+        .await
+        .map_err(|e| UpdateDidWebvhError::publish_failed("check_agent_name", e))
+}
+
+/// Bind, release, park or resume an agent name (`/@alice`) on a hosted webvh
+/// DID.
+///
+/// Reads the DID's current document, edits its `alsoKnownAs` to claim
+/// (`set`/`enable`) or no-longer-claim (`remove`/`disable`)
+/// `https://<domain>/@<name>`, then runs the *same* signing path as an update
+/// and submits the new version to the host's `agent-name/{op}` endpoint —
+/// which republishes it AND applies the registry change atomically.
+///
+/// Binding through `set` rather than a plain `dids/update` with an edited
+/// `alsoKnownAs` is deliberate: the host's `set` endpoint enforces the
+/// reserved-name and already-taken checks, so a collision comes back as
+/// `name_taken` / `name_reserved` instead of a bind that appears to succeed.
+///
+/// `did` may be a full `did:webvh:…` or a bare SCID. Refused for serverless
+/// DIDs (no host serves their names).
+pub async fn agent_name_op(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    name: &str,
+    verb: AgentNameVerb,
+    vta_did: Option<&str>,
+    channel: &str,
+) -> Result<UpdateDidWebvhResult, UpdateDidWebvhError> {
+    let record = find_record_by_scid(deps.webvh_ks, did)
+        .await?
+        .ok_or_else(|| UpdateDidWebvhError::NotFound(format!("DID {did} not found")))?;
+
+    if record.server_id == "serverless" {
+        return Err(UpdateDidWebvhError::Publish(
+            "agent names require a hosted DID; this DID is serverless \
+             (register it with a server first)"
+                .to_string(),
+        ));
+    }
+
+    let did_log = webvh_store::get_did_log(deps.webvh_ks, &record.did)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_did_log: {e}")))?
+        .ok_or_else(|| {
+            UpdateDidWebvhError::NotFound(format!("no did.jsonl stored for {}", record.did))
+        })?;
+    let mut document =
+        crate::operations::protocol::document::current_document_from_log(&did_log)
+            .map_err(|e| UpdateDidWebvhError::Library(format!("read current document: {e}")))?;
+
+    let domain = domain_from_webvh_did(&record.did).ok_or_else(|| {
+        UpdateDidWebvhError::Library(format!("cannot derive domain from DID {}", record.did))
+    })?;
+    edit_agent_name(&mut document, &domain, name, verb.claims_name());
+
+    let opts = UpdateDidWebvhOptions {
+        document: Some(document),
+        label: Some(format!("agent-name/{}", verb.as_str())),
+        ..Default::default()
+    };
+
+    match run_update(
+        deps,
+        auth,
+        &record.scid,
+        opts,
+        vta_did,
+        channel,
+        Mode::Execute,
+        PublishTarget::AgentName {
+            name: name.to_string(),
+            verb,
+        },
+        &mut Commit::NotCommitted,
+        None,
+    )
+    .await?
+    {
+        Outcome::Executed(result) => Ok(result),
+        Outcome::Planned(_) => Err(UpdateDidWebvhError::Library(
+            "execute mode returned a plan".into(),
+        )),
+    }
+}
+
+/// Extract the hosting domain (host authority) from a
+/// `did:webvh:{scid}:{host}:…` identifier, percent-decoding an encoded port
+/// (`localhost%3A8534` → `localhost:8534`). `None` if the shape is unexpected.
+fn domain_from_webvh_did(did: &str) -> Option<String> {
+    let rest = did.strip_prefix("did:webvh:")?;
+    let host = rest.split(':').nth(1)?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.replace("%3A", ":").replace("%3a", ":"))
+}
+
+/// Edit a DID document's `alsoKnownAs` to claim (`claim`) or drop (`!claim`)
+/// the agent name `https://<domain>/@<name>`. Idempotent.
+fn edit_agent_name(document: &mut serde_json::Value, domain: &str, name: &str, claim: bool) {
+    let entry = format!("https://{domain}/@{name}");
+    let Some(obj) = document.as_object_mut() else {
+        return;
+    };
+    if claim {
+        let arr = obj
+            .entry("alsoKnownAs")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(list) = arr.as_array_mut()
+            && !list.iter().any(|v| is_agent_name(v, domain, name))
+        {
+            list.push(serde_json::Value::String(entry));
+        }
+    } else if let Some(serde_json::Value::Array(list)) = obj.get_mut("alsoKnownAs") {
+        list.retain(|v| !is_agent_name(v, domain, name));
+        if list.is_empty() {
+            obj.remove("alsoKnownAs");
+        }
+    }
+}
+
+/// Whether a JSON value is the agent name `<name>` on `<domain>` (host match
+/// case-insensitive; local part exact, per the spec's case-sensitive rule).
+fn is_agent_name(v: &serde_json::Value, domain: &str, name: &str) -> bool {
+    let Some(s) = v.as_str() else {
+        return false;
+    };
+    let no_scheme = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let Some((host, rest)) = no_scheme.split_once("/@") else {
+        return false;
+    };
+    let local = rest.split('/').next().unwrap_or("");
+    host.eq_ignore_ascii_case(domain) && local == name
+}
+
+/// Whether [`run_update`] stops at the last read or goes on to commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Plan,
+    Execute,
+}
+
+enum Outcome {
+    Planned(UpdatePlan),
+    Executed(UpdateDidWebvhResult),
+}
+
+/// Where [`run_update`]'s freshly-signed log gets published (Execute mode).
+///
+/// Both variants publish the *same* signed `did.jsonl` a normal update
+/// produces; they differ only in which host endpoint receives it. Agent-name
+/// ops build the mutated document (`alsoKnownAs` edited) and pass it as
+/// `opts.document`, so the signing path is byte-for-byte the update path.
+enum PublishTarget {
+    /// `PUT /api/dids/{mnemonic}` — every plain document update.
+    DidLog,
+    /// `POST /api/agent-names/{set,remove,enable,disable}` — the host
+    /// republishes the log AND applies the registry change in one commit.
+    AgentName { name: String, verb: AgentNameVerb },
+}
+
+/// Is a caller whose `expectedVersionId` differs from our local head merely
+/// reading a host we failed to publish to — rather than being stale?
+///
+/// See the commentary at step 4a in [`run_update`]. Extracted so the rule can
+/// be pinned exhaustively: it decides whether an optimistic-concurrency
+/// refusal is real, and getting it wrong in either direction is costly. Too
+/// strict wedges a DID forever (the reconciler that heals the divergence sits
+/// *below* the check that refuses); too loose silently drops the lost-update
+/// protection.
+///
+/// - `hosted` — false for serverless DIDs, where the local head is the only
+///   truth and any mismatch really is a stale caller.
+/// - `caller_read_a_real_version` — `expected` names an entry in our own
+///   chain, so the caller read a genuine past state rather than inventing one.
+/// - `confirmed` — the last version we know reached the host. `None` counts as
+///   "nothing published beyond": this marker is written only on a successful
+///   publish, so a genuine concurrent update would have set it, and its
+///   absence alongside a moved head means a publish that never landed.
+fn caller_is_merely_ahead_of_an_unpublished_head(
+    hosted: bool,
+    caller_read_a_real_version: bool,
+    confirmed: Option<&str>,
+    expected: &str,
+) -> bool {
+    if !hosted || !caller_read_a_real_version {
+        return false;
+    }
+    match confirmed {
+        None => true,
+        Some(c) => c == expected,
+    }
+}
+
+async fn run_update(
+    deps: &super::super::WebvhDeps<'_>,
+    auth: &AuthClaims,
+    scid: &str,
+    opts: UpdateDidWebvhOptions,
+    vta_did: Option<&str>,
+    channel: &str,
+    mode: Mode,
+    publish: PublishTarget,
+    commit: &mut Commit,
+    on_commit: Option<OnCommit>,
+) -> Result<Outcome, UpdateDidWebvhError> {
+    // Re-bind the bundled deps to the historical local names so the (large) body
+    // below is unchanged. All fields are `Copy` references — this copies the
+    // borrows out of `*deps`; `deps` itself stays usable (the publish step below
+    // forwards it to `publish_log_to_server`).
+    let super::super::WebvhDeps {
+        keys_ks,
+        contexts_ks,
+        webvh_ks,
+        audit,
+        seed_store,
+        did_resolver,
+        ..
+    } = *deps;
+    // 1. Resolve SCID → record. Snapshot the version-vector fields
+    //    immediately. The snapshot is consulted just before the
+    //    final store (step 11) to catch any concurrent record
+    //    mutation — not just log_entry_count changes (which this
+    //    op makes itself) but `server_id` / `updated_at` changes
+    //    too, since a concurrent `register_did_with_server` flipping
+    //    `server_id` from `serverless` → `webvh-prod` is a real
+    //    race that the previous ad-hoc `log_entry_count` check
+    //    silently missed.
+    let record = find_record_by_scid(webvh_ks, scid)
+        .await?
+        .ok_or_else(|| UpdateDidWebvhError::NotFound(format!("SCID {scid} not found")))?;
+    // The head as it stood before we queued. Compared against the reload
+    // below to bound what the lock is allowed to hide — see the stale-document
+    // check that follows.
+    let head_before_lock = record.log_entry_count;
+    // Serialise the entire append path for one DID. The wait in
+    // `next_version_time` is inside this guard, so a queued update re-reads
+    // the first update's committed head before choosing its own timestamp.
+    // Plans stay lock-free because they perform no writes and advertise no
+    // reservation; execution re-checks its derivation-counter pin below.
+    let _update_guard = match mode {
+        Mode::Plan => None,
+        Mode::Execute => Some(DID_UPDATE_LOCKS.acquire(&record.did).await),
+    };
+    // The initial read identifies the lock key. Reload after acquiring it: a
+    // preceding holder may have appended while this request was waiting.
+    let mut record = match mode {
+        Mode::Plan => record,
+        Mode::Execute => webvh_store::get_did(webvh_ks, &record.did)
+            .await
+            .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_did: {e}")))?
+            .ok_or_else(|| {
+                UpdateDidWebvhError::NotFound(format!(
+                    "DID {} disappeared while waiting to update",
+                    record.did
+                ))
+            })?,
+    };
+    // The lock must not widen the window `RecordSnapshot` covers.
+    //
+    // `document` is a whole replacement, built by the caller from a head it
+    // read earlier — `agent_name_op` above, and every
+    // `operations::protocol::*` service patcher, do exactly that. Before the
+    // lock existed, a queued caller captured its snapshot at the *old*
+    // `log_entry_count` and step 11 refused it. Now the reload above re-bases
+    // the snapshot on the newer head, so step 11 would pass and the stale
+    // document would silently replace whatever the first caller had just
+    // written — turning a conflict the operator sees into a lost edit nobody
+    // does. `concurrency`'s module docs are explicit that false positives beat
+    // silent overwrites.
+    //
+    // So refuse here instead, restoring exactly the pre-lock guarantee. Only
+    // when the caller supplied no `expected_version_id`: if they did, the
+    // precondition at step 4a governs, and it knows about the
+    // unpublished-head heal path this check does not. Updates that carry no
+    // replacement document (key rotation, witnesses, watchers, ttl) are
+    // unaffected — they compose onto whatever head they find, which is the
+    // serialisation the lock exists to provide.
+    if mode == Mode::Execute
+        && opts.document.is_some()
+        && opts.expected_version_id.is_none()
+        && record.log_entry_count != head_before_lock
+    {
+        return Err(UpdateDidWebvhError::Conflict(format!(
+            "DID {} moved from {head_before_lock} to {} log entries while this update \
+             waited its turn, and the supplied document was built from the older \
+             version — applying it would discard the intervening change. Re-read the \
+             DID document, re-apply the edit, and send it with `expectedVersionId` set \
+             to the version you read.",
+            record.did, record.log_entry_count
+        )));
+    }
+    // `scid` may arrive as a full `did:webvh:…` (the delegated-update path,
+    // `trust_tasks/webvh.rs`) or as a bare SCID (the CLI path). `find_record_by_scid`
+    // accepts either form for lookup, but the `webvh_keys` handle keyspace is
+    // ALWAYS keyed by the canonical bare SCID (`record.scid`). Keying it off the
+    // raw argument bifurcates the keyspace — a DID updated via one path installs
+    // its handles under a prefix the other path can't find, so the DID becomes
+    // un-updatable that way (#659 regression). Canonicalize the identifier here so
+    // every `webvh_keys` op below (load/install/supersede) and every derived DID
+    // string uses the SCID, whichever caller we came from.
+    let canonical_scid = record.scid.clone();
+    let scid = canonical_scid.as_str();
+    let initial_log_entry_count = record.log_entry_count;
+    let snapshot = RecordSnapshot::capture(&record);
+
+    // 2. Auth gate. Forbidden + NotFound both surface as 404 at the
+    //    wire boundary — see `From<UpdateDidWebvhError> for AppError`.
+    //
+    // `require_admin` always holds: only an admin (of *some* context) may
+    // propose an update at all. `require_context` is the per-DID authority. In
+    // Execute mode it is mandatory — but note the caller may have widened `auth`
+    // for this one dispatch via a consented delegation
+    // (`AuthClaims::with_delegated_contexts`), so a requester who lacked the
+    // context on their own token passes here iff an approver conferred it.
+    //
+    // In Plan mode the check is *recorded, not enforced*: the plan is a
+    // read-only dry-run whose only outputs are the DID-document diff (public —
+    // webvh logs resolve for anyone) and a reserving-nothing key-counter peek.
+    // Letting it run for a context the requester can't self-authorize is what
+    // lets the consent gate show an approver the effects of a delegated update
+    // *before* anyone holds the authority to commit it. Whether the requester
+    // self-authorized rides out on `UpdatePlan.requester_authorized` so the gate
+    // knows to demand a context-admin approver.
+    // Whether the caller can authorize this update on its **own standing** —
+    // admin role AND access to the DID's context. In Execute mode `auth` may
+    // already have been widened for this one dispatch by a consented delegation
+    // (`AuthClaims::with_delegated_authority`, which confers *both* admin and the
+    // context), so a requester that held neither on its own token passes here iff
+    // an approver conferred them. This is what lets a purely unprivileged agent
+    // execute a task an approver blessed.
+    let requester_authorized =
+        auth.require_admin().is_ok() && auth.has_context_access(&record.context_id);
+    match mode {
+        // A dry-run reveals only the public DID-document diff and reserves
+        // nothing, so any known (Reader+) principal may run it to surface the
+        // effects a consent surface must show — including for a context the
+        // caller cannot self-authorize. That is precisely how the consent gate
+        // shows an approver a delegated update before anyone holds the authority
+        // to commit it. `requester_authorized` still rides out on
+        // `UpdatePlan.requester_authorized` so the gate knows to demand a
+        // conferring approver.
+        Mode::Plan => auth.require_read().map_err(|e| {
+            UpdateDidWebvhError::Forbidden(format!("read access required to plan an update: {e}"))
+        })?,
+        Mode::Execute if !requester_authorized => {
+            return Err(UpdateDidWebvhError::Forbidden(format!(
+                "caller is not authorized to update DIDs in context `{}`, and no consented delegation conferred it",
+                record.context_id
+            )));
+        }
+        Mode::Execute => {}
+    }
+
+    // 3. Validate caller-supplied inputs (cheap; do before key derivation).
+    let mut new_doc = match opts.document {
+        Some(doc) => Some(validate_document_for_update(doc, &record.did)?),
+        None => None,
+    };
+    if let Some(ref w) = opts.witnesses {
+        validate_witnesses(w, did_resolver).await?;
+    }
+    if let Some(ref watch) = opts.watchers {
+        validate_watchers(watch)?;
+    }
+
+    // 4. Load DID log → DIDWebVHState; validate the chain.
+    let did_log = webvh_store::get_did_log(webvh_ks, &record.did)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_did_log: {e}")))?
+        .ok_or_else(|| {
+            UpdateDidWebvhError::Library(format!("DID log missing for {}", record.did))
+        })?;
+    let state = state_from_jsonl(&did_log)?;
+    let last_state = state.log_entries().last().ok_or_else(|| {
+        UpdateDidWebvhError::Library(format!("DID {} has no log entries", record.did))
+    })?;
+
+    // 4a. Optimistic-concurrency precondition. Check BEFORE key
+    //     derivation / signing so a stale `get → edit → save` cycle
+    //     fails fast and cheap, with a message the operator can act
+    //     on. This catches the lost-update race the within-operation
+    //     `log_entry_count` check at the end does NOT — that one only
+    //     covers two server calls racing each other; this one covers
+    //     a client call that was authored against a stale view.
+    //
+    //     `expected` and `latest` are NOT the same source of truth, and the
+    //     difference decides whether a mismatch is the caller's fault. The
+    //     caller read `expected` from the **host**; `latest` is **our local**
+    //     head. They diverge in two opposite situations:
+    //
+    //       - the host moved on under the caller — a genuine lost update; or
+    //       - we hold a local head we never managed to publish, so the caller
+    //         is reading the host perfectly correctly and *we* are the one out
+    //         of step.
+    //
+    //     Treating the second case as a conflict is what wedges a DID
+    //     permanently: step 4b — the reconciler written to heal exactly this
+    //     divergence — sits *below* this check, so refusing here means it
+    //     never runs, and every retry dies in the same place. That is the
+    //     unrecoverable loop 4b's own comment warns about, reached from the
+    //     other side. It bites hardest through the consent flow, where the
+    //     failure is raised by the Plan dry-run: 4b is Execute-only by design,
+    //     so a plan cannot self-heal and the task never gets far enough to try.
+    //
+    //     Two conditions separate "we failed to publish" from "the caller is
+    //     stale", and BOTH are required:
+    //
+    //       1. `expected` names a real entry in our own chain. The caller read
+    //          a genuine past state of this DID rather than sending a value we
+    //          have never issued.
+    //       2. Nothing after `expected` ever reached the host — the confirmed
+    //          marker is `expected` itself, or absent.
+    //
+    //     An absent marker has to count. It is only ever written by *this*
+    //     function, so a DID created before its first successful update has
+    //     none at all, and requiring `Some(expected)` would leave exactly those
+    //     DIDs wedged with no route out. It is also safe: a genuine concurrent
+    //     update would have completed and written the marker, so the only way
+    //     to reach a moved local head with no marker is an update that stored
+    //     its log and never confirmed a publish — the wedge itself.
+    //
+    //     Hosted DIDs only. A serverless DID has no host, so the local head is
+    //     the sole truth, its marker is legitimately always absent, and a
+    //     mismatch there really is a stale caller.
+    if let Some(expected) = opts.expected_version_id.as_deref() {
+        let latest = last_state.get_version_id();
+        if latest != expected {
+            let hosted = record.server_id != "serverless";
+            let caller_read_a_real_version = state
+                .log_entries()
+                .iter()
+                .any(|e| e.get_version_id() == expected);
+            let confirmed = if hosted {
+                webvh_store::get_published_version(webvh_ks, &record.did)
+                    .await
+                    .map_err(|e| {
+                        UpdateDidWebvhError::Persistence(format!("get_published_version: {e}"))
+                    })?
+            } else {
+                None
+            };
+
+            if !caller_is_merely_ahead_of_an_unpublished_head(
+                hosted,
+                caller_read_a_real_version,
+                confirmed.as_deref(),
+                expected,
+            ) {
+                return Err(UpdateDidWebvhError::Conflict(format!(
+                    "DID {} has been updated since you read it (expected versionId `{expected}`, \
+                     current is `{latest}`). Re-fetch the document and re-apply your edits.",
+                    record.did
+                )));
+            }
+            // Proceed against the local head. In Execute mode 4b republishes it
+            // and the host catches up; the new version is then built on top. No
+            // new authority is granted by that — the unpublished head was signed
+            // under a prior authorization — so this resumes an interrupted
+            // publish rather than smuggling in an unapproved change.
+            tracing::warn!(
+                did = %record.did,
+                caller_expected = %expected,
+                local_head = %latest,
+                "caller is in step with what the host last confirmed but our local head is \
+                 ahead — an earlier publish never landed; continuing so the reconcile can heal it"
+            );
+        }
+    }
+
+    let last_params = last_state.validated_parameters.clone();
+    // `active_update_keys`, NOT `update_keys`. The two are different things and
+    // reading the wrong one bricks the DID.
+    //
+    // webvh parameters are a delta: an entry that does not restate `updateKeys`
+    // leaves the previous entry's in force. `didwebvh-rs` models that with two
+    // fields — `update_keys` is what *this entry declared* (`None` when it
+    // declared nothing) and `active_update_keys` is the effective set that
+    // validation carried forward (`parameters/mod.rs`, the `None =>` arm:
+    // "If absent, keep current updateKeys"). Only the second answers "which key
+    // signs the next entry", which is the question here.
+    //
+    // Reading `update_keys` therefore returned an empty list for every DID whose
+    // head entry omitted the parameter — which is exactly what this function
+    // writes for a metadata-only update (`set_update_keys` is `None` unless a new
+    // document or pre-rotation forces a reveal, so the entry lands as
+    // `"parameters": {}`). The DID was then permanently un-updatable: the empty
+    // list short-circuits `load_active_update_key` before it looks anything up,
+    // and reports "log entry has no update_keys — DID is deactivated or
+    // malformed" about a DID that is neither. The operator reads that as lost
+    // keys. The keys were never consulted.
+    //
+    // `next_key_hashes` needs no equivalent care: the library inherits it into
+    // the field itself, so `last_params.next_key_hashes` is already effective.
+    let last_update_keys: Vec<Multibase> = (*last_params.active_update_keys).clone();
+    // Owned snapshot of the prior state. Taken here because `state` is moved
+    // into the update config below, which ends `last_state`'s borrow — and a
+    // plan needs the before-picture after that point.
+    let prior_version_id = last_state.get_version_id().to_string();
+    let prior_document = last_state.log_entry.get_state().clone();
+    // Snapshotted for the same reason, and needed for the same invariant the
+    // other two serve: the new entry's `versionTime` must be strictly later
+    // than this one — `next_version_time` clamps against it directly, making
+    // no assumption about how the previous entry itself was stamped.
+    let prior_version_time = last_state.log_entry.get_version_time();
+
+    // 4c. The did:scid alias (`vta/webvh/dids/update/1.1`, VTI-KEY-164/166).
+    //
+    //     Applied here — after the chain is loaded and before a key is derived —
+    //     so the plan and the execution see the same document, and a refusal
+    //     costs nothing. Listing or removing the alias is a document change:
+    //     it goes through `new_doc` and so rotates the update key exactly as a
+    //     supplied `document` does (the spec keeps the task `destructive` for
+    //     that reason). An alias request that leaves the current document as it
+    //     is sets no document, so it cannot rotate the key by itself.
+    if let Some(list) = opts.scid_also_known_as {
+        let supplied = new_doc.is_some();
+        let mut doc = new_doc.take().unwrap_or_else(|| prior_document.clone());
+        if scid_alias::apply(&mut doc, &record.did, list).is_none() {
+            return Err(UpdateDidWebvhError::InvalidDocument(format!(
+                "{} is not a did:webvh:<scid>:<host> DID, so it has no did:scid alias",
+                record.did
+            )));
+        }
+        new_doc = (supplied || doc != prior_document)
+            .then(|| validate_document_for_update(doc, &record.did))
+            .transpose()?;
+    }
+    // A presented did:scid identity keeps its alias, whichever way the request
+    // would drop it — `scidAlsoKnownAs: false`, or a `document` without it,
+    // with or without `scidAlsoKnownAs` (update 1.1 item 4).
+    if (opts.scid_also_known_as == Some(false) || new_doc.is_some())
+        && scid_alias::presented_as_scid(webvh_ks, &record.did, vta_did).await?
+    {
+        let drops = opts.scid_also_known_as == Some(false)
+            || new_doc.as_ref().is_some_and(|d| {
+                !crate::operations::did_webvh::presentation::document_lists_alias(d)
+            });
+        if drops {
+            return Err(UpdateDidWebvhError::ScidAliasRequired(format!(
+                "this VTA presents {} as its did:scid DID, which exists only while the \
+                 did:webvh document lists it in alsoKnownAs (VTI-KEY-166); the update would \
+                 remove it",
+                record.did
+            )));
+        }
+    }
+    // An alias request that would publish an entry identical to the latest —
+    // same document, same parameters — publishes nothing and rotates nothing
+    // (update 1.1 item 5).
+    if opts.scid_also_known_as.is_some() {
+        let document_unchanged = new_doc.as_ref().is_none_or(|d| *d == prior_document);
+        let witnesses_unchanged = opts.witnesses.as_ref().is_none_or(|w| {
+            serde_json::to_value(w).ok()
+                == last_params
+                    .active_witness
+                    .as_deref()
+                    .and_then(|c| serde_json::to_value(c).ok())
+        });
+        let watchers_unchanged = opts
+            .watchers
+            .as_ref()
+            .is_none_or(|w| *w == last_params.watchers.as_deref().cloned().unwrap_or_default());
+        let ttl_unchanged = opts.ttl.is_none_or(|t| Some(t) == last_params.ttl);
+        let pre_rotation_unchanged = opts
+            .pre_rotation_count
+            .is_none_or(|n| n == record.pre_rotation_count);
+        if document_unchanged
+            && witnesses_unchanged
+            && watchers_unchanged
+            && ttl_unchanged
+            && pre_rotation_unchanged
+        {
+            return Err(UpdateDidWebvhError::NoChange(format!(
+                "{} already {} its did:scid alias and nothing else would change; nothing was \
+                 published and the update key was not rotated",
+                record.did,
+                if opts.scid_also_known_as == Some(true) {
+                    "lists"
+                } else {
+                    "omits"
+                }
+            )));
+        }
+    }
+    // Pre-rotation is "active" when the previous entry committed
+    // `next_key_hashes`. The library's `check_signing_key` consults
+    // `previous.next_key_hashes` (not `previous.update_keys`) for the
+    // signing-key authorization check in that case, so the next entry
+    // MUST be signed by a key whose hash was in that commitment.
+    // See didwebvh-rs::lib::DIDWebVHState::check_signing_key.
+    let last_next_key_hashes: Vec<String> = last_params
+        .next_key_hashes
+        .as_ref()
+        .map(|arc| arc.iter().map(|m| m.as_ref().to_string()).collect())
+        .unwrap_or_default();
+    let pre_rotation_active = !last_next_key_hashes.is_empty();
+
+    // 4b. Reconcile a prior failed publish before building anything new.
+    //
+    // This function commits local state (the derivation counter, the installed
+    // keys, the stored log) *before* it can confirm the host received the new
+    // version — see the seam below. So a publish that failed for any reason (a
+    // host blip, a 500, a timeout) leaves the local head ahead of what the host
+    // actually serves. Building a *new* version on that divergence, and burning
+    // a fresh key index to do it, is exactly what turns one failed publish into
+    // an unrecoverable loop: every retry advances the counter, so the consent
+    // gate re-mints and never converges.
+    //
+    // So before doing anything that moves state, make the host whole. The host
+    // accepts any valid full log (it re-verifies the chain and replaces its
+    // copy), so re-publishing the current local head is idempotent and heals a
+    // divergence of any depth in one call. Only once it lands do we record it
+    // as confirmed and go on to build the new version. If it fails we return
+    // here — before a single key is derived or allocated — so nothing moves and
+    // the next attempt starts clean. That is what makes a failed attempt
+    // self-recover instead of wedging the DID.
+    if mode == Mode::Execute && record.server_id != "serverless" {
+        let confirmed = webvh_store::get_published_version(webvh_ks, &record.did)
+            .await
+            .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_published_version: {e}")))?;
+        if confirmed.as_deref() != Some(prior_version_id.as_str()) {
+            let server = webvh_store::get_server(webvh_ks, &record.server_id)
+                .await
+                .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_server: {e}")))?
+                .ok_or_else(|| {
+                    UpdateDidWebvhError::Publish(format!(
+                        "webvh server `{}` referenced by DID is missing",
+                        record.server_id
+                    ))
+                })?;
+            let vta_did_ref = vta_did.ok_or_else(|| {
+                UpdateDidWebvhError::Publish(
+                    "VTA DID is not configured — cannot authenticate to webvh hosting \
+                     server to reconcile a pending publish."
+                        .to_string(),
+                )
+            })?;
+            tracing::info!(
+                did = %record.did,
+                local_head = %prior_version_id,
+                ?confirmed,
+                "reconcile: re-publishing an unconfirmed local head before updating"
+            );
+            super::super::publish_log_to_server(
+                deps,
+                vta_did_ref,
+                &server,
+                &record.mnemonic,
+                &did_log,
+                None,
+            )
+            .await
+            .map_err(|e| UpdateDidWebvhError::publish_failed("reconcile publish_did", e))?;
+            webvh_store::set_published_version(webvh_ks, &record.did, &prior_version_id)
+                .await
+                .map_err(|e| {
+                    UpdateDidWebvhError::Persistence(format!("set_published_version: {e}"))
+                })?;
+        }
+    }
+
+    // 5. Resolve effective pre-rotation count.
+    let pre_rotation_count = opts.pre_rotation_count.unwrap_or(record.pre_rotation_count);
+    // Whether this entry restates `nextKeyHashes` at all (step 9 consumes this),
+    // and whether what it restates is a live commitment rather than the empty
+    // array that turns pre-rotation off. Computed once so the derivation sizing
+    // here and the builder call in step 9 cannot drift apart.
+    let sends_next_key_hashes = opts.pre_rotation_count.is_some() || record.pre_rotation_count > 0;
+    let commits_next_key_hashes = sends_next_key_hashes && pre_rotation_count > 0;
+    // This entry *turns pre-rotation on*: the previous entry committed no
+    // hashes, this one does.
+    //
+    // Such an entry must not also mint a new update key, and the reason is
+    // structural rather than a workaround. Under pre-rotation the next entry is
+    // authorized by its own `updateKeys`, which must hash into the commitment
+    // this entry publishes (didwebvh 1.0 verification algorithm step 7) — so a
+    // key minted here would authorize nothing: the next entry has to reveal a
+    // pre-rotation key instead. Rotating on the way in burns a derivation index
+    // to install a handle that can never sign, and leaves an "active update key"
+    // on record that the next update will not consult.
+    //
+    // Leaving `updateKeys` unrestated is legal precisely because pre-rotation is
+    // not yet in force on the *previous* entry: inheritance is only forbidden
+    // once the predecessor has committed hashes.
+    let activates_pre_rotation = !pre_rotation_active && commits_next_key_hashes;
+
+    // 6. Resolve context base path for BIP-32 derivation.
+    let context = crate::contexts::get_context(contexts_ks, &record.context_id)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_context: {e}")))?
+        .ok_or_else(|| {
+            UpdateDidWebvhError::Library(format!(
+                "context `{}` referenced by DID is missing",
+                record.context_id
+            ))
+        })?;
+
+    // 7. Derive new keys (no persist yet — version_id unknown).
+    //    With pre-rotation active, the "auth" key for the new entry is
+    //    the *revealed* pre-rotation candidate from the previous entry,
+    //    not a freshly-minted key. We pick that handle in step 8 below.
+    //
+    //    In Plan mode we *peek* the derivation-path counter instead of
+    //    allocating from it. Allocating would make the plan a mutation —
+    //    and would mean the real run derived a different key than the one
+    //    the plan reported, since it would allocate the *next* index. The
+    //    peeked counter is pinned into the plan so the caller can detect a
+    //    concurrent allocation before acting on it.
+    let path_counter_pin = peek_path_counter(keys_ks, &context.base_path)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("peek_path_counter: {e}")))?;
+    let auth_count: u32 =
+        u32::from(new_doc.is_some() && !pre_rotation_active && !activates_pre_rotation);
+    let total_keys = auth_count + pre_rotation_count;
+
+    // Plan and execute derive the *same contiguous block* and split it the same
+    // way — that symmetry is what makes the prediction sound.
+    //
+    // Plan peeks the block (read-only); execute allocates it in one atomic step,
+    // pinned to the counter the plan peeked. If anything advanced the counter in
+    // between — a concurrent update in the same context, minutes later, while a
+    // human was deciding — the allocation fails rather than installing keys the
+    // approver never saw. Allocating the auth and pre-rotation keys separately, as
+    // this once did, left a window for exactly that between the two calls.
+    let derived_all = match mode {
+        Mode::Plan => peek_webvh_keys(keys_ks, seed_store, &context.base_path, total_keys).await?,
+        Mode::Execute => {
+            super::keys::derive_webvh_keys_block(
+                keys_ks,
+                seed_store,
+                &context.base_path,
+                total_keys,
+                Some(path_counter_pin),
+            )
+            .await?
+        }
+    };
+    let (auth_slice, pre_slice) = derived_all.split_at(auth_count as usize);
+    let (derived_auth, derived_pre_rotation) = (auth_slice.to_vec(), pre_slice.to_vec());
+
+    // 8. Resolve the signing key.
+    //
+    //    With pre-rotation active, find a handle whose hash is in
+    //    `last.next_key_hashes` — that's the only key webvh will accept
+    //    as a signer for the next log entry. Without pre-rotation, fall
+    //    back to the pre-existing `load_active_update_key` lookup over
+    //    `last.update_keys`.
+    tracing::info!(
+        scid,
+        did = %record.did,
+        pre_rotation_active,
+        next_key_hashes_count = last_next_key_hashes.len(),
+        update_keys_count = last_update_keys.len(),
+        "update_did_webvh: resolving signing key"
+    );
+    let signing_handle = if pre_rotation_active {
+        load_pre_rotation_signing_key(
+            keys_ks,
+            seed_store,
+            &context.base_path,
+            scid,
+            &last_next_key_hashes,
+        )
+        .await?
+    } else {
+        load_active_update_key(
+            keys_ks,
+            seed_store,
+            &context.base_path,
+            scid,
+            &last_update_keys,
+        )
+        .await?
+    };
+    tracing::info!(
+        scid,
+        signing_pubkey = %signing_handle.public_key,
+        signing_hash = %signing_handle.hash,
+        signing_role = ?signing_handle.role,
+        signing_version = %signing_handle.version_id,
+        "update_did_webvh: signing key resolved"
+    );
+    let signing_secret = derive_secret_for_handle(keys_ks, seed_store, &signing_handle).await?;
+
+    // 9. Build the library config.
+    let mut builder = UpdateDIDConfig::<Secret, Secret>::builder_generic()
+        .state(state)
+        .signing_key(signing_secret)
+        // Strictly after the previous entry — see `next_version_time`. This
+        // waits out a same-second collision rather than backdating; either
+        // way, `didwebvh-rs` checks neither monotonicity nor futureness at
+        // write time, so getting this wrong signs and publishes an entry that
+        // no resolver will accept and no later entry can repair.
+        .version_time(next_version_time(Some(prior_version_time)).await);
+    // The update_keys this entry sets, or `None` to leave the previous entry's
+    // in force — webvh parameters are a delta, so "not restated" means
+    // "unchanged", NOT "removed".
+    //
+    // Computed once, here, and consumed by both the builder below and the plan.
+    // Deriving it twice would be the same mistake this whole plan/apply split
+    // exists to avoid: a second implementation of the handler's semantics that
+    // is free to drift from the first.
+    //
+    // Keyed on `derived_auth` rather than restating the predicate that sized it:
+    // a fresh update key is declared exactly when one was derived, so the two
+    // cannot disagree about whether this entry rotates.
+    let set_update_keys: Option<Vec<Multibase>> = if !derived_auth.is_empty() {
+        Some(
+            derived_auth
+                .iter()
+                .map(|k| Multibase::from(k.public_key.clone()))
+                .collect(),
+        )
+    } else if pre_rotation_active {
+        // Reveal the pre-rotation key as the new update_keys entry.
+        // `validate_pre_rotation_keys` requires every key in the new update_keys
+        // to have its hash committed in previous.next_key_hashes —
+        // `signing_handle.public_key` satisfies that by construction (we picked
+        // it BY hash).
+        //
+        // This also covers the metadata-only update under pre-rotation: the
+        // active update-keys must keep moving forward in lockstep with the
+        // signing-key reveal, or the next entry's `previous.next_key_hashes`
+        // carries an unused commitment while the key on record goes stale.
+        Some(vec![Multibase::from(signing_handle.public_key.clone())])
+    } else {
+        None
+    };
+
+    /// The update keys in force *after* this entry: what it sets, or what the
+    /// previous entry left standing.
+    fn effective_update_keys(set: &Option<Vec<Multibase>>, previous: &[Multibase]) -> Vec<String> {
+        set.as_deref()
+            .unwrap_or(previous)
+            .iter()
+            .map(|k| k.as_ref().to_string())
+            .collect()
+    }
+
+    if let Some(doc) = new_doc {
+        builder = builder.document(doc);
+    }
+    if let Some(ref keys) = set_update_keys {
+        builder = builder.update_keys(keys.clone());
+    }
+    // Always pass next_key_hashes when caller toggled pre-rotation OR
+    // when the DID currently uses pre-rotation — keeps the commitment
+    // chain unbroken. Empty vec disables pre-rotation going forward.
+    if sends_next_key_hashes {
+        let hashes: Vec<Multibase> = derived_pre_rotation
+            .iter()
+            .map(|k| Multibase::from(k.hash.clone()))
+            .collect();
+        builder = builder.next_key_hashes(hashes);
+    }
+    if let Some(w) = opts.witnesses.clone() {
+        builder = builder.witness(w);
+    }
+    if let Some(watch) = opts.watchers.clone() {
+        builder = builder.watchers(watch);
+    }
+    if let Some(t) = opts.ttl {
+        builder = builder.ttl(t);
+    }
+
+    let cfg = builder
+        .build()
+        .map_err(|e| UpdateDidWebvhError::Library(format!("build update config: {e}")))?;
+
+    // 10. Append the new log entry via the library.
+    //
+    // `Rejected`, not `Library`: this is webvh judging the transition built
+    // from the caller's request, so the reason is about their update and
+    // belongs in their error rather than only in this VTA's log. Failures that
+    // are ours — a stored log that will not parse, a missing record — stay
+    // `Library` and stay opaque.
+    let result = update_did(cfg)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Rejected(e.to_string()))?;
+    let new_log_entry = result.log_entry();
+    let new_version_id = new_log_entry
+        .get_version_id_fields()
+        .map(|(n, h)| format!("{n}-{h}"))
+        .map_err(|e| UpdateDidWebvhError::Library(format!("read version id: {e}")))?;
+    // The DID's own SCID. webvh carries `scid` in the genesis entry's
+    // parameters only, so reading it off an appended entry yields nothing —
+    // and every update reported `newScid: ""`, where `rotate-keys/1.0` requires
+    // the response to report the existing SCID (VTI-KEY-040: rotation does not
+    // change the identifier).
+    let new_scid = new_log_entry
+        .get_scid()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| canonical_scid.clone());
+    let new_log_entry_str = serde_json::to_string(new_log_entry)
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("serialize new entry: {e}")))?;
+
+    // 11. Optimistic concurrency check before persisting. Uses the
+    //     shared `RecordSnapshot` machinery so we catch *every* kind
+    //     of concurrent mutation (log_entry_count, updated_at, AND
+    //     server_id) rather than just log_entry_count growth. The
+    //     server_id case is the one the ad-hoc check missed:
+    //     `register_did_with_server` flipping `server_id` from
+    //     `serverless` → `webvh-prod` between step 1 and here used
+    //     to slip past unchallenged, then step 12 would clobber the
+    //     newer record with our stale `serverless` value.
+    let current = webvh_store::get_did(webvh_ks, &record.did)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_did: {e}")))?
+        .ok_or_else(|| {
+            UpdateDidWebvhError::NotFound(format!("DID {} disappeared mid-update", record.did))
+        })?;
+    snapshot
+        .assert_unchanged(&current)
+        .map_err(|race| UpdateDidWebvhError::Conflict(race.to_string()))?;
+
+    // ── The seam. Everything above is read-only; everything below commits. ──
+    //
+    // A plan stops here, having run the real path: the same chain load, the
+    // same key derivation, the same `didwebvh_rs::update_did` that minted the
+    // actual next log entry above. What it reports is not a description of the
+    // update — it is the update, uncommitted.
+    if mode == Mode::Plan {
+        return Ok(Outcome::Planned(UpdatePlan {
+            did: record.did.clone(),
+            scid: scid.to_string(),
+            prior_version_id,
+            new_version_id: new_version_id.clone(),
+            prior_document,
+            new_document: new_log_entry.get_state().clone(),
+            prior_update_keys: last_update_keys
+                .iter()
+                .map(|k| k.as_ref().to_string())
+                .collect(),
+            new_update_keys: effective_update_keys(&set_update_keys, &last_update_keys),
+            pre_rotation_count,
+            new_next_key_hashes: derived_pre_rotation
+                .iter()
+                .map(|k| k.hash.clone())
+                .collect(),
+            base_path: context.base_path.clone(),
+            path_counter_pin,
+            subject_context: record.context_id.clone(),
+            requester_authorized,
+        }));
+    }
+
+    // 12. Persist new log + new key handles + updated record.
+    let new_log_jsonl = state_to_jsonl(result.state())?;
+    // The commit point: from here the new entry is the DID's local head, and
+    // an error below no longer means nothing happened. The write and the
+    // caller's `on_commit` run in their own task (see [`OnCommit`]).
+    let write = {
+        let webvh_ks = webvh_ks.clone();
+        let did = record.did.clone();
+        let log = new_log_jsonl.clone();
+        tokio::spawn(async move {
+            webvh_store::store_did_log(&webvh_ks, &did, &log)
+                .await
+                .map_err(|e| {
+                    (
+                        UpdateDidWebvhError::Persistence(format!("store_did_log: {e}")),
+                        Commit::NotCommitted,
+                    )
+                })?;
+            if let Some(on_commit) = on_commit {
+                on_commit().await.map_err(|e| (e, Commit::Committed))?;
+            }
+            Ok::<(), (UpdateDidWebvhError, Commit)>(())
+        })
+    };
+    match write.await {
+        Ok(Ok(())) => *commit = Commit::Committed,
+        Ok(Err((e, reached))) => {
+            *commit = reached;
+            return Err(e);
+        }
+        // A panic in the write task leaves it unknown whether the entry
+        // landed; claiming it did not would let a caller discard state a
+        // published entry depends on.
+        Err(e) => {
+            *commit = Commit::Committed;
+            return Err(UpdateDidWebvhError::Persistence(format!(
+                "log write task failed: {e}"
+            )));
+        }
+    }
+    // Single source of truth for the post-mutation self-DID resolver refresh:
+    // reseed the in-process cache straight from the log we just built, before it
+    // leaves this function. Every runtime DID-log mutation (did-webvh update and
+    // all `services {…}` ops, which funnel through here) is covered by this one
+    // call — do not re-add per-caller refreshes at the protocol layer.
+    super::super::refresh_resolver_doc_from_log(did_resolver, &record.did, &new_log_jsonl, channel)
+        .await;
+
+    if !derived_auth.is_empty() {
+        install_derived_webvh_keys(
+            keys_ks,
+            scid,
+            &new_version_id,
+            WebvhKeyRole::UpdateKey,
+            &derived_auth,
+            "update key",
+        )
+        .await?;
+    }
+    if !derived_pre_rotation.is_empty() {
+        install_derived_webvh_keys(
+            keys_ks,
+            scid,
+            &new_version_id,
+            WebvhKeyRole::PreRotation,
+            &derived_pre_rotation,
+            "pre-rotation key",
+        )
+        .await?;
+    }
+    // When we reveal a pre-rotation key, re-install it as an
+    // `UpdateKey` handle under the new version_id. Without this, the
+    // supersede step (below) moves the previous version's PreRotation
+    // handle out of the active prefix, and the next update can't
+    // resolve the now-active key by hash via the fast path. The handle
+    // contents are otherwise identical to the previous PreRotation
+    // entry — same derivation path, same secret.
+    if pre_rotation_active {
+        let revealed = WebvhKeyHandle {
+            scid: scid.to_string(),
+            version_id: new_version_id.clone(),
+            hash: signing_handle.hash.clone(),
+            public_key: signing_handle.public_key.clone(),
+            derivation_path: signing_handle.derivation_path.clone(),
+            seed_id: signing_handle.seed_id,
+            role: WebvhKeyRole::UpdateKey,
+            label: format!(
+                "revealed pre-rotation key (was version {})",
+                signing_handle.version_id
+            ),
+            created_at: Utc::now(),
+        };
+        webvh_keys::install(keys_ks, &revealed)
+            .await
+            .map_err(|e| UpdateDidWebvhError::Persistence(format!("install revealed key: {e}")))?;
+    }
+
+    // Supersede the previous version's keys (best-effort — handles that
+    // never made it into webvh_keys, e.g. legacy DIDs, are silently
+    // skipped by the prefix scan).
+    if let Some(prev) = result
+        .state()
+        .log_entries()
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|e| {
+            e.log_entry
+                .get_version_id_fields()
+                .map(|(n, h)| format!("{n}-{h}"))
+        })
+        .transpose()
+        .unwrap_or(None)
+    {
+        webvh_keys::supersede_keys_for_version(keys_ks, scid, &prev)
+            .await
+            .map_err(|e| UpdateDidWebvhError::Persistence(format!("supersede: {e}")))?;
+    }
+
+    // The recorded did:scid identity follows the document just committed, so
+    // the did:scid DID addresses this log exactly while the alias links the
+    // forms (VTI-KEY-164).
+    scid_alias::record_identity(webvh_ks, &record.did, new_log_entry.get_state()).await?;
+
+    record.log_entry_count += 1;
+    record.pre_rotation_count = derived_pre_rotation.len() as u32;
+    record.updated_at = Utc::now();
+    webvh_store::store_did(webvh_ks, &record)
+        .await
+        .map_err(|e| UpdateDidWebvhError::Persistence(format!("store_did: {e}")))?;
+
+    // 13. Publish the new log to the hosting server for non-serverless
+    //     DIDs, as a signed `did/register/0.1` Trust Task.
+    //
+    //     Local state is already committed, so a publish failure
+    //     surfaces as `Publish` (HTTP 500) but doesn't undo the
+    //     local update; operators can retry the publish out-of-band
+    //     by re-issuing the same update.
+    if record.server_id != "serverless" {
+        let server = webvh_store::get_server(webvh_ks, &record.server_id)
+            .await
+            .map_err(|e| UpdateDidWebvhError::Persistence(format!("get_server: {e}")))?
+            .ok_or_else(|| {
+                UpdateDidWebvhError::Publish(format!(
+                    "webvh server `{}` referenced by DID is missing",
+                    record.server_id
+                ))
+            })?;
+        let vta_did = vta_did.ok_or_else(|| {
+            UpdateDidWebvhError::Publish(
+                "VTA DID is not configured — cannot authenticate to webvh hosting server. \
+                 Complete `vta setup` before publishing to a server-managed DID."
+                    .to_string(),
+            )
+        })?;
+        match &publish {
+            PublishTarget::DidLog => {
+                super::super::publish_log_to_server(
+                    deps,
+                    vta_did,
+                    &server,
+                    &record.mnemonic,
+                    &new_log_jsonl,
+                    // Update paths follow the slot's existing domain — the
+                    // remote already records it on the slot. Passing None
+                    // lets the remote use the recorded value; a host that
+                    // does per-domain mnemonic namespacing would resolve via
+                    // the slot lookup.
+                    None,
+                )
+                .await
+                .map_err(|e| UpdateDidWebvhError::publish_failed("publish_did", e))?;
+            }
+            PublishTarget::AgentName { name, verb } => {
+                // The host both republishes this signed log AND applies the
+                // name registry change, so we must name the domain explicitly
+                // (it is the DID's own host) — unlike a plain publish, which
+                // lets the slot lookup supply it.
+                let domain = domain_from_webvh_did(&record.did);
+                super::super::agent_name_op_on_server(
+                    deps,
+                    vta_did,
+                    &server,
+                    *verb,
+                    &record.mnemonic,
+                    name,
+                    &new_log_jsonl,
+                    domain.as_deref(),
+                )
+                .await
+                .map_err(|e| UpdateDidWebvhError::publish_failed("agent_name", e))?;
+            }
+        }
+
+        // The host has this version now. Record it so the next update's
+        // reconcile check (step 4b) knows the local head is published and does
+        // not needlessly re-publish. A publish failure above returns before
+        // this line, leaving the marker at the prior version — which is what
+        // makes the next attempt re-publish and self-heal.
+        webvh_store::set_published_version(webvh_ks, &record.did, &new_version_id)
+            .await
+            .map_err(|e| UpdateDidWebvhError::Persistence(format!("set_published_version: {e}")))?;
+    }
+
+    // 14. Audit emission. Best-effort — a missing audit row should
+    //     not undo a successful update, so we log+swallow on error.
+    let resource = format!(
+        "did:webvh:{scid} v{} → v{}",
+        initial_log_entry_count, record.log_entry_count
+    );
+    let label = opts.label.as_deref().unwrap_or("update");
+    if let Err(e) = audit::record(
+        audit,
+        &format!("did.update:{label}"),
+        &auth.did,
+        Some(&resource),
+        "success",
+        Some(channel),
+        Some(&record.context_id),
+    )
+    .await
+    {
+        tracing::warn!(
+            channel,
+            did = %record.did,
+            error = %e,
+            "did.update audit emission failed; update committed"
+        );
+    }
+
+    tracing::info!(
+        channel,
+        did = %record.did,
+        scid = %scid,
+        new_version_id = %new_version_id,
+        label = ?opts.label,
+        "did:webvh updated"
+    );
+
+    let update_keys_count = effective_update_keys(&set_update_keys, &last_update_keys).len() as u32;
+
+    Ok(Outcome::Executed(UpdateDidWebvhResult {
+        did: record.did.clone(),
+        new_version_id,
+        new_scid,
+        new_log_entry: new_log_entry_str,
+        update_keys_count,
+        pre_rotation_key_count: derived_pre_rotation.len() as u32,
+        // Surface so route + DIDComm response shapes can emit the
+        // "fetch did.jsonl + redeploy" hint to operators. The
+        // string-equality check matches the same sentinel
+        // (`SERVERLESS_MARKER`) that `register_did_with_server`
+        // gates on and that step 13 above used to decide whether
+        // to call the host transport.
+        serverless: record.server_id == "serverless",
+        // Reported by the `update/1.1` handler only, from the published entry:
+        // 1.0, rotate-keys and the agent-name tasks answer closed schemas
+        // without these members.
+        scid_also_known_as: None,
+        scid_did_url: None,
+    }))
+}
+
+#[cfg(test)]
+mod agent_name_tests {
+    use super::{AgentNameVerb, domain_from_webvh_did, edit_agent_name, is_agent_name};
+    use serde_json::{Value, json};
+
+    /// Each verb keeps its own operator-facing name. These are what an
+    /// operator reads on a label and what the VTA's own inbound
+    /// `agent-name/{verb}/0.1` tasks are called — they did NOT collapse when
+    /// the host wire did.
+    #[test]
+    fn verbs_keep_distinct_operator_facing_names() {
+        assert_eq!(AgentNameVerb::Set.as_str(), "set");
+        assert_eq!(AgentNameVerb::Remove.as_str(), "remove");
+        assert_eq!(AgentNameVerb::Enable.as_str(), "enable");
+        assert_eq!(AgentNameVerb::Disable.as_str(), "disable");
+    }
+
+    /// The host wire mapping. did-hosting 0.8.3 serves only `update` (with a
+    /// declarative `state`) and `remove`; `set` / `enable` / `disable` are
+    /// retired and answer 404 on REST and *nothing at all* on DIDComm, where
+    /// an unrouted type is dropped without a reply — so a regression here
+    /// costs a 30s timeout, not an error. Pinned per-verb rather than by
+    /// counting, so re-adding a retired name fails here.
+    #[test]
+    fn verbs_map_onto_the_hosts_two_tasks() {
+        assert_eq!(AgentNameVerb::Set.host_endpoint(), "update");
+        assert_eq!(AgentNameVerb::Enable.host_endpoint(), "update");
+        assert_eq!(AgentNameVerb::Disable.host_endpoint(), "update");
+        assert_eq!(AgentNameVerb::Remove.host_endpoint(), "remove");
+
+        assert_eq!(AgentNameVerb::Set.host_state(), Some("active"));
+        assert_eq!(AgentNameVerb::Enable.host_state(), Some("active"));
+        assert_eq!(AgentNameVerb::Disable.host_state(), Some("parked"));
+        // `remove` carries no state — the field must be absent, not `null`.
+        assert_eq!(AgentNameVerb::Remove.host_state(), None);
+    }
+
+    /// The requested state and the document direction are the same fact told
+    /// twice, so they must agree: `active` iff the document claims the name.
+    /// This is the assertion that catches a transposition — mapping `Disable`
+    /// to `active` would ask the host to serve a name while handing it a
+    /// document that dropped the claim, and the host would reject it with
+    /// `also_known_as_mismatch` at runtime instead of here.
+    #[test]
+    fn host_state_agrees_with_the_claim_direction() {
+        for verb in [
+            AgentNameVerb::Set,
+            AgentNameVerb::Remove,
+            AgentNameVerb::Enable,
+            AgentNameVerb::Disable,
+        ] {
+            match verb.host_state() {
+                Some("active") => assert!(
+                    verb.claims_name(),
+                    "{} asks for `active` so its document must claim the name",
+                    verb.as_str()
+                ),
+                Some("parked") | None => assert!(
+                    !verb.claims_name(),
+                    "{} takes the name out of service so its document must not claim it",
+                    verb.as_str()
+                ),
+                other => panic!("{} has an unknown host state {other:?}", verb.as_str()),
+            }
+        }
+    }
+
+    /// The document direction per verb, which must match did-hosting's
+    /// `AgentNameOp::requires_claim` exactly — the host rejects the submitted
+    /// document with `also_known_as_mismatch` if it doesn't, and that
+    /// agreement is what keeps a served name and the signed document that
+    /// claims it from ever diverging.
+    #[test]
+    fn claim_direction_matches_the_hosts_rule() {
+        assert!(AgentNameVerb::Set.claims_name());
+        assert!(AgentNameVerb::Enable.claims_name());
+        assert!(!AgentNameVerb::Remove.claims_name());
+        assert!(!AgentNameVerb::Disable.claims_name());
+    }
+
+    /// End-to-end on the document: for every verb, the `alsoKnownAs` the VTA
+    /// signs claims the name iff that verb claims it.
+    #[test]
+    fn edited_document_matches_the_verbs_claim_direction() {
+        for verb in [
+            AgentNameVerb::Set,
+            AgentNameVerb::Remove,
+            AgentNameVerb::Enable,
+            AgentNameVerb::Disable,
+        ] {
+            // Start from a document that already claims the name, so both
+            // directions are a real change for at least one verb.
+            let mut doc = json!({ "alsoKnownAs": ["https://example.com/@alice"] });
+            edit_agent_name(&mut doc, "example.com", "alice", verb.claims_name());
+            let claimed = doc
+                .get("alsoKnownAs")
+                .and_then(|v| v.as_array())
+                .is_some_and(|l| l.iter().any(|v| is_agent_name(v, "example.com", "alice")));
+            assert_eq!(
+                claimed,
+                verb.claims_name(),
+                "{} must leave the document {} the name",
+                verb.as_str(),
+                if verb.claims_name() {
+                    "claiming"
+                } else {
+                    "not claiming"
+                }
+            );
+
+            // …and from a document that does not claim it.
+            let mut doc = json!({});
+            edit_agent_name(&mut doc, "example.com", "alice", verb.claims_name());
+            let claimed = doc
+                .get("alsoKnownAs")
+                .and_then(|v| v.as_array())
+                .is_some_and(|l| l.iter().any(|v| is_agent_name(v, "example.com", "alice")));
+            assert_eq!(claimed, verb.claims_name(), "{}", verb.as_str());
+        }
+    }
+
+    #[test]
+    fn domain_parses_host_and_decodes_port() {
+        assert_eq!(
+            domain_from_webvh_did("did:webvh:QmScid:example.com:alice").as_deref(),
+            Some("example.com")
+        );
+        // Percent-encoded port is decoded to match the form a name carries.
+        assert_eq!(
+            domain_from_webvh_did("did:webvh:QmScid:localhost%3A8534:staff:bob").as_deref(),
+            Some("localhost:8534")
+        );
+        assert_eq!(domain_from_webvh_did("did:key:z6Mk").as_deref(), None);
+        assert_eq!(domain_from_webvh_did("did:webvh:QmScid").as_deref(), None);
+    }
+
+    #[test]
+    fn is_agent_name_matches_host_ci_local_exact() {
+        let v = |s: &str| Value::String(s.to_string());
+        assert!(is_agent_name(
+            &v("https://example.com/@alice"),
+            "example.com",
+            "alice"
+        ));
+        // Scheme-less and host case-insensitive both match.
+        assert!(is_agent_name(
+            &v("example.com/@alice"),
+            "EXAMPLE.com",
+            "alice"
+        ));
+        // Local part is case-sensitive.
+        assert!(!is_agent_name(
+            &v("https://example.com/@Alice"),
+            "example.com",
+            "alice"
+        ));
+        // Wrong domain / not an agent name.
+        assert!(!is_agent_name(
+            &v("https://other.com/@alice"),
+            "example.com",
+            "alice"
+        ));
+        assert!(!is_agent_name(
+            &v("did:web:example.com"),
+            "example.com",
+            "alice"
+        ));
+    }
+
+    #[test]
+    fn enable_adds_canonical_entry_idempotently() {
+        let mut doc = json!({ "id": "did:webvh:x:example.com:me" });
+        edit_agent_name(&mut doc, "example.com", "alice", true);
+        assert_eq!(
+            doc["alsoKnownAs"],
+            json!(["https://example.com/@alice"]),
+            "enable creates the array with the canonical entry"
+        );
+        // Idempotent: a second enable does not duplicate.
+        edit_agent_name(&mut doc, "example.com", "alice", true);
+        assert_eq!(doc["alsoKnownAs"], json!(["https://example.com/@alice"]));
+    }
+
+    #[test]
+    fn enable_preserves_unrelated_also_known_as() {
+        let mut doc = json!({ "alsoKnownAs": ["did:web:example.com", "https://example.com/@bob"] });
+        edit_agent_name(&mut doc, "example.com", "alice", true);
+        assert_eq!(
+            doc["alsoKnownAs"],
+            json!([
+                "did:web:example.com",
+                "https://example.com/@bob",
+                "https://example.com/@alice"
+            ])
+        );
+    }
+
+    #[test]
+    fn disable_removes_the_name_in_any_form_and_prunes_empty() {
+        // A scheme-less stored form is still removed.
+        let mut doc = json!({ "alsoKnownAs": ["example.com/@alice"] });
+        edit_agent_name(&mut doc, "example.com", "alice", false);
+        assert!(
+            doc.get("alsoKnownAs").is_none(),
+            "an emptied alsoKnownAs is dropped, not left as []"
+        );
+
+        // Only the target name goes; other entries stay.
+        let mut doc = json!({
+            "alsoKnownAs": ["https://example.com/@alice", "https://example.com/@bob", "did:web:x"]
+        });
+        edit_agent_name(&mut doc, "example.com", "alice", false);
+        assert_eq!(
+            doc["alsoKnownAs"],
+            json!(["https://example.com/@bob", "did:web:x"])
+        );
+    }
+}
+
+/// Cross-repo contract: what we write into `alsoKnownAs` must be what the
+/// DID-hosting server can read back out of the published log.
+///
+/// The host does not pattern-match our string. It parses each `alsoKnownAs`
+/// entry with `agent_names::AgentName::parse` and keeps the ones whose
+/// `authority()` equals the domain it is serving
+/// (`did-hosting-common::did_ops::extract_agent_names`). If our emitted form
+/// ever stops satisfying that parser, nothing errors anywhere — the claim is
+/// simply never indexed and the name silently 404s. So these tests use the
+/// host's own parser rather than re-asserting our format against itself.
+#[cfg(test)]
+mod concurrency_precondition {
+    use super::caller_is_merely_ahead_of_an_unpublished_head as merely_ahead;
+
+    const V1: &str = "1-QmUCAL";
+    const V2: &str = "2-QmXAXx";
+
+    /// The production wedge: the host confirmed v1, our local head is v2
+    /// because a publish never landed, and the caller is pinned to v1 — which
+    /// is exactly what the host told it. Refusing this is what made the DID
+    /// permanently uneditable.
+    #[test]
+    fn a_caller_in_step_with_the_confirmed_publish_is_not_stale() {
+        assert!(merely_ahead(true, true, Some(V1), V1));
+    }
+
+    /// The case that survived the first fix. This marker is written only by a
+    /// successful publish, so a DID created before its first update has none —
+    /// and requiring `Some(expected)` left exactly those DIDs wedged with no
+    /// route out. Absent must count as "nothing published beyond".
+    #[test]
+    fn an_absent_marker_counts_as_nothing_published_beyond() {
+        assert!(merely_ahead(true, true, None, V1));
+    }
+
+    /// The protection this check exists for. The host really has moved past
+    /// the caller, so the caller is genuinely stale and must be refused —
+    /// otherwise the relaxation above would have quietly deleted the
+    /// lost-update guarantee rather than narrowed it.
+    #[test]
+    fn a_caller_behind_the_confirmed_publish_is_still_stale() {
+        assert!(!merely_ahead(true, true, Some(V2), V1));
+    }
+
+    /// A version we never issued is not a past state the caller could have
+    /// read. Without this, any unrecognised string would slip through
+    /// alongside an absent marker.
+    #[test]
+    fn a_version_absent_from_our_chain_is_never_excused() {
+        assert!(!merely_ahead(true, false, None, "9-QmInvented"));
+        assert!(!merely_ahead(true, false, Some(V1), "9-QmInvented"));
+    }
+
+    /// Serverless DIDs have no host, so the local head is the only truth and
+    /// the marker is legitimately always absent. Excusing a mismatch there
+    /// would drop the precondition entirely for every serverless DID.
+    #[test]
+    fn a_serverless_did_is_never_excused() {
+        assert!(!merely_ahead(false, true, None, V1));
+        assert!(!merely_ahead(false, true, Some(V1), V1));
+    }
+}
+
+#[cfg(test)]
+mod agent_name_host_contract {
+    use super::edit_agent_name;
+
+    /// VTI-KEY-164/166: claiming and dropping an agent name never touches the
+    /// did:scid alias that links the log's two names.
+    #[test]
+    fn agent_name_edits_keep_the_scid_alias() {
+        let alias = "did:scid:vh:1:QmScid?src=webvh.storm.ws/alice";
+        let mut doc = serde_json::json!({ "id": "did:webvh:QmScid:webvh.storm.ws:alice",
+                                          "alsoKnownAs": [alias] });
+        edit_agent_name(&mut doc, DOMAIN, "alice", true);
+        assert_eq!(
+            claims(&doc),
+            vec![alias.to_string(), format!("https://{DOMAIN}/@alice")]
+        );
+        edit_agent_name(&mut doc, DOMAIN, "alice", false);
+        assert_eq!(claims(&doc), vec![alias.to_string()]);
+    }
+
+    const DOMAIN: &str = "webvh.storm.ws";
+
+    /// Pull the `alsoKnownAs` entries out of a document, as the host would.
+    fn claims(doc: &serde_json::Value) -> Vec<String> {
+        doc.get("alsoKnownAs")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn what_we_write_is_what_the_host_parses() {
+        let mut doc = serde_json::json!({});
+        edit_agent_name(&mut doc, DOMAIN, "ops", true);
+
+        let entries = claims(&doc);
+        assert_eq!(entries.len(), 1, "expected exactly one claim: {entries:?}");
+
+        let parsed = agent_names::AgentName::parse(&entries[0])
+            .expect("the host must be able to parse what we emit");
+        assert_eq!(
+            parsed.authority(),
+            DOMAIN,
+            "the host keeps only entries whose authority matches the domain \
+             it serves; a mismatch means the name is never indexed"
+        );
+        assert_eq!(parsed.local_name(), "ops");
+    }
+
+    #[test]
+    fn a_removed_claim_leaves_nothing_for_the_host_to_index() {
+        let mut doc = serde_json::json!({});
+        edit_agent_name(&mut doc, DOMAIN, "ops", true);
+        edit_agent_name(&mut doc, DOMAIN, "ops", false);
+        assert!(
+            claims(&doc).is_empty(),
+            "a released name must leave no claim behind — the host rebuilds \
+             its index from the document on every publish"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_also_known_as_entry_survives_and_is_ignored() {
+        // `alsoKnownAs` legitimately holds other identifier types; the host
+        // skips what it cannot parse rather than erroring, and so must we.
+        let mut doc = serde_json::json!({ "alsoKnownAs": ["did:web:other.example"] });
+        edit_agent_name(&mut doc, DOMAIN, "ops", true);
+        let entries = claims(&doc);
+        assert!(entries.iter().any(|e| e == "did:web:other.example"));
+        assert_eq!(entries.len(), 2);
+
+        edit_agent_name(&mut doc, DOMAIN, "ops", false);
+        assert_eq!(
+            claims(&doc),
+            vec!["did:web:other.example".to_string()],
+            "removing our name must not disturb identifiers we do not own"
+        );
+    }
+
+    #[test]
+    fn a_name_on_another_domain_is_not_ours_to_serve() {
+        // The host drops entries whose authority is not the domain it serves.
+        // Confirms our writer never emits one that would be silently dropped.
+        let mut doc = serde_json::json!({});
+        edit_agent_name(&mut doc, DOMAIN, "ops", true);
+        let parsed = agent_names::AgentName::parse(&claims(&doc)[0]).unwrap();
+        assert_ne!(parsed.authority(), "evil.example");
+    }
+}

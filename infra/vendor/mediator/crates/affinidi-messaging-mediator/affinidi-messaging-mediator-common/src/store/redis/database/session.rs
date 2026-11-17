@@ -1,0 +1,427 @@
+//! Session storage on the Redis backend.
+//!
+//! Session type definitions live in `crate::common::session` —
+//! they're backend-agnostic (used by the JWT middleware regardless of
+//! storage). This file only carries the Redis-specific persistence
+//! methods on `Database`.
+
+use crate::error_codes;
+use crate::errors::MediatorError;
+use crate::store::types::{RefreshRotation, Session, SessionState};
+use crate::types::{accounts::AccountType, acls::MediatorACLSet};
+use ahash::AHashMap as HashMap;
+use tracing::warn;
+
+use super::Database;
+
+impl Database {
+    /// Retrieves a session and associated other info from the database
+    pub async fn get_session(&self, session_id: &str, did: &str) -> Result<Session, MediatorError> {
+        let mut con = self.get_connection().await?;
+
+        let mut session_cmd = redis::cmd("HGETALL");
+        session_cmd.arg(format!("SESSION:{session_id}"));
+        let mut did_cmd = redis::cmd("HMGET");
+        did_cmd
+            .arg(self.keys().did(&crate::did_identity::did_hash(did)))
+            .arg("ROLE_TYPE")
+            .arg("ACLS");
+        let (session_db, did_db): (HashMap<String, String>, Vec<Option<String>>) = self
+            .query_pair(&mut con, session_cmd, did_cmd)
+            .await
+            .map_err(|err| {
+                MediatorError::session_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    session_id.into(),
+                    &err,
+                    format!("Failed to retrieve session ({session_id}). Reason: {err}"),
+                )
+            })?;
+
+        // No record: expired (Redis dropped it at its TTL), deleted, or never
+        // there. The client must authenticate again; not a server fault.
+        if session_db.is_empty() {
+            return Err(crate::store::session_not_found(session_id));
+        }
+
+        let mut session: Session = Session {
+            session_id: session_id.into(),
+            ..Default::default()
+        };
+
+        if let Some(challenge) = session_db.get("challenge") {
+            session.challenge.clone_from(challenge);
+        } else {
+            warn!(
+                "Session ({}): No challenge found, did_hash={}",
+                session_id,
+                crate::did_identity::did_hash(did)
+            );
+            return Err(MediatorError::SessionError(
+                error_codes::SESSION_INVALID_STATE,
+                session_id.into(),
+                "No challenge found when retrieving session".into(),
+            ));
+        }
+
+        if let Some(state) = session_db.get("state") {
+            match SessionState::try_from(state) {
+                Ok(parsed) => {
+                    // The record holds the state only; `authenticated` is
+                    // derived from it, as the other backends store it.
+                    session.authenticated = parsed == SessionState::Authenticated;
+                    session.state = parsed;
+                }
+                Err(_) => {
+                    // Corrupt session record — typically left over
+                    // from a pre-0.14.x mediator that wrote `Unknown`
+                    // via the buggy `update_refresh_token_hash` /
+                    // `update_session_authenticated` paths. The session
+                    // is irrecoverable; delete it so a stale JWT
+                    // doesn't keep tripping this on every refresh, and
+                    // surface as "not found" so the client knows to
+                    // re-authenticate instead of seeing a 503.
+                    warn!(
+                        session_id = %session_id,
+                        state = %state,
+                        "Session has unparseable state — deleting corrupt record \
+                         and asking the client to re-authenticate"
+                    );
+                    let mut con_del = self.get_connection().await?;
+                    let _: Result<(), _> = redis::cmd("DEL")
+                        .arg(format!("SESSION:{session_id}"))
+                        .query_async(&mut con_del)
+                        .await;
+                    return Err(MediatorError::Unauthorized(
+                        error_codes::SESSION_INVALID_STATE,
+                        session_id.into(),
+                        "Session record was corrupt; please re-authenticate".into(),
+                    ));
+                }
+            }
+        } else {
+            warn!("Session ({}): No state found", session_id);
+            return Err(MediatorError::SessionError(
+                error_codes::SESSION_INVALID_STATE,
+                session_id.into(),
+                "No state found when retrieving session".into(),
+            ));
+        }
+
+        if let Some(did) = session_db.get("did") {
+            session.did = did.into();
+            session.did_hash = crate::did_identity::did_hash(did);
+        } else {
+            warn!("Session ({}): No DID found", session_id);
+            return Err(MediatorError::SessionError(
+                error_codes::SESSION_INVALID_STATE,
+                session_id.into(),
+                "No DID found when retrieving session".into(),
+            ));
+        }
+
+        // A DID gets its account only once it has answered the challenge, so
+        // a `ChallengeSent` session normally has no `DID:` record to join.
+        // Return it with default ACLs; the login handlers apply the
+        // admission policy themselves. Any later state requires the account,
+        // so removing an account ends its sessions.
+        if did_db.iter().all(Option::is_none) {
+            if session.state == SessionState::ChallengeSent {
+                return Ok(session);
+            }
+            return Err(crate::store::account_gone(session_id));
+        }
+
+        // A DID record without a role is not an account (one an earlier
+        // build left behind after removing the account): answered as the
+        // account being gone, as the other backends, which hold accounts
+        // whole, would.
+        if let Some(Some(role_type)) = did_db.first() {
+            session.account_type = AccountType::from(role_type.as_str());
+        } else {
+            warn!(
+                "{}: account record has no role; treating the account as gone",
+                session_id
+            );
+            return Err(crate::store::account_gone(session_id));
+        }
+        if let Some(acls) = did_db.get(1) {
+            if let Some(acls) = acls {
+                session.acls = match u64::from_str_radix(acls, 16) {
+                    Ok(acl) => MediatorACLSet::from_u64(acl),
+                    Err(err) => {
+                        warn!(
+                            "{}: Error parsing acls({})! Error: {}",
+                            session_id, acls, err
+                        );
+                        return Err(MediatorError::SessionError(
+                            error_codes::DB_OPERATION_ERROR,
+                            session_id.into(),
+                            "Failed to parse ACLs for session".into(),
+                        ));
+                    }
+                }
+            } else {
+                warn!(
+                    "{}: account record has no ACLs; treating the account as gone",
+                    session_id
+                );
+                return Err(crate::store::account_gone(session_id));
+            }
+        } else {
+            warn!("{}: Error parsing acls!", session_id);
+            return Err(MediatorError::SessionError(
+                error_codes::SESSION_INVALID_STATE,
+                session_id.into(),
+                "No ACL found when retrieving session".into(),
+            ));
+        }
+
+        Ok(session)
+    }
+
+    /// Updates a session in the database to become authenticated
+    pub async fn update_session_authenticated(
+        &self,
+        old_session_id: &str,
+        new_session_id: &str,
+        did_hash: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        if self.keys().cluster_mode() {
+            return self
+                .update_session_authenticated_in_steps(
+                    old_session_id,
+                    new_session_id,
+                    did_hash,
+                    refresh_token_hash,
+                )
+                .await;
+        }
+        let mut con = self.get_connection().await?;
+
+        let old_sid = format!("SESSION:{old_session_id}");
+        let new_sid = format!("SESSION:{new_session_id}");
+
+        redis::pipe()
+            .atomic()
+            .cmd("RENAME")
+            .arg(&old_sid)
+            .arg(&new_sid)
+            .cmd("HSET")
+            .arg(&new_sid)
+            .arg("state")
+            .arg(SessionState::Authenticated.to_string())
+            .arg("refresh_token_hash")
+            .arg(refresh_token_hash)
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("SESSIONS_SUCCESS")
+            .arg(1)
+            .cmd("SADD")
+            .arg("KNOWN_DIDS")
+            .arg(did_hash)
+            .expire(&new_sid, 86400)
+            .exec_async(&mut con)
+            .await
+            .map_err(|err| {
+                MediatorError::session_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    old_session_id.into(),
+                    &err,
+                    format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
+                )
+            })?;
+
+        Ok(())
+    }
+
+    /// `update_session_authenticated` for cluster mode, where the two session
+    /// keys sit in different slots and cannot be `RENAME`d. Fails closed: the
+    /// old session is read and deleted in one step before the new one is
+    /// written, so a failure can force a new login but never leaves both ids
+    /// valid.
+    async fn update_session_authenticated_in_steps(
+        &self,
+        old_session_id: &str,
+        new_session_id: &str,
+        did_hash: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut con = self.get_connection().await?;
+        let old_sid = format!("SESSION:{old_session_id}");
+        let new_sid = format!("SESSION:{new_session_id}");
+        let failed = |reason: String| {
+            MediatorError::SessionError(
+                error_codes::DB_OPERATION_ERROR,
+                old_session_id.into(),
+                format!("Failed to retrieve session ({old_session_id}). Reason: {reason}"),
+            )
+        };
+
+        let (fields, _): (HashMap<String, String>, u32) = redis::pipe()
+            .atomic()
+            .hgetall(&old_sid)
+            .del(&old_sid)
+            .query_async(&mut con)
+            .await
+            .map_err(|err| {
+                MediatorError::session_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    old_session_id.into(),
+                    &err,
+                    format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
+                )
+            })?;
+        if fields.is_empty() {
+            return Err(failed("no such session".into()));
+        }
+
+        let fields: Vec<(String, String)> = fields.into_iter().collect();
+        redis::pipe()
+            .atomic()
+            .hset_multiple(&new_sid, &fields)
+            .hset(&new_sid, "state", SessionState::Authenticated.to_string())
+            .hset(&new_sid, "refresh_token_hash", refresh_token_hash)
+            .expire(&new_sid, 86400)
+            .exec_async(&mut con)
+            .await
+            .map_err(|err| {
+                MediatorError::session_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    old_session_id.into(),
+                    &err,
+                    format!("Failed to retrieve session ({old_session_id}). Reason: {err}"),
+                )
+            })?;
+
+        // Bookkeeping beside a login that has already succeeded: a failure
+        // here must not fail the login.
+        let mut counted = redis::pipe();
+        counted
+            .cmd("HINCRBY")
+            .arg("GLOBAL")
+            .arg("SESSIONS_SUCCESS")
+            .arg(1);
+        let mut listed = redis::pipe();
+        listed.cmd("SADD").arg("KNOWN_DIDS").arg(did_hash);
+        if let Err(err) = self.exec_steps(&mut con, vec![counted, listed]).await {
+            warn!(session_id = %new_session_id, "Couldn't record a successful login: {err}");
+        }
+        Ok(())
+    }
+
+    /// Updates the stored refresh token hash for an existing authenticated session.
+    pub async fn update_refresh_token_hash(
+        &self,
+        session_id: &str,
+        refresh_token_hash: &str,
+    ) -> Result<(), MediatorError> {
+        let mut con = self.get_connection().await?;
+
+        let sid = format!("SESSION:{session_id}");
+
+        // Only an existing session is updated: a bare HSET would recreate a
+        // session that expired or ended meanwhile, as a hash with no TTL.
+        let updated: i64 = redis::Script::new(
+            r#"
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('HSET', KEYS[1], 'refresh_token_hash', ARGV[1])
+  return 1
+end
+return 0
+"#,
+        )
+        .key(&sid)
+        .arg(refresh_token_hash)
+        .invoke_async(&mut con)
+        .await
+        .map_err(|err| {
+            MediatorError::session_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                session_id.into(),
+                &err,
+                format!(
+                    "Failed to update refresh token hash for session ({session_id}). Reason: {err}"
+                ),
+            )
+        })?;
+        if updated == 0 {
+            return Err(MediatorError::SessionError(
+                error_codes::DB_OPERATION_ERROR,
+                session_id.into(),
+                format!("Session not found: {session_id}"),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Swaps the stored refresh-token hash from `presented_hash` to
+    /// `new_hash` in one server-side script, so a refresh token can be
+    /// exchanged at most once even when two requests race.
+    pub async fn rotate_refresh_token_hash(
+        &self,
+        session_id: &str,
+        presented_hash: &str,
+        new_hash: &str,
+    ) -> Result<RefreshRotation, MediatorError> {
+        let mut con = self.get_connection().await?;
+
+        // Single key, so it runs unchanged in cluster mode.
+        let outcome: i64 = redis::Script::new(
+            "local current = redis.call('HGET', KEYS[1], 'refresh_token_hash') \
+             if not current then return 0 end \
+             if current ~= ARGV[1] then return -1 end \
+             redis.call('HSET', KEYS[1], 'refresh_token_hash', ARGV[2]) \
+             return 1",
+        )
+        .key(format!("SESSION:{session_id}"))
+        .arg(presented_hash)
+        .arg(new_hash)
+        .invoke_async(&mut con)
+        .await
+        .map_err(|err| {
+            MediatorError::session_from_redis(
+                error_codes::DB_OPERATION_ERROR,
+                session_id.into(),
+                &err,
+                format!(
+                    "Failed to rotate refresh token hash for session ({session_id}). Reason: {err}"
+                ),
+            )
+        })?;
+
+        Ok(match outcome {
+            1 => RefreshRotation::Rotated,
+            -1 => RefreshRotation::Mismatch,
+            _ => RefreshRotation::Missing,
+        })
+    }
+
+    /// Retrieves the stored refresh token hash for a session.
+    pub async fn get_refresh_token_hash(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, MediatorError> {
+        let mut con = self.get_connection().await?;
+
+        let sid = format!("SESSION:{session_id}");
+
+        let hash: Option<String> = redis::Cmd::hget(&sid, "refresh_token_hash")
+            .query_async(&mut con)
+            .await
+            .map_err(|err| {
+                MediatorError::session_from_redis(
+                    error_codes::DB_OPERATION_ERROR,
+                    session_id.into(),
+                    &err,
+                    format!(
+                        "Failed to get refresh token hash for session ({session_id}). Reason: {err}"
+                    ),
+                )
+            })?;
+
+        Ok(hash)
+    }
+}

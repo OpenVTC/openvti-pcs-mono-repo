@@ -1,0 +1,4953 @@
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+#[cfg(feature = "tsp")]
+use affinidi_messaging_sdk::protocols::tsp::InboundTsp;
+use serde::{Deserialize, Serialize};
+use serde_json;
+use tracing::{debug, warn};
+
+use crate::credentials::CredentialBundle;
+
+/// Test-support types (public `SessionBackend` mock for consumers'
+/// integration tests). Compiled for unit tests and whenever the
+/// `test-support` feature is enabled by downstream crates.
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+
+// ── Session (internal) ──────────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Session {
+    client_did: String,
+    private_key: String,
+    /// `None` in the `PendingVtaBinding` state — the client DID has been
+    /// minted locally but the operator has not yet supplied the VTA DID
+    /// to bind to. `Some` in both `PendingRotation` (combined with
+    /// `needs_rotation = true`) and `Direct` (no rotation) states. See
+    /// `SessionStore::store_pending_vta_binding` + `bind_vta_did`.
+    #[serde(default)]
+    vta_did: Option<String>,
+    access_token: Option<String>,
+    access_expires_at: Option<u64>,
+    /// Origin (`scheme://host[:port]`) of the base URL `access_token` was
+    /// issued for. A cached token is reused only for a request to that same
+    /// origin; anything else re-authenticates, so a changed `#vta-rest`
+    /// endpoint never receives a token minted for a different server. `None`
+    /// on sessions written before this field existed, which therefore
+    /// re-authenticate once.
+    #[serde(default)]
+    token_origin: Option<String>,
+    /// Marks a session whose `client_did` was minted locally with no live
+    /// VTA to register it against — the user has been told to ask their
+    /// admin to run `vta acl create --did <did>`. On the first successful
+    /// authentication we atomically rotate to a fresh did:key and drop
+    /// the original from the ACL, so the DID the user initially exposed
+    /// (maybe over chat/email) does not remain long-lived.
+    #[serde(default)]
+    needs_rotation: bool,
+}
+
+/// Written by hand so the private key and access token never reach a log: a derived `Debug` would print them.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("client_did", &self.client_did)
+            .field("private_key", &"<redacted>")
+            .field("vta_did", &self.vta_did)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("access_expires_at", &self.access_expires_at)
+            .field("token_origin", &self.token_origin)
+            .field("needs_rotation", &self.needs_rotation)
+            .finish()
+    }
+}
+
+/// Pull the VTA DID out of a session or error with the deferred-setup
+/// hint. Used at every authenticated-operation entry point so a
+/// `PendingVtaBinding` session surfaces as a clean error rather than a
+/// panic when downstream code tries to unwrap.
+///
+/// This is the SDK-side defensive backstop. The CLI should gate on
+/// [`SessionStore::has_pending_vta_binding`] before reaching these
+/// functions; if it does, operators never see this string.
+fn require_vta_did(session: &Session) -> Result<&str, Box<dyn std::error::Error>> {
+    session.vta_did.as_deref().ok_or_else(|| {
+        "session is pending VTA binding — run `pnm setup continue <slug>` to supply the VTA DID"
+            .into()
+    })
+}
+
+// ── Public types ────────────────────────────────────────────────────
+
+/// Loaded session info exposed for health/diagnostics.
+///
+/// `vta_did` is `None` when the session is in the `PendingVtaBinding`
+/// state — the client DID was minted but the operator has not yet
+/// supplied the VTA DID.
+///
+/// The `private_key_multibase` is included so diagnostics can render
+/// the public half (via `did:key` derivation) without re-loading the
+/// session. `Debug` is hand-implemented to redact it.
+#[derive(Clone)]
+pub struct SessionInfo {
+    pub client_did: String,
+    pub vta_did: Option<String>,
+    pub private_key_multibase: String,
+}
+
+impl std::fmt::Debug for SessionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionInfo")
+            .field("client_did", &self.client_did)
+            .field("vta_did", &self.vta_did)
+            .field("private_key_multibase", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Status of a stored session.
+///
+/// See [`SessionInfo`] for the `vta_did` semantics. The VTA's REST URL
+/// is not part of session state — callers resolve it from the VTA DID
+/// document at runtime via [`resolve_vta_url`] or
+/// [`resolve_vta_endpoint`].
+#[derive(Debug, Clone)]
+pub struct SessionStatus {
+    pub client_did: String,
+    pub vta_did: Option<String>,
+    pub token_status: TokenStatus,
+}
+
+/// Current state of a cached access token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenStatus {
+    Valid { expires_in_secs: u64 },
+    Expired,
+    None,
+}
+
+/// Result of a successful login.
+///
+/// `vta_did` is always `Some` here — you cannot log in without one.
+/// Kept as `Option<String>` to match the cascaded field shape across
+/// the session types; callers can `.expect("login succeeded")` if they
+/// truly need the unwrapped value.
+#[derive(Debug, Clone)]
+pub struct LoginResult {
+    pub client_did: String,
+    pub vta_did: Option<String>,
+}
+
+/// Result of an authentication exchange. `Debug` is hand-implemented to
+/// redact the access token — bearer-equivalent material that should not
+/// land in `tracing::debug!("{result:?}")` or panic backtraces.
+#[derive(Clone)]
+pub struct TokenResult {
+    pub access_token: String,
+    pub access_expires_at: u64,
+}
+
+impl std::fmt::Debug for TokenResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResult")
+            .field("access_token", &"<redacted>")
+            .field("access_expires_at", &self.access_expires_at)
+            .finish()
+    }
+}
+
+// ── SessionBackend trait ────────────────────────────────────────────
+
+/// Pluggable storage backend for VTA session credentials.
+///
+/// Implement this trait to store VTA sessions in a custom backend
+/// (e.g., the same secrets store your application already uses).
+///
+/// The `key` parameter identifies the session (e.g., "default", "setup").
+/// The `value` is a JSON-serialized session blob containing credentials
+/// and cached tokens.
+pub trait SessionBackend: Send + Sync {
+    /// Load a session by key. Returns `None` if not found.
+    fn load(&self, key: &str) -> Option<String>;
+    /// Store a session. The value is JSON-serialized session data.
+    fn save(&self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>>;
+    /// Remove a session by key.
+    fn clear(&self, key: &str);
+}
+
+// ── Built-in backends ───────────────────────────────────────────────
+//
+// Each backend lives in `session/backends/<name>.rs`; the module
+// selects among them via `default_backend` based on compiled features.
+
+mod backends;
+
+use backends::default_backend;
+
+// ── SessionStore ────────────────────────────────────────────────────
+
+/// Reusable session storage for VTA authentication.
+///
+/// Uses a pluggable [`SessionBackend`] for credential persistence.
+/// By default, the backend is selected based on compiled features
+/// (keyring → azure → config-file → plaintext). Consumers can
+/// provide their own backend via [`SessionStore::with_backend`].
+pub struct SessionStore {
+    backend: Box<dyn SessionBackend>,
+}
+
+impl SessionStore {
+    /// Create a new session store with the default backend.
+    ///
+    /// The backend is selected based on compiled features:
+    /// - `keyring` → OS keyring (uses `service_name`)
+    /// - `azure-secrets` → Azure Key Vault (uses `service_name` as prefix)
+    /// - `config-session` → local JSON file (uses `sessions_dir`)
+    /// - fallback → plaintext JSON file with warning
+    pub fn new(service_name: &str, sessions_dir: PathBuf) -> Self {
+        Self {
+            backend: default_backend(service_name, sessions_dir),
+        }
+    }
+
+    /// Create a session store with a custom backend.
+    ///
+    /// Use this to integrate with your application's existing secrets
+    /// storage (e.g., AWS Secrets Manager, GCP Secret Manager, etc.).
+    pub fn with_backend(backend: Box<dyn SessionBackend>) -> Self {
+        Self { backend }
+    }
+
+    // ── Internal session serialization ───────────────────────────────
+
+    fn load_session(&self, key: &str) -> Option<Session> {
+        let json = self.backend.load(key)?;
+        serde_json::from_str(&json).ok()
+    }
+
+    fn save_session(&self, key: &str, session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string(session)?;
+        self.backend.save(key, &json)
+    }
+
+    fn clear_session(&self, key: &str) {
+        self.backend.clear(key);
+    }
+
+    // ── Public API ──────────────────────────────────────────────────
+
+    /// Returns true if a session exists for the given key.
+    pub fn has_session(&self, key: &str) -> bool {
+        self.load_session(key).is_some()
+    }
+
+    /// Authenticate with a credential bundle, then store it as the session.
+    ///
+    /// The session is written only after challenge-response succeeds. A
+    /// bundle that does not authenticate (unreachable endpoint, unknown DID,
+    /// wrong VTA) leaves whatever is stored under `key` untouched, instead of
+    /// becoming the credential later commands use.
+    ///
+    /// Returns `LoginResult` on success (no printing).
+    pub async fn login(
+        &self,
+        bundle: &CredentialBundle,
+        base_url: &str,
+        key: &str,
+    ) -> Result<LoginResult, Box<dyn std::error::Error>> {
+        debug!(
+            client_did = %bundle.did,
+            vta_did = %bundle.vta_did,
+            "login with credential bundle"
+        );
+
+        let token = challenge_response(
+            base_url,
+            &bundle.did,
+            &bundle.private_key_multibase,
+            &bundle.vta_did,
+        )
+        .await?;
+
+        let session = Session {
+            client_did: bundle.did.clone(),
+            private_key: bundle.private_key_multibase.clone(),
+            vta_did: Some(bundle.vta_did.clone()),
+            access_token: Some(token.access_token),
+            access_expires_at: Some(token.access_expires_at),
+            token_origin: url_origin(base_url),
+            needs_rotation: false,
+        };
+        self.save_session(key, &session)?;
+        debug!(keyring_key = key, "session saved");
+
+        Ok(LoginResult {
+            client_did: bundle.did.clone(),
+            vta_did: Some(bundle.vta_did.clone()),
+        })
+    }
+
+    /// Store a session directly (without performing authentication).
+    ///
+    /// The VTA's REST endpoint is resolved at runtime from the VTA DID
+    /// document on every command (see [`resolve_vta_url`] /
+    /// [`resolve_vta_endpoint`]); it is no longer persisted in session
+    /// state. Per-command CLI overrides (e.g. `--url`) remain ephemeral.
+    pub fn store_direct(
+        &self,
+        key: &str,
+        did: &str,
+        private_key: &str,
+        vta_did: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let session = Session {
+            client_did: did.to_string(),
+            private_key: private_key.to_string(),
+            vta_did: Some(vta_did.to_string()),
+            access_token: None,
+            access_expires_at: None,
+            token_origin: None,
+            needs_rotation: false,
+        };
+        self.save_session(key, &session)
+    }
+
+    /// Store a session marked for rotation on first successful authentication.
+    ///
+    /// Use this when the client has generated a did:key locally and handed
+    /// it to a human to add to the VTA's ACL. Once the VTA is reachable and
+    /// the ACL entry exists, `ensure_authenticated()` will atomically rotate
+    /// to a fresh did:key and drop the temp one, so the DID that may have
+    /// been copy-pasted through a low-trust channel does not remain live.
+    pub fn store_pending_rotation(
+        &self,
+        key: &str,
+        did: &str,
+        private_key: &str,
+        vta_did: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let session = Session {
+            client_did: did.to_string(),
+            private_key: private_key.to_string(),
+            vta_did: Some(vta_did.to_string()),
+            access_token: None,
+            access_expires_at: None,
+            token_origin: None,
+            needs_rotation: true,
+        };
+        self.save_session(key, &session)
+    }
+
+    /// Store an ephemeral did:key with no VTA DID bound yet.
+    ///
+    /// This is the `PendingVtaBinding` state used by the deferred-VTA-DID
+    /// `pnm setup` flow: phase 1 mints the DID and parks it in the keyring;
+    /// phase 2 lifts the entry into a `PendingRotation` session via
+    /// [`Self::bind_vta_did`] once the operator supplies the VTA DID.
+    ///
+    /// A session in this state is **not** usable for authentication. Callers
+    /// should gate authenticated operations on
+    /// [`Self::has_pending_vta_binding`] and route operators to
+    /// `pnm setup continue <slug>` before attempting to authenticate.
+    pub fn store_pending_vta_binding(
+        &self,
+        key: &str,
+        did: &str,
+        private_key: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if key.trim().is_empty() {
+            return Err("keyring key must be non-empty".into());
+        }
+        if !did.starts_with("did:key:") {
+            return Err(
+                "pending ephemeral DID must be a did:key (minted locally by the SDK)".into(),
+            );
+        }
+        if private_key.trim().is_empty() {
+            return Err("private key multibase must be non-empty".into());
+        }
+        let session = Session {
+            client_did: did.to_string(),
+            private_key: private_key.to_string(),
+            vta_did: None,
+            access_token: None,
+            access_expires_at: None,
+            token_origin: None,
+            needs_rotation: false,
+        };
+        self.save_session(key, &session)
+    }
+
+    /// Lift a `PendingVtaBinding` session into a `PendingRotation` session
+    /// by supplying the VTA DID.
+    ///
+    /// Preserves the ephemeral did:key + private key from phase 1 and sets
+    /// `needs_rotation = true`, so the first successful authenticate triggers
+    /// the same auto-rotate-off-the-temp-DID flow as
+    /// [`Self::store_pending_rotation`].
+    ///
+    /// Errors if:
+    /// - the entry is missing at `key`;
+    /// - the entry already has a VTA DID bound (re-binding is not allowed —
+    ///   use `logout` + re-provision instead);
+    /// - `vta_did` is empty after trim, or does not start with `did:`.
+    pub fn bind_vta_did(&self, key: &str, vta_did: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let vta_did = vta_did.trim();
+        if vta_did.is_empty() {
+            return Err("VTA DID must be non-empty".into());
+        }
+        if !vta_did.starts_with("did:") {
+            return Err(
+                "VTA DID must start with `did:` (e.g. did:webvh:..., did:web:..., did:key:...)"
+                    .into(),
+            );
+        }
+        let mut session = self
+            .load_session(key)
+            .ok_or("no session found — cannot bind VTA DID to a non-existent entry")?;
+        if session.vta_did.is_some() {
+            return Err("session already has a VTA DID bound".into());
+        }
+        session.vta_did = Some(vta_did.to_string());
+        session.needs_rotation = true;
+        self.save_session(key, &session)
+    }
+
+    /// Report whether the entry at `key` is a `PendingVtaBinding` session
+    /// (exists, parses, and has `vta_did: None`). Total — no errors.
+    pub fn has_pending_vta_binding(&self, key: &str) -> bool {
+        match self.load_session(key) {
+            Some(session) => session.vta_did.is_none(),
+            None => false,
+        }
+    }
+
+    /// Clear stored credentials and cached tokens.
+    pub fn logout(&self, key: &str) {
+        self.clear_session(key);
+    }
+
+    /// Load the stored session for diagnostics (DID resolution, etc.).
+    pub fn loaded_session(&self, key: &str) -> Option<SessionInfo> {
+        self.load_session(key).map(|s| SessionInfo {
+            client_did: s.client_did,
+            vta_did: s.vta_did,
+            private_key_multibase: s.private_key,
+        })
+    }
+
+    /// Get the status of a stored session.
+    pub fn session_status(&self, key: &str) -> Option<SessionStatus> {
+        let session = self.load_session(key)?;
+        let token_status = match (session.access_token, session.access_expires_at) {
+            (Some(_), Some(exp)) => {
+                let now = now_epoch();
+                if exp > now {
+                    TokenStatus::Valid {
+                        expires_in_secs: exp - now,
+                    }
+                } else {
+                    TokenStatus::Expired
+                }
+            }
+            _ => TokenStatus::None,
+        };
+        Some(SessionStatus {
+            client_did: session.client_did,
+            vta_did: session.vta_did,
+            token_status,
+        })
+    }
+
+    /// Ensure we have a valid access token. Returns the token string.
+    ///
+    /// If no credentials are stored, returns an error.
+    /// If a cached token is still valid (>30s remaining) and was issued for the
+    /// same origin as `base_url`, returns it.
+    /// Otherwise, performs a full challenge-response authentication.
+    ///
+    /// When the loaded session is flagged `needs_rotation`, the first
+    /// successful challenge-response triggers an automatic key roll:
+    /// a fresh did:key is minted, the VTA ACL entry for the temp DID is
+    /// mirrored onto the new DID, the temp DID is removed from the ACL,
+    /// and the session is updated in place. See `rotate_key`.
+    ///
+    /// # Only for the session's own VTA
+    ///
+    /// The audience is not a parameter: it is always the session's bound VTA
+    /// DID (the authenticate envelope is encrypted to it), and the rotation
+    /// above is a VTA ACL operation. `base_url` says *where* that VTA is, not
+    /// *who* to authenticate to. Handing this a VTC's URL — or any other
+    /// service's — produces an envelope only the VTA can open, which the other
+    /// service refuses; that is how `cnm vetting`, `cnm audit` and `cnm backup`
+    /// all failed to sign in to a VTC. Authenticate to another service with
+    /// its own DID as the audience instead:
+    /// [`crate::auth_light::challenge_response_light`], or
+    /// `vtc_client::VtcClient::connect` for a VTC.
+    pub async fn ensure_authenticated(
+        &self,
+        base_url: &str,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        debug!(base_url, keyring_key = key, "ensuring authentication");
+
+        let mut session = self.load_session(key).ok_or(
+            "Not authenticated.\n\nRun `pnm setup` (or the equivalent) to provision an admin identity.",
+        )?;
+
+        let session_vta_did = require_vta_did(&session)?.to_string();
+
+        debug!(
+            client_did = %session.client_did,
+            vta_did = %session_vta_did,
+            needs_rotation = session.needs_rotation,
+            "session loaded"
+        );
+
+        // Check cached token — but only if we're not pending rotation.
+        // A cached token on a pending-rotation session means we rotated in
+        // a previous call already, which `rotate_key` handled atomically.
+        //
+        // It must also have been issued for the origin being called. A token is
+        // a bearer credential: if `base_url` now points somewhere else (a
+        // changed `#vta-rest` advertisement, a different `--url`), returning it
+        // would hand that server a live token for this VTA.
+        let requested_origin = url_origin(base_url);
+        if !session.needs_rotation
+            && let (Some(token), Some(expires_at)) =
+                (&session.access_token, session.access_expires_at)
+            && now_epoch() + 30 < expires_at
+        {
+            if requested_origin.is_some() && session.token_origin == requested_origin {
+                debug!(expires_in = expires_at - now_epoch(), "using cached token");
+                return Ok(token.clone());
+            }
+            debug!(
+                cached_origin = ?session.token_origin,
+                requested_origin = ?requested_origin,
+                "cached token belongs to a different origin; re-authenticating"
+            );
+        }
+
+        debug!("cached token expired or missing, performing challenge-response");
+
+        // Full challenge-response with the current (possibly temp) identity.
+        let result = challenge_response(
+            base_url,
+            &session.client_did,
+            &session.private_key,
+            &session_vta_did,
+        )
+        .await?;
+
+        // If the session was provisioned as a temp did:key, rotate now —
+        // before we return the token to the caller or persist the temp
+        // token in the session.
+        if session.needs_rotation {
+            debug!("session is pending rotation, swapping to fresh did:key");
+
+            // The swap rides `acl/swap-key` like every other transport's does,
+            // so it needs a client — not a hand-rolled `POST /acl/swap`. Built
+            // directly rather than via `rest_client`, which would recurse back
+            // into this function; the token in hand is the temp DID's.
+            let temp_client = crate::client::VtaClient::authenticated(
+                base_url,
+                crate::client::ClientIdentity {
+                    client_did: session.client_did.clone(),
+                    private_key_multibase: session.private_key.clone(),
+                    vta_did: session_vta_did.clone(),
+                    verification_method: None,
+                },
+                result.access_token.clone(),
+            )
+            .await;
+
+            // If this VTA advertises a mediator, the new DID must be able to
+            // reach it *before* the swap commits — see `rotate_key_over_client`.
+            // A pure-REST VTA resolves to none and skips the probe.
+            let mediator_did = resolve_mediator_did(&session_vta_did).await.ok().flatten();
+            session = rotate_key_over_client(
+                &temp_client,
+                &session,
+                &session_vta_did,
+                // Best-effort: this client talks to the VTA over HTTP and never
+                // touches the mediator, so an unreachable one must not block the
+                // rotation itself.
+                MediatorProbe::best_effort(mediator_did.as_deref()),
+            )
+            .await?;
+
+            // Authenticate under the new DID: this both yields the token the
+            // caller asked for and confirms the swap actually landed.
+            let new_token_result = challenge_response(
+                base_url,
+                &session.client_did,
+                &session.private_key,
+                &session_vta_did,
+            )
+            .await
+            .map_err(|e| format!("rotate: new DID failed challenge-response after swap: {e}"))?;
+            session.access_token = Some(new_token_result.access_token.clone());
+            session.access_expires_at = Some(new_token_result.access_expires_at);
+            session.token_origin = requested_origin.clone();
+            self.save_session(key, &session)?;
+
+            return Ok(new_token_result.access_token);
+        }
+
+        let token = result.access_token.clone();
+        session.access_token = Some(result.access_token);
+        session.access_expires_at = Some(result.access_expires_at);
+        session.token_origin = requested_origin;
+        self.save_session(key, &session)?;
+        debug!("new token cached");
+
+        Ok(token)
+    }
+
+    /// Authenticate to a VTA over DIDComm and return a connected
+    /// [`crate::client::VtaClient`].
+    ///
+    /// DIDComm-preferred peer of [`Self::ensure_authenticated`]. Where
+    /// the REST path issues a JWT via challenge-response, this path
+    /// uses DIDComm authcrypt as the auth: every outbound message is
+    /// encrypted to the VTA's recipient key, the VTA decrypts and
+    /// reads `from` as the authenticated sender DID, then ACL-checks
+    /// it (see `vta-service/src/messaging/auth.rs::auth_for_trust_task_envelope`).
+    /// No JWT changes hands; no token to expire.
+    ///
+    /// Pending-rotation parity with the REST path: when the loaded
+    /// session is flagged `needs_rotation`, the first successful
+    /// connection triggers a key roll over the same DIDComm transport
+    /// — read the temp DID's ACL entry, mint a fresh did:key, create
+    /// a new ACL entry mirroring the role + contexts, probe the new
+    /// DID by opening a second DIDComm session, then drop the temp
+    /// DID. The new session is persisted in place; the returned
+    /// client is connected as the new DID.
+    ///
+    /// Errors with a clear message if the VTA's DID document does not
+    /// advertise a DIDComm service endpoint — caller should fall back
+    /// to [`Self::ensure_authenticated`] for REST.
+    #[cfg(feature = "session")]
+    pub async fn ensure_authenticated_didcomm(
+        &self,
+        key: &str,
+    ) -> Result<crate::client::VtaClient, Box<dyn std::error::Error>> {
+        let session = self.load_session(key).ok_or(
+            "Not authenticated.\n\nRun `pnm setup` (or the equivalent) to provision an admin identity.",
+        )?;
+
+        let session_vta_did = require_vta_did(&session)?.to_string();
+
+        debug!(
+            client_did = %session.client_did,
+            vta_did = %session_vta_did,
+            needs_rotation = session.needs_rotation,
+            "ensure_authenticated_didcomm: session loaded"
+        );
+
+        let (vta_did, mediator_did, rest_url) = match resolve_vta_endpoint(&session_vta_did).await?
+        {
+            VtaEndpoint::DIDComm {
+                vta_did,
+                mediator_did,
+                rest_url,
+            } => (vta_did, mediator_did, rest_url),
+            // A TSP-advertising VTA may *also* advertise DIDComm. This function
+            // is explicitly the DIDComm path (its caller wants a
+            // `DIDCommSession`), so take the DIDComm mediator out of the TSP
+            // result rather than refusing a VTA that plainly offers one.
+            VtaEndpoint::Tsp {
+                vta_did,
+                didcomm_mediator_did: Some(mediator_did),
+                rest_url,
+                ..
+            } => (vta_did, mediator_did, rest_url),
+            VtaEndpoint::Tsp { .. } | VtaEndpoint::Rest { .. } => {
+                return Err(format!(
+                    "VTA '{session_vta_did}' does not advertise a DIDComm service endpoint. \
+                     Use SessionStore::ensure_authenticated for REST, or \
+                     SessionStore::connect to auto-select."
+                )
+                .into());
+            }
+        };
+
+        // Open the DIDComm session as the (possibly temp) DID.
+        //
+        // Bounded, like every other DIDComm connect in this file: this path is
+        // reached from `connect_with_transport` whenever a session is pending
+        // rotation, so an unbounded connect here would turn an unreachable
+        // mediator from "errors in 30s naming `--transport rest`" back into an
+        // indefinite hang for exactly the operators least able to diagnose it.
+        let client = connect_didcomm_bounded(
+            &session.client_did,
+            &session.private_key,
+            &vta_did,
+            &mediator_did,
+            rest_url.clone(),
+        )
+        .await?;
+
+        if !session.needs_rotation {
+            return Ok(client);
+        }
+
+        debug!("session is pending rotation, swapping to fresh did:key over DIDComm");
+        self.rotate_and_reconnect(
+            key,
+            client,
+            &session,
+            &vta_did,
+            &mediator_did,
+            // This *is* the DIDComm mediator, so it is also where the account
+            // pass goes.
+            Some(&mediator_did),
+            rest_url,
+            RotationTransport::Didcomm,
+        )
+        .await
+    }
+
+    /// Rotate a pending session over an already-open `temp` client, persist it,
+    /// and return a client reconnected as the rotated DID.
+    ///
+    /// Shared by the DIDComm and TSP rotation paths — the only difference
+    /// between them is which connector reopens the socket, so they differ by
+    /// one `match` rather than by a whole duplicated flow.
+    #[allow(clippy::too_many_arguments)]
+    async fn rotate_and_reconnect(
+        &self,
+        key: &str,
+        temp: crate::client::VtaClient,
+        session: &Session,
+        vta_did: &str,
+        mediator_did: &str,
+        didcomm_mediator_did: Option<&str>,
+        rest_url: Option<String>,
+        via: RotationTransport,
+    ) -> Result<crate::client::VtaClient, Box<dyn std::error::Error>> {
+        // The reconnect below rides this mediator, so a new DID that cannot
+        // reach it must not be committed to.
+        let probe = match via {
+            RotationTransport::Didcomm => MediatorProbe::Didcomm {
+                mediator_did,
+                required: true,
+            },
+            // The TSP mediator proves reachability; the account still needs a
+            // DIDComm mediator to be issued through, and on a dual-transport
+            // VTA that is this same node.
+            RotationTransport::Tsp => MediatorProbe::Tsp {
+                mediator_did,
+                didcomm_mediator_did,
+            },
+        };
+        let rotated = rotate_key_over_client(&temp, session, vta_did, probe).await;
+
+        // Tear the temp client down on *every* path, success or not. There is
+        // no `Drop` impl, and an abandoned session keeps auto-reconnecting while
+        // holding the mediator's one-socket-per-DID slot — so an early `?` here
+        // would leak a socket that duels with the reconnect below.
+        temp.shutdown().await;
+        let rotated = rotated?;
+
+        self.save_session(key, &rotated)?;
+
+        match via {
+            RotationTransport::Didcomm => {
+                connect_didcomm_bounded(
+                    &rotated.client_did,
+                    &rotated.private_key,
+                    vta_did,
+                    mediator_did,
+                    rest_url,
+                )
+                .await
+            }
+            RotationTransport::Tsp => {
+                connect_tsp_bounded(
+                    &rotated.client_did,
+                    &rotated.private_key,
+                    vta_did,
+                    mediator_did,
+                    rest_url,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Connect to a VTA using the preferred transport (DIDComm or REST).
+    ///
+    /// Transport selection priority:
+    /// 1. If `mediator_did_hint` is provided → DIDComm (pinned, no discovery).
+    /// 2. If VTA DID doc has DIDCommMessaging service → DIDComm (resolved).
+    /// 3. If `url_override` is provided → authenticate over REST, then ask the
+    ///    VTA's status endpoint whether DIDComm is live and prefer it if so.
+    /// 4. REST-only (from DID doc or url_override).
+    ///
+    /// Note `url_override` is a *fallback hint*, not a force-REST switch: a VTA
+    /// DID that resolves to a DIDComm endpoint (priority 2) still uses DIDComm
+    /// even when `--url` is supplied. The override only takes effect when DID
+    /// resolution yields nothing usable (e.g. `did:key`). To force REST
+    /// regardless of what the DID document advertises, use
+    /// [`connect_with_transport`](Self::connect_with_transport) with
+    /// [`TransportChoice::Rest`].
+    ///
+    /// An authenticated REST client carrying the identity it signs with.
+    ///
+    /// Public because every caller that authenticates against a VTA needs this
+    /// exact triple — token, client DID, key — and assembling it by hand is how
+    /// five call sites shipped without the identity. `pnm`, `cnm` and the
+    /// provisioning runners all go through here.
+    ///
+    /// The session is re-loaded *after* `ensure_authenticated` on purpose: a
+    /// session that needed rotation now holds a different `client_did` and key,
+    /// and signing with the pre-rotation pair would produce documents whose
+    /// `issuer` no longer matches the identity the bearer token authenticates —
+    /// which SPEC §7.2 item 6 rejects.
+    pub async fn rest_client(
+        &self,
+        url: &str,
+        key: &str,
+    ) -> Result<crate::client::VtaClient, Box<dyn std::error::Error>> {
+        let token = self.ensure_authenticated(url, key).await?;
+        let session = self
+            .load_session(key)
+            .ok_or_else(|| format!("session `{key}` vanished during authentication"))?;
+        let vta_did = require_vta_did(&session)?.to_string();
+        Ok(crate::client::VtaClient::authenticated(
+            url,
+            crate::client::ClientIdentity {
+                client_did: session.client_did.clone(),
+                private_key_multibase: session.private_key.clone(),
+                vta_did,
+                verification_method: None,
+            },
+            token,
+        )
+        .await)
+    }
+
+    pub async fn connect(
+        &self,
+        key: &str,
+        url_override: Option<&str>,
+        mediator_did_hint: Option<&str>,
+    ) -> Result<crate::client::VtaClient, Box<dyn std::error::Error>> {
+        self.connect_with_transport(key, url_override, mediator_did_hint, TransportChoice::Auto)
+            .await
+    }
+
+    /// Like [`connect`](Self::connect) but with an explicit transport choice.
+    ///
+    /// [`TransportChoice::Auto`] implements the workspace preference order —
+    /// **TSP > DIDComm > REST** — and falls back *loudly*; see the enum's docs
+    /// for why that policy and not a hard failure. Every mediator connect is
+    /// bounded ([`TSP_CONNECT_TIMEOUT_DEFAULT`],
+    /// [`DIDCOMM_CONNECT_TIMEOUT_DEFAULT`]) so an unreachable mediator errors
+    /// out naming a recovery flag rather than hanging — without that ceiling,
+    /// `Auto` preferring TSP would convert today's working DIDComm story into
+    /// an indefinite hang with no output.
+    ///
+    /// Against a VTA advertising **both** TSP and DIDComm, `Auto` returns a
+    /// DIDComm client with a TSP leg: Trust Tasks go over TSP, and the DIDComm
+    /// session stays open as the mediator's one socket per DID, on which TSP
+    /// receive arrives.
+    ///
+    /// [`TransportChoice::Tsp`] forces a TSP-*only* client: errors if the VTA
+    /// advertises no `#tsp` service (naming what it *does* advertise), and
+    /// errors rather than falling back if the connect times out.
+    ///
+    /// [`TransportChoice::Didcomm`] forces DIDComm, ignoring an advertised
+    /// `#tsp` — the recovery path when TSP is broken but the DIDComm mediator
+    /// is healthy.
+    ///
+    /// [`TransportChoice::Rest`] forces REST — ignoring the mediator hint and
+    /// any advertised TSP/DIDComm — using `url_override`, else the `#vta-rest`
+    /// service on the VTA's DID document. Errors if the VTA advertises neither
+    /// and no `url_override` was given; unlike the auto path it will *not* fall
+    /// back to a URL synthesized from the DID's domain, which for a hosted
+    /// `did:webvh` points at the DID host rather than the VTA.
+    ///
+    /// This is the recovery path for an unreachable mediator.
+    pub async fn connect_with_transport(
+        &self,
+        key: &str,
+        url_override: Option<&str>,
+        mediator_did_hint: Option<&str>,
+        transport: TransportChoice,
+    ) -> Result<crate::client::VtaClient, Box<dyn std::error::Error>> {
+        let session = self.load_session(key).ok_or(
+            "Not authenticated: no session is stored for this VTA.\n\nSet one up with `pnm setup` (pnm) or `cnm auth login --credential-bundle <file>` (cnm).",
+        )?;
+
+        let session_vta_did = require_vta_did(&session)?.to_string();
+
+        // Forced REST: skip DIDComm (priorities 1 & 2). Resolve the REST
+        // endpoint (`--url`, else the DID doc's `#vta-rest`) and auth over HTTP.
+        if transport == TransportChoice::Rest {
+            let url = match url_override {
+                Some(u) => u.to_string(),
+                // Deliberately *not* `resolve_vta_url` — that falls back to a
+                // URL synthesized from the DID's own domain, which for a
+                // `did:webvh` is the DID *host*, not the VTA. Authenticating
+                // against the wrong origin fails in a way no operator can
+                // diagnose, so demand a real advertisement or an explicit
+                // `--url`.
+                None => rest_url_from_did_doc(&session_vta_did)
+                    .await?
+                    .ok_or_else(|| no_rest_endpoint_error(&session_vta_did))?,
+            };
+            debug!(url = %url, "connecting via REST (forced --transport rest)");
+            let client = self.rest_client(&url, key).await?;
+            return Ok(client);
+        }
+
+        // A pending-rotation session must swap its temp did:key before *any*
+        // mediator connect below, not just the one arm that used to check.
+        //
+        // Only the REST path (`rest_client` → `ensure_authenticated`) rotates on
+        // its own, so every other priority here would otherwise connect with the
+        // temp key and return, leaving the session flagged `needs_rotation`
+        // forever. That is three paths, not one: the explicit `mediator_did`
+        // config hint (priority 1), the `DIDComm` arm, and the `Tsp` arm — and a
+        // VTA advertising both TSP and DIDComm never reaches the `DIDComm` arm
+        // at all, so checking there alone left dual-transport deployments, the
+        // direction the workspace is moving, permanently unrotated.
+        //
+        // Which transport carries it follows the workspace preference order:
+        // TSP if the VTA advertises it, else DIDComm. `acl/swap-key` is a
+        // dispatched Trust Task, so the rotation is the same either way — only
+        // the socket differs. A REST-only VTA falls through to the paths below,
+        // where `rest_client` → `ensure_authenticated` rotates over REST.
+        // Resolution runs only while a rotation is pending — once per session
+        // lifetime — so the hint's resolution-free fast path is unaffected in
+        // steady state.
+        if session.needs_rotation && transport != TransportChoice::Rest {
+            match rotation_endpoint(&session_vta_did, transport).await {
+                Some((via, vta_did, rotation_mediator, account_mediator, rest_url)) => {
+                    debug!(
+                        ?via,
+                        "session is pending rotation, swapping to a fresh did:key"
+                    );
+                    let temp = match via {
+                        RotationTransport::Didcomm => {
+                            connect_didcomm_bounded(
+                                &session.client_did,
+                                &session.private_key,
+                                &vta_did,
+                                &rotation_mediator,
+                                rest_url.clone(),
+                            )
+                            .await?
+                        }
+                        RotationTransport::Tsp => {
+                            connect_tsp_bounded(
+                                &session.client_did,
+                                &session.private_key,
+                                &vta_did,
+                                &rotation_mediator,
+                                rest_url.clone(),
+                            )
+                            .await?
+                        }
+                    };
+                    return self
+                        .rotate_and_reconnect(
+                            key,
+                            temp,
+                            &session,
+                            &vta_did,
+                            &rotation_mediator,
+                            account_mediator.as_deref(),
+                            rest_url,
+                            via,
+                        )
+                        .await;
+                }
+                // No mediator transport to rotate over. Fall through: a
+                // REST-reachable VTA still rotates via `ensure_authenticated`.
+                None => debug!("rotation pending but no TSP/DIDComm endpoint; leaving it to REST"),
+            }
+        }
+
+        // Priority 1: Explicit mediator DID from config → DIDComm directly.
+        // Skipped under `--transport tsp`: the hint names a *DIDComm* mediator,
+        // so honouring it would silently serve DIDComm to an operator who
+        // explicitly asked for TSP.
+        if let Some(mediator_did) = mediator_did_hint
+            && transport != TransportChoice::Tsp
+        {
+            debug!(mediator_did, "connecting via DIDComm (config mediator_did)");
+            let client = connect_didcomm_bounded(
+                &session.client_did,
+                &session.private_key,
+                &session_vta_did,
+                mediator_did,
+                url_override.map(|s| s.to_string()),
+            )
+            .await?;
+            return Ok(client);
+        }
+
+        // Priority 2: Resolve VTA DID for transport selection. An explicit
+        // `--url` replaces whatever REST base the resolution produced — see
+        // `VtaEndpoint::with_rest_override`.
+        match resolve_vta_endpoint(&session_vta_did)
+            .await
+            .map(|e| e.with_rest_override(url_override))
+        {
+            Ok(VtaEndpoint::Tsp {
+                vta_did,
+                mediator_did,
+                didcomm_mediator_did,
+                rest_url,
+            }) => {
+                // Forced DIDComm ignores the advertised `#tsp` entirely.
+                if transport == TransportChoice::Didcomm {
+                    let Some(didcomm_mediator_did) = didcomm_mediator_did else {
+                        return Err(no_didcomm_endpoint_error(
+                            &vta_did,
+                            true,
+                            rest_url.is_some(),
+                        ));
+                    };
+                    debug!("connecting via DIDComm (forced --transport didcomm)");
+                    let client = connect_didcomm_bounded(
+                        &session.client_did,
+                        &session.private_key,
+                        &vta_did,
+                        &didcomm_mediator_did,
+                        rest_url,
+                    )
+                    .await?;
+                    return Ok(client);
+                }
+
+                // Both transports advertised, and the operator did not force
+                // one: build a DIDComm session and attach a TSP leg to it, so
+                // Trust Tasks go over TSP while the DIDComm session holds the
+                // mediator's one socket per DID (TSP receive arrives on it).
+                //
+                // Not a standalone TSP session beside a DIDComm one: a second
+                // websocket for the same DID is evicted as `duplicate-channel`
+                // and the two reconnect loops duel (#803).
+                if let Some(didcomm) = didcomm_mediator_did.clone()
+                    && transport != TransportChoice::Tsp
+                {
+                    match connect_didcomm_bounded(
+                        &session.client_did,
+                        &session.private_key,
+                        &vta_did,
+                        &didcomm,
+                        rest_url.clone(),
+                    )
+                    .await
+                    {
+                        Ok(mut client) => {
+                            match attach_tsp_leg_bounded(
+                                &mut client,
+                                &session.client_did,
+                                &session.private_key,
+                                &vta_did,
+                                &didcomm,
+                                &mediator_did,
+                            )
+                            .await
+                            {
+                                Ok(()) => debug!(
+                                    tsp_mediator_did = %mediator_did,
+                                    "connected via DIDComm with trust tasks over TSP"
+                                ),
+                                // `Auto` falls back, but never quietly: a TSP
+                                // deployment that never works must not look like
+                                // one that was never enabled. See
+                                // `TransportChoice`.
+                                Err(e) => warn!(
+                                    vta_did = %vta_did,
+                                    tsp_mediator_did = %mediator_did,
+                                    error = %e,
+                                    "TSP is advertised but its leg could not be established; \
+                                     trust tasks stay on DIDComm (use --transport tsp to make \
+                                     this fatal, or --transport didcomm to stop trying TSP)"
+                                ),
+                            }
+                            return Ok(client);
+                        }
+                        Err(e) => {
+                            // DIDComm is down but TSP may not be. Drop to the
+                            // TSP-only client below rather than failing outright
+                            // — loudly, because the advertised DIDComm mediator
+                            // is unreachable.
+                            warn!(
+                                vta_did = %vta_did,
+                                didcomm_mediator_did = %didcomm,
+                                error = %e,
+                                "the DIDComm mediator did not answer; falling back to a \
+                                 TSP-only client"
+                            );
+                        }
+                    }
+                }
+
+                match connect_tsp_bounded(
+                    &session.client_did,
+                    &session.private_key,
+                    &vta_did,
+                    &mediator_did,
+                    rest_url.clone(),
+                )
+                .await
+                {
+                    Ok(client) => return Ok(client),
+                    // Forced TSP never falls back — that is the whole point of
+                    // asking for it by name.
+                    Err(e) if transport == TransportChoice::Tsp => return Err(e),
+                    Err(e) => {
+                        // `Auto` falls back, but never quietly: a TSP
+                        // deployment that never works must not look like one
+                        // that was never enabled. See `TransportChoice`.
+                        warn!(
+                            vta_did = %vta_did,
+                            tsp_mediator_did = %mediator_did,
+                            error = %e,
+                            "TSP is advertised but the connect failed; falling back \
+                             (use --transport tsp to make this fatal, or \
+                             --transport didcomm to stop trying TSP)"
+                        );
+                    }
+                }
+
+                if let Some(didcomm_mediator_did) = didcomm_mediator_did {
+                    debug!("connecting via DIDComm (fallback from TSP)");
+                    let client = connect_didcomm_bounded(
+                        &session.client_did,
+                        &session.private_key,
+                        &vta_did,
+                        &didcomm_mediator_did,
+                        rest_url,
+                    )
+                    .await?;
+                    return Ok(client);
+                }
+                if let Some(url) = rest_url {
+                    debug!(url = %url, "connecting via REST (fallback from TSP)");
+                    let client = self.rest_client(&url, key).await?;
+                    return Ok(client);
+                }
+                // TSP-only VTA whose TSP is down: there is nothing to fall back
+                // to, so report the TSP failure rather than a generic one.
+                return Err(tsp_unreachable_error(&mediator_did, tsp_connect_timeout()).into());
+            }
+            Ok(VtaEndpoint::DIDComm {
+                vta_did,
+                mediator_did,
+                rest_url,
+            }) => {
+                // `--transport tsp` against a VTA that only speaks DIDComm is an
+                // error, not a silent downgrade — R6.4: name what it *does*
+                // advertise so the operator can pick.
+                if transport == TransportChoice::Tsp {
+                    return Err(no_tsp_endpoint_error(&vta_did, true, rest_url.is_some()));
+                }
+                debug!("connecting via DIDComm");
+                let client = connect_didcomm_bounded(
+                    &session.client_did,
+                    &session.private_key,
+                    &vta_did,
+                    &mediator_did,
+                    rest_url,
+                )
+                .await?;
+                return Ok(client);
+            }
+            Ok(VtaEndpoint::Rest { url }) => {
+                if transport == TransportChoice::Tsp {
+                    return Err(no_tsp_endpoint_error(&session_vta_did, false, true));
+                }
+                if transport == TransportChoice::Didcomm {
+                    return Err(no_didcomm_endpoint_error(&session_vta_did, false, true));
+                }
+                debug!(url = %url, "connecting via REST (from DID doc)");
+                let client = self.rest_client(&url, key).await?;
+                return Ok(client);
+            }
+            Err(e) => {
+                debug!(error = %e, "DID resolution failed, trying URL-based fallback");
+                // A forced mediator transport cannot be served from a URL
+                // fallback — there is no mediator DID to route through — so
+                // stop here rather than silently continuing to the REST path.
+                if matches!(transport, TransportChoice::Tsp | TransportChoice::Didcomm) {
+                    return Err(format!(
+                        "--transport {}: could not resolve VTA DID '{session_vta_did}', so its \
+                         advertised transports are unknown: {e}\n\nRetry without forcing a \
+                         transport, or reach the VTA over REST:\n  \
+                         <cli> --transport rest --url https://vta.example.com <command>",
+                        if transport == TransportChoice::Tsp {
+                            "tsp"
+                        } else {
+                            "didcomm"
+                        }
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Priority 3 & 4: URL override. Authenticate over REST first (needed for
+        // either outcome), then ask the *authenticated* status endpoint whether
+        // DIDComm is live. `GET /services/didcomm` is super-admin-gated, so an
+        // unauthenticated probe can never succeed — discovery must reuse the
+        // token we just obtained. Prefer DIDComm if available, otherwise keep
+        // the REST client we already built.
+        if let Some(url) = url_override {
+            // Via `rest_client` so the identity travels with the token: this
+            // client is used for the authenticated status probe *and* kept as
+            // the fallback when DIDComm is not available, so a bare
+            // `VtaClient::new` here would hand the caller a client that cannot
+            // produce a conforming document.
+            let rest_client = self.rest_client(url, key).await?;
+
+            // Priority 3: DIDComm discovery via the authenticated status endpoint.
+            if let Some(mediator_did) = discover_mediator_via_status(&rest_client).await {
+                debug!(mediator_did = %mediator_did, "connecting via DIDComm (REST discovery)");
+                let client = connect_didcomm_bounded(
+                    &session.client_did,
+                    &session.private_key,
+                    &session_vta_did,
+                    &mediator_did,
+                    Some(url.to_string()),
+                )
+                .await?;
+                return Ok(client);
+            }
+
+            // Priority 4: REST-only fallback.
+            debug!(url, "connecting via REST (URL override)");
+            return Ok(rest_client);
+        }
+
+        Err(format!("Could not determine transport for VTA DID: {session_vta_did}").into())
+    }
+}
+
+// ── Temp-key rotation ───────────────────────────────────────────────
+
+/// Generate a fresh Ed25519 did:key. Returns
+/// `(did, private_key_multibase, signing_key)`.
+///
+/// The seed is sourced from `getrandom` (the OS CSPRNG). `private_key_multibase`
+/// is the raw 32-byte seed base58btc-encoded, matching the format used by the
+/// rest of the workspace (see `decode_private_key_multibase`). The
+/// `signing_key` is returned so callers can sign over the new DID (e.g. the
+/// `acl/swap-key` presentation) without re-deriving it from the multibase.
+fn generate_did_key()
+-> Result<(String, String, ed25519_dalek::SigningKey), Box<dyn std::error::Error>> {
+    crate::did_key::generate_did_key()
+        .map_err(|e| format!("minting the rotated did:key: {e}").into())
+}
+
+/// Which mediator transport, if any, a pending rotation should run over.
+///
+/// Returns `(transport, vta_did, mediator_did, rest_url)`, following the
+/// workspace preference order: TSP where the VTA advertises it, else DIDComm.
+/// `None` means neither is available — a REST-only VTA, a TSP-only VTA under
+/// `--transport didcomm`, or a DID that would not resolve. The caller then
+/// falls through to the ordinary transport priorities, which report their own
+/// better-targeted errors rather than turning an unresolvable DID into a
+/// rotation failure.
+async fn rotation_endpoint(
+    vta_did: &str,
+    transport: TransportChoice,
+) -> Option<(
+    RotationTransport,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+)> {
+    match resolve_vta_endpoint(vta_did).await.ok()? {
+        // TSP is the preferred transport, so a VTA that advertises it rotates
+        // over it — including a dual-transport VTA, which never reaches the
+        // `DIDComm` arm below. `--transport didcomm` opts out by name.
+        VtaEndpoint::Tsp {
+            vta_did,
+            mediator_did,
+            didcomm_mediator_did,
+            rest_url,
+        } => {
+            if transport != TransportChoice::Didcomm {
+                Some((
+                    RotationTransport::Tsp,
+                    vta_did,
+                    mediator_did,
+                    didcomm_mediator_did,
+                    rest_url,
+                ))
+            } else {
+                // Forced DIDComm against a dual-transport VTA.
+                didcomm_mediator_did.map(|m| {
+                    (
+                        RotationTransport::Didcomm,
+                        vta_did,
+                        m.clone(),
+                        Some(m),
+                        rest_url,
+                    )
+                })
+            }
+        }
+        VtaEndpoint::DIDComm {
+            vta_did,
+            mediator_did,
+            rest_url,
+        } if transport != TransportChoice::Tsp => Some((
+            RotationTransport::Didcomm,
+            vta_did,
+            mediator_did.clone(),
+            Some(mediator_did),
+            rest_url,
+        )),
+        VtaEndpoint::DIDComm { .. } | VtaEndpoint::Rest { .. } => None,
+    }
+}
+
+/// Open and close a short-lived session as `client_did`, purely to prove the
+/// mediator will have it.
+///
+/// Transport-matched on purpose: a DIDComm trust-ping against a TSP-only
+/// mediator proves the wrong thing and fails outright, which on the rotation
+/// path would refuse a perfectly good DID.
+async fn reach_mediator(
+    client_did: &str,
+    private_key: &str,
+    mediator_did: &str,
+    over_tsp: bool,
+) -> Result<(), String> {
+    if over_tsp {
+        #[cfg(feature = "tsp")]
+        {
+            let s = TspPingSession::new(client_did, private_key, mediator_did)
+                .await
+                .map_err(|e| e.to_string())?;
+            s.shutdown().await;
+            return Ok(());
+        }
+        #[cfg(not(feature = "tsp"))]
+        {
+            // Unreachable in practice: the TSP arm is only selected after
+            // `connect_tsp_bounded` succeeded, which this build cannot do.
+            return Err("this build has no `tsp` feature".to_string());
+        }
+    }
+    let s = TrustPingSession::new(client_did, private_key, mediator_did)
+        .await
+        .map_err(|e| e.to_string())?;
+    s.shutdown().await;
+    Ok(())
+}
+
+/// What a rotation must prove about the new DID before it commits, and over
+/// which transport.
+///
+/// Two separate concerns ride in here, and conflating them is a bug:
+///
+/// - **Reachability** must be proven over the transport the caller will
+///   actually reconnect on. A DIDComm trust-ping against a TSP-only mediator
+///   proves the wrong thing and fails outright, so the TSP arm probes over TSP.
+/// - **The mediator account** (the allow-all per-DID ACL) is keyed on
+///   `sha256(did)`, not on a protocol, so one pass authorises both transports —
+///   but `set_client_acl_with_profile` issues it through the ATM, i.e. over
+///   DIDComm. It is therefore attempted only where a DIDComm mediator exists,
+///   and always best-effort: a closed account costs a dropped forwarded reply
+///   on the next connect, never a lost credential.
+///
+/// Fatality tracks whether the caller depends on the mediator at all. A REST
+/// client never touches it, so failing its rotation on one would make
+/// `--transport rest` depend on DIDComm infrastructure it does not use.
+#[derive(Clone, Copy, Debug)]
+enum MediatorProbe<'a> {
+    /// REST-only VTA — nothing to probe.
+    None,
+    /// A DIDComm mediator: reachability and the account are the same socket.
+    /// `required` is false for a REST caller.
+    Didcomm {
+        mediator_did: &'a str,
+        required: bool,
+    },
+    /// A TSP mediator. Reachability is proven over TSP; the account is opened
+    /// over `didcomm_mediator_did` when the VTA advertises one.
+    Tsp {
+        mediator_did: &'a str,
+        didcomm_mediator_did: Option<&'a str>,
+    },
+}
+
+impl<'a> MediatorProbe<'a> {
+    /// The REST caller's constructor: open the account if a mediator is
+    /// advertised, but never fail the rotation over it.
+    fn best_effort(didcomm_mediator_did: Option<&'a str>) -> Self {
+        didcomm_mediator_did.map_or(Self::None, |mediator_did| Self::Didcomm {
+            mediator_did,
+            required: false,
+        })
+    }
+
+    /// The mediator whose account should be opened, and how to reach it.
+    ///
+    /// DIDComm is preferred when the VTA advertises it, for the plain reason
+    /// that it is the arm every deployed mediator understands: the TSP
+    /// management route is newer (affinidi-tdk-rs#783), so on a dual-transport
+    /// VTA the DIDComm pass is the one certain to be acted on. A TSP-only VTA
+    /// takes the TSP arm, which is the whole point — it is that or nothing.
+    fn account_transport(&self) -> Option<(&'a str, AccountTransport)> {
+        match self {
+            Self::None => None,
+            Self::Didcomm { mediator_did, .. } => Some((mediator_did, AccountTransport::Didcomm)),
+            Self::Tsp {
+                didcomm_mediator_did: Some(didcomm),
+                ..
+            } => Some((didcomm, AccountTransport::Didcomm)),
+            #[cfg(feature = "tsp")]
+            Self::Tsp {
+                mediator_did,
+                didcomm_mediator_did: None,
+            } => Some((mediator_did, AccountTransport::Tsp)),
+            // Without the `tsp` feature there is no TSP arm to send on, so a
+            // TSP-only mediator has no account pass. Unreachable in practice —
+            // this build cannot have connected over TSP to get here.
+            #[cfg(not(feature = "tsp"))]
+            Self::Tsp {
+                didcomm_mediator_did: None,
+                ..
+            } => None,
+        }
+    }
+}
+
+/// How the mediator-account pass reaches the mediator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccountTransport {
+    Didcomm,
+    #[cfg(feature = "tsp")]
+    Tsp,
+}
+
+/// Open `client_did`'s mediator account over TSP.
+///
+/// Opens a short-lived TSP session purely to carry one `account/update`. The
+/// rotation's reachability probe has already proven this DID can reach the
+/// mediator, so this is a second connect on a path known to work — kept
+/// separate because the probe's session is torn down before the swap, and
+/// holding it open across the commit is the thing the rotation ordering exists
+/// to avoid.
+#[cfg(feature = "tsp")]
+async fn send_account_update_over_tsp(
+    client_did: &str,
+    private_key: &str,
+    mediator_did: &str,
+) -> Result<(), String> {
+    let session = TspPingSession::new(client_did, private_key, mediator_did)
+        .await
+        .map_err(|e| e.to_string())?;
+    session.provision_client_acl("pnm-rotate").await;
+    session.shutdown().await;
+    Ok(())
+}
+
+/// Which transport a rotation reopens its socket on.
+///
+/// The rotation itself is transport-agnostic (`acl/swap-key` is a dispatched
+/// Trust Task), so this selects only the connector, not the flow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RotationTransport {
+    Didcomm,
+    Tsp,
+}
+
+/// Swap a `needs_rotation=true` session's temp did:key for a fresh one —
+/// **one implementation for every transport**.
+///
+/// The swap is `acl/swap-key/0.1`, a dispatched Trust Task, so
+/// [`crate::client::VtaClient::swap_acl_for`] carries it over REST, DIDComm or
+/// TSP without this function knowing which. There is deliberately no
+/// per-transport rotation any more: the create-then-delete the DIDComm path
+/// used to run left a window in which two DIDs held the same grant, which is
+/// exactly what `acl/swap-key` exists to avoid.
+///
+/// Preconditions: `client` is authenticated as `session.client_did` (the temp
+/// DID), and the caller persists the returned [`Session`] — it carries the only
+/// copy of the new private key.
+///
+/// Ordering, which is the load-bearing part:
+///
+/// 1. **Mint** the replacement did:key.
+/// 2. **Probe the transport**, if there is a mediator. Not an authorization
+///    probe — pre-swap the new DID has no ACL entry and cannot authenticate to
+///    the VTA at all; the swap is what grants it standing and the swap's own
+///    response is what confirms the VTA accepted it. What the swap cannot tell
+///    us is whether the new DID can *reach* its mediator, and a rotation that
+///    commits to an unreachable DID is unrecoverable: the temp entry is gone.
+///    So the socket is opened and the new DID's mediator account provisioned
+///    here, where a failure still costs nothing — the temp DID remains
+///    authoritative and the caller simply retries.
+/// 3. **Swap**, atomically. Nothing optional runs after this point: from the
+///    swap until the caller's `save_session` the temp DID is gone server-side
+///    while the new private key exists only in memory, so anything that can
+///    block in that window can strand an operator with no usable credential.
+async fn rotate_key_over_client(
+    client: &crate::client::VtaClient,
+    session: &Session,
+    session_vta_did: &str,
+    probe: MediatorProbe<'_>,
+) -> Result<Session, Box<dyn std::error::Error>> {
+    use crate::protocols::acl_management::swap::build_swap_presentation;
+
+    // 1. Mint the DID that replaces the temp one.
+    let (new_did, new_private_key, new_signing) = generate_did_key()?;
+    debug!(%new_did, "minted rotation DID; swapping via acl/swap-key");
+
+    // 2. Prove the new DID is reachable, and open its mediator account —
+    //    both before anything is committed.
+    //
+    //    Bounded: pre-swap a hang is *safe* (nothing is committed, so a Ctrl-C
+    //    leaves the temp DID authoritative) but it is still a CLI that never
+    //    returns, so give it a deadline either way.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+
+    // 2a. Reachability, over the transport the caller will reconnect on.
+    if let Some(reach) = match probe {
+        MediatorProbe::None => None,
+        // A REST caller does not reconnect over the mediator, so there is
+        // nothing whose reachability it needs proven.
+        MediatorProbe::Didcomm {
+            required: false, ..
+        } => None,
+        MediatorProbe::Didcomm { mediator_did, .. } => Some((mediator_did, false)),
+        MediatorProbe::Tsp { mediator_did, .. } => Some((mediator_did, true)),
+    } {
+        let (mediator_did, over_tsp) = reach;
+        let reached = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            reach_mediator(&new_did, &new_private_key, mediator_did, over_tsp),
+        )
+        .await
+        .unwrap_or_else(|_| Err(format!("timed out after {}s", PROBE_TIMEOUT.as_secs())));
+
+        if let Err(e) = reached {
+            // The caller reconnects over this mediator, so committing to a DID
+            // that cannot reach it is unrecoverable — the temp entry would be
+            // gone. Refuse while refusing is still free.
+            return Err(format!(
+                "rotate: the new DID could not reach the mediator ({mediator_did}) over {}: \
+                 {e}\n\n\
+                 Nothing was changed — your existing credential is still valid, so this is \
+                 safe to retry once the mediator is reachable.",
+                if over_tsp { "TSP" } else { "DIDComm" }
+            )
+            .into());
+        }
+        debug!(%new_did, over_tsp, "rotation DID reached its mediator");
+    }
+
+    // 2b. The mediator account, on whichever transport reaches the mediator.
+    //     Always best-effort: the ACL is keyed on the hashed DID rather than a
+    //     protocol, so one pass authorises both transports, and a failure costs
+    //     a dropped forwarded reply on the next connect, never a credential.
+    //
+    //     A TSP-only mediator is served by the TSP arm rather than skipped. It
+    //     used to be skipped because it had to be — the mediator's management
+    //     dispatch was DIDComm-only, so no packet a TSP-only client could send
+    //     would set its own ACL (affinidi-tdk-rs#783 added the TSP wrapper).
+    //     Against a mediator predating that, the request is filed as mail and
+    //     nothing happens, which is exactly where skipping left us; the account
+    //     keeps the `global_acl_default` it was created with at authentication.
+    match probe.account_transport() {
+        Some((mediator_did, AccountTransport::Didcomm)) => {
+            let opened = tokio::time::timeout(PROBE_TIMEOUT, async {
+                let s = TrustPingSession::new(&new_did, &new_private_key, mediator_did)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                s.provision_client_acl("pnm-rotate").await;
+                s.shutdown().await;
+                Ok::<(), String>(())
+            })
+            .await
+            .unwrap_or_else(|_| Err(format!("timed out after {}s", PROBE_TIMEOUT.as_secs())));
+
+            match opened {
+                Ok(()) => debug!(%new_did, "opened the rotated DID's mediator account"),
+                Err(e) => tracing::debug!(
+                    %new_did, error = %e,
+                    "could not open the rotated DID's mediator account (non-fatal — it opens \
+                     on the next DIDComm connect)"
+                ),
+            }
+        }
+        #[cfg(feature = "tsp")]
+        Some((mediator_did, AccountTransport::Tsp)) => {
+            let sent = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                send_account_update_over_tsp(&new_did, &new_private_key, mediator_did),
+            )
+            .await
+            .unwrap_or_else(|_| Err(format!("timed out after {}s", PROBE_TIMEOUT.as_secs())));
+
+            match sent {
+                // *Sent*, not *opened*: a TSP send resolving `Ok` means the
+                // mediator accepted the frame, never that it applied the ACL
+                // (R1.1), and a mediator without the TSP management arm files it
+                // silently. Do not claim more than happened.
+                Ok(()) => debug!(
+                    %new_did,
+                    "sent the rotated DID's account/update over TSP (delivery not confirmed)"
+                ),
+                Err(e) => tracing::debug!(
+                    %new_did, error = %e,
+                    "could not send the rotated DID's account/update over TSP (non-fatal)"
+                ),
+            }
+        }
+        None => {}
+    }
+
+    // 3. Atomically move the ACL entry onto the new DID. The VP-JWT proves
+    //    control of it, and is audience-bound to this VTA and short-lived.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let presentation =
+        build_swap_presentation(&new_signing, &new_did, session_vta_did, now, 300, None);
+    client
+        .swap_acl_for(
+            &session.client_did,
+            crate::client::SwapAclRequest::new(presentation),
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "rotate: acl/swap-key failed: {e} — has your admin run \
+                 `vta import-did --did {} --role admin` yet?",
+                session.client_did
+            )
+        })?;
+
+    Ok(Session {
+        client_did: new_did,
+        private_key: new_private_key,
+        vta_did: session.vta_did.clone(),
+        access_token: None,
+        access_expires_at: None,
+        token_origin: None,
+        needs_rotation: false,
+    })
+}
+
+/// The origin (`scheme://host[:port]`) of `base_url`, used to bind a cached
+/// token to the server it was issued for. `None` for anything unparseable or
+/// without a tuple origin; `None` never matches, so such a URL always
+/// re-authenticates.
+fn url_origin(base_url: &str) -> Option<String> {
+    match url::Url::parse(base_url).ok()?.origin() {
+        origin @ url::Origin::Tuple(..) => Some(origin.ascii_serialization()),
+        url::Origin::Opaque(_) => None,
+    }
+}
+
+// ── Challenge-response auth ─────────────────────────────────────────
+
+/// Perform challenge-response authentication against a VTA.
+///
+/// Every step (`auth/challenge`, the DI-signed `auth/authenticate/0.3`) is a
+/// Trust-Task document POSTed to `/trust-tasks` — see
+/// `crate::auth_light::challenge_response_light`, which this delegates to.
+///
+/// This used to pack an authcrypt DIDComm envelope and POST the packed bytes
+/// to the now-retired `/auth/` REST route, whose server-side handler unpacked
+/// it and took the authcrypt sender as the authenticated identity. The
+/// pre-session auth family's document's own Data-Integrity proof is the
+/// authentication now, on every transport alike, so that packing step no
+/// longer has anywhere to land — `crate::did_key::secrets_from_did_key`
+/// already required `client_did` to be a `did:key`, exactly what
+/// `challenge_response_light` requires, so nothing here narrowed further.
+pub async fn challenge_response(
+    base_url: &str,
+    client_did: &str,
+    private_key_multibase: &str,
+    vta_did: &str,
+) -> Result<TokenResult, Box<dyn std::error::Error>> {
+    let result = crate::auth_light::challenge_response_light(
+        &crate::http::rest_client(),
+        base_url,
+        client_did,
+        private_key_multibase,
+        vta_did,
+    )
+    .await?;
+    Ok(TokenResult {
+        access_token: result.access_token,
+        access_expires_at: result.access_expires_at,
+    })
+}
+
+// ── DIDComm-preferred connection ─────────────────────────────────────
+
+/// Result of resolving a VTA DID's service endpoints.
+///
+/// Each variant names the transport the SDK would *connect over*, and carries
+/// the lower-preference endpoints alongside it so a caller that has to fall
+/// back does not re-resolve. Preference order is the workspace's:
+/// **TSP > DIDComm > REST**.
+///
+/// `#[non_exhaustive]`: this enum gained [`Tsp`](Self::Tsp) in 0.20 and may
+/// gain further transports. Match with a `_` arm.
+#[non_exhaustive]
+pub enum VtaEndpoint {
+    /// No TSP or DIDComm service advertised.
+    Rest { url: String },
+    /// DIDComm advertised (but no TSP), with optional REST fallback.
+    DIDComm {
+        vta_did: String,
+        mediator_did: String,
+        rest_url: Option<String>,
+    },
+    /// TSP advertised — the highest-preference transport.
+    ///
+    /// `mediator_did` is read from the `#tsp` (`TSPTransport`) entry, **not**
+    /// assumed to equal the DIDComm mediator. In a dual-transport deployment
+    /// they are usually the same mediator, but nothing requires that, and a
+    /// TSP-only node has no DIDComm entry to borrow from.
+    Tsp {
+        vta_did: String,
+        mediator_did: String,
+        /// The DIDComm mediator, when the VTA advertises that too — the
+        /// fallback [`TransportChoice::Auto`] drops to if the TSP connect
+        /// times out.
+        didcomm_mediator_did: Option<String>,
+        rest_url: Option<String>,
+    },
+}
+
+impl VtaEndpoint {
+    /// Apply an explicit `--url` / `VTA_URL` override to whatever this
+    /// resolution produced.
+    ///
+    /// An operator who names a host means it. Without this, a resolved
+    /// endpoint's advertised `rest_url` wins and the override is silently
+    /// discarded on every path except forced `--transport rest` — so a command
+    /// that later reads [`crate::client::VtaClient::rest_url`] talks to the
+    /// host the DID document names, not the one on the command line, and
+    /// nothing says so. That is Keyring's VTI-14, reported against `cnm
+    /// vetting` because that is where it is felt: `vetting` builds its
+    /// `VtcClient` from `rest_url()`, so pointing `cnm` at a host had no
+    /// effect on where vetting actually talked. The cause is here, and it is
+    /// shared by every authenticated command that reads `rest_url()`.
+    ///
+    /// The transport choice is deliberately untouched. `--url` names a REST
+    /// base; it is not a statement about whether to speak TSP or DIDComm, and
+    /// an operator wanting that says `--transport rest`.
+    fn with_rest_override(self, override_url: Option<&str>) -> Self {
+        let Some(url) = override_url else {
+            return self;
+        };
+        let url = url.to_string();
+        match self {
+            Self::Rest { .. } => Self::Rest { url },
+            Self::DIDComm {
+                vta_did,
+                mediator_did,
+                ..
+            } => Self::DIDComm {
+                vta_did,
+                mediator_did,
+                rest_url: Some(url),
+            },
+            Self::Tsp {
+                vta_did,
+                mediator_did,
+                didcomm_mediator_did,
+                ..
+            } => Self::Tsp {
+                vta_did,
+                mediator_did,
+                didcomm_mediator_did,
+                rest_url: Some(url),
+            },
+        }
+    }
+}
+
+/// Operator transport selection for
+/// [`SessionStore::connect_with_transport`] (the `pnm`/`cnm` connect path).
+///
+/// `#[non_exhaustive]`: further transports may land here. Match with a `_` arm.
+///
+/// # Auto's fallback policy
+///
+/// [`Auto`](Self::Auto) implements the workspace preference order
+/// **TSP > DIDComm > REST**, and **falls back loudly**: if the VTA advertises
+/// TSP but its mediator does not answer within
+/// [`TSP_CONNECT_TIMEOUT_DEFAULT`], `Auto` logs a `WARN` naming the mediator
+/// DID and the deadline, then tries DIDComm, then REST.
+///
+/// This is a deliberate choice between two bad options, recorded here because
+/// it is not recoverable from the code. Failing hard would make a
+/// dual-transport VTA *less* available than it is today — an operator whose
+/// TSP mediator broke would lose access to a VTA that still speaks DIDComm
+/// perfectly well, which is a regression caused purely by enabling TSP.
+/// Falling back *silently* is the other failure: a TSP deployment that never
+/// works would be invisible, and everyone would quietly run on DIDComm
+/// believing TSP was live. The `WARN` is what makes the fallback a diagnosis
+/// rather than a cover-up.
+///
+/// Operators who need the strict behaviour have it: [`Tsp`](Self::Tsp) never
+/// falls back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransportChoice {
+    /// TSP when advertised, else DIDComm, else REST. The default.
+    ///
+    /// Against a VTA advertising both `#tsp` and `#vta-didcomm`, `Auto`
+    /// returns a DIDComm client with a TSP leg: Trust Tasks (every client
+    /// operation) go over TSP, and the DIDComm session stays open as the
+    /// mediator's one socket per DID, on which TSP receive arrives. See
+    /// [`VtaClient::trust_task_transport`](crate::client::VtaClient::trust_task_transport).
+    ///
+    /// A VTA advertising `#tsp` alone still yields a TSP-only client — there is
+    /// no DIDComm leg to have.
+    #[default]
+    Auto,
+    /// Force TSP — a **TSP-only** client, for exercising TSP on its own. Errors
+    /// — naming the transports the VTA *does* advertise — if it advertises no
+    /// `#tsp` service, and errors rather than falling back if the TSP connect
+    /// times out.
+    Tsp,
+    /// Force DIDComm, ignoring an advertised `#tsp`. The recovery path when a
+    /// VTA's TSP endpoint is broken but its DIDComm mediator is healthy;
+    /// previously this existed only by accident, as "whatever `Auto` picks".
+    Didcomm,
+    /// Force REST, ignoring any advertised TSP or DIDComm. Recovery path when a
+    /// VTA's mediator is unreachable (auto would pick a mediator transport and
+    /// hang).
+    Rest,
+}
+
+/// How long an auto-selected DIDComm connect may take before we give up and
+/// tell the operator how to reach the VTA over REST instead.
+///
+/// The mediator client owns a reconnect/backoff loop, so a DIDComm connect
+/// against an unreachable mediator does not fail — it retries, and the CLI
+/// hangs with no output. `pnm health` already caps its DIDComm probes for this
+/// reason; the connect path needs the same ceiling, otherwise
+/// [`TransportChoice::Rest`] is a recovery flag nobody ever gets told about.
+///
+/// Override with `VTA_DIDCOMM_CONNECT_TIMEOUT_SECS` for links slower than the
+/// 30s default.
+const DIDCOMM_CONNECT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+fn didcomm_connect_timeout() -> Duration {
+    parse_connect_timeout(
+        std::env::var("VTA_DIDCOMM_CONNECT_TIMEOUT_SECS").ok(),
+        DIDCOMM_CONNECT_TIMEOUT_DEFAULT,
+    )
+}
+
+/// How long a TSP connect may take before we give up.
+///
+/// The TSP websocket goes to the **same mediator** the DIDComm client does, and
+/// sits behind the same reconnect/backoff loop, so it needs the same ceiling
+/// for the same reason: without it, `Auto` preferring TSP would turn a working
+/// DIDComm-fallback story into an indefinite hang with no output — i.e.
+/// enabling TSP on a VTA would make it *less* reachable.
+///
+/// Its own env override rather than sharing the DIDComm one: an operator
+/// diagnosing a slow TSP mediator should be able to stretch that deadline
+/// without also loosening the DIDComm ceiling they rely on to fail fast.
+const TSP_CONNECT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+fn tsp_connect_timeout() -> Duration {
+    parse_connect_timeout(
+        std::env::var("VTA_TSP_CONNECT_TIMEOUT_SECS").ok(),
+        TSP_CONNECT_TIMEOUT_DEFAULT,
+    )
+}
+
+/// Env-var parsing for the connect deadlines, split out so it is testable
+/// without touching process environment. Garbage and `0` fall back to
+/// `default` — a zero deadline would fail every connect instantly, which is
+/// worse than the hang it replaces.
+fn parse_connect_timeout(raw: Option<String>, default: Duration) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+/// [`crate::client::VtaClient::connect_didcomm`] under a deadline.
+///
+/// Every auto-transport DIDComm connect goes through here so an unreachable
+/// mediator surfaces as an error naming the recovery flag rather than as an
+/// indefinite hang. See [`DIDCOMM_CONNECT_TIMEOUT_DEFAULT`].
+async fn connect_didcomm_bounded(
+    client_did: &str,
+    private_key: &str,
+    vta_did: &str,
+    mediator_did: &str,
+    rest_url: Option<String>,
+) -> Result<crate::client::VtaClient, Box<dyn std::error::Error>> {
+    let timeout = didcomm_connect_timeout();
+    match tokio::time::timeout(
+        timeout,
+        crate::client::VtaClient::connect_didcomm(
+            client_did,
+            private_key,
+            vta_did,
+            mediator_did,
+            rest_url,
+        ),
+    )
+    .await
+    {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(mediator_unreachable_error(mediator_did, timeout).into()),
+    }
+}
+
+/// The message an operator sees when their VTA's mediator is down.
+///
+/// Names the recovery command verbatim, per the workspace's "operator errors
+/// should suggest the fix" rule.
+fn mediator_unreachable_error(mediator_did: &str, timeout: Duration) -> String {
+    format!(
+        "Timed out after {}s connecting to the VTA's mediator:\n  {mediator_did}\n\n\
+         The VTA advertises DIDComm, but its mediator did not answer. Reach the VTA \
+         over REST instead:\n  \
+         <cli> --transport rest <command>\n\n\
+         If the mediator is gone for good, stop advertising it:\n  \
+         pnm --transport rest services didcomm disable",
+        timeout.as_secs()
+    )
+}
+
+/// The message an operator sees when `--transport rest` has no REST endpoint
+/// to force.
+fn no_rest_endpoint_error(vta_did: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "--transport rest: VTA '{vta_did}' does not advertise a REST service \
+         (`#vta-rest`) in its DID document, so there is no REST endpoint to \
+         force.\n\nPass the VTA's base URL explicitly:\n  \
+         <cli> --transport rest --url https://vta.example.com <command>"
+    )
+    .into()
+}
+
+/// [`crate::client::VtaClient::connect_tsp`] under a deadline.
+///
+/// The TSP twin of [`connect_didcomm_bounded`]; see
+/// [`TSP_CONNECT_TIMEOUT_DEFAULT`] for why the ceiling is not optional.
+#[cfg_attr(not(feature = "tsp"), allow(unused_variables))]
+async fn connect_tsp_bounded(
+    client_did: &str,
+    private_key: &str,
+    vta_did: &str,
+    mediator_did: &str,
+    rest_url: Option<String>,
+) -> Result<crate::client::VtaClient, Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "tsp"))]
+    {
+        // Reached only when this build can't speak TSP but the VTA advertises
+        // it. Say that plainly — the alternative is an operator staring at a
+        // VTA that offers TSP and a client that silently never picks it.
+        Err(format!(
+            "VTA '{vta_did}' advertises TSP, but this build of the SDK/CLI was compiled \
+             without the `tsp` feature, so it cannot connect over it.\n\n\
+             Rebuild with `--features tsp`, or select another transport:\n  \
+             <cli> --transport didcomm <command>\n  \
+             <cli> --transport rest <command>"
+        )
+        .into())
+    }
+    #[cfg(feature = "tsp")]
+    {
+        let timeout = tsp_connect_timeout();
+        match tokio::time::timeout(
+            timeout,
+            crate::client::VtaClient::connect_tsp(
+                client_did,
+                private_key,
+                vta_did,
+                mediator_did,
+                rest_url,
+            ),
+        )
+        .await
+        {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(tsp_unreachable_error(mediator_did, timeout).into()),
+        }
+    }
+}
+
+/// Put `client`'s Trust-Task surface on TSP, bounding any connect it needs.
+///
+/// The common case does no I/O at all: when the VTA advertises the **same**
+/// mediator for `#tsp` and `#vta-didcomm` — the reference topology — TSP rides
+/// the DIDComm session's existing socket, because the mediator permits one
+/// websocket per DID (#803). Only a VTA advertising a *separate* TSP mediator
+/// needs a connection, and there two mediators mean two sockets are legitimate.
+///
+/// A failure here is not fatal to the caller: `Auto` keeps the DIDComm client
+/// and reports the loss loudly. See [`TransportChoice`].
+#[cfg_attr(not(feature = "tsp"), allow(unused_variables))]
+async fn attach_tsp_leg_bounded(
+    client: &mut crate::client::VtaClient,
+    client_did: &str,
+    private_key: &str,
+    vta_did: &str,
+    didcomm_mediator_did: &str,
+    tsp_mediator_did: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "tsp"))]
+    {
+        Err(format!(
+            "the VTA advertises TSP (`{tsp_mediator_did}`), but this build was compiled \
+             without the `tsp` feature. Rebuild with `--features tsp` to route trust tasks \
+             over it."
+        )
+        .into())
+    }
+    #[cfg(feature = "tsp")]
+    {
+        // Attach the leg: multiplexed on the DIDComm socket for the reference
+        // topology, or a separate session when the VTA advertises a distinct TSP
+        // mediator.
+        if didcomm_mediator_did == tsp_mediator_did {
+            client.enable_tsp_trust_tasks(tsp_mediator_did)?;
+        } else {
+            let timeout = tsp_connect_timeout();
+            let tsp_session = match tokio::time::timeout(
+                timeout,
+                TspSession::connect(client_did, private_key, tsp_mediator_did),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(tsp_unreachable_error(tsp_mediator_did, timeout).into()),
+            };
+            client.attach_tsp_leg(std::sync::Arc::new(tsp_session), tsp_mediator_did)?;
+        }
+
+        // §7.2.2: the VTA drops an application message from a VID it holds no
+        // relationship with. This client's relationship store is in-memory and
+        // fresh every process, so the relationship must be formed now — exactly
+        // as `connect_didcomm_with_tsp` does. Attaching the leg without it is
+        // how a Trust Task times out with nothing in either log: the request may
+        // still land (the VTA's *durable* store can remember an earlier
+        // handshake) while the client drops the VTA's reply as "no relationship".
+        //
+        // On failure, revert to a pure DIDComm client so the caller's `Auto`
+        // fallback ("trust tasks stay on DIDComm") is real — a half-attached,
+        // relationship-less leg would keep routing Trust Tasks over TSP and drop
+        // every reply.
+        if let Err(e) = client.relate_trust_task_leg(vta_did).await {
+            client.disable_tsp_trust_tasks().await;
+            return Err(e.into());
+        }
+        Ok(())
+    }
+}
+
+/// The message an operator sees when a VTA advertises TSP but its mediator
+/// does not answer.
+///
+/// Distinct from [`mediator_unreachable_error`] on purpose (R6.4): "TSP is
+/// advertised and the mediator went silent" and "the VTA advertises no TSP at
+/// all" are different faults with different fixes, and one shared hint is
+/// exactly what that rule exists to prevent. Names the mediator DID so the
+/// operator knows *which* endpoint to go look at.
+fn tsp_unreachable_error(mediator_did: &str, timeout: Duration) -> String {
+    format!(
+        "Timed out after {}s connecting to the VTA's TSP mediator:\n  {mediator_did}\n\n\
+         The VTA advertises TSP (`#tsp`), but that mediator did not answer. Reach the \
+         VTA over another transport:\n  \
+         <cli> --transport didcomm <command>\n  \
+         <cli> --transport rest <command>\n\n\
+         Raise the deadline for a slow link with VTA_TSP_CONNECT_TIMEOUT_SECS.",
+        timeout.as_secs()
+    )
+}
+
+/// The message an operator sees when `--transport tsp` has no `#tsp` service to
+/// force. Lists what the VTA *does* advertise, so the next command is obvious
+/// rather than guessed (compare [`no_rest_endpoint_error`]).
+fn no_tsp_endpoint_error(
+    vta_did: &str,
+    has_didcomm: bool,
+    has_rest: bool,
+) -> Box<dyn std::error::Error> {
+    format!(
+        "--transport tsp: VTA '{vta_did}' does not advertise a TSP service (`#tsp`, \
+         type `TSPTransport`) in its DID document, so there is no TSP endpoint to \
+         force.\n\n{}\n\nTo start advertising TSP on the VTA itself:\n  \
+         pnm services tsp enable",
+        advertised_hint(has_didcomm, has_rest)
+    )
+    .into()
+}
+
+/// As [`no_tsp_endpoint_error`], for `--transport didcomm`.
+fn no_didcomm_endpoint_error(
+    vta_did: &str,
+    has_tsp: bool,
+    has_rest: bool,
+) -> Box<dyn std::error::Error> {
+    let offers = match (has_tsp, has_rest) {
+        (true, true) => {
+            "It advertises TSP and REST:\n  <cli> --transport tsp <command>\n  <cli> --transport rest <command>"
+        }
+        (true, false) => "It advertises TSP:\n  <cli> --transport tsp <command>",
+        (false, true) => "It advertises REST:\n  <cli> --transport rest <command>",
+        (false, false) => "It advertises no other transport this client can use.",
+    };
+    format!(
+        "--transport didcomm: VTA '{vta_did}' does not advertise a DIDComm service \
+         (`DIDCommMessaging`) in its DID document, so there is no mediator to \
+         force.\n\n{offers}"
+    )
+    .into()
+}
+
+/// "It advertises X" phrasing shared by the forced-transport errors.
+fn advertised_hint(has_didcomm: bool, has_rest: bool) -> &'static str {
+    match (has_didcomm, has_rest) {
+        (true, true) => {
+            "It advertises DIDComm and REST:\n  <cli> --transport didcomm <command>\n  <cli> --transport rest <command>"
+        }
+        (true, false) => "It advertises DIDComm:\n  <cli> --transport didcomm <command>",
+        (false, true) => "It advertises REST:\n  <cli> --transport rest <command>",
+        (false, false) => "It advertises no other transport this client can use.",
+    }
+}
+
+/// Resolve a VTA DID to discover available transport endpoints.
+///
+/// Performs a single DID resolution and reads every advertised transport via
+/// [`ServiceCapabilities::from_did_document`] — the workspace's one
+/// implementation of "which protocols does this party speak", which matches on
+/// service **`type`** (`TSPTransport` / `DIDCommMessaging` / `VTARest`), never
+/// on the `#id` fragment, and accepts `type` as either a string or an array.
+///
+/// Returns the highest-preference transport advertised (**TSP > DIDComm >
+/// REST**), carrying the lower-preference endpoints with it so a caller that
+/// falls back does not resolve twice.
+///
+/// # The TSP-only case
+///
+/// A document with `TSPTransport` and no `DIDCommMessaging` resolves as
+/// [`VtaEndpoint::Tsp`]. It previously fell through both extractions and
+/// returned a REST URL *synthesized from the DID's own domain* — an endpoint
+/// that need not exist. That shape is not hypothetical: this crate ships
+/// `did-host-tsp` and `did-host-http-tsp` templates, so the SDK could mint a
+/// node it could not then resolve.
+pub async fn resolve_vta_endpoint(
+    vta_did: &str,
+) -> Result<VtaEndpoint, Box<dyn std::error::Error>> {
+    let did_resolver = crate::resolver::shared_did_resolver_from_env()
+        .await
+        .map_err(|e| format!("DID resolver init failed: {e}"))?;
+    resolve_vta_endpoint_with_resolver(vta_did, &did_resolver).await
+}
+
+/// [`resolve_vta_endpoint`] over an **existing** resolver.
+///
+/// Two reasons to reach for this rather than the env-configured entry point:
+///
+/// - **Reuse.** A caller that already holds a `DIDCacheClient` avoids building a
+///   second one (and a second cache) per resolve — the same reason
+///   [`resolve_mediator_did_with_resolver`] exists.
+/// - **Testability, which is why this was added.** `resolve_vta_endpoint` builds
+///   its resolver from the environment, so a consumer had no way to point
+///   discovery at a fixture: seeding a document into *its own* cache did nothing,
+///   because the function never saw that cache. Transport discovery — including
+///   whether a VTA advertises `#tsp` — was therefore only provable against a live
+///   deployment. With a resolver parameter a test seeds a document via
+///   `DIDCacheClient::add_did_document` and asserts what discovery makes of it,
+///   in-process and with no network.
+///
+/// # Endpoint policy
+///
+/// Every REST URL this returns, whether advertised in `#vta-rest` or
+/// synthesized from the DID's domain, has passed
+/// [`guard_vta_endpoint`](crate::http::guard_vta_endpoint) under
+/// [`EndpointPolicy::process_default`](crate::http::EndpointPolicy::process_default).
+/// A refused URL is an error that names the opt-in. That holds even when the
+/// document also advertises a mediator transport: the REST URL travels onward
+/// in every variant, so it is refused rather than silently dropped.
+pub async fn resolve_vta_endpoint_with_resolver(
+    vta_did: &str,
+    did_resolver: &DIDCacheClient,
+) -> Result<VtaEndpoint, Box<dyn std::error::Error>> {
+    resolve_vta_endpoint_with_resolver_and_policy(
+        vta_did,
+        did_resolver,
+        crate::http::EndpointPolicy::process_default(),
+    )
+    .await
+}
+
+/// [`resolve_vta_endpoint_with_resolver`] under an explicit
+/// [`EndpointPolicy`](crate::http::EndpointPolicy) instead of the process
+/// default.
+pub async fn resolve_vta_endpoint_with_resolver_and_policy(
+    vta_did: &str,
+    did_resolver: &DIDCacheClient,
+    policy: crate::http::EndpointPolicy,
+) -> Result<VtaEndpoint, Box<dyn std::error::Error>> {
+    resolve_vta_endpoint_inner(vta_did, did_resolver, policy, OnUnresolved::GuessFromDid).await
+}
+
+/// What [`resolve_vta_endpoint_inner`] does when the DID itself does not
+/// resolve.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnUnresolved {
+    /// Guess a REST URL from the DID string — the session-connect behaviour,
+    /// for a `did:web` VTA reachable before its document is served.
+    GuessFromDid,
+    /// Fail, naming the resolution error. What a setup flow wants: a mistyped
+    /// DID otherwise surfaces much later as an unrelated "is this a VTA?"
+    /// against a guessed host (OpenVTC #501).
+    Refuse,
+}
+
+/// [`resolve_vta_endpoint_with_resolver_and_policy`] with the
+/// unresolved-DID behaviour chosen by the caller.
+pub(crate) async fn resolve_vta_endpoint_inner(
+    vta_did: &str,
+    did_resolver: &DIDCacheClient,
+    policy: crate::http::EndpointPolicy,
+    on_unresolved: OnUnresolved,
+) -> Result<VtaEndpoint, Box<dyn std::error::Error>> {
+    use crate::protocol::matching::ServiceCapabilities;
+
+    debug!(vta_did, "resolving VTA DID for transport selection");
+
+    let resolved = match did_resolver.resolve(vta_did).await {
+        Ok(r) => r,
+        Err(e) if on_unresolved == OnUnresolved::Refuse => {
+            return Err(format!("the DID does not resolve: {e}").into());
+        }
+        Err(e) => {
+            debug!(error = %e, "DID resolution failed, falling back to URL parsing");
+            let url = url_from_did(vta_did)
+                .ok_or_else(|| format!("Could not determine VTA URL from DID: {vta_did}"))?;
+            let url = vet_vta_rest_url(vta_did, &url, policy)?;
+            return Ok(VtaEndpoint::Rest { url });
+        }
+    };
+
+    // Round-trip the typed document through JSON so the shared matcher — which
+    // is defined over an already-resolved `serde_json::Value` — is the single
+    // place service types are interpreted. The alternative, a second bespoke
+    // extraction over the typed `doc.service` array, is exactly what left TSP
+    // invisible here while `matching.rs` had understood it all along.
+    let doc_json = serde_json::to_value(&resolved.doc)
+        .map_err(|e| format!("could not re-serialize resolved DID document: {e}"))?;
+    let caps = ServiceCapabilities::from_did_document(&doc_json);
+
+    let rest_url = caps
+        .rest
+        .as_deref()
+        .map(|u| u.trim_matches('"').trim_end_matches('/').to_string())
+        .map(|u| vet_vta_rest_url(vta_did, &u, policy))
+        .transpose()?;
+
+    // TSP and DIDComm both advertise a *mediator DID*, not a transport URL —
+    // the real endpoint lives in the mediator's own document. Anything that
+    // isn't a DID is a misconfigured entry we cannot route through, so it is
+    // ignored rather than handed onward as a mediator.
+    let mediator_of = |endpoint: Option<&String>| -> Option<String> {
+        endpoint
+            .map(|u| u.trim_matches('"').to_string())
+            .filter(|u| u.starts_with("did:"))
+    };
+    let tsp_mediator_did = mediator_of(caps.tsp.as_ref());
+    let didcomm_mediator_did = mediator_of(caps.didcomm.as_ref());
+
+    if let Some(mediator_did) = tsp_mediator_did {
+        debug!(
+            mediator_did = %mediator_did,
+            didcomm_mediator_did = ?didcomm_mediator_did,
+            rest_url = ?rest_url,
+            "TSP endpoint found (highest preference)"
+        );
+        Ok(VtaEndpoint::Tsp {
+            vta_did: vta_did.to_string(),
+            mediator_did,
+            didcomm_mediator_did,
+            rest_url,
+        })
+    } else if let Some(mediator_did) = didcomm_mediator_did {
+        debug!(mediator_did = %mediator_did, rest_url = ?rest_url, "DIDComm endpoint found");
+        Ok(VtaEndpoint::DIDComm {
+            vta_did: vta_did.to_string(),
+            mediator_did,
+            rest_url,
+        })
+    } else if let Some(url) = rest_url {
+        debug!(url = %url, "REST-only endpoint found");
+        Ok(VtaEndpoint::Rest { url })
+    } else {
+        // Last resort: parse URL from DID string
+        let url = url_from_did(vta_did)
+            .ok_or_else(|| format!("Could not determine VTA URL from DID: {vta_did}"))?;
+        let url = vet_vta_rest_url(vta_did, &url, policy)?;
+        debug!(url = %url, "falling back to URL from DID string");
+        Ok(VtaEndpoint::Rest { url })
+    }
+}
+
+/// Best-effort: ask an already-authenticated VTA whether DIDComm is enabled
+/// and, if so, return its mediator DID.
+///
+/// Used as a fallback for DID methods with no resolvable service block (e.g.
+/// `did:key`), where the only way to learn the mediator is to ask the running
+/// VTA over REST. `GET /services/didcomm` is super-admin-gated, so this *must*
+/// run on a client that already carries a valid token — an unauthenticated
+/// probe always 401s. Returns `None` if DIDComm is disabled, the caller lacks
+/// permission, or the endpoint errs; every one of those simply means "fall
+/// back to REST".
+async fn discover_mediator_via_status(client: &crate::client::VtaClient) -> Option<String> {
+    match client.didcomm_status().await {
+        Ok(status) if status.enabled => status.mediator_did,
+        Ok(_) => {
+            debug!("DIDComm not enabled on VTA (status discovery)");
+            None
+        }
+        Err(e) => {
+            debug!(error = %e, "DIDComm status discovery failed; falling back to REST");
+            None
+        }
+    }
+}
+
+/// The `#vta-rest` service endpoint from the VTA's DID document, if it
+/// advertises one. `Ok(None)` covers both "resolution failed" and "no REST
+/// service" — neither yields a REST URL we can stand behind. An advertised URL
+/// that fails [`guard_vta_endpoint`](crate::http::guard_vta_endpoint) is an
+/// `Err`, so a caller never falls back past a refusal.
+///
+/// Strict counterpart of [`resolve_vta_url`], which additionally guesses a URL
+/// from the DID's own domain. That guess is right for a self-hosted `did:web`
+/// VTA and wrong for a `did:webvh` whose DID lives on a hosting server, so the
+/// force-REST path uses this instead.
+async fn rest_url_from_did_doc(
+    vta_did: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(did_resolver) = crate::resolver::shared_did_resolver_from_env()
+        .await
+        .inspect_err(|e| debug!(error = %e, "DID resolver init failed"))
+    else {
+        return Ok(None);
+    };
+    rest_url_from_did_doc_with_resolver(
+        vta_did,
+        &did_resolver,
+        crate::http::EndpointPolicy::process_default(),
+    )
+    .await
+}
+
+/// [`rest_url_from_did_doc`] over an existing resolver and an explicit policy.
+async fn rest_url_from_did_doc_with_resolver(
+    vta_did: &str,
+    did_resolver: &DIDCacheClient,
+    policy: crate::http::EndpointPolicy,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(resolved) = did_resolver
+        .resolve(vta_did)
+        .await
+        .inspect_err(|e| debug!(error = %e, "DID resolution failed"))
+    else {
+        return Ok(None);
+    };
+
+    let Some(uri) = resolved
+        .doc
+        .find_service("vta-rest")
+        .and_then(|s| s.service_endpoint.get_uri())
+    else {
+        return Ok(None);
+    };
+    let url = uri.trim_matches('"').trim_end_matches('/');
+    let url = vet_vta_rest_url(vta_did, url, policy)?;
+
+    debug!(url = %url, "found VTA URL from #vta-rest service endpoint");
+    Ok(Some(url))
+}
+
+/// Run a VTA REST URL through
+/// [`guard_vta_endpoint`](crate::http::guard_vta_endpoint). Returns the URL
+/// string unchanged, so callers keep joining paths onto the same text, or an
+/// error naming the DID that advertised it.
+fn vet_vta_rest_url(
+    vta_did: &str,
+    url: &str,
+    policy: crate::http::EndpointPolicy,
+) -> Result<String, Box<dyn std::error::Error>> {
+    crate::http::guard_vta_endpoint(url, policy)
+        .map_err(|e| format!("refusing the REST endpoint for VTA {vta_did}: {e}"))?;
+    Ok(url.to_string())
+}
+
+/// Resolve a VTA DID to discover its service URL.
+///
+/// Resolves the DID document and looks for the `#vta-rest` service endpoint.
+/// Falls back to parsing the domain from `did:web:` or `did:webvh:` DID strings.
+///
+/// Either URL must pass [`guard_vta_endpoint`](crate::http::guard_vta_endpoint)
+/// under [`EndpointPolicy::process_default`](crate::http::EndpointPolicy::process_default);
+/// a refused URL is an error that names the opt-in.
+pub async fn resolve_vta_url(vta_did: &str) -> Result<String, Box<dyn std::error::Error>> {
+    debug!(vta_did, "resolving VTA DID to discover service URL");
+
+    if let Some(url) = rest_url_from_did_doc(vta_did).await? {
+        return Ok(url);
+    }
+    debug!("no #vta-rest service resolved, falling back to DID parsing");
+
+    // Fallback: parse domain from did:web or did:webvh DID strings
+    let url = url_from_did(vta_did)
+        .ok_or_else(|| format!("Could not determine VTA URL from DID: {vta_did}"))?;
+    vet_vta_rest_url(
+        vta_did,
+        &url,
+        crate::http::EndpointPolicy::process_default(),
+    )
+}
+
+/// Extract the base URL from a `did:web:`, `did:webs:` or `did:webvh:` DID
+/// string, or from the `src` of a `did:scid:vh:1` DID URL (a bare did:scid
+/// names no host).
+fn url_from_did(did: &str) -> Option<String> {
+    let domain = if let Some(rest) = did.strip_prefix("did:web:") {
+        // did:web:domain.com or did:web:domain.com%3A8100
+        rest.split(':').next()
+    } else if let Some(rest) = did.strip_prefix("did:webs:") {
+        // did:webs:domain.com[:path…]:AID, the domain first as for did:web
+        rest.split(':').next()
+    } else if let Some(rest) = did.strip_prefix("did:webvh:") {
+        // did:webvh:SCID:domain.com or did:webvh:SCID:domain.com%3A8100
+        rest.split(':').nth(1)
+    } else if did.starts_with(crate::did_scid::SCID_VH_PREFIX) {
+        // did:scid:vh:1:SCID?src=domain.com/path or ?src=domain.com%3A8100
+        crate::did_scid::src(did)?.split('/').next()
+    } else {
+        None
+    }?;
+
+    let decoded = domain.replace("%3A", ":").replace("%3a", ":");
+    Some(format!("https://{decoded}"))
+}
+
+/// Send a DIDComm trust-ping to the mediator using the client's `did:key`
+/// credentials, and return latency in milliseconds.
+pub async fn send_trust_ping(
+    client_did: &str,
+    private_key_multibase: &str,
+    mediator_did: &str,
+    target_did: Option<&str>,
+) -> Result<u128, Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
+
+    let seed = crate::did_key::decode_private_key_multibase(private_key_multibase)?;
+    let secrets = crate::did_key::secrets_from_did_key(client_did, &seed)?;
+
+    // A private hub for the duration of the probe. Registering the identity with
+    // the ATM is what makes the teardown below real: an unregistered profile's
+    // websocket survives `graceful_shutdown` and keeps reconnecting for the life
+    // of the process (#830).
+    let hub = crate::session_hub::SessionHub::new().await?;
+
+    // Run the probe to completion, then tear down on EVERY path. An early `?`
+    // here used to return while the ATM's websocket transport kept running and
+    // auto-reconnecting — a failed probe must not leave a ghost socket
+    // contending for this DID's slot on the mediator.
+    //
+    // The outcome is stringified before the shutdown await: the boxed error is
+    // not `Send`, and holding it across an await would make this future non-Send.
+    let outcome = async {
+        let identity = hub
+            .attach(
+                client_did,
+                vec![secrets.signing, secrets.key_agreement],
+                mediator_did,
+            )
+            .await?;
+
+        hub.atm()
+            .profile_enable_websocket(&identity.profile)
+            .await?;
+
+        let start = Instant::now();
+        TrustPing::default()
+            .send_ping(
+                hub.atm(),
+                &identity.profile,
+                target_did.unwrap_or(mediator_did),
+                true,
+                true,
+                true,
+            )
+            .await?;
+
+        Ok::<u128, Box<dyn std::error::Error>>(start.elapsed().as_millis())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    hub.shutdown().await;
+    outcome.map_err(Into::into)
+}
+
+/// Resolve the VTA DID document and extract the mediator DID from the
+/// `DIDCommMessaging` service endpoint.
+pub async fn resolve_mediator_did(
+    vta_did: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let did_resolver = crate::resolver::shared_did_resolver_from_env()
+        .await
+        .map_err(|e| format!("DID resolver init failed: {e}"))?;
+    resolve_mediator_did_with_resolver(vta_did, &did_resolver).await
+}
+
+/// Resolve the mediator DID using an existing resolver (avoids re-creating one).
+pub async fn resolve_mediator_did_with_resolver(
+    vta_did: &str,
+    resolver: &DIDCacheClient,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let resolved = resolver
+        .resolve(vta_did)
+        .await
+        .map_err(|e| format!("DID resolution failed: {e}"))?;
+
+    for svc in &resolved.doc.service {
+        if svc.type_.iter().any(|t| t == "DIDCommMessaging")
+            && let Some(did) = svc
+                .service_endpoint
+                .get_uris()
+                .into_iter()
+                .map(|u| u.trim_matches('"').to_string())
+                .find(|u| u.starts_with("did:"))
+        {
+            return Ok(Some(did));
+        }
+    }
+
+    Ok(None)
+}
+
+/// A reusable DIDComm session for sending multiple trust-pings through
+/// the same ATM + WebSocket connection.
+///
+/// Eliminates per-ping overhead of TDK init, ATM creation, profile setup,
+/// and WebSocket handshake (~4 seconds saved per additional ping).
+pub struct TrustPingSession {
+    identity: crate::session_hub::AttachedIdentity,
+    ownership: crate::session_hub::HubOwnership,
+    mediator_did: String,
+}
+
+impl TrustPingSession {
+    /// Create a new session connected to the mediator via WebSocket, on a
+    /// private [`SessionHub`](crate::session_hub::SessionHub) of its own.
+    pub async fn new(
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let hub = crate::session_hub::SessionHub::new().await?;
+        // Stringify before the shutdown await: a `Box<dyn Error>` is not `Send`,
+        // and one held across an await would make this future non-`Send`.
+        let outcome = Self::attach(
+            &hub,
+            crate::session_hub::HubOwnership::Exclusive,
+            client_did,
+            private_key_multibase,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| e.to_string());
+
+        match outcome {
+            Ok(session) => Ok(session),
+            Err(msg) => {
+                hub.shutdown().await;
+                Err(msg.into())
+            }
+        }
+    }
+
+    /// Create a session as one identity **on a shared hub** — same probe, but
+    /// the TDK, ATM, and background tasks come from `hub` instead of being built
+    /// fresh. [`shutdown`](Self::shutdown) then detaches only this identity.
+    pub async fn new_on(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::attach(
+            hub,
+            crate::session_hub::HubOwnership::Shared,
+            client_did,
+            private_key_multibase,
+            mediator_did,
+        )
+        .await
+    }
+
+    /// Attach the identity and open its websocket.
+    ///
+    /// The socket comes up behind a single fallible step so a failure can detach
+    /// again. Without that, a session that fails to connect still leaves an
+    /// auto-reconnecting websocket task running — see `ping_over_didcomm` above.
+    async fn attach(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        ownership: crate::session_hub::HubOwnership,
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let seed = crate::did_key::decode_private_key_multibase(private_key_multibase)?;
+        let secrets = crate::did_key::secrets_from_did_key(client_did, &seed)?;
+
+        let identity = hub
+            .attach(
+                client_did,
+                vec![secrets.signing, secrets.key_agreement],
+                mediator_did,
+            )
+            .await?;
+
+        // Stringified before the detach await: a boxed error is not `Send`.
+        let prepared = hub
+            .atm()
+            .profile_enable_websocket(&identity.profile)
+            .await
+            .map_err(|e| e.to_string());
+
+        if let Err(msg) = prepared {
+            identity.detach().await;
+            return Err(msg.into());
+        }
+
+        Ok(Self {
+            identity,
+            ownership,
+            mediator_did: mediator_did.to_string(),
+        })
+    }
+
+    /// Send a trust-ping to a target (or the mediator if `target_did` is None).
+    /// Returns latency in milliseconds.
+    pub async fn ping(&self, target_did: Option<&str>) -> Result<u128, Box<dyn std::error::Error>> {
+        use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
+        use std::time::Instant;
+
+        let target = target_did.unwrap_or(&self.mediator_did);
+        let start = Instant::now();
+        TrustPing::default()
+            .send_ping(
+                self.identity.hub.atm(),
+                &self.identity.profile,
+                target,
+                true,
+                true,
+                true,
+            )
+            .await?;
+        Ok(start.elapsed().as_millis())
+    }
+
+    /// Provision this client's own allow-all mediator ACL over the session's
+    /// live socket, awaiting the result. Call before pinging a VTA whose pong
+    /// the mediator must forward back: a freshly bootstrapped or rotated client
+    /// is otherwise closed for forwarded delivery and the reply is dropped.
+    /// No-op unless the `acl-setup` feature is enabled.
+    pub async fn provision_client_acl(&self, client_name: &str) {
+        #[cfg(feature = "acl-setup")]
+        crate::acl_setup::set_client_acl_with_profile(
+            self.identity.hub.atm(),
+            &self.identity.profile,
+            &self.identity.did,
+            "trust-ping-session",
+            client_name,
+        )
+        .await;
+        #[cfg(not(feature = "acl-setup"))]
+        let _ = client_name;
+    }
+
+    /// Detach this identity — which is what stops its websocket — and, if this
+    /// session owns its hub, shut the hub down too.
+    pub async fn shutdown(self) {
+        self.identity.detach().await;
+        if self.ownership == crate::session_hub::HubOwnership::Exclusive {
+            self.identity.hub.shutdown().await;
+        }
+    }
+}
+
+/// A client-side TSP connectivity probe — the TSP analogue of
+/// [`TrustPingSession`].
+///
+/// Opens the client's **single** TSP websocket to the shared mediator, sends a
+/// Trust Task to the VTA's VID over TSP (routed through the mediator), and
+/// awaits the VTA's response envelope — proving the whole TSP round-trip:
+/// client seal → mediator route → VTA unpack → auth → `dispatch_trust_task_core`
+/// → reply → route back → client receive. This is the receive-capable
+/// counterpart to the outbound-only `atm.tsp().send_*`; the VTA replies via the
+/// symmetric `TspHandler` (`affinidi-messaging-didcomm-service` ≥ 0.3.14).
+///
+/// TSP-only client: no DIDComm listener shares this DID's socket, so
+/// `connect_websocket` is safe here (the one-socket-per-DID rule only bites a
+/// *dual* node — ADR 0005). Callers running a DIDComm [`TrustPingSession`] on
+/// the same client DID must shut it down before opening this.
+#[cfg(feature = "tsp")]
+pub struct TspPingSession {
+    identity: crate::session_hub::AttachedIdentity,
+    ownership: crate::session_hub::HubOwnership,
+    ws: affinidi_tdk::messaging::TspWebSocket,
+    client_did: String,
+    mediator_did: String,
+}
+
+#[cfg(feature = "tsp")]
+impl TspPingSession {
+    /// Form a TSP relationship with `peer_did`. See [`TspSession::relate`] —
+    /// the prober needs one for the same §7.2.2 reason, in both directions: the
+    /// peer must admit the ping, and this side must admit the reply.
+    pub async fn relate(&self, peer_did: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let tsp = self.identity.hub.atm().tsp();
+
+        // Idempotent, and it has to be: `SendInvite` is a valid transition
+        // ONLY from `RelationshipState::None`
+        // (affinidi-tsp::relationship::transition), so inviting a peer we
+        // already hold a relationship with is an `InvalidTransition` error
+        // rather than a no-op.
+        //
+        // That matters because this is now called from the client
+        // constructors. The SDK's DEFAULT relationship store is ephemeral and
+        // in-memory, so a fresh ATM per connect always starts at `None` and an
+        // unconditional invite looks perfectly safe — which is exactly why
+        // this is worth a comment. A consumer that configures a durable store
+        // through `ATMConfigBuilder::with_relationship_store` reconnects into
+        // `Pending` or `Bidirectional`, and an unconditional invite would fail
+        // their connect where it used to work: a silent-drop bug traded for a
+        // connect-time failure, and only for the deployments careful enough to
+        // persist their relationships.
+        //
+        // The check is a state read rather than catching and inspecting the
+        // error, so it does not depend on the text of an `InvalidTransition`.
+        if tsp
+            .relationship_state(&self.identity.profile, peer_did)
+            .await?
+            .admits_application_message()
+        {
+            return Ok(());
+        }
+
+        tsp.form_relationship_routed(&self.identity.profile, peer_did)
+            .await?;
+        Ok(())
+    }
+
+    /// Connect the client's TSP websocket to `mediator_did` (the VTA's `#tsp`
+    /// service endpoint — the same mediator the VTA is a local account on), on a
+    /// private [`SessionHub`](crate::session_hub::SessionHub) of its own.
+    pub async fn new(
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let hub = crate::session_hub::SessionHub::new().await?;
+        // Stringify before the shutdown await: a `Box<dyn Error>` is not `Send`,
+        // and one held across an await would make this future non-`Send`.
+        let outcome = Self::attach(
+            &hub,
+            crate::session_hub::HubOwnership::Exclusive,
+            client_did,
+            private_key_multibase,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| e.to_string());
+
+        match outcome {
+            Ok(session) => Ok(session),
+            Err(msg) => {
+                hub.shutdown().await;
+                Err(msg.into())
+            }
+        }
+    }
+
+    /// Connect as one identity **on a shared hub** — the multi-identity
+    /// counterpart to [`new`](Self::new).
+    pub async fn new_on(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::attach(
+            hub,
+            crate::session_hub::HubOwnership::Shared,
+            client_did,
+            private_key_multibase,
+            mediator_did,
+        )
+        .await
+    }
+
+    /// Attach the identity and open its TSP websocket. As in
+    /// [`TrustPingSession::attach`]: any failure past the attach must detach
+    /// again rather than abandon a live socket.
+    async fn attach(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        ownership: crate::session_hub::HubOwnership,
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let seed = crate::did_key::decode_private_key_multibase(private_key_multibase)?;
+        let secrets = crate::did_key::secrets_from_did_key(client_did, &seed)?;
+
+        let identity = hub
+            .attach(
+                client_did,
+                vec![secrets.signing, secrets.key_agreement],
+                mediator_did,
+            )
+            .await?;
+
+        // Stringified before the detach await: a boxed error is not `Send`.
+        let prepared = hub
+            .atm()
+            .tsp()
+            .connect_websocket(&identity.profile)
+            .await
+            .map_err(|e| e.to_string());
+
+        let ws = match prepared {
+            Ok(ws) => ws,
+            Err(msg) => {
+                identity.detach().await;
+                return Err(msg.into());
+            }
+        };
+
+        Ok(Self {
+            identity,
+            ownership,
+            ws,
+            client_did: client_did.to_string(),
+            mediator_did: mediator_did.to_string(),
+        })
+    }
+
+    /// Send a Trust Task to `vta_did` over TSP and await the response envelope.
+    /// Returns latency in milliseconds.
+    ///
+    /// The probe sends a `messaging/ping/0.2` Trust Task — the canonical,
+    /// session-less liveness + capability probe (ToIP Trust Tasks). It's
+    /// authenticated intrinsically by the TSP unpack's proven sender VID (no
+    /// holder proof needed on TSP, like DIDComm authcrypt) and requires no
+    /// capability beyond reachability, so it returns a clean `#response` (not a
+    /// 422 like a session-bound task would). A correlation `nonce` is included;
+    /// the round-trip latency is measured to the response frame.
+    pub async fn ping(
+        &mut self,
+        vta_did: &str,
+        timeout: std::time::Duration,
+    ) -> Result<u128, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+        let doc = ping_document(&self.client_did, vta_did)?;
+        let id = doc.id.clone();
+        // Read back off the document rather than kept alongside it: the two
+        // must be the same value for `correlates` to mean anything.
+        let nonce = doc
+            .payload
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .ok_or("messaging/ping payload carries no nonce")?
+            .to_string();
+        // Sealed inside the TSP binding envelope, like every other Trust Task
+        // this SDK sends. The bare document is what the VTA refuses as
+        // "not a binding envelope" — which reads, from here, as a ping that
+        // never gets a pong.
+        let body = crate::tsp_binding::wrap_envelope(&serde_json::to_vec(&doc)?);
+
+        let start = Instant::now();
+        // Route through our mediator to the VTA (a local account on it):
+        // inner sealed end-to-end to the VTA, outer sealed to the mediator.
+        self.identity
+            .hub
+            .atm()
+            .tsp()
+            .send_routed(
+                &self.identity.profile,
+                &[self.mediator_did.clone(), vta_did.to_string()],
+                &body,
+            )
+            .await?;
+
+        loop {
+            let remaining = timeout
+                .checked_sub(start.elapsed())
+                .ok_or("TSP ping timed out waiting for reply")?;
+            let frame = match tokio::time::timeout(remaining, self.ws.recv()).await {
+                Ok(Ok(Some(bytes))) => bytes,
+                Ok(Ok(None)) => return Err("TSP websocket closed before reply".into()),
+                Ok(Err(e)) => return Err(Box::new(e)),
+                Err(_) => return Err("TSP ping timed out waiting for reply".into()),
+            };
+            // The VTA's reply is sealed to us. Unpack it, then check it is *our*
+            // reply before believing it.
+            //
+            // "First frame that unpacks and parses as JSON" is not good enough:
+            // this DID's mediator inbox is durable, so every reply that a
+            // previous probe never collected is still queued and gets flushed
+            // onto the socket the moment we connect. Accepting the first frame
+            // meant a probe could measure a pong from an earlier run — reporting
+            // a healthy round trip, at an invented latency, against a VTA that
+            // might not have answered at all. A stale frame must not be able to
+            // turn a broken transport green.
+            //
+            // Correlation goes through [`correlates`] — the one implementation
+            // of "is this frame the reply to that request", shared with
+            // `TspSession::request`. Anything else is someone else's traffic or
+            // a leftover: skip it and keep waiting within the caller's budget.
+            let Ok((payload, _sender)) = self
+                .identity
+                .hub
+                .atm()
+                .tsp()
+                .unpack_bytes(&self.identity.profile, &frame)
+                .await
+            else {
+                continue; // not sealed to us / not TSP — not our business
+            };
+            // The pong arrives in the same binding envelope it was sent in.
+            // Open it before correlating: `correlates` reads `threadId` /
+            // `nonce` off the *document*, and an unopened envelope has neither —
+            // so a reply that is in fact ours would be skipped as uncorrelated
+            // and the probe would time out against a healthy VTA.
+            let Ok(document) = crate::tsp_binding::open_envelope(&payload) else {
+                continue; // not our binding — mediator traffic or a control frame
+            };
+            let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&document) else {
+                continue; // not a Trust-Task document
+            };
+
+            if crate::tsp_demux::correlates(&doc, &id, Some(&nonce)) {
+                return Ok(start.elapsed().as_millis());
+            }
+            tracing::debug!(
+                thread_id = doc
+                    .get("threadId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<none>"),
+                "TSP ping: skipping an uncorrelated frame (stale inbox entry or other traffic)"
+            );
+        }
+    }
+
+    /// Cold **send** probe for §3: build the same `messaging/ping` and route it
+    /// to `vta_did`, returning as soon as the send is accepted — **no reply
+    /// wait**. This is the honest §3 test for a *throwaway* DID, whose only
+    /// question is whether a cold `send_routed` hard-fails without a relationship
+    /// (a `Bidirectional` precondition would surface here as an `Err`). A
+    /// throwaway VID can't complete a round-trip regardless: it has no ACL entry
+    /// (so the VTA 403s the dispatched ping) and isn't a registered mediator
+    /// account (so the reply can't route back to it) — so waiting for a pong (as
+    /// [`ping`](Self::ping) does) always times out and masks the send success.
+    /// `Ok(())` means the relationship-free routed send worked (3c).
+    /// Open this client's own allow-all mediator account over the session's live
+    /// TSP socket.
+    ///
+    /// The TSP twin of [`TrustPingSession::provision_client_acl`]. Unlike that
+    /// one it cannot report whether the ACL was applied — see
+    /// [`crate::acl_setup::set_client_acl_over_tsp`]. No-op unless `acl-setup`
+    /// is enabled.
+    ///
+    /// Note this is deliberately *not* called on the `pnm health` TSP probe,
+    /// which runs on a throwaway DID: provisioning there would litter the
+    /// mediator with allow-all accounts for DIDs that never come back. It is for
+    /// a DID the caller is about to commit to.
+    pub async fn provision_client_acl(&self, client_name: &str) {
+        #[cfg(feature = "acl-setup")]
+        crate::acl_setup::set_client_acl_over_tsp(
+            self.identity.hub.atm(),
+            &self.identity.profile,
+            &self.client_did,
+            &self.mediator_did,
+            "tsp-ping-session",
+            client_name,
+        )
+        .await;
+        #[cfg(not(feature = "acl-setup"))]
+        let _ = client_name;
+    }
+
+    pub async fn probe_send(&self, vta_did: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let body = crate::tsp_binding::wrap_envelope(&serde_json::to_vec(&ping_document(
+            &self.client_did,
+            vta_did,
+        )?)?);
+
+        self.identity
+            .hub
+            .atm()
+            .tsp()
+            .send_routed(
+                &self.identity.profile,
+                &[self.mediator_did.clone(), vta_did.to_string()],
+                &body,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Close the TSP websocket, detach this identity from its hub, and — if the
+    /// session owns the hub — shut the hub down too.
+    pub async fn shutdown(self) {
+        let _ = self.ws.close().await;
+        self.identity.detach().await;
+        if self.ownership == crate::session_hub::HubOwnership::Exclusive {
+            self.identity.hub.shutdown().await;
+        }
+    }
+}
+
+/// A live, receive-oriented TSP session to a mediator, scoped to one client
+/// identity — the TSP analogue of [`crate::didcomm_session::DIDCommSession`].
+/// Connects the client's TSP websocket to the mediator and yields inbound
+/// Trust-Task frames already unpacked under the client key. This is the receive
+/// primitive the mobile approver uses to collect a VTA-pushed
+/// `task-consent/request` over TSP.
+///
+/// Unlike [`TspPingSession`] (a one-shot send-then-await liveness probe), this
+/// session is long-lived: [`receive_next`](Self::receive_next) can be polled
+/// repeatedly. The websocket lives behind a mutex so the receive/shutdown
+/// methods take `&self` — the session is shared as an `Arc` across the FFI
+/// boundary, mirroring `DIDCommSession::receive_next`.
+#[cfg(feature = "tsp")]
+pub struct TspSession {
+    /// This session's identity on its hub — the profile plus the teardown it
+    /// needs. One TDK + one ATM are shared with every sibling identity; the TSP
+    /// websocket below is this identity's own.
+    identity: crate::session_hub::AttachedIdentity,
+    /// Whether the hub was built for this session or handed to it.
+    ownership: crate::session_hub::HubOwnership,
+    // `Option` so `shutdown` can `take()` the socket out to `close()` it —
+    // `TspWebSocket::close` consumes `self`, which a `MutexGuard` can't yield.
+    // `None` means already shut down; receive then no-ops.
+    ws: tokio::sync::Mutex<Option<affinidi_tdk::messaging::TspWebSocket>>,
+    /// Which socket `ws` holds: bumped each time [`reconnect`](Self::reconnect)
+    /// replaces it, and only ever written with the `ws` lock held. A waiter
+    /// that saw socket N die reconnects only if `ws` still holds N, so several
+    /// requests failing on the same close open one fresh socket between them,
+    /// not one each (see [`reconnect`](Self::reconnect) for why that matters).
+    ws_generation: std::sync::atomic::AtomicU64,
+    /// This client's DID — the `issuer` on an [`announce`](Self::announce) frame.
+    client_did: String,
+    /// In-flight [`request`](Self::request) waiters plus the parking lot for
+    /// frames none of them wanted. Whichever task currently holds `ws` reads
+    /// frames on behalf of *all* of them and hands each reply to its own
+    /// waiter. Shared with the [`DIDCommSession`] TSP leg so there is one
+    /// implementation of the correlation rule.
+    ///
+    /// [`DIDCommSession`]: crate::didcomm_session::DIDCommSession
+    demux: crate::tsp_demux::TspDemux,
+}
+
+/// The signing + key-agreement secrets of a `did:key`, both from its one
+/// Ed25519 seed — what [`TspSession::connect`] and [`TspSession::connect_on`]
+/// hand to the secrets-driven constructors.
+#[cfg(feature = "tsp")]
+fn did_key_secrets(
+    client_did: &str,
+    private_key_multibase: &str,
+) -> Result<Vec<affinidi_tdk::secrets_resolver::secrets::Secret>, Box<dyn std::error::Error>> {
+    let seed = crate::did_key::decode_private_key_multibase(private_key_multibase)?;
+    let secrets = crate::did_key::secrets_from_did_key(client_did, &seed)?;
+    Ok(vec![secrets.signing, secrets.key_agreement])
+}
+
+#[cfg(feature = "tsp")]
+impl TspSession {
+    /// Connect the client's TSP websocket to `mediator_did` (the VTA's `#tsp`
+    /// endpoint — the mediator the VTA is a local account on) as `client_did`.
+    /// Same connect path as [`TspPingSession::new`]; the difference is lifetime
+    /// and direction (this one stays open to receive).
+    pub async fn connect(
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let secrets = did_key_secrets(client_did, private_key_multibase)?;
+        Self::connect_with_secrets(client_did, secrets, mediator_did).await
+    }
+
+    /// Connect with pre-built secrets — the counterpart to
+    /// [`connect`](Self::connect) for an identity that is **not** a `did:key`.
+    ///
+    /// `connect` derives both secrets from one Ed25519 seed, which is right for
+    /// a `did:key` (its X25519 key-agreement key *is* the converted signing
+    /// key) and wrong for anything else. A `did:peer:2` relationship DID carries
+    /// an independent signing key `V` and key-agreement key `E` under its own
+    /// `#key-N` ids, as does a `did:webvh` with a
+    /// [`DidSecretsBundle`](crate::did_secrets::DidSecretsBundle) — build those
+    /// with [`crate::did_key::secrets_from_bundle`] and pass them here.
+    ///
+    /// Every secret's `id` MUST be a verification-method id of `client_did`, so
+    /// the mediator can match inbound recipients against it. Same contract as
+    /// [`DIDCommSession::connect_with_secrets`].
+    ///
+    /// [`DIDCommSession::connect_with_secrets`]: crate::didcomm_session::DIDCommSession::connect_with_secrets
+    pub async fn connect_with_secrets(
+        client_did: &str,
+        secrets: Vec<affinidi_tdk::secrets_resolver::secrets::Secret>,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let hub = crate::session_hub::SessionHub::new().await?;
+        // Stringify before the shutdown await: a `Box<dyn Error>` is not `Send`,
+        // and one held across an await would make this future non-`Send`.
+        let outcome = Self::attach(
+            &hub,
+            crate::session_hub::HubOwnership::Exclusive,
+            client_did,
+            secrets,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| e.to_string());
+
+        match outcome {
+            Ok(session) => Ok(session),
+            Err(msg) => {
+                hub.shutdown().await;
+                Err(msg.into())
+            }
+        }
+    }
+
+    /// Connect as one identity **on a shared
+    /// [`SessionHub`](crate::session_hub::SessionHub)** — the multi-identity
+    /// counterpart to [`connect`](Self::connect).
+    ///
+    /// This identity gets its own TSP websocket (the mediator's one-socket-per-
+    /// DID ceiling is per DID, and still honoured) and shares the hub's TDK,
+    /// ATM, and background tasks with its siblings.
+    ///
+    /// Note the standing rule from [`TspPingSession`]: a DID that already holds
+    /// a `DIDCommSession` must use that session's TSP leg
+    /// (`DIDCommSession::request_tsp`) rather than open a `TspSession` beside
+    /// it — same hub or not, the *mediator* is what permits only one socket per
+    /// DID. Attaching the same DID twice to one hub is refused outright.
+    pub async fn connect_on(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        client_did: &str,
+        private_key_multibase: &str,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let secrets = did_key_secrets(client_did, private_key_multibase)?;
+        Self::connect_with_secrets_on(hub, client_did, secrets, mediator_did).await
+    }
+
+    /// Connect with pre-built secrets as one identity on a shared
+    /// [`SessionHub`](crate::session_hub::SessionHub) — the multi-identity
+    /// counterpart to [`connect_with_secrets`](Self::connect_with_secrets).
+    pub async fn connect_with_secrets_on(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        client_did: &str,
+        secrets: Vec<affinidi_tdk::secrets_resolver::secrets::Secret>,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::attach(
+            hub,
+            crate::session_hub::HubOwnership::Shared,
+            client_did,
+            secrets,
+            mediator_did,
+        )
+        .await
+    }
+
+    /// Attach the identity and open its TSP websocket, detaching again on any
+    /// failure past the attach so no live socket is abandoned.
+    async fn attach(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        ownership: crate::session_hub::HubOwnership,
+        client_did: &str,
+        secrets: Vec<affinidi_tdk::secrets_resolver::secrets::Secret>,
+        mediator_did: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let identity = hub.attach(client_did, secrets, mediator_did).await?;
+
+        // Stringified before the detach await: a boxed error is not `Send`.
+        let prepared = hub
+            .atm()
+            .tsp()
+            .connect_websocket(&identity.profile)
+            .await
+            .map_err(|e| e.to_string());
+
+        let ws = match prepared {
+            Ok(ws) => ws,
+            Err(msg) => {
+                identity.detach().await;
+                return Err(msg.into());
+            }
+        };
+
+        Ok(Self {
+            identity,
+            ownership,
+            ws: tokio::sync::Mutex::new(Some(ws)),
+            ws_generation: std::sync::atomic::AtomicU64::new(0),
+            client_did: client_did.to_string(),
+            demux: crate::tsp_demux::TspDemux::new(),
+        })
+    }
+
+    /// This client's DID — the proven sender VID the VTA authorizes against,
+    /// and the `issuer` on documents sent through this session.
+    #[must_use]
+    pub fn client_did(&self) -> &str {
+        &self.client_did
+    }
+
+    /// Announce this client's TSP reachability to `vta_did` by sending a
+    /// session-less `messaging/ping/0.2` frame (routed through `mediator_did`).
+    /// The point is not the pong — it's that the VTA's inbound dispatcher records
+    /// our **proven** `sender_vid` as TSP-reachable (learn-from-inbound), so its
+    /// device-push prefers TSP for us. The VTA's pong arrives on
+    /// [`receive_next`](Self::receive_next) like any other frame and is ignored
+    /// by the Trust-Task classifier (it's neither a step-up nor a task-consent).
+    ///
+    /// Send-only: unlike a socket read it needs no `ws` lock — `send_routed`
+    /// goes out through the ATM's TSP transport, so it can run concurrently with
+    /// a blocked `receive_next`. Call it on connect (and periodically) to keep
+    /// the VTA's reachability record fresh.
+    /// Form a TSP relationship with `peer_did` by sending it an invite.
+    ///
+    /// **Required before any application message under Rev 3 §7.2.2**: "It is
+    /// not permissible that one endpoint which has learned a VID of the other
+    /// simply starts with an application level message without first having an
+    /// exchange of TSP control messages." Without it the peer *drops* what
+    /// follows — drops, not refuses, so nothing comes back and the sender sees
+    /// only a timeout.
+    ///
+    /// Send-only, and there is nothing to await. The peer records the invite on
+    /// arrival and a recorded relationship already admits application messages
+    /// (`admits_application_message` is true for any state but `None`, because
+    /// §3.6 lets a sender pack user data alongside its invite) — so traffic
+    /// flows without waiting for an accept, and this side is `Pending`, which
+    /// admits the reply.
+    ///
+    /// Not test scaffolding: before Rev 3 a `TspSession` could talk to a peer
+    /// it had never greeted, and now it cannot, so a session with no way to
+    /// send an invite has no way to be used at all.
+    ///
+    /// **Routed, not direct.** Every other frame this session sends goes
+    /// `send_routed([mediator, peer])`, and the invite has to travel the same
+    /// way: a mediator refuses direct delivery unless configured to allow it
+    /// (`e.p.direct_delivery.denied`), so `form_relationship` would fail for a
+    /// mediated session while looking like a protocol problem. The routed form
+    /// also advertises our mediator, which is what lets the peer's accept find
+    /// its way back (§7.2.4).
+    pub async fn relate(&self, peer_did: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let tsp = self.identity.hub.atm().tsp();
+
+        // Idempotent, and it has to be: `SendInvite` is a valid transition
+        // ONLY from `RelationshipState::None`
+        // (affinidi-tsp::relationship::transition), so inviting a peer we
+        // already hold a relationship with is an `InvalidTransition` error
+        // rather than a no-op.
+        //
+        // That matters because this is now called from the client
+        // constructors. The SDK's DEFAULT relationship store is ephemeral and
+        // in-memory, so a fresh ATM per connect always starts at `None` and an
+        // unconditional invite looks perfectly safe — which is exactly why
+        // this is worth a comment. A consumer that configures a durable store
+        // through `ATMConfigBuilder::with_relationship_store` reconnects into
+        // `Pending` or `Bidirectional`, and an unconditional invite would fail
+        // their connect where it used to work: a silent-drop bug traded for a
+        // connect-time failure, and only for the deployments careful enough to
+        // persist their relationships.
+        //
+        // The check is a state read rather than catching and inspecting the
+        // error, so it does not depend on the text of an `InvalidTransition`.
+        if tsp
+            .relationship_state(&self.identity.profile, peer_did)
+            .await?
+            .admits_application_message()
+        {
+            return Ok(());
+        }
+
+        tsp.form_relationship_routed(&self.identity.profile, peer_did)
+            .await?;
+        Ok(())
+    }
+
+    /// Force-re-form the relationship after a §7.2.2 reply-timeout drop: reset
+    /// the local half to `None`, then re-invite. Mirrors
+    /// [`DIDCommSession::force_relate_tsp`](crate::didcomm_session::DIDCommSession::force_relate_tsp)
+    /// for a separate / standalone TSP session — same D4 rationale, and safe
+    /// against a false positive via the peer's reconcile transition.
+    pub async fn force_relate(&self, peer_did: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.identity
+            .hub
+            .atm()
+            .tsp()
+            .reset_relationship(&self.identity.profile, peer_did)
+            .await?;
+        self.relate(peer_did).await
+    }
+
+    pub async fn announce(
+        &self,
+        vta_did: &str,
+        mediator_did: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let body = serde_json::to_vec(&ping_document(&self.client_did, vta_did)?)?;
+
+        self.send_document(vta_did, mediator_did, &body).await
+    }
+
+    /// Send an already-built Trust-Task document to `vta_did`, routed through
+    /// `mediator_did`. `body` is the serialized Trust-Task document; it goes on
+    /// the wire inside the TSP **binding envelope** ([`crate::tsp_binding`]),
+    /// which is how a TSP payload says "this is a Trust Task" — TSP has neither
+    /// a message `type` nor a request path to say it with. Callers pass the
+    /// document; carriage is this layer's business.
+    ///
+    /// This is the generalisation of [`announce`](Self::announce), which is
+    /// just this with a `messaging/ping/0.2` body. The same properties hold:
+    ///
+    /// - **Send-only, lock-free.** It never touches `ws`, so it is safe to call
+    ///   while a `receive_next` is blocked holding that lock — which is the
+    ///   normal state of a client running an inbox loop.
+    /// - **Fire-and-forget.** The VTA seals its reply and routes it back over
+    ///   TSP, so the response document arrives on
+    ///   [`receive_next`](Self::receive_next) like any other frame. There is no
+    ///   correlation here; a caller that needs the reply must match it off the
+    ///   inbox itself (e.g. on the document's `id`/`type`).
+    ///
+    /// The sender is proven by TSP itself, so the VTA derives authorization
+    /// from the sealed `sender_vid` (intrinsic-sender auth) — no bearer token
+    /// and no prior REST authentication is involved.
+    pub async fn send_document(
+        &self,
+        vta_did: &str,
+        mediator_did: &str,
+        body: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let framed = crate::tsp_binding::wrap_envelope(body);
+        self.identity
+            .hub
+            .atm()
+            .tsp()
+            .send_routed(
+                &self.identity.profile,
+                &[mediator_did.to_string(), vta_did.to_string()],
+                &framed,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Wait up to `timeout_secs` for the next inbound TSP frame that unpacks to a
+    /// Trust-Task payload, and return that payload as a JSON string — the
+    /// unpacked inner document (e.g. a `task-consent/request`). TSP control
+    /// frames (which don't unpack to an application payload) are skipped within
+    /// the remaining budget rather than surfaced. Call again to poll on.
+    ///
+    /// Three outcomes, deliberately distinct:
+    /// - `Ok(Some(doc))` — an application message.
+    /// - `Ok(None)` — **idle**: nothing arrived within `timeout_secs`, or the
+    ///   session was already [`shutdown`](Self::shutdown). Poll again.
+    /// - `Err(_)` — the connection is **gone** (closed by the mediator, or a
+    ///   socket error). Polling again cannot help; reconnect.
+    ///
+    /// A closed socket used to be reported as `Ok(None)`, which made a dead
+    /// inbox look exactly like a quiet one — callers spun on it forever instead
+    /// of reconnecting. Keep these three cases distinct.
+    ///
+    /// The returned JSON is the Trust-Task **document**: the TSP binding
+    /// envelope is opened by this layer, so callers parse it as the document
+    /// itself (its own `type`/`issuer` fields), not as `{ body: … }` and not as
+    /// `{ type, document }`.
+    pub async fn receive_next(
+        &self,
+        timeout_secs: u64,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            // A frame an in-flight `request` read off the socket but did not
+            // want is ours. Drain that before touching the socket, or a push
+            // that already arrived would sit unseen behind a fresh read.
+            if let Some(doc) = self.demux.take_parked().await {
+                return Ok(Some(doc));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+
+            let mut guard = self.ws.lock().await;
+            let Some(ws) = guard.as_mut() else {
+                return Ok(None); // already shut down
+            };
+            // Bounded so the socket lock is released periodically even while
+            // idle — otherwise a long-polling `receive_next` would hold it for
+            // its whole budget and stall every concurrent `request`.
+            let slice = PUMP_SLICE.min(deadline.saturating_duration_since(Instant::now()));
+            // Bound before the `match` — see `await_reply`. A dead socket is
+            // the caller's `Err` to reconnect on, as documented above.
+            let outcome = self.pump_once(ws, slice).await.map_err(|e| e.to_string())?;
+            match outcome {
+                // Not addressed to any in-flight request → it is a push, and
+                // pushes are what this method is for.
+                PumpOutcome::Uncorrelated(doc) => return Ok(Some(doc)),
+                PumpOutcome::Delivered | PumpOutcome::Idle => {
+                    drop(guard);
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Send `document` to `vta_did` and wait for **its** reply.
+    ///
+    /// This is the piece that made TSP a transport rather than a probe: without
+    /// it a consumer could `send_document` and could `receive_next`, but could
+    /// not ask for *the reply to request X* — so nothing above the raw frame
+    /// level (trust tasks, credential flows, join ceremonies) could be routed
+    /// over TSP.
+    ///
+    /// Properties, each of which is load-bearing:
+    ///
+    /// - **Correlated, never "first frame that parses".** Replies are matched
+    ///   by [`correlates`] — `threadId`, falling back to an echoed `nonce`. The
+    ///   mediator inbox is durable and flushes on connect, so an uncorrelated
+    ///   read can hand back a reply from a *previous process run*.
+    /// - **Concurrent.** Several `request`s may be in flight on one session.
+    ///   Whichever one currently holds the socket reads on behalf of all of
+    ///   them and delivers each reply to its own waiter, so a slow request
+    ///   cannot serialise a fast one, and one request's read cannot consume
+    ///   another's reply.
+    /// - **Pushes survive.** A frame matching no in-flight request is parked
+    ///   for [`receive_next`](Self::receive_next), not discarded — a
+    ///   `task-consent/request` must not be eaten by a request waiting on
+    ///   something unrelated.
+    /// - **Finite.** Every wait is bounded by `timeout` (R1.2), plus at most one
+    ///   [`STRANDED_REPLY_GRACE`] after a reconnect.
+    /// - **A stranded reply is collected, not abandoned.** On a reply timeout
+    ///   the socket is reconnected once and the same waiter given
+    ///   [`STRANDED_REPLY_GRACE`] more. Raw-TSP sockets are flush-on-connect,
+    ///   so a reply the mediator stored but never pushed is delivered by the
+    ///   reconnect — nothing is resent. Before mediator 0.43.0 a slow store
+    ///   lost a race with the live notification and stranded the reply for
+    ///   days (affinidi-tdk-rs#957); for `provision/integration` that reply
+    ///   carried the only copy of a freshly minted admin key (OpenVTC #501).
+    /// - **A closed socket is reopened, once.** The mediator closes every
+    ///   websocket when the access token it was opened with expires (close
+    ///   1008, "authentication token expired" — 15 minutes by default), and a
+    ///   session that kept the dead socket failed every later request with
+    ///   "closed by the mediator" for the rest of its life. Now a request that
+    ///   finds the socket gone reconnects once — a fresh authentication, so a
+    ///   fresh token — and keeps waiting on the same waiter until its own
+    ///   deadline, or [`STRANDED_REPLY_GRACE`] if that is sooner. The request
+    ///   went out over the TSP transport's HTTP post, not this socket, so the
+    ///   reply is in the inbox and the new socket's flush-on-connect delivers
+    ///   it. Nothing is resent.
+    ///
+    /// # Authentication
+    ///
+    /// There is no token dance on this path and no holder proof in the
+    /// document. TSP `unpack` yields a **cryptographically proven sender VID**,
+    /// and the VTA's inbound dispatcher (`tsp_inbound::dispatch_one`) resolves
+    /// that VID straight to its ACL grant before dispatching on the shared
+    /// trust-task spine — the same intrinsic-sender model as DIDComm authcrypt,
+    /// and the reason the REST bearer-token flow has no TSP analogue. An
+    /// unknown or unauthorized sender gets a `permission_denied` trust-task
+    /// envelope back, not a drop.
+    pub async fn request(
+        &self,
+        vta_did: &str,
+        mediator_did: &str,
+        document: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use std::time::Instant;
+
+        let (request_id, nonce) = crate::tsp_demux::TspDemux::request_keys(document)?;
+        let mut rx = self.demux.register(request_id.clone(), nonce).await;
+
+        // Registered *before* sending: a reply can land while `send_routed` is
+        // still returning, and a waiter registered afterwards would miss it.
+        //
+        // Both results are flattened to `String` **before** the deregistering
+        // `.await` below. A `Box<dyn Error>` is not `Send`, and holding one
+        // across an await makes this future `!Send` — and with it every caller,
+        // including `VtaClient::dispatch_trust_task`, whose future `vta-mcp`
+        // requires to be `Send`. Because `vta-mcp` doesn't enable the `tsp`
+        // feature itself, that break only appears once Cargo's feature
+        // unification turns TSP on for a workspace build, a long way from here.
+        // Pinned by `tsp_futures_are_send`.
+        let sent = self
+            .send_document(vta_did, mediator_did, document)
+            .await
+            .map_err(|e| e.to_string());
+        if sent.is_err() {
+            self.demux.deregister(&request_id).await;
+        }
+        sent?;
+
+        let deadline = Instant::now() + timeout;
+        let mut outcome = self.await_reply(&request_id, &mut rx, deadline).await;
+        // At most one reconnect per request, whichever way the first wait
+        // failed, so every request stays bounded (R1.2). In both arms the
+        // waiter is still registered, so whatever the reconnect flushes is
+        // routed to it like any other frame.
+        match &outcome {
+            Err(ReplyFailure::TimedOut(_)) => match self.reconnect(None).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        request_id,
+                        "TSP reply timed out; reconnected to collect a stranded reply"
+                    );
+                    let grace = Instant::now() + STRANDED_REPLY_GRACE;
+                    outcome = self.await_reply(&request_id, &mut rx, grace).await;
+                }
+                Err(e) => {
+                    tracing::debug!(request_id, error = %e, "TSP reconnect after a reply timeout failed");
+                }
+            },
+            Err(ReplyFailure::SocketGone { generation, reason }) => {
+                let reason = reason.clone();
+                match self.reconnect(Some(*generation)).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            request_id,
+                            %reason,
+                            "TSP websocket was closed; reconnected to collect the reply"
+                        );
+                        // The request's own budget, but never less than the
+                        // grace: the close may have come just before it ran out.
+                        let resume = deadline.max(Instant::now() + STRANDED_REPLY_GRACE);
+                        outcome = self.await_reply(&request_id, &mut rx, resume).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(request_id, %reason, error = %e, "TSP reconnect after the websocket closed failed");
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Always deregister — a timed-out or failed request must not leave a
+        // waiter behind for the pump to deliver into.
+        self.demux.deregister(&request_id).await;
+        Ok(outcome.map_err(|f| f.to_string())?)
+    }
+
+    /// Replace this session's websocket with a fresh one, which the mediator
+    /// flushes this client's stored inbox onto as it connects.
+    ///
+    /// The new socket is opened **before** the old one is closed, so a failed
+    /// reconnect leaves the session on the socket it had rather than shut
+    /// down. The mediator keeps one raw-TSP socket per DID and closes the older
+    /// one itself when the new one arrives.
+    ///
+    /// The socket lock is held across the connect, as [`pump_once`] holds it
+    /// across a read: it is this socket's own lock, not shared state. Releasing
+    /// it would be worse — the mediator closes the old socket the moment the
+    /// new one connects, and a request pumping the old one meanwhile would fail
+    /// with "closed by the mediator" instead of waiting. Every waiter stays
+    /// bounded by its own deadline (`await_reply` selects on it beside the
+    /// lock), and the connect itself is bounded by [`STRANDED_REPLY_GRACE`]
+    /// (R1.2).
+    ///
+    /// `expected_generation` is the socket the caller saw die. When `ws` no
+    /// longer holds it, another waiter has already reconnected and this is a
+    /// no-op. Without that check, every request failing on one close would
+    /// open its own socket, each evicting the one before; frames the mediator
+    /// had already flushed onto an evicted socket are gone with it, since
+    /// raw-TSP mode deletes a frame once it is written. `None` reconnects
+    /// regardless, as the reply-timeout path always has.
+    ///
+    /// [`pump_once`]: Self::pump_once
+    async fn reconnect(&self, expected_generation: Option<u64>) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+
+        let mut guard = self.ws.lock().await;
+        if guard.is_none() {
+            return Err("TSP session was shut down".to_string());
+        }
+        if let Some(expected) = expected_generation
+            && self.ws_generation.load(Ordering::Acquire) != expected
+        {
+            return Ok(());
+        }
+        let fresh = tokio::time::timeout(
+            STRANDED_REPLY_GRACE,
+            self.identity
+                .hub
+                .atm()
+                .tsp()
+                .connect_websocket(&self.identity.profile),
+        )
+        .await
+        .map_err(|_| "timed out reconnecting the TSP websocket".to_string())?
+        .map_err(|e| e.to_string())?;
+        // Written under the `ws` lock, like every write of the generation.
+        self.ws_generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(old) = guard.replace(fresh) {
+            let _ = old.close().await;
+        }
+        Ok(())
+    }
+
+    /// Wait for `request_id`'s reply, taking a turn at pumping the socket
+    /// whenever it is free.
+    ///
+    /// Leader/followers: whoever holds `ws` reads and demultiplexes for
+    /// everyone; the rest park on their oneshot. Contending for the lock in the
+    /// same `select!` as the oneshot is what lets a follower take over the
+    /// moment the leader finishes, with no background task to supervise and no
+    /// change to [`shutdown`](Self::shutdown) semantics.
+    ///
+    /// Returns a [`ReplyFailure`] of plain `String`s, not `Box<dyn Error>`: the
+    /// latter is not `Send`, and a `Box` living across any of the awaits in
+    /// this loop would make the whole call chain `!Send`. Keeping the internals
+    /// `String`-typed makes that mistake structurally impossible rather than
+    /// merely tested for.
+    async fn await_reply(
+        &self,
+        request_id: &str,
+        rx: &mut tokio::sync::oneshot::Receiver<String>,
+        deadline: std::time::Instant,
+    ) -> Result<String, ReplyFailure> {
+        use std::time::Instant;
+
+        let timed_out = || {
+            ReplyFailure::TimedOut(format!(
+                "{} to request '{request_id}'",
+                crate::error::TSP_REPLY_TIMEOUT_PREFIX
+            ))
+        };
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(timed_out());
+            }
+
+            tokio::select! {
+                biased;
+
+                // Someone else's pump already delivered our reply.
+                delivered = &mut *rx => {
+                    return delivered.map_err(|_| {
+                        ReplyFailure::Failed(
+                            "TSP session shut down while waiting for a reply".to_string(),
+                        )
+                    });
+                }
+
+                // We are the leader for as long as we hold this.
+                mut guard = self.ws.lock() => {
+                    let Some(ws) = guard.as_mut() else {
+                        return Err(ReplyFailure::Failed("TSP session was shut down".to_string()));
+                    };
+                    // Read under the lock, so it names the socket pumped below.
+                    let generation = self.ws_generation.load(std::sync::atomic::Ordering::Acquire);
+                    let slice = PUMP_SLICE.min(remaining);
+                    // Bound before the `match`: a scrutinee temporary lives for
+                    // the whole match body, which contains an `.await`.
+                    let outcome = self.pump_once(ws, slice).await.map_err(|fault| match fault {
+                        SocketFault::Gone(reason) => ReplyFailure::SocketGone { generation, reason },
+                        SocketFault::Other(reason) => ReplyFailure::Failed(reason),
+                    })?;
+                    match outcome {
+                        PumpOutcome::Uncorrelated(doc) => {
+                            // Not ours and not any other waiter's — park it for
+                            // the push consumer instead of dropping it.
+                            self.demux.park(doc).await;
+                        }
+                        PumpOutcome::Delivered | PumpOutcome::Idle => {}
+                    }
+                    // Release before looping so a follower can take a turn.
+                    drop(guard);
+                }
+
+                () = tokio::time::sleep(remaining) => {
+                    return Err(timed_out());
+                }
+            }
+        }
+    }
+
+    /// Read at most one application frame off `ws` within `slice`, unpack it,
+    /// and route it: to the waiter it correlates with, or back to the caller as
+    /// [`PumpOutcome::Uncorrelated`].
+    ///
+    /// Frames that don't unpack are TSP control/relationship traffic and are
+    /// skipped within the slice rather than surfaced.
+    /// `String`-typed errors for the same reason as
+    /// [`await_reply`](Self::await_reply).
+    async fn pump_once(
+        &self,
+        ws: &mut affinidi_tdk::messaging::TspWebSocket,
+        slice: std::time::Duration,
+    ) -> Result<PumpOutcome, SocketFault> {
+        use std::time::Instant;
+
+        let until = Instant::now() + slice;
+        loop {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(PumpOutcome::Idle);
+            }
+            let frame = match tokio::time::timeout(remaining, ws.recv()).await {
+                Ok(Ok(Some(bytes))) => bytes,
+                // Closed socket is an ERROR, not "nothing arrived".
+                //
+                // "Nothing arrived, ask again" is the caller's normal idle
+                // path. A closed websocket is the opposite: asking again can
+                // never produce anything. Conflating them meant a dropped inbox
+                // was indistinguishable from a quiet one, so a polling loop
+                // would spin forever, burning CPU and never reconnecting,
+                // because nothing ever signalled that the connection had gone.
+                //
+                // Surfacing it as `Err` lets the supervisor do its job: the
+                // mobile listen loop already treats an error as a drop and
+                // reconnects with backoff.
+                Ok(Ok(None)) => {
+                    return Err(SocketFault::Gone(
+                        "TSP websocket closed by the mediator".to_string(),
+                    ));
+                }
+                // A receive error ends this socket too: nothing more will be
+                // read from it, so it is as gone as a close.
+                Ok(Err(e)) => return Err(SocketFault::Gone(e.to_string())),
+                Err(_) => return Ok(PumpOutcome::Idle),
+            };
+
+            // `unpack_message`, not `unpack_bytes`: the latter returns
+            // `(payload, sender)` and cannot say what kind of frame arrived, so
+            // a control message came back as an error and was skipped by the
+            // `continue` below — **without being recorded**.
+            //
+            // That is the whole §7.2.2 trap. A relationship is established only
+            // by the control exchange, and an unrecorded relationship discards
+            // every application message that follows. The peer is then silent
+            // and says nothing about why, because §7.2.2 drops rather than
+            // refuses. Recording is enough on its own:
+            // `admits_application_message` is true for any state but `None`,
+            // so nothing has to accept for traffic to flow.
+            //
+            // Same defect as affinidi-tdk-rs#800 fixed in the mediator adapter;
+            // this is the second path that had it.
+            let payload = match self
+                .identity
+                .hub
+                .atm()
+                .tsp()
+                .unpack_message(&self.identity.profile, &frame)
+                .await
+            {
+                Ok(InboundTsp::Application { payload, .. }) => payload,
+                Ok(InboundTsp::Control {
+                    control, sender, ..
+                }) => {
+                    if let Err(e) = self
+                        .identity
+                        .hub
+                        .atm()
+                        .tsp()
+                        .record_incoming_control(&self.identity.profile, &sender, &control)
+                        .await
+                    {
+                        // A protocol rule refused it — a cancellation for a
+                        // relationship we do not hold, or the losing side of the
+                        // §7.2.3 invite race. Not a fault, and nothing to answer.
+                        tracing::debug!(%sender, error = %e, "inbound TSP control message not recorded");
+                    }
+                    continue;
+                }
+                // Padding carries nothing (§9.4) and an upper-layer control
+                // message (`XCTL`) is for a layer this session does not serve.
+                // Both are skipped by name rather than as unrecognised data.
+                Ok(_) => continue,
+                Err(_) => continue, // not sealed to us
+            };
+            // Carriage comes off here, the mirror of `send_document` putting it
+            // on. A frame that is not our binding is skipped rather than
+            // surfaced: this socket also carries the mediator's own management
+            // traffic (which speaks the bare document — see `tsp_binding`), so
+            // "not an envelope" means "not addressed to this layer".
+            let document = match crate::tsp_binding::open_envelope(&payload) {
+                Ok(document) => document,
+                Err(reason) => {
+                    tracing::debug!(%reason, "skipping a TSP frame that is not a binding envelope");
+                    continue;
+                }
+            };
+            let json = String::from_utf8(document)
+                .map_err(|e| SocketFault::Other(format!("TSP payload was not UTF-8: {e}")))?;
+
+            // One correlation rule for every TSP session — see `tsp_demux`.
+            return Ok(match self.demux.route(json).await {
+                crate::tsp_demux::Routed::Delivered => PumpOutcome::Delivered,
+                crate::tsp_demux::Routed::Uncorrelated(doc) => PumpOutcome::Uncorrelated(doc),
+            });
+        }
+    }
+
+    /// Close the TSP websocket and detach this identity from its hub (shutting
+    /// the hub down as well when this session owns it). Takes `&self` (the
+    /// session is shared across the FFI boundary).
+    pub async fn shutdown(&self) {
+        // Drop every waiter first so an in-flight `request` fails fast with
+        // "session shut down" instead of blocking until its own deadline on a
+        // socket that is about to disappear.
+        self.demux.clear().await;
+        if let Some(ws) = self.ws.lock().await.take() {
+            let _ = ws.close().await;
+        }
+        self.identity.detach().await;
+        if self.ownership == crate::session_hub::HubOwnership::Exclusive {
+            self.identity.hub.shutdown().await;
+        }
+    }
+}
+
+/// How long [`TspSession::request`] waits for a stranded reply after the
+/// reconnect that flushes it. The flush happens as the socket connects, so this
+/// only has to cover the frame's unpack and routing — plus a reply that was
+/// genuinely slow rather than stranded and lands during the window.
+#[cfg(feature = "tsp")]
+pub const STRANDED_REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one turn at the socket lasts before the holder must release it.
+///
+/// Bounds lock hand-off latency: with several requests in flight, a follower
+/// waits at most this long to become leader after the current one goes idle.
+/// Short enough that concurrency feels immediate, long enough that an idle
+/// session is not spinning on the mutex.
+#[cfg(feature = "tsp")]
+const PUMP_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What one turn at the socket produced.
+#[cfg(feature = "tsp")]
+enum PumpOutcome {
+    /// A frame arrived and went to the request that was waiting for it.
+    Delivered,
+    /// A frame arrived that no in-flight request wanted.
+    Uncorrelated(String),
+    /// The slice elapsed with no application frame.
+    Idle,
+}
+
+/// Why one turn at the socket failed.
+#[cfg(feature = "tsp")]
+enum SocketFault {
+    /// The socket is finished — closed by the mediator (its token expired, or
+    /// another socket for this DID evicted it) or broken. Reading it again can
+    /// never produce anything; only a reconnect can.
+    Gone(String),
+    /// The socket is fine but a frame on it could not be read.
+    Other(String),
+}
+
+#[cfg(feature = "tsp")]
+impl std::fmt::Display for SocketFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gone(reason) | Self::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// Why [`TspSession::await_reply`] returned without a reply. The variants are
+/// what [`TspSession::request`] decides on; each carries the message the caller
+/// finally sees.
+#[cfg(feature = "tsp")]
+enum ReplyFailure {
+    /// The deadline passed. Starts with `TSP_REPLY_TIMEOUT_PREFIX`, which
+    /// `VtaError::is_tsp_reply_timeout` reads.
+    TimedOut(String),
+    /// The socket numbered `generation` was closed or broke while waiting.
+    SocketGone { generation: u64, reason: String },
+    /// Anything else, such as the session being shut down.
+    Failed(String),
+}
+
+#[cfg(feature = "tsp")]
+impl std::fmt::Display for ReplyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut(reason) | Self::Failed(reason) => f.write_str(reason),
+            Self::SocketGone { reason, .. } => f.write_str(reason),
+        }
+    }
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Build a `messaging/ping/0.2` document addressed to `vta_did`.
+///
+/// One builder for all three senders — [`TspPingSession::ping`],
+/// [`TspPingSession::probe_send`] and [`TspSession::announce`] — because the
+/// thing they had in common was the member they all left out.
+///
+/// # Why `issuedAt` is stamped here
+///
+/// A consumer that keeps a duplicate-execution record (SPEC §7.2 item 11) has
+/// to bound acceptance by the same window it retains that record over, and a
+/// document carrying no timestamp at all cannot be placed in any window. All
+/// three senders omitted both `issuedAt` and `expiresAt`, so from the moment a
+/// VTA set an acceptance window the probe was refused before reaching the
+/// handler — and refused as `expired`, which reads as a transport delay rather
+/// than a malformed document, so the failure looked like the timeout it is
+/// not. A liveness probe that a live peer refuses is worse than no probe.
+///
+/// `issuedAt` alone is the right bound to carry: an `expiresAt` would put the
+/// consumer's retention obligation in this client's hands.
+///
+/// Gated with its three callers: `TspPingSession` and `TspSession` are both
+/// `tsp`-only, so under `session` alone this is dead code and `-D warnings`
+/// fails the `vta-service rest only` feature combo.
+#[cfg(feature = "tsp")]
+fn ping_document(
+    client_did: &str,
+    vta_did: &str,
+) -> Result<trust_tasks_rs::TrustTask<serde_json::Value>, Box<dyn std::error::Error>> {
+    let type_uri = crate::trust_tasks::TASK_MESSAGING_PING_0_2
+        .parse()
+        .map_err(|e| format!("messaging/ping type URI parse: {e}"))?;
+    let mut doc: trust_tasks_rs::TrustTask<serde_json::Value> = trust_tasks_rs::TrustTask::new(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        type_uri,
+        serde_json::json!({ "nonce": uuid::Uuid::new_v4().to_string() }),
+    );
+    doc.issuer = Some(client_did.to_string());
+    doc.recipient = Some(vta_did.to_string());
+    doc.issued_at = Some(chrono::Utc::now());
+    Ok(doc)
+}
+
+#[cfg(all(test, feature = "tsp"))]
+mod ping_document_tests {
+    use super::ping_document;
+
+    /// The probe has to survive the posture SPEC §7.2 prescribes for a
+    /// consumer keeping a duplicate-execution record — which is every VTA,
+    /// since the spine guards every document it dispatches. Asserting
+    /// `issued_at.is_some()` would pass on a document the consumer still
+    /// refuses; asserting against the policy is what actually pins the bug.
+    #[test]
+    fn a_ping_survives_a_consequential_consumers_freshness_policy() {
+        let doc = ping_document("did:key:zClient", "did:key:zVta").expect("a ping document");
+        doc.validate_freshness(
+            chrono::Utc::now(),
+            &trust_tasks_rs::FreshnessPolicy::consequential(),
+        )
+        .expect(
+            "a liveness probe a live peer refuses is worse than no probe: this \
+             document must be placeable in the consumer's acceptance window",
+        );
+    }
+
+    /// The two members that make it dispatchable at all, kept distinct from the
+    /// freshness assertion above so a regression names itself.
+    #[test]
+    fn a_ping_is_addressed_and_attributed() {
+        let doc = ping_document("did:key:zClient", "did:key:zVta").expect("a ping document");
+        assert_eq!(doc.issuer.as_deref(), Some("did:key:zClient"));
+        assert_eq!(doc.recipient.as_deref(), Some("did:key:zVta"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `relate` skips the invite exactly when sending one would be invalid.
+    ///
+    /// This is the invariant the idempotency rests on, and it is a
+    /// *correspondence* between two things that live in different crates:
+    /// `relate` decides using `admits_application_message()`, while the
+    /// transition table decides whether `SendInvite` is legal. If those ever
+    /// disagree, `relate` either re-invites a peer it already holds (an
+    /// `InvalidTransition`, the bug this fixes) or silently skips forming a
+    /// relationship it actually needed — and the second failure is the one that
+    /// presents as an unexplained §7.2.2 drop with nothing in any log.
+    ///
+    /// Pinning it here costs no mediator and no socket.
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn relate_skips_the_invite_exactly_when_sending_one_would_be_invalid() {
+        use affinidi_tdk::tsp::relationship::{RelationshipEvent, RelationshipState};
+
+        for state in [
+            RelationshipState::None,
+            RelationshipState::Pending,
+            RelationshipState::InviteReceived,
+            RelationshipState::Bidirectional,
+        ] {
+            let invite_is_legal = state.transition(RelationshipEvent::SendInvite).is_ok();
+            assert_eq!(
+                state.admits_application_message(),
+                !invite_is_legal,
+                "`relate` skips inviting from {state:?} because \
+                 `admits_application_message` is {}, but `SendInvite` from that state is {} — \
+                 the two have diverged and `relate` is now wrong in one direction or the other",
+                state.admits_application_message(),
+                if invite_is_legal {
+                    "legal"
+                } else {
+                    "an InvalidTransition"
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_round_trip() {
+        let session = Session {
+            client_did: "did:key:z6Mk1".into(),
+            private_key: "z_seed".into(),
+            vta_did: Some("did:key:z6MkVTA".into()),
+            access_token: Some("tok123".into()),
+            access_expires_at: Some(1700000000),
+            token_origin: Some("https://vta.example".into()),
+            needs_rotation: false,
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.client_did, session.client_did);
+        assert_eq!(restored.private_key, session.private_key);
+        assert_eq!(restored.vta_did, session.vta_did);
+        assert_eq!(restored.access_token, session.access_token);
+        assert_eq!(restored.access_expires_at, session.access_expires_at);
+        assert_eq!(restored.token_origin, session.token_origin);
+    }
+
+    /// A session saved before tokens were origin-bound still loads; with no
+    /// origin recorded, its cached token is never reused.
+    #[test]
+    fn test_session_without_token_origin_loads() {
+        let json = r#"{
+            "client_did": "did:key:z6Mk1",
+            "private_key": "z_seed",
+            "vta_did": "did:key:z6MkVTA",
+            "access_token": "tok",
+            "access_expires_at": 4102444800
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.access_token.as_deref(), Some("tok"));
+        assert!(session.token_origin.is_none());
+    }
+
+    #[test]
+    fn url_origin_ignores_path_and_default_port() {
+        assert_eq!(
+            url_origin("https://vta.example/v1").as_deref(),
+            Some("https://vta.example")
+        );
+        assert_eq!(
+            url_origin("https://vta.example:443"),
+            url_origin("https://vta.example")
+        );
+        assert_ne!(
+            url_origin("https://vta.example:8443"),
+            url_origin("https://vta.example")
+        );
+        assert_ne!(
+            url_origin("http://vta.example"),
+            url_origin("https://vta.example")
+        );
+        assert_eq!(url_origin("not a url"), None);
+    }
+
+    /// A resolver holding one document for `did` that advertises `#vta-rest`
+    /// at `rest` (or no service at all when `rest` is `None`).
+    async fn resolver_with_rest(did: &str, rest: Option<&str>) -> DIDCacheClient {
+        use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
+        let services = match rest {
+            Some(rest) => serde_json::json!([
+                { "id": format!("{did}#vta-rest"), "type": "VTARest", "serviceEndpoint": rest }
+            ]),
+            None => serde_json::json!([]),
+        };
+        let doc = serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": did,
+            "service": services,
+        });
+        let mut client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("local DID cache");
+        client
+            .add_did_document(did, serde_json::from_value(doc).expect("fixture document"))
+            .await;
+        client
+    }
+
+    /// The forced-REST path vets the advertised URL too.
+    #[tokio::test]
+    async fn forced_rest_url_from_did_doc_is_vetted() {
+        use crate::http::EndpointPolicy;
+        let did = "did:web:vta.example";
+
+        let r = resolver_with_rest(did, Some("http://169.254.169.254/latest/meta-data/")).await;
+        let err = rest_url_from_did_doc_with_resolver(did, &r, EndpointPolicy::private_allowed())
+            .await
+            .expect_err("a metadata endpoint is refused even with the opt-in");
+        assert!(err.to_string().contains(did), "{err}");
+
+        let r = resolver_with_rest(did, Some("https://10.0.0.5")).await;
+        let err = rest_url_from_did_doc_with_resolver(did, &r, EndpointPolicy::public_only())
+            .await
+            .expect_err("a private endpoint needs the opt-in");
+        assert!(
+            err.to_string().contains("VTA_ALLOW_PRIVATE_ENDPOINTS"),
+            "{err}"
+        );
+        assert_eq!(
+            rest_url_from_did_doc_with_resolver(did, &r, EndpointPolicy::private_allowed())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("https://10.0.0.5")
+        );
+
+        let r = resolver_with_rest(did, Some("http://127.0.0.1:8100/")).await;
+        assert_eq!(
+            rest_url_from_did_doc_with_resolver(did, &r, EndpointPolicy::public_only())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:8100")
+        );
+
+        let r = resolver_with_rest(did, None).await;
+        assert!(
+            rest_url_from_did_doc_with_resolver(did, &r, EndpointPolicy::public_only())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Older session blobs include a `vta_url` field. Serde silently drops
+    /// unknown fields on deserialise so they keep loading; the field
+    /// disappears on next save.
+    #[test]
+    fn test_session_legacy_vta_url_field_silently_dropped() {
+        let json = r#"{
+            "client_did": "did:key:z6Mk1",
+            "private_key": "z_seed",
+            "vta_did": "did:key:z6MkVTA",
+            "vta_url": "https://stale.example.com",
+            "access_token": null,
+            "access_expires_at": null
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.vta_did.as_deref(), Some("did:key:z6MkVTA"));
+        // Field is gone — re-serializing produces no `vta_url` key.
+        let reserialised = serde_json::to_string(&session).unwrap();
+        assert!(!reserialised.contains("vta_url"));
+    }
+
+    #[test]
+    fn test_session_vta_did_defaults_to_none_when_missing() {
+        // A PendingVtaBinding session persists with `vta_did` absent.
+        let json = r#"{
+            "client_did": "did:key:z6MkPending",
+            "private_key": "z_seed",
+            "access_token": null,
+            "access_expires_at": null
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert!(session.vta_did.is_none());
+    }
+
+    #[test]
+    fn test_session_vta_did_round_trips_null() {
+        let session = Session {
+            client_did: "did:key:z6MkPending".into(),
+            private_key: "z_seed".into(),
+            vta_did: None,
+            access_token: None,
+            access_expires_at: None,
+            token_origin: None,
+            needs_rotation: false,
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert!(restored.vta_did.is_none());
+    }
+
+    #[test]
+    fn test_now_epoch_is_recent() {
+        let epoch = now_epoch();
+        assert!(epoch > 1704067200, "epoch {epoch} should be after 2024");
+        assert!(epoch < 4102444800, "epoch {epoch} should be before 2100");
+    }
+
+    #[test]
+    fn test_url_from_did_web() {
+        assert_eq!(
+            url_from_did("did:web:vta.example.com"),
+            Some("https://vta.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_from_did_web_with_port() {
+        assert_eq!(
+            url_from_did("did:web:localhost%3A8100"),
+            Some("https://localhost:8100".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_from_did_webs() {
+        assert_eq!(
+            url_from_did("did:webs:vta.example.com:nodes:EAbc"),
+            Some("https://vta.example.com".to_string())
+        );
+        assert_eq!(
+            url_from_did("did:webs:localhost%3A8100:EAbc"),
+            Some("https://localhost:8100".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_from_did_webvh() {
+        assert_eq!(
+            url_from_did("did:webvh:QmSCID123:vta.example.com"),
+            Some("https://vta.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_from_did_webvh_with_port() {
+        assert_eq!(
+            url_from_did("did:webvh:QmSCID123:localhost%3A8100"),
+            Some("https://localhost:8100".to_string())
+        );
+    }
+
+    #[test]
+    fn test_url_from_did_key_returns_none() {
+        assert_eq!(url_from_did("did:key:z6MkTest"), None);
+        assert_eq!(
+            url_from_did("did:scid:vh:1:QmSCID123?src=vta.example.com/vta").as_deref(),
+            Some("https://vta.example.com")
+        );
+        assert_eq!(
+            url_from_did("did:scid:vh:1:QmSCID123?src=localhost%3A8100").as_deref(),
+            Some("https://localhost:8100")
+        );
+        assert_eq!(url_from_did("did:scid:vh:1:QmSCID123"), None);
+    }
+
+    fn test_store() -> SessionStore {
+        SessionStore::with_backend(Box::new(testing::InMemorySessionBackend::new()))
+    }
+
+    #[test]
+    fn test_in_memory_backend() {
+        let store = test_store();
+
+        assert!(!store.has_session("test"));
+
+        store
+            .store_direct("test", "did:key:z6Mk1", "zSeed", "did:key:zVTA")
+            .unwrap();
+        assert!(store.has_session("test"));
+
+        let info = store.loaded_session("test").unwrap();
+        assert_eq!(info.client_did, "did:key:z6Mk1");
+        assert_eq!(info.vta_did.as_deref(), Some("did:key:zVTA"));
+
+        store.logout("test");
+        assert!(!store.has_session("test"));
+    }
+
+    #[test]
+    fn store_pending_vta_binding_round_trips() {
+        let store = test_store();
+        store
+            .store_pending_vta_binding("slug", "did:key:z6MkPending", "zSeed123")
+            .unwrap();
+
+        assert!(store.has_pending_vta_binding("slug"));
+
+        let info = store.loaded_session("slug").unwrap();
+        assert_eq!(info.client_did, "did:key:z6MkPending");
+        assert!(info.vta_did.is_none());
+    }
+
+    #[test]
+    fn store_pending_vta_binding_rejects_non_did_key() {
+        let store = test_store();
+        let err = store
+            .store_pending_vta_binding("slug", "did:web:something", "zSeed")
+            .unwrap_err();
+        assert!(err.to_string().contains("did:key"));
+    }
+
+    #[test]
+    fn store_pending_vta_binding_rejects_empty_inputs() {
+        let store = test_store();
+        assert!(
+            store
+                .store_pending_vta_binding("   ", "did:key:z6Mk", "zSeed")
+                .is_err()
+        );
+        assert!(
+            store
+                .store_pending_vta_binding("slug", "did:key:z6Mk", "")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bind_vta_did_promotes_pending_to_rotation() {
+        let store = test_store();
+        store
+            .store_pending_vta_binding("slug", "did:key:z6MkPending", "zSeed")
+            .unwrap();
+
+        store
+            .bind_vta_did("slug", "did:webvh:abc:vta.example.com:primary")
+            .unwrap();
+
+        assert!(!store.has_pending_vta_binding("slug"));
+        let info = store.loaded_session("slug").unwrap();
+        assert_eq!(info.client_did, "did:key:z6MkPending");
+        assert_eq!(
+            info.vta_did.as_deref(),
+            Some("did:webvh:abc:vta.example.com:primary")
+        );
+    }
+
+    #[test]
+    fn bind_vta_did_accepts_did_key_vta() {
+        // did:key VTAs are documented in docs/02-vta/cold-start.md — keep
+        // the validation loose.
+        let store = test_store();
+        store
+            .store_pending_vta_binding("slug", "did:key:z6MkPending", "zSeed")
+            .unwrap();
+
+        store.bind_vta_did("slug", "did:key:z6MkVTA").unwrap();
+    }
+
+    #[test]
+    fn bind_vta_did_rejects_rebind() {
+        let store = test_store();
+        store
+            .store_direct("slug", "did:key:z6Mk", "zSeed", "did:web:vta.example.com")
+            .unwrap();
+        let err = store
+            .bind_vta_did("slug", "did:web:other.example.com")
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a VTA DID bound"));
+    }
+
+    #[test]
+    fn bind_vta_did_rejects_missing_session() {
+        let store = test_store();
+        let err = store
+            .bind_vta_did("no-such-slug", "did:web:vta.example.com")
+            .unwrap_err();
+        assert!(err.to_string().contains("no session found"));
+    }
+
+    #[test]
+    fn bind_vta_did_rejects_malformed_input() {
+        let store = test_store();
+        store
+            .store_pending_vta_binding("slug", "did:key:z6Mk", "zSeed")
+            .unwrap();
+
+        assert!(store.bind_vta_did("slug", "   ").is_err());
+        assert!(store.bind_vta_did("slug", "not-a-did").is_err());
+    }
+
+    #[test]
+    fn has_pending_vta_binding_false_for_direct_session() {
+        let store = test_store();
+        store
+            .store_direct("slug", "did:key:z6Mk", "zSeed", "did:web:vta.example.com")
+            .unwrap();
+        assert!(!store.has_pending_vta_binding("slug"));
+    }
+
+    #[test]
+    fn has_pending_vta_binding_false_for_missing_entry() {
+        let store = test_store();
+        assert!(!store.has_pending_vta_binding("nope"));
+    }
+
+    #[test]
+    fn require_vta_did_errors_on_pending() {
+        let pending = Session {
+            client_did: "did:key:z6MkPending".into(),
+            private_key: "zSeed".into(),
+            vta_did: None,
+            access_token: None,
+            access_expires_at: None,
+            token_origin: None,
+            needs_rotation: false,
+        };
+        let err = require_vta_did(&pending).unwrap_err();
+        assert!(err.to_string().contains("pnm setup continue"));
+    }
+
+    // ── Transport selection ───────────────────────────────────────
+
+    #[test]
+    fn transport_choice_defaults_to_auto() {
+        assert_eq!(TransportChoice::default(), TransportChoice::Auto);
+    }
+
+    #[test]
+    fn connect_timeout_defaults_when_unset_or_junk() {
+        let d = DIDCOMM_CONNECT_TIMEOUT_DEFAULT;
+        assert_eq!(parse_connect_timeout(None, d), d);
+        assert_eq!(parse_connect_timeout(Some("not-a-number".into()), d), d);
+        // Zero would fail every connect instantly — worse than the hang.
+        assert_eq!(parse_connect_timeout(Some("0".into()), d), d);
+    }
+
+    #[test]
+    fn connect_timeout_honours_env_override() {
+        assert_eq!(
+            parse_connect_timeout(Some(" 90 ".into()), DIDCOMM_CONNECT_TIMEOUT_DEFAULT),
+            Duration::from_secs(90)
+        );
+    }
+
+    /// TSP carries its **own** deadline default, so an operator stretching the
+    /// TSP ceiling doesn't silently loosen the DIDComm one they rely on to fail
+    /// fast (and vice versa).
+    #[test]
+    fn tsp_connect_timeout_is_independent_of_the_didcomm_one() {
+        assert_eq!(
+            parse_connect_timeout(None, TSP_CONNECT_TIMEOUT_DEFAULT),
+            TSP_CONNECT_TIMEOUT_DEFAULT
+        );
+        assert_eq!(
+            parse_connect_timeout(Some("120".into()), TSP_CONNECT_TIMEOUT_DEFAULT),
+            Duration::from_secs(120)
+        );
+    }
+
+    /// R6.4: "TSP advertised but the mediator went silent" and "no TSP
+    /// advertised at all" are different faults with different fixes. One shared
+    /// hint for both is exactly what that rule exists to prevent.
+    #[test]
+    fn tsp_failure_modes_have_distinct_messages() {
+        let unreachable =
+            tsp_unreachable_error("did:web:mediator.example.com", Duration::from_secs(30));
+        assert!(
+            unreachable.contains("did:web:mediator.example.com"),
+            "must name the mediator that went silent: {unreachable}"
+        );
+        assert!(unreachable.contains("VTA_TSP_CONNECT_TIMEOUT_SECS"));
+
+        let not_advertised =
+            no_tsp_endpoint_error("did:webvh:x:vta.example", true, true).to_string();
+        assert!(
+            !not_advertised.contains("Timed out"),
+            "a VTA that never advertised TSP did not time out: {not_advertised}"
+        );
+        // Names what it *does* advertise, so the next command is obvious.
+        assert!(not_advertised.contains("--transport didcomm"));
+        assert!(not_advertised.contains("--transport rest"));
+    }
+
+    /// The advertised-transport hint must not offer a transport the VTA does
+    /// not have — that would send the operator into a second dead end.
+    #[test]
+    fn no_tsp_error_only_offers_transports_that_exist() {
+        let didcomm_only = no_tsp_endpoint_error("did:key:z6Mk", true, false).to_string();
+        assert!(didcomm_only.contains("--transport didcomm"));
+        assert!(!didcomm_only.contains("--transport rest"));
+
+        let rest_only = no_tsp_endpoint_error("did:key:z6Mk", false, true).to_string();
+        assert!(rest_only.contains("--transport rest"));
+        assert!(!rest_only.contains("--transport didcomm"));
+
+        let neither = no_tsp_endpoint_error("did:key:z6Mk", false, false).to_string();
+        assert!(neither.contains("no other transport"));
+    }
+
+    // TSP reply correlation moved to `crate::tsp_demux` when the rule became
+    // shared with the `DIDCommSession` TSP leg; its tests moved with it.
+
+    #[test]
+    fn forced_didcomm_error_names_the_alternatives() {
+        let msg = no_didcomm_endpoint_error("did:webvh:x:vta.example", true, false).to_string();
+        assert!(msg.contains("--transport tsp"));
+        assert!(!msg.contains("--transport rest"));
+    }
+
+    /// The whole point of bounding the connect is that the operator learns the
+    /// recovery flag exists. If this message stops naming it, the timeout is
+    /// just a faster dead end.
+    #[test]
+    fn mediator_timeout_error_names_the_recovery_flag() {
+        let msg =
+            mediator_unreachable_error("did:web:mediator.example.com", Duration::from_secs(30));
+        assert!(msg.contains("--transport rest"));
+        assert!(msg.contains("services didcomm disable"));
+        assert!(msg.contains("did:web:mediator.example.com"));
+        assert!(msg.contains("30s"));
+    }
+
+    #[test]
+    fn no_rest_endpoint_error_tells_operator_to_pass_url() {
+        let msg = no_rest_endpoint_error("did:webvh:scid:host.example.com").to_string();
+        assert!(msg.contains("--url"));
+        assert!(msg.contains("did:webvh:scid:host.example.com"));
+    }
+
+    // ── Rotation ordering guards ───────────────────────────────────
+    //
+    // Rotation moves the caller's ACL entry onto a new DID atomically, then the
+    // caller persists the new private key. Between those two the temp DID is
+    // gone server-side while the new key exists only in memory: anything that
+    // can block there can be killed by a Ctrl-C or a CI timeout and leave the
+    // operator with neither DID usable — locked out, nothing to recover from.
+    //
+    // The ordering is what makes that safe, and it lives across several
+    // functions with nothing type-level holding it. These read this file's own
+    // source and fail if the calls move. Source-level because the alternative
+    // is a live mediator: the bug is *where* an await sits, which no
+    // unit-testable return value observes.
+
+    /// This file's own source, truncated at the test module.
+    ///
+    /// Truncated deliberately: a guard that counts call sites would otherwise
+    /// count the string literal *in the guard itself*, and quietly pass or fail
+    /// for the wrong reason. Everything below reads production code only.
+    fn src() -> &'static str {
+        const WHOLE: &str = include_str!("session.rs");
+        // The `#[cfg(test)]` attribute on this very module. Written split so
+        // this line is not itself the first match.
+        let marker = concat!("#[cfg", "(test)]");
+        &WHOLE[..WHOLE
+            .find(marker)
+            .expect("session.rs must have a test module")]
+    }
+
+    /// Keyring VTI-14: an explicit `--url` / `VTA_URL` must survive endpoint
+    /// resolution, on every transport and not only forced `--transport rest`.
+    ///
+    /// Reported against `cnm vetting`, which is where it is felt — `vetting`
+    /// builds its `VtcClient` from `VtaClient::rest_url()`, so a discarded
+    /// override sends it to the host the DID document advertises while the
+    /// operator watches the host they named stay idle. Nothing in the output
+    /// says which one it used, which is what made it cost them a fork of the
+    /// tool rather than an afternoon.
+    #[test]
+    fn an_explicit_url_survives_endpoint_resolution_on_every_transport() {
+        let url = "https://named-by-the-operator.example/v1";
+
+        // TSP: the richest variant, and the one a dual-transport VTA resolves
+        // to — so the arm most likely to be reached in a real deployment.
+        let tsp = VtaEndpoint::Tsp {
+            vta_did: "did:webvh:example:vta".into(),
+            mediator_did: "did:webvh:example:tsp-mediator".into(),
+            didcomm_mediator_did: Some("did:webvh:example:didcomm-mediator".into()),
+            rest_url: Some("https://advertised-by-the-did-doc.example/v1".into()),
+        };
+        match tsp.with_rest_override(Some(url)) {
+            VtaEndpoint::Tsp {
+                rest_url,
+                mediator_did,
+                didcomm_mediator_did,
+                ..
+            } => {
+                assert_eq!(rest_url.as_deref(), Some(url));
+                // The override names a REST base. It is not a statement about
+                // transport, so both mediators must survive it untouched.
+                assert_eq!(mediator_did, "did:webvh:example:tsp-mediator");
+                assert_eq!(
+                    didcomm_mediator_did.as_deref(),
+                    Some("did:webvh:example:didcomm-mediator")
+                );
+            }
+            _ => panic!("an override must not change the Tsp variant"),
+        }
+
+        // DIDComm, including the case the DID document advertises no REST at
+        // all — the override is then the only REST base there is, and
+        // discarding it leaves `rest_url()` empty rather than merely wrong.
+        let didcomm = VtaEndpoint::DIDComm {
+            vta_did: "did:webvh:example:vta".into(),
+            mediator_did: "did:webvh:example:mediator".into(),
+            rest_url: None,
+        };
+        match didcomm.with_rest_override(Some(url)) {
+            VtaEndpoint::DIDComm { rest_url, .. } => assert_eq!(rest_url.as_deref(), Some(url)),
+            _ => panic!("an override must not change the DIDComm variant"),
+        }
+
+        let rest = VtaEndpoint::Rest {
+            url: "https://advertised-by-the-did-doc.example/v1".into(),
+        };
+        match rest.with_rest_override(Some(url)) {
+            VtaEndpoint::Rest { url: got } => assert_eq!(got, url),
+            _ => panic!("an override must not change the Rest variant"),
+        }
+    }
+
+    /// The other half: with no override, resolution is left exactly as it was.
+    /// A fix that always rewrote `rest_url` would pass the test above and
+    /// break every operator who relies on the advertisement.
+    #[test]
+    fn absent_an_override_the_resolved_endpoint_is_untouched() {
+        let advertised = "https://advertised-by-the-did-doc.example/v1";
+        let before = VtaEndpoint::Tsp {
+            vta_did: "did:webvh:example:vta".into(),
+            mediator_did: "did:webvh:example:tsp-mediator".into(),
+            didcomm_mediator_did: None,
+            rest_url: Some(advertised.into()),
+        };
+        match before.with_rest_override(None) {
+            VtaEndpoint::Tsp { rest_url, .. } => assert_eq!(rest_url.as_deref(), Some(advertised)),
+            _ => panic!("an absent override must not change the Tsp variant"),
+        }
+    }
+
+    /// Body of the item starting at `signature`, up to `terminator`
+    /// (`"\n}\n"` for a free function, `"\n    }\n"` for a method).
+    fn body_of(signature: &str, terminator: &str) -> &'static str {
+        let src = src();
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` not found — did it get renamed?"));
+        let rest = &src[start..];
+        let end = rest
+            .find(terminator)
+            .unwrap_or_else(|| panic!("could not find the end of `{signature}`"));
+        &rest[..end]
+    }
+
+    #[test]
+    fn rotation_reaches_the_mediator_before_it_commits_the_swap() {
+        let rotate = body_of("async fn rotate_key_over_client(", "\n}\n");
+
+        let probed = rotate
+            .find("reach_mediator(")
+            .expect("rotation must probe that the new DID can reach its mediator");
+        let swapped = rotate
+            .find("swap_acl_for")
+            .expect("rotation must move the ACL entry with the atomic acl/swap-key");
+        assert!(
+            probed < swapped,
+            "the mediator probe must precede the swap. After the swap the temp DID is gone \
+             while the caller has not yet persisted the new key, so nothing optional may run \
+             there — and a rotation that commits to a DID which cannot reach its mediator is \
+             unrecoverable. Before the swap, a failure is free: the temp DID is still \
+             authoritative and the caller retries."
+        );
+        assert!(
+            rotate.rfind("provision_client_acl").map(|i| i < swapped) == Some(true),
+            "the rotated DID's mediator account must be opened before the swap too — it is \
+             the same window"
+        );
+    }
+
+    #[test]
+    fn the_mediator_probe_is_fatal_only_where_the_caller_needs_the_mediator() {
+        // A DIDComm/TSP client reconnects over the mediator immediately after
+        // the swap, so a new DID that cannot reach it must not be committed to.
+        // A REST client never touches the mediator, and failing its rotation on
+        // one would make `--transport rest` depend on DIDComm infrastructure it
+        // does not use — the exact coupling `--transport rest` exists to avoid.
+        let rest = body_of("    pub async fn ensure_authenticated(", "\n    }\n");
+        assert!(
+            rest.contains("MediatorProbe::best_effort("),
+            "the REST rotation must treat the mediator probe as best-effort"
+        );
+        assert!(
+            !rest.contains("required: true"),
+            "a REST rotation must not fail because a mediator it never uses is down"
+        );
+
+        let reconnect = body_of("    async fn rotate_and_reconnect(", "\n    }\n");
+        assert!(
+            reconnect.contains("required: true"),
+            "a DIDComm rotation reconnects over the mediator, so its probe must be required: \
+             the temp entry is gone by then, and an unreachable new DID is unrecoverable"
+        );
+    }
+
+    #[test]
+    fn a_tsp_only_mediator_still_gets_its_account_pass() {
+        // The reason this exists: a TSP-only mediator used to be skipped
+        // entirely, because the mediator's management dispatch was DIDComm-only
+        // and no packet a client could send would set its ACL
+        // (affinidi-tdk-rs#783 added the TSP arm). Skipping is no longer
+        // correct, and the way it would regress is by falling back to `None`
+        // rather than by failing — silent, and only on the deployments that
+        // depend on it.
+        let f = body_of("    fn account_transport(", "\n    }\n");
+
+        let tsp_only = f
+            .find("didcomm_mediator_did: None,")
+            .expect("a TSP-only mediator must be matched explicitly");
+        let arm = &f[tsp_only..];
+        assert!(
+            arm.contains("AccountTransport::Tsp"),
+            "a TSP-only mediator must take the TSP account pass, not `None` — that skip was \
+             only ever correct while the mediator had no TSP management route"
+        );
+
+        // Dual-transport prefers DIDComm: it is the arm every deployed mediator
+        // understands, so on a VTA offering both it is the one certain to act.
+        let dual = f
+            .find("didcomm_mediator_did: Some(didcomm)")
+            .expect("a dual-transport mediator must be matched");
+        let dual_arm = &f[dual..f[dual..].find("Self::Tsp").map_or(f.len(), |i| dual + i)];
+        assert!(
+            dual_arm.contains("AccountTransport::Didcomm"),
+            "a VTA advertising both transports must open its account over DIDComm"
+        );
+    }
+
+    #[test]
+    fn the_tsp_account_pass_never_claims_delivery() {
+        // R1.1: a TSP send resolving `Ok` means the mediator accepted the frame,
+        // not that it applied the ACL — and a mediator without the TSP
+        // management arm files it silently and answers nothing. Every
+        // "delivered" log in the ecosystem was built on that lie once already.
+        let rotate = body_of("async fn rotate_key_over_client(", "\n}\n");
+        let tsp_arm_start = rotate
+            .find("AccountTransport::Tsp")
+            .expect("the TSP account pass must exist");
+        let tsp_arm = &rotate[tsp_arm_start..];
+        let success_log = tsp_arm
+            .find("Ok(()) =>")
+            .map(|i| &tsp_arm[i..i + 300])
+            .expect("the TSP arm must log its success case");
+        assert!(
+            success_log.contains("sent") && !success_log.contains("opened"),
+            "the TSP success log must say what was *sent*, not what was opened — a send `Ok` \
+             is acceptance for delivery, never confirmation the ACL was applied"
+        );
+    }
+
+    #[test]
+    fn tsp_reachability_is_probed_over_tsp() {
+        // The account pass rides the ATM (DIDComm) and is best-effort, but
+        // *reachability* must be proven on the transport the caller reconnects
+        // on. A DIDComm trust-ping against a TSP-only mediator proves the wrong
+        // thing and fails outright — which on this path would refuse a
+        // perfectly good DID and make TSP-only VTAs unrotatable, the very gap
+        // this exists to close.
+        let reach = body_of("async fn reach_mediator(", "\n}\n");
+        let tsp_branch = reach
+            .find("TspPingSession::new")
+            .expect("the TSP arm must probe over TSP");
+        let didcomm_branch = reach
+            .find("TrustPingSession::new")
+            .expect("the DIDComm arm must probe over DIDComm");
+        assert!(
+            tsp_branch < didcomm_branch,
+            "the `over_tsp` branch must come first and use TspPingSession"
+        );
+
+        let reconnect = body_of("    async fn rotate_and_reconnect(", "\n    }\n");
+        assert!(
+            reconnect.contains("MediatorProbe::Tsp"),
+            "a TSP rotation must use the TSP probe variant, not the DIDComm one"
+        );
+    }
+
+    #[test]
+    fn there_is_exactly_one_rotation_implementation() {
+        // `acl/swap-key` is a dispatched Trust Task, so one `swap_acl_for` call
+        // serves REST, DIDComm and TSP. A second rotation path is how the
+        // DIDComm one drifted onto create-then-delete — an over-privilege
+        // window `acl/swap-key` exists to avoid — while REST used the swap.
+        assert_eq!(
+            src().matches("swap_acl_for(").count(),
+            1,
+            "rotation must go through a single `swap_acl_for` call site; a per-transport \
+             copy is what let the DIDComm path drift onto create-then-delete"
+        );
+        for gone in ["async fn rotate_key(", "async fn rotate_key_didcomm("] {
+            assert!(
+                !src().contains(gone),
+                "`{gone}` is superseded by `rotate_key_over_client`, which is transport-\
+                 agnostic. Reintroducing a per-transport rotation reopens the drift."
+            );
+        }
+        // Create-then-delete is the shape that must not come back: an ACL entry
+        // minted for the new DID while the temp one still holds the same grant.
+        let rotate = body_of("async fn rotate_key_over_client(", "\n}\n");
+        assert!(
+            !rotate.contains("create_acl") && !rotate.contains("delete_acl"),
+            "rotation must use the atomic swap, never create-then-delete: the latter leaves \
+             a window in which two DIDs hold the same grant"
+        );
+    }
+
+    #[test]
+    fn rotation_tears_down_the_temp_client_on_every_path() {
+        let f = body_of("    async fn rotate_and_reconnect(", "\n    }\n");
+        let shutdown = f
+            .find("temp.shutdown()")
+            .expect("the temp client must be torn down");
+        let propagate = f
+            .find("let rotated = rotated?;")
+            .expect("the rotation result must be propagated after the teardown");
+        assert!(
+            shutdown < propagate,
+            "`temp.shutdown()` must run before the `?`. There is no `Drop` impl, and an \
+             abandoned session keeps auto-reconnecting while holding the mediator's \
+             one-socket-per-DID slot, so an early return leaks a socket that duels with the \
+             reconnect."
+        );
+        let saved = f
+            .find("self.save_session")
+            .expect("the rotated session must be persisted");
+        assert!(
+            propagate < saved,
+            "persist the rotated session before reconnecting on it"
+        );
+    }
+
+    #[test]
+    fn didcomm_rotation_path_bounds_its_connects() {
+        let ensure = body_of("pub async fn ensure_authenticated_didcomm(", "\n    }\n");
+        assert!(
+            !ensure.contains("VtaClient::connect_didcomm("),
+            "`ensure_authenticated_didcomm` must connect via `connect_didcomm_bounded`. \
+             `connect_with_transport` delegates here for pending-rotation sessions, so an \
+             unbounded connect turns an unreachable mediator back into an indefinite hang \
+             instead of an error naming `--transport rest`."
+        );
+        let reconnect = body_of("    async fn rotate_and_reconnect(", "\n    }\n");
+        assert!(
+            !reconnect.contains("VtaClient::connect_didcomm(")
+                && !reconnect.contains("VtaClient::connect_tsp("),
+            "the post-rotation reconnect must be bounded on both transports"
+        );
+    }
+
+    #[test]
+    fn every_mediator_transport_path_rotates() {
+        let connect = body_of("pub async fn connect_with_transport(", "\n    }\n");
+        let rotation_gate = connect
+            .find("session.needs_rotation")
+            .expect("`connect_with_transport` must handle a pending rotation");
+
+        // The check has to precede *every* mediator connect, not just one arm.
+        // It used to sit in the `DIDComm` arm alone, which a VTA advertising
+        // both TSP and DIDComm never reaches — so dual-transport deployments
+        // stayed flagged `needs_rotation` forever and never retired their temp
+        // did:key. Same for an explicit `mediator_did` config hint, which
+        // short-circuits earlier still.
+        let first_connect = connect
+            .find("connect_didcomm_bounded(")
+            .expect("`connect_with_transport` must connect over DIDComm somewhere");
+        assert!(
+            rotation_gate < first_connect,
+            "the `needs_rotation` check must come before the first mediator connect, so the \
+             config-hint, `DIDComm` and `Tsp` paths are all covered by one gate"
+        );
+        assert_eq!(
+            connect.matches("session.needs_rotation").count(),
+            1,
+            "one gate, not one per arm — a per-arm check is how the `Tsp` and config-hint \
+             paths were missed"
+        );
+    }
+
+    #[test]
+    fn rotation_prefers_tsp_over_didcomm() {
+        // The workspace preference order is TSP > DIDComm > REST, and rotation
+        // is not an exception: `acl/swap-key` dispatches over either, so a VTA
+        // advertising TSP must rotate on it.
+        let f = body_of("async fn rotation_endpoint(", "\n}\n");
+        let tsp = f
+            .find("VtaEndpoint::Tsp")
+            .expect("rotation must consider the TSP endpoint");
+        let didcomm = f
+            .find("VtaEndpoint::DIDComm")
+            .expect("rotation must consider the DIDComm endpoint");
+        assert!(
+            tsp < didcomm,
+            "the TSP arm must be matched first, so a dual-transport VTA rotates over TSP"
+        );
+    }
+}
+
+/// Every `TspSession` future must be `Send`.
+///
+/// Not a nicety: `VtaClient::dispatch_trust_task` awaits `request`, and
+/// `vta-mcp` puts that future behind `#[tool]`, which demands `Send`. A single
+/// `Box<dyn Error>` (not `Send`) held across one `.await` inside `request` is
+/// enough to make the whole chain `!Send` — and because `vta-mcp` does not
+/// enable the `tsp` feature itself, it only breaks once Cargo's feature
+/// unification turns TSP on for a workspace-wide build. That is a long way from
+/// the edit that caused it, so pin it here where the mistake is made.
+///
+/// A compile-time check: if these stop being `Send`, this module fails to
+/// build.
+#[cfg(all(test, feature = "tsp"))]
+mod tsp_send_assertions {
+    use std::time::Duration;
+
+    fn assert_send<T: Send>(_: T) {}
+
+    #[allow(dead_code)]
+    fn tsp_futures_are_send(s: &super::TspSession) {
+        assert_send(s.request("did:vta", "did:mediator", b"{}", Duration::from_secs(1)));
+        assert_send(s.receive_next(1));
+        assert_send(s.send_document("did:vta", "did:mediator", b"{}"));
+        assert_send(s.announce("did:vta", "did:mediator"));
+        assert_send(s.shutdown());
+    }
+}

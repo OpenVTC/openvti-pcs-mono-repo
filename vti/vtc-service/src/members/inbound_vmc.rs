@@ -1,0 +1,573 @@
+//! Receive + verify a member-issued **VMC** (member → community half of the
+//! membership pair) and record it on the member's row.
+//!
+//! The VTC issues a `MembershipCredential` to each member at
+//! admission; this is the reciprocal the member issues back, naming the
+//! community as its `credentialSubject`. The `eddsa-jcs-2022` issuer proof (key
+//! under the member's DID, resolved via [`DidVmResolver`] so `did:webvh`
+//! personas verify, not just `did:key`) IS the authentication of the
+//! credential. Over DIDComm the authcrypt sender independently authenticates
+//! `member_did`; the two must agree.
+//!
+//! Shared by the DIDComm `members/vmc/1.0` handler and the Trust Task
+//! document dispatcher (REST/TSP).
+//!
+//! With `vtc/members/vmc/0.1`'s optional `requestId`, this path also closes an
+//! **approved join request**: the delivered credential doubles as the member's
+//! reciprocal half of the join, superseding the retired
+//! `join-requests/accept/0.1` task (one credential-delivery path, not two).
+
+use serde_json::Value as JsonValue;
+use tracing::info;
+use uuid::Uuid;
+
+use vtc_audit::{AuditEvent, MembershipReciprocatedData};
+use vti_common::error::AppError;
+
+use vta_sdk::protocols::members::MEMBERSHIP_CREDENTIAL_TYPE;
+
+use crate::credentials::vm_resolver::{DidVmResolver, check_issuer_binding};
+use crate::error::TaskError;
+use crate::join::{JoinStatus, get_join_request};
+use crate::members::{get_member, store_member};
+use crate::server::AppState;
+
+use vti_specs::vtc::members::vmc::v0_1::error_codes as vmc_codes;
+
+/// `vtc/members/vmc:subjectMismatch` — `credentialSubject.id` is not this
+/// community.
+pub const VMC_ERR_SUBJECT_MISMATCH: &str = vmc_codes::SUBJECT_MISMATCH.code;
+/// `vtc/members/vmc:notAMember` — the sender is not an active member.
+pub const VMC_ERR_NOT_A_MEMBER: &str = vmc_codes::NOT_A_MEMBER.code;
+/// `vtc/members/vmc:invalidCredential` — the credential does not verify, or is
+/// not a MembershipCredential.
+pub const VMC_ERR_INVALID_CREDENTIAL: &str = vmc_codes::INVALID_CREDENTIAL.code;
+/// `vtc/members/vmc:requestNotFound` — no join request with that `requestId`.
+pub const VMC_ERR_REQUEST_NOT_FOUND: &str = vmc_codes::REQUEST_NOT_FOUND.code;
+/// `vtc/members/vmc:requestNotApproved` — the named request is not approved.
+pub const VMC_ERR_REQUEST_NOT_APPROVED: &str = vmc_codes::REQUEST_NOT_APPROVED.code;
+/// `vtc/members/vmc:requestApplicantMismatch` — the named request's applicant
+/// is not the delivering member.
+pub const VMC_ERR_REQUEST_APPLICANT_MISMATCH: &str = vmc_codes::REQUEST_APPLICANT_MISMATCH.code;
+
+/// What [`receive_member_vmc_inner`] recorded.
+pub struct MemberVmcOutcome {
+    pub member_did: String,
+    pub vmc_id: String,
+    /// `false` when the same VMC was already stored (idempotent re-send) — the
+    /// caller skips re-auditing / re-logging the store.
+    pub recorded: bool,
+    /// The join request this delivery closed, echoed into the receipt.
+    /// `None` when the submission carried no `requestId`.
+    pub request_id: Option<Uuid>,
+}
+
+/// Verify a member-issued VMC and store it on the member's row.
+///
+/// Checks: the member exists and is active; `vc.issuer == member_did`; the
+/// credential is a DTG [`MEMBERSHIP_CREDENTIAL_TYPE`] under the v1 context
+/// declaring an `issuerScope`;
+/// `credentialSubject.id == <this VTC's DID>`; the issuer DI proof's
+/// `verificationMethod` is under the member and verifies against the resolved
+/// key. Idempotent: re-sending the same `id` is a no-op.
+///
+/// When `request_id` is `Some`, the named join request must exist, be
+/// `Approved`, and belong to `member_did`; on success the stored credential is
+/// additionally recorded as the reciprocal half of that join
+/// (`Member::record_reciprocation`) and the reciprocation audited. Re-sending
+/// the same credential with the same `request_id` stays a no-op.
+pub async fn receive_member_vmc_inner(
+    state: &AppState,
+    member_did: String,
+    vc: JsonValue,
+    request_id: Option<Uuid>,
+) -> Result<MemberVmcOutcome, TaskError> {
+    // The community DID the member's VMC must name as its subject.
+    let community_did = state
+        .config
+        .read()
+        .await
+        .vtc_did
+        .clone()
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| {
+            AppError::Internal("VTC DID not configured — cannot accept a member VMC".into())
+        })?;
+
+    // Credential-level verification first, so a malformed or wrongly-signed
+    // credential is reported as exactly that. Reading the member row ahead of
+    // it would turn a wrong-signer delivery into "no such member", which names
+    // the wrong failure (R6.4).
+    let vmc_id = verify_member_vmc(state, &vc, &member_did, &community_did).await?;
+
+    // Resolve + validate the join request BEFORE any write, so a bad
+    // `requestId` can't half-apply the delivery.
+    if let Some(req_id) = request_id {
+        // Each refusal is the code `vtc/members/vmc/0.1` declares for it.
+        let req = get_join_request(&state.join_requests_ks, req_id)
+            .await?
+            .ok_or_else(|| {
+                TaskError::declared(
+                    VMC_ERR_REQUEST_NOT_FOUND,
+                    AppError::NotFound(format!("join request not found: {req_id}")),
+                )
+            })?;
+        if req.applicant_did != member_did {
+            return Err(TaskError::declared(
+                VMC_ERR_REQUEST_APPLICANT_MISMATCH,
+                AppError::Validation(format!(
+                    "join request {req_id} does not belong to the delivering member"
+                )),
+            ));
+        }
+        if req.status != JoinStatus::Approved {
+            return Err(TaskError::declared(
+                VMC_ERR_REQUEST_NOT_APPROVED,
+                AppError::Conflict(format!(
+                    "join request {req_id} is {:?}; only an Approved request has a membership to reciprocate",
+                    req.status
+                )),
+            ));
+        }
+    }
+
+    // The member must exist and be active. The row is read and written back
+    // whole, so the edit lock is held across both (`members::storage::
+    // edit_lock`).
+    let edit_guard = crate::members::storage::edit_lock().await;
+    let mut member = get_member(&state.members_ks, &member_did)
+        .await?
+        .filter(|m| !m.is_removed())
+        .ok_or_else(|| {
+            TaskError::declared(
+                VMC_ERR_NOT_A_MEMBER,
+                AppError::NotFound(format!("no active member: {member_did}")),
+            )
+        })?;
+
+    // Does this acknowledgement bind to the grant we issued? DTG Core
+    // Credentials: "A member-issued VMC whose `digest` does not match a valid
+    // community-issued VMC MUST NOT be treated as completing a membership
+    // edge." A mismatch is refused outright; an *absent* digest is stored but
+    // leaves the edge incomplete — see [`check_acknowledgement_binding`].
+    //
+    // Ahead of the idempotency check below, not after it: once the grant has
+    // been re-issued, an acknowledgement that used to bind no longer does, and
+    // a re-send of it should be refused rather than quietly no-oped.
+    let bound = check_acknowledgement_binding(&vc, member.current_vmc.as_ref(), &member_did)?;
+
+    // Idempotency: the same VMC re-sent is a no-op; a *different* VMC replaces
+    // the stored one (a renewal — the member rotated/reissued their half).
+    if member.member_vmc_id.as_deref() == Some(vmc_id.as_str()) {
+        // A repeat delivery that repeats the same `requestId` is equally a
+        // no-op — the reciprocation is already recorded below.
+        return Ok(MemberVmcOutcome {
+            member_did,
+            vmc_id,
+            recorded: false,
+            request_id,
+        });
+    }
+
+    member.record_member_vmc(vmc_id.clone(), vc, bound);
+    // Closing a join request: the delivered credential IS the reciprocal half
+    // of the join, so the edge is marked reciprocated with the same id.
+    if request_id.is_some() {
+        member.record_reciprocation(vmc_id.clone());
+    }
+    store_member(&state.members_ks, &member).await?;
+    drop(edit_guard);
+
+    if let Some(req_id) = request_id {
+        let audit_writer = state
+            .audit_writer
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("audit_writer not initialised".into()))?;
+        audit_writer
+            .write(
+                &member_did,
+                Some(&member_did),
+                AuditEvent::MembershipReciprocated(MembershipReciprocatedData {
+                    request_id: req_id.to_string(),
+                    vmc_id: vmc_id.clone(),
+                    reciprocal_vc_id: vmc_id.clone(),
+                }),
+            )
+            .await?;
+    }
+
+    info!(
+        member = %member_did,
+        vmc_id = %vmc_id,
+        closed_request = ?request_id,
+        "stored member-issued VMC (member → community half of the pair)"
+    );
+
+    Ok(MemberVmcOutcome {
+        member_did,
+        vmc_id,
+        recorded: true,
+        request_id,
+    })
+}
+
+/// Verify the member-issued VMC and return its top-level `id`.
+/// Does this acknowledgement bind to the grant the community issued?
+///
+/// Returns whether the edge is **complete**: `true` only when the
+/// acknowledgement carries a `digest` and it matches the stored grant.
+///
+/// # Three outcomes, not two
+///
+/// A mismatch is an error — the member acknowledged *something*, and it was not
+/// this membership. Storing it would leave the community able to show an
+/// acknowledgement that does not answer the grant it holds, which is precisely
+/// the unconsented-membership claim the pair exists to prevent.
+///
+/// An acknowledgement with **no** `digestMultibase` is not an error but does
+/// not complete the edge either, and neither does one for a member whose grant
+/// this service issued before it kept credential bodies (`current_vmc` is
+/// `None`, so there is nothing to check against).
+/// Storing them unbound keeps the credential visible to the operator while
+/// leaving the edge honestly incomplete — which is what
+/// `POST /v1/members/{did}/request-vmc` exists to resolve.
+///
+/// Deliberate asymmetry, and the reason it is safe: an unbound acknowledgement
+/// claims *less* than a bound one, so admitting it grants nothing. A
+/// mismatched one claims something false.
+fn check_acknowledgement_binding(
+    vc: &JsonValue,
+    grant: Option<&JsonValue>,
+    member_did: &str,
+) -> Result<bool, AppError> {
+    // `credentialSubject.digestMultibase`, the only spelling DTG Credentials v1
+    // defines; the Working Draft 01 `digest` is refused by the catalog and is
+    // not read here either.
+    let claimed = vc
+        .get("credentialSubject")
+        .and_then(|s| s.get("digestMultibase"))
+        .and_then(JsonValue::as_str);
+
+    let (Some(claimed), Some(grant)) = (claimed, grant) else {
+        // R6.3: say which of the two is missing, so an operator looking at an
+        // incomplete edge can tell "the member's client did not bind" from "we
+        // never kept the grant to check against".
+        tracing::warn!(
+            member = %member_did,
+            digest_present = claimed.is_some(),
+            grant_stored = grant.is_some(),
+            "member VMC stored without a verified digest — the membership edge is \
+             not complete; ask the member to re-issue with `request-vmc`"
+        );
+        return Ok(false);
+    };
+
+    // The grant half of the edge must be a conformant community-issued VMC: one
+    // that declares `issuerScope` `public`, the only scope a community can
+    // truthfully declare for itself. A grant stored before the v1 context
+    // declares none, and no acknowledgement can complete an edge against it —
+    // the member needs a renewed grant first. (The member's own
+    // acknowledgement may declare any scope; that was checked at ingress.)
+    let grant_scope = grant.get("issuerScope").and_then(JsonValue::as_str);
+    if grant_scope != Some(dtg_credentials::IssuerScope::Public.as_str()) {
+        return Err(AppError::Validation(format!(
+            "the membership credential this community holds for {member_did} does not \
+             declare issuerScope `public` (found {grant_scope:?}), so no acknowledgement can \
+             complete an edge against it. Renew the membership, then re-issue the \
+             acknowledgement against the new grant."
+        )));
+    }
+
+    // Compared as decoded bytes, never as strings: one multihash has more than
+    // one spelling, and a string comparison would report a mismatch where the
+    // two sides agree. The specification requires the byte comparison and the
+    // library does it.
+    let expected = crate::credentials::ingress::dtg_credential_digest_multibase(grant)?;
+    let matches = dtg_credentials::digests_match(claimed, &expected).map_err(|e| {
+        AppError::Validation(format!(
+            "member vmc digest is not a valid multibase digest: {e}"
+        ))
+    })?;
+
+    if !matches {
+        return Err(AppError::Validation(format!(
+            "member vmc `credentialSubject.digestMultibase` does not match the membership \
+             credential this community issued to {member_did} — it acknowledges a different \
+             grant. Re-issue against the current one."
+        )));
+    }
+
+    Ok(true)
+}
+
+async fn verify_member_vmc(
+    state: &AppState,
+    vc: &JsonValue,
+    member_did: &str,
+    community_did: &str,
+) -> Result<String, TaskError> {
+    // Every refusal below is `invalidCredential` — the credential does not
+    // verify, or is not a MembershipCredential — except a subject naming some
+    // other community, which the specification gives its own code.
+    let invalid =
+        |m: String| TaskError::declared(VMC_ERR_INVALID_CREDENTIAL, AppError::Validation(m));
+    let obj = vc
+        .as_object()
+        .ok_or_else(|| invalid("member vmc is not a JSON object".into()))?;
+
+    // Issuer must be the member (the authcrypt sender / proof signer).
+    let issuer = match obj.get("issuer") {
+        Some(JsonValue::String(s)) => s.clone(),
+        Some(JsonValue::Object(o)) => o
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    };
+    if issuer != member_did {
+        return Err(invalid(format!(
+            "member vmc issuer `{issuer}` is not the member `{member_did}`"
+        )));
+    }
+
+    // The DTG common structure — the v1 context, exactly one subtype, a
+    // declared `issuerScope` — through the one ingress classifier, and the
+    // subtype must be the membership one. Whatever scope the member declared
+    // for their own DID is theirs to declare (`pairwise`, `directed` or
+    // `public`); only that it declares one is checked.
+    match crate::credentials::ingress::classify_dtg(vc) {
+        Ok(dtg_credentials::DTGCredentialType::Membership) => {}
+        Ok(other) => {
+            return Err(invalid(format!(
+                "member vmc must be a `{MEMBERSHIP_CREDENTIAL_TYPE}`; got a {other}"
+            )));
+        }
+        Err(e) => return Err(invalid(format!("member vmc: {e}"))),
+    }
+
+    // Subject must be THIS community.
+    let subject_id = obj
+        .get("credentialSubject")
+        .and_then(JsonValue::as_object)
+        .and_then(|s| s.get("id"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if subject_id != community_did {
+        return Err(TaskError::declared(
+            VMC_ERR_SUBJECT_MISMATCH,
+            AppError::Validation(format!(
+                "member vmc subject `{subject_id}` is not this community `{community_did}`"
+            )),
+        ));
+    }
+
+    // Cryptographic issuer proof: key under the member, resolved (did:key +
+    // did:webvh) and verified.
+    let proof_value = obj
+        .get("proof")
+        .ok_or_else(|| invalid("member vmc has no issuer `proof`".into()))?;
+    // A proof SET: a hybrid VMC carries one per suite.
+    let proofs = crate::credentials::proof_set::proof_set(proof_value)
+        .map_err(|e| invalid(format!("member vmc proof is not Data-Integrity: {e}")))?;
+    // Bound to the member on EVERY proof, before any signature is checked — a
+    // proof naming another DID is a credential claiming the wrong author, not a
+    // signature that failed.
+    for proof in &proofs {
+        check_issuer_binding(&proof.verification_method, member_did)
+            .map_err(|e| TaskError::declared(VMC_ERR_INVALID_CREDENTIAL, e))?;
+    }
+
+    let resolver = DidVmResolver::new(state.did_resolver.clone());
+    let mut unsigned = vc.clone();
+    if let Some(o) = unsigned.as_object_mut() {
+        o.remove("proof");
+    }
+
+    let mut outcomes: Vec<(String, Result<(), String>)> = Vec::with_capacity(proofs.len());
+    for proof in &proofs {
+        let did = crate::credentials::proof_set::proof_signer_did(proof).to_string();
+        let r = crate::credentials::proof_set::verify_one(
+            proof,
+            &unsigned,
+            &resolver,
+            vti_common::auth::ProofPurpose::AssertionMethod,
+        )
+        .await;
+        outcomes.push((did, r));
+    }
+
+    crate::credentials::proof_set::accept_all(&outcomes)
+        .map_err(|e| invalid(format!("member vmc issuer proof did not verify: {e}")))?;
+
+    obj.get("id")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| invalid("member vmc has no top-level `id`".into()))
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    /// A grant and the acknowledgement built from it, in the wire form each
+    /// side actually holds. Built through `dtg_credentials` rather than
+    /// hand-rolled, so the fixture is what the catalog mints — a literal here
+    /// could agree with this module while disagreeing with every real client.
+    fn pair() -> (JsonValue, JsonValue) {
+        use chrono::TimeZone;
+        let valid_from = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        let grant = dtg_credentials::DTGCredential::new_vmc(
+            "did:web:community.example".to_string(),
+            "did:key:zMember".to_string(),
+            valid_from,
+            None,
+            false,
+        )
+        .with_id("urn:uuid:grant-1");
+
+        // The acknowledgement digests the grant's **wire** form, not a parsed one —
+        // `DTGCommon` does not model `credentialStatus`, so parsing and re-serialising a
+        // real grant drops it and the digest then matches nothing. 0.5.0 changed the
+        // signature to take the JSON for exactly this reason; serialise first.
+        let grant_wire = crate::test_support::dtg_json(&grant);
+
+        // `new_member_vmc_for` takes the member the grant is expected to name,
+        // established independently of the grant, and refuses a mismatch. The
+        // identity whose key signs the acknowledgement is the one to pass.
+        // The member declares `directed`: its DID is recognised by the
+        // community and the parties it shows the acknowledgement to.
+        let ack = dtg_credentials::DTGCredential::new_member_vmc_for(
+            &grant_wire,
+            "did:key:zMember",
+            dtg_credentials::IssuerScope::Directed,
+            valid_from,
+            None,
+        )
+        .expect("acknowledgement builds")
+        .with_id("urn:uuid:ack-1");
+
+        (grant_wire, crate::test_support::dtg_json(&ack))
+    }
+
+    /// The happy path, and the one that matters most: a digest computed by
+    /// `dtg-credentials` must verify against one computed here, over the wire
+    /// form. Two implementations, one definition — this is the assertion that
+    /// catches either side drifting.
+    #[test]
+    fn an_acknowledgement_of_our_grant_binds() {
+        let (grant, ack) = pair();
+        assert!(
+            check_acknowledgement_binding(&ack, Some(&grant), "did:key:zMember").unwrap(),
+            "the catalog's digest must verify against this service's"
+        );
+    }
+
+    /// A grant that does not declare `issuerScope` `public` — one stored
+    /// before the v1 context — cannot anchor an edge, whatever digest the
+    /// acknowledgement carries.
+    #[test]
+    fn a_grant_that_is_not_public_completes_no_edge() {
+        let (mut grant, ack) = pair();
+        grant.as_object_mut().unwrap().remove("issuerScope");
+        let err = check_acknowledgement_binding(&ack, Some(&grant), "did:key:zMember")
+            .expect_err("a pre-v1 grant cannot be acknowledged");
+        assert!(format!("{err:?}").contains("issuerScope"), "{err:?}");
+
+        grant["issuerScope"] = serde_json::json!("directed");
+        check_acknowledgement_binding(&ack, Some(&grant), "did:key:zMember")
+            .expect_err("a community grant is always public");
+    }
+
+    /// The Working Draft 01 `digest` spelling is not read: an acknowledgement
+    /// carrying only that binds nothing.
+    #[test]
+    fn a_working_draft_01_digest_member_binds_nothing() {
+        let (grant, ack) = pair();
+        let mut legacy_ack = ack.clone();
+        let subject = legacy_ack
+            .get_mut("credentialSubject")
+            .and_then(JsonValue::as_object_mut)
+            .expect("the acknowledgement has a subject");
+        let digest = subject.remove("digestMultibase").unwrap();
+        subject.insert("digest".into(), digest);
+
+        assert!(
+            !check_acknowledgement_binding(&legacy_ack, Some(&grant), "did:key:zMember").unwrap()
+        );
+    }
+
+    /// The community re-signing a grant must not invalidate consent already
+    /// given — the digest covers claims, not the proof.
+    #[test]
+    fn a_re_signed_grant_still_satisfies_an_existing_acknowledgement() {
+        let (mut grant, ack) = pair();
+        grant["proof"] = serde_json::json!({
+            "type": "DataIntegrityProof",
+            "cryptosuite": "eddsa-jcs-2022",
+            "proofValue": "zSomeOtherSignatureEntirely"
+        });
+
+        assert!(check_acknowledgement_binding(&ack, Some(&grant), "did:key:zMember").unwrap());
+    }
+
+    /// A member who acknowledges some other grant has consented to something,
+    /// but not to this membership. Refused rather than stored: an
+    /// acknowledgement that does not answer the grant we hold would let the
+    /// community show consent it does not have.
+    #[test]
+    fn an_acknowledgement_of_a_different_grant_is_refused() {
+        use chrono::TimeZone;
+        let (_, ack) = pair();
+
+        // Same parties, different grant — a renewal, say.
+        let renewed = dtg_credentials::DTGCredential::new_vmc(
+            "did:web:community.example".to_string(),
+            "did:key:zMember".to_string(),
+            chrono::Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap(),
+            None,
+            false,
+        )
+        .with_id("urn:uuid:grant-2");
+        let renewed = crate::test_support::dtg_json(&renewed);
+
+        let err = check_acknowledgement_binding(&ack, Some(&renewed), "did:key:zMember")
+            .expect_err("a mismatched digest must be refused");
+        assert!(
+            format!("{err:?}").contains("acknowledges a different grant"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// An acknowledgement without a digest is stored and completes no edge.
+    #[test]
+    fn an_acknowledgement_without_a_digest_is_stored_unbound() {
+        let (grant, _) = pair();
+        let legacy = serde_json::json!({
+            "@context": [
+                dtg_credentials::W3C_VC_V2_CONTEXT,
+                dtg_credentials::DTG_CONTEXT_V1
+            ],
+            "type": ["VerifiableCredential", "DTGCredential", "MembershipCredential"],
+            "id": "urn:uuid:unbound-ack",
+            "issuer": "did:key:zMember",
+            "issuerScope": "directed",
+            "validFrom": "2026-01-01T00:00:00Z",
+            "credentialSubject": { "id": "did:web:community.example" }
+        });
+
+        assert!(
+            !check_acknowledgement_binding(&legacy, Some(&grant), "did:key:zMember").unwrap(),
+            "no digest to check, so nothing was verified"
+        );
+    }
+
+    /// No stored grant means nothing to check against — not a reason to refuse
+    /// a credential the member issued correctly.
+    #[test]
+    fn an_acknowledgement_with_no_stored_grant_is_stored_unbound() {
+        let (_, ack) = pair();
+        assert!(!check_acknowledgement_binding(&ack, None, "did:key:zMember").unwrap());
+    }
+}

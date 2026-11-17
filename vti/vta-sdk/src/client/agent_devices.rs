@@ -1,0 +1,173 @@
+//! `device/*` Trust Task client methods.
+//!
+//! A `DeviceBinding` is the device-facing half of an `AclEntry`. These methods
+//! drive the `device/*` slice through the generic trust-task dispatcher
+//! ([`VtaClient::dispatch_trust_task`]) — there is no dedicated REST route.
+//! They power the `pnm device …` CLI and the agent-runtime SDK.
+//!
+//! Registration requires the caller's DID to already be in the ACL
+//! (provision-integration mints it via the `ai-agent` template); the caller
+//! always acts on its **own** binding.
+//!
+//! Each method sends the current version of its task: `register`, `wipe` and
+//! `set-wake` at 0.2, `list` and `heartbeat` at 0.3 (camelCase enum values,
+//! `device/_shared/0.2`).
+
+use serde_json::Value;
+
+use super::VtaClient;
+use crate::error::VtaError;
+use crate::protocols::device_management::{
+    DeviceDisableBody, DeviceHeartbeatBody, DeviceRegisterBody, DeviceSetWakeBody, DeviceWipeBody,
+    WakeHandle, device_name_ext,
+};
+use crate::trust_tasks;
+
+/// Round-trip timeout (seconds) for device trust tasks. Device ops are cheap
+/// ACL-entry mutations; 30s is generous and keeps a wedged mediator from
+/// hanging a CLI invocation indefinitely.
+const DEVICE_TT_TIMEOUT: u64 = 30;
+
+impl VtaClient {
+    /// `device/register/0.2` — claim a `DeviceBinding` on the caller's ACL
+    /// entry. `consumer_kind` is the wire `consumerKind` object, e.g.
+    /// `{ "kind": "service", "serviceKind": "aiAgent" }` for a personal AI
+    /// agent. Returns the registered binding.
+    pub async fn device_register(
+        &self,
+        consumer_kind: Value,
+        display_name: &str,
+        platform: Option<&str>,
+        hpke_public_key: Option<&str>,
+    ) -> Result<Value, VtaError> {
+        let payload = serde_json::to_value(DeviceRegisterBody {
+            consumer_kind,
+            display_name: display_name.to_string(),
+            platform: platform.map(str::to_string),
+            hpke_public_key: hpke_public_key.map(str::to_string),
+        })?;
+        self.dispatch_trust_task(
+            trust_tasks::TASK_DEVICE_REGISTER_0_2,
+            payload,
+            DEVICE_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `device/heartbeat/0.3` — refresh `lastSeenAt` (and `platform` if
+    /// supplied). Returns server time + any queued operations for the device.
+    pub async fn device_heartbeat(&self, platform: Option<&str>) -> Result<Value, VtaError> {
+        self.device_heartbeat_named(platform, None).await
+    }
+
+    /// `device/heartbeat/0.3` carrying this device's **current** display name.
+    ///
+    /// `displayName` is set once, at registration, and re-registration is
+    /// intentionally refused — so a renamed machine (or an install moved to
+    /// another profile) otherwise keeps announcing a name that no longer picks
+    /// it out of the list the name exists for. Sending it on the heartbeat is
+    /// how a device corrects its own binding; the VTA applies it only when it
+    /// differs, and only to the binding the caller authenticated as.
+    ///
+    /// A separate method rather than a wider `device_heartbeat`: this crate is
+    /// published and consumed across repositories, and changing a public
+    /// signature to add an optional argument would spend a breaking release on a
+    /// diagnostic field.
+    ///
+    /// A VTA that does not understand the extension ignores it (SPEC §4.5.1) —
+    /// the heartbeat still refreshes `lastSeenAt`, and the name simply stays as
+    /// it was.
+    pub async fn device_heartbeat_named(
+        &self,
+        platform: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<Value, VtaError> {
+        let payload = serde_json::to_value(DeviceHeartbeatBody {
+            platform: platform.map(str::to_string),
+            vault_seq: None,
+            ext: display_name.map(device_name_ext),
+        })?;
+        self.dispatch_trust_task(
+            trust_tasks::TASK_DEVICE_HEARTBEAT_0_3,
+            payload,
+            DEVICE_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `device/list/0.3` — list the caller's registered devices. `filters` is
+    /// the wire filter object (`{}` for all); e.g.
+    /// `{ "consumerKindFilter": "service", "serviceKindFilter": "aiAgent" }`.
+    /// A page carrying `nextCursor` is not the whole list: send it back as
+    /// `cursor` for the next.
+    pub async fn device_list(&self, filters: Value) -> Result<Value, VtaError> {
+        self.dispatch_trust_task(
+            trust_tasks::TASK_DEVICE_LIST_0_3,
+            filters,
+            DEVICE_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `device/disable/0.1` — disable a device by id (the record is kept; it can
+    /// no longer authenticate). The maintainer/operator kill switch.
+    pub async fn device_disable(&self, device_id: &str) -> Result<Value, VtaError> {
+        let payload = serde_json::to_value(DeviceDisableBody {
+            device_id: device_id.to_string(),
+            reason: None,
+        })?;
+        self.dispatch_trust_task(
+            trust_tasks::TASK_DEVICE_DISABLE_0_1,
+            payload,
+            DEVICE_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `device/wipe/0.2` — issue a remote-wipe for a compromised/lost device.
+    /// Marks the binding wiped (and disabled, so it can no longer authenticate)
+    /// and records the `reason` in the audit log. `scope` is one of `cache`,
+    /// `cacheAndKeys`, or `full` (how aggressively the device should wipe).
+    pub async fn device_wipe(
+        &self,
+        device_id: &str,
+        reason: &str,
+        scope: &str,
+    ) -> Result<Value, VtaError> {
+        let payload = serde_json::to_value(DeviceWipeBody {
+            device_id: device_id.to_string(),
+            scope: scope.to_string(),
+            reason: reason.to_string(),
+        })?;
+        self.dispatch_trust_task(
+            trust_tasks::TASK_DEVICE_WIPE_0_2,
+            payload,
+            DEVICE_TT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// `device/set-wake/0.2` — convey the device's opaque push `WakeHandle`
+    /// (`gateway` + `handle`). The VTA records it and returns the trigger
+    /// allowlist; over DIDComm it provisions the allowlist to the gateway.
+    pub async fn device_set_wake(
+        &self,
+        gateway: &str,
+        handle: &str,
+        suggested_triggers: Vec<String>,
+    ) -> Result<Value, VtaError> {
+        let payload = serde_json::to_value(DeviceSetWakeBody {
+            wake_handle: Some(WakeHandle {
+                gateway: gateway.to_string(),
+                handle: handle.to_string(),
+            }),
+            suggested_triggers: Some(suggested_triggers),
+        })?;
+        self.dispatch_trust_task(
+            trust_tasks::TASK_DEVICE_SET_WAKE_0_2,
+            payload,
+            DEVICE_TT_TIMEOUT,
+        )
+        .await
+    }
+}

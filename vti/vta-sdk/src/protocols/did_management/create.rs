@@ -1,0 +1,527 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+/// How the `<path>` segment of a server-managed `did:webvh` is chosen.
+///
+/// Only meaningful when a hosting server is selected (`server_id` is
+/// set). A serverless DID always resolves at
+/// `<host>/.well-known/did.jsonl` and ignores this — serverless mode is
+/// selected by the *absence* of `server_id`, not by this enum. The three
+/// variants map onto the hosting server's `check-name` / `create_did`
+/// path contract:
+///
+/// - [`WebvhPathMode::WellKnown`] → the reserved `.well-known` root slot
+///   (`<host>/.well-known/did.jsonl`). Admin-gated on the host.
+/// - [`WebvhPathMode::Explicit`] → an operator-chosen label
+///   (`<host>/<path>/did.jsonl`).
+/// - [`WebvhPathMode::AutoAssign`] → the host allocates a path (it mints
+///   a fresh mnemonic). This is the default.
+///
+/// `AutoAssign` is the default because that is the long-standing
+/// "no path given → the server assigns one" contract: the setup wizard's
+/// "leave blank → server-assigned" prompt maps a blank path here. An
+/// absent path has never meant the `.well-known` root on a hosting
+/// server — that is the serverless case (selected by the absence of a
+/// `server_id`, where the DID location comes from the `URL` itself).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+// camelCase, because the discriminator VALUE is part of the wire contract just
+// as much as a member name is. `vta/webvh/dids/create` spells the variants
+// `wellKnown` / `explicit` / `autoAssign`, and a `oneOf` keyed on `mode` refuses
+// `auto_assign` outright — it matches no branch, so the whole payload is
+// malformed rather than merely oddly-spelled. `alias` keeps the previous
+// spelling readable on intake for a producer that has not migrated.
+#[serde(tag = "mode", content = "path", rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum WebvhPathMode {
+    /// Root DID at the host: resolves at `<host>/.well-known/did.jsonl`.
+    #[serde(alias = "well_known")]
+    WellKnown,
+    /// Operator-chosen path label: `<host>/<path>/did.jsonl`.
+    Explicit(String),
+    /// Let the hosting server allocate the path.
+    #[default]
+    #[serde(alias = "auto_assign")]
+    AutoAssign,
+}
+
+impl WebvhPathMode {
+    /// The path string to hand the hosting server's `check-name` /
+    /// `create_did` call. `Some(".well-known")` / `Some(label)` reserve a
+    /// specific slot; `None` tells the host to allocate one (the
+    /// auto-assign contract — the host mints a mnemonic).
+    ///
+    /// Returning `None` for [`AutoAssign`](WebvhPathMode::AutoAssign) is
+    /// load-bearing: the DIDComm/REST clients must *omit* the `path` wire
+    /// field for auto-assign. Sending an empty string instead makes the
+    /// host reject it with `e.p.did.path-invalid` ("path must not be
+    /// empty"), since the host validates a present-but-empty path.
+    pub fn to_request_path(&self) -> Option<&str> {
+        match self {
+            WebvhPathMode::WellKnown => Some(".well-known"),
+            WebvhPathMode::Explicit(p) => Some(p),
+            WebvhPathMode::AutoAssign => None,
+        }
+    }
+
+    /// Resolve the effective mode from the new explicit `path_mode` field
+    /// and the legacy `path: Option<String>` field. `path_mode` wins when
+    /// present; otherwise the legacy `path` is interpreted (via
+    /// `From<Option<String>>`) so pre-enum callers keep working.
+    pub fn resolve(path_mode: Option<WebvhPathMode>, legacy_path: Option<String>) -> Self {
+        path_mode.unwrap_or_else(|| WebvhPathMode::from(legacy_path))
+    }
+}
+
+impl From<Option<String>> for WebvhPathMode {
+    fn from(path: Option<String>) -> Self {
+        match path {
+            None => WebvhPathMode::AutoAssign,
+            Some(p) => WebvhPathMode::from(p),
+        }
+    }
+}
+
+impl From<String> for WebvhPathMode {
+    fn from(path: String) -> Self {
+        match path.trim() {
+            // Empty / whitespace-only is auto-assign, not an explicit
+            // empty path — an explicit "" would be rejected by the host.
+            "" => WebvhPathMode::AutoAssign,
+            ".well-known" => WebvhPathMode::WellKnown,
+            trimmed => WebvhPathMode::Explicit(trimmed.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct CreateDidWebvhBody {
+    #[serde(alias = "context_id")]
+    pub context_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "server_id")]
+    pub server_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Legacy path selector. Prefer [`path_mode`](Self::path_mode) for
+    /// new callers — it distinguishes the `.well-known` root, an explicit
+    /// label, and server-side auto-assignment. Kept for wire back-compat:
+    /// when `path_mode` is absent, this is interpreted as `None`/empty →
+    /// auto-assign, `".well-known"` → root, else explicit (see
+    /// [`WebvhPathMode::resolve`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Explicit path-selection mode for server-managed DIDs. When set it
+    /// overrides [`path`](Self::path). Absent → fall back to `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "path_mode")]
+    pub path_mode: Option<WebvhPathMode>,
+    /// Optional explicit hosting domain on the target server. When
+    /// the server hosts multiple tenant domains, the caller may
+    /// supply this to direct the new DID at a specific one;
+    /// otherwise the server resolves via caller's ACL default →
+    /// system default. An unknown domain on the server is rejected
+    /// with `did-management:unknownDomain`. Ignored in serverless
+    /// mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "add_mediator_service"
+    )]
+    pub add_mediator_service: Option<bool>,
+    /// Publish a `#tsp` (`TSPTransport`) service pointing at the VTA's
+    /// mediator, alongside the DIDComm entry
+    /// [`add_mediator_service`](Self::add_mediator_service) adds. TSP
+    /// advertises the same mediator as DIDComm, so the endpoint is that
+    /// mediator's DID — the transport URL lives in the mediator's own
+    /// document.
+    ///
+    /// Honoured only when the VTA itself has TSP enabled (`[services] tsp`)
+    /// and a mediator is configured; absent or `false` mints exactly what
+    /// it did before. **Opt-in, and deliberately not implied by
+    /// `add_mediator_service`**: a DID advertising a transport its holder
+    /// cannot decode is unreachable over that transport, and only the
+    /// caller knows whether the client behind this DID reads TSP frames.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "add_tsp_service"
+    )]
+    pub add_tsp_service: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "additional_services"
+    )]
+    pub additional_services: Option<Vec<serde_json::Value>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "pre_rotation_count"
+    )]
+    pub pre_rotation_count: Option<u32>,
+    /// Client-provided DID Document template. When set, the VTA uses this
+    /// instead of building the document internally. `{DID}` placeholders are
+    /// resolved by `didwebvh-rs`. Mutually exclusive with `did_log`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "did_document"
+    )]
+    pub did_document: Option<serde_json::Value>,
+    /// Complete, pre-signed did.jsonl log entry. When set, the VTA publishes
+    /// it as-is without deriving keys or creating a log entry. Mutually
+    /// exclusive with `did_document`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "did_log")]
+    pub did_log: Option<String>,
+    /// Whether to set this DID as the primary DID for the context.
+    /// Defaults to `true` for backwards compatibility.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "set_primary"
+    )]
+    pub set_primary: Option<bool>,
+    /// Use an existing key as the signing (Ed25519) verification method.
+    /// When set, the VTA skips key derivation and uses this key instead.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "signing_key_id"
+    )]
+    pub signing_key_id: Option<String>,
+    /// Use an existing key as the key-agreement (X25519) verification method.
+    /// Required when the DID document includes DIDCommMessaging services.
+    /// Requires `signing_key_id` to also be set.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "ka_key_id")]
+    pub ka_key_id: Option<String>,
+    /// Stored DID template name to render as the DID document. Mutually
+    /// exclusive with `did_document` and `did_log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Scope to look the template up in. `None` means "global only"; `Some(ctx)`
+    /// means "this context first, then global, then builtin".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "template_context"
+    )]
+    pub template_context: Option<String>,
+    /// Caller-supplied template variables. Server injects `DID`,
+    /// `SIGNING_KEY_MB`, `KA_KEY_MB`, `VTA_DID`, `VTA_URL`, `CONTEXT_ID`,
+    /// `CONTEXT_DID`, `NOW` automatically.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "template_vars"
+    )]
+    pub template_vars: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// The identity the new log is presented as: its `did:webvh` DID, or its
+    /// `did:scid:vh:1` DID (`vta/webvh/dids/create/1.2`, VTI-KEY-165). Absent →
+    /// the VTA's `[dids] default_did_method`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "did_method")]
+    pub did_method: Option<crate::did_scid::DidMethod>,
+    /// Whether the first log entry lists the did:scid DID URL in `alsoKnownAs`
+    /// (`create/1.2`, VTI-KEY-166). Absent → the VTA's
+    /// `[dids] scid_also_known_as`. `false` with `did_method: scid` is refused
+    /// with `scidAliasRequired`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "scid_also_known_as"
+    )]
+    pub scid_also_known_as: Option<bool>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDidWebvhResultBody {
+    pub did: String,
+    #[serde(alias = "context_id")]
+    pub context_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "server_id")]
+    pub server_id: Option<String>,
+    /// Whether no hosting server was published to: the VTA holds the log and
+    /// the DID does not resolve until the caller serves `logEntry` at its URL
+    /// (`vta/webvh/dids/create`, Keyring VTI-20).
+    ///
+    /// `None` when the answer predates it: a `create/1.0` response, or a sealed
+    /// bundle written before 1.1. Read [`Self::is_serverless`], which falls back
+    /// to an absent `server_id` there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serverless: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mnemonic: Option<String>,
+    pub scid: String,
+    pub portable: bool,
+    #[serde(alias = "signing_key_id")]
+    pub signing_key_id: String,
+    #[serde(alias = "ka_key_id")]
+    pub ka_key_id: String,
+    /// Verification-method id of each signing key beyond the primary, by the
+    /// template slot that asked for it (`pq-signing` -> `did:webvh:…#key-2`).
+    ///
+    /// Empty for every v1 template, and skipped on the wire when empty, so an
+    /// existing consumer's parse is unchanged. Present so the provisioning flow
+    /// can read those keys back out of the keystore without re-deriving which
+    /// document method each one is — the ids come from the published document,
+    /// and only create has read it.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        alias = "additional_key_ids"
+    )]
+    pub additional_key_ids: std::collections::BTreeMap<String, String>,
+    #[serde(alias = "pre_rotation_key_count")]
+    pub pre_rotation_key_count: u32,
+    #[serde(alias = "created_at")]
+    pub created_at: DateTime<Utc>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "did_document"
+    )]
+    pub did_document: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "log_entry")]
+    pub log_entry: Option<String>,
+    /// The form the VTA applied (`create/1.2`). `did` is in this form: the
+    /// did:webvh DID, or the bare `did:scid:vh:1:<scid>`. `None` in a 1.0 or 1.1
+    /// answer, where `did` is the form applied all the same.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "did_method")]
+    pub did_method: Option<crate::did_scid::DidMethod>,
+    /// Whether the first log entry lists `scid_did_url` in `alsoKnownAs`
+    /// (`create/1.2`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "scid_also_known_as"
+    )]
+    pub scid_also_known_as: Option<bool>,
+    /// The did:webvh DID of the log — the handle the rest of the `webvh/dids`
+    /// family takes alongside `did` (`create/1.2`).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "webvh_did")]
+    pub webvh_did: Option<String>,
+    /// The `did:scid:vh:1:<scid>?src=…` DID URL of the log: what to give out
+    /// where a recipient may not hold a source for the did:scid (`create/1.2`,
+    /// VTI-KEY-163).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "scid_did_url"
+    )]
+    pub scid_did_url: Option<String>,
+}
+
+impl CreateDidWebvhResultBody {
+    /// The did:webvh DID of the log: `webvh_did` where the answer states it,
+    /// and otherwise `did`, which a 1.0/1.1 answer from a VTA presenting
+    /// did:webvh is.
+    #[must_use]
+    pub fn log_did(&self) -> &str {
+        self.webvh_did.as_deref().unwrap_or(&self.did)
+    }
+
+    /// Whether this DID was minted serverless and so does not resolve until
+    /// the caller serves its log: the stated `serverless`, or, from an answer
+    /// that predates it, an absent `server_id`.
+    #[must_use]
+    pub fn is_serverless(&self) -> bool {
+        self.serverless.unwrap_or(self.server_id.is_none())
+    }
+}
+
+// Manual Debug — `mnemonic` is a 24-word BIP-39 phrase that recovers
+// the entire key hierarchy under the DID. Logging it via `{:?}` is a
+// total compromise. Serialize is unchanged so the wire shape and
+// sealed-transfer payload still round-trip.
+impl std::fmt::Debug for CreateDidWebvhResultBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateDidWebvhResultBody")
+            .field("did", &self.did)
+            .field("context_id", &self.context_id)
+            .field("server_id", &self.server_id)
+            .field("serverless", &self.serverless)
+            .field("mnemonic", &self.mnemonic.as_ref().map(|_| "<redacted>"))
+            .field("scid", &self.scid)
+            .field("portable", &self.portable)
+            .field("signing_key_id", &self.signing_key_id)
+            .field("ka_key_id", &self.ka_key_id)
+            .field("additional_key_ids", &self.additional_key_ids)
+            .field("pre_rotation_key_count", &self.pre_rotation_key_count)
+            .field("created_at", &self.created_at)
+            .field("did_document", &self.did_document)
+            .field("log_entry", &self.log_entry)
+            .field("did_method", &self.did_method)
+            .field("scid_also_known_as", &self.scid_also_known_as)
+            .field("webvh_did", &self.webvh_did)
+            .field("scid_did_url", &self.scid_did_url)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod webvh_path_mode_tests {
+    use super::WebvhPathMode;
+
+    /// The wire path the host's `check-name`/`create_did` receives.
+    /// `AutoAssign → None` is load-bearing: the clients omit the field,
+    /// which is the only form the host treats as "allocate one for me".
+    #[test]
+    fn to_request_path_maps_each_mode() {
+        assert_eq!(
+            WebvhPathMode::WellKnown.to_request_path(),
+            Some(".well-known")
+        );
+        assert_eq!(
+            WebvhPathMode::Explicit("alice".into()).to_request_path(),
+            Some("alice")
+        );
+        assert_eq!(WebvhPathMode::AutoAssign.to_request_path(), None);
+    }
+
+    /// Default is auto-assign — the long-standing "no path → server
+    /// assigns one" contract. An absent path has never meant `.well-known`.
+    #[test]
+    fn default_is_auto_assign() {
+        assert_eq!(WebvhPathMode::default(), WebvhPathMode::AutoAssign);
+    }
+
+    /// Legacy `path: Option<String>` interpretation: None/empty →
+    /// auto-assign, `.well-known` → root, else explicit (trimmed).
+    #[test]
+    fn from_legacy_path() {
+        assert_eq!(WebvhPathMode::from(None), WebvhPathMode::AutoAssign);
+        assert_eq!(
+            WebvhPathMode::from(Some("   ".to_string())),
+            WebvhPathMode::AutoAssign
+        );
+        assert_eq!(
+            WebvhPathMode::from(Some(".well-known".to_string())),
+            WebvhPathMode::WellKnown
+        );
+        assert_eq!(
+            WebvhPathMode::from(Some("  alice ".to_string())),
+            WebvhPathMode::Explicit("alice".into())
+        );
+    }
+
+    /// `resolve`: explicit `path_mode` wins; otherwise fall back to the
+    /// legacy `path`.
+    #[test]
+    fn resolve_prefers_explicit_mode() {
+        // Explicit mode set → legacy path ignored.
+        assert_eq!(
+            WebvhPathMode::resolve(Some(WebvhPathMode::AutoAssign), Some("alice".into())),
+            WebvhPathMode::AutoAssign
+        );
+        // No mode → interpret legacy path.
+        assert_eq!(
+            WebvhPathMode::resolve(None, Some("alice".into())),
+            WebvhPathMode::Explicit("alice".into())
+        );
+        assert_eq!(
+            WebvhPathMode::resolve(None, None),
+            WebvhPathMode::AutoAssign
+        );
+    }
+
+    /// Adjacently-tagged serde shape, and that it round-trips.
+    #[test]
+    fn serde_round_trips() {
+        for mode in [
+            WebvhPathMode::WellKnown,
+            WebvhPathMode::Explicit("alice".into()),
+            WebvhPathMode::AutoAssign,
+        ] {
+            let json = serde_json::to_value(&mode).unwrap();
+            let back: WebvhPathMode = serde_json::from_value(json).unwrap();
+            assert_eq!(mode, back);
+        }
+        // Pin the explicit wire shape.
+        assert_eq!(
+            serde_json::to_value(WebvhPathMode::Explicit("alice".into())).unwrap(),
+            serde_json::json!({ "mode": "explicit", "path": "alice" })
+        );
+        assert_eq!(
+            serde_json::to_value(WebvhPathMode::AutoAssign).unwrap(),
+            serde_json::json!({ "mode": "autoAssign" })
+        );
+
+        // Postel: the previous spelling still parses, so a producer that has
+        // not migrated keeps working. It is accepted, never emitted — the
+        // assertion above is what the wire actually carries.
+        let legacy: WebvhPathMode =
+            serde_json::from_value(serde_json::json!({ "mode": "auto_assign" })).unwrap();
+        assert_eq!(legacy, WebvhPathMode::AutoAssign);
+        let legacy: WebvhPathMode =
+            serde_json::from_value(serde_json::json!({ "mode": "well_known" })).unwrap();
+        assert_eq!(legacy, WebvhPathMode::WellKnown);
+    }
+}
+
+#[cfg(test)]
+mod casing_tests {
+    use super::*;
+
+    /// camelCase is the framework wire convention; snake_case stays accepted as
+    /// an alias so callers written against the old shape keep working.
+    ///
+    /// The bug this closes is the one an end-to-end harness caught the first time
+    /// it posted a real create over the wire: the body expected `context_id`, a
+    /// framework-conventional client sent `contextId`, and with no
+    /// `deny_unknown_fields` the required field simply read as missing.
+    #[test]
+    fn create_body_reads_both_casings() {
+        let camel: CreateDidWebvhBody =
+            serde_json::from_str(r#"{"contextId":"default","preRotationCount":2}"#).unwrap();
+        assert_eq!(camel.context_id, "default");
+        assert_eq!(camel.pre_rotation_count, Some(2));
+
+        let snake: CreateDidWebvhBody =
+            serde_json::from_str(r#"{"context_id":"default","pre_rotation_count":2}"#).unwrap();
+        assert_eq!(snake.context_id, "default");
+        assert_eq!(snake.pre_rotation_count, Some(2));
+    }
+}
+
+#[cfg(test)]
+mod serverless_tests {
+    use super::*;
+
+    fn answer(extra: serde_json::Value) -> CreateDidWebvhResultBody {
+        let mut v = serde_json::json!({
+            "did": "did:webvh:Qm:example.com", "contextId": "c", "scid": "Qm",
+            "portable": false, "signingKeyId": "s", "kaKeyId": "k",
+            "preRotationKeyCount": 0, "createdAt": "2026-10-01T00:00:00Z",
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Keyring VTI-20: the VTA's statement wins when it is there.
+    #[test]
+    fn vti_20_a_stated_serverless_is_read_as_stated() {
+        assert!(answer(serde_json::json!({ "serverless": true })).is_serverless());
+        assert!(
+            !answer(serde_json::json!({ "serverless": false, "serverId": "prod" })).is_serverless()
+        );
+    }
+
+    /// A 1.0 answer, or a bundle written before 1.1, says nothing: fall back
+    /// to the absent `serverId` it always implied.
+    #[test]
+    fn vti_20_an_answer_without_it_falls_back_to_server_id() {
+        let old = answer(serde_json::json!({}));
+        assert_eq!(old.serverless, None);
+        assert!(old.is_serverless());
+        assert!(!answer(serde_json::json!({ "serverId": "prod" })).is_serverless());
+    }
+}

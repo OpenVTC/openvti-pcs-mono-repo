@@ -1,0 +1,635 @@
+//! The record commitment: a Merkle tree over a room's records.
+//!
+//! # What this is for
+//!
+//! A room's records are signed and room-bound, so a host cannot forge one,
+//! alter one, or move it between rooms. **Silence is free**:
+//! `rooms/records/list` returns a set and nothing says the set is complete, so a
+//! host serving nine records from a room holding ten is indistinguishable from a
+//! room holding nine. See `docs/05-design-notes/data-rooms-verified-reads.md`.
+//!
+//! This is the structure that closes it. The root is the room's **data
+//! commitment**: a host that signs one and then serves a listing which does not
+//! reconcile with it is caught by arithmetic rather than by suspicion.
+//!
+//! # Sorted, because completeness is a range property
+//!
+//! Leaves are ordered by record key, which is what makes *absence* provable. An
+//! inclusion proof says "this record is here"; only the ordering lets a
+//! consumer say "and there is nothing between these two keys". A tree over
+//! unsorted leaves can prove everything it contains and nothing about what it
+//! omits — which is the property being bought.
+//!
+//! # A leaf commits to the whole record, in its WIRE form
+//!
+//! Not to the body, and not to a chosen subset. A host that could flip `status`
+//! from active to retracted, or move `pinned`, or rewrite `author` on an
+//! attributed room, is a host that can rewrite the room's meaning without
+//! touching a byte of ciphertext. Picking fields invites picking wrongly, so the
+//! leaf commits to the record's canonical JSON (RFC 8785) — every member,
+//! present or absent, in an order no refactor can change.
+//!
+//! **The record it hashes is [`CommittedRecord`], not [`Record`].** This is the
+//! difference between a commitment two implementations can compare and one only
+//! another copy of this crate can reproduce, and it is not a detail: `updatedAt`
+//! is unix seconds in storage and RFC 3339 on the wire, `epoch` and `nonce` are
+//! flat in storage and inside `sealed` on the wire, and `epoch` serialises as
+//! `null` on an open room where the wire has it absent. An earlier version of
+//! this module hashed the storage record, so every root it produced was
+//! unreachable by any reader — survivable while the only use was comparing two
+//! roots from the same build, and not survivable once a trace has to be
+//! *computable by someone else*.
+//!
+//! **The plaintext is never involved.** On the sealed tiers the host holds
+//! ciphertext and could not commit to a body if it wanted to; the leaf commits
+//! to the ciphertext it stores, which is exactly what it is accountable for.
+//!
+//! # Domain separation, from RFC 6962
+//!
+//! Leaf hashes are prefixed `0x00` and internal nodes `0x01`, as Certificate
+//! Transparency does. Without it an internal node's preimage can be presented as
+//! a leaf, and a proof for one thing verifies for another — the second-preimage
+//! attack every Merkle tree specification names first.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::Record;
+use crate::wire::CommittedRecord;
+
+/// Prefix for a leaf hash (RFC 6962 §2.1).
+const LEAF_PREFIX: u8 = 0x00;
+/// Prefix for an internal node hash (RFC 6962 §2.1).
+const NODE_PREFIX: u8 = 0x01;
+
+/// A 32-byte SHA-256 digest.
+pub type Hash = [u8; 32];
+
+/// Errors this module can produce.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MerkleError {
+    /// A record would not canonicalise — it holds something JSON cannot express.
+    #[error("record `{key}` could not be canonicalised for commitment: {source}")]
+    Canonicalise {
+        key: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A wire value is not a commitment this build can compare against.
+    #[error("`{value}` is not a usable data commitment: {why}")]
+    NotACommitment { value: String, why: &'static str },
+}
+
+/// Hash one record into a leaf.
+///
+/// Canonical JSON per RFC 8785, so the leaf commits to what the record *means*
+/// rather than to one serialiser's field order. A member added to
+/// [`CommittedRecord`] later is committed automatically, which is the point of
+/// not enumerating.
+///
+/// It takes the **committed** form rather than the stored one because that is
+/// what a reader has: a consumer verifying a trace holds a
+/// `rooms/records/get` response, strips `dataCommitment`, `trace` and `ext`,
+/// and hashes what is left. Anything this function could not be handed by a
+/// reader is a root the reader cannot check.
+pub fn leaf_hash(record: &CommittedRecord) -> Result<Hash, MerkleError> {
+    let canonical =
+        serde_json_canonicalizer::to_vec(record).map_err(|source| MerkleError::Canonicalise {
+            key: record.key.clone(),
+            source,
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update([LEAF_PREFIX]);
+    hasher.update(&canonical);
+    Ok(hasher.finalize().into())
+}
+
+/// Hash two child nodes into their parent.
+fn node_hash(left: &Hash, right: &Hash) -> Hash {
+    let mut hasher = Sha256::new();
+    hasher.update([NODE_PREFIX]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
+}
+
+/// The commitment for an **empty** room.
+///
+/// `SHA-256("")`, following RFC 6962 §2.1. A distinguished value rather than
+/// zeroes: a root of all-zeroes is what an uninitialised buffer looks like, and
+/// a room with no records is a real state a host must be able to commit to
+/// honestly.
+#[must_use]
+pub fn empty_root() -> Hash {
+    Sha256::new().finalize().into()
+}
+
+/// The data commitment over `records`.
+///
+/// `records` **MUST** be ordered by key — [`commit_records`] does that for the
+/// caller, and this takes the ordered leaves so a caller that already has them
+/// need not rebuild.
+///
+/// An odd node at any level is promoted unchanged rather than duplicated. RFC
+/// 6962 does the same, and the reason is not aesthetics: duplicating the last
+/// node makes a tree of `n` leaves collide with one of `n+1` where the last is
+/// repeated, so two different rooms commit to the same root.
+#[must_use]
+pub fn root_of(leaves: &[Hash]) -> Hash {
+    if leaves.is_empty() {
+        return empty_root();
+    }
+    let mut level: Vec<Hash> = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let (pairs, remainder) = level.as_chunks::<2>();
+        for [left, right] in pairs {
+            next.push(node_hash(left, right));
+        }
+        // The promoted odd node — never duplicated, see above.
+        if let [odd] = remainder {
+            next.push(*odd);
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// A room's **tree head**: the root, and the two values that say which state it
+/// covers.
+///
+/// # Why these travel together and are computed together
+///
+/// A root on its own is not comparable to another root. A room moves — every
+/// put, curate and retraction changes the tree — so two roots differing is the
+/// most ordinary observation there is, and a host shown to have served two
+/// different ones answers *there was a write between your reads*. Certificate
+/// Transparency does not have this problem because a signed tree head is a root
+/// **and a size**; this family shipped the root alone until
+/// `trust-tasks-tf#422`.
+///
+/// All three come out of **one** pass over one set, and that is a correctness
+/// requirement rather than a tidiness one. `head_version` read from the room's
+/// own `next_version` counter would be a *second* read, and two reads are not a
+/// snapshot: a write landing between them labels a root with a version from
+/// another moment, so two honest members end up holding roots over different
+/// trees under one version. That reads as equivocation and is not, and **a
+/// false accusation discredits the mechanism rather than the host** — the worst
+/// outcome available here. Ordering the two reads does not help in either
+/// direction; only taking both from one set closes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeHead {
+    /// The root of the record tree.
+    pub root: Hash,
+    /// How many records the tree covers — leaves, tombstones included.
+    pub record_count: u64,
+    /// The highest version among those records, `0` if there are none.
+    ///
+    /// Taken from the committed set, never from the room row. It equals the
+    /// room's last assigned version for any host that has not **erased** a
+    /// record: versions are assigned strictly increasing, and a retraction keeps
+    /// its tombstone. [`crate::storage::purge_record`] is the erasure path and
+    /// has no caller outside its own tests; a family that exposes one owes this
+    /// definition another look, because an erasure moves the root without
+    /// necessarily moving this.
+    pub head_version: u64,
+}
+
+/// Sort `records` by key, hash them, and return the whole [`TreeHead`].
+///
+/// The sort is here rather than assumed of the caller because the ordering *is*
+/// the completeness property — see [`commit_records`], which is this with the
+/// head discarded.
+pub fn tree_head(records: &mut [Record]) -> Result<TreeHead, MerkleError> {
+    records.sort_by(|a, b| a.key.cmp(&b.key));
+    let leaves = records
+        .iter()
+        .map(|r| leaf_hash(&r.committed()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(TreeHead {
+        root: root_of(&leaves),
+        record_count: leaves.len() as u64,
+        // `max` over the same slice the leaves came from. An empty room has no
+        // version to report and answers 0, which is the state it is in rather
+        // than a missing value.
+        head_version: records.iter().map(|r| r.version).max().unwrap_or(0),
+    })
+}
+
+/// Sort `records` by key, hash them, and return the data commitment.
+///
+/// The sort is here rather than assumed of the caller because the ordering *is*
+/// the completeness property: a root computed over records in storage order
+/// proves membership and nothing about absence.
+pub fn commit_records(records: &mut [Record]) -> Result<Hash, MerkleError> {
+    tree_head(records).map(|head| head.root)
+}
+
+/// One step of an inclusion proof: a sibling and which side it sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofStep {
+    /// The sibling hash, a `DigestMultibase` on the wire.
+    ///
+    /// The same encoding `dataCommitment` uses, and for the same reason: a bare
+    /// hex string hard-codes SHA-256 into the wire contract, where a multihash
+    /// names the algorithm in-band. A trace and the root it reaches would
+    /// otherwise be spelled two ways in one document.
+    #[serde(with = "multibase_hash")]
+    pub sibling: Hash,
+    /// Whether the sibling is the **left** child; the proven node is the other.
+    pub sibling_is_left: bool,
+}
+
+/// The path from a leaf to the root.
+pub type InclusionProof = Vec<ProofStep>;
+
+/// Build the inclusion proof for the leaf at `index`.
+///
+/// Returns `None` for an index outside the tree, which is a caller bug rather
+/// than a proof that fails to verify — the two should not be confused.
+#[must_use]
+pub fn inclusion_proof(leaves: &[Hash], index: usize) -> Option<InclusionProof> {
+    if index >= leaves.len() {
+        return None;
+    }
+    let mut proof = Vec::new();
+    let mut level: Vec<Hash> = leaves.to_vec();
+    let mut idx = index;
+
+    while level.len() > 1 {
+        // An odd node at the end is promoted with no sibling, so it contributes
+        // no step — mirroring `root_of`, and the reason the two must be read
+        // together when either changes.
+        let has_sibling = !(idx == level.len() - 1 && level.len() % 2 == 1);
+        if has_sibling {
+            let sibling_is_left = idx % 2 == 1;
+            let sibling_idx = if sibling_is_left { idx - 1 } else { idx + 1 };
+            proof.push(ProofStep {
+                sibling: level[sibling_idx],
+                sibling_is_left,
+            });
+        }
+
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let (pairs, remainder) = level.as_chunks::<2>();
+        for [left, right] in pairs {
+            next.push(node_hash(left, right));
+        }
+        if let [odd] = remainder {
+            next.push(*odd);
+        }
+        level = next;
+        idx /= 2;
+    }
+    Some(proof)
+}
+
+/// Replay `proof` from `leaf` and report whether it reaches `root`.
+///
+/// This is the whole of what a consumer runs, and it needs nothing but hashing —
+/// no tree, no host, no network.
+#[must_use]
+pub fn verify_inclusion(root: &Hash, leaf: &Hash, proof: &InclusionProof) -> bool {
+    let mut current = *leaf;
+    for step in proof {
+        current = if step.sibling_is_left {
+            node_hash(&step.sibling, &current)
+        } else {
+            node_hash(&current, &step.sibling)
+        };
+    }
+    &current == root
+}
+
+/// `DigestMultibase` for the wire, because a digest travels in JSON and bytes
+/// do not — and because the root beside it is spelled the same way.
+mod multibase_hash {
+    use super::{Hash, from_multibase, to_multibase};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(value: &Hash, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&to_multibase(value))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Hash, D::Error> {
+        let text = String::deserialize(d)?;
+        from_multibase(&text).map_err(D::Error::custom)
+    }
+}
+
+/// Encode a commitment as the wire carries it: a `DigestMultibase`.
+///
+/// `0x12 0x20` (sha2-256, 32 bytes) followed by the digest, base58btc with the
+/// `z` prefix — the same shape `sealed_transfer::bundle_digest_multibase`
+/// produces, and what `rooms/records/{list,get}`'s `dataCommitment` is typed as.
+///
+/// **Not hex.** A bare hex string hard-codes SHA-256 into the wire contract,
+/// which is exactly what the framework's `DigestMultibase` exists to avoid:
+/// multihash names the algorithm in-band, so moving off SHA-256 later is a
+/// change of value rather than another schema revision.
+#[must_use]
+pub fn to_multibase(hash: &Hash) -> String {
+    let mut mh = Vec::with_capacity(34);
+    mh.extend_from_slice(&[0x12, 0x20]);
+    mh.extend_from_slice(hash);
+    multibase::encode(multibase::Base::Base58Btc, mh)
+}
+
+/// Read a wire `dataCommitment` back to a [`Hash`].
+///
+/// Refuses anything that is not a sha2-256 multihash. A commitment is what a
+/// comparison turns on, so silently accepting an algorithm this build cannot
+/// compute would turn "these two roots differ" into "these two roots are not
+/// comparable" without saying so.
+pub fn from_multibase(value: &str) -> Result<Hash, MerkleError> {
+    let (_, bytes) = multibase::decode(value).map_err(|_| MerkleError::NotACommitment {
+        value: value.to_string(),
+        why: "not valid multibase",
+    })?;
+    let Some((&[0x12, 0x20], digest)) = bytes.split_at_checked(2) else {
+        return Err(MerkleError::NotACommitment {
+            value: value.to_string(),
+            why: "not a sha2-256 multihash (expected the 0x12 0x20 prefix)",
+        });
+    };
+    digest.try_into().map_err(|_| MerkleError::NotACommitment {
+        value: value.to_string(),
+        why: "a sha2-256 multihash carries exactly 32 bytes",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RecordStatus;
+
+    fn record(key: &str, version: u64) -> Record {
+        Record {
+            key: key.to_string(),
+            version,
+            epoch: Some(3),
+            status: RecordStatus::Active,
+            pinned: false,
+            sealed: Some("Zm9v".into()),
+            nonce: Some("YmFy".into()),
+            sealed_version: None,
+            cleartext: None,
+            author: None,
+            updated_at: 1_700_000_000,
+            created_at: None,
+            created_by: None,
+            body_stored_at: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_room_commits_to_a_distinguished_value() {
+        assert_eq!(root_of(&[]), empty_root());
+        // Not zeroes — an uninitialised buffer must not read as a valid root.
+        assert_ne!(empty_root(), [0u8; 32]);
+    }
+
+    /// The property the whole structure exists for: omit a record and the root
+    /// moves. Without this the commitment is decoration.
+    #[test]
+    fn omitting_a_record_changes_the_commitment() {
+        let mut all = vec![record("a", 1), record("b", 2), record("c", 3)];
+        let mut fewer = vec![record("a", 1), record("c", 3)];
+
+        let full = commit_records(&mut all).expect("commits");
+        let short = commit_records(&mut fewer).expect("commits");
+        assert_ne!(
+            full, short,
+            "a host could drop a record without moving the root"
+        );
+    }
+
+    /// A host must not be able to rewrite a record's *standing* — flipping
+    /// active to retracted rewrites what the room means without touching a byte
+    /// of ciphertext.
+    #[test]
+    fn changing_any_field_changes_the_commitment() {
+        let base = record("a", 1);
+        let mut cases = vec![
+            (
+                "version",
+                Record {
+                    version: 2,
+                    ..base.clone()
+                },
+            ),
+            (
+                "status",
+                Record {
+                    status: RecordStatus::Retracted,
+                    ..base.clone()
+                },
+            ),
+            (
+                "pinned",
+                Record {
+                    pinned: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "epoch",
+                Record {
+                    epoch: Some(4),
+                    ..base.clone()
+                },
+            ),
+            (
+                "author",
+                Record {
+                    author: Some("did:example:someone".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "ciphertext",
+                Record {
+                    sealed: Some("YmF6".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "updated_at",
+                Record {
+                    updated_at: 1_700_000_001,
+                    created_at: None,
+                    created_by: None,
+                    body_stored_at: None,
+                    ..base.clone()
+                },
+            ),
+        ];
+        let original = leaf_hash(&base.committed()).expect("hashes");
+        for (what, altered) in &mut cases {
+            assert_ne!(
+                leaf_hash(&altered.committed()).expect("hashes"),
+                original,
+                "a host could change `{what}` without moving the leaf"
+            );
+        }
+    }
+
+    /// Ordering is what makes absence provable, so the commitment must not
+    /// depend on the order records happened to be read in.
+    #[test]
+    fn the_commitment_does_not_depend_on_input_order() {
+        let mut forwards = vec![record("a", 1), record("b", 2), record("c", 3)];
+        let mut backwards = vec![record("c", 3), record("b", 2), record("a", 1)];
+        assert_eq!(
+            commit_records(&mut forwards).expect("commits"),
+            commit_records(&mut backwards).expect("commits"),
+        );
+    }
+
+    /// The second-preimage defence. Without RFC 6962's prefixes an internal
+    /// node's preimage can be offered as a leaf.
+    #[test]
+    fn a_leaf_and_a_node_over_the_same_bytes_differ() {
+        let a = leaf_hash(&record("a", 1).committed()).expect("hashes");
+        let b = leaf_hash(&record("b", 2).committed()).expect("hashes");
+        let parent = node_hash(&a, &b);
+
+        let mut undomained = Sha256::new();
+        undomained.update(a);
+        undomained.update(b);
+        let raw: Hash = undomained.finalize().into();
+        assert_ne!(parent, raw, "internal nodes are not domain-separated");
+    }
+
+    #[test]
+    fn every_leaf_proves_against_the_root() {
+        for count in 1..=9usize {
+            let mut records: Vec<Record> = (0..count)
+                .map(|i| record(&format!("k{i:02}"), i as u64))
+                .collect();
+            let root = commit_records(&mut records).expect("commits");
+            let leaves: Vec<Hash> = records
+                .iter()
+                .map(|r| leaf_hash(&r.committed()).expect("hashes"))
+                .collect();
+
+            for (i, leaf) in leaves.iter().enumerate() {
+                let proof = inclusion_proof(&leaves, i)
+                    .unwrap_or_else(|| panic!("proof for {i} of {count}"));
+                assert!(
+                    verify_inclusion(&root, leaf, &proof),
+                    "leaf {i} of {count} did not prove"
+                );
+            }
+        }
+    }
+
+    /// Odd counts are where a promoted node lives, and where `root_of` and
+    /// `inclusion_proof` must agree with each other. They are written as two
+    /// functions and would drift silently.
+    #[test]
+    fn a_proof_for_a_record_not_in_the_tree_fails() {
+        let mut records = vec![record("a", 1), record("b", 2), record("c", 3)];
+        let root = commit_records(&mut records).expect("commits");
+        let leaves: Vec<Hash> = records
+            .iter()
+            .map(|r| leaf_hash(&r.committed()).expect("hashes"))
+            .collect();
+        let proof = inclusion_proof(&leaves, 0).expect("proof");
+
+        let outsider = leaf_hash(&record("zzz", 99).committed()).expect("hashes");
+        assert!(
+            !verify_inclusion(&root, &outsider, &proof),
+            "a record the room does not hold proved against its root"
+        );
+    }
+
+    #[test]
+    fn a_tampered_proof_step_fails() {
+        let mut records = vec![
+            record("a", 1),
+            record("b", 2),
+            record("c", 3),
+            record("d", 4),
+        ];
+        let root = commit_records(&mut records).expect("commits");
+        let leaves: Vec<Hash> = records
+            .iter()
+            .map(|r| leaf_hash(&r.committed()).expect("hashes"))
+            .collect();
+        let mut proof = inclusion_proof(&leaves, 1).expect("proof");
+
+        proof[0].sibling[0] ^= 0xff;
+        assert!(!verify_inclusion(&root, &leaves[1], &proof));
+
+        let mut flipped = inclusion_proof(&leaves, 1).expect("proof");
+        flipped[0].sibling_is_left = !flipped[0].sibling_is_left;
+        assert!(
+            !verify_inclusion(&root, &leaves[1], &flipped),
+            "the side a sibling sits on is part of the proof"
+        );
+    }
+
+    #[test]
+    fn an_index_outside_the_tree_has_no_proof() {
+        let leaves = [leaf_hash(&record("a", 1).committed()).expect("hashes")];
+        assert!(inclusion_proof(&leaves, 1).is_none());
+        assert!(inclusion_proof(&[], 0).is_none());
+    }
+
+    /// The wire encoding is `DigestMultibase`, not hex. A bare hex string
+    /// hard-codes SHA-256 into the contract, which is what the framework's
+    /// definition exists to prevent.
+    #[test]
+    fn a_commitment_encodes_as_a_sha2_256_multihash() {
+        let root = commit_records(&mut [record("a", 1)]).expect("commits");
+        let encoded = to_multibase(&root);
+
+        assert!(
+            encoded.starts_with('z'),
+            "base58btc is RECOMMENDED: {encoded}"
+        );
+        let (_, bytes) = multibase::decode(&encoded).expect("valid multibase");
+        assert_eq!(&bytes[..2], &[0x12, 0x20], "sha2-256 multihash prefix");
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(from_multibase(&encoded).expect("round-trips"), root);
+    }
+
+    /// A commitment is what a comparison turns on, so an unreadable one must be
+    /// an error rather than a value that quietly fails to match.
+    #[test]
+    fn something_that_is_not_a_commitment_is_refused() {
+        // Bare hex — the encoding this replaced.
+        assert!(from_multibase(&to_hex_for_test(&empty_root())).is_err());
+        // A multihash naming another algorithm.
+        let mut other = vec![0x13, 0x20];
+        other.extend_from_slice(&[7u8; 32]);
+        let encoded = multibase::encode(multibase::Base::Base58Btc, other);
+        assert!(
+            from_multibase(&encoded).is_err(),
+            "accepted a non-sha2-256 digest"
+        );
+        // Right prefix, wrong length.
+        let short = multibase::encode(multibase::Base::Base58Btc, vec![0x12, 0x20, 1, 2, 3]);
+        assert!(from_multibase(&short).is_err());
+        assert!(from_multibase("not multibase at all").is_err());
+    }
+
+    fn to_hex_for_test(hash: &Hash) -> String {
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn a_step_round_trips_through_json() {
+        let leaves: Vec<Hash> = ["a", "b", "c"]
+            .iter()
+            .map(|k| leaf_hash(&record(k, 1).committed()).expect("hashes"))
+            .collect();
+        let proof = inclusion_proof(&leaves, 0).expect("proof");
+        let json = serde_json::to_string(&proof).expect("serialises");
+        let back: InclusionProof = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(proof, back);
+    }
+}

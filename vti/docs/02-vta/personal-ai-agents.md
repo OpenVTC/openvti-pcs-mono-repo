@@ -1,0 +1,424 @@
+# Enabling personal AI agents against a VTA
+
+A concrete runbook for letting personal AI agent runtimes — open-claw,
+nano-claw, hermes, and the like — operate against an operator's VTA.
+
+A personal AI agent is **not** a community and **not** a hand-rolled
+integration. It maps onto the existing **Trust Tasks consumer model** as a
+*Service* consumer with `consumerKind.serviceKind = "aiAgent"` (see
+`vta-service/src/trust_tasks/wire_v0_2.rs`, `operations/device.rs`). The agent
+gets a VTA-minted DID, is enrolled as a device, granted a least-privilege
+capability set, reached over DIDComm through the operator's mediator, and woken
+via the push gateway. Sensitive actions it initiates are gated behind operator
+passkey step-up.
+
+This doc covers the **VTA-minted-DID** path (the VTA mints and manages the
+agent DID via the `ai-agent` template + provision-integration). The lighter
+alternative — agent self-generates a `did:key` and enrolls via
+`device/register` — skips steps 2–3 but gives up central revocation of the
+agent identity.
+
+## Layers of "service"
+
+There are three distinct things to turn on, in order:
+
+1. **Transports** you *enable* on the VTA (`pnm services …`).
+2. **Integrations** you *provision* via DID templates (mediator, push gateway,
+   the agent itself).
+3. **Capabilities / Trust Task slices** you *grant* to the agent
+   (least-privilege; set on the agent's `DeviceBinding`).
+
+## Priority order (TL;DR)
+
+1. DIDComm transport + a mediator — the agent's backbone (async, NAT-friendly,
+   intrinsic sender auth). Keep REST enabled as the fallback.
+2. Agent identity — provision the `ai-agent` template → VTA-minted agent DID +
+   ACL entry.
+3. Device enrollment + least-privilege capabilities (`SignTrustTask`,
+   `VaultRead`, `FillRelease`).
+4. Push gateway + `device/set-wake` — so the VTA can wake a sleeping agent.
+5. Step-up + WebAuthn — human-in-the-loop guardrail on the agent's high-impact
+   actions.
+6. Credential exchange / sealed-transfer — only if the agent holds/presents VCs.
+
+---
+
+## Step 1 — Transports (operator, one-time)
+
+The agent speaks Trust Tasks over DIDComm authcrypt: unpacking a message yields
+a cryptographically-authenticated sender DID, so there's no bespoke signature
+verification. Keep REST enabled as the fallback for a synchronous or REST-only
+agent (the brick-prevention invariant requires ≥1 transport regardless).
+
+```bash
+pnm services list                       # see current REST / DIDComm / WebAuthn state
+pnm services rest enable --url https://vta.example.com          # if not already on
+pnm services didcomm enable --mediator-did <mediator-did>       # see Step 1a first
+```
+
+### Step 1a — Provision the mediator (if you don't have one)
+
+```bash
+# Author/keep the built-in mediator template, then provision it.
+pnm bootstrap provision-request  --template didcomm-mediator --var URL=https://mediator.example.com
+pnm bootstrap provision-integration --request <request.json> --out mediator-bundle.armor
+# The minted mediator DID is what you pass to `services didcomm enable --mediator-did`.
+```
+
+## Step 2 — Agent identity via the `ai-agent` template (operator, per agent)
+
+The `ai-agent` built-in template (shipped with the SDK) mints an agent DID whose
+document carries a signing key (authentication + assertionMethod), a
+key-agreement key (keyAgreement — for authcrypt + sealed-transfer), and a single
+`DIDCommMessaging` service routing inbound traffic through the operator's
+mediator.
+
+To customize the shape (extra service entry, labels), fork it first:
+
+```bash
+pnm did-templates init agent > my-ai-agent.json   # 'agent' aliases 'ai-agent'
+# edit my-ai-agent.json, then:
+pnm did-templates create --file my-ai-agent.json
+```
+
+Provision one agent identity. `MEDIATOR_DID` is the only required variable; pass
+`--create-context` to create the agent's isolation context inline if it doesn't
+exist:
+
+```bash
+pnm bootstrap provision-request \
+  --template ai-agent \
+  --var MEDIATOR_DID=<mediator-did> \
+  --var LABEL=nano-claw-laptop
+
+pnm bootstrap provision-integration \
+  --request <request.json> \
+  --out nano-claw-bundle.armor \
+  --create-context
+# The agent runtime opens the sealed bundle to recover its DID + private keys.
+```
+
+The bundle is HPKE-sealed to the holder (agent) key, so the relayer running the
+command can't read the agent's keys. Verify the out-of-band digest on open.
+
+## Step 3 — ACL role + device enrollment + capabilities (per agent)
+
+The agent DID must be in the ACL before it can register a device — provision
+above adds it. Set its role/context scope:
+
+```bash
+pnm acl create --did <agent-did> --role member --contexts <ctx-id> --expires 30d
+```
+
+**Capabilities narrow what a role allows**, and both `pnm acl create` and
+`pnm acl update` set them. They can only narrow: every name must be one the role
+already carries, and one that is not is refused rather than dropped. Grant the
+minimum:
+
+| Capability        | Why an agent needs it                                              |
+|-------------------|-------------------------------------------------------------------|
+| `SignTrustTask`   | Per-envelope signing via `vault/sign-trust-task/0.2`. Smaller blast radius than `Sign`/`ProxyLogin`. Usually the only signing cap an agent needs. |
+| `VaultRead`       | Read the specific secrets/API keys it needs (`vault/get`).        |
+| `FillRelease`     | Release a stored secret into a sealed envelope (`vault/release`). |
+| `ProxyLogin`      | *Only if* the agent must act **as the user** (mints a session).   |
+| `Sign` / `KeyMint`| *Only if* the agent needs the generic signing oracle / to mint keys. |
+
+Avoid `PolicyAdmin` / `DeviceAdmin` for an agent. An `application`-role consumer
+derives `VaultRead` + `ProxyLogin` + `FillRelease` + `Sign` + `SignTrustTask`,
+both memory capabilities and both room capabilities — usually wider than one
+agent needs. Narrow it to exactly what this agent does:
+
+```bash
+# Narrow at creation — the entry is never briefly wider than intended.
+pnm acl create --did <agent-did> --role application --contexts <ctx-id> \
+  --capabilities memory-read,room-present
+
+# Or narrow one that already exists.
+pnm acl update <agent-did> --capabilities memory-read,room-present
+
+# Undo the narrowing — the entry holds everything its role implies again.
+pnm acl update <agent-did> --capabilities-all
+```
+
+**Prefer the first form.** Granting and then narrowing leaves a window in which
+the entry holds everything its role implies, and an agent that authenticates
+inside that window is authorized by what it found there.
+
+The gate reads the stored entry on every call, so a narrowing binds the agent's
+**next request** rather than waiting for its token to expire. Pick the role
+whose derived set is the ceiling you want, then narrow within it.
+
+### Driving device + vault from the CLI
+
+`device/*` and `vault/*` are reachable from `pnm` (both transports — the same
+commands work whether the client is on REST or DIDComm), so the operator can
+enroll and manage an agent, and an agent runtime built on the SDK can drive the
+same surface:
+
+```bash
+# Enroll the agent as an ai-agent Service consumer (DID already in ACL):
+pnm device register --service-kind ai-agent --display-name "nano-claw" --platform linux
+pnm device list --service-kind ai-agent          # see it
+pnm device disable <device-id>                   # soft kill: blocks auth, keeps record
+pnm device wipe <device-id> --reason "stolen" --scope full   # remote wipe for a compromised agent
+
+# Store / read secrets the agent uses (sealed ops need DIDComm transport):
+pnm vault list
+pnm vault upsert --entry-file entry.json --secret-file secret.json   # secret sealed before send
+pnm vault release <entry-id>                     # opens the sealed reply, prints cleartext
+pnm vault sign-trust-task --file envelope.json   # sign as the entry's principal
+
+# What did the agent do? (the agent's DID is the audit actor)
+pnm audit list --actor <agent-did>
+```
+
+`vault upsert` and `vault release` seal/open `didcomm-authcrypt` envelopes with
+the caller's own keys, so they require the **DIDComm transport** (a REST-only
+client returns a clear `UnsupportedTransport` error).
+
+**Kill switches actually revoke access.** Both `device disable` and `device wipe`
+set state that the VTA's auth path enforces — a disabled or wiped device's DID is
+rejected at authentication (`check_acl`), not merely hidden from `device list`.
+`wipe` additionally records the reason and marks the binding wiped (`--scope`:
+`cache`, `cache-and-keys`, or `full`); a wiped device shows in `device list` only
+with `--include-wiped --include-disabled`.
+
+### Building an agent runtime in Rust (`AgentSession`)
+
+An agent runtime (open-claw / nano-claw / hermes) doesn't need to hand-wire the
+connect → enroll → heartbeat → wake-loop plumbing. The SDK's
+`vta_sdk::agent_session::AgentSession` (feature `session`) does it in a few
+calls — `enroll` connects over DIDComm and registers the device (idempotent if
+already enrolled), `run` heartbeats on a cadence and dispatches inbound
+wake/step-up messages to a handler, and `client()` exposes the full VTA surface
+(sign, vault, …):
+
+```rust
+let cfg = AgentConfig::new(client_did, private_key_mb, vta_did, mediator_did)
+    .display_name("nano-claw").platform("linux");
+let agent = AgentSession::enroll(cfg).await?;
+agent.run(|msg| async move {
+    // route on msg.typ — e.g. a push/wake or an auth/step-up request
+    AgentControl::Continue
+}).await?;
+```
+
+The CLI path above and this Rust path are equivalent surfaces over the same
+`device/*` + `vault/*` trust tasks; use whichever fits how the agent is built.
+
+## Step 4 — Wake / push (operator + agent)
+
+So the VTA can wake a sleeping personal agent when work or an inbound message
+arrives.
+
+```bash
+# Operator: provision a push gateway (built-in template).
+pnm bootstrap provision-request  --template push-gateway --var URL=https://push.example.com
+pnm bootstrap provision-integration --request <request.json> --out push-bundle.armor
+```
+
+The gateway also serves Trust Tasks over TSP and HTTPS (transport-agnostic), so
+a gateway sharing a mediator with its VTA can advertise TSP alongside DIDComm —
+pass the whole `TSPTransport` entry as `SERVICE_TSP` (the same null-pruning
+slot `vtc-host` uses for its messaging transports):
+
+```bash
+pnm bootstrap provision-request --template push-gateway \
+  --var URL=https://push.example.com \
+  --var SERVICE_TSP='{"id":"{DID}#tsp","type":"TSPTransport","serviceEndpoint":"did:webvh:QmMED:mediator.example.com:mediator"}'
+```
+
+Omit `SERVICE_TSP` and the gateway advertises DIDComm alone, unchanged from
+before.
+
+The agent runtime then calls `device/set-wake/0.2` with its opaque `WakeHandle`;
+the VTA provisions the wake allowlist to the gateway over DIDComm
+(`operations/device.rs::provision_gateway`).
+
+## Step 5 — Step-up + WebAuthn (operator) — the guardrail
+
+For an autonomous agent this is the safety valve, not polish. Gate the agent's
+high-impact actions (large signs, ACL/role changes, context delete) behind a
+human passkey approval.
+
+```bash
+pnm services webauthn enable --url https://vta.example.com
+pnm approvals list
+pnm approvals require https://trusttasks.org/spec/acl/grant/0.3 --reauth
+```
+
+When a gated op is initiated, the agent's request returns a step-up challenge;
+the operator approves with a passkey (`auth/passkey-login`), and the op proceeds.
+
+Enrolling that passkey as a verification method on a DID goes through
+`/did/verification-methods/passkey{,/challenge,/{fragment}}` — REST routes kept
+on purpose as the **WebAuthn exception** to "every remote operation is a Trust
+Task": the browser driving the ceremony (the VTA's auth portal, or
+`examples/vta-auth-demo`) holds only the bearer passkey-login issued, with no DID
+key to sign a Trust Task. A client that does hold a DID key uses the
+`vta/passkey-vms/{enroll-challenge,enroll-submit,list,revoke}/0.1` Trust Tasks
+instead, over any transport.
+
+## Step 6 — Agent memory (optional, but the reason most agents want a VTA)
+
+An agent that forgets everything between runs is a tool. The VTA carries a
+per-context store for what an agent should remember about its user, and because
+it lives on the VTA rather than in the agent runtime, the memory survives the
+runtime being replaced, is audited (`memory.put` / `.list` / `.get` /
+`.delete`), and is included in the VTA's encrypted backups.
+
+The store is versioned (#2115). `vta/memory/put/0.3` (and 0.2) returns each item's
+`version`; a write that sends `expectedVersion` applies only if the item is
+still at that version (`0`: only if nothing is there), and otherwise fails with
+`versionConflict` carrying the current version and value, so two agents — or one
+agent on two devices — cannot silently overwrite each other.
+`vta/memory/delete/0.3` leaves a tombstone, and `vta/memory/list/0.3` is either a
+page of a context (`prefix`, `cursor`, `limit`) or a change feed from
+`sinceVersion` that carries those tombstones, so a second device's copy
+converges. `vta/memory/get/0.2` recalls up to 256 named items at once. The 0.1
+tasks (`put`, `list`, `delete`) still work against the same store; the registry
+marks them superseded, and they are withdrawn on its schedule, so move clients to
+0.3 (`get` 0.2). 0.2 (`get` 0.1) is served too; it carries no `purpose`.
+
+Three gates apply. **Capability**: `MemoryRead` for `list` and `get`,
+`MemoryWrite` for `put` and `delete` — so a `reader` can be given the memory
+without being given the ability to rewrite it. An entry with `MemoryWrite` but
+not `MemoryRead` is told that an item changed when its conditional write
+conflicts, but never what the item now says. **Context
+access**: `require_context(contextId)`, the same check the context-scoped key
+tasks use, which makes the trust context the isolation boundary — a context-A
+agent cannot read, write, or delete context-B memory. The least-privilege grant
+for a memory-only agent is an ACL entry with role `application` naming exactly
+one context; `application` carries both memory capabilities.
+
+**Purpose** (VTI-ACL-100 – 110, #2120): the entry also states what its subject
+may use what it reads for — `any`, or a list of `personalisation`,
+`taskExecution`, `analytics`, `modelTraining` or absolute IRIs. Every read of
+memory is held to it: a `get`, a `list` that returns values, and a conflict
+that would hand back the current value. A request names its purpose
+(`purpose` on `get/0.2` and the 0.3 tasks; `pnm memory recall --purpose`); one
+the entry does not grant is refused with `purposeNotGranted`, which discloses
+nothing, and every read's audit row carries its purpose — `unstated` where a
+request under `any` named none. `any` never grants `modelTraining`: that needs
+an entry that names it. An entry listing exactly one purpose applies it to a
+request that names none, so clients that predate purposes keep working; under
+an entry listing more, they are refused until they name one. Entries written
+before purposes existed are rewritten to `any` at boot.
+
+Give an agent the purposes its task needs, not `any` (VTI-VTA-044):
+
+```bash
+pnm acl create --did <agent did:key> --role application --contexts my-agent-memory \
+  --purposes personalisation,taskExecution
+pnm acl update <agent did:key> --purposes taskExecution   # narrowing: applies at its next read
+```
+
+```bash
+# One context per agent (or per domain) — this is the isolation boundary.
+pnm contexts create --name my-agent-memory
+
+# Least privilege: NOT admin. For `admin` an empty allowed-contexts list means
+# *unrestricted*; for every other role it means authorized nowhere.
+pnm acl create --did <agent did:key> --role application --contexts my-agent-memory
+```
+
+From a client, `VtaClient::{memory_put_versioned, memory_delete_versioned,
+memory_list_page, memory_get}` drive the 0.2 tasks through the generic
+Trust-Task dispatcher, so they ride TSP, DIDComm or REST according to what both
+DID documents advertise — the agent writes no transport code. The 0.1 methods
+(`memory_put`, `memory_list`, `memory_delete`) are deprecated.
+
+From the operator side the same tasks are `pnm memory`. `recall <key>` is a
+`get`, `recall` pages through the whole context, and `wipe` deletes each item
+only at the version it listed, so an item another writer changed after you
+confirmed stops the wipe instead of going with it:
+
+```bash
+pnm memory plant favourite-colour green --context my-agent-memory
+pnm memory recall --context my-agent-memory          # or `recall <key>`
+pnm memory delete favourite-colour --context my-agent-memory
+pnm memory wipe --context my-agent-memory            # deletes every entry; confirms, --yes to skip
+```
+
+`--context` is required on every subcommand: a super-admin's access check
+passes for any id and these tasks do not require the context to exist, so a
+defaulted or mistyped id would silently read and write a context that isn't
+there — indistinguishable from an empty one. `wipe` needs both capabilities
+(it lists before it deletes) and is N round-trips, not atomic — there is no
+bulk-delete task — so re-running it after a partial failure is safe and
+finishes the job.
+
+**Who read or changed it.** Every memory call is in the VTA's audit trail,
+attributed to the DID that made it: `memory.put` and `memory.delete` with the
+item they touched, `memory.get` with each item it returned, `memory.list` with
+how many and a digest of which. `pnm memory history` shows it, newest first:
+
+```bash
+pnm memory history --context my-agent-memory
+pnm memory history --context my-agent-memory --actor <agent did> --from 2026-11-01T00:00:00Z
+```
+
+The trail never holds a memory key. A key names what was remembered — often a
+person — and the trail is a hash chain that cannot be edited, so anything in it
+could never be erased (VTI-AUD-005). Each item is named instead by a keyed
+commitment under the audit key (`hmac-sha256:<key id>:<hex>`): the same item
+always gets the same one, so rows about one item can be matched, and only the
+VTA can tell which key a commitment stands for. Audit rows written before this
+change named their item in the clear; they leave the trail only at the retention
+sweep. Reading the trail is an administrator's act, as for `pnm audit list`.
+
+Two boundaries worth stating before anything is stored here:
+
+- **Memory is not a secret store.** Tokens, passwords and keys belong in the
+  secrets vault; credentials belong in the credential vault. Those are gated on
+  `VaultRead` / `VaultWrite` / `CredentialWrite` for a reason.
+- **Memory is not application state.** `memory/list/0.1` returns *every* entry
+  in the context — no version, no precondition, no cursor — and, the argument
+  that settles it, *"forget everything" has to stay a safe thing for a user to
+  ask an agent*, which it cannot be if account state lives there. Use
+  `vta/app-state/*/1.0` (versioned, namespaced, with a change feed) instead. See
+  `docs/05-design-notes/appstate-store.md`.
+
+That same "no prefix, no cursor, no search" shape means **retrieval is the
+client's job**: structure the key, keep a short description in the value to rank
+on, and return summaries rather than whole bodies. A worked example is
+[`vta-agent-memory`](https://github.com/OpenVTC/vta-agent-memory), a Claude Code
+plugin built on these three tasks.
+
+## Step 7 — Credentials (optional)
+
+If the agent must hold or present Verifiable Credentials, the
+`credential_exchange` Trust Task slice + `sealed_transfer` are already available.
+Lower priority unless your agents do credential work.
+
+---
+
+## What's a build item vs. already there
+
+| Item                                   | Status                          |
+|----------------------------------------|---------------------------------|
+| `ai-agent` DID template                | **Added** (this change) — built-in |
+| DIDComm/REST/WebAuthn transports       | Exists (`pnm services …`)        |
+| Mediator / push-gateway templates      | Exists (built-in)               |
+| Provision-integration (generic kind)   | Exists — treats `kind` as a free string, no enum to extend |
+| Device + vault Trust Tasks             | Exist server-side (`trust_tasks/{device,vault}.rs`) |
+| Capability vocabulary                  | Exists (`vti_common::acl::Capability`) |
+| `pnm device …` / `pnm vault …` CLI     | **Added** (this change) — `VtaClient::{device_*,vault_*}` + `pnm` commands, both transports |
+| Sealed vault upsert/release            | **Added** — `seal_vault_secret` / `open_sealed_secret` on the DIDComm session |
+| `pnm acl \{create,update\} --capabilities` | **Added** — an entry narrows within its role, at creation or after, enforced on every gated call |
+| Agent memory Trust Tasks               | Exists (`trust_tasks/memory.rs`, `VtaClient::memory_*`) — capability- and context-gated, audited |
+| `pnm memory …` CLI                     | **Added** — `plant` / `recall` / `forget` / `wipe` over the same three tasks |
+| Agent-side connect ladder              | Exists (`vta_sdk::agent_connect::AgentConnect`) — one way in for every agent bridge |
+
+## References
+
+- DID templates: `docs/02-vta/did-templates.md`, `vta-sdk/templates/ai-agent.json`
+- Provision-integration: `docs/02-vta/provision-integration.md`
+- Runtime service management: `docs/02-vta/runtime-service-management.md`
+- Trust Tasks (device/vault/push): `vta-service/src/trust_tasks/`,
+  `vta-sdk/src/trust_tasks.rs`
+- Mobile/agent architecture (push topology): `docs/05-design-notes/mobile-agent-architecture.md`
+- Agent memory vs. application state: `docs/05-design-notes/appstate-store.md` §1
+- Agent-side connect ladder: `vta-sdk/src/agent_connect.rs`
+- Using a VTA from an MCP host: [vta-mcp](vta-mcp.md), and the worked
+  two-server example [agent memory + vta-mcp](examples/agent-memory-with-vta-mcp.md)

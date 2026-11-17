@@ -1,0 +1,625 @@
+//! Build and holder-sign a Trust Task document — the one client-side
+//! implementation of "a Data-Integrity proof by a holder, over the proof-less
+//! document" — `eddsa-jcs-2022` for an Ed25519 key, `ecdsa-jcs-2019` for a
+//! P-256 one (#1988).
+//!
+//! Both VTI services authenticate holder-submitted Trust Tasks the same way:
+//! verify the document's Data-Integrity proof with a **`did:key`-only** resolver
+//! (`crate::trust_task_proof`) and take the proof's `verificationMethod` DID
+//! as the proven signer, cross-checked against the document `issuer` where one
+//! is present. That is the whole authentication for the VTC's `POST
+//! /trust-tasks` holder surface (join submit / manifest / status) and for both
+//! services' canonical REST login.
+//!
+//! Signing had already been written three times — [`crate::auth_di`], the
+//! provision-client's VP signer, and `vta-mobile-core` — with the JCS
+//! presence-sensitivity handled slightly differently each time. This is the
+//! shared primitive; [`crate::auth_di`] builds on it, and so does anything that
+//! needs to speak a holder-signed Trust Task.
+//!
+//! Two invariants that are easy to get wrong and expensive to debug, because a
+//! mistake in either yields a signature that verifies nowhere:
+//!
+//! - **Sign the proof-less document.** Both suites canonicalise via JCS,
+//!   which is presence-sensitive, and the verifier strips `proof` before
+//!   checking. Signing a document that already carries a `proof` key — even an
+//!   empty one — produces a signature over different bytes.
+//! - **Set `recipient`.** SPEC §4.8.2 audience binding rejects a *signed*
+//!   document with no in-band recipient unless its specification is a bearer
+//!   spec. [`build_signed`] always sets it, so the caller cannot forget.
+
+use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+use affinidi_secrets_resolver::secrets::Secret;
+use chrono::Utc;
+use serde_json::Value;
+use trust_tasks_rs::{Proof, TrustTask};
+
+use crate::did_key::decode_private_key_multibase;
+
+/// Why building or signing a Trust Task document failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TrustTaskSignError {
+    /// [`HolderKey::from_did_key`] was handed something that is not a
+    /// `did:key`. Only that constructor is method-specific, because only
+    /// `did:key` puts the verification method in the identifier; any other DID
+    /// names its key explicitly through [`HolderKey::new`].
+    NotDidKey(String),
+    /// A verification method that does not identify a key: not a `did:`, or
+    /// carrying no `#fragment`. A proof names *a key*, not a subject, so
+    /// `did:webvh:<scid>:example.com:glenn` is not one and
+    /// `did:webvh:<scid>:example.com:glenn#key-0` is.
+    NotAVerificationMethod(String),
+    /// The holder's private key could not be decoded from its multibase form.
+    BadPrivateKey(String),
+    /// The Trust Task type URI failed to parse.
+    TypeUri(String),
+    /// Serialising the document, or signing it, failed.
+    Sign(String),
+}
+
+impl std::fmt::Display for TrustTaskSignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotDidKey(did) => write!(
+                f,
+                "HolderKey::from_did_key needs a did:key, which carries its own verification \
+                 method; got {did} — use HolderKey::new and name the key"
+            ),
+            Self::NotAVerificationMethod(vm) => write!(
+                f,
+                "`{vm}` does not identify a key: a verification method is a DID with a \
+                 `#fragment`, e.g. did:webvh:<scid>:example.com:glenn#key-0"
+            ),
+            Self::BadPrivateKey(e) => write!(f, "decode holder private key: {e}"),
+            Self::TypeUri(e) => write!(f, "Trust Task type URI parse: {e}"),
+            Self::Sign(e) => write!(f, "sign Trust Task: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TrustTaskSignError {}
+
+/// The `did:key:zXxx#zXxx` verification-method id the Data-Integrity resolver
+/// recognises for a `did:key` holder.
+pub fn did_key_to_vm(did: &str) -> Option<String> {
+    let mb = did.strip_prefix("did:key:")?;
+    Some(format!("{did}#{mb}"))
+}
+
+/// An unsigned Trust Task addressed from `issuer` to `recipient`, with a fresh
+/// `urn:uuid:` id and `issuedAt` stamped now.
+///
+/// Split out from [`build_signed`] because the unsigned form is a legitimate
+/// wire shape for bearer specifications — `auth/refresh/0.2` carries no proof,
+/// its opaque token being the credential.
+pub fn build_unsigned(
+    type_uri: &str,
+    payload: Value,
+    issuer: &str,
+    recipient: &str,
+) -> Result<TrustTask<Value>, TrustTaskSignError> {
+    let mut doc: TrustTask<Value> = TrustTask::new(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        type_uri
+            .parse()
+            .map_err(|e| TrustTaskSignError::TypeUri(format!("{e}")))?,
+        payload,
+    );
+    doc.issuer = Some(issuer.to_string());
+    doc.recipient = Some(recipient.to_string());
+    doc.issued_at = Some(Utc::now());
+    Ok(doc)
+}
+
+/// The key a Trust Task proof is made with: the verification method the proof
+/// will name, and the private key behind it.
+///
+/// **Any DID that can name a key may sign.** The verifier resolves the
+/// verification method and checks the signature; the DID method is not the
+/// authorization. `did:key:z6Mk…#z6Mk…`,
+/// `did:webvh:<scid>:example.com:glenn#key-0` and `did:web:example.com#key-1`
+/// are all ordinary holders.
+///
+/// This type exists because the two cases differ in one way that a bare
+/// `(did, key)` pair cannot express: a `did:key` *contains* its verification
+/// method, and nothing else does. Deriving `#key-0` from a `did:webvh` is not
+/// possible — the document says what the keys are called — so the caller has
+/// to name it, and a signer that takes only a DID silently cannot serve any
+/// method but one. That is the shape the restriction had before this type:
+/// not a policy anyone chose, but a helper that only knew how to build one
+/// kind of identifier.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HolderKey {
+    verification_method: String,
+    private_key_multibase: String,
+}
+
+/// Written by hand so the private key never reaches a log: a derived `Debug` would print it.
+impl std::fmt::Debug for HolderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HolderKey")
+            .field("verification_method", &self.verification_method)
+            .field("private_key_multibase", &"<redacted>")
+            .finish()
+    }
+}
+
+impl HolderKey {
+    /// A holder that names its own verification method — the general case.
+    ///
+    /// `verification_method` must be a DID with a `#fragment`, e.g.
+    /// `did:webvh:<scid>:example.com:glenn#key-0`. Whether the key is *in* that
+    /// DID document, and whether the DID document is reachable, is the
+    /// verifier's business; this only refuses what cannot identify a key at all.
+    pub fn new(
+        verification_method: impl Into<String>,
+        private_key_multibase: impl Into<String>,
+    ) -> Result<Self, TrustTaskSignError> {
+        let verification_method = verification_method.into();
+        let (did, fragment) = verification_method.split_once('#').ok_or_else(|| {
+            TrustTaskSignError::NotAVerificationMethod(verification_method.clone())
+        })?;
+        if !did.starts_with("did:") || fragment.is_empty() {
+            return Err(TrustTaskSignError::NotAVerificationMethod(
+                verification_method.clone(),
+            ));
+        }
+        Ok(Self {
+            verification_method,
+            private_key_multibase: private_key_multibase.into(),
+        })
+    }
+
+    /// A `did:key` holder, whose verification method is `<did>#<multibase>` and
+    /// so needs no naming.
+    pub fn from_did_key(
+        did: &str,
+        private_key_multibase: impl Into<String>,
+    ) -> Result<Self, TrustTaskSignError> {
+        let vm =
+            did_key_to_vm(did).ok_or_else(|| TrustTaskSignError::NotDidKey(did.to_string()))?;
+        Ok(Self {
+            verification_method: vm,
+            private_key_multibase: private_key_multibase.into(),
+        })
+    }
+
+    /// The verification method the proof will name.
+    #[must_use]
+    pub fn verification_method(&self) -> &str {
+        &self.verification_method
+    }
+
+    /// Whether this is a P-256 key: its multibase carries the `p256-priv`
+    /// multicodec prefix, or it is unprefixed and the method is a P-256
+    /// `did:key` (`did:key:zDn…`). Anything else is Ed25519, as before.
+    fn is_p256(&self) -> bool {
+        const P256_PRIV: [u8; 2] = [0x86, 0x26];
+        if let Ok((_, raw)) = multibase::decode(&self.private_key_multibase)
+            && raw.len() == 34
+        {
+            return raw[..2] == P256_PRIV;
+        }
+        self.holder_did().starts_with("did:key:zDn")
+    }
+
+    /// The holder DID — the verification method without its fragment. This is
+    /// the DID a verifier recovers as the proven signer.
+    #[must_use]
+    pub fn holder_did(&self) -> &str {
+        self.verification_method
+            .split('#')
+            .next()
+            .unwrap_or(&self.verification_method)
+    }
+}
+
+/// Attach the holder's Data-Integrity proof to `doc` in place, naming
+/// `holder_did`'s `did:key` verification method.
+///
+/// The `did:key` convenience form of [`sign_in_place_with`]; see [`HolderKey`]
+/// for why any other method has to name its key.
+pub async fn sign_in_place(
+    doc: &mut TrustTask<Value>,
+    holder_did: &str,
+    private_key_multibase: &str,
+) -> Result<(), TrustTaskSignError> {
+    let key = HolderKey::from_did_key(holder_did, private_key_multibase)?;
+    sign_in_place_with(doc, &key).await
+}
+
+/// Attach the holder's Data-Integrity proof to `doc` in place:
+/// `eddsa-jcs-2022` for an Ed25519 key, `ecdsa-jcs-2019` for a P-256 key —
+/// one whose private multibase carries the `p256-priv` prefix, or whose
+/// method is a `did:key:zDn…`.
+///
+/// The proof is computed over the document with `proof` removed — see the
+/// module docs for why that matters.
+///
+/// The proof's `proofPurpose` is decided by the document's own `type`
+/// ([`crate::trust_task_proof::purpose_for_document_type`]), never a default
+/// this signer picks: `assertionMethod` only for the registry's attestation
+/// types (an approver's decision, a subject's confirmation), `authentication`
+/// for everything else (VTI-KEY-022, VTI-KEY-106). `doc.type_uri` is already a
+/// parsed [`trust_tasks_rs::TypeUri`] — a document whose `type` did not parse
+/// as one cannot exist as a `TrustTask<Value>` in the first place, so there is
+/// no separate "not a type URI" case to refuse here; [`build_unsigned`] is
+/// where a caller's raw `type_uri: &str` is refused
+/// ([`TrustTaskSignError::TypeUri`]).
+pub async fn sign_in_place_with(
+    doc: &mut TrustTask<Value>,
+    key: &HolderKey,
+) -> Result<(), TrustTaskSignError> {
+    let purpose = crate::trust_task_proof::purpose_for_document_type(&doc.type_uri);
+    let signing_doc =
+        serde_json::to_value(&*doc).map_err(|e| TrustTaskSignError::Sign(e.to_string()))?;
+    let proof_json = proof_over(signing_doc, key, purpose.as_str()).await?;
+    doc.proof = Some(
+        serde_json::from_value::<Proof>(proof_json)
+            .map_err(|e| TrustTaskSignError::Sign(e.to_string()))?,
+    );
+    Ok(())
+}
+
+/// Sign a JSON object that is not a Trust Task document, in place, for
+/// `assertionMethod`: the holder's Data Integrity proof over the object with
+/// any `proof` removed, attached as its `proof` member.
+///
+/// For objects one party signs and another reads without a host in between,
+/// such as a sealed room record's body (`SealedRecordBody` in
+/// `rooms/_shared/0.1/room.schema.json`). The suite follows the key, as in
+/// [`sign_in_place_with`].
+pub async fn sign_object_for_assertion(
+    object: &mut Value,
+    key: &HolderKey,
+) -> Result<(), TrustTaskSignError> {
+    if !object.is_object() {
+        return Err(TrustTaskSignError::Sign(
+            "only a JSON object can carry a proof".to_string(),
+        ));
+    }
+    let proof = proof_over(object.clone(), key, "assertionMethod").await?;
+    object["proof"] = proof;
+    Ok(())
+}
+
+/// The holder's Data Integrity proof over `signing_doc` (with any `proof`
+/// removed), as JSON.
+async fn proof_over(
+    mut signing_doc: Value,
+    key: &HolderKey,
+    purpose: &str,
+) -> Result<Value, TrustTaskSignError> {
+    let vm_id = key.verification_method.clone();
+    let seed = decode_private_key_multibase(&key.private_key_multibase)
+        .map_err(|e| TrustTaskSignError::BadPrivateKey(e.to_string()))?;
+    // The suite follows the key: Ed25519 signs `eddsa-jcs-2022`, P-256
+    // `ecdsa-jcs-2019` (#1988; the Trust Tasks framework has every consumer
+    // SHOULD-verify it, for hardware-backed signers).
+    let mut signer = if key.is_p256() {
+        Secret::generate_p256(Some(&vm_id), Some(&seed))
+            .map_err(|e| TrustTaskSignError::BadPrivateKey(e.to_string()))?
+    } else {
+        Secret::generate_ed25519(Some(&vm_id), Some(&seed))
+    };
+    signer.id = vm_id;
+
+    if let Some(obj) = signing_doc.as_object_mut() {
+        obj.remove("proof");
+    }
+    let di_proof = DataIntegrityProof::sign(
+        &signing_doc,
+        &signer,
+        SignOptions::new()
+            .with_proof_purpose(purpose)
+            .with_created(Utc::now()),
+    )
+    .await
+    .map_err(|e| TrustTaskSignError::Sign(e.to_string()))?;
+    serde_json::to_value(&di_proof).map_err(|e| TrustTaskSignError::Sign(e.to_string()))
+}
+
+/// Build a holder-signed Trust Task and return it as the JSON body to POST.
+///
+/// The one call a client needs: `issuer` is the holder (and the proven signer),
+/// `recipient` is the service the document is addressed to (audience binding).
+pub async fn build_signed(
+    type_uri: &str,
+    payload: Value,
+    holder_did: &str,
+    private_key_multibase: &str,
+    recipient: &str,
+) -> Result<String, TrustTaskSignError> {
+    let key = HolderKey::from_did_key(holder_did, private_key_multibase)?;
+    build_signed_with(type_uri, payload, &key, recipient).await
+}
+
+/// Build a holder-signed Trust Task for a holder of any DID method.
+///
+/// The `issuer` is [`HolderKey::holder_did`] — the verification method's own
+/// DID — so the document's claimed issuer and its proven signer cannot come
+/// apart at the point of construction.
+pub async fn build_signed_with(
+    type_uri: &str,
+    payload: Value,
+    key: &HolderKey,
+    recipient: &str,
+) -> Result<String, TrustTaskSignError> {
+    let mut doc = build_unsigned(type_uri, payload, key.holder_did(), recipient)?;
+    sign_in_place_with(&mut doc, key).await?;
+    serde_json::to_string(&doc).map_err(|e| TrustTaskSignError::Sign(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn did_key_from_seed(seed_byte: u8) -> (String, String) {
+        let seed = [seed_byte; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let did = format!(
+            "did:key:{}",
+            crate::did_key::ed25519_multibase_pubkey(&sk.verifying_key().to_bytes())
+        );
+        let mut buf = vec![0x80, 0x26];
+        buf.extend_from_slice(&seed);
+        (did, multibase::encode(multibase::Base::Base58Btc, &buf))
+    }
+
+    const TYPE: &str = "https://trusttasks.org/spec/vtc/join-requests/submit/0.3";
+
+    /// The whole point of [`HolderKey`]: a holder that is not a `did:key`
+    /// signs, and the document it produces is well-formed — `issuer` is the
+    /// holder DID, and the proof names the key the holder was told to use.
+    ///
+    /// A `did:webvh` verification method is not derivable from its DID: the DID
+    /// document decides that `#key-0` is what the key is called. So the only
+    /// thing that ever prevented this was a helper that could build one shape
+    /// of identifier.
+    #[tokio::test]
+    async fn a_did_webvh_holder_signs_and_names_its_key() {
+        const VM: &str = "did:webvh:QmScidExample:example.com:glenn#key-0";
+        let (_did, pk) = did_key_from_seed(0xb2);
+
+        let key = HolderKey::new(VM, &pk).expect("a DID with a fragment is a verification method");
+        assert_eq!(
+            key.holder_did(),
+            "did:webvh:QmScidExample:example.com:glenn"
+        );
+
+        let body = build_signed_with(TYPE, json!({"vp": {}}), &key, "did:key:z6MkVtc")
+            .await
+            .expect("a did:webvh holder can sign");
+        let doc: TrustTask<Value> = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(doc.issuer.as_deref(), Some(key.holder_did()));
+        let proof = doc.proof.as_ref().expect("signed");
+        let di: DataIntegrityProof =
+            serde_json::from_value(serde_json::to_value(proof).unwrap()).unwrap();
+        assert_eq!(
+            di.verification_method, VM,
+            "the proof must name the key the DID document publishes, not a derived one"
+        );
+    }
+
+    /// A verification method identifies a *key*. A bare DID does not, and
+    /// neither does a non-DID string — refused at construction rather than
+    /// producing a proof nothing can resolve.
+    #[test]
+    fn a_verification_method_must_name_a_key() {
+        for bad in [
+            "did:webvh:QmScid:example.com:glenn",
+            "did:webvh:QmScid:example.com:glenn#",
+            "https://example.com/keys#key-0",
+            "no-scheme#key-0",
+        ] {
+            assert!(
+                matches!(
+                    HolderKey::new(bad, "z1234"),
+                    Err(TrustTaskSignError::NotAVerificationMethod(_))
+                ),
+                "`{bad}` must be refused"
+            );
+        }
+    }
+
+    /// `did:key` keeps its convenience: it is the one method whose verification
+    /// method is derivable, because the key is in the identifier.
+    #[test]
+    fn a_did_key_holder_still_derives_its_own_verification_method() {
+        let (did, pk) = did_key_from_seed(0xb3);
+        let key = HolderKey::from_did_key(&did, &pk).expect("did:key derives");
+        assert_eq!(key.verification_method(), format!("{did}#{}", &did[8..]));
+        assert_eq!(key.holder_did(), did);
+
+        assert!(matches!(
+            HolderKey::from_did_key("did:webvh:QmScid:example.com:glenn", &pk),
+            Err(TrustTaskSignError::NotDidKey(_))
+        ));
+    }
+
+    /// The signed document verifies under the same `did:key` resolver both
+    /// services use, and carries issuer + recipient.
+    #[tokio::test]
+    async fn signed_document_verifies_server_side() {
+        use affinidi_data_integrity::{DidKeyResolver, VerifyOptions};
+
+        let (did, pk) = did_key_from_seed(0xa1);
+        let body = build_signed(TYPE, json!({"vp": {}}), &did, &pk, "did:key:z6MkVtc")
+            .await
+            .expect("sign");
+        let doc: TrustTask<Value> = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(doc.issuer.as_deref(), Some(did.as_str()));
+        assert_eq!(doc.recipient.as_deref(), Some("did:key:z6MkVtc"));
+
+        let proof: DataIntegrityProof =
+            serde_json::from_value(serde_json::to_value(doc.proof.as_ref().unwrap()).unwrap())
+                .unwrap();
+        let mut unsigned = doc.clone();
+        unsigned.proof = None;
+        proof
+            .verify(&unsigned, &DidKeyResolver, VerifyOptions::new())
+            .await
+            .expect("must verify under the server's resolver");
+    }
+
+    /// The proof covers the payload — a post-signature edit does not verify.
+    #[tokio::test]
+    async fn tampered_payload_fails() {
+        use affinidi_data_integrity::{DidKeyResolver, VerifyOptions};
+
+        let (did, pk) = did_key_from_seed(0xa2);
+        let body = build_signed(TYPE, json!({"vp": {}}), &did, &pk, "did:key:z6MkVtc")
+            .await
+            .unwrap();
+        let mut doc: TrustTask<Value> = serde_json::from_str(&body).unwrap();
+        doc.payload = json!({"vp": {"forged": true}});
+
+        let proof: DataIntegrityProof =
+            serde_json::from_value(serde_json::to_value(doc.proof.as_ref().unwrap()).unwrap())
+                .unwrap();
+        let mut unsigned = doc.clone();
+        unsigned.proof = None;
+        assert!(
+            proof
+                .verify(&unsigned, &DidKeyResolver, VerifyOptions::new())
+                .await
+                .is_err()
+        );
+    }
+
+    /// The `did:key` convenience form refuses a DID it cannot derive a
+    /// verification method from — which is every other method.
+    ///
+    /// This is a limit of *this entry point*, not a rule about who may sign: a
+    /// `did:web` holder signs perfectly well through [`build_signed_with`] by
+    /// naming its key. The refusal is here so the caller finds out at the
+    /// helper rather than by sending a proof whose `verificationMethod` was
+    /// invented.
+    #[tokio::test]
+    async fn the_did_key_helper_refuses_a_did_it_cannot_derive_a_key_from() {
+        let (_, pk) = did_key_from_seed(0xa3);
+        let err = build_signed(
+            TYPE,
+            json!({}),
+            "did:web:example.com",
+            &pk,
+            "did:key:z6MkVtc",
+        )
+        .await
+        .expect_err("the derive-it form cannot serve did:web");
+        assert!(matches!(err, TrustTaskSignError::NotDidKey(_)), "{err:?}");
+
+        // The same holder, naming its key, signs.
+        let key = HolderKey::new("did:web:example.com#key-1", &pk).expect("names a key");
+        build_signed_with(TYPE, json!({}), &key, "did:key:z6MkVtc")
+            .await
+            .expect("naming the key is all it took");
+    }
+
+    /// The unsigned builder always sets `recipient` — a signed document without
+    /// one is rejected by SPEC §4.8.2 audience binding.
+    #[test]
+    fn unsigned_sets_issuer_and_recipient() {
+        let doc = build_unsigned(TYPE, json!({}), "did:key:z6MkA", "did:key:z6MkB").unwrap();
+        assert_eq!(doc.issuer.as_deref(), Some("did:key:z6MkA"));
+        assert_eq!(doc.recipient.as_deref(), Some("did:key:z6MkB"));
+        assert!(doc.proof.is_none());
+    }
+
+    /// `sign_in_place_with` picks the proof's purpose from the document's own
+    /// `type`, not a default: an operational document (`TYPE` here —
+    /// `join-requests/submit`, not in the registry's attestation list) is
+    /// signed for `authentication` (VTI-KEY-106, VTI-KEY-022).
+    #[tokio::test]
+    async fn an_operational_document_is_signed_for_authentication() {
+        let (did, pk) = did_key_from_seed(0xc1);
+        let mut doc = build_unsigned(TYPE, json!({}), &did, "did:key:z6MkVtc").unwrap();
+        sign_in_place(&mut doc, &did, &pk).await.unwrap();
+        assert_eq!(doc.proof.as_ref().unwrap().proof_purpose, "authentication");
+    }
+
+    /// The registry's attestation types — an approver's decision, a step-up
+    /// approve-response, a subject's confirmation — are signed for
+    /// `assertionMethod`, whoever calls this signer with one.
+    #[tokio::test]
+    async fn attestation_types_are_signed_for_assertion_method() {
+        for uri in [
+            "https://trusttasks.org/spec/task-consent/decision/0.2",
+            "https://trusttasks.org/spec/auth/step-up/approve-response/0.7",
+            "https://trusttasks.org/spec/confirm/response/0.1",
+        ] {
+            let (did, pk) = did_key_from_seed(0xc2);
+            let mut doc = build_unsigned(uri, json!({}), &did, "did:key:z6MkVtc").unwrap();
+            sign_in_place(&mut doc, &did, &pk).await.unwrap();
+            assert_eq!(
+                doc.proof.as_ref().unwrap().proof_purpose,
+                "assertionMethod",
+                "{uri}"
+            );
+        }
+    }
+
+    /// A `type` that does not parse as a Trust Task Type URI is refused before
+    /// any purpose is chosen or any signature is made — `build_unsigned`
+    /// refuses it, so `sign_in_place_with` never sees a document whose `type`
+    /// is not a real [`trust_tasks_rs::TypeUri`].
+    #[tokio::test]
+    async fn a_malformed_type_is_refused() {
+        let (did, pk) = did_key_from_seed(0xc3);
+        for bad in [
+            "not-a-uri-at-all",
+            "https://trusttasks.org/spec/task-consent/decision", // no version
+            "http://trusttasks.org/spec/task-consent/decision/0.2", // not https
+        ] {
+            let err = build_signed(bad, json!({}), &did, &pk, "did:key:z6MkVtc")
+                .await
+                .expect_err("a malformed type must be refused before signing");
+            assert!(
+                matches!(err, TrustTaskSignError::TypeUri(_)),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    /// A P-256 holder signs `ecdsa-jcs-2019` (#1988) — whether its private key
+    /// carries the `p256-priv` prefix or is bare beside a `did:key:zDn…` — and
+    /// the shared verifier recovers it as the signer.
+    #[cfg(feature = "proof-verify")]
+    #[tokio::test]
+    async fn a_p256_holder_signs_ecdsa_jcs_2019() {
+        let kp = affinidi_crypto::p256::generate(Some(&[0x5a; 32])).unwrap();
+        let mut jwk = serde_json::to_value(&kp.jwk).unwrap();
+        jwk.as_object_mut().unwrap().remove("d");
+        let did = crate::jws::JwsKey::from_jwk(&jwk).unwrap().did_key();
+        let mut prefixed = vec![0x86, 0x26];
+        prefixed.extend_from_slice(&kp.private_bytes);
+
+        for pk in [
+            multibase::encode(multibase::Base::Base58Btc, &prefixed),
+            multibase::encode(multibase::Base::Base58Btc, &kp.private_bytes),
+        ] {
+            let signed = build_signed(
+                "https://trusttasks.org/spec/vta/contexts/create/1.0",
+                json!({}),
+                &did,
+                &pk,
+                "did:key:z6MkVtc",
+            )
+            .await
+            .expect("sign");
+            let doc: Value = serde_json::from_str(&signed).unwrap();
+            assert_eq!(doc["proof"]["cryptosuite"], "ecdsa-jcs-2019");
+            let signer = crate::trust_task_proof::verify_trust_task_proof_value(
+                &doc,
+                &crate::trust_task_proof::TrustTaskVmResolver::did_key_only(),
+            )
+            .await
+            .expect("verifies");
+            assert_eq!(signer, did);
+        }
+    }
+}

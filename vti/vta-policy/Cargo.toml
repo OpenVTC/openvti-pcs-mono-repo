@@ -1,0 +1,40 @@
+[package]
+name = "vta-policy"
+description = "VTA policy subsystem — the regorus (Rego) engine, the default policy bundle, consent model, and decision evaluators"
+readme = "README.md"
+version = "0.39.0"
+edition.workspace = true
+# Published, because `vta-service` is — and a crate cannot go to crates.io
+# without its whole dependency closure there too. Not published for its own
+# sake: nothing outside this workspace is expected to depend on it directly.
+#
+# #938 set `publish = false` here on the finding that no external consumer
+# existed. That was wrong by one: `openvtc-core` dev-depends on `vta-service`
+# for `test_support::MockVta`, an in-process VTA the OpenVTC end-to-end tests
+# run against. See `vta-service/Cargo.toml` for what unpublishing it actually
+# broke. See RELEASING.md ("What gets published").
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# `policy`: the bounded regorus engine shared with the VTC (#2577).
+vti-common = { path = "../vti-common", version = "0.66", features = ["policy"] }
+vta-config = { path = "../vta-config", version = "0.43" }
+vta-keyspaces = { path = "../vta-keyspaces", version = "0.40" }
+# Types only (default features off): the declarative approvals model + its Rego
+# synthesizer, shared with the CLI so both sides derive the same module.
+vta-sdk = { path = "../vta-sdk", version = "0.90", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# `spawn_blocking` for compiling the policy set off the executor (`PolicyCache`).
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

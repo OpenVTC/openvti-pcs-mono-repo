@@ -1,0 +1,578 @@
+//! The control plane's `config.toml`: [`AppConfig`] and its registry, limits
+//! and stats sections, loaded from file with environment overrides.
+
+use did_hosting_common::server::error::AppError;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+// Re-export shared config types so existing code can still use `crate::config::*`
+pub use did_hosting_common::server::config::{
+    AuthConfig, FeaturesConfig, FjallTuning, HostingConfig, LogConfig, LogFormat, SecretsConfig,
+    ServerConfig, StoreConfig, TransportSelection, VtaConfig,
+};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub features: FeaturesConfig,
+    pub server_did: Option<String>,
+    pub mediator_did: Option<String>,
+    pub public_url: Option<String>,
+    pub did_hosting_url: Option<String>,
+    #[serde(default = "default_server")]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+    #[serde(default = "default_store")]
+    pub store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep the store's memory use
+    /// inside a pod's Kubernetes limit. Every field defaults to `None`
+    /// (fjall's own defaults, unchanged). See
+    /// [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub vta: VtaConfig,
+    #[serde(default)]
+    pub registry: RegistryConfig,
+    /// Multi-domain hosting knobs. Today the control plane reads
+    /// `hosting.disable_purge_grace` to schedule the soft-delete
+    /// timer; `bootstrap_domains` + `unassigned_purge_grace` are
+    /// server-side concerns (replicated here for shared-store
+    /// deployments where one fjall directory backs both processes).
+    #[serde(default)]
+    pub hosting: HostingConfig,
+    /// Trust Tasks configuration.
+    #[serde(default)]
+    pub trust_tasks: TrustTasksConfig,
+    /// How the service's own identity is produced, and how long a superseded
+    /// generation keeps being honoured after a rotation
+    /// (`identity.rotation_grace_period`).
+    #[serde(default)]
+    pub identity: did_hosting_common::server::config::IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `CONTROL_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
+    /// Local GeoIP database (`[geoip]`; env `CONTROL_GEOIP_DATABASE`) for the
+    /// city and country a wallet shows for a sign-in request.
+    #[serde(default, skip_serializing_if = "GeoIpConfig::is_default")]
+    pub geoip: GeoIpConfig,
+    /// How fast the periodic statistics flush may write (`[stats_flush]`; env
+    /// `CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND`).
+    #[serde(default, skip_serializing_if = "StatsFlushConfig::is_default")]
+    pub stats_flush: StatsFlushConfig,
+    /// Which DIDs keep 5-minute statistics (`[stats]`; env `CONTROL_STATS_*`).
+    /// See `docs/stats-tiers.md`.
+    #[serde(default, skip_serializing_if = "StatsTierConfig::is_default")]
+    pub stats: StatsTierConfig,
+    #[serde(skip)]
+    pub config_path: PathBuf,
+}
+
+pub use did_hosting_common::server::stats_tiers::{StatsMode, StatsTierConfig};
+
+/// Largest `[stats_flush] max_rows_per_second` accepted: far above any table
+/// it would be sized for, low enough that a typo is caught.
+pub const STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT: u32 = 10_000;
+
+/// Seconds between statistics flushes.
+pub const STATS_FLUSH_INTERVAL_SECS: u64 = 10;
+
+/// How often the storage task flushes statistics.
+pub const STATS_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(STATS_FLUSH_INTERVAL_SECS);
+
+/// The periodic statistics flush (`[stats_flush]`).
+///
+/// Every [`STATS_FLUSH_INTERVAL`] the control plane takes the per-DID counters
+/// gathered since the last flush and writes them, each row a read and a
+/// write. The budget counts rows, not table units: on DynamoDB a row costs
+/// one or more units by size ("Costs" in `docs/stats-tiers.md`). A flush
+/// writes at most `max_rows_per_second` ×
+/// [`STATS_FLUSH_INTERVAL_SECS`] rows, paced at `max_rows_per_second`, so the
+/// store sees that rate rather than a burst.
+///
+/// Rows past the budget wait for the next flush. Two limits drop what waits
+/// too long, each with a warning: time-series buckets older than an hour
+/// (`server::STATS_BUCKET_MAX_AGE`), and rows past the collector's caps of
+/// 100,000 DIDs and 200,000 buckets. A DID's row is written once per closed
+/// 5-minute bucket, plus a ring row per bucket for a DID with 5-minute
+/// statistics (`docs/stats-tiers.md`), so the budget should exceed those
+/// rows over 300 seconds. Per-DID totals are never dropped by age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsFlushConfig {
+    /// Most statistics rows written a second, averaged over the flush
+    /// interval. From 1 to [`STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT`].
+    ///
+    /// Default: `20`
+    #[serde(default = "default_stats_flush_max_rows_per_second")]
+    pub max_rows_per_second: u32,
+}
+
+fn default_stats_flush_max_rows_per_second() -> u32 {
+    20
+}
+
+impl Default for StatsFlushConfig {
+    fn default() -> Self {
+        Self {
+            max_rows_per_second: default_stats_flush_max_rows_per_second(),
+        }
+    }
+}
+
+impl StatsFlushConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Most rows one flush writes, every [`STATS_FLUSH_INTERVAL`].
+    pub fn rows_per_flush(&self) -> usize {
+        self.max_rows_per_second as usize * STATS_FLUSH_INTERVAL_SECS as usize
+    }
+
+    /// Refuse a budget outside 1 to [`STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT`]:
+    /// zero would defer every row forever.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(1..=STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT).contains(&self.max_rows_per_second) {
+            return Err(AppError::Config(format!(
+                "stats_flush.max_rows_per_second ({}) must be from 1 to \
+                 {STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT}",
+                self.max_rows_per_second
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply `{prefix}_STATS_FLUSH_MAX_ROWS_PER_SECOND`, then validate.
+    pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), AppError> {
+        let var = format!("{prefix}_STATS_FLUSH_MAX_ROWS_PER_SECOND");
+        if let Ok(v) = std::env::var(&var) {
+            self.max_rows_per_second = v
+                .trim()
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid {var}: {e}")))?;
+        }
+        self.validate()
+    }
+}
+
+/// Local GeoIP lookups (`[geoip]`) — base design §12.6: a local database only,
+/// never a third-party call. See `docs/geoip.md` and [`crate::geoip`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeoIpConfig {
+    /// Path of a MaxMind DB (`.mmdb`) file with the GeoIP2 City record shape:
+    /// DB-IP "IP to City Lite" (recommended) or MaxMind GeoLite2 City. Unset,
+    /// every sign-in location is `"unknown"`. A file that is missing or not a
+    /// database is a warning at startup, not a boot failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<PathBuf>,
+    /// Operator-named networks (`[[geoip.networks]]`), checked before the
+    /// database: an office LAN, a VPN, or a known egress address, which a
+    /// public database cannot place (private ranges are never looked up in
+    /// it). The most specific range containing the address wins. Works with
+    /// or without `database`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<NamedNetwork>,
+}
+
+/// One `[[geoip.networks]]` entry: every address in `cidr` is shown as
+/// `location`. Checked at load — a bad range, or a label that is empty, has
+/// control characters, or is over the schema's 128 characters, is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawNamedNetwork", into = "RawNamedNetwork")]
+pub struct NamedNetwork {
+    pub cidr: ipnetwork::IpNetwork,
+    pub location: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawNamedNetwork {
+    cidr: String,
+    location: String,
+}
+
+impl TryFrom<RawNamedNetwork> for NamedNetwork {
+    type Error = String;
+
+    fn try_from(raw: RawNamedNetwork) -> Result<Self, String> {
+        let cidr = raw.cidr.trim().parse().map_err(|_| {
+            format!(
+                "[[geoip.networks]] cidr `{}` is not an IP address or CIDR range",
+                raw.cidr
+            )
+        })?;
+        let location = raw.location.trim().to_string();
+        if location.is_empty() || location.chars().any(char::is_control) {
+            return Err(format!(
+                "[[geoip.networks]] location for `{}` must be non-empty text without \
+                 control characters",
+                raw.cidr
+            ));
+        }
+        if location.chars().count() > crate::geoip::MAX_LOCATION_CHARS {
+            return Err(format!(
+                "[[geoip.networks]] location for `{}` is longer than {} characters",
+                raw.cidr,
+                crate::geoip::MAX_LOCATION_CHARS
+            ));
+        }
+        Ok(Self { cidr, location })
+    }
+}
+
+impl From<NamedNetwork> for RawNamedNetwork {
+    fn from(n: NamedNetwork) -> Self {
+        Self {
+            cidr: n.cidr.to_string(),
+            location: n.location,
+        }
+    }
+}
+
+impl GeoIpConfig {
+    pub fn is_default(&self) -> bool {
+        self.database.is_none() && self.networks.is_empty()
+    }
+
+    /// `{prefix}_GEOIP_DATABASE` overrides `[geoip] database`; an empty value
+    /// clears one set in the file.
+    pub fn apply_env_overrides(&mut self, prefix: &str) {
+        if let Ok(path) = std::env::var(format!("{prefix}_GEOIP_DATABASE")) {
+            self.database = (!path.trim().is_empty()).then(|| PathBuf::from(path));
+        }
+    }
+}
+
+/// Trust Tasks framework runtime knobs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustTasksConfig {
+    /// Retained only so an existing config that sets it still parses.
+    ///
+    /// Proofs are now verified on every trust-task path, and every privileged
+    /// document must carry one bound to its sender; there is no mode that
+    /// accepts or ignores proofs. `true` (the default) is a no-op, and
+    /// `false` is refused at startup by [`AppConfig::load`] rather than
+    /// silently disregarded — an operator who turned verification off must
+    /// learn that it is back on.
+    #[serde(default = "default_enforce_proofs")]
+    pub enforce_proofs: bool,
+}
+
+fn default_enforce_proofs() -> bool {
+    true
+}
+
+impl Default for TrustTasksConfig {
+    fn default() -> Self {
+        Self {
+            enforce_proofs: default_enforce_proofs(),
+        }
+    }
+}
+
+fn default_server() -> ServerConfig {
+    ServerConfig {
+        host: "0.0.0.0".to_string(),
+        port: 8532,
+        trusted_proxies: Vec::new(),
+        client_ipv6_prefix: did_hosting_common::server::config::default_client_ipv6_prefix(),
+        trusted_proxy_cidrs: Vec::new(),
+        resolve_cache: Default::default(),
+        resolve_rate_limit: Default::default(),
+    }
+}
+
+fn default_store() -> StoreConfig {
+    StoreConfig {
+        data_dir: PathBuf::from("data/did-hosting-control"),
+        ..StoreConfig::default()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryConfig {
+    #[serde(default)]
+    pub instances: Vec<InstanceConfig>,
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval: u64,
+    /// Hostname allowlist for registered service-instance URLs
+    /// (`registry/admin-register`, `server/register`).
+    ///
+    /// Matching is on the URL **host only** (scheme and port are ignored),
+    /// case-insensitive, and **exact** — an entry `example.com` does NOT match
+    /// `evil.example.com`.
+    ///
+    /// - **Non-empty:** registration rejects any URL whose host is not listed.
+    /// - **Empty (the default):** registration still **default-denies**
+    ///   non-routable / internal *literal* hosts (loopback, RFC1918,
+    ///   link-local incl. `169.254.169.254`, CGNAT, ULA, IPv4-mapped); a
+    ///   public host is accepted.
+    ///
+    /// See `validate_registered_url` for the enforcement.
+    #[serde(default)]
+    pub url_allowlist: Vec<String>,
+    /// The watchers this control plane may push to (`[[registry.watchers]]`).
+    ///
+    /// A DID log names its watchers by URL (the `watchers` parameter); this map
+    /// says which DID answers at each URL, so the control plane can send that
+    /// watcher signed `webvh/sync/*` Trust Tasks through its outbox. A watcher
+    /// a log names but this map does not is not pushed to. A listed watcher's
+    /// DID may acknowledge what it was sent, and nothing else.
+    #[serde(default)]
+    pub watchers: Vec<WatcherPeer>,
+}
+
+/// One watcher: the URL DID logs name it by, and its DID.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WatcherPeer {
+    pub url: String,
+    pub did: String,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            instances: Vec::new(),
+            health_check_interval: default_health_check_interval(),
+            url_allowlist: Vec::new(),
+            watchers: Vec::new(),
+        }
+    }
+}
+
+fn default_health_check_interval() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceConfig {
+    pub label: Option<String>,
+    pub service_type: crate::registry::ServiceType,
+    pub url: String,
+}
+
+impl AppConfig {
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
+        let path = config_path
+            .or_else(|| std::env::var("CONTROL_CONFIG_PATH").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("config.toml"));
+
+        if !path.exists() {
+            return Err(AppError::Config(format!(
+                "configuration file not found: {}",
+                path.display()
+            )));
+        }
+
+        let contents = std::fs::read_to_string(&path).map_err(AppError::Io)?;
+        let mut config = toml::from_str::<AppConfig>(&contents)
+            .map_err(|e| AppError::Config(format!("failed to parse {}: {e}", path.display())))?;
+
+        config.config_path = path;
+
+        if !config.trust_tasks.enforce_proofs {
+            return Err(AppError::Config(
+                "trust_tasks.enforce_proofs = false is no longer supported: every privileged \
+                 trust task must carry a proof bound to its sender. Remove the setting."
+                    .into(),
+            ));
+        }
+
+        // Apply shared env overrides for common config fields
+        did_hosting_common::server::config::apply_env_overrides(
+            "CONTROL",
+            &mut config.features,
+            &mut config.server,
+            &mut config.log,
+            &mut config.store,
+            &mut config.auth,
+            &mut config.secrets,
+        )?;
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "CONTROL",
+            &mut config.hosting,
+        )?;
+        // CONTROL_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("CONTROL")?;
+        // CONTROL_GEOIP_DATABASE — the local sign-in location database.
+        config.geoip.apply_env_overrides("CONTROL");
+        // CONTROL_STATS_FLUSH_MAX_ROWS_PER_SECOND. Also validates `[stats_flush]`.
+        config.stats_flush.apply_env_overrides("CONTROL")?;
+        // CONTROL_STATS_MODE / _PROMOTE_PER_HOUR / _DEMOTE_PER_HOUR /
+        // _MAX_FINE_DIDS. Also validates `[stats]`.
+        config.stats.apply_env_overrides("CONTROL")?;
+
+        // Control-specific env vars
+        macro_rules! env_opt {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    $field = Some(v);
+                }
+            };
+        }
+        macro_rules! env_parse {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    $field = v
+                        .parse()
+                        .map_err(|e| AppError::Config(format!("invalid {}: {e}", $var)))?;
+                }
+            };
+        }
+
+        env_opt!("CONTROL_SERVER_DID", config.server_did);
+        env_opt!("CONTROL_MEDIATOR_DID", config.mediator_did);
+        env_opt!("CONTROL_PUBLIC_URL", config.public_url);
+        env_opt!("CONTROL_DID_HOSTING_URL", config.did_hosting_url);
+
+        // VTA config
+        env_opt!("CONTROL_VTA_URL", config.vta.url);
+        env_opt!("CONTROL_VTA_DID", config.vta.did);
+        env_opt!("CONTROL_VTA_CONTEXT_ID", config.vta.context_id);
+        env_parse!(
+            "CONTROL_REGISTRY_HEALTH_CHECK_INTERVAL",
+            config.registry.health_check_interval
+        );
+
+        // Normalize: strip trailing slashes from public_url and did_hosting_url
+        if let Some(ref mut url) = config.public_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+        if let Some(ref mut url) = config.did_hosting_url {
+            let trimmed = url.trim_end_matches('/').to_string();
+            *url = trimmed;
+        }
+
+        Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    /// What the setup wizard and recipe write (a serialised `AppConfig`)
+    /// loads back under the strict parser, with a registry instance's
+    /// `service_type` read as the enum; a misspelt key or an unknown service
+    /// type is refused.
+    #[test]
+    fn a_written_config_loads_and_typos_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config: AppConfig = toml::from_str("").unwrap();
+        config.server_did = Some("did:webvh:abc:control.example.com".into());
+        config.public_url = Some("https://control.example.com".into());
+        config.features.http_listener = true;
+        config.features.didcomm = true;
+        config.registry.instances.push(InstanceConfig {
+            label: Some("edge".into()),
+            service_type: crate::registry::ServiceType::Server,
+            url: "https://edge.example.com".into(),
+        });
+        std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let loaded = AppConfig::load(Some(path.clone())).expect("written config loads");
+        assert!(loaded.features.http_listener);
+        assert_eq!(
+            loaded.registry.instances[0].service_type,
+            crate::registry::ServiceType::Server
+        );
+        assert_eq!(loaded.hosting.disable_purge_grace.as_secs(), 30 * 86_400);
+
+        // A config written before the rename still loads.
+        std::fs::write(&path, "[features]\nrest_api = true\n").unwrap();
+        assert!(
+            AppConfig::load(Some(path.clone()))
+                .unwrap()
+                .features
+                .http_listener
+        );
+
+        for bad in [
+            "[registry]\nhealth_check_intreval = 5\n",
+            "[[registry.instances]]\nservice_type = \"edge\"\nurl = \"https://e.example.com\"\n",
+            "[trust_tasks]\nenforce = true\n",
+            "[hosting]\ndisable_purge_grace = \"1w\"\n",
+            "did_hosting_ur = \"https://x.example.com\"\n",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(AppConfig::load(Some(path.clone())).is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+// `std::env::set_var` / `remove_var` are `unsafe` in edition 2024; these tests
+// mutate the process environment, so they opt out of the workspace ban.
+#[allow(unsafe_code)]
+mod stats_flush_tests {
+    use super::*;
+
+    #[test]
+    fn test_stats_flush_default_keeps_todays_rate() {
+        assert_eq!(StatsFlushConfig::default().max_rows_per_second, 20);
+        assert!(StatsFlushConfig::default().is_default());
+    }
+
+    #[test]
+    fn test_stats_flush_zero_and_out_of_range_budgets_are_refused() {
+        for bad in [0, STATS_FLUSH_MAX_ROWS_PER_SECOND_LIMIT + 1] {
+            let err = StatsFlushConfig {
+                max_rows_per_second: bad,
+            }
+            .validate()
+            .expect_err("out of range");
+            assert!(
+                err.to_string().contains("stats_flush.max_rows_per_second"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stats_flush_env_override_is_read_and_checked() {
+        // A prefix no other test uses, so no lock is needed.
+        let mut config = StatsFlushConfig::default();
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND", "7") };
+        config.apply_env_overrides("SFTEST").expect("valid");
+        assert_eq!(config.max_rows_per_second, 7);
+
+        unsafe { std::env::set_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND", "0") };
+        assert!(config.apply_env_overrides("SFTEST").is_err());
+        unsafe { std::env::set_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND", "many") };
+        assert!(config.apply_env_overrides("SFTEST").is_err());
+        unsafe { std::env::remove_var("SFTEST_STATS_FLUSH_MAX_ROWS_PER_SECOND") };
+    }
+
+    #[test]
+    fn test_stats_flush_unknown_keys_are_refused() {
+        let parsed: Result<StatsFlushConfig, _> = toml::from_str("max_rows = 5");
+        assert!(
+            parsed.is_err(),
+            "a misspelt key must not silently keep the default"
+        );
+    }
+}

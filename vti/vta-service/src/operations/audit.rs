@@ -1,0 +1,967 @@
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use vta_sdk::protocols::audit_management::list::{
+    AuditEnvelope, AuditLogEntry, ListAuditLogsBody, ListAuditLogsResultBody,
+};
+use vta_sdk::protocols::audit_management::retention::RetentionResultBody;
+use vti_common::pagination::{Cursor, CursorKey, MAX_LIMIT};
+
+use crate::audit::{self, audit};
+use crate::auth::AuthClaims;
+use crate::config::AppConfig;
+use crate::error::AppError;
+use crate::store::{KeyspaceHandle, ScanOpts};
+
+/// Page size used when the caller omits `pageSize`.
+const DEFAULT_PAGE_SIZE: u64 = 50;
+/// Internal batch size for full-chain verification. Listing uses `MAX_LIMIT`
+/// because it cannot return more than the public page-size maximum.
+const AUDIT_VERIFY_SCAN_BATCH_SIZE: usize = 500;
+
+/// Does this stored row pass every supplied filter?
+///
+/// `action` and `outcome` match on **equality**, per canonical
+/// `audit/list`. They previously matched on substring, which quietly
+/// widened a query — asking for `action=vault.delete` also returned
+/// `vault.delete_force` — so an operator reading the result could not
+/// tell which rows they had actually asked for.
+fn matches(params: &ListAuditLogsBody, entry: &AuditLogEntry) -> bool {
+    if let Some(from) = params.from
+        && (entry.timestamp as i64) < from.timestamp()
+    {
+        return false;
+    }
+    // Canonical: `to` is exclusive.
+    if let Some(to) = params.to
+        && (entry.timestamp as i64) >= to.timestamp()
+    {
+        return false;
+    }
+    if let Some(action) = &params.action
+        && entry.action != *action
+    {
+        return false;
+    }
+    if let Some(actor) = &params.actor
+        && entry.actor != *actor
+    {
+        return false;
+    }
+    if let Some(outcome) = &params.outcome
+        && entry.outcome != *outcome
+    {
+        return false;
+    }
+    if let Some(ctx) = &params.context_id
+        && entry.context_id.as_deref() != Some(ctx.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+/// The bytes a cursor is bound to.
+///
+/// Canonical forbids changing the filters while paging — they are part
+/// of the cursor's position — so they are folded into the cursor's
+/// HMAC, and resuming under a different filter set fails verification.
+/// The caller's DID is bound too, so a leaked cursor is not a
+/// cross-principal read (canonical §"Cursor as a capability").
+///
+/// Length-prefixed so that `action="a&actor=b"` cannot collide with
+/// `action="a", actor="b"`.
+fn cursor_binding(params: &ListAuditLogsBody, caller_did: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut field = |v: Option<&str>| {
+        let bytes = v.unwrap_or("").as_bytes();
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
+    };
+    field(Some(caller_did));
+    field(params.from.map(|t| t.to_rfc3339()).as_deref());
+    field(params.to.map(|t| t.to_rfc3339()).as_deref());
+    field(params.action.as_deref());
+    field(params.actor.as_deref());
+    field(params.outcome.as_deref());
+    field(params.context_id.as_deref());
+    out
+}
+
+/// Authorize an audit read.
+///
+/// The audit log is the whole agent's tail: it holds actor DIDs and
+/// actions from **every** trust context. `require_admin` alone tests
+/// only the role, so a context-scoped admin — an admin deliberately
+/// confined to one context — could read every other context's
+/// activity. Canonical states the gate directly: this is the tightest-
+/// gated read a maintainer offers, and a context-scoped admin does not
+/// qualify for the whole-log tail.
+///
+/// So: a super-admin reads anything; a scoped admin must name a
+/// `contextId` inside their own scope, which the filter then confines
+/// the results to.
+///
+/// Note this deliberately goes through `is_super_admin` /
+/// `has_context_access` rather than testing `allowed_contexts`
+/// directly — an empty context list means *unrestricted* for an admin
+/// and *authorized nowhere* for every other role.
+fn authorize(auth: &AuthClaims, params: &ListAuditLogsBody) -> Result<(), AppError> {
+    auth.require_admin()?;
+
+    if auth.is_super_admin() {
+        return Ok(());
+    }
+
+    let Some(ctx) = params.context_id.as_deref() else {
+        return Err(AppError::Forbidden(
+            "reading the whole audit log requires an unrestricted admin; a context-scoped \
+             admin must pass contextId to read that context's entries"
+                .into(),
+        ));
+    };
+
+    if !auth.has_context_access(ctx) {
+        return Err(AppError::Forbidden(format!(
+            "not authorized to read audit entries for context {ctx}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// List audit logs, newest first, with optional filters and opaque
+/// cursor pagination — canonical `audit/list/0.2`.
+/// Verify the audit log's chain, in storage order.
+///
+/// Reads ascending by key, which is write order, because the chain is a strict
+/// left fold and verifying it in any other order reports breaks that are not
+/// there.
+pub use vta_sdk::protocols::audit_management::verify::{
+    AuditChainBreak, AuditChainReport, VTA_EXT_KEY, VtaVerifyExt,
+};
+
+/// A sha2-256 digest as the canonical shape requires it: a multibase-encoded
+/// multihash, not hex.
+///
+/// The algorithm travels in the value, so a verifier never has to infer it —
+/// which is why the schema refuses a bare hex string.
+fn digest_multibase(digest: &[u8; 32]) -> String {
+    let mut mh = vec![0x12, 0x20];
+    mh.extend_from_slice(digest);
+    multibase::encode(multibase::Base::Base58Btc, mh)
+}
+
+/// Verify the audit log's chain, in storage order.
+///
+/// Reads ascending by key, which is write order, because the chain is a strict
+/// left fold and verifying it in any other order reports breaks that are not
+/// there.
+pub async fn verify_audit_chain(
+    audit_ks: &vti_common::store::KeyspaceHandle,
+) -> Result<AuditChainReport, AppError> {
+    use vti_common::audit::envelope::{ChainBreak, ChainVerifier};
+
+    // Retention deletes the oldest entries, so the oldest survivor points back
+    // at something that is gone. Resuming from the sweep's watermark is what
+    // tells an intact-but-pruned log apart from one an entry was removed from
+    // — without it the two are the same failure.
+    let watermark = vta_audit::prune_watermark(audit_ks).await?;
+    let resumed = watermark.as_ref().and_then(|w| {
+        let raw = hex::decode(&w.head).ok()?;
+        let head: [u8; 32] = raw.try_into().ok()?;
+        Some((head, w.pruned_entries))
+    });
+    let mut verifier = match resumed {
+        Some((head, index)) => ChainVerifier::resume(head, index),
+        None => ChainVerifier::new(),
+    };
+
+    let mut extra = VtaVerifyExt {
+        resumed_from_prune: resumed.is_some(),
+        pruned_entries: watermark.as_ref().map_or(0, |w| w.pruned_entries),
+        ..Default::default()
+    };
+    let mut chain_break = None;
+    // A pruned log has no entry before the watermark, so the first survivor is
+    // a continuation rather than an opening.
+    let mut chain_opened = resumed.is_some();
+
+    let mut entries_examined = 0usize;
+    // A pager, not a `scan_raw` loop: verification always walks the whole
+    // retained log, so the page count is a function of the log's size. On a
+    // backend that cannot bound a read itself, a `scan_raw` loop would
+    // re-read every row once per page.
+    let mut pages = audit_ks.scan_pager(ScanOpts::new("log:", AUDIT_VERIFY_SCAN_BATCH_SIZE));
+    loop {
+        let pairs = pages.next_page().await?;
+        if pairs.is_empty() {
+            break;
+        }
+
+        for (key, value) in &pairs {
+            // Counted here, per row actually looked at — not per page fetched.
+            // `entriesExamined` is "rows examined, chainable or not", and the
+            // VTC reports exactly that (`verifier.index()`, which counts the
+            // breaking row too). Counting a whole page up front would report
+            // rows the walk never reached, and make the number move with the
+            // batch size.
+            entries_examined += 1;
+            let env = match serde_json::from_slice::<vta_audit::VtaAuditEnvelope>(value) {
+                Ok(env) => env,
+                Err(_) => {
+                    // Before the first envelope this is a row from before the
+                    // chain existed. After it, nothing this sink writes looks like
+                    // this, so something else put it there.
+                    if chain_opened {
+                        extra.unchained_after_open += 1;
+                        tracing::warn!(
+                            key = %String::from_utf8_lossy(key),
+                            "audit row after the chain opened is not an envelope",
+                        );
+                    } else {
+                        extra.pre_chain_rows += 1;
+                    }
+                    continue;
+                }
+            };
+            chain_opened = true;
+
+            if let Err(brk) = verifier.push(&env) {
+                let (kind, index, event_id) = match brk {
+                    ChainBreak::TamperedEntry { index, event_id } => {
+                        ("tamperedEntry", index, event_id)
+                    }
+                    ChainBreak::BrokenLink { index, event_id } => ("brokenLink", index, event_id),
+                };
+                chain_break = Some(AuditChainBreak {
+                    kind: kind.to_string(),
+                    index,
+                    event_id: Some(event_id.to_string()),
+                });
+                break;
+            }
+        }
+
+        if chain_break.is_some() {
+            // The chain is a strict left fold, so nothing past the break can
+            // be verified and reading on would examine rows for no purpose.
+            break;
+        }
+    }
+
+    Ok(AuditChainReport {
+        verified: chain_break.is_none(),
+        entries_examined,
+        entries_verified: verifier.verified(),
+        legacy_skipped: verifier.skipped_legacy(),
+        // The canonical shape has one bucket for what would not parse; the two
+        // kinds a VTA distinguishes are broken out in `ext`.
+        unparseable_skipped: extra.pre_chain_rows + extra.unchained_after_open,
+        head: verifier.head().as_ref().map(digest_multibase),
+        chain_break,
+        ext: Some(serde_json::json!({ VTA_EXT_KEY: extra })),
+    })
+}
+
+/// Read one stored row, in either shape the audit keyspace holds.
+///
+/// A VTA's audit keyspace holds rows written before the log was chained and
+/// envelopes written since, under the same key format and interleaved by time.
+/// A reader that knows only one shape does not fail loudly — it skips what it
+/// cannot parse — so a reader that knew only the older shape would report a
+/// log that stops at the moment chaining began.
+fn read_row(value: &[u8]) -> Option<AuditLogEntry> {
+    if let Ok(row) = serde_json::from_slice::<AuditLogEntry>(value) {
+        return Some(row);
+    }
+    serde_json::from_slice::<vta_audit::VtaAuditEnvelope>(value)
+        .ok()
+        .map(|env| flatten(&env))
+}
+
+/// An envelope in the shape the query and the response speak.
+///
+/// The actor is the plaintext where it is still there. A redacted row has
+/// none, and the empty actor is the honest answer: the identifier was erased,
+/// and what survives is a commitment that answers *was it this DID?* rather
+/// than *who was it?* — which is what an erasure is supposed to leave behind.
+fn flatten(env: &vta_audit::VtaAuditEnvelope) -> AuditLogEntry {
+    use vta_audit::VtaAuditEvent as AuditEvent;
+
+    let (action, resource, outcome, channel, context_id, detail) = match &env.event {
+        AuditEvent::VtaOperation(op) => (
+            op.action.clone(),
+            op.resource.clone(),
+            op.outcome.clone(),
+            op.channel.clone(),
+            op.context_id.clone(),
+            op.detail.clone(),
+        ),
+        other => (
+            other.variant_name().to_string(),
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        ),
+    };
+
+    AuditLogEntry {
+        id: env.event_id.to_string(),
+        timestamp: u64::try_from(env.timestamp.timestamp()).unwrap_or(0),
+        action,
+        actor: env.actor_did_plain.clone().unwrap_or_default(),
+        // A DID-shaped resource travels in the envelope's hashed members, so
+        // it comes back from there rather than from the event.
+        resource: resource.or_else(|| env.target_did_plain.clone()),
+        outcome,
+        channel,
+        context_id,
+        detail,
+    }
+}
+
+/// List audit entries, newest first, filtered and paged.
+///
+/// **A selective filter reads to the end of the log.** The walk stops early
+/// only once it holds `limit` matches *and* one more, so a `nextCursor` means
+/// "more *matching* entries remain" rather than "more rows remain". The price
+/// is that a log which cannot satisfy a filter `limit + 1` times is answered
+/// by reading every remaining row — "there is nothing further" is a claim
+/// about everything this call does not return. It applies to successful
+/// queries too: three matches return three entries and no `nextCursor`, after
+/// scanning to the end. An unfiltered list exits after one page.
+///
+/// Deliberately unbounded. A row budget would have to report
+/// a `nextCursor` at its cut-off without knowing whether anything further
+/// matches, handing back a cursor whose next page may be empty — the reading
+/// as results-withheld this ordering exists to prevent. Revisit the budget
+/// and the guarantee together, or not at all.
+/// Every successful row of `action` recorded on `channel` still in the audit
+/// keyspace, oldest first. For the VTA's own boot-time reconstruction of
+/// facts it once recorded only here (`operations::collection::
+/// backfill_provisioned`); no caller-facing path reads through it. Rows pruned
+/// by retention, or written only to an external sink, are not seen.
+pub(crate) async fn successful_rows_on_channel(
+    audit_ks: &KeyspaceHandle,
+    action: &str,
+    channel: &str,
+) -> Result<Vec<AuditLogEntry>, AppError> {
+    let mut out = Vec::new();
+    let mut pages = audit_ks.scan_pager(ScanOpts::new("log:", MAX_LIMIT));
+    loop {
+        let pairs = pages.next_page().await?;
+        if pairs.is_empty() {
+            break;
+        }
+        for (_, value) in &pairs {
+            if let Some(row) = read_row(value)
+                && row.action == action
+                && row.outcome == "success"
+                && row.channel.as_deref() == Some(channel)
+            {
+                out.push(row);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub async fn list_audit_logs(
+    audit_ks: &KeyspaceHandle,
+    auth: &AuthClaims,
+    params: &ListAuditLogsBody,
+    _channel: &str,
+) -> Result<ListAuditLogsResultBody, AppError> {
+    authorize(auth, params)?;
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_LIMIT as u64) as usize;
+
+    let cursor_key = CursorKey::new(audit_ks.clone()).get().await?;
+    let binding = cursor_binding(params, &auth.did);
+    let resume_from = match &params.cursor {
+        Some(wire) => Some(Cursor::decode_bound(wire, &cursor_key, &binding)?),
+        None => None,
+    };
+
+    let mut entries: Vec<AuditEnvelope> = Vec::with_capacity(limit);
+    let mut last_seen_key: Option<Vec<u8>> = None;
+    let mut more_matches = false;
+    let mut scanned_rows = 0u64;
+
+    // A filter that matches nothing in the newest rows walks on until it
+    // finds `limit` matches plus one, so the page count is bounded only by
+    // the log's size — the same reason verification pages rather than loops
+    // on `scan_raw`.
+    let mut opts = ScanOpts::newest_first("log:", MAX_LIMIT);
+    if let Some(cursor) = resume_from {
+        opts = opts.after(cursor.last_key);
+    }
+    let mut pages = audit_ks.scan_pager(opts);
+
+    loop {
+        let pairs = pages.next_page().await?;
+        if pairs.is_empty() {
+            break;
+        }
+        scanned_rows += pairs.len() as u64;
+
+        for (key, value) in &pairs {
+            if entries.len() < limit {
+                match read_row(value) {
+                    Some(row) => {
+                        if matches(params, &row) {
+                            entries.push(AuditEnvelope::from(&row));
+                            last_seen_key = Some(key.clone());
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            key = %String::from_utf8_lossy(key),
+                            "skipping unparseable audit row",
+                        );
+                    }
+                }
+            } else if let Some(row) = read_row(value)
+                && matches(params, &row)
+            {
+                // A `nextCursor` must mean "more *matching* entries remain", not
+                // "more rows remain": under a filter the tail may hold nothing
+                // that matches, and handing back a cursor for an empty next
+                // page would read as results being withheld. So the scan runs
+                // on only as far as the first further match.
+                more_matches = true;
+                break;
+            }
+        }
+
+        if more_matches {
+            break;
+        }
+    }
+
+    let next_cursor = if more_matches {
+        last_seen_key.map(|k| Cursor::new(k, scanned_rows).encode_bound(&cursor_key, &binding))
+    } else {
+        None
+    };
+
+    Ok(ListAuditLogsResultBody {
+        entries,
+        next_cursor,
+    })
+}
+
+/// Get the current audit retention period.
+pub async fn get_retention(
+    config: &Arc<RwLock<AppConfig>>,
+    auth: &AuthClaims,
+    _channel: &str,
+) -> Result<RetentionResultBody, AppError> {
+    auth.require_admin()?;
+    let config = config.read().await;
+    Ok(RetentionResultBody {
+        retention_days: config.audit.retention_days,
+    })
+}
+
+/// Update the audit retention period (super-admin only).
+pub async fn update_retention(
+    config: &Arc<RwLock<AppConfig>>,
+    // The sink, not the keyspace: this only *writes* one row. Note that the
+    // retention period it sets governs the keyspace, which an alternative sink
+    // does not necessarily share — see `vta_audit::sink`.
+    audit: &vta_audit::SharedAuditSink,
+    auth: &AuthClaims,
+    retention_days: u32,
+    channel: &str,
+) -> Result<RetentionResultBody, AppError> {
+    auth.require_super_admin()?;
+
+    if !(1..=365).contains(&retention_days) {
+        return Err(AppError::Validation(
+            "retention_days must be between 1 and 365".into(),
+        ));
+    }
+
+    let (result, contents, path) = {
+        let mut config = config.write().await;
+        config.audit.retention_days = retention_days;
+        let result = RetentionResultBody { retention_days };
+        let contents = config.to_runtime_toml()?;
+        let path = config.config_path.clone();
+        (result, contents, path)
+    };
+
+    std::fs::write(&path, contents).map_err(AppError::Io)?;
+    tracing::info!(channel, retention_days, "audit retention updated");
+    audit!(
+        "audit.retention_update",
+        actor = &auth.did,
+        resource = retention_days,
+        outcome = "success"
+    );
+    audit::record_best_effort(
+        audit,
+        "audit.retention_update",
+        &auth.did,
+        Some(&retention_days.to_string()),
+        "success",
+        Some(channel),
+        None,
+    )
+    .await;
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) mod verify_tests_support {
+    use vta_sdk::protocols::audit_management::list::AuditLogEntry;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::{KeyspaceHandle, Store};
+
+    pub(crate) fn keyspaces() -> (KeyspaceHandle, KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("store");
+        (
+            store
+                .keyspace(crate::keyspaces::AUDIT)
+                .expect("audit keyspace"),
+            store
+                .keyspace(crate::keyspaces::AUDIT_KEY)
+                .expect("audit_key keyspace"),
+            dir,
+        )
+    }
+
+    pub(crate) fn entry(action: &str) -> AuditLogEntry {
+        AuditLogEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: 1_700_000_000,
+            action: action.to_string(),
+            actor: "did:key:z6MkA".to_string(),
+            resource: None,
+            outcome: "success".to_string(),
+            channel: None,
+            context_id: None,
+            detail: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::verify_tests_support::{entry, keyspaces};
+    use super::*;
+    use vta_audit::{AuditSink, ChainedKeyspaceAuditSink};
+
+    /// A pre-chain row is expected and is not a finding: the VTA audited to
+    /// this keyspace before its log was chained, and nothing committed to
+    /// those rows at the time.
+    #[tokio::test]
+    async fn rows_written_before_the_chain_are_counted_not_faulted() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+
+        audit_ks
+            .insert(
+                format!(
+                    "log:{:020}:11111111-1111-1111-1111-111111111111",
+                    1_699_999_999u64
+                ),
+                &entry("auth.challenge"),
+            )
+            .await
+            .expect("seed a pre-chain row");
+
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        sink.record(&entry("acl.create")).await.expect("record");
+
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+
+        assert!(report.verified, "the chain itself is intact");
+        let ext: vta_sdk::protocols::audit_management::verify::VtaVerifyExt =
+            serde_json::from_value(report.ext.clone().unwrap()[VTA_EXT_KEY].clone()).unwrap();
+        assert_eq!(ext.pre_chain_rows, 1);
+        assert_eq!(
+            ext.unchained_after_open, 0,
+            "a row before the chain opened is not an insertion"
+        );
+        assert_eq!(
+            report.entries_verified, 2,
+            "the opening entry and the event"
+        );
+        assert!(report.head.is_some());
+    }
+
+    /// The same row after the chain has opened is a different fact. Nothing
+    /// this sink writes looks like that, so something else put it there.
+    #[tokio::test]
+    async fn an_unchained_row_after_the_chain_opened_is_a_finding() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        sink.record(&entry("acl.create")).await.expect("record");
+
+        // Far in the future, so it sorts after everything the sink wrote.
+        audit_ks
+            .insert(
+                format!(
+                    "log:{:020}:22222222-2222-2222-2222-222222222222",
+                    2_000_000_000u64
+                ),
+                &entry("acl.grant"),
+            )
+            .await
+            .expect("insert a row the sink did not write");
+
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+
+        let ext: vta_sdk::protocols::audit_management::verify::VtaVerifyExt =
+            serde_json::from_value(report.ext.clone().unwrap()[VTA_EXT_KEY].clone()).unwrap();
+        assert_eq!(
+            ext.unchained_after_open, 1,
+            "a non-envelope row after the chain opened is reported as a finding"
+        );
+        assert_eq!(ext.pre_chain_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_entry_is_reported_with_where_it_broke() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        for i in 0..3 {
+            sink.record(&entry(&format!("op.{i}")))
+                .await
+                .expect("record");
+        }
+
+        // Rewrite one entry's outcome in place, leaving its hashes alone.
+        let pairs = audit_ks.prefix_iter_raw("log:").await.expect("scan");
+        let (key, raw) = pairs
+            .iter()
+            .max_by(|(a, _), (b, _)| a.cmp(b))
+            .expect("a row");
+        let mut env: vta_audit::VtaAuditEnvelope = serde_json::from_slice(raw).expect("envelope");
+        if let vta_audit::VtaAuditEvent::VtaOperation(op) = &mut env.event {
+            op.outcome = "failure".to_string();
+        }
+        audit_ks
+            .insert(String::from_utf8(key.clone()).expect("utf8 key"), &env)
+            .await
+            .expect("rewrite the row");
+
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+
+        assert!(!report.verified);
+        let brk = report.chain_break.expect("a break is reported");
+        assert_eq!(brk.kind, "tamperedEntry");
+        assert_eq!(brk.event_id, Some(env.event_id.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::verify_tests_support::{entry, keyspaces};
+    use super::*;
+    use vta_audit::{AuditSink, ChainedKeyspaceAuditSink};
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// Retention and tamper-evidence have to coexist. A sweep deletes the
+    /// oldest entries, so the oldest survivor points back at something that is
+    /// gone — which is what a removed entry looks like. The watermark is what
+    /// tells the two apart.
+    #[tokio::test]
+    async fn a_pruned_log_still_verifies() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        for i in 0..5 {
+            sink.record(&entry(&format!("op.{i}")))
+                .await
+                .expect("record");
+        }
+
+        // A cutoff one second ahead of everything written so far, so the
+        // sweep prunes all of it. Derived from `now`, the sweep's only
+        // reachable boundaries in a test are a whole day ago and nothing.
+        let cutoff = now_secs() + 1;
+        let removed = vta_audit::cleanup_logs_before(&audit_ks, cutoff)
+            .await
+            .expect("sweep");
+        assert!(removed > 0, "the sweep must actually have pruned something");
+
+        sink.record(&entry("op.after-the-sweep"))
+            .await
+            .expect("record after sweep");
+
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+        assert!(
+            report.verified,
+            "a pruned log must still verify: {:?}",
+            report.chain_break
+        );
+        let ext: vta_sdk::protocols::audit_management::verify::VtaVerifyExt =
+            serde_json::from_value(report.ext.clone().unwrap()[VTA_EXT_KEY].clone()).unwrap();
+        assert!(ext.resumed_from_prune);
+        assert_eq!(ext.pruned_entries, removed as usize);
+    }
+
+    /// Each chunk's deletions and its watermark advance are one journal
+    /// record, so a crash mid-sweep never leaves a removed entry the watermark
+    /// does not account for.
+    #[tokio::test]
+    async fn a_sweep_commits_each_chunk_with_its_watermark() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        for i in 0..300 {
+            sink.record(&entry(&format!("op.{i}")))
+                .await
+                .expect("record");
+        }
+        let rows = audit_ks.prefix_keys("log:").await.unwrap().len() as u64;
+        let before = audit_ks.journal_seqno().unwrap();
+        let removed = vta_audit::cleanup_logs_before(&audit_ks, now_secs() + 1)
+            .await
+            .expect("sweep");
+        assert_eq!(removed, rows);
+        assert_eq!(
+            audit_ks.journal_seqno().unwrap() - before,
+            rows.div_ceil(256),
+            "{rows} entries in chunks of 256, each chunk one journal record"
+        );
+    }
+
+    /// Sweeps racing over one backlog must account for every removed entry
+    /// exactly once — each chunk's deletions and its watermark advance are one
+    /// batch — so the remainder still verifies and the count is the truth.
+    /// Deleting one by one and writing the watermark at the end let two sweeps
+    /// both count the entries they both removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn racing_sweeps_count_each_pruned_entry_once() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        const WRITTEN: usize = 300;
+        for i in 0..WRITTEN {
+            sink.record(&entry(&format!("op.{i}")))
+                .await
+                .expect("record");
+        }
+        let rows = audit_ks.prefix_keys("log:").await.unwrap().len();
+        let cutoff = now_secs() + 1;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let mut sweeps = Vec::new();
+        for _ in 0..4 {
+            let (ks, barrier) = (audit_ks.clone(), barrier.clone());
+            sweeps.push(tokio::spawn(async move {
+                barrier.wait().await;
+                vta_audit::cleanup_logs_before(&ks, cutoff)
+                    .await
+                    .expect("sweep")
+            }));
+        }
+        let mut removed = 0;
+        for s in sweeps {
+            removed += s.await.unwrap();
+        }
+        assert!(rows >= WRITTEN);
+        assert_eq!(removed as usize, rows, "each entry is removed once");
+
+        sink.record(&entry("op.after-the-sweep"))
+            .await
+            .expect("record after sweep");
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+        assert!(report.verified, "{:?}", report.chain_break);
+        let ext: vta_sdk::protocols::audit_management::verify::VtaVerifyExt =
+            serde_json::from_value(report.ext.clone().unwrap()[VTA_EXT_KEY].clone()).unwrap();
+        assert_eq!(ext.pruned_entries, rows);
+    }
+
+    /// The watermark must not become a way to hide a removal. An entry taken
+    /// out *after* the sweep still breaks the chain.
+    #[tokio::test]
+    async fn a_removal_after_the_sweep_is_still_caught() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        for i in 0..3 {
+            sink.record(&entry(&format!("op.{i}")))
+                .await
+                .expect("record");
+        }
+        vta_audit::cleanup_logs_before(&audit_ks, now_secs() + 1)
+            .await
+            .expect("sweep");
+
+        for i in 0..3 {
+            sink.record(&entry(&format!("later.{i}")))
+                .await
+                .expect("record");
+        }
+
+        // Remove one of the survivors, which is exactly what the chain is for.
+        let mut pairs = audit_ks.prefix_iter_raw("log:").await.expect("scan");
+        pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let victim = pairs[1].0.clone();
+        audit_ks.remove(victim).await.expect("remove a survivor");
+
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+        assert!(
+            !report.verified,
+            "removing an entry after the sweep must still break the chain"
+        );
+    }
+}
+
+#[cfg(test)]
+mod paged_reader_tests {
+    use super::verify_tests_support::{entry, keyspaces};
+    use super::*;
+    use vta_audit::{AuditSink, ChainedKeyspaceAuditSink};
+    use vta_sdk::protocols::audit_management::list::ListAuditLogsBody;
+
+    #[tokio::test]
+    async fn verify_reads_across_a_scan_page_boundary() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        for index in 0..501 {
+            sink.record(&entry(&format!("operation.{index}")))
+                .await
+                .expect("record audit entry");
+        }
+
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+
+        assert!(report.verified);
+        assert_eq!(report.entries_examined, 502);
+        assert_eq!(report.entries_verified, 502);
+    }
+
+    /// A break stops the count where it stops the verification.
+    ///
+    /// `entriesExamined` is "rows examined, chainable or not" — what the walk
+    /// actually looked at, including the row that broke. It is **not** the
+    /// size of the log: reading on after a break would examine rows for no
+    /// purpose, and reporting rows the walk never reached would be a number
+    /// that moves with the internal batch size rather than describing
+    /// anything.
+    ///
+    /// This matches the VTC, which reports `verifier.index()` from the same
+    /// shared verifier and stops at its break the same way. The VTA used to
+    /// report the whole log's row count here, which agreed with neither.
+    ///
+    /// The log is deliberately longer than one scan batch, with the tamper
+    /// near the start, so a per-page count would show up as the batch size.
+    #[tokio::test]
+    async fn a_break_stops_the_examined_count_where_it_stops_verifying() {
+        let (audit_ks, key_ks, _dir) = keyspaces();
+        let sink = ChainedKeyspaceAuditSink::new(audit_ks.clone(), key_ks);
+        for index in 0..600 {
+            sink.record(&entry(&format!("operation.{index}")))
+                .await
+                .expect("record audit entry");
+        }
+        let total = audit_ks.prefix_iter_raw("log:").await.expect("scan").len();
+        assert!(
+            total > AUDIT_VERIFY_SCAN_BATCH_SIZE,
+            "the log must span more than one page for this to mean anything"
+        );
+
+        // Rewrite the third row's outcome in place, leaving its hashes alone.
+        let mut pairs = audit_ks.prefix_iter_raw("log:").await.expect("scan");
+        pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let (key, raw) = pairs.get(2).expect("an early row");
+        let mut env: vta_audit::VtaAuditEnvelope = serde_json::from_slice(raw).expect("envelope");
+        if let vta_audit::VtaAuditEvent::VtaOperation(op) = &mut env.event {
+            op.outcome = "failure".to_string();
+        }
+        audit_ks
+            .insert(String::from_utf8(key.clone()).expect("utf8 key"), &env)
+            .await
+            .expect("rewrite the row");
+
+        let report = verify_audit_chain(&audit_ks).await.expect("verify");
+
+        assert!(!report.verified, "the tampered row must be caught");
+        let brk = report.chain_break.expect("a break is reported");
+        assert_eq!(brk.kind, "tamperedEntry");
+        assert_eq!(brk.index, 2, "the third row is the one that broke");
+        assert_eq!(
+            report.entries_examined, 3,
+            "two good rows and the one that broke — not the batch size, not the log size"
+        );
+        assert_eq!(
+            report.entries_verified, 2,
+            "the breaking row is examined but not verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pages_filtered_rows_with_a_signed_cursor() {
+        let (audit_ks, _key_ks, _dir) = keyspaces();
+        for index in 0..5u64 {
+            let action = if index % 2 == 0 { "target" } else { "other" };
+            audit_ks
+                .insert(format!("log:{index:020}:entry"), &entry(action))
+                .await
+                .expect("seed audit entry");
+        }
+
+        let auth = crate::test_support::super_admin_claims();
+        let params = ListAuditLogsBody {
+            action: Some("target".into()),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let first = list_audit_logs(&audit_ks, &auth, &params, "test")
+            .await
+            .expect("first page");
+
+        assert_eq!(first.entries.len(), 2);
+        assert!(first.entries.iter().all(|row| row.action == "target"));
+        let cursor = first.next_cursor.clone().expect("second page cursor");
+
+        let second = list_audit_logs(
+            &audit_ks,
+            &auth,
+            &ListAuditLogsBody {
+                action: Some("target".into()),
+                limit: Some(2),
+                cursor: Some(cursor.clone()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .expect("second page");
+
+        assert_eq!(second.entries.len(), 1);
+        assert!(second.entries.iter().all(|row| row.action == "target"));
+        assert!(second.next_cursor.is_none());
+
+        let error = list_audit_logs(
+            &audit_ks,
+            &auth,
+            &ListAuditLogsBody {
+                action: Some("other".into()),
+                limit: Some(2),
+                cursor: Some(cursor),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .expect_err("a cursor must not cross filter bindings");
+        assert!(matches!(error, AppError::InvalidCursor));
+    }
+}

@@ -1,0 +1,2125 @@
+//! Sending a Trust Task to another party, over whatever that party advertises.
+//!
+//! # Why this is one place
+//!
+//! Adding an external service should be choosing a task URI and a recipient
+//! DID. It was not: `room_host` hand-rolled REST, `webvh_didcomm` hand-rolled
+//! DIDComm, and the TSP path hand-rolled its own carriage — three carriages for
+//! one wire contract, and a fourth service would have been a fourth.
+//!
+//! The cost of that was not duplication, which is cheap. It was **divergence
+//! nobody could see**: the two existing paths disagreed about whether a reply is
+//! evidence. `room_host` verified the proof and bound the signer to the party it
+//! addressed; `webvh_didcomm` verified nothing at all. Both were reasonable
+//! inside their own file and only one of them can be right, and the difference
+//! was invisible because there was no place the question was asked once. Hence
+//! [`ReplyTrust`]: the answer is now an argument, so a caller that wants the
+//! weaker one has to write it down.
+//!
+//! # What this is not
+//!
+//! Not a Trust-Task *client* in the `vta-sdk` sense, and not a second document
+//! layer. [`vta_sdk::client::VtaClient`] signs from a `ClientIdentity` holding a
+//! raw `private_key_multibase`, and **a VTA never holds its own keys in that
+//! shape** — it derives, signs and zeroizes behind
+//! [`crate::operations::keys::sign_payload`]. So the caller builds and signs its
+//! own document, and only the bytes travel here.
+//!
+//! # What this is deliberately not: pushing to a device
+//!
+//! `trust_tasks::step_up::try_push_over_tsp` and the DIDComm fallback beside it
+//! also put Trust Tasks on a wire, and they are **not** folded in here. Three
+//! reasons, and the first is the one that decides it:
+//!
+//! - **Selection cannot be by advertisement.** A device is a wallet behind a
+//!   mediator; its DID often advertises nothing a sender could dial. The push
+//!   path chooses by *learned reachability* — `tsp_reach`, a fact recorded from
+//!   inbound frames — which is a different question from "what does this peer
+//!   say it accepts", and the right one for a device.
+//! - **There is no reply to correlate.** A push is delivered, not asked.
+//! - **Delivery is durable and has a doorbell**: a buffered `PendingResponse`
+//!   and a gateway wake, neither of which means anything for a request whose
+//!   answer the caller is waiting on.
+//!
+//! Giving this function a no-reply mode and a pluggable selection strategy to
+//! absorb that would make it less clear about what it does, not more. What the
+//! two paths **do** share is the thing that matters for adding a transport: the
+//! binding. Both go through `vta_sdk::tsp_binding` for TSP, and both would go
+//! through the next one the same way.
+//!
+//! # Transport: an intersection, not a downgrade
+//!
+//! The protocol used is the highest-preference one present in **both** parties'
+//! advertisements. [`Protocol::PREFERENCE_ORDER`] is the workspace order — TSP,
+//! then DIDComm, then REST — and [`OUTBOUND_SUPPORTED`] is this VTA's half.
+//! A peer with nothing in the intersection gets a **loud typed refusal naming
+//! both sets**, never a quiet fallback: downgrading past what a peer advertises
+//! is forbidden, and being honest that this agent cannot yet *initiate* on a
+//! protocol is a different statement. The error says which it is.
+//!
+//! "This VTA's half" is what it can use **for this document, now**: a
+//! transport compiled but not wired (no mediator session) is not in it, and
+//! neither is a messaging transport whose authenticated sender is not the
+//! document's `issuer` — TSP and DIDComm authenticate this VTA's own DID, so a
+//! document signed by a member's persona can travel only on the HTTPS binding,
+//! where its proof is the authentication. See `initiable_for`.
+//!
+//! # Fire-and-forget, and what correlation actually is
+//!
+//! A Trust Task is a document. Correlation is a document concern — SPEC §4.9's
+//! `threadId`, falling back to `id` — and none of the three transports has
+//! request/response semantics of its own. REST happens to hand the reply back on
+//! the same socket; that is REST's accident, not the framework's model.
+//!
+//! This is what TSP took longest to get. TSP's binding (`trust-tasks-tsp`)
+//! offers `pack` and `unpack` and nothing else, by design, so reaching it was
+//! **not** a matter of building a request/reply call over `send_routed`: it was
+//! teaching the inbound path that a document threading to one we sent is a reply
+//! rather than a request — which `messaging::tsp_inbound::dispatch_one` did not
+//! do, since it authorizes every frame and dispatches it as a request. Until
+//! that landed, naming TSP in `OUTBOUND_SUPPORTED` would have produced a request
+//! that is sent and never answered: worse than an honest refusal, because it
+//! times out instead of saying why. It is named there now, under `cfg(tsp)`,
+//! because the spine correlates the reply.
+
+use serde_json::Value;
+use vta_sdk::protocol::matching::{Protocol, ServiceCapabilities};
+use vti_common::error::{AppError, NoMatchingProtocol, bad_gateway_error};
+
+#[cfg(feature = "didcomm")]
+use crate::didcomm_bridge::DIDCommBridge;
+
+/// How long to wait for a reply over DIDComm, in seconds.
+#[cfg(feature = "didcomm")]
+const DIDCOMM_REPLY_TIMEOUT_SECS: u64 = 30;
+
+/// The DIDComm message `type` every Trust Task rides under.
+///
+/// Named once, here, for every caller. It used to be produced per client — and
+/// the one that did it took care to return it from a single function precisely
+/// because getting it wrong fails *silently*: a conformant host rejects a
+/// message typed with the task URI without telling you why. That care is now
+/// structural instead of local; a caller has no way to supply a message type,
+/// so there is nothing to get wrong.
+const DIDCOMM_MESSAGE_TYPE: &str = trust_tasks_didcomm::ENVELOPE_TYPE;
+
+/// The protocols this VTA can **initiate** a Trust-Task request on.
+///
+/// Order here is not the preference order — [`Protocol::PREFERENCE_ORDER`] is,
+/// and [`pick_transport`] walks that and consults this only for membership. A
+/// second ordering would be a second thing to keep in step.
+pub const OUTBOUND_SUPPORTED: &[Protocol] = &[
+    // Only where this build can actually initiate it. A VTA compiled without
+    // `didcomm` has no bridge to send on, and naming a protocol here that the
+    // build cannot reach would turn a compile-time absence into a runtime
+    // "named in OUTBOUND_SUPPORTED but has no send path" — a worse way to find
+    // out.
+    #[cfg(feature = "tsp")]
+    Protocol::Tsp,
+    #[cfg(feature = "didcomm")]
+    Protocol::Didcomm,
+    Protocol::Rest,
+];
+
+/// How long to wait for a reply over TSP, in seconds.
+///
+/// The same window DIDComm gets. TSP delivers through the same mediator socket,
+/// so the thing being waited on is the peer's processing time either way.
+///
+/// Re-exported from [`vta_sdk::budget`] rather than defined here. It used to be
+/// a private const, which made the window a fact only this end knew — and a
+/// client sized its own budget from a different literal in a different crate,
+/// until the two crossed and `create_did_webvh` could no longer see the errors
+/// this function produces. Whoever changes this number changes what callers
+/// must allow, so it belongs where both ends read it.
+#[cfg(feature = "tsp")]
+use vta_sdk::budget::TSP_REPLY_TIMEOUT_SECS;
+
+/// What makes a reply believable.
+///
+/// A reply is bytes off a socket. What licenses acting on it is a separate
+/// question from how it arrived, and the two callers of this module had
+/// different answers to it — which is the reason this is an argument rather
+/// than a policy baked in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyTrust {
+    /// Require a verifying proof whose signer **is the party we addressed**.
+    ///
+    /// The default for anything whose answer is acted on. Both halves matter and
+    /// the second is the one easy to omit: a proof by
+    /// `did:webvh:…:someone-else#key-1` verifies perfectly well, and that it is
+    /// not the party you asked is a separate check. Skipping it turns "signed by
+    /// somebody" into "signed by the host".
+    SignedByRecipient,
+
+    /// Believe the authenticated transport alone, and nothing further.
+    ///
+    /// Only defensible where the transport authenticates the peer end to end
+    /// **and** the reply confers nothing — a path reservation, an availability
+    /// probe. A caller choosing this is asserting both; the variant exists so
+    /// that assertion is written at the call site instead of being the silent
+    /// consequence of nobody having added a check.
+    TransportAuthenticated,
+}
+
+/// A TSP transport, plus the registry that turns it into a round trip.
+///
+/// Carriage is [`TspTransport`](crate::messaging::tsp_transport::TspTransport)'s
+/// job and lives there, shared with the inbound reply path and the device push.
+/// The only thing this adds is the half those two do not need: TSP has no
+/// request/response — `trust-tasks-tsp` is `pack` and `unpack`, deliberately,
+/// because correlation belongs to the document layer — so a round trip here is
+/// a send now and an inbound document later, and without somewhere to keep the
+/// waiter between them an agent can only receive.
+///
+/// That split is why the mediator is not a field: it belongs to the transport,
+/// which reads it off the profile that will seal to it. This struct used to
+/// carry its own copy out of `AppConfig`, which was a second source for one fact
+/// with nothing checking that the two agreed.
+#[cfg(feature = "tsp")]
+use affinidi_messaging_sdk::RecoveryAction;
+
+/// The outcome of one send-and-await-reply over TSP.
+#[cfg(feature = "tsp")]
+pub(crate) enum TspAttempt {
+    /// The peer answered; the reply document.
+    Reply(Value),
+    /// No answer within the window — the §7.2.2 silent-drop signature.
+    Timeout,
+    /// The reply waiter was cancelled (the registry was cleared) — not a timeout.
+    Cancelled,
+    /// The seal/route failed before the frame left; carries the reason.
+    SendFailed(String),
+}
+
+/// Whether a Trust Task is safe to blind-resend after re-forming a relationship.
+/// A §7.2.2 drop is indistinguishable from a lost reply, so only a task whose
+/// second execution does no harm is resent; the rest are healed and surfaced.
+/// Same gate as the client-side self-repair (vta-sdk #1544).
+#[cfg(feature = "tsp")]
+fn resend_after_reform(type_uri: &str) -> bool {
+    vta_sdk::retry_safety::retry_safety(type_uri).is_some_and(|c| c.is_blind_retry_safe())
+}
+
+/// How long a relationship may go without a successful round trip before the
+/// next send re-invites alongside its payload rather than trusting it.
+///
+/// # Why a send re-invites at all
+///
+/// A peer that lost its half (a data wipe, an operator reset, a build that did
+/// not persist relationships) drops our next frame silently — §7.2.2 forbids it
+/// from saying so (design note C2) — and we learn of it only when
+/// [`TSP_REPLY_TIMEOUT_SECS`] expires and D6 recovers. That costs every such
+/// first request a full reply window, which any caller with a budget near it
+/// reports as a failure while the task in fact succeeds. A peer loses state
+/// while quiet far more often than mid-conversation, so a relationship that has
+/// been idle this long is re-asserted up front: our half is reset and the
+/// payload goes out with a fresh invite, which a peer that kept its half simply
+/// re-accepts (D2). Nothing is signalled back, so C2 still holds.
+///
+/// An hour keeps the extra invite rare on a busy pair while covering the gap a
+/// restart or reset leaves.
+#[cfg(feature = "tsp")]
+const TSP_IDLE_REESTABLISH_MS: u64 = 60 * 60 * 1000;
+
+/// Peers an idle-relationship re-invite is currently in flight to — the
+/// single-flight for [`TspSender::send_after_idle_reestablish`]. Shared through
+/// `AppState`, because a [`TspSender`] is built per request.
+#[cfg(feature = "tsp")]
+#[derive(Clone, Default)]
+pub struct IdleReinvites(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+
+#[cfg(feature = "tsp")]
+impl IdleReinvites {
+    /// Claim `peer`, or `None` if another send already holds it. The claim is
+    /// released when the guard drops, on every path out of the send.
+    fn claim(&self, peer: &str) -> Option<IdleReinviteClaim> {
+        let mut peers = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        peers.insert(peer.to_string()).then(|| IdleReinviteClaim {
+            peers: self.clone(),
+            peer: peer.to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "tsp")]
+struct IdleReinviteClaim {
+    peers: IdleReinvites,
+    peer: String,
+}
+
+#[cfg(feature = "tsp")]
+impl Drop for IdleReinviteClaim {
+    fn drop(&mut self) {
+        self.peers
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.peer);
+    }
+}
+
+/// Wall-clock milliseconds for the recovery coordinator's clock.
+#[cfg(feature = "tsp")]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "tsp")]
+#[derive(Clone)]
+pub struct TspSender {
+    transport: crate::messaging::tsp_transport::TspTransport,
+    replies: crate::trust_tasks::pending_replies::PendingReplies,
+    /// Shared D6 single-flight/backoff recovery, owned by `AppState`. Cloned in
+    /// (an `Arc`) rather than rebuilt per sender so concurrent sends to one peer
+    /// coalesce onto a single re-invite.
+    recovery: std::sync::Arc<affinidi_messaging_sdk::RecoveryCoordinator>,
+    /// The durable relationship store, for last-active stamps (D5): written on
+    /// every reply, read to decide whether a send should re-invite first.
+    relationships: std::sync::Arc<crate::messaging::tsp_relationship_store::VtaRelationshipStore>,
+    /// Single-flight for idle re-invites, shared through `AppState`.
+    idle_reinvites: IdleReinvites,
+    /// How long to wait for a reply before treating a send as a §7.2.2 drop.
+    /// A field rather than the bare [`TSP_REPLY_TIMEOUT_SECS`] const only so a
+    /// test can shorten it — production always gets the const default.
+    reply_timeout: std::time::Duration,
+}
+
+#[cfg(feature = "tsp")]
+impl TspSender {
+    /// `None` when this node cannot initiate TSP — no live mediator session, so
+    /// no profile that can seal. Absence here removes TSP from selection rather
+    /// than failing at send time, which is the difference between a peer being
+    /// reached over its next-preferred transport and a request that errors.
+    pub(crate) fn from_app_state(state: &crate::server::AppState) -> Option<Self> {
+        Some(Self {
+            transport: state.tsp_transport()?,
+            replies: state.pending_replies.clone(),
+            recovery: state.tsp_recovery.clone(),
+            relationships: state.tsp_relationships.clone(),
+            idle_reinvites: state.tsp_idle_reinvites.clone(),
+            reply_timeout: std::time::Duration::from_secs(TSP_REPLY_TIMEOUT_SECS),
+        })
+    }
+
+    /// [`from_app_state`](Self::from_app_state) for the transport harness.
+    ///
+    /// The `harness_*` twins and the hooks below exist only under the test-only
+    /// `transport-harness` feature: their only callers are the D6 tests in
+    /// `vta-test-support`'s transport harness, which sits outside this crate
+    /// (#2570). Production code reaches the `pub(crate)` originals.
+    #[cfg(feature = "transport-harness")]
+    #[doc(hidden)]
+    pub fn harness_from_app_state(state: &crate::server::AppState) -> Option<Self> {
+        Self::from_app_state(state)
+    }
+
+    /// [`first_attempt`](Self::first_attempt) for the transport harness:
+    /// whether the peer answered. Test-only, under `transport-harness`.
+    #[cfg(feature = "transport-harness")]
+    #[doc(hidden)]
+    pub async fn harness_first_attempt_replied(
+        &self,
+        recipient: &str,
+        peer_mediator: Option<&str>,
+        thread: &str,
+        framed: &[u8],
+    ) -> bool {
+        matches!(
+            self.first_attempt(recipient, peer_mediator, thread, framed)
+                .await,
+            TspAttempt::Reply(_)
+        )
+    }
+
+    /// [`idle_reestablish_due`](Self::idle_reestablish_due) for the transport
+    /// harness. Test-only, under `transport-harness`.
+    #[cfg(feature = "transport-harness")]
+    #[doc(hidden)]
+    pub async fn harness_idle_reestablish_due(&self, recipient: &str) -> bool {
+        self.idle_reestablish_due(recipient).await
+    }
+
+    /// Shorten the reply timeout, so a recovery test does not wait the full 30s
+    /// per dropped attempt.
+    #[cfg(feature = "transport-harness")]
+    #[doc(hidden)]
+    pub fn with_reply_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.reply_timeout = timeout;
+        self
+    }
+
+    /// The shared recovery coordinator, for asserting attempt/give-up counts in
+    /// a test.
+    #[cfg(feature = "transport-harness")]
+    #[doc(hidden)]
+    pub fn recovery(&self) -> &affinidi_messaging_sdk::RecoveryCoordinator {
+        &self.recovery
+    }
+
+    /// Drive the D6 recovery for a `recipient` whose send just timed out —
+    /// exposed for the recovery test; production reaches it through
+    /// [`send_tsp`](Outbound::send_tsp).
+    #[cfg(feature = "transport-harness")]
+    #[doc(hidden)]
+    pub async fn recover_for_test(
+        &self,
+        recipient: &str,
+        thread: &str,
+        framed: &[u8],
+        type_uri: &str,
+    ) -> Result<Value, AppError> {
+        self.recover_send_tsp(recipient, None, thread, framed, type_uri)
+            .await
+    }
+
+    /// Register a reply waiter for `thread`, send `framed` to `recipient`, and
+    /// await the reply within the TSP window. One attempt, no recovery.
+    ///
+    /// `reestablish` picks the re-inviting send (`send_reestablishing`) over the
+    /// plain routed send — the recovery path uses it after a reset. `peer_mediator`
+    /// is the recipient's advertised TSP mediator DID: when the peer is on a
+    /// different mediator the send nests, and a re-establishing send routes its
+    /// invite through that mediator (VTI-56). `None` keeps the direct route.
+    async fn send_and_await(
+        &self,
+        recipient: &str,
+        peer_mediator: Option<&str>,
+        thread: &str,
+        framed: &[u8],
+        reestablish: bool,
+    ) -> TspAttempt {
+        // Registered before the frame leaves: a reply that arrived between
+        // sending and registering would find nothing waiting.
+        let waiting = self.replies.register(thread, recipient);
+        let sent = if reestablish {
+            self.transport
+                .send_reestablishing(recipient, peer_mediator, framed)
+                .await
+        } else {
+            self.transport
+                .send_metadata_private(recipient, peer_mediator, framed)
+                .await
+        };
+        if let Err(e) = sent {
+            self.replies.abandon(thread);
+            return TspAttempt::SendFailed(e.to_string());
+        }
+        match tokio::time::timeout(self.reply_timeout, waiting).await {
+            // The reply as received, never re-serialised: `verify_reply` checks
+            // its proof over exactly these members (VTI-45).
+            Ok(Ok(reply)) => {
+                self.mark_active(recipient).await;
+                TspAttempt::Reply(reply)
+            }
+            Ok(Err(_)) => {
+                self.replies.abandon(thread);
+                TspAttempt::Cancelled
+            }
+            Err(_elapsed) => {
+                self.replies.abandon(thread);
+                TspAttempt::Timeout
+            }
+        }
+    }
+
+    /// Stamp the relationship with `recipient` as active now (D5). Called only
+    /// on a correlated reply — a broken relationship must age out, not refresh
+    /// itself on every failed attempt. A failed write costs only an extra
+    /// re-invite on the next send, so it is logged, not surfaced.
+    async fn mark_active(&self, recipient: &str) {
+        let Some(our) = self.transport.our_vid() else {
+            return;
+        };
+        if let Err(e) = self.relationships.touch(&our, recipient, now_ms()).await {
+            tracing::debug!(peer = recipient, error = %e, "could not stamp TSP relationship activity");
+        }
+    }
+
+    /// Whether the next send to `recipient` should re-invite first: our half is
+    /// established, but no round trip has succeeded within
+    /// [`TSP_IDLE_REESTABLISH_MS`] — or none was ever recorded, which covers every
+    /// relationship formed before this stamp existed. A relationship that is not
+    /// established needs nothing here: the ordinary send already invites.
+    pub(crate) async fn idle_reestablish_due(&self, recipient: &str) -> bool {
+        use affinidi_messaging_sdk::protocols::tsp::RelationshipStore as _;
+        let Some(our) = self.transport.our_vid() else {
+            return false;
+        };
+        match self.relationships.get(&our, recipient).await {
+            Ok(affinidi_messaging_sdk::protocols::tsp::RelationshipState::Bidirectional) => {}
+            _ => return false,
+        }
+        match self.relationships.last_active(&our, recipient).await {
+            Ok(Some(at_ms)) => now_ms().saturating_sub(at_ms) > TSP_IDLE_REESTABLISH_MS,
+            Ok(None) => true,
+            // Unreadable: do what we would have done without the stamp.
+            Err(_) => false,
+        }
+    }
+
+    /// The first attempt at a send: re-inviting alongside it when the
+    /// relationship has been idle past [`TSP_IDLE_REESTABLISH_MS`], the ordinary
+    /// routed send otherwise. A `Timeout` from either goes on to D6.
+    pub(crate) async fn first_attempt(
+        &self,
+        recipient: &str,
+        peer_mediator: Option<&str>,
+        thread: &str,
+        framed: &[u8],
+    ) -> TspAttempt {
+        if self.idle_reestablish_due(recipient).await {
+            self.send_after_idle_reestablish(recipient, peer_mediator, thread, framed)
+                .await
+        } else if self.no_relationship(recipient).await {
+            // First contact (or our half was lost): the peer drops an
+            // application frame from a VID it holds no relationship with
+            // (§7.2.2), so a plain send would only wait out the reply timeout
+            // before D6 re-invites. Invite alongside the first send instead.
+            self.send_and_await(recipient, peer_mediator, thread, framed, true)
+                .await
+        } else {
+            self.send_and_await(recipient, peer_mediator, thread, framed, false)
+                .await
+        }
+    }
+
+    /// Send to a peer idle past [`TSP_IDLE_REESTABLISH_MS`]: reset our half and
+    /// send `framed` with a fresh invite. One send per peer does this at a time;
+    /// a concurrent one, or one whose reset fails, goes out the ordinary way —
+    /// and if the peer did lose its half, D6 recovers that one as before.
+    ///
+    /// This is the first send of `framed`, not a resend, so retry safety does not
+    /// apply. It is not a D6 recovery either, and does not touch that
+    /// coordinator or its metrics.
+    async fn send_after_idle_reestablish(
+        &self,
+        recipient: &str,
+        peer_mediator: Option<&str>,
+        thread: &str,
+        framed: &[u8],
+    ) -> TspAttempt {
+        let Some(_claim) = self.idle_reinvites.claim(recipient) else {
+            return self
+                .send_and_await(recipient, peer_mediator, thread, framed, false)
+                .await;
+        };
+        if let Err(e) = self.transport.reset_relationship(recipient).await {
+            tracing::debug!(peer = recipient, error = %e, "could not reset an idle TSP relationship");
+            return self
+                .send_and_await(recipient, peer_mediator, thread, framed, false)
+                .await;
+        }
+        tracing::info!(
+            peer = recipient,
+            "re-inviting an idle TSP relationship alongside the request"
+        );
+        self.send_and_await(recipient, peer_mediator, thread, framed, true)
+            .await
+    }
+
+    /// Whether we hold no relationship with `recipient` at all, so a send would
+    /// have to (re)establish one. Unreadable counts as "has one": the ordinary
+    /// send and D6 behind it are what ran before this check existed.
+    async fn no_relationship(&self, recipient: &str) -> bool {
+        matches!(
+            self.transport
+                .atm()
+                .tsp()
+                .send_readiness(self.transport.profile(), recipient)
+                .await,
+            Ok(affinidi_messaging_sdk::protocols::tsp::SendReadiness::Reestablish)
+        )
+    }
+
+    /// D6 self-repair on a reply-timeout (design note `tsp-relationship-recovery.md`).
+    ///
+    /// A §7.2.2 drop is silent, so a reply-timeout may mean the peer lost its
+    /// half of the relationship. Ask the shared [`RecoveryCoordinator`] whether
+    /// to act: `Start` gives this call the single-flight token (a concurrent send
+    /// to the same peer gets `InFlight` and coalesces, so one lost peer is not
+    /// invite-flooded); `Backoff`/`GiveUp` cap a genuinely-down peer. On `Start`
+    /// we reset our stale half (safe against a false positive via D2 reconcile),
+    /// then for a retry-safe task re-invite-and-resend once — recovering in this
+    /// call — while a task that could double-execute is only healed, its resend
+    /// left to the caller.
+    async fn recover_send_tsp(
+        &self,
+        recipient: &str,
+        peer_mediator: Option<&str>,
+        thread: &str,
+        framed: &[u8],
+        type_uri: &str,
+    ) -> Result<Value, AppError> {
+        let timed_out = || {
+            bad_gateway_error(format!(
+                "`{recipient}` did not answer over TSP within {TSP_REPLY_TIMEOUT_SECS}s"
+            ))
+        };
+        let Some(our) = self.transport.our_vid() else {
+            return Err(timed_out());
+        };
+        let now = now_ms();
+
+        // One jittered base-backoff hold-off per failed attempt; the coordinator
+        // still caps the peer at `max_attempts` (GiveUp). Growing the delay with
+        // the attempt count needs an accessor the coordinator does not expose, so
+        // this first increment uses the base delay — single-flight and the cap
+        // are the herd-control properties that matter here.
+        let backoff = || {
+            self.recovery
+                .retry_delay(0, 1.0)
+                .unwrap_or(std::time::Duration::from_secs(1))
+        };
+
+        match self.recovery.begin(&our, recipient, now).await {
+            RecoveryAction::Start => {
+                if let Err(e) = self.transport.reset_relationship(recipient).await {
+                    self.recovery
+                        .settle_failure(&our, recipient, now, backoff())
+                        .await;
+                    return Err(bad_gateway_error(format!(
+                        "could not re-establish the TSP relationship with `{recipient}`: {e}"
+                    )));
+                }
+                if resend_after_reform(type_uri) {
+                    // A cross-mediator peer gets its invite routed through its
+                    // own mediator and the resend nested: a direct send to it
+                    // is refused by ours (VTI-56).
+                    match self
+                        .send_and_await(recipient, peer_mediator, thread, framed, true)
+                        .await
+                    {
+                        TspAttempt::Reply(v) => {
+                            self.recovery.settle_success(&our, recipient).await;
+                            Ok(v)
+                        }
+                        // Why the resend failed, not just that it did. The
+                        // steady-state `send_tsp` above already tells these three
+                        // apart; collapsing them here said "the peer did not
+                        // answer" for a frame that never left this VTA, which
+                        // sends whoever reads it to look at the wrong endpoint.
+                        other => {
+                            self.recovery
+                                .settle_failure(&our, recipient, now, backoff())
+                                .await;
+                            Err(bad_gateway_error(match other {
+                                TspAttempt::SendFailed(reason) => format!(
+                                    "could not resend to `{recipient}` over TSP after \
+                                     re-establishing the relationship: {reason}"
+                                ),
+                                TspAttempt::Cancelled => format!(
+                                    "the wait for `{recipient}`'s reply was cancelled after \
+                                     re-establishing the relationship"
+                                ),
+                                // `Timeout`, and `Reply` cannot reach here.
+                                _ => format!(
+                                    "`{recipient}` did not answer over TSP after re-establishing \
+                                     the relationship"
+                                ),
+                            }))
+                        }
+                    }
+                } else {
+                    // Not safe to blind-resend — a duplicate could double-execute.
+                    // Re-invite so the caller's retry lands, then report.
+                    if let Err(e) = self.transport.relate(recipient).await {
+                        self.recovery
+                            .settle_failure(&our, recipient, now, backoff())
+                            .await;
+                        return Err(bad_gateway_error(format!(
+                            "could not re-establish the TSP relationship with `{recipient}`: {e}"
+                        )));
+                    }
+                    self.recovery.settle_success(&our, recipient).await;
+                    Err(bad_gateway_error(format!(
+                        "`{recipient}` did not answer over TSP; the relationship was re-established \
+                         — retry the operation"
+                    )))
+                }
+            }
+            RecoveryAction::InFlight => Err(bad_gateway_error(format!(
+                "re-establishing the TSP relationship with `{recipient}` is already in flight — retry"
+            ))),
+            RecoveryAction::Backoff(_) => Err(bad_gateway_error(format!(
+                "backing off before re-establishing the TSP relationship with `{recipient}` — retry \
+                 later"
+            ))),
+            RecoveryAction::GiveUp => Err(bad_gateway_error(format!(
+                "gave up re-establishing the TSP relationship with `{recipient}` after repeated \
+                 failures"
+            ))),
+        }
+    }
+}
+
+/// The transports this VTA can reach a peer on, and the things needed to use
+/// them.
+///
+/// A struct rather than loose arguments because the set travels together: drop
+/// the resolver and there is nothing to read a peer's advertisement from; drop
+/// the bridge and DIDComm silently stops being selectable.
+pub struct Outbound<'a> {
+    // Private, and the constructors below are the only way in. A struct literal
+    // is how a caller silently opts out of a transport: `webvh_didcomm` built
+    // one, so adding TSP here broke it at compile time — which was lucky. The
+    // next field added would have broken it the same way, or worse, been given
+    // a plausible default that quietly removed a transport from selection.
+    resolver: &'a affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    /// What a TSP send needs: the socket, the profile that seals, the mediator
+    /// to route through, and somewhere to leave the waiter. Absent in a build
+    /// without `tsp`, along with its arm and its entry in
+    /// [`OUTBOUND_SUPPORTED`].
+    #[cfg(feature = "tsp")]
+    tsp: Option<TspSender>,
+    /// Absent in a build without `didcomm`, along with the arm that uses it and
+    /// the entry in [`OUTBOUND_SUPPORTED`] that would select it.
+    #[cfg(feature = "didcomm")]
+    bridge: &'a DIDCommBridge,
+    /// The Trust-Task HTTPS base to use when the peer advertises none, set by a
+    /// caller that knows the peer's product serves the binding at a fixed path
+    /// (see [`Outbound::with_https_base`]). It only ever fills an empty slot:
+    /// an advertised `TrustTaskHTTPS` endpoint wins, and TSP and DIDComm still
+    /// come first.
+    https_base: Option<String>,
+    /// Which peer endpoints a REST send may dial ([`send_rest_to`]).
+    endpoint_policy: vta_sdk::http::EndpointPolicy,
+}
+
+impl<'a> Outbound<'a> {
+    /// Reach the peer over the Trust-Task HTTPS binding at `base` (the request
+    /// URL is `base + "/trust-tasks"`) when its DID document advertises no
+    /// Trust-Task HTTPS endpoint of its own.
+    ///
+    /// For a peer whose product documents where it serves the binding but whose
+    /// DID document does not say so — the DID hosting service serves
+    /// `POST /api/trust-tasks` at the origin its `WebVHHosting` service names.
+    /// It does not change the preference order: a peer that advertises TSP or
+    /// DIDComm is still reached over it. A caller setting this should also ask
+    /// for [`ReplyTrust::SignedByRecipient`], because TLS authenticates the
+    /// host, not the DID that composed the reply.
+    #[must_use]
+    pub fn with_https_base(mut self, base: Option<String>) -> Self {
+        self.https_base = base;
+        self
+    }
+
+    /// A seam assembled from borrowed parts rather than from an `AppState`.
+    ///
+    /// For a caller whose own dependencies were threaded to it — today that is
+    /// the webvh layer, whose `WebvhHostClient` carries a [`TspSender`] down
+    /// from its `WebvhDeps`. Passing `tsp: None` is a real answer, not a shortcut.
+    /// What it leaves depends on the bridge beside it: a DIDComm handler holds
+    /// the live bridge and the seam falls to DIDComm there; an offline CLI or a
+    /// setup wizard holds a signing-only bridge, no mediator session at all, so
+    /// there the seam is left with REST, and a host that advertises no HTTPS
+    /// endpoint is out of its reach (`webvh_cli` tells the operator so).
+    ///
+    /// This replaced a `didcomm_or_rest` constructor that hardcoded `None` and
+    /// so silently removed TSP from selection for every webvh call. The name is
+    /// the difference: a caller now has to pass *something* for TSP, and
+    /// passing `None` is visible at the call site.
+    pub fn from_parts(
+        resolver: &'a affinidi_did_resolver_cache_sdk::DIDCacheClient,
+        #[cfg(feature = "didcomm")] bridge: &'a DIDCommBridge,
+        #[cfg(feature = "tsp")] tsp: Option<TspSender>,
+    ) -> Self {
+        Self {
+            resolver,
+            #[cfg(feature = "tsp")]
+            tsp,
+            #[cfg(feature = "didcomm")]
+            bridge,
+            https_base: None,
+            endpoint_policy: vta_sdk::http::EndpointPolicy::process_default(),
+        }
+    }
+
+    /// Borrow what this needs from an [`AppState`](crate::server::AppState).
+    ///
+    /// A constructor rather than five struct literals because the bridge is
+    /// feature-gated: without this, every call site would carry the same `cfg`
+    /// and the next one added would omit it and break a build nobody runs
+    /// locally. Same reason `WebvhDeps::from_app_state` exists.
+    ///
+    /// `resolver` is threaded separately because `AppState` holds it as an
+    /// `Option` — the caller unwraps it, surfacing the typed "DID resolver not
+    /// available" reject, before there is anything to send.
+    pub fn from_app_state(
+        state: &'a crate::server::AppState,
+        resolver: &'a affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    ) -> Self {
+        Self {
+            resolver,
+            #[cfg(feature = "tsp")]
+            tsp: TspSender::from_app_state(state),
+            #[cfg(feature = "didcomm")]
+            bridge: state.didcomm_bridge.as_ref(),
+            https_base: None,
+            endpoint_policy: state.endpoint_policy,
+        }
+    }
+}
+
+/// The largest reply [`send_rest_to`] reads from a peer. A reply carries at
+/// most a batch of room records (512 KiB of entries plus one record, itself
+/// at most about 1.4 MiB of base64url) and its envelope; 4 MiB holds that with
+/// room to spare and stops a peer from streaming an unbounded body into
+/// memory.
+pub(crate) const MAX_REST_REPLY_BYTES: usize = 4 * 1024 * 1024;
+
+/// The total time a REST round trip may take. The peer runs the task before
+/// it answers, so this is the general REST budget rather than the shorter
+/// foreign-fetch one; the connect timeout stays the foreign-fetch one.
+const REST_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How much of a peer's unparseable reply goes to the debug log.
+const REPLY_LOG_EXCERPT_CHARS: usize = 256;
+
+/// POST `document` to `{endpoint}/trust-tasks` and parse the reply.
+///
+/// `endpoint` comes from the recipient's DID document, which whoever controls
+/// that DID writes, so it is vetted as a foreign target
+/// ([`vta_sdk::http::guard_peer_endpoint`]) and dialled through the guarded
+/// foreign-fetch client under the same `policy`: no proxy, no redirects, and a
+/// resolver that refuses a name answering with an address the policy does not
+/// admit. Loopback and private-network peers need the process opt-in
+/// ([`vta_sdk::http::ALLOW_PRIVATE_ENDPOINTS_ENV`]). The reply is read under
+/// [`MAX_REST_REPLY_BYTES`], and a reply that is not JSON is reported by
+/// class only — its text goes to the debug log, never into the error.
+pub(crate) async fn send_rest_to(
+    recipient: &str,
+    endpoint: &str,
+    document: &Value,
+    policy: vta_sdk::http::EndpointPolicy,
+) -> Result<Value, AppError> {
+    let url = format!("{}/trust-tasks", endpoint.trim_end_matches('/'));
+    vta_sdk::http::guard_peer_endpoint(&url, policy).map_err(|e| {
+        bad_gateway_error(format!(
+            "`{recipient}` advertises a REST endpoint this VTA will not dial: {e}"
+        ))
+    })?;
+    let response = vta_sdk::http::foreign_fetch_client_for(policy)
+        .post(&url)
+        .timeout(REST_SEND_TIMEOUT)
+        .header("content-type", "application/json")
+        .json(document)
+        .send()
+        .await
+        .map_err(|e| bad_gateway_error(format!("`{recipient}` at {url} did not answer: {e}")))?;
+
+    // The body is read once, and before the status is judged: a refusal
+    // arrives as a `trust-task-error` document with a code an operator can
+    // act on, and throwing on the status first would discard it (guide rule
+    // R3.7).
+    let status = response.status();
+    let body = vta_sdk::http::read_body_capped(response, MAX_REST_REPLY_BYTES)
+        .await
+        .map_err(|e| bad_gateway_error(format!("`{recipient}` sent an unreadable body: {e}")))?;
+    serde_json::from_slice(&body).map_err(|e| {
+        let text = String::from_utf8_lossy(&body);
+        tracing::debug!(
+            recipient,
+            %status,
+            excerpt = %text.chars().take(REPLY_LOG_EXCERPT_CHARS).collect::<String>(),
+            error = %e,
+            "peer REST reply is not JSON"
+        );
+        bad_gateway_error(format!(
+            "`{recipient}` sent a body that is not a Trust-Task document (HTTP {status}, \
+             {} bytes, {:?} error at line {} column {})",
+            body.len(),
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })
+}
+
+/// The highest-preference protocol both this VTA and `peer` can do, with the
+/// endpoint to reach it on.
+///
+/// `initiable` is the set this agent can start a conversation on **right now**,
+/// which is narrower than the build's [`OUTBOUND_SUPPORTED`] whenever a
+/// transport the build compiled is not actually wired on the sender — see
+/// [`Outbound::initiable_protocols`]. Reading it here rather than the const is
+/// the fix for #1483's regression: a build with the `tsp` feature named TSP in
+/// `OUTBOUND_SUPPORTED`, so a TSP-advertising peer was *selected* over TSP even
+/// when this sender held no `TspSender`, and the send then failed with an
+/// internal error instead of falling to the next shared transport.
+///
+/// A REST candidate is skipped — logged, not selected — when its endpoint is
+/// not `https://` (or `http://` to an exact loopback host —
+/// [`vta_sdk::protocol::matching::is_https_or_loopback`]): `send_rest` puts a
+/// signed document on the wire with no encryption of its own, so a peer
+/// advertising plain `http://` would otherwise have it delivered in the clear.
+/// TSP and DIDComm are unaffected — their advertised value is a mediator DID,
+/// not a URL this function dials. With REST the only shared protocol and its
+/// endpoint refused this way, selection falls through to the closed error
+/// below exactly as if the peer had advertised no REST at all.
+pub fn pick_transport(
+    caps: &ServiceCapabilities,
+    initiable: &[Protocol],
+    peer: &str,
+) -> Result<(Protocol, String), AppError> {
+    let mut rest_refused_plaintext = false;
+    for protocol in Protocol::PREFERENCE_ORDER {
+        if !initiable.contains(&protocol) {
+            continue;
+        }
+        let Some(endpoint) = caps.endpoint(protocol) else {
+            continue;
+        };
+        if protocol == Protocol::Rest
+            && !vta_sdk::protocol::matching::is_https_or_loopback(endpoint)
+        {
+            tracing::warn!(
+                peer,
+                endpoint,
+                "ignoring a peer's plaintext http:// REST endpoint; only a loopback host may use \
+                 http://"
+            );
+            rest_refused_plaintext = true;
+            continue;
+        }
+        return Ok((protocol, endpoint.to_string()));
+    }
+
+    // Typed, never `Validation`: that is `malformedRequest` on the wire, which
+    // tells the producer its document was wrong when nothing in it was
+    // (CLAUDE.md, "Prefer TSP, then DIDComm, then REST": an empty intersection
+    // is the typed "no matching protocol").
+    Err(NoMatchingProtocol {
+        peer: peer.to_string(),
+        ours: initiable.to_vec(),
+        theirs: Protocol::PREFERENCE_ORDER
+            .into_iter()
+            .filter(|p| caps.endpoint(*p).is_some())
+            .collect(),
+        note: rest_refused_plaintext.then(|| {
+            "Its REST endpoint is plaintext http:// to a non-loopback host, so it was not usable"
+                .to_string()
+        }),
+    }
+    .into())
+}
+
+/// Who this agent is authenticated as on each messaging transport that is
+/// **wired** on this instance right now — `None` for one that is not.
+///
+/// The DID matters as much as the wiring. TSP and DIDComm both authenticate
+/// the sender in the transport (the TSP `VID_sndr`; the authcrypt
+/// `sender_kid`), and both bindings make a document's in-band `issuer` a
+/// cross-check against that sender: a mismatch is `identityMismatch`
+/// (framework SPEC §4.8.1 and §7.2 item 6; `bindings/tsp/0.1` §3,
+/// `bindings/didcomm/0.2` §3). So a messaging transport can carry a document
+/// only when the party it authenticates this agent as **is** the document's
+/// issuer.
+#[derive(Debug, Clone, Copy, Default)]
+struct WiredSenders<'s> {
+    /// This agent's TSP VID, when a live [`TspSender`] is present.
+    tsp: Option<&'s str>,
+    /// This agent's DIDComm sender DID, when the bridge holds a live mediator
+    /// session (`[messaging] kind = "skip"` never publishes one).
+    didcomm: Option<&'s str>,
+}
+
+/// The pure core of [`Outbound::initiable_protocols`]: the protocols in
+/// [`OUTBOUND_SUPPORTED`] this agent can start **for a document issued by
+/// `issuer`**.
+///
+/// - **REST** is always in the set. The Trust-Task HTTPS binding takes its
+///   transport-authenticated sender from an `Authorization` bearer, and
+///   `send_rest` sends none — so there is no transport identity to contradict
+///   the document's, and its `proof` (required on every binding, VTI-OPS-020 /
+///   VTI-OPS-021) is the whole of the authentication. That is why it is the one
+///   binding that can carry a document this agent signs *as another DID* — a
+///   member's persona, in a data room.
+/// - **TSP** and **DIDComm** only when wired ([`WiredSenders`]) **and** their
+///   authenticated sender is `issuer`. A document with no in-band `issuer` takes
+///   its issuer from the transport, so any wired messaging transport carries it.
+///
+/// A transport this agent cannot use for this document is not in its set, so
+/// [`pick_transport`] chooses the best one **both** sides can actually use, and
+/// an empty intersection is the typed refusal rather than an error at send
+/// time ("DIDComm messaging not initialized") or an `identityMismatch` from the
+/// peer.
+///
+/// Factored out so the gate can be tested without standing up an `Outbound`
+/// (which needs a resolver and a bridge).
+fn initiable_for(wired: WiredSenders<'_>, issuer: Option<&str>) -> Vec<Protocol> {
+    // Exact equality: the TSP binding compares VIDs as exact strings, and the
+    // DIDComm binding normalises the sender to its bare DID — which is what
+    // `wired.didcomm` already is. An `issuer` that is not the bare DID can only
+    // make this stricter, never let a mismatch through.
+    let carries = |sender: Option<&str>| sender.is_some_and(|s| issuer.is_none_or(|i| i == s));
+    OUTBOUND_SUPPORTED
+        .iter()
+        .copied()
+        .filter(|p| match p {
+            Protocol::Rest => true,
+            Protocol::Tsp => carries(wired.tsp),
+            Protocol::Didcomm => carries(wired.didcomm),
+        })
+        .collect()
+}
+
+impl Outbound<'_> {
+    /// The DIDs this `Outbound` is authenticated as on each wired messaging
+    /// transport — see [`WiredSenders`]. Owned, because both are read off live
+    /// wiring that a reconnect can replace.
+    fn wired_senders(&self) -> (Option<String>, Option<String>) {
+        #[cfg(feature = "tsp")]
+        let tsp = self.tsp.as_ref().and_then(|t| t.transport.our_vid());
+        #[cfg(not(feature = "tsp"))]
+        let tsp = None;
+        #[cfg(feature = "didcomm")]
+        let didcomm = self.bridge.vta_did();
+        #[cfg(not(feature = "didcomm"))]
+        let didcomm = None;
+        (tsp, didcomm)
+    }
+
+    /// The protocols this `Outbound` can **initiate** right now, for a document
+    /// issued by `issuer` — see [`initiable_for`].
+    ///
+    /// Narrower than [`OUTBOUND_SUPPORTED`] when a compiled transport is not
+    /// wired on this instance, or is wired under a DID other than the
+    /// document's issuer.
+    ///
+    /// - **TSP not wired**: `WebvhDeps::from_vta_state` (the DIDComm handler's
+    ///   state) holds no TSP socket and constructs the seam with `tsp: None`,
+    ///   yet a `tsp`-feature build names TSP in `OUTBOUND_SUPPORTED` (#1483).
+    /// - **DIDComm not wired**: a REST-only VTA (`[messaging] kind = "skip"`)
+    ///   compiles DIDComm but never publishes a mediator session, so a peer
+    ///   advertising DIDComm and REST was selected over DIDComm and the send
+    ///   failed with "DIDComm messaging not initialized".
+    /// - **Wired as someone else**: a data-room document is signed by the
+    ///   member's persona, while TSP and DIDComm authenticate this VTA's own
+    ///   DID — the peer refuses that as `identityMismatch`, as both bindings
+    ///   require it to.
+    pub(crate) fn initiable_protocols(&self, issuer: Option<&str>) -> Vec<Protocol> {
+        let (tsp, didcomm) = self.wired_senders();
+        initiable_for(
+            WiredSenders {
+                tsp: tsp.as_deref(),
+                didcomm: didcomm.as_deref(),
+            },
+            issuer,
+        )
+    }
+
+    /// Send an already-signed Trust-Task `document` to `recipient` and return
+    /// the reply document, verified per `trust`.
+    ///
+    /// The reply is returned rather than interpreted: what a given `#response`
+    /// or refusal *means* is the caller's family to read, and a shared reader
+    /// would have to know every family to do it.
+    pub async fn send(
+        &self,
+        recipient: &str,
+        document: Value,
+        trust: ReplyTrust,
+    ) -> Result<Value, AppError> {
+        // Boxed, and this is load bearing rather than tidiness.
+        //
+        // This future is large: a DID resolution, a transport round trip and a
+        // proof verification, each with its own awaited sub-futures. In a debug
+        // build the compiler inlines all of that into the *caller's* frame, so
+        // every caller pays the whole thing in stack whether or not it is deep
+        // already.
+        //
+        // `webvh_host` is deep already — it sits under `create_did_webvh`,
+        // which is itself several awaits down — and calling this inline
+        // overflowed the 2MB stack a `#[tokio::test]` worker gets. It surfaced
+        // as `mock_vta` aborting with SIGABRT during a full-workspace run, on a
+        // *different* test each time and never when that binary ran alone,
+        // which reads exactly like resource-pressure flakiness and was not:
+        // the same suite on the parent commit passes with zero overflows.
+        //
+        // Boxing here rather than at each call site because the size is this
+        // function's, not its callers'. A caller cannot know it has become too
+        // large to inline, and the next one added would rediscover this the
+        // same expensive way.
+        Box::pin(self.send_inner(recipient, document, trust)).await
+    }
+
+    async fn send_inner(
+        &self,
+        recipient: &str,
+        document: Value,
+        trust: ReplyTrust,
+    ) -> Result<Value, AppError> {
+        let resolved = self.resolver.resolve(recipient).await.map_err(|e| {
+            AppError::Validation(format!(
+                "`{recipient}` does not resolve, so there is nothing to send to: {e}"
+            ))
+        })?;
+        let doc_value = serde_json::to_value(&resolved.doc)
+            .map_err(|e| AppError::Internal(format!("serialise the peer's DID document: {e}")))?;
+        let mut caps = ServiceCapabilities::from_did_document(&doc_value);
+        if caps.rest.is_none() {
+            caps.rest.clone_from(&self.https_base);
+        }
+        // The document's own issuer decides which messaging transport can carry
+        // it — see `initiable_for`. Read from the document as it will be sent.
+        let issuer = document.get("issuer").and_then(Value::as_str);
+        let initiable = self.initiable_protocols(issuer);
+        let (protocol, endpoint) =
+            pick_transport(&caps, &initiable, recipient).map_err(|e| match (e, issuer) {
+                // Say why a messaging transport this agent has wired was left
+                // out, or an operator reads "can initiate [rest]" on a VTA with
+                // a live mediator session and goes looking for a fault in it.
+                (AppError::NoMatchingProtocol(mut refusal), Some(issuer))
+                    if initiable.len() < self.initiable_protocols(None).len() =>
+                {
+                    let why = format!(
+                        "The document is issued by `{issuer}`, and TSP and DIDComm authenticate \
+                         this agent as its own DID, so the peer would refuse it as \
+                         `identityMismatch`; only a Trust-Task HTTPS endpoint, where the \
+                         document's proof is the authentication, can carry it"
+                    );
+                    refusal.note = Some(match refusal.note.take() {
+                        Some(n) => format!("{n}. {why}"),
+                        None => why,
+                    });
+                    AppError::NoMatchingProtocol(refusal)
+                }
+                (e, _) => e,
+            })?;
+
+        let reply = match protocol {
+            Protocol::Rest => self.send_rest(recipient, &endpoint, &document).await?,
+            // `endpoint` for TSP is the peer's advertised mediator DID (its
+            // `#tsp` service endpoint) — the second hop for a metadata-private
+            // nested route when it differs from ours.
+            #[cfg(feature = "tsp")]
+            Protocol::Tsp => self.send_tsp(recipient, &endpoint, document).await?,
+            #[cfg(not(feature = "tsp"))]
+            Protocol::Tsp => {
+                return Err(AppError::Internal(
+                    "TSP was selected in a build without the `tsp` feature".into(),
+                ));
+            }
+            #[cfg(feature = "didcomm")]
+            Protocol::Didcomm => self.send_didcomm(recipient, document).await?,
+            // Not selectable in this build — it is not in `OUTBOUND_SUPPORTED`
+            // — but the arm must exist for the match to be exhaustive.
+            #[cfg(not(feature = "didcomm"))]
+            Protocol::Didcomm => {
+                return Err(AppError::Internal(
+                    "DIDComm was selected in a build without the `didcomm` feature".into(),
+                ));
+            }
+        };
+
+        verify_reply(self.resolver, &reply, recipient, trust).await?;
+        Ok(reply)
+    }
+
+    async fn send_rest(
+        &self,
+        recipient: &str,
+        endpoint: &str,
+        document: &Value,
+    ) -> Result<Value, AppError> {
+        send_rest_to(recipient, endpoint, document, self.endpoint_policy).await
+    }
+
+    /// Seal a Trust Task to `recipient` over TSP and wait for the reply to come
+    /// back as its own inbound frame.
+    ///
+    /// The shape is forced by the binding rather than chosen. TSP has no
+    /// request/response: `pack` and `unpack` is the whole of it, because
+    /// correlation is a document concern (SPEC §4.9 `threadId`). So this is a
+    /// send now, and later an inbound document that the dispatch spine
+    /// recognises as an answer and hands to the receiver registered here.
+    ///
+    /// **The waiter is registered before the frame is sealed.** A reply that
+    /// arrived between sending and registering would find nothing waiting, be
+    /// dispatched as a request, and be refused — while this call sat here until
+    /// it timed out. The window is small and the mediator is fast, which is
+    /// exactly the combination that makes it rare enough to survive testing.
+    #[cfg(feature = "tsp")]
+    async fn send_tsp(
+        &self,
+        recipient: &str,
+        peer_mediator: &str,
+        document: Value,
+    ) -> Result<Value, AppError> {
+        let tsp = self.tsp.as_ref().ok_or_else(|| {
+            AppError::Internal(
+                "TSP was selected but this node has no TSP transport; it should not have been \
+                 offered"
+                    .into(),
+            )
+        })?;
+
+        // The thread the reply will name, not the request's id — see
+        // `reply_thread_of`, which is the contract `trust-tasks-rs` applies when
+        // it builds the response.
+        let thread = crate::trust_tasks::pending_replies::reply_thread_of(&document)
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "an outbound Trust Task with neither `threadId` nor `id` cannot be answered"
+                        .into(),
+                )
+            })?
+            .to_string();
+
+        let type_uri = document
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let body = serde_json::to_vec(&document)
+            .map_err(|e| AppError::Internal(format!("serialise the request: {e}")))?;
+        let framed = vta_sdk::tsp_binding::wrap_envelope(&body);
+
+        match tsp
+            .first_attempt(recipient, Some(peer_mediator), &thread, &framed)
+            .await
+        {
+            TspAttempt::Reply(v) => Ok(v),
+            TspAttempt::SendFailed(e) => Err(bad_gateway_error(format!(
+                "`{recipient}` could not be reached over TSP: {e}"
+            ))),
+            TspAttempt::Cancelled => Err(bad_gateway_error(format!(
+                "the wait for `{recipient}`'s reply was cancelled"
+            ))),
+            // §7.2.2 D6: a silent reply-timeout may mean the peer lost the
+            // relationship. Hand off to the coordinator-gated self-repair.
+            TspAttempt::Timeout => {
+                tsp.recover_send_tsp(recipient, Some(peer_mediator), &thread, &framed, &type_uri)
+                    .await
+            }
+        }
+    }
+
+    #[cfg(feature = "didcomm")]
+    async fn send_didcomm(&self, recipient: &str, document: Value) -> Result<Value, AppError> {
+        // The message is addressed to the **peer's** DID; the endpoint it
+        // advertises is the mediator it can be reached through, and the delivery
+        // layer resolves that route. Addressing the mediator would address the
+        // mediator.
+        let reply = self
+            .bridge
+            .send_and_wait(
+                recipient,
+                DIDCOMM_MESSAGE_TYPE,
+                document,
+                // The expected *outer* type is the envelope we sent: on this
+                // binding a reply rides the same envelope, so success and
+                // refusal are indistinguishable out here. Both are told apart on
+                // the inner document, by the caller.
+                DIDCOMM_MESSAGE_TYPE,
+                // A DIDComm problem report can still arrive *ahead* of the
+                // envelope — an unroutable message never reaches the far side's
+                // dispatcher — so it stays mapped to a typed error.
+                vta_sdk::protocols::PROBLEM_REPORT_TYPE,
+                DIDCOMM_REPLY_TIMEOUT_SECS,
+            )
+            .await?;
+        Ok(reply.body)
+    }
+}
+
+/// Apply `trust` to a reply.
+///
+/// An **error document is exempt from the proof requirement**, whichever
+/// trust level applies. A refusal's `type` resolves to the framework's
+/// `trust-task-error` specification, whose own proof requirement is
+/// RECOMMENDED rather than REQUIRED (SPEC §8.1) — demanding one would make
+/// every conforming refusal unreadable, including the ones whose entire
+/// purpose is to carry a reason back to an operator. A refusal is believed
+/// only to the extent of being a refusal; it confers nothing and grants
+/// nothing, which is why the framework asks less of it.
+///
+/// A free function rather than a method: verifying a reply needs the resolver
+/// and nothing else, and a method would have made every test of this property
+/// stand up a DIDComm bridge to ask a question that has no transport in it.
+async fn verify_reply(
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    reply: &Value,
+    recipient: &str,
+    trust: ReplyTrust,
+) -> Result<(), AppError> {
+    if trust == ReplyTrust::TransportAuthenticated {
+        return Ok(());
+    }
+    let doc_type = reply
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if doc_type.starts_with("https://trusttasks.org/spec/trust-task-error/") {
+        return Ok(());
+    }
+
+    let _doc: trust_tasks_rs::TrustTask<Value> =
+        serde_json::from_value(reply.clone()).map_err(|e| {
+            bad_gateway_error(format!(
+                "`{recipient}` sent a reply this agent cannot read as a Trust-Task \
+                 document: {e}"
+            ))
+        })?;
+
+    // Over the reply as received, never a re-serialisation of `_doc` (VTI-45).
+    let vm_resolver = vti_common::auth::TrustTaskVmResolver::from_optional(Some(resolver.clone()));
+    let signer = vti_common::auth::verify_trust_task_proof_value(reply, &vm_resolver)
+        .await
+        .map_err(|e| match e {
+            // Still a refusal, and deliberately not a 5xx: the SDK retries a
+            // 5xx under the caller's idempotency key, which would re-send a
+            // request the peer may already have applied. The reply is not
+            // believed; only the wording tells the operator why.
+            vti_common::auth::DiProofError::ResolverFailed(_) => AppError::Forbidden(format!(
+                "could not retrieve `{recipient}`'s verification key, so its reply was not \
+                 checked and is not believed ({e}). This is a key-retrieval failure, not a bad \
+                 proof: the request may have taken effect at `{recipient}`, so check its state \
+                 before sending it again"
+            )),
+            // VTI-KEY-009 on a reply: the peer signed as a DID of a method this
+            // agent does not resolve. The same caution as a retrieval failure
+            // applies — the reply was never checked, but the request may have
+            // taken effect — and the method is named so the operator knows why.
+            vti_common::auth::DiProofError::UnsupportedDidMethod { method } => {
+                AppError::Forbidden(format!(
+                    "could not retrieve `{recipient}`'s verification key: its reply is signed \
+                     as a did:{method}, a method this agent does not resolve \
+                     (unsupportedDidMethod), so it was not checked and is not believed. This is \
+                     not a bad proof: the request may have taken effect at `{recipient}`, so \
+                     check its state before sending it again"
+                ))
+            }
+            other => AppError::Forbidden(format!(
+                "the reply from `{recipient}` is unsigned or its proof does not verify \
+                 ({other}), so nothing in it can be believed — an unsigned answer is bytes, not \
+                 evidence"
+            )),
+        })?;
+
+    if signer != recipient {
+        return Err(AppError::Forbidden(format!(
+            "the reply claiming to come from `{recipient}` is signed by `{signer}`. The \
+             proof verifies, which means somebody really signed it — just not the party this \
+             agent asked"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod send_rest_guard {
+        use super::*;
+        use vta_sdk::http::{ALLOW_PRIVATE_ENDPOINTS_ENV, EndpointPolicy};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn doc() -> Value {
+            serde_json::json!({ "type": "https://trusttasks.org/spec/rooms/epoch/chain/0.1" })
+        }
+
+        /// A peer advertising a loopback endpoint is not dialled under the
+        /// default policy, and the refusal names the opt-in.
+        #[tokio::test]
+        async fn loopback_peer_is_not_dialled_without_private_endpoints() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(doc()))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let err = send_rest_to(
+                "did:example:peer",
+                &server.uri(),
+                &doc(),
+                EndpointPolicy::public_only(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(ALLOW_PRIVATE_ENDPOINTS_ENV),
+                "{err}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn non_public_peers_are_refused_under_the_default_policy() {
+            for endpoint in [
+                "https://10.0.0.5",
+                "https://169.254.169.254",
+                "http://127.0.0.1.example.net",
+                "https://user:pw@example.com",
+            ] {
+                let err = send_rest_to(
+                    "did:example:peer",
+                    endpoint,
+                    &doc(),
+                    EndpointPolicy::public_only(),
+                )
+                .await
+                .unwrap_err();
+                assert!(!err.to_string().contains("pw@"), "{endpoint}: {err}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_json_reply_is_returned() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(doc()))
+                .mount(&server)
+                .await;
+            let reply = send_rest_to(
+                "did:example:peer",
+                &server.uri(),
+                &doc(),
+                EndpointPolicy::private_allowed(),
+            )
+            .await
+            .expect("a JSON reply");
+            assert_eq!(reply, doc());
+        }
+
+        /// A reply that is not JSON is reported by class, size and position;
+        /// none of its text reaches the error the caller sees.
+        #[tokio::test]
+        async fn a_non_json_reply_is_not_echoed() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string("<html>internal-only-text"),
+                )
+                .mount(&server)
+                .await;
+            let err = send_rest_to(
+                "did:example:peer",
+                &server.uri(),
+                &doc(),
+                EndpointPolicy::private_allowed(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("not a Trust-Task document"), "{err}");
+            assert!(!err.contains("internal-only-text"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn an_oversized_reply_is_refused() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string("x".repeat(MAX_REST_REPLY_BYTES + 1)),
+                )
+                .mount(&server)
+                .await;
+            let err = send_rest_to(
+                "did:example:peer",
+                &server.uri(),
+                &doc(),
+                EndpointPolicy::private_allowed(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("cap"), "{err}");
+        }
+    }
+
+    fn caps_from(services: Value) -> ServiceCapabilities {
+        ServiceCapabilities::from_did_document(&serde_json::json!({ "service": services }))
+    }
+
+    async fn test_resolver() -> affinidi_did_resolver_cache_sdk::DIDCacheClient {
+        affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
+            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        )
+        .await
+        .expect("a resolver for tests")
+    }
+
+    /// A refusal is exempt, and deliberately: `trust-task-error` declares its
+    /// proof RECOMMENDED, so demanding one would make every conforming refusal
+    /// unreadable — including the `hostRefused` whose whole job is to carry the
+    /// host's reason back.
+    #[tokio::test]
+    async fn a_refusal_is_read_without_a_proof() {
+        let reply = serde_json::json!({
+            "type": "https://trusttasks.org/spec/trust-task-error/0.5",
+            "payload": { "code": "notAMember", "reason": "no" }
+        });
+        verify_reply(
+            &test_resolver().await,
+            &reply,
+            "did:example:host",
+            ReplyTrust::SignedByRecipient,
+        )
+        .await
+        .expect("a refusal needs no proof");
+    }
+
+    /// A reply signed by a DID method this resolver cannot resolve fails at
+    /// resolution — before any signature is even inspected — and must be
+    /// reported as a retrieval failure, not folded into "does not verify".
+    /// The mutation may already have committed on the peer's side; only the
+    /// verification *fetch* failed (FTL-29595, fix direction 3, server-side
+    /// half: this is the VTA acting as an outbound caller to a peer/room-host).
+    #[tokio::test]
+    async fn a_resolver_failure_reports_retrieval_not_invalid_proof() {
+        let reply = serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000002",
+            "type": "https://trusttasks.org/spec/rooms/epoch/chain/0.1#response",
+            "issuer": "did:example:host",
+            "recipient": "did:example:agent",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": { "links": [] },
+            "proof": {
+                "type": "DataIntegrityProof",
+                "cryptosuite": "eddsa-jcs-2022",
+                "proofPurpose": "assertionMethod",
+                "verificationMethod": "did:example:host#key-0",
+                "created": "2026-01-01T00:00:00Z",
+                "proofValue": "z2aBcD"
+            }
+        });
+        let err = verify_reply(
+            &test_resolver().await,
+            &reply,
+            "did:example:host",
+            ReplyTrust::SignedByRecipient,
+        )
+        .await
+        .expect_err("did:example is not a method this resolver can resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not retrieve"),
+            "expected a retrieval-failure message, got: {msg}"
+        );
+        assert!(msg.contains("before sending it again"), "got: {msg}");
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "a retrieval failure must stay a refusal the SDK does not retry: {err:?}"
+        );
+        assert!(
+            msg.contains("unsupportedDidMethod") && msg.contains("did:example"),
+            "an unresolved method is named (VTI-KEY-009): {msg}"
+        );
+        assert!(
+            !msg.contains("does not verify"),
+            "a retrieval failure must not read as an invalid proof: {msg}"
+        );
+    }
+
+    /// The control: an actual bad signature, reached through a `did:key`
+    /// verification method the resolver handles locally (so resolution
+    /// itself succeeds), must still say "does not verify".
+    #[tokio::test]
+    async fn an_actual_bad_signature_still_says_does_not_verify() {
+        let (recipient, _vm) = crate::test_support::did_for_seed(13);
+        let mut doc: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000003",
+            "type": "https://trusttasks.org/spec/rooms/epoch/chain/0.1#response",
+            "issuer": recipient,
+            "recipient": "did:key:zAgent",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": { "links": [] }
+        }))
+        .expect("well-formed reply");
+        crate::test_support::sign_as(13, &mut doc);
+
+        // Corrupt the signature — a one-character flip keeps the multibase
+        // string decodable, so this exercises "does not verify" rather than
+        // "malformed proof".
+        let proof = doc.proof.as_mut().expect("document is signed");
+        let last = proof.proof_value.pop().expect("non-empty proofValue");
+        proof.proof_value.push(if last == '1' { '2' } else { '1' });
+
+        let reply = serde_json::to_value(&doc).expect("doc serialises");
+        let err = verify_reply(
+            &test_resolver().await,
+            &reply,
+            &recipient,
+            ReplyTrust::SignedByRecipient,
+        )
+        .await
+        .expect_err("a corrupted signature must not verify");
+        let msg = err.to_string();
+        assert!(msg.contains("does not verify"), "got: {msg}");
+        assert!(
+            !msg.contains("could not retrieve"),
+            "a bad signature must not read as a retrieval failure: {msg}"
+        );
+    }
+
+    /// An unsigned success reply is refused. Bytes off a socket attest to
+    /// nothing, and every check downstream of this one is about *shape* — so an
+    /// intermediary that rewrote a record listing would pass all of them.
+    #[tokio::test]
+    async fn an_unsigned_success_reply_is_refused() {
+        let reply = serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+            "type": "https://trusttasks.org/spec/rooms/epoch/chain/0.1#response",
+            "issuer": "did:example:host",
+            "recipient": "did:example:agent",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": { "links": [] }
+        });
+        let err = verify_reply(
+            &test_resolver().await,
+            &reply,
+            "did:example:host",
+            ReplyTrust::SignedByRecipient,
+        )
+        .await
+        .expect_err("an unsigned success reply must not be believed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bytes, not") || msg.contains("unsigned"),
+            "the refusal must say why an unsigned answer is worthless: {msg}"
+        );
+    }
+
+    // ── Selection: an intersection, walked in the workspace's order ──────────
+
+    #[test]
+    fn a_peer_serving_rest_is_reachable() {
+        let caps = caps_from(serde_json::json!([{
+            "id": "#rest", "type": "VTARest", "serviceEndpoint": "https://host.example"
+        }]));
+        let (protocol, endpoint) =
+            pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer").expect("reachable");
+        assert_eq!(protocol, Protocol::Rest);
+        assert_eq!(endpoint, "https://host.example");
+    }
+
+    /// A peer advertising REST over plain `http://` to a non-loopback host is
+    /// not reachable over REST at all: `send_rest` puts a signed document on
+    /// the wire in the clear, and a peer that only offers that is treated as
+    /// if it advertised nothing, failing closed with a named reason.
+    #[test]
+    fn a_peer_serving_plaintext_http_rest_is_refused() {
+        let caps = caps_from(serde_json::json!([{
+            "id": "#rest", "type": "TrustTaskHTTPS", "serviceEndpoint": "http://host.example"
+        }]));
+        let msg = pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer")
+            .expect_err("plaintext REST must not be selected")
+            .to_string();
+        assert!(
+            msg.contains("plaintext http://"),
+            "the refusal must say why: {msg}"
+        );
+    }
+
+    /// Lookalike hosts — a domain that merely contains a loopback address or
+    /// name — are ordinary DNS names, not loopback, and are refused exactly
+    /// like any other plaintext non-loopback endpoint.
+    #[test]
+    fn a_peer_serving_a_lookalike_loopback_host_over_http_is_refused() {
+        for endpoint in ["http://127.0.0.1.evil.com", "http://localhost.evil"] {
+            let caps = caps_from(serde_json::json!([{
+                "id": "#rest", "type": "TrustTaskHTTPS", "serviceEndpoint": endpoint
+            }]));
+            assert!(
+                pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer").is_err(),
+                "{endpoint} must be refused"
+            );
+        }
+    }
+
+    /// Plain `http://` to exact loopback is still selectable, for local
+    /// development.
+    #[test]
+    fn a_peer_serving_http_to_loopback_is_still_reachable() {
+        let caps = caps_from(serde_json::json!([{
+            "id": "#rest", "type": "TrustTaskHTTPS", "serviceEndpoint": "http://127.0.0.1:8100"
+        }]));
+        let (protocol, endpoint) =
+            pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer").expect("reachable");
+        assert_eq!(protocol, Protocol::Rest);
+        assert_eq!(endpoint, "http://127.0.0.1:8100");
+    }
+
+    /// A refused plaintext REST entry does not stop a shared higher-preference
+    /// transport from being picked — it only takes REST off the table.
+    #[test]
+    fn a_plaintext_rest_endpoint_does_not_block_a_shared_didcomm_transport() {
+        let caps = caps_from(serde_json::json!([
+            { "id": "#rest", "type": "TrustTaskHTTPS", "serviceEndpoint": "http://host.example" },
+            { "id": "#didcomm", "type": "DIDCommMessaging",
+              "serviceEndpoint": [{ "uri": "did:example:mediator", "accept": ["didcomm/v2"] }] }
+        ]));
+        let (protocol, _) =
+            pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer").expect("reachable");
+        assert_eq!(protocol, Protocol::Didcomm);
+    }
+
+    /// The case that matters in practice: a room host started with
+    /// `--mediator-did` publishes DIDComm there and need not open an HTTP port
+    /// at all.
+    #[test]
+    fn a_didcomm_only_peer_is_reachable() {
+        let caps = caps_from(serde_json::json!([{
+            "id": "#didcomm",
+            "type": "DIDCommMessaging",
+            "serviceEndpoint": [{ "uri": "did:example:mediator", "accept": ["didcomm/v2"] }]
+        }]));
+        let (protocol, _) =
+            pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer").expect("reachable");
+        assert_eq!(protocol, Protocol::Didcomm);
+    }
+
+    /// Preference, not availability: the rule is the highest-preference
+    /// protocol present in **both** sets, never the first that happens to work.
+    #[test]
+    fn didcomm_is_preferred_over_rest_when_a_peer_offers_both() {
+        let caps = caps_from(serde_json::json!([
+            { "id": "#rest", "type": "VTARest", "serviceEndpoint": "https://host.example" },
+            { "id": "#didcomm", "type": "DIDCommMessaging",
+              "serviceEndpoint": [{ "uri": "did:example:mediator", "accept": ["didcomm/v2"] }] }
+        ]));
+        let (protocol, _) =
+            pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer").expect("reachable");
+        assert_eq!(
+            protocol,
+            Protocol::Didcomm,
+            "REST was chosen while the peer also advertised DIDComm"
+        );
+    }
+
+    /// The ordering lives in one place. `OUTBOUND_SUPPORTED` is a membership
+    /// set and must never become a second preference list — its own order is
+    /// deliberately the opposite of the one that must win, so anything that
+    /// starts reading it in order trips here.
+    #[test]
+    fn preference_comes_from_preference_order_not_from_this_list() {
+        let rank = |p: Protocol| Protocol::PREFERENCE_ORDER.iter().position(|q| *q == p);
+        assert!(rank(Protocol::Didcomm) < rank(Protocol::Rest));
+        assert!(
+            OUTBOUND_SUPPORTED.contains(&Protocol::Didcomm)
+                && OUTBOUND_SUPPORTED.contains(&Protocol::Rest)
+        );
+    }
+
+    /// A peer advertising only TSP, as this file's two builds see it. One
+    /// helper because the peer is the same in both; only what this agent can do
+    /// about it differs.
+    fn tsp_only_peer() -> ServiceCapabilities {
+        caps_from(serde_json::json!([{
+            "id": "#tsp", "type": "TSPTransport", "serviceEndpoint": "did:example:mediator"
+        }]))
+    }
+
+    /// The honest refusal. A peer speaking only TSP is not unreachable in
+    /// principle — this agent cannot start the conversation — and the message
+    /// has to say which, or an operator goes looking at the peer.
+    ///
+    /// **Only in a build without `tsp`.** With the feature on this VTA can
+    /// initiate TSP, so the intersection is non-empty and there is nothing to
+    /// refuse — see the sibling test. The gate is load-bearing rather than
+    /// tidiness: this assertion used to be unconditional, which held only for as
+    /// long as nothing in a workspace build turned `tsp` on for `vta-service`.
+    /// The first thing that did (a sibling crate's dev-dependency asking for it,
+    /// feature unification doing the rest) made it panic — in a crate whose own
+    /// `cargo test -p vta-service` was green, because that build has no `tsp`
+    /// either. A test that asserts a refusal must say which build it is
+    /// describing.
+    #[cfg(not(feature = "tsp"))]
+    #[test]
+    fn a_tsp_only_peer_is_refused_naming_both_sides() {
+        let caps = tsp_only_peer();
+        let msg = pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer")
+            .expect_err("no common transport")
+            .to_string();
+        assert!(
+            msg.contains("tsp"),
+            "must name what the peer advertises: {msg}"
+        );
+        assert!(
+            msg.contains("didcomm") && msg.contains("rest"),
+            "must name everything this agent can do, not just one: {msg}"
+        );
+        assert!(
+            matches!(
+                pick_transport(&caps, OUTBOUND_SUPPORTED, "did:example:peer"),
+                Err(AppError::NoMatchingProtocol(_))
+            ),
+            "must be the typed refusal the client can switch on"
+        );
+    }
+
+    /// And the other half of that statement: in a build that *can* initiate TSP,
+    /// the same peer is reached over it rather than refused. Asserting both
+    /// sides keeps the refusal above a claim about this build, not about TSP.
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn a_tsp_only_peer_is_reached_over_tsp_when_this_build_can_initiate_it() {
+        let (protocol, endpoint) =
+            pick_transport(&tsp_only_peer(), OUTBOUND_SUPPORTED, "did:example:peer")
+                .expect("TSP is in the intersection when this build can initiate it");
+
+        assert_eq!(
+            protocol,
+            Protocol::Tsp,
+            "a TSP-only peer must be reached over TSP, not refused"
+        );
+        assert_eq!(
+            endpoint, "did:example:mediator",
+            "and over the mediator the peer's `#tsp` service names"
+        );
+    }
+
+    const VTA: &str = "did:example:vta";
+    const PERSONA: &str = "did:example:persona";
+
+    const WEBS_VTA: &str = "did:webs:vta.example:nodes:EAbc";
+
+    /// A `did:peer:2` peer advertising one Trust-Task HTTPS endpoint, and no
+    /// `resolvedMethods` — resolved offline, so the whole send runs.
+    fn rest_peer(endpoint: &str) -> String {
+        use base64::Engine as _;
+        let service = serde_json::json!({ "t": "TrustTaskHTTPS", "s": endpoint });
+        format!(
+            "did:peer:2.Vz6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK.S{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(service.to_string())
+        )
+    }
+
+    /// VTI-KEY-003 / VTI-KEY-001, and VTI-KEY-008 withdrawn: every node
+    /// resolves did:webs, so a did:webs VTA acts toward a peer whose document
+    /// declares nothing (no `resolvedMethods`) exactly as a did:webvh VTA
+    /// does — the document is sent and the reply returned.
+    #[tokio::test]
+    async fn vti_key_003_a_did_webs_vta_sends_to_a_peer_that_declares_nothing() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let reply = serde_json::json!({ "type": "urn:example:reply", "payload": {} });
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&reply))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let peer = rest_peer(&server.uri());
+        let resolver = test_resolver().await;
+        let peer_doc = serde_json::to_value(resolver.resolve(&peer).await.unwrap().doc).unwrap();
+        assert!(peer_doc.get("resolvedMethods").is_none(), "{peer_doc}");
+
+        #[cfg(feature = "didcomm")]
+        let bridge = DIDCommBridge::placeholder();
+        let mut outbound = Outbound::from_parts(
+            &resolver,
+            #[cfg(feature = "didcomm")]
+            &bridge,
+            #[cfg(feature = "tsp")]
+            None,
+        );
+        outbound.endpoint_policy = vta_sdk::http::EndpointPolicy::private_allowed();
+        let document = serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000003",
+            "type": "urn:example:request",
+            "issuer": WEBS_VTA,
+            "recipient": peer,
+            "payload": {},
+        });
+        let got = outbound
+            .send(&peer, document, ReplyTrust::TransportAuthenticated)
+            .await
+            .expect("a did:webs VTA reaches a peer that declares nothing");
+        assert_eq!(got, reply);
+        server.verify().await;
+    }
+
+    /// Every messaging transport this build compiles, wired as this VTA.
+    fn all_wired() -> WiredSenders<'static> {
+        WiredSenders {
+            tsp: Some(VTA),
+            didcomm: Some(VTA),
+        }
+    }
+
+    /// TSP wiring removed — a sender whose state holds no TSP socket.
+    fn without_tsp() -> WiredSenders<'static> {
+        WiredSenders {
+            tsp: None,
+            ..all_wired()
+        }
+    }
+
+    /// A VTC: DIDComm through its mediator and the Trust-Task HTTPS door.
+    fn didcomm_and_rest_peer() -> ServiceCapabilities {
+        caps_from(serde_json::json!([
+            { "id": "#didcomm", "type": "DIDCommMessaging",
+              "serviceEndpoint": [{ "uri": "did:example:mediator", "accept": ["didcomm/v2"] }] },
+            { "id": "#trust-tasks", "type": "TrustTaskHTTPS",
+              "serviceEndpoint": "https://vtc.example/v1" }
+        ]))
+    }
+
+    /// The runtime gate. A `tsp`-feature build names TSP in
+    /// [`OUTBOUND_SUPPORTED`], but a sender with no live [`TspSender`] cannot
+    /// start one, so [`initiable_for`] must drop it — and keep it once a sender
+    /// is present.
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn initiable_drops_tsp_without_a_live_sender_and_keeps_it_with_one() {
+        let without = initiable_for(without_tsp(), Some(VTA));
+        assert!(
+            !without.contains(&Protocol::Tsp),
+            "TSP must not be initiable without a live sender"
+        );
+        assert!(
+            without.contains(&Protocol::Didcomm) && without.contains(&Protocol::Rest),
+            "dropping TSP must not disturb the transports that remain"
+        );
+        assert!(
+            initiable_for(all_wired(), Some(VTA)).contains(&Protocol::Tsp),
+            "TSP is initiable once a sender is wired"
+        );
+    }
+
+    /// Bug 1, at the gate: a REST-only VTA (`[messaging] kind = "skip"`)
+    /// compiles DIDComm but holds no mediator session, so DIDComm is not in
+    /// its set — any more than TSP is.
+    #[test]
+    fn a_rest_only_vta_can_initiate_rest_alone() {
+        assert_eq!(
+            initiable_for(WiredSenders::default(), Some(VTA)),
+            vec![Protocol::Rest],
+            "with no messaging wired, REST is the only thing this agent can start"
+        );
+    }
+
+    /// Bug 1, at the selector: the live failure. A REST-only VTA sending to a VTC
+    /// that advertises DIDComm and REST picked DIDComm — the higher preference —
+    /// and failed with "DIDComm messaging not initialized". It must pick the
+    /// REST both sides can actually use.
+    #[test]
+    fn a_rest_only_vta_reaches_a_didcomm_and_rest_peer_over_rest() {
+        let (protocol, endpoint) = pick_transport(
+            &didcomm_and_rest_peer(),
+            &initiable_for(WiredSenders::default(), Some(VTA)),
+            "did:example:vtc",
+        )
+        .expect("REST is shared");
+        assert_eq!(protocol, Protocol::Rest);
+        assert_eq!(endpoint, "https://vtc.example/v1");
+    }
+
+    /// And where the peer offers nothing this agent can start, the typed refusal
+    /// names both sets — never the send-time "not initialized".
+    #[test]
+    fn a_rest_only_vta_is_refused_by_a_didcomm_only_peer_naming_both_sides() {
+        let caps = caps_from(serde_json::json!([
+            { "id": "#didcomm", "type": "DIDCommMessaging",
+              "serviceEndpoint": [{ "uri": "did:example:mediator", "accept": ["didcomm/v2"] }] }
+        ]));
+        let err = pick_transport(
+            &caps,
+            &initiable_for(WiredSenders::default(), Some(VTA)),
+            "did:example:vtc",
+        )
+        .expect_err("nothing in common");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("advertises [didcomm]") && msg.contains("initiate [rest]"),
+            "must name what each side has: {msg}"
+        );
+        match err {
+            AppError::NoMatchingProtocol(refusal) => {
+                assert_eq!(refusal.peer, "did:example:vtc");
+                assert_eq!(refusal.ours, vec![Protocol::Rest]);
+                assert_eq!(refusal.theirs, vec![Protocol::Didcomm]);
+            }
+            other => panic!("must be the typed refusal, never `Validation`: {other:?}"),
+        }
+    }
+
+    /// Bug 2, at the gate. TSP and DIDComm authenticate this VTA's own DID; the
+    /// bindings make the in-band `issuer` a cross-check against that sender
+    /// (`identityMismatch` on a mismatch). A document signed by a persona is
+    /// therefore not something either can carry, however wired — only REST,
+    /// where the proof is the authentication.
+    #[test]
+    fn a_document_issued_by_another_did_rides_only_rest() {
+        assert_eq!(
+            initiable_for(all_wired(), Some(PERSONA)),
+            vec![Protocol::Rest],
+            "a persona-signed document must not ride a transport authenticated as the VTA"
+        );
+    }
+
+    /// The other half: the VTA's own documents keep every wired transport, and
+    /// a document with no in-band issuer takes it from the transport.
+    #[test]
+    fn the_vtas_own_documents_keep_every_wired_transport() {
+        for issuer in [Some(VTA), None] {
+            let set = initiable_for(all_wired(), issuer);
+            assert_eq!(
+                set,
+                OUTBOUND_SUPPORTED.to_vec(),
+                "issuer {issuer:?}: nothing wired as the issuer may be dropped"
+            );
+        }
+    }
+
+    /// Bug 2, at the selector: the live failure. A VTA with its mediator session
+    /// up sends a persona-signed document to a VTC advertising DIDComm and REST.
+    /// It went over DIDComm, authenticated as the VTA, and the VTC refused it
+    /// `identityMismatch`. It must go over REST.
+    #[cfg(feature = "didcomm")]
+    #[test]
+    fn a_persona_signed_document_goes_to_a_didcomm_and_rest_peer_over_rest() {
+        let caps = didcomm_and_rest_peer();
+        let (own, _) =
+            pick_transport(&caps, &initiable_for(all_wired(), Some(VTA)), "vtc").expect("shared");
+        assert_eq!(
+            own,
+            Protocol::Didcomm,
+            "this VTA's own document still prefers DIDComm"
+        );
+        let (persona, _) = pick_transport(&caps, &initiable_for(all_wired(), Some(PERSONA)), "vtc")
+            .expect("REST is shared");
+        assert_eq!(
+            persona,
+            Protocol::Rest,
+            "a persona-signed document must use the binding whose authenticated sender can be its \
+             issuer"
+        );
+    }
+
+    /// #1483's regression, at the selector. A did-hosting server advertises both
+    /// TSP and DIDComm; a `tsp`-feature VTA answering from its DIDComm handler
+    /// (`WebvhDeps::from_vta_state`, `tsp: None`) has no TSP sender. Before the
+    /// fix, `pick_transport` read the build const, selected TSP, and the send
+    /// failed with "TSP was selected but this node has no TSP transport". It must
+    /// now fall to the DIDComm the two genuinely share.
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn a_tsp_and_didcomm_peer_is_reached_over_didcomm_when_this_sender_has_no_tsp() {
+        let caps = caps_from(serde_json::json!([
+            { "id": "#tsp", "type": "TSPTransport", "serviceEndpoint": "did:example:mediator" },
+            { "id": "#didcomm", "type": "DIDCommMessaging",
+              "serviceEndpoint": [{ "uri": "did:example:mediator", "accept": ["didcomm/v2"] }] }
+        ]));
+        let (protocol, _) = pick_transport(
+            &caps,
+            &initiable_for(without_tsp(), Some(VTA)),
+            "did:example:peer",
+        )
+        .expect("DIDComm is shared, so the peer is reachable");
+        assert_eq!(
+            protocol,
+            Protocol::Didcomm,
+            "a sender with no TSP must fall to the shared DIDComm, not select TSP"
+        );
+    }
+
+    /// And where TSP is the *only* thing in common, a sender without it gets the
+    /// honest refusal naming both sets — not the internal error the field saw.
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn a_tsp_only_peer_is_refused_not_errored_when_this_sender_has_no_tsp() {
+        let err = pick_transport(
+            &tsp_only_peer(),
+            &initiable_for(without_tsp(), Some(VTA)),
+            "did:example:peer",
+        )
+        .expect_err("TSP is the only shared transport and this sender cannot start it");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, AppError::NoMatchingProtocol(_)),
+            "must be the typed refusal, not an internal error or `Validation`: {msg}"
+        );
+        assert!(
+            msg.contains("tsp") && msg.contains("didcomm") && msg.contains("rest"),
+            "must name what the peer offers and what this sender can start: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_peer_advertising_nothing_says_so() {
+        let err = pick_transport(
+            &caps_from(serde_json::json!([])),
+            OUTBOUND_SUPPORTED,
+            "did:example:peer",
+        )
+        .expect_err("nothing advertised");
+        assert!(err.to_string().contains("nothing"));
+    }
+
+    // ── Reply trust: the question the two hand-rolled paths answered
+    //    differently ───────────────────────────────────────────────────────────
+
+    /// The weaker level is a decision, and this is what it decides. Asserted so
+    /// that `TransportAuthenticated` cannot quietly become "verify anyway" or
+    /// the reverse without a test saying so.
+    #[tokio::test]
+    async fn transport_authenticated_believes_an_unsigned_reply() {
+        let reply = serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+            "type": "https://trusttasks.org/spec/did-management/did/check-name/0.1#response",
+            "issuer": "did:example:peer",
+            "recipient": "did:example:agent",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": { "available": true }
+        });
+        verify_reply(
+            &test_resolver().await,
+            &reply,
+            "did:example:peer",
+            ReplyTrust::TransportAuthenticated,
+        )
+        .await
+        .expect("this level asks nothing of the document");
+    }
+
+    /// The envelope type goes on the message; a task type never does. This
+    /// fails silently on the wire — a conformant host rejects a message typed
+    /// with the task URI and the sender learns nothing — so it is asserted here,
+    /// at the one place that now decides it for every caller.
+    #[test]
+    fn the_didcomm_message_carries_the_binding_envelope_type() {
+        assert_eq!(DIDCOMM_MESSAGE_TYPE, trust_tasks_didcomm::ENVELOPE_TYPE);
+        assert!(
+            !DIDCOMM_MESSAGE_TYPE.starts_with("https://trusttasks.org/spec/"),
+            "a `spec/` URI here is a task type on the wire: {DIDCOMM_MESSAGE_TYPE}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "tsp"))]
+mod idle_reinvite_tests {
+    use super::IdleReinvites;
+
+    #[test]
+    fn one_idle_reinvite_per_peer_at_a_time_and_released_on_drop() {
+        let reinvites = IdleReinvites::default();
+        let first = reinvites.claim("did:example:hosting").expect("free peer");
+        assert!(
+            reinvites.claim("did:example:hosting").is_none(),
+            "a second concurrent send to the same peer goes out the ordinary way"
+        );
+        assert!(
+            reinvites.claim("did:example:other").is_some(),
+            "other peers are independent"
+        );
+        drop(first);
+        assert!(
+            reinvites.claim("did:example:hosting").is_some(),
+            "the claim is released when the send finishes, whichever way"
+        );
+    }
+}

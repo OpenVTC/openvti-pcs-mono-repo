@@ -1,0 +1,3348 @@
+use crate::store::keyspaces;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use affinidi_tdk::common::TDKSharedState;
+use affinidi_tdk::common::config::TDKConfig;
+use affinidi_tdk::messaging::ATM;
+use affinidi_tdk::messaging::config::ATMConfig;
+use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver, secrets::Secret};
+
+use hkdf::Hkdf;
+use sha2::Sha256;
+
+use crate::auth::AuthState;
+use crate::auth::jwt::JwtKeys;
+use crate::auth::session::cleanup_expired_sessions;
+use crate::config::{AppConfig, AuthConfig};
+use crate::error::AppError;
+use crate::install::{InstallTokenSigner, InstallTokenStore};
+use crate::keys::seed_store::SecretStore;
+use crate::messaging;
+use crate::routes;
+use crate::store::{KeyspaceHandle, Store};
+use crate::supervisor::{SupervisorKind, detect_supervisor};
+use tokio::sync::{RwLock, watch};
+use tower_http::cors::CorsLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
+use tracing::{debug, error, info, warn};
+use vtc_audit::{AuditKeyStore, AuditWriter};
+use vti_common::auth::passkey::{PasskeyState, build_webauthn};
+use webauthn_rs::Webauthn;
+
+/// Default enrolment-invite TTL surfaced by `PasskeyState::enrollment_ttl`.
+/// Admin-invite enrolment lands in M0.6; until then this constant is the
+/// canonical "how long is an admin invite redeemable" value. An hour
+/// is the same default `webvh-common`'s passkey routes use.
+const DEFAULT_ENROLLMENT_TTL_SECS: u64 = 60 * 60;
+
+/// Whole-request timeout for the REST surface (P0.10). A wedged handler — a
+/// registry call without its own timeout, a slow downstream — must not hold
+/// its connection (and a runtime worker) open forever. `tower_http`'s
+/// `TimeoutLayer` returns `408 Request Timeout` when exceeded.
+const REST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct AppState {
+    pub sessions_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    pub community_ks: KeyspaceHandle,
+    pub config_ks: KeyspaceHandle,
+    pub passkey_ks: KeyspaceHandle,
+    pub install_ks: KeyspaceHandle,
+    pub members_ks: KeyspaceHandle,
+    /// Cached count of member rows in [`Self::members_ks`] — kept equal to
+    /// `members::list_members(..).len()` so ceremony facts assembly (the
+    /// unauthenticated join-submit path included) reads it in O(1) instead of
+    /// walking the whole keyspace per request. Seeded once at boot, then
+    /// adjusted by the single member-mutation seam (`ceremony::execute`):
+    /// +1 on admit, −1 on a purge-departure. Tombstone/historical departures
+    /// and role-change re-mints keep the row, so they don't move it. Access via
+    /// [`Self::member_count`] / [`Self::member_count_inc`] /
+    /// [`Self::member_count_dec`].
+    pub member_count_cache: Arc<AtomicU64>,
+    pub join_requests_ks: KeyspaceHandle,
+    /// Uploaded Rego policies (M2.2). Holds every revision; the
+    /// active pointer for each purpose lives in
+    /// [`Self::active_policies_ks`].
+    pub policies_ks: KeyspaceHandle,
+    /// Per-purpose pointer to the currently-active policy id. One
+    /// row per [`crate::policy::PolicyPurpose`] variant. M2.3's
+    /// activate endpoint flips this; M2.6 / M2.7 / M2.13 read it.
+    pub active_policies_ks: KeyspaceHandle,
+    /// BitstringStatusList state (M2.10). One row per
+    /// [`affinidi_status_list::StatusPurpose`] variant. M2.11's
+    /// public route reads from it; M2.14's flip-on-removal path
+    /// writes.
+    pub status_lists_ks: KeyspaceHandle,
+    /// Local mirror of trust-registry records (Phase 3 M3.1).
+    /// Updated when a `SyncJob` completes successfully so the
+    /// daemon can detect drift at boot.
+    pub registry_records_ks: KeyspaceHandle,
+    /// Pending / in-flight / failed trust-registry sync jobs
+    /// (Phase 3 M3.1). Drained by `MembershipSyncer` (M3.4).
+    pub sync_queue_ks: KeyspaceHandle,
+    /// Singleton row tracking the audit-log tail's last-seen
+    /// timestamp for boot-time replay (Phase 3 M3.3).
+    pub sync_cursor_ks: KeyspaceHandle,
+    /// Durable queue of membership-hook capability-grant jobs.
+    pub hooks_queue_ks: KeyspaceHandle,
+    /// Singleton audit-tail cursor for the hook relay.
+    pub hooks_cursor_ks: KeyspaceHandle,
+    /// In-flight capability writes awaiting their DIDComm reply — shared
+    /// between the hook relay's writer and the inbound demux.
+    pub pending_replies: crate::hooks::PendingReplies,
+    /// VRC trust-edge rows (Phase 4 M4.5). Primary keyspace.
+    pub relationships_ks: KeyspaceHandle,
+    /// VRC per-DID secondary index (Phase 4 M4.5). Keyed by
+    /// `<did>:<vrc-id>` so per-DID list queries are O(matched
+    /// rows). CAS-paired with `relationships_ks`.
+    pub relationships_by_did_ks: KeyspaceHandle,
+    /// Operator-uploaded endorsement type registry (Phase 4
+    /// M4.8.0). Only registered types are issuable.
+    pub endorsement_types_ks: KeyspaceHandle,
+    /// Vetting statement withdrawal notices, keyed by issuer + statement id +
+    /// digest (`crate::vetting::revocation`).
+    pub vetting_revocations_ks: KeyspaceHandle,
+    /// Vetter profiles, keyed by vetter DID (`crate::vetting::profiles`).
+    pub vetter_profiles_ks: KeyspaceHandle,
+    /// Hidden-vetter admission (development branch `zkp-pcs`): spent attestation
+    /// tokens, keyed by token label + serial (`crate::vetting::pcs`).
+    pub vetting_pcs_spent_ks: KeyspaceHandle,
+    /// Hidden-vetter admission (development branch `zkp-pcs`): what the community
+    /// minted — vetter enrolments and served drip ticks (`crate::vetting::pcs_issue`).
+    pub vetting_pcs_issue_ks: KeyspaceHandle,
+    /// The accepted-document-id record (VTI-OPS-025…027). One row per Trust
+    /// Task document `id` accepted for execution. Held in the store rather
+    /// than in a process-local map because VTI-OPS-027 requires the record to
+    /// be shared across every binding this node exposes — the document
+    /// dispatcher today, a bearer REST route in #1641 phase 2. Reach it
+    /// through [`AppState::accepted_ids`].
+    pub accepted_ids_ks: KeyspaceHandle,
+    /// Console signing-key delegations (#1684) — `console_key:<consoleDid>` →
+    /// the admin DID that key may act as. Read on the signed-document path
+    /// when a signer holds no ACL row of its own; see
+    /// [`crate::acl::console_key`].
+    pub console_keys_ks: KeyspaceHandle,
+    /// Operation-bound step-up marks — the pending WebAuthn ceremony for a
+    /// refused signed document, and the one-shot authorization a verified
+    /// gesture leaves for its re-send. See [`crate::acl::bound_step_up`].
+    pub step_up_marks_ks: KeyspaceHandle,
+    /// Members' step-up passkeys — see `crate::step_up_passkey`. Never read
+    /// by login or session step-up.
+    pub step_up_passkeys_ks: KeyspaceHandle,
+    /// Member-portal sessions — see `crate::member_portal`. Never read by the
+    /// administrator auth path.
+    pub member_sessions_ks: KeyspaceHandle,
+    /// Member-portal passkeys — see `crate::member_portal`. Never read by
+    /// console login or step-up.
+    pub member_passkey_ks: KeyspaceHandle,
+    /// Step-up approvers — see `crate::acl::approver`. Read only by the bound
+    /// step-up gate (VTI-APV-015).
+    pub step_up_approvers_ks: KeyspaceHandle,
+    /// Unrestricted-admin consent requests and grants (VTI-APV-014). See
+    /// `crate::acl::admin_consent`.
+    pub admin_actions_ks: KeyspaceHandle,
+    /// Member pushes in flight (`crate::member_push`). Encrypted at rest.
+    pub member_pushes_ks: KeyspaceHandle,
+    /// Notifications addressed to this community, and whom it relayed them to
+    /// (`crate::notifications`). Encrypted at rest.
+    pub notifications_ks: KeyspaceHandle,
+    /// Community boards: boards, ideas and notes (`crate::boards`).
+    pub boards_ks: KeyspaceHandle,
+    /// Member badges: settings, badges, awards and holders' preferences (`crate::badges`).
+    pub badges_ks: KeyspaceHandle,
+    /// Badge pictures, re-encoded (`crate::badges`, over `crate::directory::images`).
+    pub badge_images_ks: KeyspaceHandle,
+    /// OpenID4VP verifier identities and their keys (`crate::oid4vp`).
+    /// Encrypted at rest.
+    pub oid4vp_keys_ks: KeyspaceHandle,
+    /// The verifier identities this VTC can sign OpenID4VP requests as, loaded
+    /// from `oid4vp_keys_ks` at boot. Empty for a community that verifies no
+    /// wallet presentations.
+    pub oid4vp_signers: Arc<crate::oid4vp::VerifierSigners>,
+    /// Open and recently closed OpenID4VP wallet sessions
+    /// (`crate::oid4vp::session`). Encrypted at rest.
+    pub oid4vp_sessions_ks: KeyspaceHandle,
+    /// Certificates trusted to certify credential issuers known by an X.509
+    /// chain (`[oid4vp] x509_trust_anchors`). Empty: none is trusted.
+    pub x509_trust_anchors: Arc<vta_sdk::x509_issuer::X509TrustAnchors>,
+    /// Which members were recently seen sending here over TSP, recorded from
+    /// the proven sender of each inbound TSP frame. A member whose DID
+    /// document advertises no transport (a `did:key` wallet) is pushed to over
+    /// TSP first while it is fresh (`crate::member_push`).
+    pub tsp_reach: Arc<vti_common::tsp_reach::TspReachability>,
+    /// Local GeoIP database (`[geoip] database`) — the coarse city and country
+    /// of a wallet sign-in's requester. Disabled when unconfigured; reloaded
+    /// when its file changes. See [`crate::geoip`].
+    pub geoip: Arc<crate::geoip::GeoIp>,
+    /// In-flight backup bundles for the chunked `backup/*` transfer — records
+    /// and manifests; the bytes are staged under `<data_dir>/backups`. See
+    /// [`vti_common::backup_transfer`].
+    pub backup_bundles_ks: KeyspaceHandle,
+    /// Credential-type schema store (Phase 2 task 2.2): the Issues / Accepts
+    /// registry binding each type to a DTG catalog type + JSON Schema.
+    pub schemas_ks: KeyspaceHandle,
+    /// Community-issued statement and vetter-grant rows (Phase 4
+    /// M4.7). Tracked here for list + revoke surfaces; a statement's body
+    /// itself is signed + returned at issuance time.
+    pub endorsements_ks: KeyspaceHandle,
+    /// Data rooms — one row per room. Carries owner, visibility, epoch and
+    /// retention, and deliberately **no member list**: room membership is
+    /// decided by credentials the room itself issued, so a roster here would
+    /// make the room unmovable and make this service part of its membership.
+    /// See `crate::rooms`.
+    pub rooms_ks: KeyspaceHandle,
+    /// Room records. Ciphertext on the `attributed` and `private` tiers.
+    pub room_records_ks: KeyspaceHandle,
+    /// The rooms' epoch key chains. Wrapped key material this service cannot read.
+    pub room_epoch_links_ks: KeyspaceHandle,
+    /// Each hosted room's revocation list (`rooms/revocations/put`), consulted by every
+    /// room authorization.
+    pub room_revocations_ks: KeyspaceHandle,
+    /// The watches members armed on hosted rooms (`rooms/watch/0.1`): host state only,
+    /// consulted to authorize nothing, signalled over this VTC's messaging.
+    pub room_watches: Arc<vti_rooms::watch::RoomWatches>,
+    /// Room files: the blob index, transfers in flight, limits and the blob store
+    /// (`[rooms.files]`). Ciphertext only: this service never holds a file key.
+    pub room_files: Arc<vti_rooms::blobs::BlobHost>,
+    /// Where room files are stored: storage configs and room assignments
+    /// (`docs/05-design-notes/data-rooms-files.md` §7). The resolver `room_files` writes,
+    /// reads and collects through.
+    pub room_storage: Arc<crate::rooms::storage_configs::RoomStorage>,
+    /// The rooms this community owns (`crate::rooms::community`): the owner's record,
+    /// in its own keyspace, and the community's VTA that holds the rooms' keys.
+    pub community_rooms: Arc<crate::rooms::community::CommunityRooms>,
+    /// The member directory (`crate::directory`): its schema and every
+    /// member's card, in its own keyspace.
+    pub directory: Arc<crate::directory::Directory>,
+    /// The community's logo as served (`crate::community::logo`): the bytes of
+    /// the digest last served, its update rate limit and re-encoding permit.
+    pub community_logo: Arc<crate::community::logo::LogoState>,
+    /// Community elections (`crate::elections`): the registrar's records, and its
+    /// link to ballot boxes over this VTC's messaging.
+    pub elections: Arc<crate::elections::Elections>,
+    pub audit_ks: KeyspaceHandle,
+    pub audit_key_ks: KeyspaceHandle,
+    /// Signed audit checkpoints (#708). Read by `GET /v1/audit/verify`,
+    /// written by the periodic `CheckpointEmitter`.
+    pub audit_checkpoint_ks: KeyspaceHandle,
+    /// Secondary index over the audit log (`crate::audit_index`): derived,
+    /// caught up from the log before every read, never backed up.
+    pub audit_index_ks: KeyspaceHandle,
+    /// Durable delivery-layer outbox (D2 P1a). Backs
+    /// [`vti_common::outbox_store::VtiOutboxStore`] for the messaging
+    /// service's `Guaranteed` sends so delivery-critical work survives a
+    /// restart. Opened alongside the other keyspaces and handed to
+    /// [`crate::messaging::run_didcomm_service`].
+    pub outbox_ks: KeyspaceHandle,
+    /// Durable TSP relationship state ([`vti_common::relationship_store`]) so a
+    /// restart does not §7.2.2-drop every peer's traffic. Injected into the ATM
+    /// by [`crate::messaging::build_messaging`] and swept by its maintenance loop.
+    pub tsp_relationships_ks: KeyspaceHandle,
+    /// Single-use ledger for redeemed Invitation Credentials (VICs).
+    /// Written when a VIC-driven join is admitted; read at verify
+    /// time so a consumed invite can't be replayed.
+    pub consumed_invitations_ks: KeyspaceHandle,
+    /// Registry of issued Invitation Credentials (id → slot / subject /
+    /// role / revocation state). Drives the invitation list + revoke ops.
+    pub invitations_ks: KeyspaceHandle,
+    /// Trust-registry client (Phase 3 M3.2). `None` when
+    /// `config.registry.url` is unset — the daemon runs in
+    /// "no-registry" mode and `registry_health.status()` stays
+    /// `Degraded`.
+    pub registry_client: Option<Arc<dyn crate::registry::TrustRegistryClient>>,
+    /// Live trust-registry reachability + last-success /
+    /// last-failure surface (Phase 3 M3.2). The community-
+    /// profile + diagnostics handlers read this; the
+    /// boot/probe paths write it.
+    /// Per-member publish rate limiting, keyed on a hashed DID. See
+    /// [`crate::relationships::rate_limit`] for why it is keyed that way and
+    /// why it lives in memory.
+    pub publish_rate_limiter: crate::relationships::rate_limit::PublishRateLimiter,
+    pub registry_health: crate::registry::RegistryHealth,
+    /// Latest comparison of the local registry mirror against the registry
+    /// itself. `None` until the first check completes — "not yet known", which
+    /// the diagnostics surface must not render as "no drift".
+    pub registry_drift: crate::registry::DriftState,
+    /// Liveness of the `MembershipSyncer` task (P3.13). The
+    /// supervisor updates it on start / restart-after-panic; the
+    /// diagnostics handler reads it so a dead syncer is visible.
+    pub syncer_health: crate::registry::SyncerHealth,
+    pub config: Arc<RwLock<AppConfig>>,
+    pub did_resolver: Option<DIDCacheClient>,
+    pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    pub jwt_keys: Option<Arc<JwtKeys>>,
+    pub atm: Option<ATM>,
+    /// WebAuthn relying-party handle. `None` when `config.public_url`
+    /// is unset at startup — the install + admin-passkey routes 503
+    /// in that case (per `PasskeyState` contract).
+    pub webauthn: Option<Arc<Webauthn>>,
+    /// Cached `public_url` snapshot for `PasskeyState::public_url`.
+    /// Held alongside the `Webauthn` so the trait impl doesn't need
+    /// to take an async read-lock on the config every request.
+    pub public_url: Option<String>,
+    /// EdDSA signer that verifies install tokens and mints setup-session
+    /// tokens at the end of the claim ceremony. `None` until the secret
+    /// store yields key material — install routes 503 in that case.
+    pub install_signer: Option<Arc<InstallTokenSigner>>,
+    /// Ed25519 signer that mints VMC, VAC, and BitstringStatusList
+    /// credentials (M2.9). Wraps the same `#key-0` secret the
+    /// `secrets_resolver` holds. `None` until the secret store
+    /// yields key material — credential routes 503 in that case.
+    pub credential_signer: Option<Arc<crate::credentials::LocalSigner>>,
+    /// Wraps `install_ks` with the claim-window state machine. Cheap
+    /// to clone; always present once `install_ks` is open.
+    pub install_store: InstallTokenStore,
+    /// HMAC-actor-hashing audit envelope writer. `None` until the
+    /// secret store yields key material (the audit key is HKDF-
+    /// derived from the master seed). Endpoints that emit audit
+    /// events 503 in that case.
+    pub audit_writer: Option<AuditWriter>,
+    /// Sender half of the shared graceful-shutdown channel.
+    /// `POST /v1/admin/config/restart` flips this to `true` to
+    /// trigger the same drain path SIGINT/SIGTERM use.
+    pub shutdown_tx: watch::Sender<bool>,
+    /// Cached supervisor probe (M0.8.3). Computed once at startup
+    /// — process supervisors don't change during the daemon's
+    /// lifetime, and a cached value lets tests inject
+    /// `Some(Manual)` / `None` without racing other tests on the
+    /// shared `std::env`.
+    pub supervisor: Option<SupervisorKind>,
+    /// Shared handle to the running inbound DIDComm listener, published by
+    /// [`crate::messaging::run_didcomm_service`] once it starts. Every outbound
+    /// push to a member goes through this (see [`crate::member_push`]) so it
+    /// reuses the listener's single mediator websocket — the mediator permits
+    /// only one connection per DID, and opening a second made it terminate one
+    /// as `w.websocket.duplicate-channel`. Unset until the listener boots (and
+    /// when messaging is disabled), so sends are best-effort.
+    pub didcomm: Arc<tokio::sync::OnceCell<Arc<crate::messaging::VtcMessaging>>>,
+    /// Git namespaces (`crate::git_ns`): the three keyspaces and the bridge
+    /// client that sends `git-ns/bridge/job` documents.
+    pub git_ns: crate::git_ns::GitNsHandles,
+    /// Per-address budget for raised-limit documents (over the framework's
+    /// default 64 KiB) a claimed — not yet verified — known issuer is granted
+    /// a raised size limit for. See [`crate::trust_tasks::size`].
+    pub large_document_budget: Arc<crate::trust_tasks::size::LargeDocumentBudget>,
+    /// The room budgets (`[rooms.rate_limits]`), one set charged by every
+    /// transport: the HTTPS door and DIDComm / TSP alike, so a presenter has one
+    /// budget per room whichever way it sends
+    /// (`crate::routing::trust_task_admission`). Built on first use.
+    pub room_limiters: crate::routing::trust_task_admission::SharedRoomLimiters,
+    /// Whether the published DID document lets a wallet sign in
+    /// (`TrustTaskHTTPS` + `SignInPortal`), checked at boot and lazily with a
+    /// five-minute cache. Advisory and read-only.
+    pub did_self_check: Arc<crate::did_self_check::DidSelfCheck>,
+}
+
+/// Delivery deadline for a pushed credential-exchange step or other ordinary
+/// proactive task to a member ([`crate::credentials::delivery::push_document`]).
+///
+/// A member who misses one of these can ask again — the credential push, the
+/// exchange query and the reciprocal-VMC request all have a member-initiated
+/// counterpart.
+pub(crate) const EXCHANGE_DELIVER_BY: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
+
+/// Delivery deadline for a removal notice: **30 days**.
+///
+/// Longer than everything else because a removed member has no second route to
+/// the information. Removal hard-deletes their ACL row, and `resolve_auth_role`
+/// refuses any DID without one, so every authenticated endpoint — including any
+/// poll that might have served the notice — is closed to them from the moment
+/// the removal lands. The push is the only channel that exists.
+///
+/// Thirty days is a judgement, not a derivation: long enough that a member
+/// offline for a holiday still learns they were removed, short enough that the
+/// outbox is not a permanent store. A member offline beyond it never finds out,
+/// and no window fixes that — the honest fix would be a retrieval path that
+/// does not require an ACL row, which is a larger design than this.
+pub(crate) const REMOVAL_NOTICE_DELIVER_BY: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 3600);
+
+impl AppState {
+    /// The resolver Trust Task Data-Integrity proofs are verified with.
+    ///
+    /// Carries the configured DID cache, so a proof by any DID that names a key
+    /// — `did:webvh:<scid>:example.com:glenn#key-0` as much as a `did:key` —
+    /// resolves. With no cache configured this degrades to `did:key` only,
+    /// which is what a deployment with no outbound DID resolution gets.
+    pub fn trust_task_vm_resolver(&self) -> vti_common::auth::TrustTaskVmResolver {
+        vti_common::auth::TrustTaskVmResolver::from_optional(self.did_resolver.clone())
+    }
+
+    /// The accepted-document-id record (VTI-OPS-025…027), shared by every
+    /// binding this node exposes.
+    ///
+    /// Cheap to call — the handle is a clone and the claim path's locks are
+    /// shared statically — so a binding takes one where it needs it rather
+    /// than threading it through. See
+    /// [`crate::trust_tasks::accepted_ids`] for how a binding uses it.
+    pub(crate) fn accepted_ids(&self) -> crate::trust_tasks::accepted_ids::AcceptedIds {
+        crate::trust_tasks::accepted_ids::AcceptedIds::new(self.accepted_ids_ks.clone())
+    }
+
+    /// Current cached member-row count (equal to
+    /// `members::list_members(..).len()`). O(1) — see
+    /// [`Self::member_count_cache`].
+    pub fn member_count(&self) -> u64 {
+        self.member_count_cache.load(Ordering::SeqCst)
+    }
+
+    /// Record a newly-admitted member. Call once per admit, under the same
+    /// guard that commits the member row.
+    pub fn member_count_inc(&self) {
+        self.member_count_cache.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record a purged member. Saturating at zero so an unexpected
+    /// double-decrement can never wrap the count around to `u64::MAX` and
+    /// poison every size-gated policy.
+    pub fn member_count_dec(&self) {
+        // `fetch_update` is deprecated in rustc 1.99 in favour of `try_update`,
+        // which is newer than the workspace's 1.95 MSRV.
+        #[allow(deprecated)]
+        let _ = self
+            .member_count_cache
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+}
+
+impl AuthState for AppState {
+    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
+        self.jwt_keys.as_ref()
+    }
+    fn sessions_ks(&self) -> &KeyspaceHandle {
+        &self.sessions_ks
+    }
+}
+
+impl PasskeyState for AppState {
+    fn webauthn(&self) -> Option<&Arc<Webauthn>> {
+        self.webauthn.as_ref()
+    }
+
+    fn acl_ks(&self) -> &KeyspaceHandle {
+        &self.acl_ks
+    }
+
+    fn access_token_expiry(&self) -> u64 {
+        // `config` is wrapped in an `Arc<RwLock<…>>`; the trait method
+        // is sync. `try_read` returns immediately — if a writer is
+        // mid-update we fall through to the workspace default so the
+        // auth layer never blocks. The default values match the
+        // compiled-in `AuthConfig::default()` and the runtime tax of
+        // missing a recently-updated value is bounded by the JWT TTL
+        // anyway.
+        self.config
+            .try_read()
+            .map(|c| c.auth.access_token_expiry)
+            .unwrap_or(AuthConfig::default().access_token_expiry)
+    }
+
+    fn refresh_token_expiry(&self) -> u64 {
+        self.config
+            .try_read()
+            .map(|c| c.auth.refresh_token_expiry)
+            .unwrap_or(AuthConfig::default().refresh_token_expiry)
+    }
+
+    fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
+    }
+
+    fn enrollment_ttl(&self) -> u64 {
+        DEFAULT_ENROLLMENT_TTL_SECS
+    }
+}
+
+pub async fn run(
+    mut config: AppConfig,
+    store: Store,
+    secret_store: Box<dyn SecretStore>,
+) -> Result<(), AppError> {
+    // A console served from a directory must be there, and not writable by
+    // everyone, before anything is served — see `check_serve_dir`.
+    #[cfg(feature = "admin-ui")]
+    if let Some(dir) = config.admin_ui.serve_dir() {
+        crate::admin_ui::check_serve_dir(dir).map_err(AppError::Config)?;
+        info!(dir = %dir.display(), "admin console served from directory");
+    }
+    #[cfg(feature = "admin-ui")]
+    if let Some(dir) = config.admin_ui.members_dir.as_deref() {
+        crate::admin_ui::check_serve_dir(dir).map_err(AppError::Config)?;
+        info!(dir = %dir.display(), "member portal served from directory");
+    }
+    #[cfg(feature = "website")]
+    if let Some(dir) = config.website.landing_dir.as_deref() {
+        crate::website::default_site::check_landing_dir(dir).map_err(AppError::Config)?;
+        info!(dir = %dir.display(), "landing page served from directory");
+    }
+
+    // Open cached keyspace handles
+    let sessions_ks = store.keyspace(keyspaces::SESSIONS)?;
+    let acl_ks = store.keyspace(keyspaces::ACL)?;
+    let community_ks = store.keyspace(keyspaces::COMMUNITY)?;
+    let config_ks = store.keyspace(keyspaces::CONFIG)?;
+
+    // P3.9: refuse to boot on a half-applied backup import. The sentinel
+    // (in the `config` keyspace, which import never clears) is stamped
+    // before the destructive replay and removed only on success — its
+    // presence means a prior import crashed mid-flight and the keyspaces
+    // are in an indeterminate state. Serving that would surface partial
+    // community state. This refusal has no TTL — a stale sentinel is
+    // exactly as unsafe to serve past as a fresh one, so only an explicit
+    // operator decision (not the clock) clears it.
+    if crate::backup::import_in_progress(&config_ks).await? {
+        let since = crate::backup::import_in_progress_since(&config_ks)
+            .await?
+            .unwrap_or_else(|| "an unknown time".into());
+        return Err(AppError::Config(format!(
+            "a backup import was interrupted before it completed (started {since}) — the \
+             datastore is in a half-restored state and the daemon will not serve it. \
+             Recover with one of:\n\
+             • if you still have the original backup bundle: re-run the import \
+               (`cnm backup import`) with it to finish the restore\n\
+             • otherwise: `vtc admin discard-interrupted-import` wipes the partially \
+               restored state back to empty and clears this marker (irreversible — the \
+               community has no state left until a fresh import or re-provision)"
+        )));
+    }
+
+    // P1.1: `config_store` (the db overlay) is canonical for the runtime
+    // config keys — fold any operator PATCHes onto the in-memory config
+    // *before* anything derives from it. The server bind address
+    // (`server.host`/`server.port`) and the `public_url`-derived WebAuthn
+    // RP + status-list URLs are all read from `config` below; without this
+    // a PATCH to a `requires_restart` key is stored but never applied,
+    // even after the restart it asks for.
+    crate::config_store::apply_overrides(
+        &mut config,
+        &crate::config_store::ConfigStore::new(config_ks.clone()),
+    )
+    .await?;
+
+    // Refuse to serve a DID document this binary can't honour. The document is
+    // a contract, and the workspace prefers TSP > DIDComm > REST, so a
+    // transport advertised but not served is the path every *conforming*
+    // client picks — and the only one that cannot work. Runs after the
+    // config-store overlay above because it reads `vtc_did` + `store.data_dir`,
+    // both of which an operator PATCH can move.
+    crate::transport_capability::enforce_at_boot(&config).await?;
+
+    let passkey_ks = store.keyspace(keyspaces::PASSKEY)?;
+    let install_ks = store.keyspace(keyspaces::INSTALL)?;
+    // `install_store` is built later (after `init_auth` yields the storage
+    // key) so it wraps the encrypted `install` handle — see P0.7 below.
+    let members_ks = store.keyspace(keyspaces::MEMBERS)?;
+    let join_requests_ks = store.keyspace(keyspaces::JOIN_REQUESTS)?;
+    let policies_ks = store.keyspace(keyspaces::POLICIES)?;
+    let active_policies_ks = store.keyspace(keyspaces::ACTIVE_POLICIES)?;
+    let status_lists_ks = store.keyspace(keyspaces::STATUS_LISTS)?;
+    let registry_records_ks = store.keyspace(keyspaces::REGISTRY_RECORDS)?;
+    let sync_queue_ks = store.keyspace(keyspaces::SYNC_QUEUE)?;
+    let sync_cursor_ks = store.keyspace(keyspaces::SYNC_CURSOR)?;
+    let hooks_queue_ks = store.keyspace(keyspaces::HOOKS_QUEUE)?;
+    let hooks_cursor_ks = store.keyspace(keyspaces::HOOKS_CURSOR)?;
+    let relationships_ks = store.keyspace(keyspaces::RELATIONSHIPS)?;
+    let relationships_by_did_ks = store.keyspace(keyspaces::RELATIONSHIPS_BY_DID)?;
+    let endorsement_types_ks = store.keyspace(keyspaces::ENDORSEMENT_TYPES)?;
+    let vetting_revocations_ks = store.keyspace(keyspaces::VETTING_REVOCATIONS)?;
+    let vetter_profiles_ks = store.keyspace(keyspaces::VETTER_PROFILES)?;
+    let vetting_pcs_spent_ks = store.keyspace(keyspaces::VETTING_PCS_SPENT)?;
+    let vetting_pcs_issue_ks = store.keyspace(keyspaces::VETTING_PCS_ISSUE)?;
+    let accepted_ids_ks = store.keyspace(keyspaces::ACCEPTED_IDS)?;
+    let console_keys_ks = store.keyspace(keyspaces::CONSOLE_KEYS)?;
+    let step_up_marks_ks = store.keyspace(keyspaces::STEP_UP_MARKS)?;
+    let step_up_passkeys_ks = store.keyspace(keyspaces::STEP_UP_PASSKEYS)?;
+    let member_sessions_ks = store.keyspace(keyspaces::MEMBER_SESSIONS)?;
+    let member_passkey_ks = store.keyspace(keyspaces::MEMBER_PASSKEYS)?;
+    let admin_actions_ks = store.keyspace(keyspaces::ADMIN_ACTIONS)?;
+    let step_up_approvers_ks = store.keyspace(keyspaces::STEP_UP_APPROVERS)?;
+    let member_pushes_ks = store.keyspace(keyspaces::MEMBER_PUSHES)?;
+    let notifications_ks = store.keyspace(keyspaces::NOTIFICATIONS)?;
+    let boards_ks = store.keyspace(keyspaces::BOARDS)?;
+    let badges_ks = store.keyspace(keyspaces::BADGES)?;
+    let badge_images_ks = store.keyspace(keyspaces::BADGE_IMAGES)?;
+    let oid4vp_keys_ks = store.keyspace(keyspaces::OID4VP_KEYS)?;
+    let oid4vp_sessions_ks = store.keyspace(keyspaces::OID4VP_SESSIONS)?;
+    let backup_bundles_ks = store.keyspace(keyspaces::BACKUP_BUNDLES)?;
+    let schemas_ks = store.keyspace(keyspaces::SCHEMAS)?;
+    // Seed the schema store with the built-in catalog Issues types (idempotent;
+    // never overwrites operator edits) so the registry reflects what the VTC
+    // mints out of the box.
+    crate::schemas::seed_default_issues(&schemas_ks).await?;
+    // Seed the predicate accept list with the DTG VSC registry's core
+    // profiles, once (an operator's deletions stay deleted). Without it the
+    // fail-closed accept list would refuse every presented statement.
+    crate::endorsement_types::seed_defaults(&endorsement_types_ks).await?;
+    let endorsements_ks = store.keyspace(keyspaces::ENDORSEMENTS)?;
+    let rooms_ks = store.keyspace(keyspaces::ROOMS)?;
+    let room_records_ks = store.keyspace(keyspaces::ROOM_RECORDS)?;
+    let room_epoch_links_ks = store.keyspace(keyspaces::ROOM_EPOCH_LINKS)?;
+    let room_revocations_ks = store.keyspace(keyspaces::ROOM_REVOCATIONS)?;
+    let room_storage = crate::rooms::files::open_room_storage(
+        &store,
+        &config.store.data_dir,
+        config.rooms.files.as_ref(),
+        config.vtc_did.as_deref(),
+    )
+    .await?;
+    let room_files = Arc::new(crate::rooms::files::open_blob_host(
+        &store,
+        &config.store.data_dir,
+        config.rooms.files.as_ref(),
+        room_storage.clone(),
+    )?);
+    let audit_ks = store.keyspace(keyspaces::AUDIT)?;
+    let audit_key_ks = store.keyspace(keyspaces::AUDIT_KEY)?;
+    let audit_checkpoint_ks = store.keyspace(keyspaces::AUDIT_CHECKPOINT)?;
+    let audit_index_ks = store.keyspace(keyspaces::AUDIT_INDEX)?;
+    let consumed_invitations_ks = store.keyspace(keyspaces::CONSUMED_INVITATIONS)?;
+    let invitations_ks = store.keyspace(keyspaces::INVITATIONS)?;
+    let outbox_ks = store.keyspace(keyspaces::OUTBOX)?;
+    let tsp_relationships_ks = store.keyspace(keyspaces::TSP_RELATIONSHIPS)?;
+
+    // M2.5: install the workspace-shipped default policies for any
+    // PolicyPurpose that lacks an active row. Idempotent — operator
+    // uploads are preserved verbatim. A failure here is non-fatal:
+    // policies are only evaluated by handlers that ship in M2.6+,
+    // and those handlers default-deny when the active pointer is
+    // missing, so a partial install still produces a safe daemon.
+    match crate::policy::default::install_defaults(&policies_ks, &active_policies_ks).await {
+        Ok(0) => debug!("default policies: every purpose already has an active row"),
+        Ok(n) => info!("installed {n} default policy(ies) at boot"),
+        Err(e) => warn!("failed to install default policies: {e}"),
+    }
+
+    // Self-heal a binary-upgrade-over-old-data state: a ceremony purpose
+    // whose active policy predates the decision-pipeline migration
+    // (defines `allow`, not `decision`) is non-functional — the routes
+    // evaluate `data.<pkg>.decision`. Replace those with the shipped
+    // decision-shaped defaults; operator decision-policies are untouched.
+    match crate::policy::default::upgrade_legacy_ceremony_defaults(
+        &policies_ks,
+        &active_policies_ks,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!("upgraded {n} legacy ceremony policy(ies) to decision-shaped defaults"),
+        Err(e) => warn!("failed to upgrade legacy ceremony policies: {e}"),
+    }
+
+    // The personhood default an earlier binary installed either admitted any
+    // witness with a non-empty issuer, digest unchecked (#1068), was written
+    // for the credential shapes before the DTG v1 context and recognises no
+    // current witness statement, or reads the community's own identity check
+    // as the retired plain credential (#1859) rather than as its `vetted/1`
+    // statement. Replace it if — and
+    // only if — it is still the workspace's own row; an operator-authored
+    // personhood policy is left alone.
+    if let Err(e) =
+        crate::policy::default::upgrade_stale_personhood_default(&policies_ks, &active_policies_ks)
+            .await
+    {
+        warn!("failed to upgrade the superseded personhood default: {e}");
+    }
+
+    // The rooms default an earlier binary installed refuses every room the
+    // community itself would own (`vtc/rooms/community/create`): its owner is
+    // no member. Replaced only while it is still the workspace's own row.
+    if let Err(e) =
+        crate::policy::default::upgrade_stale_rooms_default(&policies_ks, &active_policies_ks).await
+    {
+        warn!("failed to upgrade the superseded rooms default: {e}");
+    }
+    // The directory default an earlier binary installed answers members with a
+    // field list, which the card model reads as a narrowing to two fields.
+    // Replaced only while it is still the workspace's own row.
+    if let Err(e) =
+        crate::policy::default::upgrade_stale_directory_default(&policies_ks, &active_policies_ks)
+            .await
+    {
+        warn!("failed to upgrade the superseded directory default: {e}");
+    }
+
+    // M2.10 + M2.11: provision the two BitstringStatusLists.
+    // Idempotent — only seeds decoys when the row is brand new; an
+    // existing row is re-pointed if `public_url` has since changed.
+    // Skipped when `public_url` is unset (pre-setup deployment) —
+    // the status-list `list_credential_id` is baked into every
+    // VMC's `credentialStatus.statusListCredential`, so we can't
+    // mint the row until we know the canonical URL.
+    if let Some(public_url) = config.public_url.as_deref() {
+        for purpose in [
+            affinidi_status_list::StatusPurpose::Revocation,
+            affinidi_status_list::StatusPurpose::Suspension,
+        ] {
+            let url = format!("{public_url}/v1/status-lists/{purpose}");
+            match crate::status_list::ensure_initial(&status_lists_ks, purpose, url).await {
+                Ok(_) => debug!(?purpose, "status list initialised"),
+                Err(e) => warn!(?purpose, "failed to initialise status list: {e}"),
+            }
+        }
+    } else {
+        warn!(
+            "public_url not configured — status lists deferred; \
+             VMC issuance + GET /v1/status-lists/* return 503 until set"
+        );
+    }
+
+    let registry_health = crate::registry::RegistryHealth::new();
+    let registry_drift = crate::registry::DriftState::new();
+
+    // Initialize auth infrastructure. Pass the audit keyspaces in so
+    // `init_auth` can derive the HMAC audit key from the same secret
+    // store contents it uses for the install signer.
+    let (
+        did_resolver,
+        secrets_resolver,
+        jwt_keys,
+        atm,
+        install_signer,
+        audit_writer,
+        credential_signer,
+        storage_key,
+    ) = init_auth(
+        &config,
+        &*secret_store,
+        audit_ks.clone(),
+        audit_key_ks.clone(),
+    )
+    .await?;
+
+    // The did:scid identities verified here before resolve by their bare DID
+    // again, from the sources recorded when they were (VTI-KEY-162).
+    if let Some(resolver) = did_resolver.as_ref() {
+        match crate::scid_sources::seed(&members_ks, resolver).await {
+            Ok(0) => {}
+            Ok(n) => info!(seeded = n, "did:scid sources seeded from the store"),
+            Err(e) => warn!(error = %e, "did:scid sources not seeded"),
+        }
+    }
+
+    // P0.7: `install` (ephemeral install-token signing key) and `passkey`
+    // (WebAuthn state) also hold secrets in the clear. `init_auth` already
+    // migrated + wrapped `audit_key`; do the same for these two here, where
+    // the derived storage key is in scope. Migration is idempotent and
+    // crash-safe; a failure aborts boot rather than serving a store with a
+    // half-encrypted secret keyspace. `install_store` is (re)built on the
+    // wrapped handle so issued tokens are encrypted on disk.
+    // A push record holds the signed Trust Task a TSP or REST outbox entry
+    // names, so it is encrypted like the other stores that hold content; it
+    // starts empty, so there is nothing to migrate.
+    let member_pushes_ks = match storage_key {
+        Some(key) => member_pushes_ks.with_encryption(key),
+        None => member_pushes_ks,
+    };
+    // Held notifications name who told this community what, and whom it relayed
+    // them to: encrypted like the push records. New, so nothing to migrate.
+    let notifications_ks = match storage_key {
+        Some(key) => notifications_ks.with_encryption(key),
+        None => notifications_ks,
+    };
+    // Verifier identities hold private keys; written only through
+    // `vtc oid4vp install`, which encrypts under the same key, so there is
+    // nothing plaintext to migrate. A record that does not load fails the
+    // boot: a verifier that cannot sign answers every wallet with a request
+    // the wallet cannot verify.
+    let oid4vp_keys_ks = match storage_key {
+        Some(key) => oid4vp_keys_ks.with_encryption(key),
+        None => oid4vp_keys_ks,
+    };
+    // An identity whose key the VTA keeps signs over the link to the VTA,
+    // which can be built only once messaging and the credential signer exist —
+    // below. The signers hold the cell it lands in.
+    let vta_link_cell = crate::oid4vp::VtaLinkCell::default();
+    let oid4vp_signers =
+        Arc::new(crate::oid4vp::load_signers(&oid4vp_keys_ks, &vta_link_cell).await?);
+    let vta_held_identities = crate::oid4vp::needs_vta_link(&oid4vp_keys_ks).await?;
+    // A session holds the ephemeral key a wallet's response is encrypted to
+    // and, once answered, the presented claims. New, so nothing plaintext to
+    // migrate.
+    let oid4vp_sessions_ks = match storage_key {
+        Some(key) => oid4vp_sessions_ks.with_encryption(key),
+        None => oid4vp_sessions_ks,
+    };
+    if !oid4vp_signers.is_empty() {
+        info!(
+            identities = ?oid4vp_signers.keys().collect::<Vec<_>>(),
+            "OpenID4VP verifier identities loaded"
+        );
+    }
+    let x509_trust_anchors = Arc::new(load_x509_trust_anchors(&config.oid4vp.x509_trust_anchors)?);
+    if let Some(swiyu) = &config.oid4vp.swiyu_trust {
+        swiyu.check().map_err(AppError::Config)?;
+    }
+    let (install_ks, passkey_ks, audit_key_ks) = match storage_key {
+        Some(key) => {
+            let n_install = install_ks.migrate_to_encrypted(key).await?;
+            let n_passkey = passkey_ks.migrate_to_encrypted(key).await?;
+            if n_install > 0 || n_passkey > 0 {
+                info!(
+                    "encrypted {n_install} legacy install + {n_passkey} legacy passkey row(s) at rest"
+                );
+            }
+            // `audit_key`'s on-disk rows were already migrated inside
+            // `init_auth`; wrap the `AppState`-bound handle too so the
+            // field is consistent with what the `AuditKeyStore` uses.
+            (
+                install_ks.with_encryption(key),
+                passkey_ks.with_encryption(key),
+                audit_key_ks.with_encryption(key),
+            )
+        }
+        None => (install_ks, passkey_ks, audit_key_ks),
+    };
+    let install_store = InstallTokenStore::new(install_ks.clone());
+
+    // Build WebAuthn relying party handle from `public_url`. Optional —
+    // a serverless / pre-setup deployment has no public URL yet and
+    // the install + admin-passkey routes will 503 until one is set.
+    let public_url = config.public_url.clone();
+    let webauthn = match &public_url {
+        Some(url) => match build_webauthn(url) {
+            Ok(w) => Some(Arc::new(w)),
+            Err(e) => {
+                warn!(
+                    "failed to build WebAuthn relying party from public_url '{url}': {e} — passkey routes disabled"
+                );
+                None
+            }
+        },
+        None => {
+            debug!("public_url not configured — WebAuthn / passkey routes disabled");
+            None
+        }
+    };
+
+    // Build the trust-registry client. Two addressing modes, in preference
+    // order:
+    //
+    // - `registry.did` — the registry is a peer we reach over the transport
+    //   both DID documents advertise (TSP > DIDComm > REST). This is the
+    //   normal case: a registry is named by DID in the community's
+    //   `#trust-registry` referral, and a deployment need publish no URL at
+    //   all. `registry.url`, when also set, becomes the REST arm of that
+    //   client rather than a separate path.
+    // - `registry.url` alone — a registry that speaks only TRQP over HTTP.
+    //
+    // Neither ⇒ no client, registry features no-op, `registry_status` reads
+    // `degraded`. Constructed here rather than earlier because the messaging
+    // client needs the credential signer and DID resolver `init_auth` produces;
+    // the messaging handle itself arrives later, through the shared `OnceCell`.
+    let didcomm_cell: Arc<tokio::sync::OnceCell<Arc<crate::messaging::VtcMessaging>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let pending_replies = crate::hooks::PendingReplies::new();
+    let http_arm = match config.registry.url.as_deref() {
+        Some(url) => {
+            let cfg = crate::registry::upstream::UpstreamConfig {
+                base_url: url.to_string(),
+                http_timeout: std::time::Duration::from_secs(config.registry.http_timeout_seconds),
+                authority_did: config.vtc_did.clone(),
+            };
+            match crate::registry::UpstreamRegistryClient::new(cfg) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!(error = ?e, "failed to construct the HTTP trust-registry arm");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let registry_client: Option<Arc<dyn crate::registry::TrustRegistryClient>> =
+        match (config.registry.did.clone(), credential_signer.clone()) {
+            (Some(registry_did), Some(signer)) => {
+                info!(%registry_did, "trust registry addressed by DID over messaging");
+                Some(Arc::new(crate::registry::MessagingRegistryClient::new(
+                    registry_did,
+                    config.vtc_did.clone(),
+                    didcomm_cell.clone(),
+                    signer,
+                    pending_replies.clone(),
+                    did_resolver.clone(),
+                    http_arm,
+                ))
+                    as Arc<dyn crate::registry::TrustRegistryClient>)
+            }
+            // A registry DID without a credential signer would be able to build
+            // documents but not sign them, so every write would fail
+            // `proofRequired` at the registry. Refusing to construct the client
+            // is the honest outcome — `registry_status` reads degraded and the
+            // reason is in the log, rather than a queue that only fills up.
+            (Some(_), None) => {
+                warn!(
+                    "registry.did is set but the VTC has no credential signer — registry \
+                     features disabled until setup completes"
+                );
+                None
+            }
+            (None, _) => match http_arm {
+                Some(c) => {
+                    debug!("trust registry addressed by URL (REST only — no registry.did set)");
+                    Some(Arc::new(c) as Arc<dyn crate::registry::TrustRegistryClient>)
+                }
+                None => {
+                    debug!(
+                        "no trust registry configured (neither registry.did nor registry.url) — \
+                         registry features disabled; registry_status reads 'degraded'"
+                    );
+                    None
+                }
+            },
+        };
+
+    // The link to the VTA (`vta_link`), over this VTC's messaging socket: the
+    // verifier identities whose key it keeps sign through it, and `vta-account`
+    // room storage asks it for presigned requests. Built when this VTC names
+    // its VTA and can sign and resolve.
+    let vta_link = match (
+        config.vta_did.clone(),
+        credential_signer.clone(),
+        did_resolver.clone(),
+    ) {
+        (Some(vta_did), Some(signer), Some(resolver)) => {
+            Some(Arc::new(crate::vta_link::VtaLink::new(
+                vta_did,
+                didcomm_cell.clone(),
+                signer,
+                pending_replies.clone(),
+                resolver,
+            )))
+        }
+        _ => None,
+    };
+
+    // One that cannot be built stops the boot when a verifier identity needs
+    // it: those identities would answer every wallet with nothing, and the
+    // reason belongs in front of the operator.
+    if !vta_held_identities.is_empty() {
+        let Some(link) = vta_link.clone() else {
+            return Err(AppError::Config(format!(
+                "verifier identities {vta_held_identities:?} keep their key in the VTA, which \
+                 needs vta_did, the VTC's signing key and a DID resolver; set them, or remove \
+                 the identities with `vtc oid4vp remove`"
+            )));
+        };
+        info!(vta_did = link.vta_did(), identities = ?vta_held_identities, "verifier identities sign through the VTA");
+        let _ = vta_link_cell.set(link as Arc<dyn crate::oid4vp::VtaJwsSigner>);
+    }
+
+    // The rooms this community owns (`rooms::community`): its VTA holds their
+    // keys, reached over the same link. Without one, a create is refused
+    // `noKeyHolder`.
+    let community_rooms = crate::rooms::community::CommunityRooms::new(
+        store.keyspace(keyspaces::COMMUNITY_ROOMS)?,
+        vta_link
+            .clone()
+            .map(|l| l as Arc<dyn crate::rooms::vta_storage::VtaChannel>),
+    );
+
+    // The member directory (`crate::directory`). Its settings are the
+    // operator's `[directory]`; one it cannot use stops the boot rather than
+    // run wider than written.
+    let directory = Arc::new(crate::directory::Directory::new(
+        store.keyspace(keyspaces::DIRECTORY)?,
+        config.directory.settings().map_err(AppError::Config)?,
+    ));
+
+    // Community elections: ballot boxes are reached over this VTC's messaging, as
+    // this community (VTI-VOT-005), so the link needs its signing key and a resolver.
+    let ballot_box_link = match (credential_signer.clone(), did_resolver.clone()) {
+        (Some(signer), Some(resolver)) => Some(Arc::new(crate::elections::link::BallotBoxLink {
+            peers: crate::outbound::PeerTasks {
+                didcomm: didcomm_cell.clone(),
+                signer: Some(signer),
+                replies: pending_replies.clone(),
+                resolver: Some(resolver),
+            },
+        })
+            as Arc<dyn crate::elections::link::BallotBoxChannel>),
+        _ => None,
+    };
+    let elections = Arc::new(crate::elections::Elections::new(
+        store.keyspace(keyspaces::ELECTIONS)?,
+        ballot_box_link,
+    ));
+
+    // Watches on hosted rooms (`rooms/watch/0.1`). Their signal leaves over this VTC's
+    // messaging as this community, so it needs the signing key and a resolver; without
+    // them every address is unreachable and a watch is refused `addressUnreachable`.
+    let room_watches = Arc::new(vti_rooms::watch::RoomWatches::new(
+        store.keyspace(keyspaces::ROOM_WATCHES)?,
+        rooms_ks.clone(),
+        room_revocations_ks.clone(),
+    ));
+    if let (Some(signer), Some(resolver)) = (credential_signer.clone(), did_resolver.clone()) {
+        room_watches.set_signals(Arc::new(crate::rooms::watch::VtcSignals {
+            peers: crate::outbound::PeerTasks {
+                didcomm: didcomm_cell.clone(),
+                signer: Some(signer),
+                replies: pending_replies.clone(),
+                resolver: Some(resolver),
+            },
+        }));
+    }
+
+    // Sealed storage credentials (`rooms::storage_credentials`): opened with the
+    // community's own key, kept encrypted under the storage key. Without either there
+    // is nowhere safe to keep one, and a `sealed` config reports its credential
+    // `required`.
+    if let (Some(signer), Some(key)) = (credential_signer.as_ref(), storage_key)
+        && let Some(seed) = signer.ed25519_seed()
+        && let Some(root) = signer.derivation_root()
+    {
+        let sealed = crate::rooms::storage_credentials::SealedCredentials::new(
+            store.keyspace(keyspaces::STORAGE_CREDENTIALS)?,
+            key,
+            &seed,
+            root.as_bytes(),
+        );
+        room_storage
+            .set_sealed_credentials(Arc::new(sealed))
+            .await?;
+    }
+
+    // Room files through the community's VTA (`rooms::vta_storage`): the
+    // presigned requests come sealed to this community's key-agreement key.
+    if let (Some(link), Some(vtc_did), Some(secrets)) =
+        (vta_link, config.vtc_did.clone(), secrets_resolver.clone())
+    {
+        let local_ids = credential_signer
+            .as_ref()
+            .and_then(|s| s.key_role_ids().cloned());
+        let (_, ka_id) =
+            crate::messaging::vtc_key_ids(did_resolver.as_ref(), &vtc_did, local_ids.as_ref())
+                .await;
+        let mut storage = crate::rooms::vta_storage::VtaStorage::new(link, vtc_did, secrets);
+        if let Some(ka_id) = ka_id {
+            storage = storage.with_key_agreement_id(ka_id);
+        }
+        room_storage.set_vta_storage(Arc::new(storage)).await?;
+    }
+
+    // Bind TCP listener on the main thread for early port validation
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let std_listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
+    std_listener.set_nonblocking(true).map_err(AppError::Io)?;
+    info!("server listening addr={addr}");
+
+    // Shutdown coordination
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Spawn signal handler on the main tokio runtime
+    tokio::spawn({
+        let shutdown_tx = shutdown_tx.clone();
+        async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        }
+    });
+
+    // Gather DIDComm thread inputs
+    let didcomm_config = config.clone();
+    let didcomm_secrets = secrets_resolver.clone();
+    let didcomm_vtc_did = config.vtc_did.clone();
+
+    // Gather storage thread inputs
+    let storage_sessions_ks = sessions_ks.clone();
+    let storage_member_sessions_ks = member_sessions_ks.clone();
+    let storage_auth_config = config.auth.clone();
+    let has_auth = jwt_keys.is_some();
+
+    // Seed the cached member counter with a single keyspace walk at boot; the
+    // ceremony executor keeps it in step with the row count thereafter.
+    let member_count_cache = Arc::new(AtomicU64::new(
+        crate::members::list_members(&members_ks).await?.len() as u64,
+    ));
+
+    // Git namespaces: the records, the bridge jobs, the registry mirror, and
+    // the client that reaches bridges over the messaging socket the listener
+    // publishes into `didcomm_cell`.
+    let git_ns = crate::git_ns::GitNsHandles {
+        ks: store.keyspace(keyspaces::GIT_NS)?,
+        acl_ks: store.keyspace(keyspaces::ACL)?,
+        jobs_ks: store.keyspace(keyspaces::GIT_NS_JOBS)?,
+        projection_ks: store.keyspace(keyspaces::GIT_NS_PROJECTION)?,
+        bridge: Arc::new(crate::git_ns::bridge::MessagingBridgeClient::new(
+            didcomm_cell.clone(),
+            credential_signer.clone(),
+            pending_replies.clone(),
+            did_resolver.clone(),
+        )),
+    };
+    // Offer the default join criteria once (invitation → automatic, a
+    // membership credential → automatic, anything else → review). Once only:
+    // an administrator's deletions stay deleted, and a community that already
+    // has criteria keeps them. "Recognised" issuers need a trust registry to
+    // be evaluable, so without one the credential criterion counts this
+    // community's own credentials only.
+    let seeded =
+        crate::schemas::seed_default_criteria(&schemas_ks, registry_client.is_some()).await?;
+    if seeded > 0 {
+        info!(seeded, "default join criteria registered");
+    }
+
+    // The local GeoIP database, if configured (base design §12.6). Advisory:
+    // a file that cannot be read is a warning and every location "unknown",
+    // never a boot failure. Read off the runtime's workers — a city database
+    // is over a hundred megabytes.
+    let geoip_path = config.geoip.database.clone();
+    let geoip = Arc::new(
+        tokio::task::spawn_blocking(move || crate::geoip::GeoIp::open(geoip_path))
+            .await
+            .map_err(|e| AppError::Internal(format!("GeoIP database load task: {e}")))?,
+    );
+
+    // Build AppState for the REST thread
+    let state = AppState {
+        sessions_ks,
+        acl_ks,
+        community_ks,
+        config_ks,
+        passkey_ks,
+        install_ks,
+        members_ks,
+        member_count_cache,
+        join_requests_ks,
+        policies_ks,
+        active_policies_ks,
+        status_lists_ks: status_lists_ks.clone(),
+        registry_records_ks,
+        sync_queue_ks,
+        sync_cursor_ks,
+        hooks_queue_ks,
+        hooks_cursor_ks,
+        pending_replies: pending_replies.clone(),
+        relationships_ks,
+        relationships_by_did_ks,
+        endorsement_types_ks,
+        vetting_revocations_ks,
+        vetter_profiles_ks,
+        vetting_pcs_spent_ks,
+        vetting_pcs_issue_ks,
+        accepted_ids_ks: accepted_ids_ks.clone(),
+        console_keys_ks,
+        step_up_marks_ks,
+        step_up_passkeys_ks,
+        member_sessions_ks,
+        member_passkey_ks,
+        admin_actions_ks,
+        step_up_approvers_ks,
+        member_pushes_ks,
+        notifications_ks,
+        boards_ks,
+        badges_ks,
+        badge_images_ks,
+        oid4vp_keys_ks,
+        oid4vp_signers,
+        oid4vp_sessions_ks,
+        x509_trust_anchors,
+        tsp_reach: Arc::new(vti_common::tsp_reach::TspReachability::new()),
+        geoip,
+        backup_bundles_ks,
+        schemas_ks,
+        endorsements_ks,
+        rooms_ks,
+        room_records_ks,
+        room_epoch_links_ks,
+        room_revocations_ks,
+        room_watches,
+        room_files,
+        room_storage,
+        community_rooms,
+        directory,
+        community_logo: Arc::new(crate::community::logo::LogoState::default()),
+        elections,
+        audit_ks,
+        audit_key_ks,
+        audit_checkpoint_ks: audit_checkpoint_ks.clone(),
+        audit_index_ks,
+        outbox_ks,
+        tsp_relationships_ks,
+        consumed_invitations_ks,
+        invitations_ks,
+        registry_client: registry_client.clone(),
+        // Keyed on a random per-process secret: the limiter's map never
+        // leaves this process, so the key need not be stable across restarts
+        // — and a fresh one per boot means a restart cannot be used to
+        // correlate counters from before it.
+        publish_rate_limiter: crate::relationships::rate_limit::PublishRateLimiter::new({
+            let mut k = [0u8; 32];
+            rand::fill(&mut k);
+            k
+        }),
+        registry_health: registry_health.clone(),
+        registry_drift: registry_drift.clone(),
+        syncer_health: crate::registry::SyncerHealth::new(),
+        config: Arc::new(RwLock::new(config)),
+        did_resolver,
+        secrets_resolver,
+        jwt_keys,
+        atm,
+        webauthn,
+        public_url,
+        install_signer,
+        credential_signer: credential_signer.clone(),
+        install_store,
+        audit_writer,
+        shutdown_tx: shutdown_tx.clone(),
+        supervisor: detect_supervisor(),
+        didcomm: didcomm_cell,
+        git_ns,
+        large_document_budget: Arc::new(crate::trust_tasks::size::LargeDocumentBudget::new()),
+        room_limiters: Default::default(),
+        did_self_check: Arc::new(crate::did_self_check::DidSelfCheck::new()),
+    };
+
+    // Rewrite every ACL row from before role-based administration, before
+    // anything is authorized (`vtc-admin-roles.md` §9): an upgrade in place
+    // must not lock an administrator out. A row that cannot be mapped refuses
+    // the boot, naming the DID and the fix — never dropped.
+    crate::acl::migrate::migrate_on_boot(&state).await?;
+    // Phase C3: git-namespace rights are resource grants on the ACL entries.
+    // Any left in the old rights store move onto them now, before a git-ns
+    // task is authorized from the entries (VTI-VTC-020).
+    crate::git_ns::migrate::migrate_on_boot(&state).await?;
+    // The secondary indexes, backfilled for rows written before they existed
+    // (or by a version that did not keep them), before anything reads them:
+    // the ACL's authority holders (#2602) and the relationships' VRC digests
+    // (#2603).
+    let indexed = crate::acl::rebuild_authority_index(&state.acl_ks).await?;
+    tracing::debug!(indexed, "ACL authority index rebuilt");
+    let indexed =
+        crate::relationships::storage::rebuild_hash_index(&state.relationships_ks).await?;
+    tracing::debug!(indexed, "relationship digest index rebuilt");
+    // The audit index is caught up by every reader; doing it here moves the
+    // backfill of an existing log off the first request. Not fatal: a reader
+    // retries it.
+    match crate::audit_index::catch_up(&state.audit_ks, &state.audit_index_ks).await {
+        Ok(read) => tracing::debug!(read, "audit index caught up"),
+        Err(e) => warn!(error = %e, "audit index not caught up at boot; the first read will"),
+    }
+    // Room rows in the earlier, ambiguous key layout move before a room is served (#2382).
+    crate::rooms::migrate_room_keys(&state, "the boot migration").await?;
+
+    // Heal missing AdminEntries: any DID with an Admin ACL grant +
+    // a PasskeyUser but no AdminEntry gets the AdminEntry synthesised
+    // from the PasskeyUser's credentials. Covers daemons where
+    // `vtc admin invite` ran before `claim_finish` started writing
+    // the AdminEntry — without this, `auth/passkey/list` came back empty
+    // (a 404 on the old bearer route) because it reads AdminEntry, not PasskeyUser.
+    if let Err(e) = heal_missing_admin_entries(&state).await {
+        warn!(error = %e, "admin-entry heal scan failed");
+    }
+
+    // Name any endorsement type whose stored `claimSchema` will not compile.
+    // Registration refuses one now, but a row written before that check makes
+    // every issuance of its type fail — and until an issuance is attempted,
+    // nothing says so. The scan is advisory: a read failure is logged and
+    // never stops boot, exactly like the approval-rule warning (#1633).
+    report_invalid_claim_schemas(&state).await;
+
+    // One-shot heal for daemons bootstrapped before the install
+    // ceremony initialised the community profile. New installs land
+    // here as a no-op because `POST /v1/admin/bootstrap` now writes
+    // the profile up front; legacy daemons get a one-time create so
+    // `GET /v1/community/profile` stops 404'ing in the admin UI.
+    // `community_did` is immutable per spec §5.1, so we only heal
+    // when `vtc_did` is actually configured.
+    //
+    // Snapshot the config once for the remainder of the boot path.
+    // The earlier `state.config.read().await` repeated six times
+    // through the boot section made it ambiguous which copy was
+    // canonical and added an awkward "did I drop the guard before
+    // the next await?" question to every change. One clone, read
+    // many times.
+    let boot_cfg = state.config.read().await.clone();
+    if let Some(vtc_did) = boot_cfg.vtc_did.clone()
+        && crate::community::load_profile(&state.community_ks)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        let profile = crate::community::CommunityProfile::new(&vtc_did, "");
+        match crate::community::store_profile(&state.community_ks, &profile).await {
+            Ok(()) => info!(
+                %vtc_did,
+                "initialised default community profile at boot (heal)",
+            ),
+            Err(e) => warn!(error = %e, "failed to initialise default community profile at boot"),
+        }
+    }
+
+    // M3.2: health probes. The **boot** probe and the periodic one are the same
+    // task — the boot probe is simply its first iteration.
+    //
+    // It used to run inline, right here. That was not a race, it was a
+    // guaranteed failure: this is the startup path, and the DIDComm thread is
+    // not spawned until several hundred lines below, so a registry addressed by
+    // DID had no transport to reach when the probe ran. `our_capabilities` was
+    // empty, `select` returned "no transport available yet", and every boot of
+    // a messaging-addressed registry opened with
+    //
+    //     trust-registry health probe failed at boot — running with
+    //     registry_status=degraded
+    //
+    // which said nothing about the registry and everything about our own
+    // ordering. `classify_no_match` already carries a `Transient` arm written
+    // for exactly this window (so the first sync jobs are retried rather than
+    // parked in `Failed`) — that arm is a guard against the consequence; this is
+    // the cause.
+    //
+    // So the probe now waits for the messaging handle to be published before its
+    // first attempt. It stays off the startup path — `run` must reach its
+    // shutdown select for a signal to be honoured — so the wait happens inside
+    // the spawned task, is bounded, and is shutdown-aware. Boot probes when
+    // messaging is not configured at all (a REST-arm-only registry) are
+    // unaffected: there is nothing to wait for, so it probes immediately.
+    let probe_interval_secs = boot_cfg.registry.health_probe_interval_seconds;
+    // Skip the periodic probe entirely when `vtc_did` isn't yet set
+    // (pre-setup). The previous `unwrap_or("did:key:vtc-unknown")`
+    // fallback poisoned every health-probe audit envelope with a
+    // sentinel actor — operators couldn't tell a real "boot before
+    // setup" event from a misconfigured production daemon. The probe
+    // has nothing useful to do until setup completes anyway.
+    let probe_did_opt = boot_cfg.vtc_did.clone();
+    // Note the gate no longer includes `probe_interval_secs > 0`: disabling the
+    // *periodic* probe must not also delete the boot probe, which is the one
+    // that populates `registry_status` for an operator opening the dashboard.
+    if registry_client.is_some() && probe_did_opt.is_some() {
+        /// How long the first probe waits for the messaging listener to publish
+        /// its handle. Generous, because being late costs one delayed probe
+        /// while being early costs a guaranteed-wrong "degraded" at every boot.
+        const MESSAGING_WAIT: Duration = Duration::from_secs(30);
+        /// Poll interval while waiting for that handle.
+        const MESSAGING_POLL: Duration = Duration::from_millis(250);
+
+        let probe_client = registry_client.clone().expect("checked is_some");
+        let probe_health = registry_health.clone();
+        let probe_audit = state.audit_writer.clone();
+        let probe_did = probe_did_opt.clone().expect("checked is_some");
+        let mut probe_shutdown = shutdown_rx.clone();
+        let probe_didcomm = state.didcomm.clone();
+        // Nothing to wait for when messaging is not configured — a registry
+        // reached over its REST arm is ready the moment the client exists.
+        let awaits_messaging = boot_cfg.messaging.is_some();
+        tokio::spawn(async move {
+            if awaits_messaging {
+                match wait_for_handle(
+                    probe_didcomm.as_ref(),
+                    MESSAGING_WAIT,
+                    MESSAGING_POLL,
+                    &mut probe_shutdown,
+                )
+                .await
+                {
+                    HandleWait::Ready => {}
+                    // Probe anyway rather than staying silent: an operator needs
+                    // `registry_status` to reflect a real attempt, and
+                    // "messaging never came up" is itself the diagnosis.
+                    HandleWait::TimedOut => warn!(
+                        wait_secs = MESSAGING_WAIT.as_secs(),
+                        "VTC messaging did not publish its handle before the first \
+                         trust-registry health probe — probing anyway",
+                    ),
+                    HandleWait::ShuttingDown => {
+                        debug!(
+                            "trust-registry health probe task shutting down before its first \
+                             probe",
+                        );
+                        return;
+                    }
+                }
+            }
+
+            // `interval` fires its first tick immediately, so the boot probe is
+            // the first iteration of the same loop rather than a separate call
+            // site that can drift from it. A zero interval would panic the
+            // constructor, so clamp it and return after that first tick.
+            let mut timer = tokio::time::interval(Duration::from_secs(probe_interval_secs.max(1)));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut first = true;
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        match probe_client.health().await {
+                            Ok(()) => {
+                                probe_health
+                                    .record_success(probe_audit.as_ref(), &probe_did)
+                                    .await;
+                                if first {
+                                    info!("trust-registry health probe passed at boot");
+                                }
+                            }
+                            Err(e) => {
+                                probe_health
+                                    .record_failure(
+                                        format!("{e}"),
+                                        probe_audit.as_ref(),
+                                        &probe_did,
+                                    )
+                                    .await;
+                                if first {
+                                    warn!(
+                                        error = %e,
+                                        "trust-registry health probe failed at boot — running \
+                                         with registry_status=degraded",
+                                    );
+                                }
+                            }
+                        }
+                        if first {
+                            first = false;
+                            if probe_interval_secs == 0 {
+                                debug!(
+                                    "periodic trust-registry health probe disabled \
+                                     (health_probe_interval_seconds = 0) — boot probe only",
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    _ = probe_shutdown.changed() => {
+                        debug!("trust-registry health probe task shutting down");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    // Drift check: compare the local `registry_records` mirror against what the
+    // registry actually holds. Its own timer rather than the diagnostics
+    // handler, because enumerating the graph is several round trips and the
+    // admin console polls diagnostics every 15 seconds — computing on demand
+    // would turn one open browser tab into steady load on a third party.
+    let drift_interval_secs = boot_cfg.registry.drift_check_interval_seconds;
+    if registry_client.is_some() && drift_interval_secs > 0 {
+        let drift_client = registry_client.clone().expect("checked is_some");
+        let drift_state = registry_drift.clone();
+        let drift_records_ks = state.registry_records_ks.clone();
+        let mut drift_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            // Offset the first check past boot. The mirror is durable and the
+            // registry is a third party, so there is nothing to learn in the
+            // first seconds that is not better learned once messaging has
+            // settled — and a check that races the health probe's first
+            // connect just reports an outage that is not one.
+            let mut timer = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                Duration::from_secs(drift_interval_secs),
+            );
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        crate::registry::check_drift(
+                            drift_client.as_ref(),
+                            &drift_records_ks,
+                            &drift_state,
+                        )
+                        .await;
+                    }
+                    _ = drift_shutdown.changed() => {
+                        debug!("trust-registry drift check task shutting down");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    // M3.4: spawn the MembershipSyncer task. Drains the
+    // sync_queue against the trust-registry client with
+    // exponential backoff + boot-time InFlight recovery.
+    // Only runs when a registry is configured — without
+    // one, the queue grows visibly via /v1/health/diagnostics
+    // but no dispatch happens.
+    // Same discipline as the probe above — without a `vtc_did` the
+    // syncer's audit envelopes would carry the `vtc-unknown` sentinel
+    // and the queue can't usefully dispatch (no identity to sign
+    // outbound TRQP calls with).
+    let syncer_actor_did_opt = boot_cfg.vtc_did.clone();
+    if let (Some(client), Some(actor_did)) =
+        (state.registry_client.clone(), syncer_actor_did_opt.clone())
+    {
+        let rtbf_batch_window_hours = boot_cfg.registry.rtbf_batch_window_hours;
+        // Supervisor: a bare `tokio::spawn` meant a panicking syncer
+        // loop died silently — the sync queue just stopped draining with
+        // no signal. Re-spawn the loop after a panic (with backoff) and
+        // surface liveness + restart count via `syncer_health`, which
+        // `/v1/health/diagnostics` reports (P3.13). `run(self)` consumes
+        // the syncer, so we reconstruct it from cloned handles each
+        // iteration (cheap — all inputs are `Arc`/handle clones).
+        let health = state.syncer_health.clone();
+        health.set_enabled();
+        let audit_ks = state.audit_ks.clone();
+        let sync_queue_ks = state.sync_queue_ks.clone();
+        let sync_cursor_ks = state.sync_cursor_ks.clone();
+        let registry_records_ks = state.registry_records_ks.clone();
+        let policies_ks = state.policies_ks.clone();
+        let active_policies_ks = state.active_policies_ks.clone();
+        let members_ks = state.members_ks.clone();
+        let directory_ks = state.directory.ks().clone();
+        let registry_health = state.registry_health.clone();
+        let audit_writer = state.audit_writer.clone();
+        let mut supervisor_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *supervisor_shutdown.borrow() {
+                    break;
+                }
+                let syncer = crate::registry::MembershipSyncer::new(
+                    audit_ks.clone(),
+                    sync_queue_ks.clone(),
+                    sync_cursor_ks.clone(),
+                    registry_records_ks.clone(),
+                    policies_ks.clone(),
+                    active_policies_ks.clone(),
+                    members_ks.clone(),
+                    client.clone(),
+                    registry_health.clone(),
+                    audit_writer.clone(),
+                    actor_did.clone(),
+                )
+                .with_rtbf_batch_window_hours(rtbf_batch_window_hours)
+                .with_directory(directory_ks.clone());
+                let run_shutdown = supervisor_shutdown.clone();
+                health.mark_running();
+                let child = tokio::spawn(async move { syncer.run(run_shutdown).await });
+                match child.await {
+                    // Clean return — the loop observed shutdown.
+                    Ok(()) => {
+                        health.mark_stopped();
+                        break;
+                    }
+                    Err(join_err) if join_err.is_panic() => {
+                        health.mark_stopped();
+                        health.record_restart();
+                        error!(
+                            error = %join_err,
+                            "MembershipSyncer task panicked — restarting after backoff"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = supervisor_shutdown.changed() => break,
+                        }
+                    }
+                    // Cancelled (shutdown aborted the child) — stop.
+                    Err(_) => {
+                        health.mark_stopped();
+                        break;
+                    }
+                }
+            }
+            health.mark_stopped();
+        });
+    }
+
+    // Membership hook relay: propagate membership changes to capability grants
+    // in the community's trust registry. Spawned only when git-trust hooks are
+    // configured AND the registry DID + the VTC credential signer are present —
+    // absent any of these the relay is not started (R5.1: no config, no relay).
+    if let (Some(git_trust_cfg), Some(registry_did), Some(signer)) = (
+        boot_cfg.hooks.git_trust.clone(),
+        boot_cfg.registry.did.clone(),
+        state.credential_signer.clone(),
+    ) {
+        let writer = std::sync::Arc::new(crate::hooks::DidcommCapabilityWriter::new(
+            state.didcomm.clone(),
+            signer,
+            registry_did,
+            state.pending_replies.clone(),
+        ));
+        let audit_ks = state.audit_ks.clone();
+        let queue_ks = state.hooks_queue_ks.clone();
+        let cursor_ks = state.hooks_cursor_ks.clone();
+        let git_ns_ks = state.git_ns.ks.clone();
+        // Say so at boot when a role-derived grant lands inside a bound git
+        // namespace: from now on the git-ns projection publishes it, not this
+        // relay, and an operator reading the config should know why.
+        if let Ok(snap) = crate::git_ns::store::Snapshot::load_records(&git_ns_ks).await {
+            for resource in crate::git_ns::projection::hook_overlaps(&snap, &git_trust_cfg) {
+                warn!(
+                    %resource,
+                    "[hooks.git-trust] grant_on_role names a resource inside a bound git \
+                     namespace; the git-ns projection publishes it as a role-derived right \
+                     and the hook relay leaves it alone"
+                );
+            }
+        }
+        let mut supervisor_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *supervisor_shutdown.borrow() {
+                    break;
+                }
+                let relay = crate::hooks::HookRelay::new(
+                    audit_ks.clone(),
+                    queue_ks.clone(),
+                    cursor_ks.clone(),
+                    git_trust_cfg.clone(),
+                    writer.clone(),
+                )
+                .with_git_ns(git_ns_ks.clone());
+                let run_shutdown = supervisor_shutdown.clone();
+                let child = tokio::spawn(async move { relay.run(run_shutdown).await });
+                match child.await {
+                    Ok(()) => break,
+                    Err(join_err) if join_err.is_panic() => {
+                        error!(error = %join_err, "HookRelay task panicked — restarting after backoff");
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = supervisor_shutdown.changed() => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Capability modules: project each enable / disable this community has
+    // decided to its trust registry, until the registry holds it. Spawned only
+    // with a registry client; without one, decisions are held here with their
+    // projection pending and the reason on it, and a later boot with a
+    // registry configured projects them. Supervised like the hook relay.
+    if state.registry_client.is_some() {
+        let projector_state = state.clone();
+        let mut supervisor_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *supervisor_shutdown.borrow() {
+                    break;
+                }
+                let projector = crate::capability_modules::Projector::new(projector_state.clone());
+                let run_shutdown = supervisor_shutdown.clone();
+                let child = tokio::spawn(async move { projector.run(run_shutdown).await });
+                match child.await {
+                    Ok(()) => break,
+                    Err(join_err) if join_err.is_panic() => {
+                        error!(error = %join_err, "capability-module projector panicked — restarting after backoff");
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = supervisor_shutdown.changed() => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Suspensions first, before anything is served and before the git-ns
+    // projector's first pass: a crash between an action's write and its
+    // marker's is settled from the action list, so no request is answered —
+    // and no git right projected or withheld — from a marker the list does
+    // not hold (`vtc-action-list.md` §8.2). Bounded local-store work (one
+    // pass over the action list and the markers), no network and no wait on
+    // another task, so the startup path still reaches its shutdown select.
+    crate::admin_actions::reconcile_suspensions(&state).await?;
+
+    // Git namespaces: the projector — lifecycle sweeps, forge role projection
+    // and bridge job dispatch always; the registry projection when a registry
+    // and this community's DID are both configured. Supervised like the hook
+    // relay: a panic restarts the loop after a pause rather than silently
+    // ending the projection.
+    {
+        let registry = match (state.registry_client.clone(), boot_cfg.vtc_did.clone()) {
+            (Some(client), Some(did)) => Some((client, did)),
+            _ => None,
+        };
+        let tick = std::time::Duration::from_secs(boot_cfg.git_ns.tick_seconds.max(1));
+        let projector_state = state.clone();
+        let mut supervisor_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *supervisor_shutdown.borrow() {
+                    break;
+                }
+                let projector = crate::git_ns::projection::Projector::new(
+                    projector_state.clone(),
+                    registry.clone(),
+                    tick,
+                );
+                let run_shutdown = supervisor_shutdown.clone();
+                let child = tokio::spawn(async move { projector.run(run_shutdown).await });
+                match child.await {
+                    Ok(()) => break,
+                    Err(join_err) if join_err.is_panic() => {
+                        error!(error = %join_err, "git-ns projector panicked — restarting after backoff");
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = supervisor_shutdown.changed() => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Badge groups as issuers the community recognises (VTI-BDG-080), projected to the
+    // trust registry when a registry and this community's DID are both configured.
+    // Supervised like the projectors above.
+    if let (Some(client), Some(did)) = (state.registry_client.clone(), boot_cfg.vtc_did.clone()) {
+        let projector_state = state.clone();
+        let mut supervisor_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *supervisor_shutdown.borrow() {
+                    break;
+                }
+                let projector = crate::badges::registry::Projector::new(
+                    projector_state.clone(),
+                    client.clone(),
+                    did.clone(),
+                );
+                let run_shutdown = supervisor_shutdown.clone();
+                let child = tokio::spawn(async move { projector.run(run_shutdown).await });
+                match child.await {
+                    Ok(()) => break,
+                    Err(join_err) if join_err.is_panic() => {
+                        error!(error = %join_err, "badge issuer registry projector panicked — restarting after backoff");
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            _ = supervisor_shutdown.changed() => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // P0.6: spawn the retention sweeper. It was defined but never spawned, so
+    // terminal join requests (PII in the submitted VP), expired
+    // present-challenge / credx-pending rows, and `Failed` registry sync jobs
+    // accumulated forever. Unconditional — unlike the registry syncer, it has
+    // no external dependency. Runs on its own task until shutdown.
+    // The action list's sweep (VTI-APV-008, §4.4): expiry, invalidation,
+    // acknowledgement, cooling-offs that are due (VTI-APV-019) — and, on its
+    // first pass, at startup, the reconciliation of any action a crash left
+    // `executing` (R2.1): nothing is running in this new process, so every one
+    // is settled from the effect it recorded.
+    // (Suspensions were reconciled above, before the git-ns projector.)
+    crate::admin_actions::spawn_sweeper(state.clone(), shutdown_rx.clone());
+    // The did:scid version floors of the community's members and administrators,
+    // persisted as the resolver learns them so a restart does not reset what it
+    // refuses (VTI-KEY-162).
+    if let Some(resolver) = state.did_resolver.clone() {
+        crate::scid_sources::spawn(
+            state.members_ks.clone(),
+            state.acl_ks.clone(),
+            resolver,
+            shutdown_rx.clone(),
+        );
+    }
+    // Members who left the community leave the rooms it owns (`members/add` item 6): the
+    // one owner of those removals, resuming at start whatever a restart interrupted.
+    crate::rooms::departures::spawn(state.clone(), shutdown_rx.clone());
+    // What archiving and removing a room the community owns leaves to do: a change whose
+    // reset landed and whose re-issue did not, a purge whose grace period ended, a purge
+    // that has not finished, and suspended members owed a restore. Always spawned: idle
+    // while no room has any of these.
+    crate::rooms::community_lifecycle::spawn(state.clone(), shutdown_rx.clone());
+    // A retired directory field's values, erased once its retention period
+    // has passed (`crate::directory::sweep`).
+    crate::directory::sweep::spawn(state.clone(), shutdown_rx.clone());
+    // A refreshed GeoIP database is picked up without a restart.
+    state.geoip.spawn_reloader(shutdown_rx.clone());
+    // The community's own authority over each room it owns, renewed at its VTA before it
+    // lapses. Always spawned: it reads `[rooms.community]` on every pass and does nothing
+    // while community rooms are off or there is no VTA link.
+    crate::rooms::community_renewal::spawn(state.clone(), shutdown_rx.clone());
+    // Each group's authority credential and its members' group credentials,
+    // renewed at the community's VTA before they lapse (`vtc/groups/create`
+    // item 5). Always spawned: it does nothing while `[groups]` is off.
+    crate::groups::renewal::spawn(state.clone(), shutdown_rx.clone());
+    // What each group's room bindings provide its members: offers, withdrawals and
+    // renewals (`vtc/groups/bindings/*`). Always spawned: idle while no binding exists.
+    crate::groups::bindings::spawn(state.clone(), shutdown_rx.clone());
+    // Each dynamic group's members, recomputed from its rule (`vtc/groups/create`
+    // item 6, `update` item 6). Always spawned: idle while no dynamic group exists.
+    crate::groups::dynamic::spawn(state.clone(), shutdown_rx.clone());
+    // The profile of each room the community owns, written into the room by its VTA:
+    // the one retry owner for a create or update that answered `roomProfile: pending`.
+    crate::rooms::community_profile::spawn(state.clone(), shutdown_rx.clone());
+    // Community elections: the one retry owner for a registration the ballot box has
+    // not answered, the board checkpoints, and discarding pre-credentials after close.
+    #[cfg(feature = "voting")]
+    crate::elections::sweeper::spawn(state.clone(), shutdown_rx.clone());
+    // Notifications addressed to this community: later revisions relayed to whoever an
+    // earlier one was (VTI-NTF-044), and lapsed relay records discarded.
+    crate::notifications::inbox::spawn(state.clone(), shutdown_rx.clone());
+    // Room files deleted, orphaned past their grace, or abandoned mid-transfer.
+    crate::rooms::files::spawn_sweeper(
+        state.room_files.clone(),
+        state.room_storage.clone(),
+        boot_cfg.rooms.files.as_ref().map_or_else(
+            || crate::config::RoomFilesConfig::default().sweep_interval_secs,
+            |f| f.sweep_interval_secs,
+        ),
+        shutdown_rx.clone(),
+    );
+    // Room files moved onto the config their room is assigned to
+    // (`vtc/rooms/storage/migrate`): the one retry owner of every migration. Idle while
+    // none is running.
+    crate::rooms::migration::spawn(
+        state.clone(),
+        boot_cfg
+            .rooms
+            .files
+            .as_ref()
+            .and_then(|f| f.migration_max_bytes_per_second)
+            .unwrap_or(crate::rooms::migration::DEFAULT_MAX_BYTES_PER_SECOND)
+            .max(vti_rooms::blobs::MIN_MIGRATION_BYTES_PER_SECOND),
+        shutdown_rx.clone(),
+    );
+    crate::join::retention::RetentionSweeper::spawn(
+        state.join_requests_ks.clone(),
+        state.sync_queue_ks.clone(),
+        state.accepted_ids_ks.clone(),
+        state.step_up_marks_ks.clone(),
+        state.step_up_passkeys_ks.clone(),
+        state.passkey_ks.clone(),
+        state.member_passkey_ks.clone(),
+        state.backup_bundles_ks.clone(),
+        crate::trust_tasks::backup_tasks::blob_dir(&boot_cfg.store.data_dir),
+        boot_cfg.join_requests.clone(),
+        shutdown_rx.clone(),
+    );
+
+    // Step-up approver enrolment state — invites, redemption ceremonies,
+    // install claims, parked install bindings and spent statement ids — past
+    // their life. A storage bound: every read already treats an expired row as
+    // absent. The bindings and their tombstones are kept.
+    {
+        let ks = state.step_up_approvers_ks.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) =
+                    crate::step_up_approver::sweep_expired(&ks, chrono::Utc::now()).await
+                {
+                    warn!(error = %e, "step-up approver sweep failed");
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                }
+            }
+        });
+    }
+
+    // Room watches whose lease ran out (`rooms/watch/0.1` Host item 5). A storage bound:
+    // a lapsed watch never fires, and a room's own are also swept when it moves.
+    {
+        let watches = state.room_watches.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = watches.sweep(chrono::Utc::now()).await {
+                    warn!(error = %e, "room watch sweep failed");
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                }
+            }
+        });
+    }
+
+    // OpenID4VP wallet sessions: close each at `expiresAt` if no wallet
+    // answered — dropping its response key, which the specification requires
+    // of a closed session — and drop records nothing reads any more. Every
+    // minute, because a session lives minutes.
+    {
+        let ks = state.oid4vp_sessions_ks.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = crate::oid4vp::session::sweep(&ks, chrono::Utc::now()).await {
+                    warn!(error = %e, "wallet session sweep failed");
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                }
+            }
+        });
+    }
+
+    // Automatic vetter grants. Always spawned: it reads its configuration
+    // every minute and does nothing until an admin turns it on
+    // (`PUT /v1/vetting/auto-grant`), so enabling needs no restart.
+    crate::vetting::auto_grant::AutoGrantSweeper::spawn(state.clone(), shutdown_rx.clone());
+
+    // Does the published DID document let a wallet sign in? Advisory: runs
+    // off the startup path, a few seconds in (a serverless VTC answers its
+    // own resolution only once it listens), logs one warning naming the fix,
+    // and never stops the boot. Re-checked lazily by the sign-in config.
+    crate::did_self_check::DidSelfCheck::spawn_at_boot(state.clone(), shutdown_rx.clone());
+
+    // #708: spawn the signed-checkpoint emitter. Without it the audit chain
+    // is unkeyed all the way down — a store-level adversary can restamp a
+    // forged suffix or truncate the log to a valid prefix, and `verify` cannot
+    // tell. Requires the credential signer: checkpoints are signed with the
+    // *community* Ed25519 key, deliberately not the audit HMAC key (which
+    // lives in the same store the adversary is assumed to have reached, and
+    // whose symmetric verification would make every verifier a forger).
+    match state.credential_signer.as_ref().and_then(|s| {
+        s.ed25519_signing_key()
+            .map(|k| (k, s.assertion_method_id().to_string()))
+    }) {
+        Some((signing_key, verification_method)) => {
+            crate::audit_checkpoint::CheckpointEmitter::spawn(
+                state.audit_ks.clone(),
+                state.audit_checkpoint_ks.clone(),
+                signing_key,
+                verification_method,
+                boot_cfg.audit_checkpoints.clone(),
+                shutdown_rx.clone(),
+            );
+        }
+        None => {
+            // Not fatal — a VTC with no key material yet still runs — but it
+            // must not look like checkpointing is on when it isn't.
+            tracing::warn!(
+                "no community signing key available; audit checkpoints will NOT be \
+                 emitted and the audit log has only unkeyed-chain tamper-evidence"
+            );
+        }
+    }
+
+    // M0.10, VTI-APV-014 / VTI-APV-016 / VTI-VTC-023: audit every write an
+    // offline command made while the daemon was stopped — the emergency
+    // bootstrap included — and raise each for every remaining administrator to
+    // acknowledge.
+    audit_offline_break_glass(&state).await;
+
+    // VTI-APV-022 item 4: single-administrator mode is never quiet — a
+    // `Critical` row at every start with it in effect, and another when host
+    // configuration turned it on or off since the last start. A start that
+    // cannot record it does not proceed.
+    crate::acl::single_admin::audit_on_boot(&state).await?;
+
+    // Snapshot the CORS allowlist + routing config before the
+    // AppState `move` into the REST thread. Both layers are fixed
+    // at start-up; a future `POST /v1/admin/config/reload` can
+    // swap them if operators demand live updates.
+    let rest_cors = boot_cfg.cors.clone();
+    let rest_routing = boot_cfg.routing.clone();
+
+    // Phase 5 M5.7.2 — emit `AdminUiServed` audit envelope exactly
+    // once at boot, after the audit writer is online. Captures the
+    // SHA-256 of the baked admin SPA's `index.html` so an operator
+    // who suspects a compromise can pin the running build.
+    #[cfg(feature = "admin-ui")]
+    if let Some(writer) = state.audit_writer.as_ref() {
+        let info = crate::admin_ui::AdminUiInfo::for_config(&boot_cfg.admin_ui);
+        let _ = writer
+            .write(
+                "daemon",
+                None,
+                vtc_audit::AuditEvent::AdminUiServed(vtc_audit::AdminUiServedData {
+                    index_sha256: (*info.index_sha256).clone(),
+                    file_count: info.file_count,
+                    mode: (*info.mode).clone(),
+                    daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                }),
+            )
+            .await;
+    }
+
+    // Spawn three named OS threads
+    let mut rest_shutdown_rx = shutdown_rx.clone();
+    let rest_state = state.clone();
+    let rest_handle = std::thread::Builder::new()
+        .name("vtc-rest".into())
+        .spawn(move || {
+            run_rest_thread(
+                std_listener,
+                rest_state,
+                rest_cors,
+                rest_routing,
+                &mut rest_shutdown_rx,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?;
+
+    let mut didcomm_shutdown_rx = shutdown_rx.clone();
+    let didcomm_state = state.clone();
+    let didcomm_handle = std::thread::Builder::new()
+        .name("vtc-didcomm".into())
+        .spawn(move || {
+            run_didcomm_thread(
+                didcomm_config,
+                didcomm_secrets,
+                didcomm_vtc_did,
+                didcomm_state,
+                &mut didcomm_shutdown_rx,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn DIDComm thread: {e}")))?;
+
+    let mut storage_shutdown_rx = shutdown_rx.clone();
+    let storage_handle = std::thread::Builder::new()
+        .name("vtc-storage".into())
+        .spawn(move || {
+            run_storage_thread(
+                store,
+                storage_sessions_ks,
+                storage_member_sessions_ks,
+                storage_auth_config,
+                has_auth,
+                &mut storage_shutdown_rx,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
+
+    // Join REST + DIDComm in parallel, then storage last
+    let (rest_result, didcomm_result) = tokio::join!(
+        tokio::task::spawn_blocking(move || rest_handle.join()),
+        tokio::task::spawn_blocking(move || didcomm_handle.join()),
+    );
+
+    // If either thread panicked, trigger shutdown for the remaining threads
+    let mut any_panic = false;
+
+    match rest_result {
+        Ok(Ok(())) => info!("REST thread stopped"),
+        Ok(Err(_panic)) => {
+            error!("REST thread panicked");
+            any_panic = true;
+        }
+        Err(e) => {
+            error!("failed to join REST thread: {e}");
+            any_panic = true;
+        }
+    }
+
+    match didcomm_result {
+        Ok(Ok(())) => info!("DIDComm thread stopped"),
+        Ok(Err(_panic)) => {
+            error!("DIDComm thread panicked");
+            any_panic = true;
+        }
+        Err(e) => {
+            error!("failed to join DIDComm thread: {e}");
+            any_panic = true;
+        }
+    }
+
+    if any_panic {
+        let _ = shutdown_tx.send(true);
+    }
+
+    // Join storage last — guarantees all writes flushed before database closes
+    match storage_handle.join() {
+        Ok(()) => info!("storage thread stopped"),
+        Err(_panic) => {
+            error!("storage thread panicked");
+            any_panic = true;
+        }
+    }
+
+    if any_panic {
+        return Err(AppError::Internal("one or more threads panicked".into()));
+    }
+
+    info!("server shut down");
+    Ok(())
+}
+
+/// WARN for every registered endorsement type whose stored `claimSchema` is
+/// not valid JSON Schema, naming the type and the part of the document that
+/// is wrong.
+///
+/// Issuance against such a type cannot succeed: `vtc/endorsements/issue/0.1`
+/// has enforced `claimSchema` since #1649, and a schema that will not compile
+/// fails the compile rather than the claim. Registration refuses one now, so
+/// anything this finds was written before that gate — and the only other way
+/// to learn of it is for a member to be refused an endorsement. One line per
+/// broken type at boot is what turns that into something an operator can act
+/// on before it bites.
+///
+/// Advisory: a read failure is logged and never stops boot.
+async fn report_invalid_claim_schemas(state: &AppState) {
+    let types = match crate::endorsement_types::all_types(&state.endorsement_types_ks).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "could not scan endorsement types for invalid claimSchemas");
+            return;
+        }
+    };
+    for t in &types {
+        let Some(schema) = t.claim_schema.as_ref() else {
+            continue;
+        };
+        if let Err(detail) = crate::schemas::check_schema(schema) {
+            warn!(
+                type_uri = %t.type_uri,
+                %detail,
+                "endorsement type has an invalid stored claimSchema — every issuance of \
+                 this type will fail. Delete the type and register it again with a valid \
+                 JSON Schema (or with none).",
+            );
+        }
+    }
+}
+
+/// Walk the ACL keyspace for `Admin` entries; for each, if a
+/// `PasskeyUser` exists for the DID but no `AdminEntry` does,
+/// synthesise the `AdminEntry` from the user's registered
+/// credentials. Idempotent — no-op once every Admin DID has its
+/// entry. Used to repair daemons where the AdminEntry was never
+/// written (pre-fix `vtc admin invite` + claim flow, or a partial
+/// bootstrap that crashed between PasskeyUser and AdminEntry).
+async fn heal_missing_admin_entries(state: &AppState) -> Result<(), AppError> {
+    use chrono::Utc;
+    use vti_common::auth::passkey::store::get_passkey_user_by_did;
+
+    use crate::acl::admin::{AdminEntry, RegisteredPasskey, get_admin_entry, store_admin_entry};
+    // Use the VTC's own ACL type (`VtcRole`), not `vti_common`'s `Role`. The
+    // VTC stores `VtcAclEntry`, whose role set includes `Member` (written by a
+    // join admit); deserializing those rows via `vti_common::acl` fails with
+    // "unknown variant `member`" once any member exists.
+    use crate::acl::list_acl_entries;
+
+    let admins = list_acl_entries(&state.acl_ks).await?;
+    let mut healed = 0usize;
+    for acl_entry in admins {
+        // Any administrative role signs in to the console.
+        if !acl_entry.admin.is_administrator() {
+            continue;
+        }
+        if get_admin_entry(&state.passkey_ks, &acl_entry.did)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        let Some(pk_user) = get_passkey_user_by_did(&state.passkey_ks, &acl_entry.did).await?
+        else {
+            // Admin DID with no passkey yet — login is impossible
+            // anyway. Leave alone; nothing to heal from.
+            continue;
+        };
+        let now = Utc::now();
+        let passkeys: Vec<RegisteredPasskey> = pk_user
+            .credentials
+            .iter()
+            .map(|cred| {
+                let cred_id_hex = hex::encode(<_ as AsRef<[u8]>>::as_ref(cred.cred_id()));
+                RegisteredPasskey {
+                    credential_id: cred_id_hex,
+                    label: "install".into(),
+                    transports: Vec::new(),
+                    registered_at: now,
+                    last_used_at: None,
+                }
+            })
+            .collect();
+        if passkeys.is_empty() {
+            continue;
+        }
+        let entry = AdminEntry {
+            did: acl_entry.did.clone(),
+            passkeys,
+            extensions: serde_json::Value::Null,
+            created_at: now,
+        };
+        store_admin_entry(&state.passkey_ks, &entry).await?;
+        info!(did = %acl_entry.did, "synthesised missing AdminEntry from PasskeyUser (heal)");
+        healed += 1;
+    }
+    if healed > 0 {
+        info!(count = healed, "admin-entry heal scan completed");
+    }
+    Ok(())
+}
+
+/// Storage thread: runs session cleanup loop and persists the store on shutdown.
+fn run_storage_thread(
+    store: Store,
+    sessions_ks: KeyspaceHandle,
+    member_sessions_ks: KeyspaceHandle,
+    auth_config: AuthConfig,
+    has_auth: bool,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build storage runtime");
+
+    rt.block_on(async {
+        info!("storage thread started");
+
+        if has_auth {
+            let interval = Duration::from_secs(auth_config.session_cleanup_interval);
+            let mut timer = tokio::time::interval(interval);
+            // First tick completes immediately; skip it so cleanup doesn't run at startup
+            timer.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
+                            warn!("session cleanup error: {e}");
+                        }
+                        // Member-portal sessions live in their own keyspace
+                        // (`crate::member_portal`) and expire the same way.
+                        if let Err(e) = cleanup_expired_sessions(&member_sessions_ks, auth_config.challenge_ttl).await {
+                            warn!("member session cleanup error: {e}");
+                        }
+                        // Wallet sign-in requests share that keyspace: end
+                        // the expired ones (dropping their addresses) and
+                        // drop the long-ended ones.
+                        if let Err(e) = crate::member_portal::oob::sweep(&member_sessions_ks).await {
+                            warn!("wallet sign-in request sweep error: {e}");
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        info!("storage thread shutting down");
+                        break;
+                    }
+                }
+            }
+        } else {
+            // No auth — just wait for shutdown
+            let _ = shutdown_rx.changed().await;
+            info!("storage thread shutting down");
+        }
+
+        // Persist store before closing
+        if let Err(e) = store.persist().await {
+            error!("failed to persist store on shutdown: {e}");
+        } else {
+            info!("store persisted");
+        }
+    });
+}
+
+/// Build the [`CorsLayer`] applied to every REST response. Honours
+/// the spec §9.3 allowlist:
+///
+/// - Empty `allowed_origins` → CORS is disabled (no cross-origin
+///   responses set the headers); same-origin path-mode deployments
+///   never need an entry.
+/// - Each origin is reflected verbatim by the `Origin` header
+///   match; wildcards are refused at config-load (see
+///   `crate::config::validate_cors`), so by the time we get here
+///   every entry is a literal `http(s)://host[:port]`.
+///
+/// `Access-Control-Allow-Headers` is fixed at the workspace's
+/// "common" header set (Authorization, Content-Type, Trust-Task,
+/// Idempotency-Key). `Access-Control-Allow-Credentials` is `true`
+/// so the admin SPA can carry the future cookie session over the
+/// allowlist edge; an empty allowlist disables CORS entirely so
+/// `credentials: true` is harmless there.
+fn build_cors_layer(cors: &crate::config::CorsConfig) -> CorsLayer {
+    use axum::http::Method;
+    use axum::http::header::{
+        ACCESS_CONTROL_ALLOW_HEADERS, AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue,
+    };
+
+    if cors.allowed_origins.is_empty() {
+        // No origins → same-origin only.
+        return CorsLayer::new();
+    }
+
+    let allowed_origins: Vec<HeaderValue> = cors
+        .allowed_origins
+        .iter()
+        .filter_map(|o| o.parse::<HeaderValue>().ok())
+        .collect();
+
+    let allowed_methods = vec![
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ];
+
+    let allowed_headers: Vec<HeaderName> = vec![
+        AUTHORIZATION,
+        CONTENT_TYPE,
+        ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderName::from_static("trust-task"),
+        HeaderName::from_static("idempotency-key"),
+    ];
+
+    CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods(allowed_methods)
+        .allow_headers(allowed_headers)
+        .allow_credentials(true)
+}
+
+/// REST thread: serves the Axum HTTP server.
+fn run_rest_thread(
+    std_listener: std::net::TcpListener,
+    state: AppState,
+    cors: crate::config::CorsConfig,
+    routing: crate::config::RoutingConfig,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    // P0.10: the REST surface must not run CPU-bound work (Argon2id verify on
+    // the unauth claim-start, Rego eval, VC signing) on a single executor — a
+    // few distinct source IPs hitting claim-start would otherwise saturate the
+    // lone thread (the governor is per-IP, so it doesn't help). A small
+    // worker pool lets concurrent requests progress while one is mid-Argon2id;
+    // the heavy calls themselves are also moved off-runtime via `spawn_blocking`.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 8);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build REST runtime");
+
+    rt.block_on(async {
+        info!(worker_threads, "REST thread started");
+
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .expect("failed to convert std TcpListener to tokio TcpListener");
+
+        let cors_layer = build_cors_layer(&cors);
+
+        // Subdomain-mode host-dispatch (Phase 5 M5.1.2). The
+        // middleware is a no-op when every routing surface has
+        // `host = None` (pure path mode), so configuring it
+        // unconditionally is cheap.
+        let host_map = crate::routing::host_dispatch::HostMap::from_routing(&routing);
+        let host_layer =
+            axum::middleware::from_fn_with_state(host_map, crate::routing::host_dispatch::enforce);
+
+        // CSRF double-submit + Sec-Fetch-Site check (Phase 5
+        // M5.2.2) is attached inside `routes::router_with_xff` (via
+        // `with_csrf`) so the integration harness exercises it exactly
+        // as production does (P3.2) — it is no longer layered here.
+
+        // What the website surface serves (Phase 5 M5.4): the
+        // `website.root_dir` site, else the operator's
+        // `website.landing_dir` page, else the built-in page.
+        #[cfg(feature = "website")]
+        let website_source = match build_website_state(&state.config).await {
+            Some(site) => crate::website::WebsiteSource::Filesystem(site),
+            None => match state.config.read().await.website.landing_dir.clone() {
+                Some(dir) => crate::website::WebsiteSource::Landing(dir),
+                None => crate::website::WebsiteSource::BuiltIn,
+            },
+        };
+
+        let trust_xff_cidrs = state.config.read().await.server.trust_xff_cidrs.clone();
+        // HSTS from the declared public origin (#2661): the request itself
+        // cannot say whether the browser reached us over TLS.
+        let hsts = axum::middleware::from_fn_with_state(
+            crate::routing::security_headers::HstsPolicy::from_public_url(
+                state.config.read().await.public_url.as_deref(),
+            ),
+            crate::routing::security_headers::strict_transport_security,
+        );
+        // `TimeoutLayer` is the outermost layer so the whole-request budget
+        // (P0.10) covers every inner middleware + the handler.
+        #[cfg(feature = "website")]
+        let app = routes::router_with_xff(&routing, website_source, &trust_xff_cidrs)
+            .with_state(state)
+            .layer(host_layer)
+            .layer(hsts)
+            .layer(cors_layer)
+            .layer(TraceLayer::new_for_http())
+            .layer(TimeoutLayer::with_status_code(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                REST_REQUEST_TIMEOUT,
+            ));
+        #[cfg(not(feature = "website"))]
+        let app = routes::router_with_xff(&routing, &trust_xff_cidrs)
+            .with_state(state)
+            .layer(host_layer)
+            .layer(hsts)
+            .layer(cors_layer)
+            .layer(TraceLayer::new_for_http())
+            .layer(TimeoutLayer::with_status_code(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                REST_REQUEST_TIMEOUT,
+            ));
+
+        let shutdown_rx = shutdown_rx.clone();
+        // `into_make_service_with_connect_info` is required: the per-IP
+        // rate limiters key on the peer socket address (or, behind a
+        // trusted proxy, the client it names), and refuse a request
+        // without one (Phase 5 M5.1.5).
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let mut rx = shutdown_rx;
+            let _ = rx.changed().await;
+        })
+        .await
+        .expect("axum serve failed");
+
+        info!("REST thread shutting down");
+    });
+}
+
+/// DIDComm thread: runs the DIDComm service until shutdown.
+fn run_didcomm_thread(
+    config: AppConfig,
+    secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    vtc_did: Option<String>,
+    state: AppState,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build DIDComm runtime");
+
+    rt.block_on(async {
+        info!("DIDComm thread started");
+
+        let (sr, did) = match (&secrets_resolver, &vtc_did) {
+            (Some(sr), Some(did)) => (sr, did.as_str()),
+            _ => {
+                info!("DIDComm not configured — thread idle");
+                let _ = shutdown_rx.changed().await;
+                info!("DIDComm thread shutting down (idle)");
+                return;
+            }
+        };
+
+        messaging::run_didcomm_service(&config, sr, did, state, shutdown_rx).await;
+
+        info!("DIDComm thread shutting down");
+    });
+}
+
+/// Initialize DID resolver, secrets resolver, and JWT keys for authentication.
+///
+/// Returns `None` values if the VTC DID is not configured (server still starts
+/// so the setup wizard can be run first).
+///
+/// Loads a serialized [`crate::setup::VtcKeyBundle`] from the secret
+/// store. The bundle is what the VTA's `provision-integration` flow
+/// produced at setup time; it carries the integration DID + the
+/// Ed25519 + X25519 keys that back `vtc_did#key-0` / `#key-1`.
+/// Install-token signing key + audit key are HKDF-derived from the
+/// Ed25519 private bytes (32 B IKM) with `/v2` info strings — see
+/// `tasks/vtc-mvp/vta-driven-keys.md` §5.2.
+async fn init_auth(
+    config: &AppConfig,
+    secret_store: &dyn SecretStore,
+    audit_ks: KeyspaceHandle,
+    audit_key_ks: KeyspaceHandle,
+) -> Result<
+    (
+        Option<DIDCacheClient>,
+        Option<Arc<ThreadedSecretsResolver>>,
+        Option<Arc<JwtKeys>>,
+        Option<ATM>,
+        Option<Arc<InstallTokenSigner>>,
+        Option<AuditWriter>,
+        Option<Arc<crate::credentials::LocalSigner>>,
+        // P0.7: at-rest storage-encryption key (HKDF of the bundle Ed25519
+        // seed). `None` only when no key material is configured yet (pre-setup)
+        // or derivation fails — the caller then leaves keyspaces unencrypted.
+        // The `audit_key` keyspace is already migrated + wrapped with this key
+        // before return; the caller re-wraps `install` + `passkey`.
+        Option<[u8; 32]>,
+    ),
+    AppError,
+> {
+    // P0.9: a daemon with no `vtc_did` is legitimately pre-setup — it boots
+    // degraded (auth/issue/install routes 503) so the operator can run
+    // `vtc setup`. But once `vtc_did` IS configured, an empty / erroring /
+    // mismatched secret store is a *broken* identity (lost keyring entry,
+    // wrong backend, wrong service name). Those used to return all-`None`
+    // too, so the daemon served a healthy listener while every auth call
+    // 503'd and the only signal was a log line. Fail the boot hard instead so
+    // monitoring sees a non-zero exit, not a zombie.
+    let vtc_did = match &config.vtc_did {
+        Some(did) => did.clone(),
+        None => {
+            warn!("vtc_did not configured — auth endpoints will not work (run setup first)");
+            return Ok((None, None, None, None, None, None, None, None));
+        }
+    };
+
+    // Load the VtcKeyBundle from the secret store. Backwards-compat
+    // window: tests + the legacy bootstrap flow still feed 64 raw
+    // bytes (`[Ed25519:32 || X25519:32]`) directly; we accept that
+    // shape too and synthesize an in-memory bundle. Production
+    // setup writes the JSON shape via `inline_secret_for_bundle`.
+    let stored = match secret_store.get().await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err(AppError::Config(format!(
+                "vtc_did is configured ({vtc_did}) but the secret store is empty — key \
+                 material is missing (lost keyring entry, wrong secrets backend, or a \
+                 different keyring_service?). Run `vtc setup` or restore the secret; \
+                 refusing to boot into an auth-dead state"
+            )));
+        }
+        Err(e) => {
+            return Err(AppError::Config(format!(
+                "vtc_did is configured ({vtc_did}) but the secret store failed to load: {e} \
+                 — check the backend's availability and permissions; refusing to boot into \
+                 an auth-dead state"
+            )));
+        }
+    };
+
+    // The post-quantum signing keys the bundle holds, if any. Read before the
+    // pair because a bundle whose extra key cannot be decoded must fail the
+    // boot, not be booted past: the DID document publishes that key as an
+    // assertion method, so issuing without it produces credentials a verifier
+    // expecting two proofs will read as incomplete — silently.
+    //
+    // Empty for every VTC provisioned from a v1 `vtc-host`, which is every one
+    // that exists today, and for the legacy raw-bytes shape below.
+    let additional_secrets =
+        match crate::setup::bundle::VtcKeyBundle::from_secret_store_bytes(&stored) {
+            Ok(bundle) => crate::setup::bundle::additional_signing_secrets(&bundle)?,
+            // Not a bundle at all — the legacy 64-raw-byte fixture shape, which
+            // `decode_secret_store_value` accepts just below and which cannot carry
+            // extra keys. Its own error is the one worth surfacing, so say nothing
+            // here.
+            Err(_) => Vec::new(),
+        };
+
+    let own = match crate::setup::bundle::own_key_material(&vtc_did, &stored) {
+        Ok(own) => own,
+        Err(msg) => {
+            return Err(AppError::Config(format!(
+                "vtc_did is configured ({vtc_did}) but the stored key material does not \
+                     match it: {msg}. This usually means the secret store holds a different \
+                     identity's bundle; refusing to boot into an auth-dead state"
+            )));
+        }
+    };
+
+    let derivation_root = own.derivation_root.clone();
+
+    // P0.7: derive the at-rest storage-encryption key from the derivation root
+    // (HKDF-SHA256, info `vtc-storage-key/v1`) — the bundle's Ed25519 seed for
+    // every VTC that has no explicit root, so the key is what it always was,
+    // and a stored root once the signing key can rotate, so a rotation does not
+    // strand what is encrypted. Domain-separated from the install-token
+    // (`vtc-install-jwt-key/v2`) and audit (`vtc-audit-key/v2`) derivations by
+    // its info string, so the same IKM yields three independent keys. `None`
+    // only on the (practically impossible) HKDF-expand failure, in which case
+    // keyspaces stay plaintext rather than the daemon refusing to boot.
+    let storage_key: Option<[u8; 32]> = derive_storage_key(&*derivation_root);
+
+    // M2.9 credential signer — wraps the same 32-byte Ed25519
+    // seed in a [`LocalSigner`] handle so VMC / VAC / status-list
+    // credential builders can sign without round-tripping through
+    // the secret store on every call.
+    //
+    // Every additional signing key the VTA minted is added here, so each
+    // credential carries one proof per key — the classical one a verifier that
+    // has not migrated checks, the post-quantum one a verifier that has. A VTC
+    // holding only `#key-0` adds nothing and issues exactly what it always did:
+    // one key emits a proof object, several emit an array.
+    //
+    // Keys by role: a key-role identity (a did:webs VTC) signs credentials as
+    // the `attestation` method its bundle names and authenticates with its
+    // distinct `operational` key; a did:webvh VTC signs both as `#key-0`.
+    let signer = additional_secrets.into_iter().fold(
+        crate::credentials::LocalSigner::for_own_keys(vtc_did.clone(), &own),
+        |signer, secret| signer.with_additional_key(secret),
+    );
+    let crate::setup::bundle::OwnKeyMaterial {
+        ed25519: ed25519_bytes,
+        x25519: x25519_bytes,
+        authentication: authentication_secret,
+        key_role_ids,
+        ..
+    } = own;
+    info!(
+        vtc_did = %vtc_did,
+        signing_keys = signer.key_count(),
+        "credential signer ready"
+    );
+    let credential_signer = Some(Arc::new(signer));
+
+    // Derive the install-token signer from the derivation root (the
+    // 32-byte Ed25519 private for every VTC without a stored root). HKDF info is `vtc-install-jwt-key/v2` — bumped from
+    // /v1 alongside the VTA-driven-keys rework so any pre-rework
+    // deployment that still feeds a BIP-39-derived 64-byte seed
+    // derives a different signing key and fails token verification
+    // loudly instead of silently accepting tokens minted under the
+    // old derivation. See `tasks/vtc-mvp/vta-driven-keys.md` §5.2.
+    let install_signer = match InstallTokenSigner::from_master_seed(&*derivation_root) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            warn!("failed to derive install token signer: {e} — install routes disabled");
+            None
+        }
+    };
+
+    // P0.7: the `audit_key` keyspace holds the HMAC audit key in the clear.
+    // Migrate any pre-encryption plaintext row in place, then wrap the
+    // handle so the key is encrypted at rest going forward. A migration
+    // failure leaves the keyspace bare (still readable) and is logged — we
+    // only build the encrypted handle once the legacy rows are converted,
+    // so an encrypted read can never hit a stale plaintext row.
+    let audit_key_ks = match storage_key {
+        Some(key) => match audit_key_ks.migrate_to_encrypted(key).await {
+            Ok(n) => {
+                if n > 0 {
+                    info!("encrypted {n} legacy audit_key row(s) at rest");
+                }
+                audit_key_ks.with_encryption(key)
+            }
+            Err(e) => {
+                warn!(
+                    "audit_key encryption-at-rest migration failed: {e} — \
+                     keyspace left unencrypted"
+                );
+                audit_key_ks
+            }
+        },
+        None => audit_key_ks,
+    };
+
+    // Derive the initial HMAC audit key from the derivation root (it is
+    // persisted on first boot, encrypted under the storage key). The
+    // `AuditKeyStore` info string is also bumped to /v2 in
+    // vti-common — see the rework note there.
+    let audit_writer = {
+        let key_store = AuditKeyStore::new(audit_key_ks);
+        match key_store.ensure_initial(&*derivation_root).await {
+            Ok(_) => Some(AuditWriter::new(audit_ks, key_store)),
+            Err(e) => {
+                warn!("failed to derive initial audit key: {e} — audit-emitting routes disabled");
+                None
+            }
+        }
+    };
+
+    // 1. DID resolver (local mode) — the node's one DID-document cache. The
+    // messaging listener shares it (`messaging::build_messaging`), so a
+    // refresh on any path is seen by all of them. Its TTL is explicit and
+    // bounded (`[did_cache]`, default 60 s, at most 300 s): it is how long a
+    // key revoked from a member's document keeps verifying here. The host
+    // policy is the one the VTA and the CLIs use.
+    info!(
+        ttl_secs = config.did_cache.ttl_secs,
+        capacity = config.did_cache.capacity,
+        "DID document cache bounds"
+    );
+    let did_resolver =
+        match DIDCacheClient::new(vta_sdk::resolver::build_verifier_did_cache_config(
+            None,
+            config.did_cache.ttl_secs,
+            config.did_cache.capacity,
+        ))
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("failed to create DID resolver: {e} — auth endpoints will not work");
+                return Ok((
+                    None,
+                    None,
+                    None,
+                    None,
+                    install_signer,
+                    audit_writer,
+                    credential_signer,
+                    storage_key,
+                ));
+            }
+        };
+
+    // A did:webs VTC whose VTA rotated its key (`pnm webs rotate`) holds a key
+    // its document no longer lists, and a verifier refuses what that key signs
+    // (VTI-KEY-042): refuse to boot, naming `vtc keys request` / `refresh`. An
+    // unreachable host proves nothing, so it only warns.
+    if vtc_did.starts_with("did:webs:")
+        && let Ok(bundle) = crate::setup::bundle::VtcKeyBundle::from_secret_store_bytes(&stored)
+    {
+        match did_resolver.resolve(&vtc_did).await {
+            Ok(resolved) => {
+                if let Ok(document) = serde_json::to_value(&resolved.doc)
+                    && let Some(why) = crate::setup::refresh::stale_signing_key(&bundle, &document)
+                {
+                    return Err(AppError::Config(why));
+                }
+            }
+            Err(e) => warn!(
+                %vtc_did,
+                error = %e,
+                "could not resolve the VTC's did:webs to check its keys are current"
+            ),
+        }
+    }
+
+    // 2. Secrets resolver with VTC's Ed25519 + X25519 secrets
+    let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
+
+    // Under the ids the VTC's own document gives its keys, by role
+    // (VTI-KEY-150; `#key-0` / `#key-1` on the VTC's own did:webvh).
+    let (signing_id, ka_id) =
+        crate::messaging::vtc_key_ids(Some(&did_resolver), &vtc_did, key_role_ids.as_ref()).await;
+    match authentication_secret {
+        // A key-role identity authenticates (DIDComm, mediator login) with its
+        // operational key; its attestation key is held too, under its own id.
+        Some(mut operational) => {
+            operational.id = signing_id;
+            secrets_resolver.insert(operational).await;
+            if let Some(ids) = key_role_ids.as_ref() {
+                let mut attestation = Secret::generate_ed25519(None, Some(&*ed25519_bytes));
+                attestation.id = ids.signing.clone();
+                secrets_resolver.insert(attestation).await;
+            }
+        }
+        None => {
+            let mut signing_secret = Secret::generate_ed25519(None, Some(&*ed25519_bytes));
+            signing_secret.id = signing_id;
+            secrets_resolver.insert(signing_secret).await;
+        }
+    }
+
+    match Secret::generate_x25519(None, Some(&*x25519_bytes)) {
+        Ok(mut ka_secret) => {
+            ka_secret.id = ka_id.unwrap_or_else(|| format!("{vtc_did}#key-1"));
+            secrets_resolver.insert(ka_secret).await;
+        }
+        Err(e) => warn!("failed to create VTC key-agreement secret: {e}"),
+    }
+
+    // 3. JWT signing key from config (random key, not derived from VTC keys)
+    let jwt_keys = match &config.auth.jwt_signing_key {
+        Some(b64) => match JwtKeys::from_base64_seed(b64, "VTC") {
+            Ok(k) => k,
+            Err(e) => {
+                warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
+                return Ok((
+                    Some(did_resolver),
+                    Some(Arc::new(secrets_resolver)),
+                    None,
+                    None,
+                    install_signer,
+                    audit_writer,
+                    credential_signer,
+                    storage_key,
+                ));
+            }
+        },
+        None => {
+            warn!(
+                "auth.jwt_signing_key not configured — auth endpoints will not work (run setup first)"
+            );
+            return Ok((
+                Some(did_resolver),
+                Some(Arc::new(secrets_resolver)),
+                None,
+                None,
+                install_signer,
+                audit_writer,
+                credential_signer,
+                storage_key,
+            ));
+        }
+    };
+
+    // 4. Build ATM for DIDComm message unpacking (used by auth endpoints)
+    let secrets_resolver = Arc::new(secrets_resolver);
+    let atm = {
+        let tdk_config = TDKConfig::builder()
+            .with_did_resolver(did_resolver.clone())
+            .with_secrets_resolver((*secrets_resolver).clone())
+            .with_load_environment(false)
+            .build();
+        match tdk_config {
+            Ok(cfg) => match TDKSharedState::new(cfg).await {
+                Ok(tdk) => match ATMConfig::builder().build() {
+                    Ok(atm_cfg) => match ATM::new(atm_cfg, Arc::new(tdk)).await {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            warn!("failed to create ATM for auth unpack: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        // Every other init branch in this block falls
+                        // back to `None` and lets the daemon boot
+                        // without DIDComm auth. The earlier `.unwrap()`
+                        // here would crash the entire process on what
+                        // is structurally an optional feature.
+                        warn!("failed to build ATMConfig: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("failed to create TDK shared state: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("failed to build TDK config: {e}");
+                None
+            }
+        }
+    };
+
+    info!("auth initialized for DID {vtc_did}");
+
+    Ok((
+        Some(did_resolver),
+        Some(secrets_resolver),
+        Some(Arc::new(jwt_keys)),
+        atm,
+        install_signer,
+        audit_writer,
+        credential_signer,
+        storage_key,
+    ))
+}
+
+/// Derive the at-rest storage-encryption key (P0.7).
+///
+/// `HKDF-SHA256(IKM = derivation root, info = b"vtc-storage-key/v1")`, where the
+/// root is the bundle's Ed25519 seed unless the bundle stores one
+/// ([`crate::setup::bundle::VtcKeyBundle::derivation_root`]).
+/// The info string domain-separates this key from the install-token signer
+/// (`vtc-install-jwt-key/v2`) and audit HMAC key (`vtc-audit-key/v2`) that
+/// share the same IKM. Returns `None` only if HKDF expand fails (it cannot
+/// for a 32-byte output), in which case the caller leaves keyspaces
+/// unencrypted rather than refusing to boot.
+/// The at-rest storage key, derived exactly as the daemon derives it, for an
+/// offline command that writes an encrypted keyspace (`vtc oid4vp install`).
+///
+/// Reads the VTC's key bundle from its secret store; refuses when the VTC is
+/// not set up, because a row written unencrypted (or under another key) is one
+/// the daemon cannot read back.
+pub(crate) async fn offline_storage_key(config: &AppConfig) -> Result<[u8; 32], AppError> {
+    let vtc_did = config.vtc_did.as_deref().ok_or_else(|| {
+        AppError::Config("this VTC is not set up (no vtc_did); run `vtc setup` first".into())
+    })?;
+    let store = crate::keys::seed_store::create_secret_store(config)?;
+    let stored = store
+        .get()
+        .await
+        .map_err(|e| AppError::Config(format!("the secret store failed to load: {e}")))?
+        .ok_or_else(|| AppError::Config("the secret store holds no key bundle".into()))?;
+    let own = crate::setup::bundle::own_key_material(vtc_did, &stored).map_err(AppError::Config)?;
+    derive_storage_key(&*own.derivation_root)
+        .ok_or_else(|| AppError::Internal("storage-key derivation failed".into()))
+}
+
+pub(crate) fn derive_storage_key(root: &[u8]) -> Option<[u8; 32]> {
+    let mut key = [0u8; 32];
+    match Hkdf::<Sha256>::new(None, root).expand(b"vtc-storage-key/v1", &mut key) {
+        Ok(()) => Some(key),
+        Err(e) => {
+            warn!("failed to derive storage-encryption key: {e} — keyspaces left unencrypted");
+            None
+        }
+    }
+}
+
+/// Decode a base64url-no-pad JWT signing key and construct `JwtKeys`.
+/// Construct the public-website state from operator config (Phase 5
+/// M5.4). Returns `None` when:
+///
+/// - `website.root_dir` is unset (operator opt-out); the handler
+///   stays as the 503 placeholder.
+/// - The configured `deploy_mode` value isn't recognised; a
+///   warning is logged and the daemon falls back to the
+///   placeholder so a misconfiguration can't bring down the API
+///   surface.
+///
+/// On success, the returned [`crate::website::WebsiteState`] is
+/// passed to [`crate::routes::router_with`] which mounts the
+/// static handler at `routing.website.mount`.
+#[cfg(feature = "website")]
+async fn build_website_state(
+    config: &Arc<RwLock<crate::config::AppConfig>>,
+) -> Option<crate::website::WebsiteState> {
+    let cfg = config.read().await;
+    let root_dir = cfg.website.root_dir.as_ref()?;
+
+    let root = match crate::website::WebsiteRoot::new(root_dir, &cfg.website.deploy_mode) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("website.deploy_mode invalid ({e}); falling back to 503 placeholder");
+            return None;
+        }
+    };
+
+    let cache = crate::website::cache::WebsiteCache::new(cfg.website.live_cache_ttl_seconds);
+
+    info!(
+        root = %root_dir.display(),
+        mode = %cfg.website.deploy_mode,
+        "public-website handler enabled",
+    );
+
+    Some(crate::website::WebsiteState {
+        root,
+        cache,
+        executable_blocklist: cfg.website.executable_blocklist.clone(),
+        cache_control: cfg.website.cache_control.clone(),
+        csp_override_file: cfg.website.csp_override_file.clone(),
+        csp_cache: crate::website::CspOverrideCache::new(cfg.website.live_cache_ttl_seconds),
+    })
+}
+
+use vti_common::runtime::shutdown_signal;
+
+/// How a wait for a background task's published handle ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleWait {
+    /// The handle was published; the caller can use it.
+    Ready,
+    /// The budget elapsed first. The caller decides whether to proceed anyway —
+    /// for the health probe, proceeding is right, because "it never came up" is
+    /// a real answer that belongs in `registry_status`.
+    TimedOut,
+    /// Shutdown was signalled while waiting; the caller must return.
+    ShuttingDown,
+}
+
+/// Wait for a [`OnceCell`](tokio::sync::OnceCell) to be filled, giving up after
+/// `wait` and abandoning immediately on shutdown.
+///
+/// Generic over the cell's contents purely so it is testable: the real caller
+/// passes the messaging handle, which cannot be constructed without a live ATM
+/// and mediator socket.
+///
+/// This exists because the trust-registry health probe used to run inline on the
+/// startup path, before the DIDComm thread was spawned — so a registry addressed
+/// by DID was probed with no transport available and every boot reported
+/// `degraded`. Polling rather than a notify keeps it decoupled from whatever
+/// fills the cell; the cost is bounded by `poll`, and this runs once per process.
+async fn wait_for_handle<T>(
+    cell: &tokio::sync::OnceCell<T>,
+    wait: Duration,
+    poll: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> HandleWait {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if cell.get().is_some() {
+            return HandleWait::Ready;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return HandleWait::TimedOut;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(poll) => {}
+            _ = shutdown.changed() => return HandleWait::ShuttingDown,
+        }
+    }
+}
+
+/// Surface every write an offline command made while the daemon was stopped —
+/// an ACL grant or removal (VTI-APV-014), a step-up approver invite minted on
+/// the host (`vtc admin enrol-approver`, VTI-APV-016), an emergency bootstrap.
+/// Each skipped the rules the daemon enforces by design. For each, this writes
+/// the audit row that says so and raises an `acknowledge` item every remaining
+/// administrator must acknowledge (**VTI-VTC-023**,
+/// [`crate::admin_actions::raise_operator_item`]). Called at boot, once the
+/// audit writer is online.
+///
+/// Remote-first (CLAUDE.md R2.1): a marker is cleared only after its item is
+/// raised. A crash in between raises it again on the next boot — under the
+/// same id, so once — rather than losing it; at worst its audit row is written
+/// twice, never not at all.
+pub async fn audit_offline_break_glass(state: &AppState) {
+    use crate::admin_actions::{OperatorWrite, operator_item_raised, raise_operator_item};
+
+    // M0.10: an emergency bootstrap wiped every administrator, so its item is
+    // for whoever administers the community next (`vtc-admin-roles.md` §2).
+    match state.install_store.peek_pending_emergency().await {
+        Ok(Some(pending)) => {
+            let write = OperatorWrite {
+                marker: format!(
+                    "emergency:{}:{}",
+                    pending.operator_hostname,
+                    pending.invoked_at.to_rfc3339()
+                ),
+                command: "vtc admin emergency-bootstrap".into(),
+                action: "emergencyBootstrap".into(),
+                // The recovery DID it installed, then the administrators it
+                // wiped (`vtc/operator/offline-write/0.2` `dids`).
+                dids: pending.dids.clone(),
+                operator_host: pending.operator_hostname.clone(),
+                invoked_at: pending.invoked_at,
+                acknowledgers: None,
+            };
+            match operator_item_raised(state, &write.marker).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        operator_hostname = %pending.operator_hostname,
+                        invoked_at = %pending.invoked_at,
+                        "EMERGENCY BOOTSTRAP was invoked since the daemon last ran — auditing now",
+                    );
+                    if let Some(writer) = state.audit_writer.as_ref()
+                        && let Err(e) = writer
+                            .write(
+                                "did:key:vtc-emergency",
+                                None,
+                                vtc_audit::AuditEvent::EmergencyBootstrapInvoked(
+                                    vtc_audit::EmergencyBootstrapData {
+                                        operator_hostname: pending.operator_hostname.clone(),
+                                        invoked_at: pending.invoked_at,
+                                    },
+                                ),
+                            )
+                            .await
+                    {
+                        error!(error = %e, "failed to emit EmergencyBootstrapInvoked envelope");
+                    }
+                    if let Err(e) = raise_operator_item(state, &write).await {
+                        error!(error = %e, "could not raise the emergency bootstrap for acknowledgement; kept for the next boot");
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "could not read the action list; the emergency marker is kept");
+                    return;
+                }
+            }
+            if let Err(e) = state.install_store.clear_pending_emergency().await {
+                error!(error = %e, "could not clear the emergency-bootstrap marker");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => error!(error = %e, "failed to read the emergency-bootstrap marker"),
+    }
+
+    let writes = match state.install_store.pending_break_glass().await {
+        Ok(w) => w,
+        Err(e) => {
+            error!(error = %e, "failed to read queued break-glass ACL writes");
+            return;
+        }
+    };
+    for (key, w) in writes {
+        let write = OperatorWrite {
+            marker: format!("break-glass:{}", String::from_utf8_lossy(&key)),
+            command: w.command.clone(),
+            action: w.action.clone(),
+            dids: vec![w.did.clone()],
+            operator_host: w.operator_hostname.clone(),
+            invoked_at: w.invoked_at,
+            acknowledgers: (!w.admins.is_empty()).then(|| w.admins.clone()),
+        };
+        match operator_item_raised(state, &write.marker).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    command = %w.command,
+                    action = %w.action,
+                    did = %w.did,
+                    operator_hostname = %w.operator_hostname,
+                    invoked_at = %w.invoked_at,
+                    "an offline change (break-glass) was made since the daemon last ran \
+                     — auditing now and raising it for every administrator to acknowledge",
+                );
+                if let Some(writer) = state.audit_writer.as_ref()
+                    && let Err(e) = writer
+                        .write(
+                            "did:key:vtc-break-glass",
+                            Some(&w.did),
+                            vtc_audit::AuditEvent::AclBreakGlassWritten(
+                                vtc_audit::BreakGlassAclData {
+                                    command: w.command.clone(),
+                                    action: w.action.clone(),
+                                    did: w.did.clone(),
+                                    role: w.role.clone(),
+                                    contexts: w.contexts.clone(),
+                                    operator_hostname: w.operator_hostname.clone(),
+                                    invoked_at: w.invoked_at,
+                                },
+                            ),
+                        )
+                        .await
+                {
+                    error!(error = %e, "failed to emit AclBreakGlassWritten envelope");
+                }
+                if let Err(e) = raise_operator_item(state, &write).await {
+                    error!(error = %e, "could not raise an offline write for acknowledgement; kept for the next boot");
+                    continue;
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "could not read the action list; the break-glass marker is kept");
+                continue;
+            }
+        }
+        if let Err(e) = state.install_store.clear_break_glass(key).await {
+            error!(error = %e, "could not clear a break-glass marker");
+        }
+    }
+}
+
+#[cfg(test)]
+mod handle_wait_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_handle_published_while_waiting_is_picked_up() {
+        // The case the fix exists for: the probe starts before the messaging
+        // listener has published, and must proceed once it does.
+        let cell: Arc<tokio::sync::OnceCell<u8>> = Arc::new(tokio::sync::OnceCell::new());
+        let (_tx, mut rx) = watch::channel(false);
+        let filler = cell.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = filler.set(7);
+        });
+
+        let outcome = wait_for_handle(
+            cell.as_ref(),
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            &mut rx,
+        )
+        .await;
+        assert_eq!(outcome, HandleWait::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_handle_that_never_arrives_times_out_rather_than_hanging() {
+        // Messaging misconfigured or the mediator unreachable: the probe must
+        // still run, so `registry_status` reflects a real attempt instead of
+        // staying blank forever.
+        let cell: tokio::sync::OnceCell<u8> = tokio::sync::OnceCell::new();
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = wait_for_handle(
+            &cell,
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            &mut rx,
+        )
+        .await;
+        assert_eq!(outcome, HandleWait::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_the_wait_abandons_it() {
+        // A stop signal must not be held for the full budget — `run` has to
+        // reach its shutdown select for the signal to be honoured.
+        let cell: tokio::sync::OnceCell<u8> = tokio::sync::OnceCell::new();
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(true);
+        });
+
+        let outcome = wait_for_handle(
+            &cell,
+            Duration::from_secs(30),
+            Duration::from_millis(5),
+            &mut rx,
+        )
+        .await;
+        assert_eq!(outcome, HandleWait::ShuttingDown);
+    }
+
+    #[tokio::test]
+    async fn an_already_published_handle_does_not_wait_at_all() {
+        let cell: tokio::sync::OnceCell<u8> = tokio::sync::OnceCell::new();
+        cell.set(1).expect("fresh cell");
+        let (_tx, mut rx) = watch::channel(false);
+
+        // A 30s budget would hang the test if the ready path slept.
+        let outcome = wait_for_handle(
+            &cell,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            &mut rx,
+        )
+        .await;
+        assert_eq!(outcome, HandleWait::Ready);
+    }
+}
+
+#[cfg(test)]
+mod p0_10_timeout_tests {
+    //! P0.10: the REST `TimeoutLayer` bounds each request so a wedged handler
+    //! can't hold a connection (and a worker) forever, and a concurrent fast
+    //! request is unaffected.
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn timeout_layer_408s_a_slow_handler_but_not_a_fast_one() {
+        async fn slow() -> &'static str {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            "done"
+        }
+        async fn fast() -> &'static str {
+            "ok"
+        }
+
+        let app = axum::Router::new()
+            .route("/slow", get(slow))
+            .route("/fast", get(fast))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                std::time::Duration::from_millis(50),
+            ));
+
+        let slow_res = app
+            .clone()
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            slow_res.status(),
+            StatusCode::REQUEST_TIMEOUT,
+            "a handler exceeding the budget must 408"
+        );
+
+        let fast_res = app
+            .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            fast_res.status(),
+            StatusCode::OK,
+            "a fast request must be unaffected by the timeout"
+        );
+    }
+}
+
+#[cfg(test)]
+mod p0_9_init_auth_tests {
+    //! P0.9: a configured-but-broken identity must fail the boot hard, while
+    //! a daemon with no `vtc_did` still boots degraded for first-run setup.
+    use super::*;
+    use crate::keys::seed_store::PlaintextSecretStore;
+    use std::future::Future;
+    use std::pin::Pin;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    fn temp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .unwrap();
+        (store, dir)
+    }
+
+    fn config_with_did(did: Option<&str>) -> AppConfig {
+        let mut c: AppConfig = toml::from_str("").unwrap();
+        c.vtc_did = did.map(str::to_string);
+        c
+    }
+
+    /// SecretStore whose `get` always errors — models a broken backend
+    /// (keyring locked, cloud perms revoked).
+    struct ErroringStore;
+    impl SecretStore for ErroringStore {
+        fn get(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, AppError>> + Send + '_>> {
+            Box::pin(async { Err(AppError::SecretStore("backend unreachable".into())) })
+        }
+        fn set(
+            &self,
+            _secret: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    // The Ok tuple isn't `Debug`, so `expect_err` won't compile — match instead.
+    async fn assert_hard_fails(config: &AppConfig, secret: &dyn SecretStore, store: &Store) {
+        let audit = store.keyspace("audit").unwrap();
+        let audit_key = store.keyspace("audit_key").unwrap();
+        match init_auth(config, secret, audit, audit_key).await {
+            Err(AppError::Config(_)) => {}
+            Err(other) => panic!("expected Config error, got {other:?}"),
+            Ok(_) => panic!("expected a hard boot failure, but init_auth booted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn boots_degraded_when_vtc_did_unset() {
+        let (store, _d) = temp_store();
+        let audit = store.keyspace("audit").unwrap();
+        let audit_key = store.keyspace("audit_key").unwrap();
+        // Secret store is never consulted when there's no vtc_did.
+        let result = init_auth(&config_with_did(None), &ErroringStore, audit, audit_key).await;
+        let tuple = result.expect("no vtc_did must boot degraded, not error");
+        assert!(
+            tuple.0.is_none() && tuple.2.is_none(),
+            "degraded boot yields no resolver / jwt keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_fails_when_vtc_did_set_but_store_empty() {
+        let (store, dir) = temp_store();
+        // Empty plaintext store → get() yields Ok(None).
+        let secret = PlaintextSecretStore::new(dir.path());
+        assert_hard_fails(&config_with_did(Some("did:key:zVtc")), &secret, &store).await;
+    }
+
+    #[tokio::test]
+    async fn hard_fails_when_store_errors() {
+        let (store, _d) = temp_store();
+        assert_hard_fails(
+            &config_with_did(Some("did:key:zVtc")),
+            &ErroringStore,
+            &store,
+        )
+        .await;
+    }
+}
+
+/// Read the X.509 trust anchors `[oid4vp] x509_trust_anchors` names, refusing
+/// the boot on any file that does not load: an anchor file that silently
+/// loaded nothing would refuse every credential it was configured to admit.
+pub fn load_x509_trust_anchors(
+    paths: &[std::path::PathBuf],
+) -> Result<vta_sdk::x509_issuer::X509TrustAnchors, AppError> {
+    let mut anchors = vta_sdk::x509_issuer::X509TrustAnchors::new();
+    for path in paths {
+        let pem = std::fs::read(path).map_err(|e| {
+            AppError::Config(format!(
+                "[oid4vp] x509_trust_anchors: read {}: {e}",
+                path.display()
+            ))
+        })?;
+        let added = anchors.add_pem(&pem).map_err(|e| {
+            AppError::Config(format!(
+                "[oid4vp] x509_trust_anchors: {}: {e}",
+                path.display()
+            ))
+        })?;
+        info!(file = %path.display(), certificates = added, "X.509 issuer trust anchors loaded");
+    }
+    Ok(anchors)
+}

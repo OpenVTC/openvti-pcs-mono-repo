@@ -1,0 +1,485 @@
+use axum::Json;
+use axum::extract::State;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use tracing::debug;
+use vti_common::error::AppError;
+
+use crate::registry::{HealthStatus, list_sync_jobs};
+use crate::server::AppState;
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct HealthResponse {
+    // Deliberately *not* `rename_all = "camelCase"`, unlike
+    // `DiagnosticsResponse` below.
+    //
+    // `/health` is not a bound Trust Task, so no published schema describes
+    // it, and `vtc_did` is read by the default landing page
+    // (`website-default/site.js`). Renaming it would break a page this
+    // service ships, to satisfy a contract that does not exist. R3.1 governs
+    // wire types with schemas; this is an unauth status page.
+    status: &'static str,
+    version: &'static str,
+    /// The VTC's own did:webvh, set during `vtc setup`. Kept on the
+    /// unauth payload because it's the community's public identity —
+    /// already served at `/.well-known/did.jsonl` and rendered by the
+    /// default landing page. The `vta_did` / `mediator_url` /
+    /// `mediator_did` fields used to live here too, but they're
+    /// infrastructure detail (which VTA backs the community + the
+    /// mediator's location) and now require auth — see
+    /// [`DiagnosticsResponse`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vtc_did: Option<String>,
+}
+
+/// `GET /health` — unauth, unthrottled liveness. Deliberately
+/// minimal: `{status, version, vtc_did}`. It sits at the parent root
+/// outside the governor, so it must not leak infrastructure topology
+/// (the mediator URL was a free recon oracle). The DID/mediator
+/// detail moved to the administrator's signed [`diagnostics`] task.
+pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    debug!("health check");
+    let vtc_did = state.config.read().await.vtc_did.clone();
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        vtc_did,
+    })
+}
+
+/// Phase 3 M3.8 — admin-gated diagnostics view.
+///
+/// Surfaces enough of the trust-registry reconciler's internal
+/// state to debug "is sync stuck?" without shelling onto the
+/// host. The fields are picked for *operator action*, not raw
+/// metrics dump:
+///
+/// - `registry_status` — does the daemon think the registry
+///   is reachable right now? Mirrors the same flag on
+///   `GET /v1/community/profile` (M3.2).
+/// - `queue_depth` — count of pending+InFlight rows. A
+///   monotonically rising number means the registry is
+///   refusing dispatch.
+/// - `oldest_pending_age_seconds` — staleness of the
+///   longest-waiting job. Drives the "≥1h behind →
+///   degraded" SLI per spec §8.3.
+/// - `rtbf_batched_count` — how many jobs are parked behind
+///   the RTBF window. Lets operators verify the batch
+///   protection is active without inspecting fjall.
+/// - `failed_count` — terminal-failure rows the syncer gave
+///   up on (`attempts > max_attempts` or
+///   `RegistryError::Permanent`). These need operator
+///   triage; the syncer won't retry them.
+/// - `last_success_at` / `last_failure_at` / `last_error` —
+///   replayed verbatim from the health probe state.
+///
+/// Diagnostics is **admin-gated**, not super-admin: ops staff
+/// running on-call should be able to read this without
+/// holding the super-admin role.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsResponse {
+    pub registry_status: String,
+    pub queue_depth: u64,
+    pub rtbf_batched_count: u64,
+    pub failed_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// DID of the VTA the VTC was provisioned against. Moved here
+    /// from the unauth `/health` payload (P3.7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vta_did: Option<String>,
+    /// The mediator's HTTPS endpoint. Infrastructure topology —
+    /// admin-gated so it's not a free unauth recon oracle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mediator_url: Option<String>,
+    /// The mediator's DID. Also surfaced (post-bootstrap) on the
+    /// unauth `/v1/community/public-profile`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mediator_did: Option<String>,
+    /// Whether the `MembershipSyncer` task is enabled (a registry is
+    /// configured) and currently running (P3.13). `syncer_enabled &&
+    /// !syncer_running` means the syncer is spawned but dead — e.g.
+    /// mid-restart after a panic. `syncer_restarts` counts panic
+    /// restarts; a rising value is a "syncer keeps crashing" signal.
+    pub syncer_enabled: bool,
+    pub syncer_running: bool,
+    pub syncer_restarts: u64,
+    /// Live messaging connectivity (D2 P1a): `"connected"` when the delivery
+    /// layer's transport reports a live mediator websocket, else
+    /// `"disconnected"` — including before the listener has bound. Read off
+    /// [`MessagingService::status`](affinidi_messaging_delivery::MessagingService::status),
+    /// which tracks the transport's re-falsifiable connection signal (never a
+    /// boot-time latch, per R6.2). `"disconnected"` when messaging is
+    /// unconfigured.
+    pub messaging_status: String,
+    /// Whether the VTC is **collecting** its mediator inbox — the receive leg,
+    /// which `messaging_status` (a socket signal) cannot see. A connected
+    /// socket whose mediator has stopped delivering to it reads `notDelivering`
+    /// here; a backlog redelivery does not clear (frames the VTC cannot unpack)
+    /// reads `backlogged` with its age. The reconnects the VTC asked for to
+    /// recover are counted here, and `receive` is the messaging SDK's own view
+    /// of the socket's receive side (last data frame, a stalled consumer, its
+    /// probe, frames it deleted or kept). `None` before messaging has started
+    /// or when it is unconfigured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox_collection: Option<vti_common::inbox::InboxHealth>,
+    /// How this VTC reaches its **trust registry**: its DID, the protocols the
+    /// registry's own document advertises, and the one the last call actually
+    /// chose. `None` when no registry is configured.
+    ///
+    /// Advertised and active are reported separately on purpose. A registry
+    /// that advertises TSP while this VTC can only answer DIDComm is
+    /// *configured* and *unreachable* at the same time, and one collapsed
+    /// "protocol" field cannot say so — it would have to pick one of the two
+    /// facts and drop the other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_transport: Option<crate::registry::RegistryTransport>,
+    /// This VTC's **own** transports: per protocol, whether its DID document
+    /// advertises it and whether this build can serve it right now.
+    ///
+    /// The same view the unauthenticated community profile publishes, from the
+    /// same helper — an operator comparing the two should never see them
+    /// disagree. Empty when the VTC's DID could not be resolved, which is
+    /// "unknown", not "none advertised".
+    pub transports: Vec<crate::transport_capability::TransportStatus>,
+    /// Vendor-namespaced additions to the published response.
+    pub ext: DiagnosticsExt,
+}
+
+/// The `ext` envelope on the diagnostics response.
+///
+/// `spec/vtc/registry/diagnostics/0.1#response` is `additionalProperties:
+/// false` and `response_conformance` enforces it against every response an
+/// integration test provokes, so a new top-level field here is a spec change
+/// upstream in `trust-tasks-rs` before it is a change in this repo. `ext` is
+/// the mechanism the spec provides instead (SPEC.md §4.5.1) — an open object
+/// whose immediate keys must each be a reverse-DNS namespace, with the
+/// structure beneath one opaque to the framework.
+///
+/// Typed rather than a bare `serde_json::Value` so the shape reaches
+/// `openapi.json`, and from there the console's generated `wire.ts`. An
+/// untyped `ext` would publish the field and un-type exactly the consumer it
+/// exists for.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct DiagnosticsExt {
+    /// `org.openvtc`, not `vtc`: §4.5.1 requires at least two segments
+    /// (`^[a-z][a-z0-9-]*(\.[a-z0-9-]+)+$`), and a bare `vtc` claims a name
+    /// nobody owns — the collision the rule exists to prevent. Same namespace
+    /// the audit surface already extends under.
+    #[serde(rename = "org.openvtc")]
+    pub openvtc: OpenVtcDiagnostics,
+}
+
+/// What OpenVTC adds to the standard diagnostics payload.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVtcDiagnostics {
+    /// What the document-versus-binary comparison actually *means*, from
+    /// [`transport_capability::findings_for_build`](crate::transport_capability::findings_for_build)
+    /// — the same list `vtc status` prints and the daemon logs at messaging
+    /// start.
+    ///
+    /// Served rather than re-derived in the console because two of the four
+    /// findings cannot be reconstructed from
+    /// [`DiagnosticsResponse::transports`] at all. "advertises TSP with no
+    /// DIDComm fallback" and "advertises no messaging at all" are statements
+    /// about the *shape* of the advertised set, not about any one protocol's
+    /// two booleans, so a console deriving its own view necessarily dropped
+    /// them — and the first of those is the finding that explains why an
+    /// operator should care about the informational line it *could* render.
+    /// Re-deriving also conflated "this build cannot serve it" with "the
+    /// mediator socket is down", because `serviceable` is the conjunction,
+    /// which turned a transient disconnect into a document-is-broken banner.
+    ///
+    /// Admin-gated, which is what lets it carry the full remediation prose:
+    /// that text names build feature flags, and the unauthenticated community
+    /// profile deliberately excludes it (see
+    /// [`TransportStatus`](crate::transport_capability::TransportStatus)).
+    ///
+    /// Empty means either "document and binary agree" or "the DID did not
+    /// resolve" — [`DiagnosticsResponse::transports`] being empty
+    /// distinguishes them.
+    pub transport_findings: Vec<crate::transport_capability::Finding>,
+    /// The `Failed` sync jobs behind [`DiagnosticsResponse::failed_count`],
+    /// in full.
+    ///
+    /// The count alone was not an operator surface. A `Failed` row is
+    /// terminal — the syncer skips it on every tick, boot recovery only
+    /// rescues `InFlight`, and no drift reconciler re-derives it — so the
+    /// number names a condition that will never resolve on its own, and
+    /// the doc comment on `failed_count` asks for "operator triage" that
+    /// nothing on the wire made possible. The detail lived only in the
+    /// service log and in a `RegistrySyncFailed` audit envelope whose DIDs
+    /// are HMAC-hashed, so even the audit trail could not say *which
+    /// member* had stopped publishing.
+    ///
+    /// Capped at [`MAX_REPORTED_FAILED_JOBS`]; `failed_count` remains the
+    /// authoritative total. Newest failure first, so a truncated list is
+    /// the part an operator wants.
+    pub failed_jobs: Vec<FailedSyncJob>,
+    /// The latest comparison of the local `registry_records` mirror against
+    /// what the trust registry actually holds, or `null` before the first
+    /// check completes.
+    ///
+    /// `null` is "not yet known", **not** "no drift", and a consumer must not
+    /// render the two alike. The check runs on its own timer
+    /// (`[registry] drift_check_interval_seconds`, default 900s), so a
+    /// freshly-booted VTC legitimately reports `null` for the first half
+    /// minute.
+    ///
+    /// Answers the question a failed sync job leaves open: a job that has
+    /// aged out of the queue is gone, and until this existed nothing in the
+    /// service could then say the member was still unpublished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_drift: Option<crate::registry::DriftSnapshot>,
+    /// The pending jobs that are waiting out a retry backoff, and when the
+    /// first of them is next due.
+    ///
+    /// [`DiagnosticsResponse::oldest_pending_age_seconds`] counts only jobs
+    /// that are due now, so a queue whose every job had failed once read as
+    /// a depth beside "nothing waiting" — true of the dispatcher, and no
+    /// answer to an operator asking when the queue will move. Jobs parked
+    /// for the RTBF window are excluded; they have their own count.
+    pub backing_off: BackingOff,
+}
+
+/// Pending jobs scheduled for a later attempt after a failure.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackingOff {
+    pub count: u64,
+    /// When the soonest of them is next attempted. Absent when `count` is 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+}
+
+impl BackingOff {
+    fn of(jobs: &[crate::registry::SyncJob], now: DateTime<Utc>) -> Self {
+        let waiting: Vec<_> = jobs
+            .iter()
+            .filter(|j| {
+                j.state == crate::registry::SyncJobState::Pending
+                    && !j.rtbf_batched
+                    && j.next_attempt_at > now
+            })
+            .collect();
+        Self {
+            count: waiting.len() as u64,
+            next_attempt_at: waiting.iter().map(|j| j.next_attempt_at).min(),
+        }
+    }
+}
+
+/// How many `Failed` rows [`OpenVtcDiagnostics::failed_jobs`] will carry.
+///
+/// A healthy VTC has zero and a broken one usually has a handful — every
+/// member added while the registry was mis-deployed, sharing one cause.
+/// The cap exists so a community that queued thousands before anyone looked
+/// cannot turn an admin page load into a multi-megabyte response.
+pub const MAX_REPORTED_FAILED_JOBS: usize = 50;
+
+/// One terminally-failed reconciliation job, as the operator needs to see it.
+///
+/// `member_did` is in the clear. It is already stored unhashed in the
+/// `sync_queue` row (the registry call needs the real DID), this response is
+/// admin-gated, and an admin can list the same DIDs from `/v1/members` — so
+/// nothing is disclosed here that the caller could not already read. Hashing
+/// it would only reproduce the gap that made this field necessary: the audit
+/// envelope for these failures already carries `targetDidHash`, and an
+/// operator holding a hash cannot tell which member stopped publishing.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedSyncJob {
+    /// UUID of the `sync_queue` row. The handle `vtc sync-jobs
+    /// {retry,discard}` takes, and the `jobId` on the matching
+    /// `RegistrySyncFailed` audit envelope.
+    pub job_id: String,
+    /// Wire-form `SyncJobKind` — `publishMember`, `updateMember`,
+    /// `deleteMember`, `markDeparted`.
+    pub kind: String,
+    /// The member whose registry record is now stale or absent.
+    pub member_did: String,
+    /// Attempts made before giving up. `1` means the registry refused it
+    /// outright (a permanent or incompatible answer); a number at
+    /// `DEFAULT_MAX_ATTEMPTS` means it exhausted ~18 hours of backoff
+    /// against a registry that never answered.
+    pub attempts: u32,
+    /// The registry's last answer, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempted_at: Option<DateTime<Utc>>,
+    /// When the retention sweeper will purge this row
+    /// (`last_attempted_at` — or `created_at` — plus the configured
+    /// `join_requests` retention window). After that the failure is gone
+    /// and the member is still unpublished, so it is a deadline, not a fix.
+    pub purge_due_at: DateTime<Utc>,
+}
+
+/// `vtc/registry/diagnostics/0.1` — the reconciler's health, for an
+/// administrator. A signed document served by the spine
+/// (`trust_tasks::admin_tasks`); there is no REST route.
+pub(crate) async fn diagnostics(state: &AppState) -> Result<DiagnosticsResponse, AppError> {
+    let jobs = list_sync_jobs(&state.sync_queue_ks).await?;
+    let now = Utc::now();
+    let queue_depth = jobs
+        .iter()
+        .filter(|j| {
+            matches!(
+                j.state,
+                crate::registry::SyncJobState::Pending | crate::registry::SyncJobState::InFlight
+            )
+        })
+        .count() as u64;
+    let rtbf_batched_count = jobs
+        .iter()
+        .filter(|j| j.rtbf_batched && j.state == crate::registry::SyncJobState::Pending)
+        .count() as u64;
+    let failed_count = jobs
+        .iter()
+        .filter(|j| j.state == crate::registry::SyncJobState::Failed)
+        .count() as u64;
+    // The rows behind that count. Newest failure first so a truncated list
+    // is the part worth reading; `failed_count` above stays authoritative.
+    let retention_days = { state.config.read().await.join_requests.retention_days };
+    let mut failed: Vec<&crate::registry::SyncJob> = jobs
+        .iter()
+        .filter(|j| j.state == crate::registry::SyncJobState::Failed)
+        .collect();
+    failed.sort_by_key(|j| std::cmp::Reverse(j.last_attempted_at.unwrap_or(j.created_at)));
+    let failed_jobs: Vec<FailedSyncJob> = failed
+        .into_iter()
+        .take(MAX_REPORTED_FAILED_JOBS)
+        .map(|j| {
+            let gave_up_at = j.last_attempted_at.unwrap_or(j.created_at);
+            FailedSyncJob {
+                job_id: j.id.to_string(),
+                kind: j.kind.as_str().to_string(),
+                member_did: j.member_did.clone(),
+                attempts: j.attempts,
+                last_error: j.last_error.clone(),
+                created_at: j.created_at,
+                last_attempted_at: j.last_attempted_at,
+                purge_due_at: gave_up_at + chrono::Duration::days(retention_days as i64),
+            }
+        })
+        .collect();
+    // Oldest *dispatchable* pending job — RTBF-parked rows are
+    // intentionally future-dated so they shouldn't count
+    // against the "stuck" SLI.
+    let oldest_pending_age_seconds = jobs
+        .iter()
+        .filter(|j| j.state == crate::registry::SyncJobState::Pending && j.next_attempt_at <= now)
+        .map(|j| (now - j.created_at).num_seconds())
+        .max();
+
+    let backing_off = BackingOff::of(&jobs, now);
+    let registry_drift = state.registry_drift.snapshot().await;
+    let snapshot = state.registry_health.snapshot().await;
+    let registry_status = match snapshot.status {
+        HealthStatus::Active => "active",
+        HealthStatus::Degraded => "degraded",
+    }
+    .to_string();
+
+    // Live messaging connectivity — off the delivery-layer transport's
+    // re-falsifiable connection signal, not a boot latch (R6.2). Absent handle
+    // (listener not yet bound / messaging unconfigured) reads "disconnected".
+    let messaging_status = match state.didcomm.get() {
+        Some(m) => match m.service.status() {
+            affinidi_messaging_delivery::MessagingStatus::Connected => "connected",
+            _ => "disconnected",
+        },
+        None => "disconnected",
+    }
+    .to_string();
+
+    let inbox_collection = state.didcomm.get().map(|m| m.inbox.snapshot());
+
+    // Identity / mediator detail — folded down from the unauth
+    // `/health` payload (P3.7), now only readable by an admin.
+    let syncer = state.syncer_health.snapshot();
+
+    let config = state.config.read().await;
+    let vta_did = config.vta_did.clone();
+    let config_vtc_did = config.vtc_did.clone();
+    let (mediator_url, mediator_did) = config
+        .messaging
+        .as_ref()
+        .map(|m| (Some(m.mediator_url.clone()), Some(m.mediator_did.clone())))
+        .unwrap_or((None, None));
+    drop(config);
+
+    debug!(
+        queue_depth,
+        rtbf_batched_count,
+        failed_count,
+        registry_status = %registry_status,
+        "diagnostics queried"
+    );
+
+    // How we reach the registry, straight off the live client — so this
+    // reflects the transport the last call actually used, not the one config
+    // implies.
+    let registry_transport = state.registry_client.as_ref().map(|c| c.transport());
+
+    // Our own advertised-versus-servable view, resolved from the document
+    // rather than config: the deployment that motivated this had `#tsp` added
+    // to its DID log long after the VTC last wrote its own mirror.
+    let caps = crate::transport_capability::resolved_capabilities(
+        state.did_resolver.as_ref(),
+        config_vtc_did.as_deref().unwrap_or_default(),
+    )
+    .await;
+    let transports = match &caps {
+        Some(caps) => crate::transport_capability::public_transport_view_for_build(
+            caps,
+            messaging_status == "connected",
+        ),
+        None => Vec::new(),
+    };
+    // The interpretation of that table, off the same function every other
+    // surface reads — so the console cannot tell an operator a different story
+    // than `vtc status` did about the same document.
+    let transport_findings = caps
+        .as_ref()
+        .map(crate::transport_capability::findings_for_build)
+        .unwrap_or_default();
+
+    Ok(DiagnosticsResponse {
+        registry_status,
+        queue_depth,
+        rtbf_batched_count,
+        failed_count,
+        oldest_pending_age_seconds,
+        last_success_at: snapshot.last_success_at,
+        last_failure_at: snapshot.last_failure_at,
+        last_error: snapshot.last_error,
+        vta_did,
+        mediator_url,
+        mediator_did,
+        syncer_enabled: syncer.enabled,
+        syncer_running: syncer.running,
+        syncer_restarts: syncer.restarts,
+        messaging_status,
+        inbox_collection,
+        registry_transport,
+        transports,
+        ext: DiagnosticsExt {
+            openvtc: OpenVtcDiagnostics {
+                transport_findings,
+                failed_jobs,
+                registry_drift,
+                backing_off,
+            },
+        },
+    })
+}

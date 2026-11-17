@@ -1,0 +1,71 @@
+[package]
+name = "vta-keys"
+description = "VTA key management — master-seed storage, BIP-32 key derivation, key wrapping, and the seed-store backend selection"
+readme = "README.md"
+version = "0.44.0"
+edition.workspace = true
+# Published, because `vta-service` is — and a crate cannot go to crates.io
+# without its whole dependency closure there too. Not published for its own
+# sake: nothing outside this workspace is expected to depend on it directly.
+#
+# #938 set `publish = false` here on the finding that no external consumer
+# existed. That was wrong by one: `openvtc-core` dev-depends on `vta-service`
+# for `test_support::MockVta`, an in-process VTA the OpenVTC end-to-end tests
+# run against. See `vta-service/Cargo.toml` for what unpublishing it actually
+# broke. See RELEASING.md ("What gets published").
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Seed-store backend selection. Each activates the matching vti-secrets backend
+# so `create_seed_store` can construct it. Off by default (the local/dev VTA
+# uses the keyring or a config seed); the enclave enables `tee`.
+aws-secrets = ["vti-secrets/aws-secrets"]
+azure-secrets = ["vti-secrets/azure-secrets"]
+gcp-secrets = ["vti-secrets/gcp-secrets"]
+vault-secrets = ["vti-secrets/vault-secrets"]
+k8s-secrets = ["vti-secrets/k8s-secrets"]
+config-seed = ["vti-secrets/config-seed"]
+keyring = ["vti-secrets/keyring"]
+tee = ["vti-secrets/tee"]
+# TPM 2.0 KEK source for the `encrypted_file` backend (Linux, native tss2 libs).
+tpm = ["vti-secrets/tpm"]
+
+[dependencies]
+vta-keyspaces = { path = "../vta-keyspaces", version = "0.40" }
+vta-config = { path = "../vta-config", version = "0.43" }
+vta-signing = { path = "../vta-signing", version = "0.1" }
+vti-common = { path = "../vti-common", version = "0.66" }
+vti-secrets = { path = "../vti-secrets", version = "0.39" }
+vta-sdk = { path = "../vta-sdk", version = "0.90", features = ["sealed-transfer"] }
+affinidi-tdk = { workspace = true }
+affinidi-crypto = { workspace = true }
+ed25519-dalek = { workspace = true }
+bip39 = { workspace = true }
+multibase = { workspace = true }
+aes-gcm = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+x25519-dalek = { workspace = true }
+p256 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

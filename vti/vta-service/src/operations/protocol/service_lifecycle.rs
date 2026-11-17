@@ -1,0 +1,595 @@
+//! Generic enable/update engine for the transport-service families
+//! (`rest`, `webauthn`) — P2.3 part (a).
+//!
+//! `enable_rest` / `enable_webauthn` and `update_rest` / `update_webauthn`
+//! were ~95% identical: they differ only in the config flag they read/flip,
+//! the document patcher + service reader, the snapshot variant, the telemetry
+//! kind, and (enable only) how "enabled" is persisted. This module captures
+//! the shared skeleton once:
+//!
+//! ```text
+//! super-admin → PROTOCOL_LOCK → validate URL → preconditions →
+//! snapshot (pre-state) → patch document → publish (`publish_patch`: a
+//! did:webvh log entry, or a did:webs designation) →
+//! [persist enabled, enable only] → telemetry → result
+//! ```
+//!
+//! The transport differences live behind [`ServiceLifecycle`] (all-sync hooks,
+//! so the engine futures stay `Send`); the enable-vs-update *shape* is the two
+//! `run_*` engines. The per-op modules keep their public `*Params` / `*Result`
+//! / `*Error` types and become thin wrappers, so every caller (routes, DIDComm
+//! dispatch, rollback) is untouched.
+//!
+//! `disable_{rest,webauthn}` reuse the lower-level pieces — `publish_patch`,
+//! `check_disable_preconditions` (brick-prevention + preconditions), and the
+//! `without_service` / `snapshot_enabled` hooks — rather than a full
+//! `run_disable` engine, because disable diverges per transport (WebAuthn also
+//! strips passkey VMs and returns a cleanup summary). Rollback (a dispatcher
+//! over the forward ops) and the DIDComm family stay out of scope.
+
+use std::sync::Arc;
+
+use serde_json::Value as JsonValue;
+use tracing::info;
+
+use vti_common::telemetry::{SharedTelemetrySink, TelemetryEvent, TelemetryKind};
+
+use vta_sdk::protocol::services::validate_service_url;
+
+use crate::auth::AuthClaims;
+use crate::config::AppConfig;
+use crate::operations::did_webvh::{UpdateDidWebvhError, UpdateDidWebvhOptions, update_did_webvh};
+use crate::operations::protocol::document::DocumentPatchError;
+use crate::operations::protocol::invariant::{
+    CurrentServices, ProposedOp, would_violate_last_service,
+};
+use crate::operations::protocol::preconditions::{ProtocolPreconditionError, VtaDocBacking};
+use crate::operations::protocol::snapshot::{self, ServiceConfigSnapshot, ServiceKind};
+use crate::operations::protocol::{OpContext, PROTOCOL_LOCK};
+use crate::store::KeyspaceHandle;
+use tokio::sync::RwLock;
+use vta_sdk::error::VtaError;
+
+/// Transport-specific hooks for the shared enable/update engine. One impl per
+/// advertised transport service (`RestService`, `WebauthnService`). All methods
+/// are synchronous so a generic engine over `S: ServiceLifecycle` produces a
+/// `Send` future (the only async step — persisting "enabled" — is passed to
+/// [`run_enable`] as a closure instead).
+pub(crate) trait ServiceLifecycle {
+    /// Human label for log lines (`"REST"`, `"WebAuthn"`).
+    const LABEL: &'static str;
+    /// This service's [`ServiceKind`] — used by the brick-prevention check on
+    /// the disable path.
+    const KIND: ServiceKind;
+    /// Telemetry kind emitted on a successful enable.
+    const ENABLE_TELEMETRY: TelemetryKind;
+    /// Telemetry kind emitted on a successful update.
+    const UPDATE_TELEMETRY: TelemetryKind;
+
+    /// Validate + canonicalize the operator-supplied advertised value,
+    /// returning the canonical form to publish or an error message.
+    ///
+    /// REST / WebAuthn validate an HTTPS URL (`validate_service_url`); TSP
+    /// validates a mediator **DID** (the endpoint is a `did:...` VID, not a
+    /// URL), so it can't reuse the URL validator.
+    fn validate(input: &str) -> Result<String, String>;
+    /// Is this service currently flagged on in the live config?
+    fn config_enabled(cfg: &AppConfig) -> bool;
+    /// The URL this service currently advertises in the DID document, if any.
+    fn current_service_url(doc: &JsonValue) -> Option<String>;
+    /// Patch the document to advertise `url` on this service entry (insert on
+    /// enable, replace on update — the patcher is idempotent on shape).
+    fn with_service(doc: JsonValue, url: &str) -> Result<JsonValue, DocumentPatchError>;
+    /// Patch the document to remove this service entry (the disable path —
+    /// infallible: removing an absent entry is a no-op).
+    fn without_service(doc: JsonValue) -> JsonValue;
+    /// Pre-state snapshot for an enable (rollback target = "off").
+    fn snapshot_disabled() -> ServiceConfigSnapshot;
+    /// Pre-state snapshot for an update/disable (rollback target = prior URL).
+    fn snapshot_enabled(prior_url: String) -> ServiceConfigSnapshot;
+}
+
+/// Error-construction surface the engine needs. Implemented by each per-op
+/// error enum so the engine builds the *caller's* error type directly — the
+/// public `*Error` enums (matched by routes + DIDComm `ToProblemReport`) are
+/// preserved unchanged. The `From` supertraits reuse the enums' existing
+/// `#[from]` / `From<…>` impls for the `?`-propagated cases.
+pub(crate) trait ServiceMutationError:
+    Sized + From<ProtocolPreconditionError> + From<DocumentPatchError> + From<UpdateDidWebvhError>
+{
+    fn validation(msg: String) -> Self;
+    fn auth(msg: String) -> Self;
+    fn storage(msg: String) -> Self;
+}
+
+/// Enable-specific error constructors.
+pub(crate) trait EnableMutationError: ServiceMutationError {
+    fn already_enabled() -> Self;
+    fn config_persistence(msg: String) -> Self;
+}
+
+/// Update-specific error constructors.
+pub(crate) trait UpdateMutationError: ServiceMutationError {
+    fn not_present() -> Self;
+}
+
+/// Disable-specific error surface. Independent of [`ServiceMutationError`]
+/// because disable takes no URL (so has no `validation` constructor); it adds
+/// `From<VtaError>` for the brick-prevention check's `LastServiceRefused`.
+pub(crate) trait DisableMutationError:
+    Sized
+    + From<ProtocolPreconditionError>
+    + From<DocumentPatchError>
+    + From<UpdateDidWebvhError>
+    + From<VtaError>
+{
+    /// The service is not currently advertised — nothing to disable.
+    fn not_present() -> Self;
+}
+
+/// Successful enable/update outcome. The per-op wrapper maps this into its
+/// public `*Result` (`prior_url` is `Some` only for updates).
+pub(crate) struct ServiceMutationOk {
+    pub new_version_id: String,
+    pub canonical_url: String,
+    pub vta_did: String,
+    pub serverless: bool,
+    pub prior_url: Option<String>,
+}
+
+/// The shared dependency bundle both engines read is
+/// [`super::ServiceOpDeps`] — the same struct the public ops receive at their
+/// boundary (P2.5). The engine reads only the subset it needs (every field
+/// except `service_state_ks`, which is the REST persist step's concern).
+pub(crate) use super::ServiceOpDeps;
+
+/// What a publish produced, for either method: the new version's id (a
+/// `did:webvh` log entry's `versionId`; a `did:webs` key event log's
+/// `<sn>:<said>`, as `vta/webs/dids/*` report it) and whether the host must be
+/// redeployed by hand (`serverless`, `did:webvh` only).
+#[derive(Debug, Clone)]
+pub(crate) struct PublishedPatch {
+    pub new_version_id: String,
+    pub serverless: bool,
+}
+
+/// Publish a patched document — the common publish step shared by enable /
+/// update / disable, for every family (REST, TSP, WebAuthn, DIDComm). Bound
+/// only on `From<UpdateDidWebvhError>` (the single error it propagates) so
+/// disable errors — which carry no `validation` constructor — can use it too.
+///
+/// Switched on `backing`: a `did:webvh` VTA appends a log entry
+/// (`update_did_webvh`); a `did:webs` VTA designates the patched document's
+/// service set ([`super::webs_backing::publish`], whose refusals arrive as the
+/// same `UpdateDidWebvhError` variants).
+pub(crate) async fn publish_patch<E: From<UpdateDidWebvhError>>(
+    deps: &ServiceOpDeps<'_>,
+    auth: &AuthClaims,
+    backing: &VtaDocBacking,
+    vta_did: &str,
+    patched: JsonValue,
+    channel: &str,
+) -> Result<PublishedPatch, E> {
+    match backing {
+        // `update_did_webvh` owns the post-mutation self-DID resolver refresh
+        // (it reseeds the cache from the freshly-built log right after
+        // persisting it — see `did_webvh::update::orchestrator`).
+        VtaDocBacking::Webvh { scid, .. } => update_did_webvh(
+            &deps.webvh(),
+            auth,
+            scid,
+            UpdateDidWebvhOptions {
+                document: Some(patched),
+                ..Default::default()
+            },
+            Some(vta_did),
+            channel,
+        )
+        .await
+        .map(|r| PublishedPatch {
+            new_version_id: r.new_version_id,
+            serverless: r.serverless,
+        })
+        .map_err(E::from),
+        #[cfg(feature = "webs")]
+        VtaDocBacking::Webs { record } => {
+            super::webs_backing::publish(deps, auth, record, vta_did, &patched, channel)
+                .await
+                .map_err(E::from)
+        }
+    }
+}
+
+/// Enable preconditions: the service must be OFF in both the live config and
+/// the on-chain DID document. A divergence surfaces as already-enabled (the
+/// operator reconciles via `services list`). Returns the loaded doc state.
+///
+/// Extracted from [`run_enable`] so it stays unit-testable with just a config +
+/// store fixture (no resolver / seed-store / bridge), preserving the coverage
+/// the per-op `read_preconditions` helpers used to carry.
+pub(crate) async fn check_enable_preconditions<S, E>(
+    config: &Arc<RwLock<AppConfig>>,
+    webvh_ks: &KeyspaceHandle,
+    webs_ks: &KeyspaceHandle,
+) -> Result<crate::operations::protocol::preconditions::VtaDocState, E>
+where
+    S: ServiceLifecycle,
+    E: EnableMutationError,
+{
+    // "Already enabled" means enabled in **both** places, not in either.
+    //
+    // Refusing on the config alone made one reachable state unmanageable.
+    // `update` requires the service ON in the config *and* advertised in the
+    // document; this refused whenever the config said ON. So config-ON with the
+    // document silent — which is exactly what re-pointing `vta_did` at a freshly
+    // minted DID produces, and what restoring a config without its log produces
+    // — could be neither enabled nor updated. The operator's only route out was
+    // to edit the config by hand.
+    //
+    // Enable's job is to make both true. Where they disagree there is work to
+    // do, and this is the operation that does it.
+    let cfg_on = {
+        let cfg = config.read().await;
+        S::config_enabled(&cfg)
+    };
+    let state =
+        crate::operations::protocol::preconditions::load_vta_doc_state(config, webvh_ks, webs_ks)
+            .await?;
+    if cfg_on && S::current_service_url(&state.current_doc).is_some() {
+        return Err(E::already_enabled());
+    }
+    Ok(state)
+}
+
+/// Update preconditions: the service must be ON in both the live config and the
+/// on-chain document. Returns the loaded doc state plus the prior URL (the
+/// rollback target captured for the snapshot).
+pub(crate) async fn check_update_preconditions<S, E>(
+    config: &Arc<RwLock<AppConfig>>,
+    webvh_ks: &KeyspaceHandle,
+    webs_ks: &KeyspaceHandle,
+) -> Result<
+    (
+        crate::operations::protocol::preconditions::VtaDocState,
+        String,
+    ),
+    E,
+>
+where
+    S: ServiceLifecycle,
+    E: UpdateMutationError,
+{
+    {
+        let cfg = config.read().await;
+        if !S::config_enabled(&cfg) {
+            return Err(E::not_present());
+        }
+    }
+    let state =
+        crate::operations::protocol::preconditions::load_vta_doc_state(config, webvh_ks, webs_ks)
+            .await?;
+    let prior_url = S::current_service_url(&state.current_doc).ok_or_else(E::not_present)?;
+    Ok((state, prior_url))
+}
+
+/// Disable preconditions: the service must be ON, disabling it must not leave
+/// the VTA with no advertised transport (brick-prevention, spec §3.2 — checked
+/// before any I/O), and it must be present on-chain. Returns the loaded doc
+/// state plus the prior URL (the rollback target for the snapshot).
+///
+/// The caller takes `PROTOCOL_LOCK` first (mirrors the historical order: lock →
+/// brick-check → load), then runs its op-specific steps (webauthn's passkey-VM
+/// cleanup, persist, telemetry) around [`publish_patch`].
+pub(crate) async fn check_disable_preconditions<S, E>(
+    config: &Arc<RwLock<AppConfig>>,
+    webvh_ks: &KeyspaceHandle,
+    webs_ks: &KeyspaceHandle,
+) -> Result<
+    (
+        crate::operations::protocol::preconditions::VtaDocState,
+        String,
+    ),
+    E,
+>
+where
+    S: ServiceLifecycle,
+    E: DisableMutationError,
+{
+    // Brick-prevention runs FIRST — cheap config-only check before any I/O.
+    let (rest, didcomm, webauthn, tsp) = {
+        let cfg = config.read().await;
+        if !S::config_enabled(&cfg) {
+            return Err(E::not_present());
+        }
+        (
+            cfg.services.rest,
+            cfg.services.didcomm,
+            cfg.services.webauthn,
+            cfg.services.tsp,
+        )
+    };
+    would_violate_last_service(
+        &CurrentServices::new(rest, didcomm, webauthn, tsp),
+        ProposedOp::disable(S::KIND),
+    )?;
+
+    let state =
+        crate::operations::protocol::preconditions::load_vta_doc_state(config, webvh_ks, webs_ks)
+            .await?;
+    let prior_url = S::current_service_url(&state.current_doc).ok_or_else(E::not_present)?;
+    Ok((state, prior_url))
+}
+
+/// Generic `enable_<service>` engine.
+///
+/// `persist_enabled` performs the (async, transport-specific) "flip to enabled"
+/// step after a successful publish — REST writes runtime-state + the in-memory
+/// flag, WebAuthn writes the config file. Passing it as a closure keeps
+/// [`ServiceLifecycle`] all-sync (and the engine future `Send`).
+pub(crate) async fn run_enable<S, E>(
+    deps: &ServiceOpDeps<'_>,
+    auth: &AuthClaims,
+    url: &str,
+    ctx: OpContext,
+    channel: &str,
+    persist_enabled: impl AsyncFnOnce() -> Result<(), String>,
+) -> Result<ServiceMutationOk, E>
+where
+    S: ServiceLifecycle,
+    E: EnableMutationError,
+{
+    auth.require_super_admin()
+        .map_err(|e| E::auth(e.to_string()))?;
+
+    let _guard = PROTOCOL_LOCK.lock().await;
+
+    let canonical_url = S::validate(url).map_err(E::validation)?;
+
+    let state =
+        check_enable_preconditions::<S, E>(deps.config, deps.webvh_ks, deps.webs_ks).await?;
+
+    // Snapshot BEFORE the runtime mutation (spec §3.5a): pre-state is "off".
+    snapshot::write(deps.snapshot_ks, S::snapshot_disabled())
+        .await
+        .map_err(|e| E::storage(format!("snapshot write: {e}")))?;
+
+    let patched = S::with_service(state.current_doc, &canonical_url)?;
+    let update_result =
+        publish_patch::<E>(deps, auth, &state.backing, &state.vta_did, patched, channel).await?;
+
+    persist_enabled().await.map_err(E::config_persistence)?;
+
+    emit_telemetry(
+        deps.telemetry,
+        S::ENABLE_TELEMETRY,
+        channel,
+        &update_result.new_version_id,
+        &canonical_url,
+        None,
+        ctx,
+    )
+    .await;
+    info!(
+        channel,
+        url = %canonical_url,
+        new_version_id = %update_result.new_version_id,
+        vta_did = %state.vta_did,
+        "{} enabled",
+        S::LABEL,
+    );
+
+    Ok(ServiceMutationOk {
+        new_version_id: update_result.new_version_id,
+        canonical_url,
+        vta_did: state.vta_did,
+        serverless: update_result.serverless,
+        prior_url: None,
+    })
+}
+
+/// Generic `update_<service>` engine. No config flip — the service stays
+/// enabled; only the advertised URL changes. The prior URL is captured for the
+/// rollback snapshot and surfaced in `prior_url`.
+pub(crate) async fn run_update<S, E>(
+    deps: &ServiceOpDeps<'_>,
+    auth: &AuthClaims,
+    url: &str,
+    ctx: OpContext,
+    channel: &str,
+) -> Result<ServiceMutationOk, E>
+where
+    S: ServiceLifecycle,
+    E: UpdateMutationError,
+{
+    auth.require_super_admin()
+        .map_err(|e| E::auth(e.to_string()))?;
+
+    let _guard = PROTOCOL_LOCK.lock().await;
+
+    let canonical_url = S::validate(url).map_err(E::validation)?;
+
+    let (state, prior_url) =
+        check_update_preconditions::<S, E>(deps.config, deps.webvh_ks, deps.webs_ks).await?;
+
+    // Snapshot BEFORE the mutation (spec §3.5a): pre-state is the prior URL.
+    snapshot::write(deps.snapshot_ks, S::snapshot_enabled(prior_url.clone()))
+        .await
+        .map_err(|e| E::storage(format!("snapshot write: {e}")))?;
+
+    let patched = S::with_service(state.current_doc, &canonical_url)?;
+    let update_result =
+        publish_patch::<E>(deps, auth, &state.backing, &state.vta_did, patched, channel).await?;
+
+    emit_telemetry(
+        deps.telemetry,
+        S::UPDATE_TELEMETRY,
+        channel,
+        &update_result.new_version_id,
+        &canonical_url,
+        Some(&prior_url),
+        ctx,
+    )
+    .await;
+    info!(
+        channel,
+        prior_url = %prior_url,
+        url = %canonical_url,
+        new_version_id = %update_result.new_version_id,
+        vta_did = %state.vta_did,
+        "{} URL updated",
+        S::LABEL,
+    );
+
+    Ok(ServiceMutationOk {
+        new_version_id: update_result.new_version_id,
+        canonical_url,
+        vta_did: state.vta_did,
+        serverless: update_result.serverless,
+        prior_url: Some(prior_url),
+    })
+}
+
+/// Shared telemetry emission (channel + version + URL, optional prior URL, plus
+/// the `triggered_by` tag for rollback-dispatched ops).
+async fn emit_telemetry(
+    telemetry: &SharedTelemetrySink,
+    kind: TelemetryKind,
+    channel: &str,
+    new_version_id: &str,
+    url: &str,
+    prior_url: Option<&str>,
+    ctx: OpContext,
+) {
+    let mut event = TelemetryEvent::new(kind)
+        .with_field("channel", JsonValue::from(channel))
+        .with_field("new_version_id", JsonValue::from(new_version_id))
+        .with_field("url", JsonValue::from(url));
+    if let Some(prior) = prior_url {
+        event = event.with_field("prior_url", JsonValue::from(prior));
+    }
+    if let Some(tag) = ctx.telemetry_triggered_by() {
+        event = event.with_field("triggered_by", JsonValue::from(tag));
+    }
+    let _ = telemetry.record(event).await;
+}
+
+/// REST transport (`#vta-rest`).
+pub(crate) struct RestService;
+
+impl ServiceLifecycle for RestService {
+    const LABEL: &'static str = "REST";
+    const KIND: ServiceKind = ServiceKind::Rest;
+    const ENABLE_TELEMETRY: TelemetryKind = TelemetryKind::ServicesRestEnable;
+    const UPDATE_TELEMETRY: TelemetryKind = TelemetryKind::ServicesRestUpdate;
+
+    fn validate(input: &str) -> Result<String, String> {
+        validate_service_url(input)
+            .map(|u| u.to_string())
+            .map_err(|e| e.to_string())
+    }
+    fn config_enabled(cfg: &AppConfig) -> bool {
+        cfg.services.rest
+    }
+    fn current_service_url(doc: &JsonValue) -> Option<String> {
+        crate::operations::protocol::document::current_rest_service(doc).map(|s| s.url)
+    }
+    fn with_service(doc: JsonValue, url: &str) -> Result<JsonValue, DocumentPatchError> {
+        crate::operations::protocol::document::with_rest_service(doc, url)
+    }
+    fn without_service(doc: JsonValue) -> JsonValue {
+        crate::operations::protocol::document::without_rest_service(doc)
+    }
+    fn snapshot_disabled() -> ServiceConfigSnapshot {
+        ServiceConfigSnapshot::Rest(crate::operations::protocol::snapshot::RestSnapshot::Disabled)
+    }
+    fn snapshot_enabled(prior_url: String) -> ServiceConfigSnapshot {
+        ServiceConfigSnapshot::Rest(
+            crate::operations::protocol::snapshot::RestSnapshot::Enabled { url: prior_url },
+        )
+    }
+}
+
+/// WebAuthn transport (`#vta-webauthn`).
+pub(crate) struct WebauthnService;
+
+impl ServiceLifecycle for WebauthnService {
+    const LABEL: &'static str = "WebAuthn";
+    const KIND: ServiceKind = ServiceKind::Webauthn;
+    const ENABLE_TELEMETRY: TelemetryKind = TelemetryKind::ServicesWebauthnEnable;
+    const UPDATE_TELEMETRY: TelemetryKind = TelemetryKind::ServicesWebauthnUpdate;
+
+    fn validate(input: &str) -> Result<String, String> {
+        validate_service_url(input)
+            .map(|u| u.to_string())
+            .map_err(|e| e.to_string())
+    }
+    fn config_enabled(cfg: &AppConfig) -> bool {
+        cfg.services.webauthn
+    }
+    fn current_service_url(doc: &JsonValue) -> Option<String> {
+        crate::operations::protocol::document::current_webauthn_service(doc).map(|s| s.url)
+    }
+    fn with_service(doc: JsonValue, url: &str) -> Result<JsonValue, DocumentPatchError> {
+        crate::operations::protocol::document::with_webauthn_service(doc, url)
+    }
+    fn without_service(doc: JsonValue) -> JsonValue {
+        crate::operations::protocol::document::without_webauthn_service(doc)
+    }
+    fn snapshot_disabled() -> ServiceConfigSnapshot {
+        ServiceConfigSnapshot::Webauthn(
+            crate::operations::protocol::snapshot::WebauthnSnapshot::Disabled,
+        )
+    }
+    fn snapshot_enabled(prior_url: String) -> ServiceConfigSnapshot {
+        ServiceConfigSnapshot::Webauthn(
+            crate::operations::protocol::snapshot::WebauthnSnapshot::Enabled { url: prior_url },
+        )
+    }
+}
+
+/// TSP transport (`#tsp`, `TSPTransport`).
+///
+/// Unlike REST / WebAuthn the advertised value is a **mediator DID** (the
+/// VTA's TSP VID), not a URL — so `validate` checks for a non-empty
+/// `did:...` string rather than running `validate_service_url`. TSP has no
+/// drain and no handshake, so (like REST) it needs only the shared
+/// enable/update/disable skeleton. The lifecycle hooks' `*_url` naming is
+/// kept (it's the engine's generic "advertised value" slot); the value
+/// carried is the mediator DID.
+pub(crate) struct TspService;
+
+impl ServiceLifecycle for TspService {
+    const LABEL: &'static str = "TSP";
+    const KIND: ServiceKind = ServiceKind::Tsp;
+    const ENABLE_TELEMETRY: TelemetryKind = TelemetryKind::ServicesTspEnable;
+    const UPDATE_TELEMETRY: TelemetryKind = TelemetryKind::ServicesTspUpdate;
+
+    fn validate(input: &str) -> Result<String, String> {
+        if input.is_empty() || !input.starts_with("did:") {
+            return Err("TSP mediator must be a DID (did:...)".into());
+        }
+        Ok(input.to_string())
+    }
+    fn config_enabled(cfg: &AppConfig) -> bool {
+        cfg.services.tsp
+    }
+    fn current_service_url(doc: &JsonValue) -> Option<String> {
+        crate::operations::protocol::document::current_tsp_service(doc).map(|s| s.mediator_did)
+    }
+    fn with_service(doc: JsonValue, url: &str) -> Result<JsonValue, DocumentPatchError> {
+        crate::operations::protocol::document::with_tsp_service(doc, url)
+    }
+    fn without_service(doc: JsonValue) -> JsonValue {
+        crate::operations::protocol::document::without_tsp_service(doc)
+    }
+    fn snapshot_disabled() -> ServiceConfigSnapshot {
+        ServiceConfigSnapshot::Tsp(crate::operations::protocol::snapshot::TspSnapshot::Disabled)
+    }
+    fn snapshot_enabled(prior_url: String) -> ServiceConfigSnapshot {
+        ServiceConfigSnapshot::Tsp(
+            crate::operations::protocol::snapshot::TspSnapshot::Enabled {
+                mediator_did: prior_url,
+            },
+        )
+    }
+}

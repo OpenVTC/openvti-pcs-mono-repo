@@ -1,0 +1,756 @@
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use affinidi_messaging_delivery::{Delivery, MessagingService, MessagingStatus};
+use affinidi_tdk::didcomm::Message;
+use affinidi_tdk::messaging::ATM;
+use affinidi_tdk::messaging::profiles::ATMProfile;
+use tracing::debug;
+
+use crate::error::{AppError, bad_gateway_error};
+use vta_sdk::protocols::{PROBLEM_REPORT_TYPE, extract_problem_report};
+
+/// Translate a remote peer's DIDComm problem-report into a typed [`AppError`].
+///
+/// Every problem report used to collapse into a 502, which made a remote's
+/// "you sent an invalid path" indistinguishable from a genuine upstream
+/// outage: both reached the operator as a 5xx, and the SDK maps *any* 5xx to
+/// `VtaError::Server`, whose CLI hint reads "This is a VTA-side failure.
+/// Check server logs or contact the operator." That is precisely the wrong
+/// thing to tell someone whose request the *host* rejected for a reason they
+/// can act on.
+///
+/// Codes are namespaced per protocol (`e.p.did.*`, `e.p.registration.*`,
+/// `e.p.msg.*`) but the trailing segment is the shared vocabulary, so match
+/// on that. The did-hosting service's `AppError::didcomm_code()` is the
+/// authoritative producer for the `e.p.did.*` arm; this is its inverse.
+///
+/// Unrecognised codes — and every `internal-error` — stay a 502. A failure we
+/// can't attribute to the caller *is* a gateway failure, and silently
+/// re-labelling an upstream crash as a 400 would be a worse lie than the one
+/// being fixed.
+///
+/// Remote auth denials map to [`AppError::Forbidden`] (403), never
+/// `Unauthorized` (401): the caller's credential to *this* VTA is valid — it
+/// is the VTA's own DID that lacks rights on the host. A 401 would make the
+/// CLI print a misleading "token may be expired" hint (see the
+/// `e.p.msg.forbidden` note in the workspace CLAUDE.md).
+/// A problem report can still arrive ahead of a Trust-Task envelope (an
+/// unroutable message never reaches the far side's dispatcher). Inside the
+/// envelope a refusal is a `trust-task-error` document, read by its caller
+/// (e.g. `webvh_host::host_refusal`) — but the code→status mapping here must
+/// not fork, or the same host rejection would surface as a different HTTP status
+/// depending on which framing carried it.
+pub(crate) fn problem_report_to_app_error(code: &str, comment: &str) -> AppError {
+    let detail = format!("remote peer rejected the request: {comment} [{code}]");
+    match code.rsplit('.').next().unwrap_or_default() {
+        "unauthorized" | "forbidden" => AppError::Forbidden(detail),
+        "path-unavailable" | "conflict" => AppError::Conflict(detail),
+        "mnemonic-not-found" | "not-found" => AppError::NotFound(detail),
+        "path-invalid" | "invalid-log" | "witness-invalid" | "validation-error" | "bad-request"
+        | "replay-detected" | "size-exceeded" | "quota-exceeded" => AppError::Validation(detail),
+        _ => bad_gateway_error(detail),
+    }
+}
+
+/// The live delivery-layer wiring the bridge sends through, published each time
+/// `server::MessagingConnect` establishes a mediator session.
+struct BridgeInner {
+    /// The one delivery-layer service over the VTA's mediator websocket(s).
+    /// Outbound `send`/`request` route through its current **primary**;
+    /// `request_via` targets a named (candidate) transport for the mediator
+    /// handshake.
+    service: Arc<MessagingService>,
+    /// The ATM used to authcrypt-pack outbound messages (pack sender = the
+    /// VTA's DID).
+    atm: ATM,
+    /// The profile this session registered against the mediator — the one a
+    /// TSP seal, send or unseal must use.
+    ///
+    /// Published here rather than left in `MessagingConnect` because a profile
+    /// is only good for TSP if it *has a mediator*: `ATMProfile::dids()` and
+    /// `get_mediator_rest_endpoint()` both fail without one, and every TSP
+    /// entry point in the SDK goes through them. A profile built for unpacking
+    /// alone looks interchangeable with this one and is not, which is how the
+    /// outbound seam came to seal on a profile that could never send.
+    profile: Arc<ATMProfile>,
+    /// The VTA's own DID — the `from` on every packed outbound message.
+    vta_did: String,
+}
+
+/// Outbound DIDComm adapter over the reliable-messaging delivery layer.
+///
+/// **D2 P2a cut-over**: this used to wrap the
+/// `affinidi-messaging-didcomm-service` framework's `DIDCommService` + a
+/// thread-id pending-map. It now wraps the delivery-layer [`MessagingService`]:
+/// `send_and_wait` → [`MessagingService::request`] (the outbound message id is
+/// the correlation thread id), `send_guaranteed` → [`MessagingService::send`] with
+/// [`Delivery::Guaranteed`], `send_and_wait_via` → [`MessagingService::request_via`]
+/// (a named candidate transport, for the mediator handshake). The delivery
+/// dispatcher owns thread-id correlation, so the old pending-map / `try_complete`
+/// / `send_message_with_retry` are gone.
+///
+/// The public method surface is unchanged so the ~25 WebVH / provision / CLI /
+/// test call-sites that thread `Arc<DIDCommBridge>` compile untouched;
+/// [`placeholder`](Self::placeholder) stays free (offline CLI + tests never
+/// send). The live wiring is published via [`set_messaging`](Self::set_messaging)
+/// on every (re)connect and dropped via
+/// [`clear_messaging`](Self::clear_messaging) when a session ends.
+pub struct DIDCommBridge {
+    /// The current wiring, or `None` before the first successful mediator
+    /// connect.
+    ///
+    /// **Republishable, not set-once.** `server::MessagingConnect` reconnects
+    /// after a dropped session, and each reconnect builds a *new*
+    /// `MessagingService`/ATM over a new socket. A set-once cell silently
+    /// discarded the republish, leaving every outbound send pointed at the
+    /// previous session's dead socket — so the bridge has to be able to swap.
+    ///
+    /// Accessors clone the `Arc` out and drop the guard before any `.await`
+    /// (R1.3: never hold a lock across an await), which is also why this is a
+    /// `std` lock rather than a `tokio` one.
+    inner: RwLock<Option<Arc<BridgeInner>>>,
+    /// The VTA's operational signing key (resolver + verification-method id),
+    /// used to sign Trust Task documents this VTA originates to a peer
+    /// ([`Self::sign_outbound_request`]). Set once at state construction.
+    signer: RwLock<
+        Option<(
+            Arc<affinidi_tdk::secrets_resolver::ThreadedSecretsResolver>,
+            String,
+        )>,
+    >,
+    /// The primary transport id (e.g. `"vta-main"`). Retained for parity with
+    /// the old listener id; outbound always routes through the service's
+    /// current primary regardless.
+    #[allow(dead_code)]
+    listener_id: String,
+    /// Test seam: report a live session authenticated as this DID without one
+    /// ([`Self::pretend_live_as`]). Sends still fail "not initialized", which
+    /// is the point — a test using it shows what transport selection does when
+    /// DIDComm is wired, without a mediator.
+    #[cfg(test)]
+    pretend_sender: RwLock<Option<String>>,
+}
+
+impl DIDCommBridge {
+    /// Create a new bridge. Call [`set_messaging`](Self::set_messaging) after
+    /// the delivery-layer `MessagingService` starts to enable outbound sends.
+    pub fn new(listener_id: impl Into<String>) -> Self {
+        Self {
+            inner: RwLock::new(None),
+            signer: RwLock::new(None),
+            listener_id: listener_id.into(),
+            #[cfg(test)]
+            pretend_sender: RwLock::new(None),
+        }
+    }
+
+    /// Create a placeholder bridge for test/CLI contexts that never send.
+    /// Attempting to send via a placeholder returns an error.
+    pub fn placeholder() -> Self {
+        Self::new("")
+    }
+
+    /// A placeholder that signs as this VTA: no mediator session, but
+    /// [`Self::sign_outbound_request`] works.
+    ///
+    /// For the offline CLI. Every document sent to a DID hosting server
+    /// carries this VTA's proof, and the daemon installs that signer at
+    /// startup. The offline CLI never starts the daemon, so with a bare
+    /// placeholder every create, publish, register and delete on a hosting
+    /// server failed with "could not sign the DID-management task", however
+    /// the VTA was configured. The key loaded here is the one the daemon signs
+    /// with, read from the same store. With no mediator session the request
+    /// goes over the host's HTTPS endpoint, where the proof is the whole of
+    /// the authentication.
+    ///
+    /// `vta_did == None` gives the bare placeholder: the hosting client
+    /// refuses a VTA with no DID by name before anything is signed.
+    pub async fn signing_only(
+        vta_did: Option<&str>,
+        keys_ks: &crate::store::KeyspaceHandle,
+        imported_ks: &crate::store::KeyspaceHandle,
+        contexts_ks: &crate::store::KeyspaceHandle,
+        // This VTA's own `did:webvh` log, from which its signing key's id is
+        // read (VTI-KEY-150); `None` falls back to the did:webvh convention.
+        webvh_ks: Option<&crate::store::KeyspaceHandle>,
+        // A did:webs VTA's key event log, for the same purpose.
+        webs_ks: Option<&crate::store::KeyspaceHandle>,
+        seed_store: &dyn crate::keys::seed_store::SeedStore,
+        audit: &vta_audit::SharedAuditSink,
+    ) -> Result<Self, AppError> {
+        let bridge = Self::placeholder();
+        let Some(vta_did) = vta_did else {
+            return Ok(bridge);
+        };
+        let self_keys = crate::self_keys::self_keys(vta_did, webvh_ks, webs_ks).await;
+        // It signs requests with `proofPurpose: authentication`, so it holds
+        // the authentication key (a key-role identity's `operational` one).
+        let secret = crate::operations::credentials::load_vta_issuer_secret_from_store(
+            keys_ks,
+            imported_ks,
+            contexts_ks,
+            seed_store,
+            audit,
+            &self_keys.authentication,
+            "cli-did-management",
+        )
+        .await?;
+        let vm_id = secret.id.clone();
+        let (resolver, _handle) =
+            affinidi_tdk::secrets_resolver::ThreadedSecretsResolver::new(None).await;
+        {
+            use affinidi_tdk::secrets_resolver::SecretsResolver as _;
+            resolver.insert(secret).await;
+        }
+        bridge.set_document_signer(Arc::new(resolver), vm_id);
+        Ok(bridge)
+    }
+
+    /// A process-wide placeholder bridge for builds that never send DIDComm
+    /// (e.g. a REST-only enclave, where `AppState.didcomm_bridge` is compiled
+    /// out). Returns a `'static` reference so it can satisfy operation-context
+    /// fields that otherwise borrow `&AppState.didcomm_bridge`. Sending via it
+    /// errors, exactly like any other placeholder.
+    #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+    pub fn placeholder_ref() -> &'static Arc<DIDCommBridge> {
+        static PLACEHOLDER: std::sync::LazyLock<Arc<DIDCommBridge>> =
+            std::sync::LazyLock::new(|| Arc::new(DIDCommBridge::placeholder()));
+        &PLACEHOLDER
+    }
+
+    /// Install the VTA's operational signing key for
+    /// [`Self::sign_outbound_request`].
+    pub fn set_document_signer(
+        &self,
+        resolver: Arc<affinidi_tdk::secrets_resolver::ThreadedSecretsResolver>,
+        signing_vm_id: String,
+    ) {
+        *self.signer.write().unwrap_or_else(|p| p.into_inner()) = Some((resolver, signing_vm_id));
+    }
+
+    /// Sign a Trust Task document this VTA originates to a peer — with its
+    /// operational key and `proofPurpose: authentication` — in place. The
+    /// document must already carry `id`, `issuer`, `recipient` and `issuedAt`.
+    /// `false` when no signer is installed or the signature will not attach; the
+    /// caller must then not send the document, because the peer does not rely
+    /// on the transport sender to identify its composer.
+    pub async fn sign_outbound_request(&self, doc: &mut serde_json::Value) -> bool {
+        let signer = self
+            .signer
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some((resolver, vm_id)) = signer else {
+            tracing::warn!("no signing key installed; an outbound request cannot be signed");
+            return false;
+        };
+        use affinidi_tdk::secrets_resolver::SecretsResolver as _;
+        let Some(secret) = resolver.get_secret(&vm_id).await else {
+            tracing::error!(%vm_id, "no resident secret for the signing key");
+            return false;
+        };
+        crate::trust_tasks::sign_as_authentication(
+            &secret,
+            doc,
+            vti_common::trust_task::envelope::EnvelopeRole::Request,
+        )
+        .await
+    }
+
+    /// Publish the live delivery-layer wiring, replacing any previous session's.
+    /// Called from `server::MessagingConnect` after each successful mediator
+    /// connect.
+    pub fn set_messaging(
+        &self,
+        service: Arc<MessagingService>,
+        atm: ATM,
+        profile: Arc<ATMProfile>,
+        vta_did: String,
+    ) {
+        let replacing = {
+            let mut guard = self.write_inner();
+            guard
+                .replace(Arc::new(BridgeInner {
+                    service,
+                    atm,
+                    profile,
+                    vta_did,
+                }))
+                .is_some()
+        };
+        if replacing {
+            debug!("DIDComm bridge wiring replaced (mediator reconnect)");
+        }
+    }
+
+    /// Drop the published wiring — outbound sends fail with "not initialized"
+    /// until the next [`set_messaging`](Self::set_messaging).
+    ///
+    /// Called by the reconnect supervisor once a session's inbound loop has
+    /// ended: the old `MessagingService` is finished at that point, and leaving
+    /// it published would have callers queue sends onto a dead socket that can
+    /// only fail. Failing fast is the honest signal.
+    pub fn clear_messaging(&self) {
+        if self.write_inner().take().is_some() {
+            debug!("DIDComm bridge wiring cleared (mediator session ended)");
+        }
+    }
+
+    /// The live [`MessagingService`] handle, or `None` before
+    /// [`set_messaging`](Self::set_messaging). Used by the live mediator
+    /// handshake prover, which drives `add_transport`/`request_via`/`promote`
+    /// against it.
+    pub fn messaging_handle(&self) -> Option<Arc<MessagingService>> {
+        self.snapshot().map(|i| i.service.clone())
+    }
+
+    /// The ATM (for building a candidate transport's profile + packing during
+    /// the mediator handshake), or `None` before the service is published.
+    pub fn atm(&self) -> Option<ATM> {
+        self.snapshot().map(|i| i.atm.clone())
+    }
+
+    /// The mediator-registered profile, or `None` before the service is
+    /// published.
+    ///
+    /// This is the profile every TSP operation needs, because a TSP seal, send
+    /// or unseal resolves the mediator off the profile itself: `pack` and
+    /// `unpack_bytes` call `ATMProfile::dids()`, and `send_raw` additionally
+    /// calls `get_mediator_rest_endpoint()`. A profile constructed with no
+    /// mediator answers `ConfigError("No Mediator is configured for this
+    /// Profile")` to all three — before any I/O, so it reads like a logic error
+    /// rather than a wiring one.
+    ///
+    /// Paired with [`atm`](Self::atm): the profile is registered *on* that ATM,
+    /// and passing a profile to a different ATM's `tsp()` is not a
+    /// combination that works.
+    pub fn profile(&self) -> Option<Arc<ATMProfile>> {
+        self.snapshot().map(|i| i.profile.clone())
+    }
+
+    /// The ATM and its mediator-registered profile of **one** session, taken
+    /// together, or `None` before the service is published — what a
+    /// `messaging/wake/request` needs (`crate::messaging::mediator_wake`).
+    pub fn wake_wiring(&self) -> Option<(ATM, Arc<ATMProfile>)> {
+        self.snapshot().map(|i| (i.atm.clone(), i.profile.clone()))
+    }
+
+    /// The service, ATM and own DID of **one** session, taken together, or
+    /// `None` before the service is published — what a Trust Task push needs
+    /// (`crate::messaging::push`). One snapshot rather than three accessor
+    /// calls, so a reconnect between them cannot pair one session's service
+    /// with another's ATM.
+    pub fn push_wiring(&self) -> Option<(Arc<MessagingService>, ATM, String)> {
+        self.snapshot()
+            .map(|i| (i.service.clone(), i.atm.clone(), i.vta_did.clone()))
+    }
+
+    /// The VTA's own DID, or `None` before the service is published.
+    pub fn vta_did(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(did) = self
+            .pretend_sender
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return Some(did);
+        }
+        self.snapshot().map(|i| i.vta_did.clone())
+    }
+
+    /// Test-only: make [`Self::vta_did`] report a live session authenticated
+    /// as `did`, as `server::MessagingConnect` would after connecting. Nothing
+    /// is wired, so a DIDComm send still fails — a test that selects DIDComm
+    /// sees that failure instead of the peer.
+    #[cfg(all(test, feature = "didcomm"))]
+    pub(crate) fn pretend_live_as(&self, did: &str) {
+        *self
+            .pretend_sender
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(did.to_string());
+    }
+
+    /// The live, **non-latched** messaging status (R6.2), or `None` before the
+    /// service is published. Read straight off [`MessagingService::status`],
+    /// which reflects each transport's live connection signal and can go false
+    /// again after boot.
+    pub fn messaging_status_str(&self) -> Option<String> {
+        self.snapshot().map(|i| {
+            match i.service.status() {
+                MessagingStatus::Connected => "connected",
+                MessagingStatus::Degraded => "degraded",
+                // `MessagingStatus` is `#[non_exhaustive]`; treat any other
+                // (including `Disconnected`) as disconnected.
+                _ => "disconnected",
+            }
+            .to_string()
+        })
+    }
+
+    /// Clone the current wiring out from under the read lock. Every accessor
+    /// goes through this so no guard is ever alive across an `.await`.
+    fn snapshot(&self) -> Option<Arc<BridgeInner>> {
+        match self.inner.read() {
+            Ok(guard) => guard.clone(),
+            // A poisoned lock means a writer panicked mid-swap. The wiring is
+            // just three cloneable handles, so recover rather than propagate a
+            // panic into every send path.
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, Option<Arc<BridgeInner>>> {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn inner(&self) -> Result<Arc<BridgeInner>, AppError> {
+        self.snapshot()
+            .ok_or_else(|| AppError::Internal("DIDComm messaging not initialized".into()))
+    }
+
+    /// Authcrypt-pack `body` as a DIDComm message from the VTA to `recipient`.
+    /// Returns `(message_id, packed_bytes)`; the id is the correlation thread
+    /// id for a request/reply round trip.
+    async fn pack(
+        inner: &BridgeInner,
+        recipient: &str,
+        msg_type: &str,
+        body: serde_json::Value,
+        timeout_secs: Option<u64>,
+    ) -> Result<(String, Vec<u8>), AppError> {
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut builder = Message::build(msg_id.clone(), msg_type.to_string(), body)
+            .from(inner.vta_did.clone())
+            .to(recipient.to_string())
+            .created_time(now);
+        if let Some(secs) = timeout_secs {
+            builder = builder.expires_time(now + secs);
+        }
+        let msg = builder.finalize();
+        let (packed, _meta) = inner
+            .atm
+            .pack_encrypted(&msg, recipient, Some(&inner.vta_did), Some(&inner.vta_did))
+            .await
+            .map_err(|e| bad_gateway_error(format!("failed to pack message: {e}")))?;
+        Ok((msg_id, packed.into_bytes()))
+    }
+
+    /// Durably enqueue `body` as a **Guaranteed** DIDComm push to
+    /// `recipient_did`: written to the outbox and drained with exponential
+    /// backoff so a websocket reconnect can no longer silently drop it (R1.1 —
+    /// the exact failure a bare `BestEffort` send hid). The push hop-accepts to
+    /// the mediator **once** (then it is `Sent`, never re-sent — only a *failed*
+    /// hop retries), settling `Delivered` on §5a evidence or `Unconfirmed` when
+    /// the `deliver_by` window passes; never a silent success.
+    ///
+    /// Used for the delegated step-up / task-consent pushes — the approver's
+    /// device replies later via a separate out-of-thread call, so this is
+    /// fire-and-forget from the request thread's point of view, but now
+    /// delivery-durable. `idempotency_key` dedups re-enqueues of the same logical
+    /// push (pass the request/thread id). Returns once durably **queued**, not
+    /// once delivered. `_listener_id` is retained for call-site parity; outbound
+    /// routes through the service's current primary transport.
+    pub async fn send_guaranteed(
+        &self,
+        _listener_id: &str,
+        recipient_did: &str,
+        msg_type: &str,
+        body: serde_json::Value,
+        idempotency_key: Option<String>,
+        deliver_by: Duration,
+    ) -> Result<(), AppError> {
+        let inner = self.inner()?;
+        // No DIDComm `expires_time`: `deliver_by` bounds the outbox *hop-retry*
+        // window (how long we retry reaching the mediator), NOT the message's
+        // content validity. A held push must remain collectable until the
+        // request's own `expiresAt` — a shorter message expiry could make the
+        // mediator drop it before an offline device reconnects. (This preserves
+        // the prior `send_oneway` behaviour, which set no expiry.)
+        let (msg_id, packed) = Self::pack(&inner, recipient_did, msg_type, body, None).await?;
+        // The message id was discarded here, which left nothing to correlate a
+        // send against — not the outbox entry, not the mediator's record, not
+        // the recipient's. Logged before the enqueue so an enqueue that fails
+        // still names what was being sent and to whom.
+        tracing::info!(
+            msg_id = %msg_id,
+            recipient = %recipient_did,
+            msg_type = %msg_type,
+            deliver_by_secs = deliver_by.as_secs(),
+            idempotency_key = ?idempotency_key,
+            "enqueueing guaranteed push"
+        );
+        inner
+            .service
+            .send(
+                recipient_did,
+                packed,
+                Delivery::Guaranteed {
+                    idempotency_key,
+                    ordering_key: None,
+                    deliver_by,
+                },
+            )
+            .await
+            .map_err(|e| bad_gateway_error(format!("failed to enqueue guaranteed push: {e}")))?;
+        Ok(())
+    }
+
+    /// Send a DIDComm message and await the correlated reply, validating it
+    /// against `expected_type` / `problem_report_type` exactly as before.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_and_wait(
+        &self,
+        server_did: &str,
+        msg_type: &str,
+        body: serde_json::Value,
+        expected_type: &str,
+        problem_report_type: &str,
+        timeout_secs: u64,
+    ) -> Result<Message, AppError> {
+        let inner = self.inner()?;
+        let (msg_id, packed) =
+            Self::pack(&inner, server_did, msg_type, body, Some(timeout_secs)).await?;
+        // The outbound message id IS the correlation thread id: the reply
+        // threads to it (`thid == request.id`), and the delivery dispatcher
+        // demuxes the reply to this waiter by that thread id.
+        let received = inner
+            .service
+            .request(
+                server_did,
+                packed,
+                &msg_id,
+                Duration::from_secs(timeout_secs),
+            )
+            .await
+            .map_err(|e| bad_gateway_error(format!("failed to send message: {e}")))?;
+        Self::validate_reply(received.payload, expected_type, problem_report_type)
+    }
+
+    /// Like [`send_and_wait`](Self::send_and_wait) but sends over a **named**
+    /// (non-primary) installed transport — the candidate mediator being proven
+    /// during a migration handshake — while still awaiting the correlated reply
+    /// on the merged dispatcher.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_and_wait_via(
+        &self,
+        listener_id: &str,
+        recipient_did: &str,
+        msg_type: &str,
+        body: serde_json::Value,
+        expected_type: &str,
+        problem_report_type: &str,
+        timeout_secs: u64,
+    ) -> Result<Message, AppError> {
+        let inner = self.inner()?;
+        let (msg_id, packed) =
+            Self::pack(&inner, recipient_did, msg_type, body, Some(timeout_secs)).await?;
+        let received = inner
+            .service
+            .request_via(
+                listener_id,
+                recipient_did,
+                packed,
+                &msg_id,
+                Duration::from_secs(timeout_secs),
+            )
+            .await
+            .map_err(|e| bad_gateway_error(format!("failed to send message: {e}")))?;
+        Self::validate_reply(received.payload, expected_type, problem_report_type)
+    }
+
+    /// Parse a delivery-layer reply payload (the full plaintext DIDComm message
+    /// JSON) and validate it: a problem-report maps through
+    /// [`problem_report_to_app_error`]; any non-`expected_type` reply is a 502.
+    fn validate_reply(
+        payload: Vec<u8>,
+        expected_type: &str,
+        problem_report_type: &str,
+    ) -> Result<Message, AppError> {
+        let response: Message = serde_json::from_slice(&payload)
+            .map_err(|e| bad_gateway_error(format!("failed to parse DIDComm response: {e}")))?;
+
+        if response.typ == problem_report_type || response.typ == PROBLEM_REPORT_TYPE {
+            let (code, comment) = extract_problem_report(&response.body);
+            return Err(problem_report_to_app_error(&code, &comment));
+        }
+
+        if response.typ != expected_type {
+            return Err(bad_gateway_error(format!(
+                "unexpected response type: expected {expected_type}, got {}",
+                response.typ
+            )));
+        }
+
+        Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    /// The status the operator actually receives — drive the real
+    /// `IntoResponse` rather than re-asserting the variant, so a future
+    /// change to `AppError`'s status mapping can't quietly re-break this.
+    fn status_of(code: &str) -> StatusCode {
+        problem_report_to_app_error(code, "boom")
+            .into_response()
+            .status()
+    }
+
+    /// The did-hosting service's `AppError::didcomm_code()` is the
+    /// authoritative producer of these codes; this pins our inverse of it.
+    /// The bug this fixes: every one of these used to come back 502, and the
+    /// SDK maps any 5xx to `VtaError::Server` → "This is a VTA-side failure",
+    /// which is a lie when the *host* rejected an actionable request.
+    #[test]
+    fn remote_client_errors_keep_their_meaning() {
+        // The exact code from the root-DID register failure.
+        assert_eq!(status_of("e.p.did.path-invalid"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_of("e.p.did.invalid-log"), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status_of("e.p.did.witness-invalid"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of("e.p.did.validation-error"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(status_of("e.p.did.quota-exceeded"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_of("e.p.did.size-exceeded"), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status_of("e.p.did.replay-detected"),
+            StatusCode::BAD_REQUEST
+        );
+
+        // Slot taken → the operator needs `--force`, not a bug report.
+        assert_eq!(status_of("e.p.did.path-unavailable"), StatusCode::CONFLICT);
+        assert_eq!(
+            status_of("e.p.did.mnemonic-not-found"),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Remote auth denials are 403, never 401 — the caller's token for *this*
+    /// VTA is fine; it's the VTA's DID that lacks rights on the host. A 401
+    /// would make the CLI print a misleading "token may be expired" hint.
+    #[test]
+    fn remote_auth_denial_is_forbidden_not_unauthorized() {
+        for code in [
+            "e.p.did.unauthorized",
+            "e.p.registration.unauthorized",
+            "e.p.stats.unauthorized",
+            "e.p.msg.forbidden",
+        ] {
+            assert_eq!(status_of(code), StatusCode::FORBIDDEN, "code {code}");
+        }
+    }
+
+    /// A genuine upstream failure stays a 502. Re-labelling an upstream crash
+    /// as a caller error would be a worse lie than the one being fixed.
+    #[test]
+    fn upstream_failures_and_unknown_codes_stay_bad_gateway() {
+        for code in [
+            "e.p.did.internal-error",
+            "e.p.registration.internal-error",
+            "e.p.did.some-code-we-have-never-seen",
+            "",
+        ] {
+            assert_eq!(status_of(code), StatusCode::BAD_GATEWAY, "code {code}");
+        }
+    }
+
+    /// The remote's comment and code both survive into the operator-visible
+    /// message — without them the error is unactionable.
+    #[test]
+    fn detail_carries_remote_comment_and_code() {
+        let err = problem_report_to_app_error(
+            "e.p.did.path-invalid",
+            "path segments must contain only lowercase letters, digits, and hyphens",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("lowercase letters"), "lost comment: {msg}");
+        assert!(msg.contains("e.p.did.path-invalid"), "lost code: {msg}");
+    }
+
+    /// A request this VTA really produces, with the envelope
+    /// `sign_outbound_request` needs. A real one rather than a literal, so
+    /// `produced_census` has no new URI to account for.
+    #[cfg(feature = "didcomm")]
+    fn request_from(issuer: &str) -> serde_json::Value {
+        crate::trust_tasks::step_up::push_wake_document(
+            Some(issuer),
+            "did:key:z6MkGateway",
+            "handle-1",
+            "did:web:mediator.example",
+        )
+    }
+
+    async fn signing_only_for(
+        state: &crate::server::AppState,
+        vta_did: Option<&str>,
+    ) -> DIDCommBridge {
+        DIDCommBridge::signing_only(
+            vta_did,
+            &state.keys_ks,
+            &state.imported_ks,
+            &state.contexts_ks,
+            Some(&state.webvh_ks),
+            Some(&state.webs_ks),
+            &*state.seed_store,
+            &state.audit_sink,
+        )
+        .await
+        .expect("signing-only bridge")
+    }
+
+    /// The offline CLI's bridge signs as this VTA, with the key the daemon
+    /// signs with, so a DID hosting server accepts what it sends. Before, the
+    /// offline `did-mgmt` commands used a bare placeholder and every one that
+    /// reached a hosting server failed with "could not sign the
+    /// DID-management task".
+    #[cfg(feature = "didcomm")]
+    #[tokio::test]
+    async fn signing_only_signs_as_the_vta() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let vta_did = state.config.read().await.vta_did.clone().expect("vta_did");
+        let bridge = signing_only_for(&state, Some(&vta_did)).await;
+
+        let mut doc = request_from(&vta_did);
+        assert!(bridge.sign_outbound_request(&mut doc).await, "must sign");
+
+        let typed: trust_tasks_rs::TrustTask<serde_json::Value> =
+            serde_json::from_value(doc.clone()).unwrap();
+        let signer =
+            vti_common::auth::verify_trust_task_proof_with(&typed, &state.trust_task_vm_resolver())
+                .await
+                .expect("the proof verifies against the VTA's DID");
+        assert_eq!(signer.split('#').next(), Some(vta_did.as_str()));
+        assert_eq!(
+            doc["proof"]["verificationMethod"],
+            crate::operations::credentials::vta_signing_vm(&vta_did)
+        );
+    }
+
+    /// No VTA DID, nothing to sign as: the bridge stays a bare placeholder
+    /// and refuses rather than signing as someone.
+    #[cfg(feature = "didcomm")]
+    #[tokio::test]
+    async fn signing_only_without_a_vta_did_does_not_sign() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let bridge = signing_only_for(&state, None).await;
+        let mut doc = request_from("did:key:z6MkAnyone");
+        assert!(!bridge.sign_outbound_request(&mut doc).await);
+        assert!(doc.get("proof").is_none());
+    }
+}

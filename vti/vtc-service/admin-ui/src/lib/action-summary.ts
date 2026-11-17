@@ -1,0 +1,642 @@
+// What an approver is shown about an administrator action, derived from the
+// bytes that are digested (VTI-APV-011, VTI-APV-013;
+// docs/05-design-notes/vtc-action-list.md §7a.2).
+//
+// The VTC publishes, with each action, a **summary template** — a title, an
+// optional effect sentence, and named fields that are each an RFC 6901 JSON
+// Pointer into the action's `payload`. The console does not trust the values
+// the VTC filled in. It:
+//
+//  1. checks the template is the one pinned for the action's `(kind, typeUri)`
+//     in this build ([`PINNED_TEMPLATE_DIGESTS`]) — a template the VTC could
+//     rewrite per action could say anything;
+//  2. recomputes the payload digest (multibase sha2-256 multihash of
+//     JCS(payload)) and compares it with the action's `payloadDigest` — the
+//     digest is what an approval is bound to, so a summary of other bytes is a
+//     summary of a different act;
+//  3. re-derives every field from `payload` through its pointer, and refuses
+//     when any differs from the value the VTC sent;
+//  4. renders the title and effect from the **re-derived** values only.
+//
+// Any failure refuses to render at all: the card says the summary does not
+// match the payload and must not be approved. There is no partial rendering.
+//
+// Rendering is plain text. A `text` field is shown as its own characters —
+// React text nodes, never markup — so `<b>night shift</b>` in a label is
+// those eighteen characters.
+//
+// The same template vectors (`action-summary.vectors.json`, produced by the
+// Rust renderer) are run here, in the VTC and in `cnm`, so the three agree.
+
+import { base58btcDecode, base58btcEncode, jcsCanonicalize } from "./jcs";
+import { formatDateTime } from "@/lib/format";
+
+const SPEC = "https://trusttasks.org/spec";
+
+/** An operator's offline write, raised for acknowledgement (VTI-VTC-023). */
+export const KIND_OPERATOR_WRITE = "operator.offlineWrite";
+
+/**
+ * The `typeUri` every operator offline write is recorded under: an embedded
+ * document type (payload `{command, dids, host, at}`), never a task anybody
+ * sends.
+ */
+export const OPERATOR_OFFLINE_WRITE_URI = "https://trusttasks.org/spec/vtc/operator/offline-write/0.2";
+
+/** The `typeUri` the boot-time ACL migration's acknowledge item is recorded under. */
+export const OPERATOR_ACL_MIGRATION_URI = "urn:openvtc:vtc:operator:acl-migration";
+
+/** A departed granter's grants, raised for re-affirmation (`vtc-admin-roles.md`
+ *  §6.3): approving re-affirms them, declining withdraws them. */
+export const KIND_GRANTS_REVIEW = "acl.grants.review";
+
+/** The record type a grants review is raised under — never a task anybody sends. */
+export const GRANTS_REVIEW_URI = "urn:openvtc:vtc:acl:grants-review";
+
+// Queue items (`vtc-action-list.md` §8.2): existing human decisions surfaced
+// in the action list as category `queue`, each named by a record type.
+
+/** An unratified git-ns break-glass: approve ratifies it, decline revokes it. */
+export const KIND_BREAK_GLASS_REVIEW = "gitNs.breakGlass.review";
+export const BREAK_GLASS_REVIEW_URI = "urn:openvtc:vtc:git-ns:break-glass-review";
+/** A join request referred for review: approve admits, decline rejects. */
+export const KIND_JOIN_REVIEW = "member.join.review";
+export const JOIN_REVIEW_URI = "urn:openvtc:vtc:join:review";
+/** A withdrawn vetting statement a membership rests on: approve keeps the
+ *  member, decline starts their removal. */
+export const KIND_VETTING_REVIEW = "vetting.withdrawal.review";
+export const VETTING_REVIEW_URI = "urn:openvtc:vtc:vetting:withdrawal-review";
+
+/** A direct admission the community's `admission` policy referred for
+ *  approval: adding a member without a join request. */
+export const KIND_MEMBER_ADMIT = "member.admit";
+export const MEMBERS_ADMIT_URI = `${SPEC}/vtc/members/admit/0.1`;
+/** A direct admission the `admission` policy referred for approval: making an
+ *  existing access-control entry a membership. */
+export const KIND_MEMBER_MAKE_MEMBERSHIP = "member.makeMembership";
+export const MEMBERS_MAKE_MEMBERSHIP_URI = `${SPEC}/vtc/members/make-membership/0.1`;
+
+/**
+ * The pinned template digest for each `(kind, typeUri)`.
+ *
+ * This table MUST match `vtc-service/src/admin_actions/summary.rs` `PINNED`.
+ * A template whose digest is not listed here for its pair is refused, so a
+ * new kind (or a changed template) needs an entry in both places.
+ */
+export const PINNED_TEMPLATE_DIGESTS: Readonly<Record<string, string>> = Object.freeze({
+  // A group carrying authority (VTI-DIR-104).
+  [pinKey("acl.grant.authority", `${SPEC}/vtc/groups/members/add/0.1`)]:
+    "zQmZr8mXvAph3Sxdxbv9ge82svqswrBn9xunstWKDsSD1tG",
+  [pinKey("acl.grant.authority", `${SPEC}/vtc/groups/bindings/add/0.1`)]:
+    "zQmXa9sTSnLan8LEf7QyEzavkt5doEHVz6jZ9c34Yg8bKi9",
+  [pinKey("acl.reduce.authority", `${SPEC}/vtc/groups/members/remove/0.1`)]:
+    "zQmQVW9TAVk3kGCAiCwc7vvyhKCXYJobPYRxxfD9nphPMfi",
+  [pinKey("acl.reduce.authority", `${SPEC}/vtc/groups/bindings/remove/0.1`)]:
+    "zQmPdSegnSr9GKnqAyFoiBrBQV4pHHHea4sQ9oKeyu1FsSq",
+  [pinKey("acl.reduce.authority", `${SPEC}/vtc/groups/delete/0.1`)]:
+    "zQmemh2M3haEy21mKWDKRoaswuSUeD6oSRyjUKGwUSENWZz",
+  [pinKey("acl.grant.authority", `${SPEC}/acl/grant/0.2`)]:
+    "zQmNiciJtH7xnKdQUxEwp44mpbCrVt8tfBrt1XKg7VfAc71",
+  [pinKey("acl.grant.authority", `${SPEC}/acl/update/0.2`)]:
+    "zQmQBA6WoTVVo2wBJrmkJwTnefj6q1Hgwc2BWFTCCPpWnQT",
+  [pinKey("acl.grant.authority", `${SPEC}/acl/change-role/0.2`)]:
+    "zQmVAPMeYXgX9bUi5HruaPFxBLsW1ZJNkbRss6VixMz48vt",
+  [pinKey("acl.reduce.authority", `${SPEC}/acl/revoke/0.2`)]:
+    "zQmfJss7J6uNUdyZPUC64BoJ971CdnTfgd6BVEQd7aFjYwD",
+  [pinKey("acl.reduce.authority", `${SPEC}/acl/update/0.2`)]:
+    "zQmNWjHGRwDCfUsvVFxx6o6eXczqjQTepMEKwkS3qqNo1N6",
+  [pinKey("acl.reduce.authority", `${SPEC}/acl/change-role/0.2`)]:
+    "zQmaAjJC1L9w3pbUTEbWfhzfBdUpv8pofDZvL6mWSpU2eWk",
+  // `acl/change-role/0.1` is no longer served; kept so a move parked under it
+  // still renders in the history.
+  [pinKey("acl.grant.authority", `${SPEC}/acl/change-role/0.1`)]:
+    "zQmQX9Dx7cDqLtcoTNuDSWWo5nJTGecB9CqRLKgpd4es1c9",
+  // A community-role move (`vtc/members/role/set/0.1`).
+  [pinKey("acl.grant.authority", `${SPEC}/vtc/members/role/set/0.1`)]:
+    "zQmeeEJA8obiMqBSq33xo2prbmZcPzPd3SfenmT58Km7LRZ",
+  [pinKey("acl.reduce.authority", `${SPEC}/vtc/members/role/set/0.1`)]:
+    "zQmPDwBktx52yrW3HneQuL8AbdZ44d6bq5K5WkU51jN38jD",
+  [pinKey("admin.invite.create", `${SPEC}/vtc/admin/invites/create/0.1`)]:
+    "zQmSXC2GaMpizs4kKRhz4nBchZikWjqHAoeDfA5D7fVizgp",
+  // create 0.2: a passkey invitation names no DID, so the title names none.
+  [pinKey("admin.invite.create", `${SPEC}/vtc/admin/invites/create/0.2`)]:
+    "zQmXg9RsQh74pTGLccB8ENC4trXmhB5MfYzN8VG7Mzb6Zuw",
+  [pinKey("acl.reduce.authority", `${SPEC}/acl/change-role/0.1`)]:
+    "zQmfHspRZaXfEPkeAyqcFkpgqYT2RCqXjjnXVZmFhsaJQcu",
+  [pinKey("acl.reduce.authority", `${SPEC}/vtc/members/admin-remove/0.1`)]:
+    "zQmc2FGMz27Bqiu3CPpy5BrVBWyst3RkfWhfk322QWzu6mR",
+  [pinKey("config.threshold.lower", `${SPEC}/config/patch/0.1`)]:
+    "zQmeGT7ztnicC5RScp86U5Yjq1s3vhtzZof8yYy6sWi9cYP",
+  [pinKey("config.threshold.lower", `${SPEC}/vtc/config/import/0.1`)]:
+    "zQmQ6yxgM1HYuJkY4RvQDYiB7NyfsFeAeYzcPnh6d5rrrPc",
+  // Any change to the trusted-witness list (VTI-CMP-090).
+  [pinKey("config.witnesses.change", `${SPEC}/config/patch/0.1`)]:
+    "zQmYGMiMk9SpEJwJ7g4EpxKCourBJVRP6PnmHMzYccbQugH",
+  [pinKey("config.witnesses.change", `${SPEC}/vtc/config/import/0.1`)]:
+    "zQmathdofD8yrXDQ2AuSfsWwjjKdx9RdPkAnC2r7qdU79hc",
+  // Creating a binding election (VTI-VOT-081).
+  [pinKey("election.binding.create", `${SPEC}/vtc/elections/create/0.1`)]:
+    "zQmRruPSiJx9JHEBJCdQiH1qXMTdqf2Dy6yL1WmUJqTU8mX",
+  [pinKey("election.binding.create", `${SPEC}/vtc/elections/create/0.3`)]:
+    "zQmSCbudt2Arz4PCwpWmzhMhA4gLfVjxmAd5UMZi8bef7hq",
+  [pinKey("election.binding.create", `${SPEC}/vtc/elections/create/0.4`)]:
+    "zQmR79wDEhh2mEJLRAbTgWiYWgtEby8xcwzEQFQQJ63mqZs",
+  [pinKey("election.binding.create", `${SPEC}/vtc/elections/create/0.5`)]:
+    "zQmVDaP58EusQDuDEKJ9TU289EvDHpbQwdYbzZhZoF5BSEE",
+  // Widening a member-directory field (VTI-DIR-024).
+  [pinKey("directory.field.widen", `${SPEC}/vtc/directory/fields/update/0.1`)]:
+    "zQmafxMMkTfH4kb9QgoUQEJtUs4tuZFvqM8nxhjEawj6vYZ",
+  // Replacing or activating the personhood policy (VTI-APV-023).
+  [pinKey("policy.recognition.change", `${SPEC}/policy/upsert/0.3`)]:
+    "zQmbvZxPwfxKg7j3MNguVQNJXVwVcfrRbBQZiWrWyfszTm3",
+  [pinKey("policy.recognition.change", `${SPEC}/policy/activate/0.1`)]:
+    "zQmSdYoQSJ79w1Di8LMr3QJKcjLt47c2DdH2F9gbfoLF6hv",
+  // Publishing or withdrawing hidden vetting on a join criterion (VTI-APV-023).
+  [pinKey("join.criteria.hiddenVetting", `${SPEC}/vtc/vetting/hidden/publish/0.1`)]:
+    "zQmfB8sMNE5otp8D7uYDLeBuWhHfLHQUe3BPCVrwqNWyRDi",
+  [pinKey("join.criteria.hiddenVetting", `${SPEC}/vtc/vetting/hidden/withdraw/0.1`)]:
+    "zQmcN7gkKudstTLhhf5kKTrS6eoxNyS5hBkjSGzoK8nYcKL",
+  // Registering, replacing or removing a join criterion (VTI-APV-023).
+  [pinKey("join.criteria.change", `${SPEC}/vtc/schemas/accepts/register/0.2`)]:
+    "zQmbgGnKd4rpcj5dPZsKGTrL48wFiL5jGnyyUe9o3JcP5mr",
+  [pinKey("join.criteria.change", `${SPEC}/vtc/schemas/accepts/delete/0.1`)]:
+    "zQmaKTFtV3fF3hBkeWwduWohd35nePzqcEvBP95HLa3e7Pu",
+  [pinKey("policy.authority.change", `${SPEC}/policy/upsert/0.3`)]:
+    "zQmTE3m6nY2PUjccPc1kXE8E3qUg1B44XhN2Tvgy5JHNPLv",
+  [pinKey("policy.authority.change", `${SPEC}/policy/activate/0.1`)]:
+    "zQmTqKd5UoQZfTy7giJU9KFWFyhUbqxAtr5XWoUB9BLncBL",
+  // An operator's offline write, raised for acknowledgement (VTI-VTC-023).
+  [pinKey(KIND_OPERATOR_WRITE, OPERATOR_OFFLINE_WRITE_URI)]:
+    "zQmaFWSdUF1Ais5qw1yGuSM6oxkarq9VQ4ZKd52ikKXiRcR",
+  [pinKey(KIND_OPERATOR_WRITE, OPERATOR_ACL_MIGRATION_URI)]:
+    "zQmcx336K693LHuAKosCP9avuLZWauw1vome6VBxWBFDiqK",
+  // Custom administrative roles (`vtc-admin-roles.md` §6.2).
+  [pinKey("acl.role.define", `${SPEC}/vtc/roles/define/0.1`)]:
+    "zQmf6erEaANYgarV9c8frmZSZ8R5XuomNdXxGNQ8FAZ2QUh",
+  [pinKey("acl.role.delete", `${SPEC}/vtc/roles/delete/0.1`)]:
+    "zQmNmqjjmZmPfvapiR91YcFDgXtg1xdAw3QNwaQemrEHL8U",
+  // Restoring a backup replaces the ACL (§7).
+  [pinKey("backup.restore", `${SPEC}/backup/finalize-import/0.1`)]:
+    "zQmY89pWbScF2Mj1B1tWXJrtKPyhqcWDJDiV8eKCTchKscE",
+  // A departed granter's grants, for re-affirmation (§6.3).
+  [pinKey(KIND_GRANTS_REVIEW, GRANTS_REVIEW_URI)]:
+    "zQmes3QBrvXfxcwu7tyU7gk58b8RrLfrQiteFRJGCwDYS4S",
+  // Queue items (§8.2).
+  [pinKey(KIND_BREAK_GLASS_REVIEW, BREAK_GLASS_REVIEW_URI)]:
+    "zQmc83acTt15e5rhcZi7TKnXt2NNBPB3zZ7cShQhbjvCkcP",
+  [pinKey(KIND_JOIN_REVIEW, JOIN_REVIEW_URI)]:
+    "zQmaxhUVhRYpEsMxfAzJWuoHvzVKmcbKSmZ2JjG8kQaHzW1",
+  [pinKey(KIND_VETTING_REVIEW, VETTING_REVIEW_URI)]:
+    "zQmcUNShH782uKh8YFnXsQ322vCS2Hs6U9tJv8SLABeKmBV",
+  // Direct admission, when the `admission` policy refers it for approval.
+  [pinKey(KIND_MEMBER_ADMIT, MEMBERS_ADMIT_URI)]:
+    "zQmbYVQV8iyGc9pCgXB3mD1s7dYXRYEBmHNyHcQnEkeaH6C",
+  [pinKey(KIND_MEMBER_MAKE_MEMBERSHIP, MEMBERS_MAKE_MEMBERSHIP_URI)]:
+    "zQmYUPeQMYvpEnuBu9RCX4BSvQ5Nmpz4t2sRxKpyQpg6FVB",
+  // Room storage (`vtc/storage/configs/*`, `vtc/rooms/storage/{assign,migrate}`).
+  [pinKey("storage.config.create", `${SPEC}/vtc/storage/configs/create/0.1`)]:
+    "zQmbKUbMCxeKhULY9Ea5CL5SYQozDAE4ithNpnKx7jCQZAJ",
+  [pinKey("storage.config.update", `${SPEC}/vtc/storage/configs/update/0.1`)]:
+    "zQmUr4boR7Uk2yrYFGFggoTMbcK33AVKA8DbZUKct3bbGqN",
+  [pinKey("storage.config.retire", `${SPEC}/vtc/storage/configs/retire/0.1`)]:
+    "zQmW4jo3NSHqJGAeDeEPzJt1fUgdDAeAsur9ehhSCyA4bEh",
+  [pinKey("rooms.storage.assign", `${SPEC}/vtc/rooms/storage/assign/0.1`)]:
+    "zQmZWR9odGdRi5noLhZxgzSrNk3YRF5ZWH4JaNVBYMqMKja",
+  [pinKey("rooms.storage.migrate", `${SPEC}/vtc/rooms/storage/migrate/0.1`)]:
+    "zQmZamMHumTwGimMGYsuEGBoxvuYmEozzpkSStPjrZHrShX",
+  // 0.2 (ambient and sealed auth), and setting a sealed credential: approvers see
+  // the config and the sealed block's digest, never the credential.
+  [pinKey("storage.config.create", `${SPEC}/vtc/storage/configs/create/0.2`)]:
+    "zQmSJcki3MwXF8HBUbPpwZScUm4HuzqomYhA825hYGLbmyN",
+  [pinKey("storage.config.update", `${SPEC}/vtc/storage/configs/update/0.2`)]:
+    "zQmbqMzuGGxuGv2dmp6qVDQnZTeGvJSYU93eg8JiaxdirAi",
+  [pinKey("storage.credential.set", `${SPEC}/vtc/storage/credentials/set/0.2`)]:
+    "zQmTzhrbBfZEaijm2CMzMvNzeYzPBA4RW1DBJRWPTwJc3XL",
+  [pinKey("rooms.storage.migrate", `${SPEC}/vtc/rooms/storage/migrate/0.2`)]:
+    "zQmR7m9q28aLudzaema3wPTgyt9VJnPAVoSykoCL14YiVAN",
+  // The current versions the community parks storage operations under; the
+  // versions above stay pinned so an action recorded under one still renders.
+  [pinKey("storage.config.create", `${SPEC}/vtc/storage/configs/create/0.3`)]:
+    "zQmPUm3o1m98v5TKrsQ6RsAXMRWw1fqSDnwN3iFrJK5Awrx",
+  [pinKey("storage.config.update", `${SPEC}/vtc/storage/configs/update/0.3`)]:
+    "zQmc2DLfT3ZNgo31ctpTvACDFoy1yiWAbdEBmtAbswkFfKT",
+  [pinKey("storage.credential.set", `${SPEC}/vtc/storage/credentials/set/0.3`)]:
+    "zQmf4q7oZzgLTPjF4bavNePfvEhwPdG53CG2XVMgYfKHYex",
+  [pinKey("storage.config.retire", `${SPEC}/vtc/storage/configs/retire/0.3`)]:
+    "zQmdCZnjZerPoDQQaiDinpjZbxKPkB1d5MLLwV1iYDbt75M",
+  [pinKey("rooms.storage.assign", `${SPEC}/vtc/rooms/storage/assign/0.2`)]:
+    "zQmer3KKgKaxJV2UUTH3jyEVyQeaQ2MuBHZvfYxAerEka2L",
+  [pinKey("rooms.storage.migrate", `${SPEC}/vtc/rooms/storage/migrate/0.3`)]:
+    "zQmdLkFUd8giwGZH79H1htDfCrSxJWE9mKwpSSkbhhQRjGy",
+});
+
+function pinKey(kind: string, typeUri: string): string {
+  return `${kind}\n${typeUri}`;
+}
+
+// ── Wire shapes ─────────────────────────────────────────────────────
+
+/** The closed set of field formats. */
+export type FieldFormat = "did" | "capabilityList" | "duration" | "datetime" | "text";
+
+export interface SummaryField {
+  /** RFC 6901 JSON Pointer into the action's payload. */
+  pointer: string;
+  format: FieldFormat;
+  /** The value the VTC says the pointer resolves to — checked, never shown. */
+  value: unknown;
+}
+
+export interface ActionSummaryWire {
+  title: string;
+  effect?: string;
+  fields: Record<string, SummaryField>;
+  templateDigest: string;
+}
+
+/** What [`verifySummary`] checks: an action's own claims about itself. */
+export interface SummarySubject {
+  kind: string;
+  typeUri: string;
+  payload: unknown;
+  summary: ActionSummaryWire;
+  /** The action's `payloadDigest`. Required for a live action; the shared
+   *  template vectors carry none. */
+  payloadDigest?: string;
+}
+
+// ── The verified form ───────────────────────────────────────────────
+
+/** One field as shown, from the re-derived value. */
+export interface RenderedField {
+  name: string;
+  format: FieldFormat;
+  /** Display text — `"—"` for an absent value. */
+  text: string;
+}
+
+/**
+ * A summary that passed every check. Only [`verifySummary`] makes one, so a
+ * card that takes it cannot render an unverified summary by mistake.
+ */
+export class VerifiedSummary {
+  private constructor(
+    readonly title: string,
+    readonly effect: string | undefined,
+    readonly fields: readonly RenderedField[],
+  ) {}
+
+  /** @internal — [`verifySummary`] only. */
+  static create(title: string, effect: string | undefined, fields: RenderedField[]) {
+    return new VerifiedSummary(title, effect, Object.freeze(fields));
+  }
+}
+
+export type SummaryRefusalReason =
+  | "unpinnedTemplate"
+  | "payloadDigestMismatch"
+  | "fieldMismatch"
+  | "badFormat"
+  | "unknownPlaceholder";
+
+export class SummaryRefusal {
+  constructor(
+    readonly reason: SummaryRefusalReason,
+    /** For a log or a test; never a reason to show the summary anyway. */
+    readonly detail: string,
+  ) {}
+}
+
+/** The single sentence a refused summary is shown as. */
+export const SUMMARY_REFUSED_MESSAGE =
+  "This action's summary does not match its payload — do not approve it.";
+
+// ── Verification ────────────────────────────────────────────────────
+
+/** Verify and render `subject`'s summary, or say why it is refused. */
+export async function verifySummary(
+  subject: SummarySubject,
+): Promise<VerifiedSummary | SummaryRefusal> {
+  const { kind, typeUri, payload, summary } = subject;
+  if (!summary || typeof summary !== "object" || typeof summary.title !== "string") {
+    return new SummaryRefusal("badFormat", "no summary");
+  }
+  const pinned = PINNED_TEMPLATE_DIGESTS[pinKey(kind, typeUri)];
+  if (!pinned || summary.templateDigest !== pinned) {
+    return new SummaryRefusal(
+      "unpinnedTemplate",
+      `template ${String(summary.templateDigest)} is not pinned for ${kind} / ${typeUri}`,
+    );
+  }
+
+  if (subject.payloadDigest !== undefined) {
+    let recomputed: string;
+    try {
+      recomputed = await payloadDigestOf(payload);
+    } catch (e) {
+      return new SummaryRefusal("payloadDigestMismatch", `payload cannot be digested: ${e}`);
+    }
+    if (recomputed !== subject.payloadDigest) {
+      return new SummaryRefusal(
+        "payloadDigestMismatch",
+        `payload digests to ${recomputed}, the action says ${subject.payloadDigest}`,
+      );
+    }
+  }
+
+  const fields = summary.fields && typeof summary.fields === "object" ? summary.fields : {};
+  const rendered: RenderedField[] = [];
+  const inline: Record<string, string> = {};
+  for (const [name, field] of Object.entries(fields)) {
+    if (!field || typeof field.pointer !== "string") {
+      return new SummaryRefusal("badFormat", `field ${name} has no pointer`);
+    }
+    const derived = resolvePointer(payload, field.pointer);
+    if (derived === INVALID_POINTER) {
+      return new SummaryRefusal("badFormat", `field ${name}: invalid pointer ${field.pointer}`);
+    }
+    if (!deepEqual(derived, field.value ?? null)) {
+      return new SummaryRefusal(
+        "fieldMismatch",
+        `field ${name}: payload has ${JSON.stringify(derived)}, summary says ${JSON.stringify(field.value)}`,
+      );
+    }
+    const text = formatValue(field.format, derived, "full");
+    const short = formatValue(field.format, derived, "inline");
+    if (text === null || short === null) {
+      return new SummaryRefusal("badFormat", `field ${name}: not a ${field.format}`);
+    }
+    rendered.push({ name, format: field.format, text });
+    inline[name] = short;
+  }
+
+  const title = fill(summary.title, inline);
+  if (title === null) {
+    return new SummaryRefusal("unknownPlaceholder", `title names a field it has not got`);
+  }
+  let effect: string | undefined;
+  if (typeof summary.effect === "string") {
+    const filled = fill(summary.effect, inline);
+    if (filled === null) {
+      return new SummaryRefusal("unknownPlaceholder", `effect names a field it has not got`);
+    }
+    effect = filled;
+  }
+  return VerifiedSummary.create(title, effect, rendered);
+}
+
+/** Replace each `{name}` with `values[name]`; `null` when one is unknown. */
+function fill(template: string, values: Record<string, string>): string | null {
+  let unknown = false;
+  const out = template.replace(/\{([A-Za-z0-9_]+)\}/g, (_, name: string) => {
+    if (!Object.prototype.hasOwnProperty.call(values, name)) {
+      unknown = true;
+      return "";
+    }
+    return values[name] as string;
+  });
+  return unknown ? null : out;
+}
+
+const INVALID_POINTER = Symbol("invalid-pointer");
+
+/**
+ * The value `pointer` (RFC 6901) names in `doc`, `null` when there is none —
+ * an absent member and an explicit `null` read alike, as the VTC renders them.
+ */
+export function resolvePointer(doc: unknown, pointer: string): unknown {
+  if (pointer === "") return doc ?? null;
+  if (!pointer.startsWith("/")) return INVALID_POINTER;
+  let at: unknown = doc;
+  for (const raw of pointer.slice(1).split("/")) {
+    const token = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(at)) {
+      if (!/^(0|[1-9][0-9]*)$/.test(token)) return null;
+      at = at[Number(token)];
+    } else if (at !== null && typeof at === "object") {
+      at = Object.prototype.hasOwnProperty.call(at, token)
+        ? (at as Record<string, unknown>)[token]
+        : undefined;
+    } else {
+      return null;
+    }
+    if (at === undefined) return null;
+  }
+  return at ?? null;
+}
+
+/** Structural equality over JSON values. */
+export function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const bb = b as unknown[];
+    return a.length === bb.length && a.every((v, i) => deepEqual(v, bb[i]));
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const ak = Object.keys(ao);
+  if (ak.length !== Object.keys(bo).length) return false;
+  return ak.every((k) => Object.prototype.hasOwnProperty.call(bo, k) && deepEqual(ao[k], bo[k]));
+}
+
+// ── Formats ─────────────────────────────────────────────────────────
+
+/** Shown for an absent value. */
+export const ABSENT = "—";
+
+/** A DID longer than this is shown by both ends in a sentence. */
+const LONG_DID = 40;
+
+/**
+ * A DID for a sentence: whole, or — when long — its first 16 and last 12
+ * characters. Never just a prefix: two DIDs that share a method and an SCID
+ * prefix differ at the end.
+ */
+export function formatDidInline(did: string): string {
+  if (did.length <= LONG_DID) return did;
+  return `${did.slice(0, 16)}…${did.slice(-12)}`;
+}
+
+/**
+ * `value` as `format` text, or `null` when it is not of that format. `full`
+ * is for the field list (a DID in full), `inline` for the title and effect.
+ */
+export function formatValue(
+  format: FieldFormat,
+  value: unknown,
+  mode: "full" | "inline" = "full",
+): string | null {
+  if (value === null || value === undefined) return ABSENT;
+  switch (format) {
+    case "did":
+      if (typeof value !== "string") return null;
+      return mode === "inline" ? formatDidInline(value) : value;
+    case "capabilityList":
+      if (!Array.isArray(value)) return null;
+      if (value.length === 0) return "none";
+      if (!value.every((v) => typeof v === "string")) return null;
+      return value.join(", ");
+    case "datetime": {
+      if (typeof value !== "string") return null;
+      return formatDateTime(value);
+    }
+    case "duration":
+      if (typeof value !== "string" && typeof value !== "number") return null;
+      return String(value);
+    case "text":
+      if (typeof value === "string") return value;
+      if (typeof value === "number" || typeof value === "boolean") return String(value);
+      return readableValue(value);
+    default:
+      return null;
+  }
+}
+
+/**
+ * A field's name for a reader: `expiresAt` → `Expires at`. The summary
+ * template names its fields in the wire's camelCase.
+ */
+export function humanizeFieldName(name: string): string {
+  const words = name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .trim()
+    .toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/**
+ * A structured value in words rather than JSON — what a `text` field holding
+ * an object shows (an authority scope, a capability set, an entry). Display
+ * only: the verification above compares the raw value, never this text.
+ */
+export function readableValue(value: unknown): string {
+  if (value === null || value === undefined) return ABSENT;
+  if (typeof value === "string") return value === "" ? ABSENT : value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value.length === 0 ? "none" : value.map(readableValue).join(", ");
+  }
+  if (typeof value === "object") {
+    const o = value as Record<string, unknown>;
+    if (typeof o.capability === "string") {
+      const at = typeof o.resource === "string" ? ` at ${o.resource}` : "";
+      return `${o.capability}${at}${o.additive === true ? " (additive)" : ""}`;
+    }
+    if (typeof o.scope === "string") {
+      switch (o.scope) {
+        case "all":
+          return "all";
+        case "none":
+          return "none";
+        case "ceiling":
+          return "the role's full set of capabilities";
+        case "listed":
+          return Array.isArray(o.grants) ? readableValue(o.grants) : "none";
+        case "contexts":
+          return Array.isArray(o.contexts) ? readableValue(o.contexts) : "none";
+      }
+    }
+    const parts = Object.entries(o).map(
+      ([k, v]) => `${humanizeFieldName(k)}: ${readableValue(v)}`,
+    );
+    return parts.length === 0 ? ABSENT : parts.join("; ");
+  }
+  return String(value);
+}
+
+// ── Digests ─────────────────────────────────────────────────────────
+
+/** The sha2-256 multihash prefix: code 0x12, length 0x20. */
+const SHA256_MULTIHASH = [0x12, 0x20] as const;
+
+async function sha256Bytes(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource));
+}
+
+/** `z` + base58btc(0x12 0x20 || digest). */
+function multibaseSha256(digest: Uint8Array): string {
+  const mh = new Uint8Array(2 + digest.length);
+  mh.set(SHA256_MULTIHASH, 0);
+  mh.set(digest, 2);
+  return `z${base58btcEncode(mh)}`;
+}
+
+/** An action's `payloadDigest`: multibase sha2-256 multihash of JCS(payload). */
+export async function payloadDigestOf(payload: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(jcsCanonicalize(payload));
+  return multibaseSha256(await sha256Bytes(bytes));
+}
+
+/** The 32-byte digest inside a multibase sha2-256 multihash, or `null`. */
+export function digestBytesOf(multibase: string): Uint8Array | null {
+  if (typeof multibase !== "string" || !multibase.startsWith("z")) return null;
+  let bytes: Uint8Array;
+  try {
+    bytes = base58btcDecode(multibase.slice(1));
+  } catch {
+    return null;
+  }
+  if (bytes.length !== 34 || bytes[0] !== 0x12 || bytes[1] !== 0x20) return null;
+  return bytes.slice(2);
+}
+
+/**
+ * The **match code**: the first 6 lowercase hex characters of the digest in
+ * `payloadDigest`. Shown on every card ("Code: abc123") and by `cnm`, so the
+ * requester and each approver can say aloud that they are looking at the same
+ * bytes. `null` when the digest is not a sha2-256 multihash.
+ */
+export function matchCode(payloadDigest: string): string | null {
+  const d = digestBytesOf(payloadDigest);
+  if (!d) return null;
+  return Array.from(d.slice(0, 3), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** The domain tag the decision's wire digest starts with. */
+const WIRE_DIGEST_TAG = "vta/task-consent/v1\0";
+
+function u64be(n: number): Uint8Array {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, BigInt(n), false);
+  return out;
+}
+
+/**
+ * The `payloadDigest` a `task-consent/decision` carries — the **wire** digest,
+ * salted with the decision's challenge so an approval answers one request
+ * only:
+ *
+ * `z` base58btc multihash(sha2-256(
+ *   "vta/task-consent/v1\0" || u64be(len typeUri) || typeUri ||
+ *   u64be(len JCS(payload)) || JCS(payload) || challenge))`
+ *
+ * Lengths are UTF-8 byte lengths.
+ */
+export async function wireDigest(
+  typeUri: string,
+  payload: unknown,
+  challenge: string,
+): Promise<string> {
+  const enc = new TextEncoder();
+  const uri = enc.encode(typeUri);
+  const body = enc.encode(jcsCanonicalize(payload));
+  const parts = [
+    enc.encode(WIRE_DIGEST_TAG),
+    u64be(uri.length),
+    uri,
+    u64be(body.length),
+    body,
+    enc.encode(challenge),
+  ];
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    buf.set(p, off);
+    off += p.length;
+  }
+  return multibaseSha256(await sha256Bytes(buf));
+}

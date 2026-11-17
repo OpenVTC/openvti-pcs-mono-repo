@@ -1,0 +1,182 @@
+//! Centralised registry of every named keyspace the workspace opens.
+//!
+//! Why: keyspace names were previously stringly typed at every call site
+//! across `did-hosting-{server, control, daemon}`, `webvh-{witness,
+//! watcher}`, and tests. A typo (`"sesions"` instead of `"sessions"`)
+//! would silently create a parallel empty keyspace, and the multi-domain
+//! work needs to add three new keyspaces — each one would otherwise mean
+//! editing dozens of call sites and praying for consistency.
+//!
+//! The registry constant pattern is:
+//! - one `KS_*` const per keyspace, kebab-cased name in a `&'static str`;
+//! - every call site uses the const, not the literal;
+//! - a workspace lint (`rg 'keyspace\("'` returns no matches outside this
+//!   file plus the storage-backend unit tests) is the CI invariant.
+//!
+//! Adding a new keyspace = add a `KS_*` const here, document it, done.
+
+// ---------------------------------------------------------------------------
+// Core keyspaces
+// ---------------------------------------------------------------------------
+
+/// `dids:<mnemonic>` — DID records (`DidRecord`; legacy raw bytes until
+/// migrated). Backs every DID resolution and management op.
+pub const KS_DIDS: &str = "dids";
+
+/// `acl:<did>` — ACL entries (`AclEntry`). Gates which DIDs are allowed
+/// to authenticate and what roles they hold.
+pub const KS_ACL: &str = "acl";
+
+/// `session:<id>` + `refresh:<token>` — auth sessions and the reverse
+/// refresh-token index. Holds the JWT challenge-response flow's state.
+pub const KS_SESSIONS: &str = "sessions";
+
+/// `pk_user:<uuid>`, `pk_did:<did>`, `pk_cred:<cred_id_hex>` — **step-up-only**
+/// passkeys (`auth/passkey/enroll/invite/0.3` `purpose: stepUp`), in the same
+/// layout [`KS_SESSIONS`] holds login passkeys in.
+///
+/// A separate keyspace so the separation holds by construction: the passkey
+/// login ceremony reads [`KS_SESSIONS`] and nothing else, so a step-up
+/// credential can never be offered at, or accepted by, a login — and a login
+/// credential is never found where a step-up credential is looked for.
+pub const KS_PASSKEY_STEP_UP: &str = "passkey_step_up";
+
+/// `stats:<mnemonic>` — per-DID resolve/update counters, totals and coarse
+/// series; `statspin:<mnemonic>` — a DID's tier override. See
+/// [`stats_tiers`](crate::server::stats_tiers).
+pub const KS_STATS: &str = "stats";
+
+/// `t5:<mnemonic>:<slot>` — fine time-series ring slots, plus the
+/// server-wide coarse series (`c:_all`). See
+/// [`stats_tiers`](crate::server::stats_tiers).
+pub const KS_TIMESERIES: &str = "timeseries";
+
+/// `registry:<instance_id>` — control plane's registry of remote
+/// `did-hosting-server` instances and `webvh-witness` services.
+pub const KS_REGISTRY: &str = "registry";
+
+/// `witnesses:<mnemonic>` — witness proofs the witness service has
+/// signed for hosted DIDs.
+pub const KS_WITNESSES: &str = "witnesses";
+
+/// `meta:<key>` — runner-internal state (e.g. `migration:applied:{id}`
+/// markers from the migration runner in `super::super::migrations`).
+/// Reserved for workspace-internal bookkeeping; not part of the wire
+/// surface.
+pub const KS_META: &str = "meta";
+
+// ---------------------------------------------------------------------------
+// Multi-domain keyspaces
+// ---------------------------------------------------------------------------
+//
+// - KS_DOMAINS         → `domain::store` (`DomainEntry` CRUD)
+// - KS_ASSIGNMENTS     → `assignment` (server-local cached assignments)
+// - KS_PENDING_PURGES  → `pending_purge` (unassignment grace-period purges)
+
+/// `domains:<name>` — first-class `DomainEntry` records. Used by the
+/// multi-domain hosting feature.
+pub const KS_DOMAINS: &str = "domains";
+
+/// `assignments:<domain>` — local cache of which domains
+/// this server is currently authoritative for. Read on cold start
+/// before the control plane is reachable.
+pub const KS_ASSIGNMENTS: &str = "assignments";
+
+/// `pending_purges:<domain>` — one pending grace-period purge per domain,
+/// queued after a `replica/domain/unassign/0.1` Trust Task.
+pub const KS_PENDING_PURGES: &str = "pending_purges";
+
+/// `identity:current` → the current generation id; `identity:gen:<id>` →
+/// an [`IdentityGeneration`](crate::server::identity::IdentityGeneration).
+///
+/// Records which version(s) of the service's *own* DID identity are still
+/// honoured: the resolved verification-method key IDs, the mediator, the
+/// protocol set, and (once a generation is retired) its expiry. Boot
+/// reconstructs the live set from here, because `config.toml` only ever
+/// describes the *current* identity — a retiring generation's mediator and
+/// kids exist nowhere else.
+///
+/// Metadata only. Private key material stays in the secret store, behind
+/// the keyring/KMS boundary; it is never written to a keyspace.
+pub const KS_IDENTITY: &str = "identity";
+
+/// `outbox:<target_did>:<enqueue_micros>:<uuid>` — durable outbound
+/// DIDComm queue. Every control→server mutation (assign, unassign,
+/// purge, domain-upsert, sync-update, sync-delete) is persisted here
+/// before delivery is attempted. The outbox worker drains entries in
+/// per-target FIFO order; on transient failure the entry stays in the
+/// keyspace with an updated retry timestamp, so a server outage
+/// doesn't lose mutations and a control restart doesn't drop in-
+/// flight work. Receivers must remain idempotent because the
+/// delivery guarantee is at-least-once.
+pub const KS_OUTBOUND_QUEUE: &str = "outbox";
+
+/// `tsp-rel/v1/<facet><len(our_vid)><our_vid><their_vid>` — durable TSP
+/// relationship state (Rev 3 §7.2.2), the byte backend behind
+/// [`crate::server::tsp_relationship_store`]. Keyed and encoded entirely by the
+/// SDK's `PersistentRelationshipStore`; this crate only supplies the raw
+/// get/put/delete over the keyspace. Persisting it is what stops a restarted
+/// node from forgetting every peer and silently dropping their application
+/// traffic until a re-handshake.
+pub const KS_TSP_RELATIONSHIPS: &str = "tsp_relationships";
+/// `scid_floor:<bare did:scid>` — the did:scid sources and latest verified
+/// log version (`ScidSourceRecord`) of every did:scid identity this service
+/// authorises (ACL subjects, DID owners, a configured control plane), so the
+/// resolver's rollback floor survives a restart (VTI-KEY-162). Seeded into
+/// the service identity's resolver at boot; see
+/// [`crate::server::scid_floors`].
+pub const KS_SCID_FLOORS: &str = "scid_floors";
+
+/// Every keyspace this workspace opens, so a backend can prepare (or
+/// migrate) each one at startup without waiting for its first use. A new
+/// `KS_*` constant belongs here too.
+pub const ALL_KEYSPACES: &[&str] = &[
+    KS_DIDS,
+    KS_ACL,
+    KS_SESSIONS,
+    KS_PASSKEY_STEP_UP,
+    KS_STATS,
+    KS_TIMESERIES,
+    KS_REGISTRY,
+    KS_WITNESSES,
+    KS_META,
+    KS_DOMAINS,
+    KS_ASSIGNMENTS,
+    KS_PENDING_PURGES,
+    KS_IDENTITY,
+    KS_OUTBOUND_QUEUE,
+    KS_TSP_RELATIONSHIPS,
+    KS_SCID_FLOORS,
+];
+
+#[cfg(test)]
+mod tests {
+    use super::ALL_KEYSPACES;
+
+    /// Every `pub const KS_*: &str = "…";` in this file is in
+    /// [`ALL_KEYSPACES`], read from the source so a new constant cannot be
+    /// forgotten.
+    #[test]
+    fn every_keyspace_constant_is_listed() {
+        let source = include_str!("keyspaces.rs");
+        let mut declared = Vec::new();
+        for line in source.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const KS_") else {
+                continue;
+            };
+            let value = rest
+                .split('"')
+                .nth(1)
+                .unwrap_or_else(|| panic!("cannot read the value of `{line}`"));
+            declared.push(value);
+        }
+        assert!(!declared.is_empty());
+        for name in &declared {
+            assert!(
+                ALL_KEYSPACES.contains(name),
+                "keyspace `{name}` is declared but missing from ALL_KEYSPACES"
+            );
+        }
+        assert_eq!(declared.len(), ALL_KEYSPACES.len(), "{declared:?}");
+    }
+}

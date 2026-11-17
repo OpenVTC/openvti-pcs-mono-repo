@@ -1,0 +1,97 @@
+//! VTC service library surface.
+//!
+//! `vtc-service` is primarily a binary crate (`vtc`) — see `src/main.rs`
+//! for the CLI entry point. This `lib.rs` exists to expose the internal
+//! module tree to integration tests under `tests/` (and, in the future,
+//! to alternative front-ends).
+//!
+//! Every module here is `pub` so integration tests can construct the
+//! same `AppState` + `routes::router()` the binary uses, but the crate
+//! is `publish = workspace` only because removing it would break the
+//! workspace `Cargo.toml`'s symmetric treatment of `vta-service` and
+//! `vtc-service`. External consumers should depend on `vta-sdk`, not
+//! on this crate.
+
+pub mod acl;
+pub mod acl_cli;
+pub mod admin_actions;
+pub mod admin_events;
+#[cfg(feature = "admin-ui")]
+pub mod admin_ui;
+pub mod audit_checkpoint;
+pub mod audit_index;
+pub mod auth;
+pub mod backup;
+pub mod badges;
+pub mod boards;
+pub mod capability_modules;
+pub mod ceremony;
+pub mod community;
+pub mod config;
+pub mod config_store;
+pub mod credentials;
+pub mod did_hosting;
+pub mod did_key;
+pub mod did_log_install;
+pub mod did_self_check;
+pub mod directory;
+pub mod elections;
+#[cfg(feature = "setup")]
+pub mod emergency;
+pub mod endorsement_types;
+pub mod endorsements;
+pub mod error;
+pub mod geoip;
+pub mod git_ns;
+pub mod groups;
+pub mod holder_signature;
+pub mod hooks;
+pub mod install;
+pub mod join;
+pub mod keys;
+pub mod keys_cli;
+pub mod member_portal;
+pub mod member_push;
+pub mod members;
+pub mod messaging;
+pub mod networks;
+pub mod notifications;
+pub mod oid4vp;
+pub mod oid4vp_cli;
+/// The one place this service packs a Trust Task for the wire.
+mod outbound;
+pub mod policy;
+pub mod recognition;
+pub mod registry;
+pub mod relationships;
+pub mod rooms;
+pub mod routes;
+pub mod routing;
+pub mod schemas;
+pub mod scid_sources;
+pub mod secure_file;
+pub mod server;
+pub mod setup;
+pub mod status;
+pub mod status_list;
+pub mod step_up_approver;
+pub mod step_up_passkey;
+pub mod store;
+pub mod supervisor;
+pub mod sync_jobs_cli;
+pub mod transport_capability;
+pub mod trust_tasks;
+pub mod vetting;
+pub mod vta_link;
+pub mod webauthn;
+pub mod website;
+/// Generated payload members read as this crate's own types (#2574).
+pub(crate) mod wire;
+
+// `test_support` is gated internally on `any(test, feature = "test-support")`.
+// A `#[cfg(...)]` here would hide the module from the crate's own `cargo
+// test` builds (which don't pass `--features test-support`); the module
+// header handles the gating itself.
+/// The audit log's reads (`audit/list`, `audit/verify`).
+pub(crate) mod audit_ops;
+pub mod test_support;

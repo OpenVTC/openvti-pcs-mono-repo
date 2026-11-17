@@ -1,0 +1,79 @@
+/* Layout particular to the profile screen. Shared look lives in components.css. */
+
+/* The join-discovery switch, with its hint under it. */
+.join-discovery-toggle {
+  margin-bottom: var(--space-1);
+}
+
+/* The theme card: built-in theme picker and the stylesheet editor. */
+.theme-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 var(--space-4);
+}
+
+.theme-preset {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elev);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.theme-preset[aria-checked="true"] {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 1px var(--brand);
+}
+
+.theme-swatches {
+  display: inline-flex;
+}
+
+.theme-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  margin-left: -4px;
+}
+
+.theme-swatch:first-child {
+  margin-left: 0;
+}
+
+.theme-editor {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--text-sm-leading);
+  tab-size: 2;
+  resize: vertical;
+}
+
+/* Logo card: the stored logo, or the one chosen, drawn on a checkerboard so
+   transparency reads. The image keeps its aspect ratio inside a fixed box. */
+.logo-preview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+  margin-block: var(--space-3, 12px);
+}
+.logo-preview .brand-logo {
+  max-width: 256px;
+  max-height: 96px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  align-self: flex-start;
+  padding: 8px;
+  border: 1px solid var(--border, currentColor);
+  border-radius: var(--radius-md, 8px);
+  background:
+    repeating-conic-gradient(rgb(128 128 128 / 0.18) 0% 25%, transparent 0% 50%) 50% / 16px 16px;
+}

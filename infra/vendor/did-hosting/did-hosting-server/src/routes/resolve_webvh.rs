@@ -1,0 +1,284 @@
+//! did:webvh resolution routes (T25, gated by `method-webvh`).
+//!
+//! Handles the webvh artifacts published at each hosted DID's HTTPS
+//! origin:
+//!
+//! - `GET /{*mnemonic}/did.jsonl` — the canonical did:webvh log.
+//! - `GET /{*mnemonic}/did-witness.json` — the witness file (optional).
+//! - `GET /.well-known/did.jsonl` / `/.well-known/did-witness.json` —
+//!   the root-DID variants (mnemonic = `.well-known`).
+//!
+//! ## Why this module exists separately from did:web (`resolve_web`)
+//!
+//! The two methods are wire-incompatible: webvh delivers an append-
+//! only jsonl log + a sidecar witness, did:web delivers a single
+//! `did.json` document. They share storage (T12's `DidRecord` carries
+//! the method tag) but they don't share HTTP paths. Putting them in
+//! separate modules makes the feature gating ergonomic — a
+//! `method-web`-only build never compiles the jsonl handler, and the
+//! corresponding route is never registered.
+
+use axum::extract::{Request, State};
+use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
+use tracing::debug;
+
+use super::resolve_shared::{Lookup, assert_gate_allows, content_ks, content_response};
+use crate::did_ops;
+use crate::error::AppError;
+use crate::mnemonic::validate_mnemonic;
+use crate::server::AppState;
+
+/// Serve stored content for a mnemonic, optionally incrementing
+/// resolve stats. Runs the disabled/deleted check and the T21
+/// resolve-side safety check before returning bytes.
+async fn serve_content(
+    lookup: &Lookup<'_>,
+    mnemonic: &str,
+    key: &str,
+    content_type: &str,
+    track_stats: bool,
+) -> Result<Response, AppError> {
+    let state = lookup.state;
+    match lookup.record(mnemonic).await? {
+        Some(record) => {
+            if record.disabled || record.deleted_at.is_some() {
+                return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+            }
+            if let Some(ref did_id) = record.did_id {
+                assert_gate_allows(state, lookup.host(), did_id).await?;
+            }
+        }
+        // No record at all — e.g. `did/delete`, which removes the record
+        // outright rather than soft-deleting it. Refuse before ever
+        // consulting the cache below: a warm entry there must not outlive
+        // the record it was read from by up to the cache's TTL.
+        None => {
+            return Err(AppError::NotFound(format!("content not found: {mnemonic}")));
+        }
+    }
+
+    let content = if let Some(cached) = state.did_cache.get(key) {
+        #[cfg(feature = "metrics")]
+        did_hosting_common::server::metrics::inc_cache_hit();
+        cached
+    } else {
+        #[cfg(feature = "metrics")]
+        did_hosting_common::server::metrics::inc_cache_miss();
+        let generation = state.did_cache.generation();
+        let data = content_ks(state)
+            .get_raw(key)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?;
+        // The did:webvh log itself (not its witness-proof sidecar): serve
+        // only up to the last version that verifies and — for an entry that
+        // configures one — meets its witness threshold. A resolver must not
+        // serve an entry naming a witness it has no threshold-meeting proof
+        // for; per did:webvh this truncates the log rather than refusing it
+        // outright, so a DID with a satisfied genesis and an unwitnessed
+        // republish still resolves to its last witnessed version.
+        //
+        // Up to `MAX_LOG_ENTRIES` signature checks: on a blocking thread, so
+        // a cold resolve of a long log does not stall the resolution workers.
+        let data = if content_type == "application/jsonl+json" {
+            let log_text = String::from_utf8(data)
+                .map_err(|e| AppError::Internal(format!("invalid log bytes: {e}")))?;
+            let witness_text = content_ks(state)
+                .get_raw(did_ops::content_witness_key(mnemonic))
+                .await?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            tokio::task::spawn_blocking(move || {
+                did_ops::servable_did_log(&log_text, witness_text.as_deref())
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("log verification panicked: {e}")))?
+            .ok_or_else(|| AppError::NotFound(format!("content not found: {mnemonic}")))?
+            .into_bytes()
+        } else {
+            data
+        };
+        state.did_cache.insert(generation, key.to_string(), data)
+    };
+
+    if track_stats && let Some(ref collector) = state.stats_collector {
+        collector.record_resolve(mnemonic);
+        #[cfg(feature = "metrics")]
+        did_hosting_common::server::metrics::inc_resolve();
+    }
+
+    debug!(mnemonic = %mnemonic, size = content.bytes.len(), content_type, "content resolved");
+
+    // DID logs are content-addressed (the SCID prevents content drift) and
+    // safe to cache; the policy is `[server.resolve_cache]`.
+    Ok(content_response(lookup, content_type, &content))
+}
+
+/// `GET /.well-known/did.jsonl` — root-DID webvh log.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/.well-known/did.jsonl",
+    tag = "resolve",
+    responses(
+        (status = 200, description = "Root DID's did:webvh log (JSONL)", content_type = "application/jsonl+json"),
+        (status = 304, description = "The `If-None-Match` tag is current"),
+        (status = 404, description = "No root DID hosted on this domain"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+    ),
+))]
+pub async fn serve_root_did_log(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, AppError> {
+    let (parts, _) = request.into_parts();
+    let lookup = Lookup::new(&state, &parts);
+    serve_content(
+        &lookup,
+        ".well-known",
+        "content:.well-known:log",
+        "application/jsonl+json",
+        true,
+    )
+    .await
+}
+
+/// `GET /.well-known/did-witness.json` — root-DID witness.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/.well-known/did-witness.json",
+    tag = "resolve",
+    responses(
+        (status = 200, description = "Root DID's did:webvh witness proofs", content_type = "application/json"),
+        (status = 404, description = "No root DID, or no witness file, hosted on this domain"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+    ),
+))]
+pub async fn serve_root_witness(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, AppError> {
+    let (parts, _) = request.into_parts();
+    let lookup = Lookup::new(&state, &parts);
+    serve_content(
+        &lookup,
+        ".well-known",
+        "content:.well-known:witness",
+        "application/json",
+        false,
+    )
+    .await
+}
+
+/// Catch-all dispatcher for webvh artifacts.
+///
+/// Returns:
+/// - `Some(response)` when the URL is a webvh artifact path. This is
+///   terminal — the caller serves whatever's in the response (200 with
+///   bytes, 304, 404 for unknown mnemonic, 503 for disabled-domain, etc.).
+/// - `None` when the URL has no webvh suffix. The caller should try
+///   the next method's dispatcher (e.g. [`super::resolve_web::dispatch`]).
+pub async fn dispatch(lookup: &Lookup<'_>, parts: &Parts) -> Option<Response> {
+    let path = parts.uri.path().trim_start_matches('/');
+
+    if let Some(mnemonic) = path.strip_suffix("/did.jsonl")
+        && !mnemonic.is_empty()
+    {
+        if let Err(e) = validate_mnemonic(mnemonic) {
+            return Some(e.into_response());
+        }
+        let key = format!("content:{mnemonic}:log");
+        return Some(
+            serve_content(lookup, mnemonic, &key, "application/jsonl+json", true)
+                .await
+                .unwrap_or_else(|e| e.into_response()),
+        );
+    }
+
+    if let Some(mnemonic) = path.strip_suffix("/did-witness.json")
+        && !mnemonic.is_empty()
+    {
+        if let Err(e) = validate_mnemonic(mnemonic) {
+            return Some(e.into_response());
+        }
+        let key = format!("content:{mnemonic}:witness");
+        return Some(
+            serve_content(lookup, mnemonic, &key, "application/json", false)
+                .await
+                .unwrap_or_else(|e| e.into_response()),
+        );
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use did_hosting_common::server::config::{
+        AuthConfig, FeaturesConfig, LogConfig, SecretsConfig, ServerConfig, StoreConfig, VtaConfig,
+    };
+    use did_hosting_common::server::store::Store;
+    use tower::ServiceExt;
+
+    use crate::config::{AppConfig, LimitsConfig, StatsConfig};
+    use crate::server::AppState;
+
+    /// A throttled store is the store's limit, not a fault: resolution answers
+    /// 429 with `Retry-After` and `x-rate-limit-source: did-host`, the shape a
+    /// client recognises as "wait and retry". (A unit test: the throttling is
+    /// injected, which integration tests do not do.)
+    #[tokio::test]
+    async fn a_throttled_store_answers_429_with_retry_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_config = StoreConfig {
+            data_dir: PathBuf::from(dir.path()),
+            ..StoreConfig::default()
+        };
+        let store = Store::open(&store_config).await.unwrap();
+        let config = AppConfig {
+            fjall: Default::default(),
+            features: FeaturesConfig::default(),
+            server_did: None,
+            mediator_did: None,
+            public_url: None,
+            server: ServerConfig::default(),
+            log: LogConfig::default(),
+            store: store_config,
+            auth: AuthConfig::default(),
+            hosting: Default::default(),
+            secrets: SecretsConfig::default(),
+            limits: LimitsConfig::default(),
+            replication: Default::default(),
+            stats: StatsConfig::default(),
+            control_did: None,
+            vta: VtaConfig::default(),
+            identity: Default::default(),
+            replay: Default::default(),
+            config_path: PathBuf::new(),
+        };
+        let mut state = AppState::new(store, config).unwrap();
+        state.dids_ks = state.dids_ks.throttled_reads();
+
+        let response = crate::routes::router(1024 * 1024)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/alice/did.jsonl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = response.headers();
+        assert_eq!(headers.get("x-rate-limit-source").unwrap(), "did-host");
+        assert_eq!(headers.get("retry-after").unwrap(), "2");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["limiter"], "store-throughput");
+    }
+}

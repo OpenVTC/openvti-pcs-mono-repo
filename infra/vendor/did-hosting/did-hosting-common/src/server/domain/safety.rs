@@ -1,0 +1,962 @@
+//! Safety checks at the boundary between an inbound write and storage.
+//!
+//! Per `docs/archive/multi-domain-spec.md` §3 row "Safety check on create /
+//! publish": every create / publish must, **before any storage write**:
+//!
+//! 1. Parse the DID identifier embedded in the caller's payload (the
+//!    `state.id` from the latest jsonl entry, or the `id` from a
+//!    did:web doc — surfaced through [`super::super::super::method::DidMethod`]).
+//! 2. Verify the parsed host is an [`DomainStatus::Active`](crate::server::domain::DomainStatus::Active) domain in
+//!    the `KS_DOMAINS` keyspace. Missing or disabled → `400`
+//!    (`AppError::Validation`).
+//! 3. Verify the caller's ACL [`DomainScope`](crate::server::domain::DomainScope) permits that host.
+//!    Not-allowed → `403` (`AppError::Forbidden`).
+//!
+//! The two error codes are distinct so the UI can render different
+//! messages — "we don't serve that domain" (operator misconfig) vs
+//! "you can't post there" (ACL misconfig).
+
+use std::collections::HashMap;
+
+use super::super::acl::{AclEntry, Role};
+use super::super::error::AppError;
+use super::super::store::{KeyspaceHandle, Store};
+use super::normalize::normalize_domain_name;
+use super::store::get_domain;
+use super::types::DomainEntry;
+use crate::method::{method_by_name, parse_did_method};
+
+/// Verify that `host` is an active configured domain on this server.
+///
+/// Returns `Err(AppError::Validation)` if the domain doesn't exist OR
+/// is disabled. The two cases collapse to the same response code (400)
+/// — operators get the active-domain set via the admin list anyway.
+pub async fn assert_host_is_active_domain(store: &Store, host: &str) -> Result<(), AppError> {
+    let entry = get_domain(store, host).await?.ok_or_else(|| {
+        AppError::invalid(format!(
+            "did host '{host}' is not a configured domain on this server"
+        ))
+    })?;
+    if !entry.status.is_active() {
+        return Err(AppError::invalid(format!(
+            "did host '{host}' is configured but disabled"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify that the caller's ACL [`DomainScope`](crate::server::domain::DomainScope) permits operating on
+/// `host`. Admin and Service roles short-circuit per spec §3.
+///
+/// Returns `Err(AppError::Forbidden)` if the ACL scope doesn't allow
+/// the host. The error body intentionally doesn't echo the host —
+/// avoids leaking which domains the caller IS allowed on via
+/// timing / message diffs.
+pub fn assert_acl_allows_host(acl_entry: &AclEntry, host: &str) -> Result<(), AppError> {
+    if matches!(acl_entry.role, Role::Admin | Role::Service) {
+        return Ok(());
+    }
+    if acl_entry.domains.allows(host) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(format!(
+        "caller is not authorised to operate on domain '{host}'"
+    )))
+}
+
+/// Parse a DID identifier and extract its host segment via the
+/// [`DidMethod`](crate::method::DidMethod) dispatcher.
+///
+/// The host segment of a did:webvh / did:web identifier percent-encodes
+/// reserved characters — notably the port colon: `localhost:8534`
+/// appears in the identifier as `localhost%3A8534` (see
+/// [`crate::did::encode_host`]). This function percent-decodes the
+/// extracted host before returning, so callers always see the literal
+/// form (`localhost:8534`). That literal form is what the rest of the
+/// system stores and compares against: configured-domain entries are
+/// seeded from `public_url` in decoded form (e.g. `localhost:8534`, see
+/// the assignment / domain seed), domain-name normalisation treats the
+/// literal `:port` as canonical and rejects the `%3A` form, and the
+/// HTTP `Host` header on the resolve path carries the literal colon.
+/// Without the decode here the publish path would look up the store with
+/// the encoded key `localhost%3A8534` (missing the decoded entry) and
+/// domain normalisation would reject the stray `%` outright.
+///
+/// The decode is a no-op for hosts with no percent-escapes (real domains
+/// like `hosting.example.com`, or an already-decoded `localhost:8534`),
+/// so it's safe for every caller. If the host contains malformed
+/// percent-escapes the raw segment is returned unchanged — the
+/// downstream domain / host comparison then fails honestly rather than
+/// this function inventing a decode error.
+///
+/// Returns `Err(AppError::Validation)` on:
+/// - malformed identifier (no `did:` prefix, empty method, etc.)
+/// - unknown method (the compiled binary doesn't know about
+///   `did:webs` if `method-webs` is off — same response shape as a
+///   malformed identifier so callers can't fingerprint our feature
+///   set).
+pub fn extract_did_host(did: &str) -> Result<String, AppError> {
+    let method_name = parse_did_method(did)
+        .map_err(|e| AppError::invalid(format!("malformed DID identifier '{did}': {e}")))?;
+    let method = method_by_name(method_name).ok_or_else(|| {
+        AppError::invalid(format!(
+            "DID method '{method_name}' is not supported by this server"
+        ))
+    })?;
+    let parsed = method
+        .parse_identifier(did)
+        .map_err(|e| AppError::invalid(format!("could not parse DID identifier '{did}': {e}")))?;
+    // Percent-decode the host authority (`localhost%3A8534` → `localhost:8534`).
+    // Fall back to the raw segment on malformed escapes — see doc comment.
+    Ok(percent_decode_to_string(&parsed.domain).unwrap_or(parsed.domain))
+}
+
+/// One-shot check covering all three steps. The intended entry point
+/// for `did_ops::create_did` / `register_did_atomic` / the agent-name ops:
+/// call this immediately after extracting the embedded DID identifier
+/// and before any storage write.
+///
+/// - 400 if the identifier is malformed / wrong method / unknown
+///   method.
+/// - 400 if the host isn't a configured domain on this server.
+/// - 400 if the host is configured but Disabled.
+/// - 403 if the caller's ACL doesn't allow the host.
+pub async fn assert_did_host_allowed(
+    store: &Store,
+    acl_entry: &AclEntry,
+    did: &str,
+) -> Result<(), AppError> {
+    let host = extract_did_host(did)?;
+    assert_host_is_active_domain(store, &host).await?;
+    assert_acl_allows_host(acl_entry, &host)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Resolve-side safety
+// ---------------------------------------------------------------------------
+
+/// Resolve-side check: the request's `Host` header (already
+/// normalised + resolved through trusted-CIDR gating) must
+/// match the DID identifier's embedded host.
+///
+/// Per `docs/archive/multi-domain-spec.md` §3 safety-check-on-resolution:
+/// mismatch returns **404** (not 403) to avoid confirming the DID
+/// exists elsewhere. Same shape as `NotFound`; callers shouldn't
+/// need to distinguish "wrong domain" from "really gone".
+///
+/// The embedded host is percent-decoded (inside [`extract_did_host`])
+/// before comparison: the did:webvh / did:web specs require the port
+/// colon (and any other reserved character) to be percent-encoded in
+/// the identifier (`localhost%3A8534`), while the HTTP `Host` header
+/// carries the literal form (`localhost:8534`). Without the decode the
+/// two representations of the same host never match.
+pub fn assert_request_host_matches_did(request_host: &str, did_id: &str) -> Result<(), AppError> {
+    // `extract_did_host` returns the host in decoded / literal form
+    // (`localhost:8534`), matching the shape of the HTTP `Host` header.
+    let embedded_host = extract_did_host(did_id).map_err(|_| {
+        // Storage carries an unparseable DID identifier — return 404
+        // rather than 500 so the response is honest about "we can't
+        // serve this".
+        AppError::NotFound(format!("did identifier unparseable: {did_id}"))
+    })?;
+    if request_host.eq_ignore_ascii_case(&embedded_host) {
+        return Ok(());
+    }
+    tracing::warn!(
+        request_host = %request_host,
+        did_host = %embedded_host,
+        did_id = %did_id,
+        "resolution rejected: request Host does not match embedded did.host"
+    );
+    Err(AppError::NotFound(format!(
+        "no DID resolvable at host {request_host}"
+    )))
+}
+
+/// Minimal percent-decoder for the resolve-side host check. Decodes
+/// any `%XX` sequence (the spec allows `%3A`, `%2F`, …); returns
+/// `None` if a `%` isn't followed by two hex digits or the result
+/// isn't valid UTF-8. Scoped tight so we don't take a new dep just
+/// to decode one segment.
+fn percent_decode_to_string(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Resolve-side check: the named domain must be `Active`. Disabled
+/// or missing returns the appropriate error code per spec §3.
+///
+/// - **Disabled** → `AppError::DomainDisabled` → 503 with maintenance
+///   JSON body `{ "status": "disabled", "domain": "..." }`.
+/// - **Missing** → `AppError::NotFound` → 404. Should not happen on
+///   the resolve path (we already matched the embedded did.host
+///   against the configured domain), but guarded for safety.
+pub async fn assert_domain_active_for_resolution(
+    store: &Store,
+    host: &str,
+) -> Result<(), AppError> {
+    domain_active_for_resolution(host, get_domain(store, host).await?)
+}
+
+/// The verdict of [`assert_domain_active_for_resolution`] for `host`'s
+/// stored entry.
+fn domain_active_for_resolution(host: &str, entry: Option<DomainEntry>) -> Result<(), AppError> {
+    let entry = entry.ok_or_else(|| {
+        // Unexpected — the host came from the embedded DID, and the
+        // create-side check refused to write it without a matching
+        // active domain. Reaching this branch means a domain was
+        // deleted out from under a hosted DID; 404 is honest.
+        AppError::NotFound(format!("domain not configured: {host}"))
+    })?;
+    if entry.status.is_active() {
+        return Ok(());
+    }
+    Err(AppError::DomainDisabled {
+        domain: host.to_string(),
+        message: None,
+    })
+}
+
+/// Permissive variant of [`assert_did_host_allowed`] used by the
+/// did_ops write paths.
+///
+/// Behaviour:
+/// - If the `domains` keyspace contains **at least one** entry, the
+///   strict check runs and the same error semantics apply
+///   (400 / 403).
+/// - If the keyspace is **empty**, the check is **skipped** with a
+///   warn-log. This is the legacy state — deployments that predate the domain seed, test
+///   fixtures that haven't seeded a domain — and is the only
+///   ergonomically-tolerable behaviour for the transition window.
+///
+/// Production daemons run the first-boot domain seed before serving
+/// requests, so the empty-keyspace path is unreachable in practice
+/// once the daemon is up. The warn-log makes the legacy state
+/// visible to operators if they hit it.
+///
+/// The strict [`assert_did_host_allowed`] stays available for code
+/// paths that want hard enforcement regardless of keyspace state
+/// (e.g. an admin tool walking the store for a one-shot audit).
+pub async fn assert_did_host_allowed_when_domains_configured(
+    store: &Store,
+    acl_entry: &AclEntry,
+    did: &str,
+) -> Result<(), AppError> {
+    use crate::server::store::KS_DOMAINS;
+    let ks = store.keyspace(KS_DOMAINS)?;
+    let any_domain = ks
+        .prefix_iter_raw(b"".to_vec())
+        .await?
+        .into_iter()
+        .next()
+        .is_some();
+    if !any_domain {
+        tracing::warn!(
+            did = %did,
+            "domains keyspace is empty — skipping host-vs-domain safety check. \
+             Configure `[hosting] bootstrap_domains` or create a domain via the \
+             `domain/create` Trust Task to enable enforcement."
+        );
+        return Ok(());
+    }
+    assert_did_host_allowed(store, acl_entry, did).await
+}
+
+/// Resolve-side bundle: enforce host-match + domain-active in one call.
+///
+/// Wraps [`assert_request_host_matches_did`] and
+/// [`assert_domain_active_for_resolution`] with the same
+/// "permissive when [`KS_DOMAINS`] is empty" pattern used by
+/// [`assert_did_host_allowed_when_domains_configured`] on the write
+/// path. The legacy state (no domain seeded, fresh test fixtures) keeps
+/// resolving its DIDs; the moment a domain exists, enforcement turns
+/// on automatically.
+///
+/// `request_host` is `Option` because a caller cannot always resolve one —
+/// no `Host` header, no trusted `Forwarded`/`X-Forwarded-Host`, nothing.
+/// Every caller must route through this function rather than skipping it on
+/// `None`: once at least one domain is configured, a request with no
+/// resolvable host is refused rather than served with the domain-ownership
+/// gate silently bypassed. Skipping the call on `None` — the bug this
+/// replaces — meant *any* tenant's content was resolvable by a request that
+/// simply omitted its Host header.
+///
+/// Returns:
+/// - **404** (`AppError::NotFound`) on a missing host once domains are
+///   configured, or on host mismatch (per spec, hide the DID from the
+///   wrong domain).
+/// - **503** (`AppError::DomainDisabled`) when the matched domain is
+///   disabled.
+/// - **Ok** when the keyspace is empty (legacy), or when host matches
+///   and the domain is active.
+///
+/// [`KS_DOMAINS`]: crate::server::store::KS_DOMAINS
+pub async fn assert_resolution_allowed(
+    store: &Store,
+    request_host: Option<&str>,
+    did_id: &str,
+) -> Result<(), AppError> {
+    ResolutionDomains::load(store)
+        .await?
+        .assert_allowed(request_host, did_id)
+}
+
+/// The `domains` keyspace as the resolve-side check reads it: loaded
+/// with one scan, then checked against any number of requests.
+///
+/// [`assert_resolution_allowed`] loads one per request. A caller that
+/// can tell when a domain changes may keep one and drop it on each
+/// change, so a resolve reads no domain from the store.
+#[derive(Debug, Clone, Default)]
+pub struct ResolutionDomains {
+    /// Raw entries by stored key (the canonical domain name). Parsed
+    /// only when a request names one, as a direct read would.
+    entries: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+impl ResolutionDomains {
+    /// Read every domain entry.
+    pub async fn load(store: &Store) -> Result<Self, AppError> {
+        Self::load_from(&store.keyspace(crate::server::store::KS_DOMAINS)?).await
+    }
+
+    /// Read every domain entry through `domains`, a handle on the
+    /// `domains` keyspace.
+    pub async fn load_from(domains: &KeyspaceHandle) -> Result<Self, AppError> {
+        let entries = domains
+            .prefix_iter_raw(b"".to_vec())
+            .await?
+            .into_iter()
+            .collect();
+        Ok(Self { entries })
+    }
+
+    /// [`assert_resolution_allowed`] against these entries.
+    pub fn assert_allowed(&self, request_host: Option<&str>, did_id: &str) -> Result<(), AppError> {
+        if self.entries.is_empty() {
+            // Reached on every resolution until a domain is configured, so
+            // at most one warning a minute.
+            static NO_DOMAINS: crate::server::log_limit::WarnLimit =
+                crate::server::log_limit::WarnLimit::new(
+                    crate::server::log_limit::DEFAULT_INTERVAL_SECS,
+                );
+            match NO_DOMAINS.admit() {
+                Some(held) => tracing::warn!(
+                    did = %did_id,
+                    request_host = ?request_host,
+                    more_since_last_warning = held,
+                    "domains keyspace is empty — skipping resolve-side safety check"
+                ),
+                None => tracing::debug!(
+                    did = %did_id,
+                    "domains keyspace is empty — skipping resolve-side safety check"
+                ),
+            }
+            return Ok(());
+        }
+        let Some(request_host) = request_host else {
+            // Any client can omit `Host`, so at most one warning a minute.
+            static NO_HOST: crate::server::log_limit::WarnLimit =
+                crate::server::log_limit::WarnLimit::new(
+                    crate::server::log_limit::DEFAULT_INTERVAL_SECS,
+                );
+            match NO_HOST.admit() {
+                Some(held) => tracing::warn!(
+                    did = %did_id,
+                    more_since_last_warning = held,
+                    "no resolvable request host (no Host header, and none of Forwarded / \
+                     X-Forwarded-Host from a trusted peer); refusing to serve now that at \
+                     least one domain is configured"
+                ),
+                None => tracing::debug!(did = %did_id, "no resolvable request host; refusing"),
+            }
+            return Err(AppError::NotFound(format!(
+                "no resolvable request host for {did_id}"
+            )));
+        };
+        assert_request_host_matches_did(request_host, did_id)?;
+        let canonical = normalize_domain_name(request_host)?;
+        let entry = match self.entries.get(canonical.as_bytes()) {
+            Some(bytes) => Some(serde_json::from_slice::<DomainEntry>(bytes)?),
+            None => None,
+        };
+        domain_active_for_resolution(request_host, entry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
+    use super::*;
+    use crate::server::acl::AclEntry;
+    use crate::server::config::StoreConfig;
+    use crate::server::domain::scope::DomainScope;
+    use crate::server::domain::store::{create_domain, set_default_domain};
+    use crate::server::domain::types::{DomainEntry, DomainStatus, DomainUrlScheme};
+
+    #[cfg(feature = "store-fjall")]
+    async fn fjall_store() -> Store {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        };
+        std::mem::forget(dir);
+        Store::open(&cfg).await.expect("open fjall")
+    }
+
+    fn entry(name: &str, status: DomainStatus) -> DomainEntry {
+        DomainEntry {
+            name: name.into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status,
+            created_at: 0,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        }
+    }
+
+    fn acl(role: Role, scope: DomainScope) -> AclEntry {
+        AclEntry {
+            did: "did:example:caller".into(),
+            role,
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains: scope,
+        }
+    }
+
+    // ---- extract_did_host ----
+
+    #[test]
+    fn extract_host_webvh() {
+        let host = extract_did_host("did:webvh:QmABC:example.com:user1").unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn extract_host_webvh_with_port_encoded() {
+        // The identifier percent-encodes the port colon as `%3A`;
+        // `extract_did_host` decodes it back to the literal form so the
+        // publish-path store lookup / domain comparison sees the same
+        // `host:port` that the domain seed stored.
+        let host = extract_did_host("did:webvh:QmABC:example.com%3A8085:user1").unwrap();
+        assert_eq!(host, "example.com:8085");
+    }
+
+    #[test]
+    fn extract_host_webvh_with_port_encoded_localhost() {
+        // Regression for a live publish refused as `400`:
+        // a did:webvh log published by a VTA carries the daemon's own
+        // host as `localhost%3A8534`; it must decode to `localhost:8534`
+        // to match the seeded domain entry.
+        let host = extract_did_host("did:webvh:QmABC:localhost%3A8534:user1").unwrap();
+        assert_eq!(host, "localhost:8534");
+    }
+
+    #[test]
+    fn extract_host_webvh_with_port_encoded_lowercase_hex() {
+        // Lowercase `%3a` must decode identically to uppercase `%3A`.
+        let host = extract_did_host("did:webvh:QmABC:localhost%3a8534:user1").unwrap();
+        assert_eq!(host, "localhost:8534");
+    }
+
+    #[test]
+    fn extract_host_webvh_plain_domain_unchanged() {
+        // No percent-escapes → decode is a no-op.
+        let host = extract_did_host("did:webvh:QmABC:hosting.example.com:user1").unwrap();
+        assert_eq!(host, "hosting.example.com");
+    }
+
+    #[test]
+    fn extract_host_unknown_method_rejects() {
+        // A method no build enables. Using a method that *can* be
+        // compiled in would make this assertion depend on the feature
+        // set, which is what it used to do with `did:webs`.
+        let err =
+            extract_did_host("did:example:scid:example.com:user1").expect_err("unknown method");
+        assert!(matches!(err, AppError::Validation { .. }));
+    }
+
+    /// The host of a `did:webs` identifier is its first label — the AID
+    /// is the *last* one, not a SCID in front of the host as webvh has.
+    /// Getting this backwards would point the domain-safety check at a
+    /// host nobody configured.
+    #[cfg(feature = "method-webs")]
+    #[test]
+    fn extract_host_webs() {
+        let host = extract_did_host(
+            "did:webs:hosting.example.com:ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
+        )
+        .expect("webs is compiled in");
+        assert_eq!(host, "hosting.example.com");
+    }
+
+    /// And the percent-encoded port form decodes, like every other
+    /// method's — the allowlist is keyed on the decoded host.
+    #[cfg(feature = "method-webs")]
+    #[test]
+    fn extract_host_webs_with_port() {
+        let host = extract_did_host(
+            "did:webs:localhost%3A8534:ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
+        )
+        .expect("webs is compiled in");
+        assert_eq!(host, "localhost:8534");
+    }
+
+    #[cfg(not(feature = "method-webs"))]
+    #[test]
+    fn extract_host_webs_rejects_when_feature_off() {
+        let err = extract_did_host(
+            "did:webs:hosting.example.com:ENro7uf0ePmiK3jdTo2YCdXLqW7z7xoP6qhhBou6gBLe",
+        )
+        .expect_err("webs is not compiled in");
+        assert!(matches!(err, AppError::Validation { .. }));
+    }
+
+    #[test]
+    fn extract_host_web() {
+        let host = extract_did_host("did:web:example.com:user1").unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn extract_host_web_no_path() {
+        let host = extract_did_host("did:web:example.com").unwrap();
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn extract_host_malformed_rejects() {
+        for bad in ["not-a-did", "did:", "did::body", "did:webvh:onlyone"] {
+            let err = extract_did_host(bad).expect_err(bad);
+            assert!(matches!(err, AppError::Validation { .. }));
+        }
+    }
+
+    // ---- assert_host_is_active_domain ----
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn host_must_be_configured_domain() {
+        let store = fjall_store().await;
+        let err = assert_host_is_active_domain(&store, "missing.example")
+            .await
+            .expect_err("must reject missing domain");
+        assert!(matches!(err, AppError::Validation { .. }));
+        assert!(err.to_string().contains("not a configured domain"));
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn host_must_be_active_not_disabled() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("disabled.example", DomainStatus::Disabled))
+            .await
+            .unwrap();
+        let err = assert_host_is_active_domain(&store, "disabled.example")
+            .await
+            .expect_err("must reject disabled");
+        assert!(matches!(err, AppError::Validation { .. }));
+        assert!(err.to_string().contains("disabled"));
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn active_domain_passes() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("active.example", DomainStatus::Active))
+            .await
+            .unwrap();
+        assert!(
+            assert_host_is_active_domain(&store, "active.example")
+                .await
+                .is_ok()
+        );
+    }
+
+    // ---- assert_acl_allows_host ----
+
+    #[test]
+    fn admin_short_circuits_regardless_of_scope() {
+        let e = acl(
+            Role::Admin,
+            DomainScope::Allowed {
+                domains: vec!["a.example".into()],
+            },
+        );
+        // Admin has scope = Allowed([a]) but tries to operate on b.
+        assert!(assert_acl_allows_host(&e, "b.example").is_ok());
+    }
+
+    #[test]
+    fn service_short_circuits_regardless_of_scope() {
+        let e = acl(
+            Role::Service,
+            DomainScope::Allowed {
+                domains: vec!["a.example".into()],
+            },
+        );
+        assert!(assert_acl_allows_host(&e, "b.example").is_ok());
+    }
+
+    #[test]
+    fn owner_all_scope_allows_anything() {
+        let e = acl(Role::Owner, DomainScope::All);
+        assert!(assert_acl_allows_host(&e, "any.example").is_ok());
+    }
+
+    #[test]
+    fn owner_allowed_scope_membership_only() {
+        let e = acl(
+            Role::Owner,
+            DomainScope::Allowed {
+                domains: vec!["a.example".into(), "b.example".into()],
+            },
+        );
+        assert!(assert_acl_allows_host(&e, "a.example").is_ok());
+        assert!(assert_acl_allows_host(&e, "b.example").is_ok());
+        let err = assert_acl_allows_host(&e, "c.example").expect_err("not in scope");
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn forbidden_error_does_not_leak_allowed_list() {
+        let e = acl(
+            Role::Owner,
+            DomainScope::Allowed {
+                domains: vec!["secret-tenant.example".into()],
+            },
+        );
+        let err = assert_acl_allows_host(&e, "other.example").expect_err("not in scope");
+        // The Forbidden message names the rejected host (caller already
+        // sent it) but MUST NOT echo any names from the allowed list.
+        let s = err.to_string();
+        assert!(s.contains("other.example"));
+        assert!(!s.contains("secret-tenant.example"));
+    }
+
+    // ---- resolve-side checks ----
+
+    #[test]
+    fn request_host_matches_did_happy_path() {
+        assert!(
+            assert_request_host_matches_did("example.com", "did:webvh:Q1:example.com:user1")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_host_matches_did_case_insensitive() {
+        // DNS is case-insensitive — operators sometimes get
+        // mixed-case Host headers from buggy clients. Accept.
+        assert!(
+            assert_request_host_matches_did("Example.COM", "did:webvh:Q1:example.com:user1")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_host_matches_did_mismatch_yields_404() {
+        let err = assert_request_host_matches_did(
+            "domain-b.example",
+            "did:webvh:Q1:domain-a.example:user1",
+        )
+        .expect_err("mismatch must reject");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn request_host_matches_did_unparseable_yields_404() {
+        let err = assert_request_host_matches_did("example.com", "garbage")
+            .expect_err("unparseable did must reject");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn request_host_matches_did_with_encoded_port() {
+        // The webvh / web identifier encodes the port colon as `%3A`;
+        // the HTTP Host header carries the literal `:`. Must match.
+        assert!(
+            assert_request_host_matches_did("localhost:8534", "did:webvh:Q1:localhost%3A8534")
+                .is_ok()
+        );
+        assert!(
+            assert_request_host_matches_did("example.com:8443", "did:web:example.com%3A8443:user1")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn request_host_matches_did_with_encoded_port_mismatch_yields_404() {
+        // Right host, wrong port — still a mismatch after decoding.
+        let err =
+            assert_request_host_matches_did("localhost:9999", "did:webvh:Q1:localhost%3A8534")
+                .expect_err("port mismatch must reject");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn percent_decode_helpers() {
+        assert_eq!(
+            percent_decode_to_string("localhost%3A8534").as_deref(),
+            Some("localhost:8534")
+        );
+        // Lowercase hex.
+        assert_eq!(
+            percent_decode_to_string("localhost%3a8534").as_deref(),
+            Some("localhost:8534")
+        );
+        // No escapes — identity.
+        assert_eq!(
+            percent_decode_to_string("example.com").as_deref(),
+            Some("example.com")
+        );
+        // Multiple escapes (host%2Fpath form, though we don't mint
+        // these — exercise the general path anyway).
+        assert_eq!(
+            percent_decode_to_string("a%2Fb%3Ac").as_deref(),
+            Some("a/b:c")
+        );
+        // Malformed: trailing `%`, short escape, non-hex.
+        assert_eq!(percent_decode_to_string("bad%"), None);
+        assert_eq!(percent_decode_to_string("bad%3"), None);
+        assert_eq!(percent_decode_to_string("bad%ZZ"), None);
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_against_disabled_domain_yields_503() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("disabled.example", DomainStatus::Disabled))
+            .await
+            .unwrap();
+        let err = assert_domain_active_for_resolution(&store, "disabled.example")
+            .await
+            .expect_err("disabled must reject");
+        match err {
+            AppError::DomainDisabled { domain, .. } => {
+                assert_eq!(domain, "disabled.example");
+            }
+            other => panic!("expected DomainDisabled, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_against_missing_domain_yields_404() {
+        let store = fjall_store().await;
+        let err = assert_domain_active_for_resolution(&store, "missing.example")
+            .await
+            .expect_err("missing must reject");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_against_active_domain_passes() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("active.example", DomainStatus::Active))
+            .await
+            .unwrap();
+        assert!(
+            assert_domain_active_for_resolution(&store, "active.example")
+                .await
+                .is_ok()
+        );
+    }
+
+    // ---- bundle: assert_resolution_allowed ----
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_allowed_empty_keyspace_is_permissive() {
+        let store = fjall_store().await;
+        assert!(
+            assert_resolution_allowed(
+                &store,
+                Some("example.com"),
+                "did:webvh:Q1:example.com:user1"
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_allowed_happy_path() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("example.com", DomainStatus::Active))
+            .await
+            .unwrap();
+        assert!(
+            assert_resolution_allowed(
+                &store,
+                Some("example.com"),
+                "did:webvh:Q1:example.com:user1"
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_allowed_cross_domain_leakage_rejected() {
+        // Hosted: domain-a (active) AND domain-b (active). A request
+        // arriving on domain-b for a DID issued at domain-a must NOT
+        // resolve — return 404, not the DID.
+        let store = fjall_store().await;
+        create_domain(&store, &entry("domain-a.example", DomainStatus::Active))
+            .await
+            .unwrap();
+        create_domain(&store, &entry("domain-b.example", DomainStatus::Active))
+            .await
+            .unwrap();
+        let err = assert_resolution_allowed(
+            &store,
+            Some("domain-b.example"),
+            "did:webvh:Q1:domain-a.example:user1",
+        )
+        .await
+        .expect_err("cross-domain resolve must reject");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_allowed_disabled_domain_returns_503() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("disabled.example", DomainStatus::Disabled))
+            .await
+            .unwrap();
+        let err = assert_resolution_allowed(
+            &store,
+            Some("disabled.example"),
+            "did:webvh:Q1:disabled.example:user1",
+        )
+        .await
+        .expect_err("disabled domain must 503");
+        assert!(matches!(err, AppError::DomainDisabled { .. }));
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn resolution_allowed_missing_host_rejected_once_domains_exist() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("example.com", DomainStatus::Active))
+            .await
+            .unwrap();
+        let err = assert_resolution_allowed(&store, None, "did:webvh:Q1:example.com:user1")
+            .await
+            .expect_err("no resolvable host must not bypass the domain-ownership gate");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    // ---- end-to-end: assert_did_host_allowed ----
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn end_to_end_happy_path() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("example.com", DomainStatus::Active))
+            .await
+            .unwrap();
+        set_default_domain(&store, "example.com").await.unwrap();
+        let e = acl(
+            Role::Owner,
+            DomainScope::AllowedWithDefault {
+                domains: vec!["example.com".into()],
+                default: "example.com".into(),
+            },
+        );
+        let did = "did:webvh:QmABC:example.com:user1";
+        assert!(assert_did_host_allowed(&store, &e, did).await.is_ok());
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn end_to_end_did_host_not_configured() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("example.com", DomainStatus::Active))
+            .await
+            .unwrap();
+        let e = acl(Role::Owner, DomainScope::All);
+        let did = "did:webvh:QmABC:other.example:user1";
+        let err = assert_did_host_allowed(&store, &e, did)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, AppError::Validation { .. }));
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn end_to_end_acl_rejects() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("example.com", DomainStatus::Active))
+            .await
+            .unwrap();
+        let e = acl(
+            Role::Owner,
+            DomainScope::Allowed {
+                domains: vec!["allowed.example".into()],
+            },
+        );
+        // Add the "other" domain so the active-domain check passes;
+        // it's the ACL that rejects.
+        create_domain(&store, &entry("allowed.example", DomainStatus::Active))
+            .await
+            .unwrap();
+        let did = "did:webvh:QmABC:example.com:user1";
+        let err = assert_did_host_allowed(&store, &e, did)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn end_to_end_disabled_domain_rejects_with_400() {
+        let store = fjall_store().await;
+        create_domain(&store, &entry("example.com", DomainStatus::Disabled))
+            .await
+            .unwrap();
+        let e = acl(Role::Admin, DomainScope::All);
+        let did = "did:webvh:QmABC:example.com:user1";
+        // Even Admin can't write to a disabled domain — the active-
+        // domain check runs first and is role-blind.
+        let err = assert_did_host_allowed(&store, &e, did)
+            .await
+            .expect_err("disabled rejects");
+        assert!(matches!(err, AppError::Validation { .. }));
+    }
+}

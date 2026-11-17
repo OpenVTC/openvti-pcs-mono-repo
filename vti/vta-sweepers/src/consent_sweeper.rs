@@ -1,0 +1,91 @@
+//! Background pruning of expired consent records.
+//!
+//! Called from the storage thread's interval loop. Removes pending consent
+//! requests that were never answered before their TTL — the main unbounded-
+//! growth risk, since `vti_common::consent::consume_pending_consent` only prunes
+//! on access — and grants whose optional TTL has lapsed. Each removal is
+//! recorded in the audit log as `consent.expire` (actor `system:sweeper`), the
+//! same trail the ACL sweeper leaves.
+
+use tracing::{debug, info, warn};
+
+use vti_common::consent::{ConsentGrant, PendingConsent};
+
+use vta_audit::SharedAuditSink;
+use vti_common::error::AppError;
+use vti_common::store::KeyspaceHandle;
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Sweep the consent keyspace: delete expired pending requests and lapsed
+/// grants. Audit-record failures are warn-logged but don't abort the sweep.
+pub async fn sweep_expired(
+    consent_ks: &KeyspaceHandle,
+    audit: &SharedAuditSink,
+) -> Result<(), AppError> {
+    let now = now_epoch();
+    let mut pruned = 0usize;
+
+    // Expired pending requests (raised but never answered).
+    let mut rows = crate::rows::rows(consent_ks, "consent_pending:");
+    while let Some((key, value)) = rows.next().await? {
+        let pending: PendingConsent = match serde_json::from_slice(&value) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "consent sweeper: skipping unreadable pending row");
+                continue;
+            }
+        };
+        if now >= pending.expires_at {
+            consent_ks.remove(key).await?;
+            pruned += 1;
+            audit_expire(audit, &pending.subject.agent).await;
+        }
+    }
+
+    // Grants whose optional TTL has lapsed.
+    let mut rows = crate::rows::rows(consent_ks, "grant:");
+    while let Some((key, value)) = rows.next().await? {
+        let grant: ConsentGrant = match serde_json::from_slice(&value) {
+            Ok(g) => g,
+            Err(e) => {
+                debug!(error = %e, "consent sweeper: skipping unreadable grant row");
+                continue;
+            }
+        };
+        if grant.is_expired(now) {
+            consent_ks.remove(key).await?;
+            pruned += 1;
+            audit_expire(audit, &grant.subject.agent).await;
+        }
+    }
+
+    if pruned > 0 {
+        info!(
+            consent_pruned = pruned,
+            "consent sweeper pruned expired records"
+        );
+    }
+    Ok(())
+}
+
+async fn audit_expire(audit: &SharedAuditSink, agent: &str) {
+    if let Err(e) = vta_audit::record(
+        audit,
+        "consent.expire",
+        "system:sweeper",
+        Some(agent),
+        "success",
+        None,
+        None,
+    )
+    .await
+    {
+        warn!(error = %e, "consent sweeper: deletion succeeded but audit::record failed");
+    }
+}

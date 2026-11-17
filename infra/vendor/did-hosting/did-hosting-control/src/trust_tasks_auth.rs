@@ -1,0 +1,1141 @@
+//! Control-plane auth trust tasks: `auth/challenge/0.1`,
+//! `auth/authenticate/0.3` and `auth/refresh/0.2`.
+//!
+//! Only the latest version of each is served. `authenticate/0.2` and
+//! `refresh/0.1` are refused as unsupported types: a client still sending
+//! them (the VTI Wallet browser extension did, for its own login and its
+//! step-up renewal) has to move to `0.3` / `0.2`, which process every older
+//! document's members identically.
+//!
+//! Authentication to this control plane existed in two mutually exclusive
+//! shapes, and neither was reachable from the third transport:
+//!
+//! | binding | how a peer authenticated |
+//! |---|---|
+//! | HTTPS | canonical challenge → authenticate, with a signed document |
+//! | DIDComm | bespoke `MSG_AUTHENTICATE`: the reported sender *is* the auth, body ignored (route since removed) |
+//! | TSP | nothing at all |
+//!
+//! So a wallet connected over TSP could not log in, and a wallet over DIDComm
+//! logged in by a different rule than one over HTTPS. This module gives the
+//! family one identity on every wire, exactly as [`crate::messaging::infra`]
+//! did for server registration and health — see its module doc for the same
+//! argument made about a different family.
+//!
+//! ## Why not `did_hosting_common::server::trust_tasks::build_dispatcher`
+//!
+//! That dispatcher's [`TrustTaskContext`](did_hosting_common::server::trust_tasks::TrustTaskContext) carries `acl_ks`, `acl_locks` and
+//! `my_vid` — it is the ACL family's context. Auth needs session storage,
+//! challenge tracking and token minting, which live on the control plane's
+//! `AppState`. Widening the shared context to carry control-plane state would
+//! push this service's concerns into the crate both services share. A local
+//! `owns` + `dispatch` pair is the pattern this codebase already uses twice for
+//! exactly that reason.
+//!
+//! ## The authentication rule, and why it is the strict one
+//!
+//! `AuthenticateInput::signer_did` is documented as: *"Verified signer DID. The
+//! transport layer must produce this from a cryptographic check — never echo it
+//! from the request body unchecked."*
+//!
+//! Two things were candidates here. The transport's reported sender is what
+//! the bespoke DIDComm handler used — but a report is not a cryptographic check
+//! this service performs. The
+//! **document proof** is what the canonical spec means: `auth/authenticate/0.1`
+//! exists so that possession of a challenge plus a signature over it proves
+//! control of a VID, independent of how the bytes travelled.
+//!
+//! This takes the document proof. `ResolvedParties::issuer` is that value:
+//! [`TransportBoundVerifier`](did_hosting_common::server::trust_tasks::TransportBoundVerifier)
+//! requires an in-band `issuer` and binds the proof's `verificationMethod` to
+//! it, and `dispatch_trust_task_doc`'s gate has already refused any
+//! `auth/authenticate` document that is unsigned or whose issuer disagrees with
+//! the transport's sender. There is no path here where an unverified body value,
+//! or a transport's report of the sender, becomes a session. (`auth/challenge`
+//! is the one member of the family routed without a proof: it only mints the
+//! nonce the authenticate document must then sign.)
+//!
+//! The stricter reading is the right one for a family whose entire purpose is
+//! proving identity: accepting the transport's word would make `challenge`
+//! decorative on two of three bindings, and a decorative challenge is one that
+//! stops being checked.
+//!
+//! ## Session keys (`auth/authenticate`)
+//!
+//! An authenticate document may name a `sessionKey`, a `did:key` the producer
+//! holds. It sits inside the payload, so the subject's own proof is what
+//! authorises the binding. `authenticate_arm` stores its Ed25519 multikey on
+//! the new session row, exactly as a passkey login stores its browser key. From
+//! then on the HTTPS binding accepts that key's `authentication` proofs as the
+//! subject:
+//!
+//! - **for that session only.** The key is honoured only alongside the
+//!   session's own bearer token, and only for that token's subject;
+//! - **within the session's bounds.** The bearer extractor reads the session
+//!   row on every request, so expiry, `auth/revoke-session` and logout end the
+//!   key with the session. The session's `acr` is carried unchanged, so
+//!   anything that needs a step-up still does;
+//! - **never where an `assertionMethod` attestation is required.** A step-up
+//!   approval must be signed by the subject's own key, on every path, and
+//!   the verifier refuses a delegated approval outright;
+//! - **never to mint or extend a session.** `auth/authenticate` and
+//!   `auth/refresh` refuse a session-key proof (`session_key_may_sign`). A
+//!   refresh is authorised by the refresh token, not by the key. A key-bound
+//!   session's refresh does check the key's proof
+//!   (`routes::auth::verify_session_bound_proof`), but only on top of the
+//!   refresh token, as proof that the browser presenting
+//!   the token is the one that logged in: the key alone refreshes nothing.
+//!
+//! A key type this service cannot verify is refused with
+//! `auth/authenticate:sessionKeyUnsupported`, before the challenge is spent. It
+//! never falls back to a login without the binding the producer asked for.
+
+use did_hosting_common::tasks::auth::{
+    authenticate::v0_3 as authenticate, challenge::v0_1 as challenge, refresh::v0_2 as refresh,
+};
+use serde_json::Value;
+use tracing::{info, warn};
+use trust_tasks_rs::{
+    Dispatcher, ErrorPayload, ErrorResponse, ProofPolicy, ProofVerifier, ResolvedParties,
+    StandardCode, TransportHandler, TrustTask,
+};
+
+use did_hosting_common::epoch_to_rfc3339;
+use did_hosting_common::server::auth::session::{
+    SessionFate, get_session, get_session_by_refresh, now_epoch,
+};
+use did_hosting_common::server::trust_tasks::{DispatchOutcome, run_pipeline};
+use vti_common::auth::backend::{AuthenticateInput, RefreshInput};
+use vti_common::auth::handlers::{handle_authenticate, handle_refresh};
+
+use crate::server::AppState;
+
+/// The three request documents this module narrows an untyped inbound into.
+enum TypedAuth {
+    Challenge(Box<TrustTask<challenge::Payload>>),
+    Authenticate(Box<TrustTask<authenticate::Payload>>),
+    Refresh(Box<TrustTask<refresh::Payload>>),
+}
+
+/// Narrowing dispatcher — SPEC §7.2 items 1–3 (framework schema, payload-type
+/// narrowing, unknown-type rejection). Items 4–8 run per-arm in
+/// [`run_pipeline`].
+fn build_auth_dispatcher() -> Dispatcher<TypedAuth> {
+    Dispatcher::new()
+        .on::<challenge::Payload, _>(|d| TypedAuth::Challenge(Box::new(d)))
+        .on::<authenticate::Payload, _>(|d| TypedAuth::Authenticate(Box::new(d)))
+        .on::<refresh::Payload, _>(|d| TypedAuth::Refresh(Box::new(d)))
+}
+
+/// Does this Type URI belong to the auth family handled here?
+///
+/// Asked of the dispatcher rather than matched against literals, so the set
+/// this claims and the set it can actually narrow cannot drift apart — the
+/// failure mode being a URI `owns` accepts and `dispatch` then warns about as
+/// unowned, which is a silent 500 dressed as a routing bug.
+/// Every Type URI [`owns`] claims (for the generated Trust Task catalogue).
+pub fn task_uris() -> Vec<String> {
+    build_auth_dispatcher()
+        .registered_uris()
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+pub fn owns(type_uri: &str) -> bool {
+    build_auth_dispatcher()
+        .registered_uris()
+        .contains(&type_uri)
+}
+
+/// Handle an auth trust task. Returns the serialised response document.
+pub async fn dispatch<V>(
+    state: &AppState,
+    transport: &(impl TransportHandler + Sync),
+    policy: ProofPolicy<'_, V>,
+    doc: TrustTask<Value>,
+) -> Option<Value>
+where
+    V: ProofVerifier + ?Sized,
+{
+    let error_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+    let typed = match build_auth_dispatcher().dispatch_or_reject(doc, error_id) {
+        Ok(t) => t,
+        Err(err) => return Some(serialise(&err)),
+    };
+
+    let outcome = match typed {
+        TypedAuth::Challenge(d) => {
+            run_pipeline(
+                transport,
+                policy,
+                *d,
+                my_vid(state)?,
+                |doc, parties| async move { challenge_arm(state, doc, &parties).await },
+            )
+            .await
+        }
+        TypedAuth::Authenticate(d) => {
+            run_pipeline(
+                transport,
+                policy,
+                *d,
+                my_vid(state)?,
+                |doc, parties| async move { authenticate_v3_arm(state, doc, &parties).await },
+            )
+            .await
+        }
+        TypedAuth::Refresh(d) => {
+            run_pipeline(
+                transport,
+                policy,
+                *d,
+                my_vid(state)?,
+                |doc, parties| async move { refresh_v2_arm(state, doc, &parties).await },
+            )
+            .await
+        }
+    };
+
+    match outcome {
+        DispatchOutcome::Handled(resp) => Some(serialise(&resp)),
+        DispatchOutcome::Rejected(err) => Some(serialise(&err)),
+        // SPEC §8.1: an identity mismatch with no transport-authenticated
+        // sender has nobody safe to address a rejection to.
+        DispatchOutcome::Suppressed => None,
+    }
+}
+
+fn my_vid(state: &AppState) -> Option<&str> {
+    match state.config.server_did.as_deref() {
+        Some(v) => Some(v),
+        None => {
+            warn!("trust_tasks_auth: server_did not configured; cannot answer an auth task");
+            None
+        }
+    }
+}
+
+fn serialise<T: serde::Serialize>(doc: &T) -> Value {
+    serde_json::to_value(doc).expect("response document serialises")
+}
+
+/// The caller, as established by the framework — never a body value.
+// `ErrorResponse` is the upstream `TrustTask<ErrorPayload>`, which
+// `result_large_err` flags — here and on each of the three arms below, all of
+// which return it. Same reasoning as the allows in `did-hosting-common`'s
+// handlers: the type is upstream, and boxing it at this
+// boundary would churn every caller to save one move on a path that is about to
+// serialise the error onto the wire anyway.
+#[allow(clippy::result_large_err)]
+fn caller<P>(doc: &TrustTask<P>, parties: &ResolvedParties) -> Result<String, ErrorResponse> {
+    parties
+        .issuer
+        .as_deref()
+        .map(did_hosting_common::scid::identity)
+        .ok_or_else(|| {
+            doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                ErrorPayload::new(StandardCode::PermissionDenied).with_message(
+                    "inbound document has no in-band or transport-derived issuer, so there is \
+                 no verified identity to authenticate",
+                ),
+            )
+        })
+}
+
+/// Map a backend auth failure onto a framework rejection.
+///
+/// Deliberately opaque: `AuthError` distinguishes an unknown session from an
+/// expired challenge from a signer that does not match the session, and telling
+/// an unauthenticated caller which of those it hit is an oracle. The operator
+/// gets the detail in the log; the wire gets `permissionDenied`.
+fn denied<P>(doc: &TrustTask<P>, what: &str, err: impl std::fmt::Display) -> ErrorResponse {
+    warn!(error = %err, op = what, "auth trust task refused");
+    doc.reject_with(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        ErrorPayload::new(StandardCode::PermissionDenied).with_message("authentication refused"),
+    )
+}
+
+/// A refresh this deployment's policy ended: the session idled out. Expected
+/// behaviour, not a suspicious request, so nothing is logged here — the check
+/// that refused it already said so, once, at `info`.
+///
+/// Still `permissionDenied`, the code an idled-out refresh has always carried
+/// on the wire, and still non-retryable: a client must tell this apart from a
+/// transient failure ([`unavailable`]) and stop renewing, not try again.
+fn session_ended<P>(doc: &TrustTask<P>, message: &str) -> ErrorResponse {
+    doc.reject_with(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        ErrorPayload::new(StandardCode::PermissionDenied).with_message(message),
+    )
+}
+
+/// A refresh this service could not judge because its own store failed —
+/// before anything was spent, so re-issuing it is safe. Answered
+/// `unavailable` (retryable), not [`denied`]: a non-retryable refusal tells
+/// the browser its session is over, and a store hiccup is no reason to sign
+/// anyone out.
+fn unavailable<P>(doc: &TrustTask<P>, what: &str, err: impl std::fmt::Display) -> ErrorResponse {
+    warn!(error = %err, op = what, "auth trust task could not be served");
+    doc.reject_with(
+        format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        ErrorPayload::new(StandardCode::Unavailable)
+            .with_message("the authentication service is temporarily unavailable"),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+async fn challenge_arm(
+    state: &AppState,
+    doc: TrustTask<challenge::Payload>,
+    parties: &ResolvedParties,
+) -> Result<TrustTask<vta_sdk::protocols::auth::ChallengeResponse>, ErrorResponse> {
+    let did = caller(&doc, parties)?;
+
+    // `subject` in the payload is the VID the producer *intends* to
+    // authenticate as. It is not taken as the caller: the challenge is bound to
+    // the identity the framework verified, so a document asking for a challenge
+    // on someone else's behalf gets one bound to itself and fails at
+    // authenticate. Honouring it would make the challenge a request for a
+    // credential naming an arbitrary subject.
+    //
+    // Issued through the same path as `POST /api/auth/challenge`, so the
+    // per-DID and global pending-challenge caps hold on every binding — before,
+    // this arm called the canonical handler directly with its per-DID limit
+    // disabled, and challenges over DIDComm/TSP were unbounded. (The per-IP
+    // limiter has no meaning here: there is no client IP on a messaging
+    // binding.) The Trust Task specification defines no rate-limit code, so a
+    // refusal takes this arm's existing mapping for every challenge failure —
+    // `permissionDenied`, with the limiter and retry hint in the operator log
+    // only.
+    let resp = crate::routes::auth::issue_challenge(state, did)
+        .await
+        .map_err(|e| denied(&doc, "challenge", e))?;
+
+    Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), resp))
+}
+
+/// The Ed25519 multikey (`z6Mk…`) inside a `sessionKey` `did:key`, or `None`
+/// when it encodes anything this service cannot verify a proof from.
+///
+/// The session-key verifier resolves `did:key:{pk}#{pk}` and signs with
+/// `eddsa-jcs-2022`, so only an Ed25519 key is usable. Accepting another curve
+/// would bind a key whose every later proof is refused. The schema has already
+/// held the value to `did:key:z…` in base58btc; this checks what it decodes to.
+fn ed25519_session_key(session_key: &str) -> Option<String> {
+    let multikey = session_key.strip_prefix("did:key:")?;
+    did_hosting_common::server::auth::session::is_ed25519_multikey(multikey)
+        .then(|| multikey.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// auth/authenticate/0.3 — the proxied form
+// ---------------------------------------------------------------------------
+
+/// The one `delegationEvidence.kind` this deployment recognizes: a mandate
+/// the principal signed themselves, naming the delegate and this service.
+///
+/// A `reference` alone, or any other `kind`, is refused
+/// (`delegationNotRecognized`) — this service keeps no out-of-band
+/// delegation registry to resolve a bare reference against, and the
+/// Authorization section is explicit that an unrecognized `kind` is refused,
+/// never treated as an unenforced pass.
+const MANDATE_EVIDENCE_KIND: &str = "mandateCredential";
+
+/// The `type` this deployment requires on an inline `mandateCredential`, so a
+/// document minted for some *other* purpose — signed by the same principal,
+/// addressed to the same service, naming the same delegate by coincidence of
+/// field names — cannot be replayed here as a mandate it never was.
+///
+/// `local/…`, not `_local/…`: a Trust Task *Type URI* slug segment must start
+/// with an ASCII lowercase letter (SPEC.md §6.1's grammar; `TypeUri::from_str`
+/// enforces it), so a leading underscore fails to parse at all — every
+/// mandate a producer could ever present would be refused as "not a Trust
+/// Task document" before its own contents were ever checked, which is a
+/// silent, total outage of this evidence kind rather than the deliberate
+/// unenforced-kind refusal `delegationNotRecognized` is for.
+const MANDATE_EVIDENCE_TYPE_URI: &str =
+    "https://trusttasks.org/spec/local/did-hosting-auth-mandate/0.1";
+
+/// The longest a `mandateCredential` may be valid for, `issuedAt` to
+/// `expiresAt`: the default absolute session lifetime. A mandate is a
+/// standing grant to log in as its principal, so it must name its own end.
+pub(crate) const MAX_MANDATE_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// How far ahead of this service's clock a mandate's `issuedAt` may be.
+const MANDATE_CLOCK_SKEW_SECS: i64 = 60;
+
+/// Check a mandate's validity window at `now` and return its `expiresAt` in
+/// epoch seconds. Both `issuedAt` and `expiresAt` are required; `issuedAt`
+/// may not be in the future (beyond a small skew), `expiresAt` must follow
+/// it and be in the future, and the window may not exceed
+/// [`MAX_MANDATE_LIFETIME_SECS`].
+fn mandate_validity(
+    mandate: &TrustTask<Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<u64, String> {
+    let issued_at = mandate
+        .issued_at
+        .ok_or_else(|| "credential has no issuedAt".to_string())?;
+    let expires_at = mandate
+        .expires_at
+        .ok_or_else(|| "credential has no expiresAt".to_string())?;
+    if issued_at > now + chrono::Duration::seconds(MANDATE_CLOCK_SKEW_SECS) {
+        return Err("credential issuedAt is in the future".into());
+    }
+    if expires_at <= issued_at {
+        return Err("credential expiresAt is not after its issuedAt".into());
+    }
+    if (expires_at - issued_at).num_seconds() > MAX_MANDATE_LIFETIME_SECS {
+        return Err(format!(
+            "credential is valid for longer than {MAX_MANDATE_LIFETIME_SECS} seconds"
+        ));
+    }
+    if expires_at <= now {
+        return Err("credential has expired".into());
+    }
+    u64::try_from(expires_at.timestamp()).map_err(|_| "credential expiresAt is out of range".into())
+}
+
+/// `payload.delegate` on a `mandateCredential`: the delegate the principal is
+/// entitling, which MUST equal the authenticate document's own signer.
+#[derive(serde::Deserialize)]
+struct MandatePayload {
+    delegate: String,
+}
+
+/// The second recognized `delegationEvidence.kind`: the compact SIOPv2
+/// `id_token` the VTA-proxied SIOP login already produces (`vault/proxy-login`
+/// custodial signing — the *principal's own* key, held at the VTA, signs the
+/// token; the browser never touches it). Session-specific rather than a
+/// standing grant: it is freshly signed over *this* login's own challenge, so
+/// unlike `mandateCredential` it carries no separate expiry of its own — its
+/// freshness is the challenge's.
+const SIOP_ID_TOKEN_EVIDENCE_KIND: &str = "siopIdToken";
+
+/// `delegationEvidence.credential` under `kind: "siopIdToken"`.
+#[derive(serde::Deserialize)]
+struct SiopIdTokenCredential {
+    #[serde(rename = "idToken")]
+    id_token: String,
+}
+
+/// Verify that `evidence` establishes `delegate` (the authenticate
+/// document's own signer — verified via its framework `proof`, never a body
+/// claim) is entitled to authenticate as `principal`, for the challenge this
+/// authenticate document itself carries.
+///
+/// Independent verification, exactly as Authorization requires: `evidence`
+/// is never taken at its word. Two shapes are recognized; any other `kind`
+/// (and a `reference` alone, under either) is refused —
+/// `delegationNotRecognized` — this service keeps no out-of-band delegation
+/// registry to resolve a bare reference against:
+///
+/// - **`mandateCredential`** — `credential`, inline, shaped as a Trust Task
+///   document whose `issuer` is the principal, `recipient` is this service's
+///   own VID (so a mandate minted for one auth service cannot be replayed at
+///   another), `payload.delegate` names the delegate, and a `proof` with
+///   `proofPurpose: assertionMethod` — an attestation, over the principal's
+///   *own* key, never a session-key delegation — that
+///   [`AppState::trust_tasks_verifier`] resolves through the principal's own
+///   DID document and verifies as a decision
+///   (`TransportBoundVerifier::verify_approval`: the key under the
+///   principal's `assertionMethod`, and a principal that has not deactivated
+///   its DID). A standing grant, but a bounded one: `issuedAt` and
+///   `expiresAt` are required, the mandate may be valid for at most
+///   [`MAX_MANDATE_LIFETIME_SECS`], and a session it backs ends no later than
+///   its `expiresAt`.
+/// - **`siopIdToken`** — `credential.idToken`, the compact SIOPv2 `id_token`
+///   `vault/proxy-login`'s custodial signing already produces: `iss`/`sub`
+///   MUST be the principal, `aud` MUST be this service, and — the freshness
+///   that ties it to *this* login rather than any other the principal's VTA
+///   ever signed — its `nonce` MUST equal `challenge`, the same value this
+///   authenticate document itself echoes from `auth/challenge`. Verified via
+///   [`didcomm_unpack::verify_siop_id_token`], which resolves `iss`'s DID
+///   document independently; a party that cannot produce the principal's own
+///   signature cannot satisfy this, whatever `issuer`/`proof` the outer
+///   authenticate document carries.
+///
+/// On success this is exactly the property
+/// `auth/authenticate:delegationNotRecognized`'s absence promises: the
+/// principal themselves said, in a signature only they could produce, that
+/// this delegate may act for them at this service.
+///
+/// Returns, on success, the instant (epoch seconds) after which the evidence
+/// no longer entitles the delegate — a mandate's `expiresAt` — so the session
+/// it backs ends no later; `None` for evidence bound to this login alone.
+/// Returns the refusal reason (operator-log detail only; the wire refusal is
+/// the same opaque `delegationNotRecognized` for every cause) on failure.
+///
+/// Callers check first that `principal` has an ACL entry
+/// ([`principal_is_listed`]): both kinds resolve the principal's DID, and
+/// that must never be a DID a stranger chose. Each check is bounded by
+/// [`crate::unlisted_signers::RESOLUTION_TIMEOUT`].
+async fn verify_delegation_evidence(
+    state: &AppState,
+    principal: &str,
+    delegate: &str,
+    challenge: &str,
+    evidence: &authenticate::PayloadDelegationEvidence,
+) -> Result<Option<u64>, String> {
+    match evidence.kind.as_str() {
+        MANDATE_EVIDENCE_KIND => {
+            if evidence.credential.is_empty() {
+                return Err("mandateCredential requires an inline credential".into());
+            }
+            let mandate: TrustTask<Value> = serde_json::from_value(Value::Object(
+                evidence.credential.clone(),
+            ))
+            .map_err(|e| format!("credential does not parse as a Trust Task document: {e}"))?;
+
+            if mandate.type_uri.to_string() != MANDATE_EVIDENCE_TYPE_URI {
+                return Err("credential is not a did-hosting-auth-mandate document".into());
+            }
+            if !mandate
+                .issuer
+                .as_deref()
+                .is_some_and(|i| did_hosting_common::scid::same_reference(i, principal))
+            {
+                return Err("credential.issuer does not name the principal".into());
+            }
+            if mandate.recipient.as_deref() != state.config.server_did.as_deref() {
+                return Err("credential.recipient does not name this service".into());
+            }
+            let expires_at = mandate_validity(&mandate, chrono::Utc::now())?;
+            let mandate_payload: MandatePayload =
+                serde_json::from_value(mandate.payload.clone())
+                    .map_err(|e| format!("credential.payload does not name a delegate: {e}"))?;
+            if mandate_payload.delegate != delegate {
+                return Err("credential does not name this delegate".into());
+            }
+            if mandate.proof.as_ref().map(|p| p.proof_purpose.as_str()) != Some("assertionMethod") {
+                return Err("credential proof must be an assertionMethod attestation".into());
+            }
+            let verifier = state
+                .trust_tasks_verifier
+                .as_ref()
+                .ok_or_else(|| "no proof verifier configured".to_string())?;
+            // A mandate is the principal's decision, so it is held to the
+            // rules every decision is: an `assertionMethod` key of the
+            // principal's own, never a session delegate, and a signer that has
+            // not deactivated its DID.
+            tokio::time::timeout(
+                state.unlisted_signers.timeout(),
+                verifier.verify_approval(&mandate),
+            )
+            .await
+            .map_err(|_| "credential proof verification timed out".to_string())?
+            .map_err(|e| format!("credential proof failed verification: {e}"))?;
+            Ok(Some(expires_at))
+        }
+        SIOP_ID_TOKEN_EVIDENCE_KIND => {
+            if evidence.credential.is_empty() {
+                return Err("siopIdToken requires an inline credential".into());
+            }
+            let cred: SiopIdTokenCredential =
+                serde_json::from_value(Value::Object(evidence.credential.clone()))
+                    .map_err(|e| format!("credential is not a siopIdToken payload: {e}"))?;
+            // Refused before anything is resolved unless the token at least
+            // claims to be the principal's: the only DID it may make this
+            // service resolve is one the caller has already checked.
+            if !did_hosting_common::server::didcomm_unpack::siop_id_token_claimed_issuer(
+                &cred.id_token,
+            )
+            .is_some_and(|iss| did_hosting_common::scid::same_reference(&iss, principal))
+            {
+                return Err("id_token does not claim to be issued by the principal".into());
+            }
+            let did_resolver = state
+                .did_resolver
+                .as_ref()
+                .ok_or_else(|| "no DID resolver configured".to_string())?;
+            let verified = tokio::time::timeout(
+                state.unlisted_signers.timeout(),
+                did_hosting_common::server::didcomm_unpack::verify_siop_id_token(
+                    &cred.id_token,
+                    did_resolver,
+                ),
+            )
+            .await
+            .map_err(|_| "id_token verification timed out".to_string())?
+            .map_err(|e| format!("id_token failed verification: {e}"))?;
+            if !did_hosting_common::scid::same_reference(&verified.issuer, principal) {
+                return Err("id_token iss/sub does not name the principal".into());
+            }
+            let own_vid = state
+                .config
+                .server_did
+                .as_deref()
+                .ok_or_else(|| "server_did not configured".to_string())?;
+            if verified.audience != own_vid {
+                return Err("id_token aud does not name this service".into());
+            }
+            if verified.nonce != challenge {
+                return Err("id_token nonce does not match this authenticate's challenge".into());
+            }
+            let now = now_epoch();
+            const CLOCK_SKEW_SECS: u64 = 60;
+            if verified.expires_at <= now {
+                return Err("id_token has expired".into());
+            }
+            if verified.issued_at > now + CLOCK_SKEW_SECS {
+                return Err("id_token iat is in the future".into());
+            }
+            if verified.issued_at > verified.expires_at {
+                return Err("id_token iat is after exp".into());
+            }
+            Ok(None)
+        }
+        other => Err(format!("unrecognized delegationEvidence.kind {other:?}")),
+    }
+}
+
+/// Whether `principal` has an ACL entry. A failed lookup counts as `false`:
+/// the caller refuses, and the login can be retried.
+async fn principal_is_listed(state: &AppState, principal: &str) -> bool {
+    matches!(
+        did_hosting_common::server::acl::get_acl_entry(&state.acl_ks, principal).await,
+        Ok(Some(_))
+    )
+}
+
+/// Whether `doc` is a proxied `auth/authenticate/0.3` whose principal has an
+/// ACL entry and whose delegation evidence — signed by that principal,
+/// naming `doc`'s issuer as its delegate — verifies. The gate then verifies
+/// the delegate's own proof as it would a member's, rather than under the
+/// bounds for signers the ACL does not list (`crate::unlisted_signers`): the
+/// member has vouched for it. Everything here resolves only the member's
+/// DID. The arm checks the evidence again; this decides nothing else.
+pub(crate) async fn vouched_delegate(state: &AppState, doc: &TrustTask<Value>) -> bool {
+    use trust_tasks_rs::Payload as _;
+    if doc.type_uri.to_string() != authenticate::Payload::TYPE_URI {
+        return false;
+    }
+    let Some(delegate) = doc.issuer.as_deref() else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_value::<authenticate::Payload>(doc.payload.clone()) else {
+        return false;
+    };
+    let (Some(principal), Some(evidence)) = (
+        payload.principal.as_ref().map(|p| p.to_string()),
+        payload.delegation_evidence.as_ref(),
+    ) else {
+        return false;
+    };
+    principal != delegate
+        && principal_is_listed(state, &principal).await
+        && verify_delegation_evidence(
+            state,
+            &principal,
+            delegate,
+            payload.challenge.as_str(),
+            evidence,
+        )
+        .await
+        .is_ok()
+}
+
+/// Side state this module keeps *outside* the `vti_common::auth::session`
+/// row, keyed by `session_id` (which, for an authenticated session, is
+/// stable for the session's whole life — vti-common mints it once, at
+/// `auth/authenticate`, and every `auth/refresh` preserves it unchanged).
+/// Two members neither vti-common's `Session` nor its canonical handlers
+/// carry: the proxied login's delegate (`actor`) and the absolute session
+/// lifetime this deployment enforces. Overwritten, never accumulated: a
+/// fresh login for the same principal writes the same key.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuthProxyMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor: Option<String>,
+    absolute_expires_at: u64,
+}
+
+fn auth_proxy_meta_key(session_id: &str) -> String {
+    format!("auth-proxy-meta:{session_id}")
+}
+
+pub(crate) async fn store_auth_proxy_meta(
+    state: &AppState,
+    session_id: &str,
+    actor: Option<String>,
+    absolute_expires_at: u64,
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    state
+        .sessions_ks
+        .insert(
+            auth_proxy_meta_key(session_id),
+            &AuthProxyMeta {
+                actor,
+                absolute_expires_at,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn get_auth_proxy_meta(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Option<AuthProxyMeta>, did_hosting_common::server::error::AppError> {
+    state.sessions_ks.get(auth_proxy_meta_key(session_id)).await
+}
+
+/// Remove `session_id`'s auth-proxy meta row, if any.
+///
+/// Called from `auth/revoke-session` (the console's logout) and from any
+/// other path that ends a session outright, so a proxied login's `actor`
+/// and absolute-lifetime cap never outlive the session they were minted
+/// for. A session with no row here (one not minted by
+/// `auth/authenticate`) makes this a no-op, not an error.
+pub(crate) async fn delete_auth_proxy_meta(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    state
+        .sessions_ks
+        .remove(auth_proxy_meta_key(session_id))
+        .await
+}
+
+/// Apply `fate` to every live session of `subject` (any reference to its
+/// identity), and drop the auth-proxy meta row of each session it ends.
+///
+/// The one place the control plane ends or demotes sessions because what they
+/// rest on was withdrawn: an ACL entry removed, or a passkey revoked.
+pub(crate) async fn settle_subject_sessions(
+    state: &AppState,
+    subject: &str,
+    fate: impl Fn(&did_hosting_common::server::auth::session::Session) -> SessionFate,
+) -> Result<
+    did_hosting_common::server::auth::session::SettledSessions,
+    did_hosting_common::server::error::AppError,
+> {
+    let settled = did_hosting_common::server::auth::session::settle_subject_sessions(
+        &state.sessions_ks,
+        subject,
+        fate,
+    )
+    .await?;
+    for session_id in &settled.ended {
+        delete_auth_proxy_meta(state, session_id).await?;
+    }
+    Ok(settled)
+}
+
+#[allow(clippy::result_large_err)]
+async fn authenticate_v3_arm(
+    state: &AppState,
+    doc: TrustTask<authenticate::Payload>,
+    parties: &ResolvedParties,
+) -> Result<TrustTask<authenticate::Response>, ErrorResponse> {
+    let signer_did = caller(&doc, parties)?;
+
+    // Refused before the challenge is touched, so the producer can retry the
+    // same challenge without the key. It is never quietly dropped: a login the
+    // producer believes bound a key, and which did not, would have every
+    // later call the key signs refused.
+    let requested_key = doc.payload.session_key.as_ref().map(|k| k.to_string());
+    let session_pubkey_b58btc = match requested_key.as_deref() {
+        None => None,
+        Some(key) => Some(ed25519_session_key(key).ok_or_else(|| {
+            warn!(session_key = %key, "authenticate refused: unsupported session key type");
+            doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                ErrorPayload::from(authenticate::error_codes::SESSION_KEY_UNSUPPORTED)
+                    .with_message("this service binds Ed25519 did:key session keys only")
+                    .with_details(serde_json::json!({ "requested": key })),
+            )
+        })?),
+    };
+
+    // The acting party: `principal` when present and unequal to `issuer` (a
+    // proxied authenticate), otherwise `issuer` itself — SPEC conformance
+    // item 5. Passed to `handle_authenticate` as the session's own subject,
+    // so the challenge-binding check it already runs
+    // (`subjectMismatch`/`SignerMismatch`) compares against the *acting
+    // party*, exactly as item 5 requires, without this module re-deriving
+    // vti-common's session lookup to do it separately.
+    let principal = doc.payload.principal.as_ref().map(|p| p.to_string());
+    let proxied = principal.as_deref().is_some_and(|p| p != signer_did);
+    let acting_party = if proxied {
+        principal.clone().expect("proxied implies principal")
+    } else {
+        signer_did.clone()
+    };
+
+    // When the evidence that let the delegate in stops entitling it.
+    let mut evidence_ends_at = None;
+    if proxied {
+        let Some(evidence) = doc.payload.delegation_evidence.as_ref() else {
+            return Err(doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                ErrorPayload::from(authenticate::error_codes::DELEGATION_EVIDENCE_REQUIRED)
+                    .with_message("a proxied authenticate must carry delegationEvidence"),
+            ));
+        };
+        // Only a member may be logged in as, so a principal outside the ACL
+        // is refused before its evidence is checked — which would resolve
+        // whatever DID the request named, before the challenge is even
+        // looked at.
+        if !principal_is_listed(state, &acting_party).await {
+            return Err(denied(
+                &doc,
+                "authenticate",
+                format!("proxied principal {acting_party} has no ACL entry"),
+            ));
+        }
+        match verify_delegation_evidence(
+            state,
+            &acting_party,
+            &signer_did,
+            doc.payload.challenge.as_str(),
+            evidence,
+        )
+        .await
+        {
+            Ok(until) => evidence_ends_at = until,
+            Err(reason) => {
+                warn!(
+                    principal = %acting_party,
+                    delegate = %signer_did,
+                    reason = %reason,
+                    "proxied authenticate refused: delegation not recognized",
+                );
+                return Err(doc.reject_with(
+                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                    ErrorPayload::from(authenticate::error_codes::DELEGATION_NOT_RECOGNIZED)
+                        .with_message("delegation evidence did not establish the entitlement"),
+                ));
+            }
+        }
+    }
+
+    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
+        .map_err(|e| denied(&doc, "authenticate/backend", e))?;
+
+    let session_id = doc.payload.session_id.to_string();
+    let resp = handle_authenticate(
+        &backend,
+        AuthenticateInput {
+            session_id: session_id.clone(),
+            challenge: doc.payload.challenge.to_string(),
+            // The acting party — `principal` for a proxied login, else the
+            // verified signer. Never the raw, unproxied `issuer` on a
+            // proxied request: that would bind the session, and the
+            // challenge's own subject check, to the delegate instead of the
+            // principal it is authenticating.
+            signer_did: acting_party.clone(),
+            created_time: None,
+            session_pubkey_b58btc,
+            audience: vti_common::auth::AudienceBinding::Transport,
+        },
+    )
+    .await
+    .map_err(|e| denied(&doc, "authenticate", e))?;
+
+    state.pending_challenges.release_session(&session_id);
+
+    // Keyed by `resp.session.id` — the canonical, DID-keyed session id
+    // `handle_authenticate` just minted — never `session_id` above, which is
+    // `payload.sessionId`, the now-consumed *challenge*'s row. The two are
+    // different identifiers throughout the session's whole life (a fresh
+    // login mints a new challenge id every time; the authenticated session id
+    // is the subject's own DID and outlives it), and `refresh_v2_arm` reads
+    // this row back keyed by the former, not the latter. Keying the write by
+    // the challenge id silently orphaned every meta row the instant the
+    // challenge it was written under was released a line above — no refresh
+    // could ever find it again, so neither the absolute lifetime cap nor
+    // `actor` ever actually reached a refresh.
+    //
+    // A session a mandate backs ends when the mandate does: the mandate is
+    // the only thing that entitles the delegate to act as the principal.
+    let absolute_expires_at = (now_epoch() + state.config.auth.absolute_session_lifetime)
+        .min(evidence_ends_at.unwrap_or(u64::MAX));
+    let actor = proxied.then(|| signer_did.clone());
+    store_auth_proxy_meta(state, &resp.session.id, actor.clone(), absolute_expires_at)
+        .await
+        .map_err(|e| denied(&doc, "authenticate/meta", e))?;
+
+    let mut value =
+        serde_json::to_value(&resp).map_err(|e| denied(&doc, "authenticate/response", e))?;
+    if let Some(key) = requested_key {
+        value["session"]["sessionKey"] = Value::String(key);
+    }
+    if let Some(actor) = actor {
+        value["session"]["actor"] = Value::String(actor);
+    }
+    // A session a mandate backs ends when the mandate does, tokens included.
+    // One whose mandate ends before its refresh token would is not refreshed:
+    // its delegate logs in again with its mandate.
+    if let Some(mandate_end) = evidence_ends_at {
+        bound_session_to_mandate(state, &resp.session.id, mandate_end, &mut value)
+            .await
+            .map_err(|e| denied(&doc, "authenticate/meta", e))?;
+    }
+    value["session"]["absoluteExpiresAt"] = Value::String(epoch_to_rfc3339(absolute_expires_at));
+    let payload: authenticate::Response =
+        serde_json::from_value(value).map_err(|e| denied(&doc, "authenticate/response", e))?;
+
+    Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
+}
+
+/// End the session `session_id` a mandate backs no later than the mandate:
+/// its row's `not_after` (which `auth/refresh` clamps every rotation to, and
+/// the bearer extractor refuses past), its refresh token's expiry, and the
+/// first access token, re-signed with the earlier `exp` when it would outlive
+/// the mandate. `value` is the authenticate response, adjusted to match.
+async fn bound_session_to_mandate(
+    state: &AppState,
+    session_id: &str,
+    mandate_end: u64,
+    value: &mut Value,
+) -> Result<(), did_hosting_common::server::error::AppError> {
+    use did_hosting_common::server::error::AppError;
+    let now = now_epoch();
+    let left = mandate_end.saturating_sub(now).max(1);
+    let mut session = get_session(&state.sessions_ks, session_id)
+        .await?
+        .ok_or_else(|| AppError::Internal("the session just created is missing".into()))?;
+    session.not_after = Some(mandate_end);
+    if session
+        .refresh_expires_at
+        .is_some_and(|expires| expires > mandate_end)
+    {
+        session.refresh_expires_at = Some(mandate_end);
+        if value["tokens"].get("refreshExpiresIn").is_some() {
+            value["tokens"]["refreshExpiresIn"] = serde_json::json!(left);
+        }
+    }
+    did_hosting_common::server::auth::session::store_session(&state.sessions_ks, &session).await?;
+
+    let jwt_keys = state
+        .jwt_keys
+        .as_deref()
+        .ok_or_else(|| AppError::Config("auth not configured".into()))?;
+    if let Some(token) = value["tokens"]["accessToken"].as_str() {
+        let mut claims = jwt_keys.decode(token)?;
+        if claims.exp > mandate_end {
+            // Same `jti`, so the session's token pin still matches.
+            claims.exp = mandate_end;
+            value["tokens"]["accessToken"] = Value::String(jwt_keys.encode(&claims)?);
+            value["tokens"]["expiresIn"] = serde_json::json!(left);
+            value["session"]["expiresAt"] = Value::String(epoch_to_rfc3339(mandate_end));
+        }
+    }
+    Ok(())
+}
+
+/// Re-type `doc` as the framework's untyped `TrustTask<Value>`, for
+/// [`crate::routes::auth::verify_session_bound_proof`], whose signature
+/// predates the typed `refresh::Payload`.
+///
+/// MUST carry every member exactly as received — `issuer`, `recipient`,
+/// `issuedAt` and the real `payload` alongside `id`/`type`/`proof` — not a
+/// reconstruction with the payload nulled out. A Data Integrity proof signs
+/// the whole document (canonicalised, minus `proof` itself); verifying it
+/// against anything else, however "unused" that field looks, recomputes a
+/// different hash than the one the signature covers and can never succeed.
+/// An earlier version of this helper built a stripped `{id, type, proof}`
+/// probe on exactly that mistaken premise — a session that bound a key could
+/// then never pass its own binding check, on this refresh version alone.
+fn proof_probe<P: serde::Serialize>(doc: &TrustTask<P>) -> TrustTask<Value> {
+    let value = serde_json::to_value(doc).expect("TrustTask serialises");
+    serde_json::from_value(value).expect("TrustTask<Value> re-parses from its own serialisation")
+}
+
+#[allow(clippy::result_large_err)]
+async fn refresh_v2_arm(
+    state: &AppState,
+    doc: TrustTask<refresh::Payload>,
+    parties: &ResolvedParties,
+) -> Result<TrustTask<refresh::Response>, ErrorResponse> {
+    // Unlike `authenticate` (proof REQUIRED), this arm does not require a
+    // verified issuer at all — SPEC declares `proofRequirement: OPTIONAL`,
+    // and a session with no bound key legitimately omits `proof` entirely
+    // (Conformance item 3, "exactly as in 0.1"). The refresh token itself is
+    // the authority (Authorization); a bound session key, checked below
+    // against the *session's own record* rather than against this value, is
+    // the only additional binding this version adds.
+    let signer_did = parties.issuer.clone();
+    let refresh_token = doc.payload.refresh_token.to_string();
+
+    // Pre-checks against the *presented* token's session, non-consuming
+    // (`get_session_by_refresh` peeks the index; `handle_refresh`'s own
+    // atomic claim is what actually spends the token). Both refusals below
+    // MUST NOT burn the token on the way to refusing it — SPEC conformance
+    // item 3 for the session-key check, and the same principle for the
+    // absolute-lifetime check: a producer that retries with the right proof,
+    // or that was refused only because it is out of time, must still get the
+    // canonical answer, not "token already spent".
+    //
+    // A session that carries a bound key is required to prove it right here
+    // — never by `handle_refresh`'s own signer-matches-session check, which
+    // compares against the session's long-term *subject*, not the ephemeral
+    // `did:key` a session key proof is signed by (and, for the auth family,
+    // never delegated at the transport level — `session_key_may_sign`
+    // excludes it). So a session with a bound key passes `None` below: this
+    // check is what stands in for it.
+    let mut bound_key_verified = false;
+    if let Some(session_id) = get_session_by_refresh(&state.sessions_ks, &refresh_token)
+        .await
+        .map_err(|e| unavailable(&doc, "refresh/peek", e))?
+        && let Some(session) = get_session(&state.sessions_ks, &session_id)
+            .await
+            .map_err(|e| unavailable(&doc, "refresh/peek", e))?
+    {
+        // Enforce this deployment's idle-timeout policy, not vti-common's
+        // (its `AuthBackend::idle_timeout` stays `None`, the default). Checked
+        // before anything is spent, same reasoning as the session-key-proof
+        // check below. The check logs the refusal itself, at `info`.
+        crate::routes::auth::refuse_if_idle_session(&session, state.config.auth.admin_idle_timeout)
+            .map_err(|_| {
+                session_ended(
+                    &doc,
+                    "the session was signed out after a period of inactivity; \
+                     re-authenticate via auth/authenticate",
+                )
+            })?;
+
+        crate::routes::auth::verify_session_bound_proof(&proof_probe(&doc), &session)
+            .await
+            .map_err(|e| {
+                warn!(session_id = %session_id, error = %e, "refresh refused: session-key proof required");
+                doc.reject_with(
+                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                    ErrorPayload::from(refresh::error_codes::SESSION_KEY_PROOF_REQUIRED)
+                        .with_message(
+                            "a session that bound a key must refresh with that key's proof",
+                        ),
+                )
+            })?;
+        bound_key_verified = session.session_pubkey_b58btc.is_some();
+
+        if let Some(meta) = get_auth_proxy_meta(state, &session_id)
+            .await
+            .map_err(|e| unavailable(&doc, "refresh/meta", e))?
+            && session
+                .refresh_expires_at
+                .is_some_and(|expires| expires >= meta.absolute_expires_at)
+        {
+            // The session lived its full span: expected, so `info`.
+            info!(session_id = %session_id, "refresh refused: absolute session lifetime reached");
+            return Err(doc.reject_with(
+                format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                ErrorPayload::from(refresh::error_codes::SESSION_LIFETIME_EXCEEDED).with_message(
+                    "the session has reached its absolute lifetime; re-authenticate via \
+                         auth/authenticate",
+                ),
+            ));
+        }
+    }
+
+    let backend = crate::auth::DidHostingControlAuthBackend::from_state(state)
+        .map_err(|e| denied(&doc, "refresh/backend", e))?;
+
+    let presented_refresh_token = refresh_token.clone();
+    let resp = handle_refresh(
+        &backend,
+        RefreshInput {
+            refresh_token,
+            signer_did: if bound_key_verified { None } else { signer_did },
+        },
+    )
+    .await
+    .map_err(|e| denied(&doc, "refresh", e))?;
+
+    // `resp.session.id` is the same session_id throughout the session's
+    // life (vti-common preserves it across rotation), so the meta row
+    // written at login is still the right one to read and needs no
+    // migration here.
+    let new_session_id = resp.session.id.clone();
+    let mut value = serde_json::to_value(&resp).map_err(|e| denied(&doc, "refresh/response", e))?;
+
+    // A session ended or demoted while this refresh was in flight (its
+    // passkey revoked, its ACL entry removed) stays so: the rotation was
+    // written from the row as it stood before.
+    // The rotation this refresh wrote: a row that has moved on since is not
+    // this refresh's to settle.
+    let rotated_refresh_token = value["tokens"]["refreshToken"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let rotated_token_id = state
+        .jwt_keys
+        .as_deref()
+        .and_then(|keys| {
+            value["tokens"]["accessToken"]
+                .as_str()
+                .and_then(|t| keys.decode(t).ok())
+        })
+        .map(|claims| claims.jti)
+        .unwrap_or_default();
+    match did_hosting_common::server::auth::session::settle_after_refresh(
+        &state.sessions_ks,
+        &presented_refresh_token,
+        &new_session_id,
+        &rotated_refresh_token,
+        &rotated_token_id,
+    )
+    .await
+    .map_err(|e| denied(&doc, "refresh/settled", e))?
+    {
+        Some(SessionFate::End) => {
+            delete_auth_proxy_meta(state, &new_session_id)
+                .await
+                .map_err(|e| denied(&doc, "refresh/settled", e))?;
+            return Err(denied(
+                &doc,
+                "refresh",
+                "the session was ended while the refresh was in flight",
+            ));
+        }
+        Some(SessionFate::Demote) => {
+            value["session"]["acr"] = Value::String("aal1".into());
+            value["session"]["amr"] = serde_json::json!(["did"]);
+        }
+        _ => {}
+    }
+    if let Some(meta) = get_auth_proxy_meta(state, &new_session_id)
+        .await
+        .map_err(|e| denied(&doc, "refresh/meta", e))?
+    {
+        // Cap the rotated session's own refresh deadline at the ceiling —
+        // conformance item 4 ("MUST NOT set the resulting Session.expiresAt
+        // later than Session.absoluteExpiresAt"). The pre-check above has
+        // already refused outright once the *current* deadline reached the
+        // ceiling, so what remains here is only ever a downward clamp, never
+        // a silent zero-or-negative window.
+        if let Some(mut session) = get_session(&state.sessions_ks, &new_session_id)
+            .await
+            .map_err(|e| denied(&doc, "refresh/meta", e))?
+            && let Some(refresh_expires_at) = session.refresh_expires_at
+            && refresh_expires_at > meta.absolute_expires_at
+        {
+            session.refresh_expires_at = Some(meta.absolute_expires_at);
+            did_hosting_common::server::auth::session::store_session(&state.sessions_ks, &session)
+                .await
+                .map_err(|e| denied(&doc, "refresh/meta", e))?;
+            let now = now_epoch();
+            value["tokens"]["refreshExpiresIn"] =
+                serde_json::json!(meta.absolute_expires_at.saturating_sub(now));
+        }
+        value["session"]["absoluteExpiresAt"] =
+            Value::String(epoch_to_rfc3339(meta.absolute_expires_at));
+        // Preserved unchanged across the refresh — conformance item 6.
+        if let Some(actor) = meta.actor {
+            value["session"]["actor"] = Value::String(actor);
+        }
+    }
+
+    let payload: refresh::Response =
+        serde_json::from_value(value).map_err(|e| denied(&doc, "refresh/response", e))?;
+
+    Ok(doc.respond_with(format!("urn:uuid:{}", uuid::Uuid::new_v4()), payload))
+}
+
+#[cfg(test)]
+#[path = "trust_tasks_auth_tests.rs"]
+mod tests;

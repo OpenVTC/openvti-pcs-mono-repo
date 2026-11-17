@@ -1,0 +1,3418 @@
+//! Internal layout:
+//! - `mod.rs` — `create_did_webvh`, `delete_did_webvh`,
+//!   `CreateDidWebvhParams`, helpers still used only by the main flow
+//! - `document` — pure DID-document construction (shared with the TEE
+//!   enclave bootstrap path)
+//! - `lifecycle` — read ops on stored DID records (`get`, `list`, log)
+//! - `servers` — webvh hosting-server CRUD + DID validation
+
+mod concurrency;
+pub(crate) mod document;
+pub(crate) mod host;
+mod lifecycle;
+pub(crate) mod log_authority;
+pub(crate) mod presentation;
+mod realign;
+mod register_server;
+mod servers;
+pub(crate) mod transport;
+mod update;
+pub(crate) mod webvh_keys;
+
+pub(crate) use host::{
+    agent_name_op_on_server, check_agent_name_on_server, delete_log_on_server,
+    list_agent_names_on_server, list_dids_on_server, my_domains_on_server, publish_log_to_server,
+    register_did_atomic_on_server,
+};
+
+pub(crate) use concurrency::{RaceDetected, RecordSnapshot};
+
+pub use document::{build_did_document, build_vta_did_document_with_sealed_transfer};
+pub(crate) use document::{build_did_document_with_options, with_tsp_service};
+pub use lifecycle::{get_did_webvh, list_dids_webvh};
+pub use realign::{RealignDidKeysResultBody, RealignedKey, realign_did_key_records};
+pub use register_server::{
+    RegisterDidWithServerError, RegisterDidWithServerParams, RegisterDidWithServerResult,
+    register_did_with_server,
+};
+pub use servers::{
+    list_webvh_server_domains, list_webvh_servers, reconcile_webvh_server_dids,
+    register_webvh_server, remove_webvh_server, retire_orphan_slot,
+};
+pub use update::{
+    AgentNameVerb, Commit, RotateDidWebvhKeysOptions, StagedRotationRecovery, UpdateDidWebvhError,
+    UpdateDidWebvhOptions, UpdateDidWebvhResult, UpdatePlan, agent_name_op, check_agent_name,
+    list_agent_names, plan_did_webvh_update, recover_staged_rotations, resolve_webvh_did,
+    rotate_did_webvh_keys, state_from_jsonl_pub, update_did_webvh,
+    update_did_webvh_reporting_commit,
+};
+
+use std::sync::Arc;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use chrono::Utc;
+use didwebvh_rs::create::{CreateDIDConfig, create_did};
+use didwebvh_rs::log_entry::{LogEntry, LogEntryMethods};
+use didwebvh_rs::parameters::Parameters as WebVHParameters;
+use didwebvh_rs::url::WebVHURL;
+use tracing::{info, warn};
+use url::Url;
+
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+use crate::didcomm_bridge::DIDCommBridge;
+
+use vta_sdk::protocols::did_management::{
+    create::{CreateDidWebvhBody, CreateDidWebvhResultBody, WebvhPathMode},
+    delete::DeleteDidWebvhResultBody,
+};
+use vta_sdk::webvh::{WebvhDidRecord, WebvhServerRecord};
+
+use crate::auth::AuthClaims;
+use crate::config::AppConfig;
+use crate::error::AppError;
+use crate::keys::imported;
+use crate::keys::seed_store::SeedStore;
+use crate::keys::seeds::{get_active_seed_id, load_seed_bytes};
+use crate::keys::{self, KeyType as SdkKeyType, encode_private_multibase};
+use crate::store::KeyspaceHandle;
+use crate::webvh_store;
+use vta_sdk::keys::{KeyOrigin, KeyRecord, KeyStatus, KeyType};
+use vta_support::version_time::next_version_time;
+use zeroize::Zeroize;
+
+/// Shared dependency bundle for the WebVH DID-management operations
+/// (`delete_did_webvh`, `rotate_did_webvh_keys`, `register_did_with_server`,
+/// `list_webvh_server_domains`) — P2.5.
+///
+/// These ops each took the same 11–14 positional arguments: the five keyspaces
+/// the WebVH publish path touches (keys / imported / contexts / webvh / audit)
+/// plus `seed_store`, `did_resolver` and `didcomm_bridge`. Bundling them into one borrowed struct — built once at the
+/// transport boundary via [`WebvhDeps::from_app_state`] /
+/// [`WebvhDeps::from_vta_state`] (or directly by the offline CLI / tests) and
+/// threaded through unchanged — drops every op to ≤6 args.
+///
+/// All fields are borrows. The per-op identity (`vta_did`, `scid`, the DID
+/// being operated on, the WebVH server target) stays a separate argument — it
+/// varies per call and isn't ambient state. `contexts_ks` is read only by
+/// `rotate_did_webvh_keys`; the other ops ignore it.
+/// The keyspaces a DID deletion has to reach beyond the DID's own records.
+///
+/// Bundled rather than three loose fields because they are needed together or
+/// not at all: a caller that can reach the ACL but not the issued credentials
+/// can still only perform half a deletion, and half is the shape that leaves
+/// live authority and unrevokable credentials behind.
+pub struct DeleteCascadeDeps<'a> {
+    /// Authorization keyed by DID. An ACL entry outliving its subject is live
+    /// authority for an identity that can no longer be resolved or rotated.
+    pub acl_ks: &'a KeyspaceHandle,
+    /// Sessions are authority already issued; they go the same way.
+    pub sessions_ks: &'a KeyspaceHandle,
+    /// Credentials the VTA issued. Revoked, never deleted — third parties hold
+    /// copies, so removing our record would destroy the only means of revoking
+    /// them. See [`vta_keyspaces::DidDeleteEffect`].
+    pub issued_credentials_ks: &'a KeyspaceHandle,
+}
+
+pub struct WebvhDeps<'a> {
+    pub keys_ks: &'a KeyspaceHandle,
+    pub imported_ks: &'a KeyspaceHandle,
+    pub contexts_ks: &'a KeyspaceHandle,
+    pub webvh_ks: &'a KeyspaceHandle,
+    /// The did:webs records, for what must see every slot this VTA holds on a
+    /// server — reconcile and retire-orphan, where a did:webs slot read as
+    /// missing from this VTA would be offered up for removal. `None` only on
+    /// paths that never compare against a host.
+    pub webs_ks: Option<&'a KeyspaceHandle>,
+    /// The state a *deletion* must reach, absent on callers that only read or
+    /// publish.
+    ///
+    /// `None` does not mean "skip the cascade" — it means this caller cannot
+    /// perform one, and [`delete_did_webvh`] refuses rather than deleting a DID
+    /// while leaving its authorization and credentials behind. A partial
+    /// deletion is the failure mode this whole change exists to prevent, so it
+    /// is not something a construction site gets to opt into by omission.
+    pub delete_cascade: Option<DeleteCascadeDeps<'a>>,
+    pub audit: &'a vta_audit::SharedAuditSink,
+    pub seed_store: &'a dyn SeedStore,
+    pub did_resolver: &'a DIDCacheClient,
+    pub didcomm_bridge: &'a Arc<DIDCommBridge>,
+    /// What lets the outbound seam choose TSP when talking to a webvh host.
+    ///
+    /// `None` is a real answer, not a gap: a CLI, a setup wizard or a DIDComm
+    /// handler holds no TSP socket of its own. A DIDComm handler still has the
+    /// live bridge, so the seam falls to DIDComm there; the offline CLI and the
+    /// wizards have a signing-only bridge and no mediator session, so there the
+    /// seam is left with REST. It is carried on the dep bundle rather than
+    /// rebuilt further down because `AppState` is the only thing that can
+    /// produce one, and the webvh ops layer deliberately does not take an
+    /// `AppState`.
+    #[cfg(feature = "tsp")]
+    pub tsp: Option<crate::operations::outbound::TspSender>,
+}
+
+impl<'a> WebvhDeps<'a> {
+    /// Borrow the WebVH op dependencies from an [`AppState`](crate::server::AppState)
+    /// (REST + trust-task transports). `did_resolver` is threaded separately
+    /// because `AppState` holds it as an `Option` — the caller unwraps it
+    /// (surfacing the typed "DID resolver not available" reject) first.
+    // Only `webvh`: every field it borrows exists in any build. The DIDComm
+    // edge came from `from_vta_state` below (VtaState is the DIDComm handler
+    // state) and was never needed on this side — trust tasks reach these ops
+    // over whichever transport is compiled.
+    #[cfg(feature = "webvh")]
+    pub fn from_app_state(
+        s: &'a crate::server::AppState,
+        did_resolver: &'a DIDCacheClient,
+    ) -> Self {
+        Self {
+            keys_ks: &s.keys_ks,
+            imported_ks: &s.imported_ks,
+            contexts_ks: &s.contexts_ks,
+            webvh_ks: &s.webvh_ks,
+            webs_ks: Some(&s.webs_ks),
+            delete_cascade: Some(DeleteCascadeDeps {
+                acl_ks: &s.acl_ks,
+                sessions_ks: &s.sessions_ks,
+                issued_credentials_ks: &s.issued_credentials_ks,
+            }),
+            audit: &s.audit_sink,
+            seed_store: &*s.seed_store,
+            did_resolver,
+            #[cfg(any(feature = "didcomm", feature = "tsp"))]
+            didcomm_bridge: &s.didcomm_bridge,
+            #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+            didcomm_bridge: crate::didcomm_bridge::DIDCommBridge::placeholder_ref(),
+            #[cfg(feature = "tsp")]
+            tsp: crate::operations::outbound::TspSender::from_app_state(s),
+        }
+    }
+
+    /// Borrow the WebVH op dependencies from a
+    /// [`VtaState`](crate::messaging::router::VtaState) (DIDComm transport).
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    pub fn from_vta_state(
+        s: &'a crate::messaging::router::VtaState,
+        did_resolver: &'a DIDCacheClient,
+    ) -> Self {
+        Self {
+            keys_ks: &s.keys_ks,
+            imported_ks: &s.imported_ks,
+            contexts_ks: &s.contexts_ks,
+            webvh_ks: &s.webvh_ks,
+            webs_ks: Some(&s.webs_ks),
+            delete_cascade: Some(DeleteCascadeDeps {
+                acl_ks: &s.acl_ks,
+                sessions_ks: &s.sessions_ks,
+                issued_credentials_ks: &s.issued_credentials_ks,
+            }),
+            audit: &s.audit_sink,
+            seed_store: &*s.seed_store,
+            did_resolver,
+            #[cfg(any(feature = "didcomm", feature = "tsp"))]
+            didcomm_bridge: &s.didcomm_bridge,
+            #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+            didcomm_bridge: crate::didcomm_bridge::DIDCommBridge::placeholder_ref(),
+            // `VtaState` is the DIDComm handler's state and holds no TSP
+            // socket, profile or reply registry. Reaching a webvh host over TSP
+            // from inside a DIDComm handler would need those threaded onto
+            // `VtaState` first; until then the seam falls to DIDComm, which is
+            // the transport this caller arrived on anyway.
+            #[cfg(feature = "tsp")]
+            tsp: None,
+        }
+    }
+}
+
+/// Dependency bundle for [`create_did_webvh`] — P2.5.
+///
+/// Create has a *different* shape from [`WebvhDeps`]: it mints + stores a new
+/// DID locally (no remote publish at create time, so no `audit`
+/// / `vta_did`), but it renders a DID template (`did_templates_ks`) and reads
+/// operator config (`config`). Distinct struct rather than a strained reuse.
+///
+/// `config` is a borrowed `&AppConfig` snapshot — REST/DIDComm callers pass the
+/// guard from `state.config.read().await`, so the constructors take it as an
+/// explicit argument (it can't be produced synchronously from `&state`).
+pub struct CreateDidWebvhDeps<'a> {
+    pub keys_ks: &'a KeyspaceHandle,
+    pub imported_ks: &'a KeyspaceHandle,
+    pub contexts_ks: &'a KeyspaceHandle,
+    pub webvh_ks: &'a KeyspaceHandle,
+    pub did_templates_ks: &'a KeyspaceHandle,
+    /// Audit keyspace — needed to load the VTA's own signing identity
+    /// (`load_vta_webvh_signing_identity`) when authenticating a
+    /// server publish. Only touched on the non-serverless path.
+    pub audit: &'a vta_audit::SharedAuditSink,
+    pub seed_store: &'a dyn SeedStore,
+    pub config: &'a AppConfig,
+    pub did_resolver: &'a DIDCacheClient,
+    pub didcomm_bridge: &'a Arc<DIDCommBridge>,
+    /// The ACL keyspace, so the `KeyMint` gate can read the caller's **entry**
+    /// and honour a narrowing on the very next call — the rule every other
+    /// capability gate follows since #1279.
+    ///
+    /// `None` is for the offline CLI and first-boot setup only. Their claims
+    /// are synthesized under a DID that is deliberately in no ACL, so reading
+    /// the store would find no entry and fall back to the role — `None` takes
+    /// that answer directly without opening another keyspace. A live transport
+    /// passing `None` would skip narrowings, so both `from_*` constructors pass
+    /// `Some`.
+    pub acl_ks: Option<&'a KeyspaceHandle>,
+    /// What lets the outbound seam choose TSP when publishing to a webvh host.
+    /// See the note on [`WebvhDeps::tsp`] — `None` is a real answer.
+    #[cfg(feature = "tsp")]
+    pub tsp: Option<crate::operations::outbound::TspSender>,
+}
+
+impl<'a> CreateDidWebvhDeps<'a> {
+    /// Borrow create-deps from an [`AppState`](crate::server::AppState) (REST +
+    /// trust-task). `config` (the read-guard snapshot) and the unwrapped
+    /// `did_resolver` are threaded separately.
+    // Only `webvh`: every field it borrows exists in any build. The DIDComm
+    // edge came from `from_vta_state` below (VtaState is the DIDComm handler
+    // state) and was never needed on this side — trust tasks reach these ops
+    // over whichever transport is compiled.
+    #[cfg(feature = "webvh")]
+    pub fn from_app_state(
+        s: &'a crate::server::AppState,
+        config: &'a AppConfig,
+        did_resolver: &'a DIDCacheClient,
+    ) -> Self {
+        Self {
+            keys_ks: &s.keys_ks,
+            imported_ks: &s.imported_ks,
+            contexts_ks: &s.contexts_ks,
+            webvh_ks: &s.webvh_ks,
+            did_templates_ks: &s.did_templates_ks,
+            audit: &s.audit_sink,
+            seed_store: &*s.seed_store,
+            config,
+            did_resolver,
+            #[cfg(any(feature = "didcomm", feature = "tsp"))]
+            didcomm_bridge: &s.didcomm_bridge,
+            #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+            didcomm_bridge: crate::didcomm_bridge::DIDCommBridge::placeholder_ref(),
+            acl_ks: Some(&s.acl_ks),
+            #[cfg(feature = "tsp")]
+            tsp: crate::operations::outbound::TspSender::from_app_state(s),
+        }
+    }
+
+    /// Borrow create-deps from a
+    /// [`VtaState`](crate::messaging::router::VtaState) (DIDComm transport).
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    pub fn from_vta_state(
+        s: &'a crate::messaging::router::VtaState,
+        config: &'a AppConfig,
+        did_resolver: &'a DIDCacheClient,
+    ) -> Self {
+        Self {
+            keys_ks: &s.keys_ks,
+            imported_ks: &s.imported_ks,
+            contexts_ks: &s.contexts_ks,
+            webvh_ks: &s.webvh_ks,
+            did_templates_ks: &s.did_templates_ks,
+            audit: &s.audit_sink,
+            seed_store: &*s.seed_store,
+            config,
+            did_resolver,
+            #[cfg(any(feature = "didcomm", feature = "tsp"))]
+            didcomm_bridge: &s.didcomm_bridge,
+            #[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+            didcomm_bridge: crate::didcomm_bridge::DIDCommBridge::placeholder_ref(),
+            acl_ks: Some(&s.acl_ks),
+            // See the same field on `WebvhDeps::from_vta_state`: a DIDComm
+            // handler's state holds no TSP socket to lend.
+            #[cfg(feature = "tsp")]
+            tsp: None,
+        }
+    }
+}
+
+/// Refresh the resolver cache for `did` from the provided did.jsonl content.
+///
+/// This runs after local did-log mutations so subsequent in-process resolves
+/// observe the newest DID document without waiting for process restart.
+///
+/// Fail-safe on error: if the new log can't be parsed/deserialized we **keep**
+/// the existing cache entry rather than evicting it. For the VTA's own DID the
+/// runtime-service-management invariant keeps `verificationMethod` byte-identical
+/// across mutations, so a stale-but-present self-document still carries the exact
+/// keys DIDComm pack/unpack needs — strictly safer than dropping the entry, which
+/// for a serverless / network-unreachable `did:webvh` would leave self-resolution
+/// with no source at all. Failures are non-fatal regardless: the mutation already
+/// committed, and normal resolver network fallback remains available.
+pub(crate) async fn refresh_resolver_doc_from_log(
+    did_resolver: &DIDCacheClient,
+    did: &str,
+    did_log: &str,
+    channel: &str,
+) {
+    let doc_value = match crate::operations::protocol::document::current_document_from_log(did_log)
+    {
+        Ok(doc) => doc,
+        Err(e) => {
+            warn!(
+                channel,
+                did = %did,
+                error = %e,
+                "resolver refresh skipped: parse current DID document from did.jsonl failed; keeping last-known-good cache entry"
+            );
+            return;
+        }
+    };
+
+    let doc = match serde_json::from_value(doc_value.clone()) {
+        Ok(doc) => doc,
+        Err(e) => {
+            warn!(
+                channel,
+                did = %did,
+                error = %e,
+                "resolver refresh skipped: deserialize DID document failed; keeping last-known-good cache entry"
+            );
+            return;
+        }
+    };
+
+    let mut cache = did_resolver.clone();
+    cache.add_did_document(did, doc).await;
+
+    // A log that lists its did:scid alias is also known by that DID: cache its
+    // own document under it (VTI-KEY-161) and record its source, so the bare
+    // DID resolves here — a serverless log is reachable no other way.
+    if presentation::document_lists_alias(&doc_value)
+        && let Some((bare, url)) = vta_sdk::did_scid::scid_forms(did)
+    {
+        match didwebvh_rs::did_web::to_scid_did_document(&doc_value)
+            .map_err(|e| e.to_string())
+            .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+        {
+            Ok(scid_doc) => {
+                cache.scid_sources().add_source(&url);
+                cache.add_did_document(&bare, scid_doc).await;
+            }
+            Err(e) => warn!(
+                channel,
+                did = %did,
+                error = %e,
+                "resolver refresh: the did:scid document could not be derived from the log"
+            ),
+        }
+    }
+}
+
+/// Resolve a DID template by name for use in a create-DID flow.
+///
+/// Resolution order:
+/// 1. Context scope (if `template_context` is provided)
+/// 2. Global scope
+/// 3. Built-in templates shipped with the SDK
+///
+/// Context-scoped templates therefore naturally shadow global ones with the
+/// same name; global templates shadow built-ins.
+/// What a template's `keys` block asks the minting flow to derive.
+///
+/// The template speaks in algorithm *names* (`"mldsa44"`), because a template is
+/// a JSON document an operator authors. Derivation speaks in [`KeyType`]. This
+/// is the one place the two meet, so a name this build does not know is refused
+/// here with the slot that named it — rather than in `derive_*`, which would
+/// only know the algorithm.
+#[derive(Debug)]
+struct KeySlotPlan {
+    /// Signing-key preference, most preferred first. Never empty.
+    signing: Vec<KeyType>,
+    /// Extra signing slots, in the template's own (sorted) slot order.
+    additional_signing: Vec<(String, Vec<KeyType>)>,
+}
+
+impl Default for KeySlotPlan {
+    /// No template means the pair this stack has always minted.
+    fn default() -> Self {
+        Self {
+            signing: vec![KeyType::Ed25519],
+            additional_signing: Vec::new(),
+        }
+    }
+}
+
+/// Narrow a primary-signing preference list to the algorithms that can sign a
+/// `did:webvh` **log entry**.
+///
+/// This is not our rule and not a capability gap we can close by minting
+/// differently. `didwebvh` 1.0 mandates JCS canonicalization and
+/// `eddsa-jcs-2022` for log-entry proofs; `didwebvh-rs` enforces it, and its
+/// `experimental-pqc` build flag — which would widen the set to
+/// `mldsa44-jcs-2024` — is opt-in precisely because a log signed that way is
+/// unverifiable by any conformant resolver. Turning it on would trade "cannot
+/// mint" for "mints a DID nobody else can resolve", which is worse.
+///
+/// So a `did:webvh` DID's **primary** signing key is Ed25519, and post-quantum
+/// signing arrives as an *additional* slot published alongside it. That is not
+/// a workaround: an issuer that signs a credential with every key it holds
+/// needs both keys anyway, and one of them has to be the one the log is signed
+/// with.
+///
+/// A list is filtered rather than rejected outright, because that is what a
+/// preference list is for — `["mldsa44", "ed25519"]` is a template written for
+/// a fleet where some VTAs can do more than others, and it falls back here
+/// exactly as it would for an algorithm this build could not mint. A list with
+/// no usable entry is refused, naming what it asked for and what to do instead;
+/// silently substituting Ed25519 for a list that never mentioned it is the
+/// quiet downgrade the whole `keys` block exists to prevent.
+fn log_entry_capable_signing(preference: &[KeyType]) -> Result<Vec<KeyType>, AppError> {
+    let usable: Vec<KeyType> = preference
+        .iter()
+        .filter(|k| matches!(k, KeyType::Ed25519))
+        .cloned()
+        .collect();
+    if usable.is_empty() {
+        return Err(AppError::Validation(format!(
+            "the template's `signing` slot names {preference:?}, and a did:webvh log entry can \
+             only be signed with ed25519 (didwebvh 1.0 mandates eddsa-jcs-2022). Add `ed25519` \
+             to that slot's algorithms and declare the post-quantum key as an additional \
+             signing slot — a DID publishing both is what lets its holder issue a credential \
+             carrying one proof each verifier can check."
+        )));
+    }
+    Ok(usable)
+}
+
+/// Turn the template's declared slots into a [`KeySlotPlan`].
+///
+/// The key-agreement slot takes no preference: X25519 is the only algorithm
+/// that can serve it in a DID document, and template validation already refuses
+/// a `keyAgreement` slot naming anything else. An *additional* key-agreement
+/// slot is refused here instead of silently ignored — a second `keyAgreement`
+/// entry changes which key an inbound JWE resolves to
+/// (`did_secrets::select_secret_kid`), and minting one without answering that is
+/// how a message becomes undecryptable at a mediator rather than here.
+fn plan_key_slots(
+    slots: &std::collections::BTreeMap<String, vta_sdk::did_templates::KeySlot>,
+) -> Result<KeySlotPlan, AppError> {
+    use vta_sdk::did_templates::{KeyPurpose, SLOT_KA, SLOT_SIGNING};
+
+    if slots.is_empty() {
+        return Ok(KeySlotPlan::default());
+    }
+
+    let parse =
+        |slot: &str, spec: &vta_sdk::did_templates::KeySlot| -> Result<Vec<KeyType>, AppError> {
+            spec.algorithms
+                .iter()
+                .map(|a| {
+                    serde_json::from_value::<KeyType>(serde_json::Value::String(a.clone())).map_err(
+                    |_| {
+                        AppError::Validation(format!(
+                            "key slot '{slot}' names algorithm '{a}', which this build does not \
+                             know"
+                        ))
+                    },
+                )
+                })
+                .collect()
+        };
+
+    let mut plan = KeySlotPlan {
+        signing: Vec::new(),
+        additional_signing: Vec::new(),
+    };
+
+    for (slot, spec) in slots {
+        match (slot.as_str(), spec.purpose) {
+            (SLOT_SIGNING, _) => plan.signing = parse(slot, spec)?,
+            (SLOT_KA, _) => {}
+            (_, KeyPurpose::Signing) => {
+                plan.additional_signing
+                    .push((slot.clone(), parse(slot, spec)?));
+            }
+            (_, KeyPurpose::KeyAgreement) => {
+                return Err(AppError::Validation(format!(
+                    "key slot '{slot}' declares a second key-agreement key, which this VTA \
+                     cannot mint. One key-agreement key per DID: a second `keyAgreement` entry \
+                     changes which secret an inbound encrypted message resolves to, and nothing \
+                     here decides that. Declare it as `{SLOT_KA}` if it is the DID's only one."
+                )));
+            }
+            // `KeyPurpose` is `#[non_exhaustive]`: a purpose this VTA cannot
+            // mint is refused, never guessed at.
+            (_, purpose) => {
+                return Err(AppError::Validation(format!(
+                    "key slot '{slot}' declares purpose {purpose:?}, which this VTA cannot mint"
+                )));
+            }
+        }
+    }
+
+    if plan.signing.is_empty() {
+        return Err(AppError::Validation(format!(
+            "the template declares key slots but none named '{SLOT_SIGNING}'; every DID this \
+             VTA mints needs a primary signing key"
+        )));
+    }
+    Ok(plan)
+}
+
+pub(crate) async fn resolve_template_for_render(
+    did_templates_ks: &KeyspaceHandle,
+    name: &str,
+    template_context: Option<&str>,
+) -> Result<vta_sdk::did_templates::DidTemplateRecord, AppError> {
+    use vta_sdk::did_templates::{DidTemplateRecord, Scope, load_embedded};
+
+    if let Some(ctx) = template_context
+        && let Some(record) =
+            crate::did_templates::get_context_template(did_templates_ks, ctx, name).await?
+    {
+        return Ok(record);
+    }
+
+    if let Some(record) = crate::did_templates::get_global_template(did_templates_ks, name).await? {
+        return Ok(record);
+    }
+
+    if let Ok(tpl) = load_embedded(name) {
+        // Built-ins have no stored provenance — synthesize a record so
+        // downstream code treats it uniformly. `created_at`/`updated_at` are
+        // 0 because there's no meaningful moment of authorship beyond the
+        // crate's compile time; `created_by` is the well-known sentinel
+        // `"builtin"`.
+        return Ok(DidTemplateRecord {
+            template: tpl,
+            scope: Scope::Builtin,
+            created_at: 0,
+            updated_at: 0,
+            created_by: "builtin".into(),
+        });
+    }
+
+    Err(AppError::NotFound(format!(
+        "DID template '{name}' not found (searched{} global, builtin)",
+        template_context
+            .map(|c| format!(" context '{c}',"))
+            .unwrap_or_default()
+    )))
+}
+
+pub struct CreateDidWebvhParams {
+    pub context_id: String,
+    pub server_id: Option<String>,
+    pub url: Option<String>,
+    /// How to choose the server-managed DID's `<path>` segment. Drives
+    /// the host's `check-name`/`create_did` call (`WellKnown` →
+    /// `.well-known`, `Explicit` → label, `AutoAssign` → host allocates).
+    /// Ignored in serverless mode (`server_id` is `None`).
+    pub path_mode: WebvhPathMode,
+    /// Optional explicit hosting domain on the target server.
+    /// Honored only for server-managed DIDs (when `server_id` is set);
+    /// ignored in serverless mode. Resolution chain on the remote:
+    /// explicit → caller's ACL default on the server → server's
+    /// system default → reject with `did-management:unknownDomain`.
+    /// Enables a VTA managing slots across multiple tenant domains
+    /// on one shared `did-hosting-control` backplane to direct
+    /// provisioning at the right tenant.
+    pub domain: Option<String>,
+    pub label: Option<String>,
+    pub portable: bool,
+    pub add_mediator_service: bool,
+    /// Also publish a `#tsp` (`TSPTransport`) entry pointing at the same
+    /// mediator the DIDComm entry names.
+    ///
+    /// Ignored unless this VTA has `[services] tsp` on and a mediator
+    /// configured — advertising a transport the VTA's own stack does not
+    /// run is the failure this exists to prevent, not to spread.
+    ///
+    /// `None` means "decide from what this VTA and its mediator can actually
+    /// carry" (Keyring VTI-Q11): a DID minted by a TSP-capable VTA whose
+    /// mediator advertises `TSPTransport` gets the entry, and one behind a
+    /// mediator that does not carry TSP stays DIDComm-only. This is what a
+    /// persona takes, since the holder behind it is this VTA's own client and
+    /// the wire field is one a persona-minting caller does not send. An
+    /// explicit `Some` is always honoured.
+    pub add_tsp_service: Option<bool>,
+    pub additional_services: Option<Vec<serde_json::Value>>,
+    pub pre_rotation_count: u32,
+    /// Client-provided DID Document template. Mutually exclusive with `did_log`
+    /// and `template`.
+    pub did_document: Option<serde_json::Value>,
+    /// Complete, pre-signed did.jsonl log entry. Mutually exclusive with
+    /// `did_document` and `template`.
+    pub did_log: Option<String>,
+    /// Whether to set this DID as the primary DID for the context.
+    pub set_primary: bool,
+    /// Entity keys the caller already derived, used instead of deriving a
+    /// fresh pair.
+    ///
+    /// Exists for one case: a caller that must render the DID document
+    /// *before* calling this function — the offline CLI shows the operator a
+    /// preview to edit. Without this, that caller derives one pair for the
+    /// document and this function derives another for the store, because
+    /// `derive_entity_keys` allocates a fresh BIP-32 path index per call.
+    /// The DID then advertises keys the VTA cannot sign with, and nothing
+    /// notices until a verifier rejects a signature.
+    ///
+    /// In-process only — there is no wire field, and there must not be: a
+    /// remote caller supplying key material would invert the rule that the
+    /// VTA is the key generator. Use `signing_key_id`/`ka_key_id` to point
+    /// at keys this VTA already holds.
+    pub pre_derived: Option<keys::DerivedEntityKeys>,
+    /// Use an existing key as the signing verification method.
+    pub signing_key_id: Option<String>,
+    /// Use an existing key as the key-agreement verification method.
+    pub ka_key_id: Option<String>,
+    /// Stored DID template to render into `did_document`. Resolution order:
+    /// `template_context` scope (if set) → global → no fallback.
+    pub template: Option<String>,
+    /// Scope to look `template` up in. `None` = global only.
+    pub template_context: Option<String>,
+    /// Caller-supplied template variables. Server injects `DID`,
+    /// `SIGNING_KEY_MB`, `KA_KEY_MB`, `VTA_DID`, `VTA_URL`, `CONTEXT_ID`,
+    /// `CONTEXT_DID`, `NOW` automatically.
+    pub template_vars: std::collections::HashMap<String, serde_json::Value>,
+    /// When `true`, this DID *is* the VTA's own identity — mint a third
+    /// key (`{did}#sealed-transfer-0`) and add it to the DID document.
+    /// The operator uses this key only to sign sealed-transfer producer
+    /// assertions, keeping it disjoint from `#key-0` (VC issuance) so
+    /// the two can rotate / leak independently. Ignored when
+    /// `did_document` is caller-supplied or `did_log` is pre-signed —
+    /// templates that need the key must declare it themselves.
+    pub is_vta_identity: bool,
+    /// The identity the new log is presented as. `None` → the VTA's
+    /// `[dids] default_did_method` (VTI-VTA-036).
+    pub did_method: Option<vta_sdk::did_scid::DidMethod>,
+    /// Whether the first log entry lists the did:scid alias. `None` → the
+    /// VTA's `[dids] scid_also_known_as` (VTI-VTA-036).
+    pub scid_also_known_as: Option<bool>,
+}
+
+impl From<CreateDidWebvhBody> for CreateDidWebvhParams {
+    fn from(body: CreateDidWebvhBody) -> Self {
+        Self {
+            context_id: body.context_id,
+            server_id: body.server_id,
+            url: body.url,
+            // Explicit `path_mode` wins; otherwise interpret the legacy
+            // `path` field so pre-enum wire callers keep working.
+            path_mode: WebvhPathMode::resolve(body.path_mode, body.path),
+            domain: body.domain,
+            label: body.label,
+            portable: body.portable.unwrap_or(true),
+            add_mediator_service: body.add_mediator_service.unwrap_or(false),
+            // Absent means "decide from capability" — not "no". See the field.
+            add_tsp_service: body.add_tsp_service,
+            additional_services: body.additional_services,
+            pre_rotation_count: body.pre_rotation_count.unwrap_or(0),
+            did_document: body.did_document,
+            did_log: body.did_log,
+            // No wire field by design — see the field docs.
+            pre_derived: None,
+            set_primary: body.set_primary.unwrap_or(true),
+            signing_key_id: body.signing_key_id,
+            ka_key_id: body.ka_key_id,
+            template: body.template,
+            template_context: body.template_context,
+            template_vars: body.template_vars.unwrap_or_default(),
+            // Wire callers never mint the VTA's own identity — that happens
+            // only during first-boot setup (setup wizard / TEE autogen /
+            // non-interactive --from). An admin hitting create-did-webvh at
+            // runtime is always creating an integration DID.
+            is_vta_identity: false,
+            did_method: body.did_method,
+            scid_also_known_as: body.scid_also_known_as,
+        }
+    }
+}
+
+/// Load an existing key record and return it as a `Secret` for use in DID creation.
+///
+/// Validates key type, status, and context access. Returns the Secret,
+/// public key multibase, and the original KeyRecord.
+async fn load_key_as_secret(
+    keys_ks: &KeyspaceHandle,
+    imported_ks: &KeyspaceHandle,
+    contexts_ks: &KeyspaceHandle,
+    seed_store: &dyn SeedStore,
+    audit: &vta_audit::SharedAuditSink,
+    key_id: &str,
+    expected_type: KeyType,
+    auth: &AuthClaims,
+) -> Result<(Secret, String, KeyRecord), AppError> {
+    let record: KeyRecord = keys_ks
+        .get(keys::store_key(key_id))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("key {key_id} not found")))?;
+
+    // Validate key type
+    if record.key_type != expected_type {
+        return Err(AppError::Validation(format!(
+            "key {key_id} is {} but expected {}",
+            record.key_type, expected_type
+        )));
+    }
+
+    // Validate status
+    if record.status != KeyStatus::Active {
+        return Err(AppError::Validation(format!(
+            "key {key_id} is not active (status: {:?})",
+            record.status
+        )));
+    }
+
+    // Validate context access
+    if let Some(ref ctx) = record.context_id {
+        auth.require_context(ctx)?;
+    } else if !auth.is_super_admin() {
+        return Err(AppError::Forbidden(
+            "only super admin can use keys without a context".into(),
+        ));
+    }
+
+    // Load private key material
+    let private_key_multibase = match record.origin {
+        // An internal key must never authorise a `did:webvh` log entry.
+        //
+        // WebVH is append-only and each entry is authorised by the update key
+        // the previous entry named. An internal key cannot be recovered — no
+        // backup, no mnemonic, no derivation — so if it were the update key and
+        // the keyspace were lost, the DID could never be updated again by
+        // anyone, permanently, and every integration pinned to it would be
+        // stranded. That failure is not recoverable by re-issuing anything.
+        //
+        // Internal keys are still perfectly good as a *signing*
+        // `verificationMethod` inside the published document: losing one costs
+        // the ability to produce new signatures, not the ability to control the
+        // identity.
+        KeyOrigin::Internal => {
+            return Err(AppError::Validation(format!(
+                "key `{key_id}` is an internal key and cannot sign did:webvh log \
+                 entries: internal keys are unrecoverable, and losing the update \
+                 key would freeze this DID permanently. Use a derived key for the \
+                 update authority; an internal key may still be a signing \
+                 verificationMethod in the document"
+            )));
+        }
+        KeyOrigin::Imported => {
+            let seed = load_seed_bytes(keys_ks, seed_store, None)
+                .await
+                .map_err(|e| AppError::Internal(format!("{e}")))?;
+            let mut secret_bytes = imported::load_secret(
+                imported_ks,
+                keys_ks,
+                &seed,
+                key_id,
+                &record.key_type.to_string(),
+            )
+            .await?;
+            let priv_mb = encode_private_multibase(&record.key_type, &secret_bytes);
+            secret_bytes.zeroize();
+            priv_mb
+        }
+        // Through key custody: `key_id` is caller-supplied, so a record whose
+        // path lies outside its context's base must not authorise a DID
+        // (`vta_keys::custody` rule 6).
+        KeyOrigin::Derived => {
+            let key = crate::operations::key_custody::derive_record_key(
+                contexts_ks,
+                keys_ks,
+                seed_store,
+                audit,
+                &auth.did,
+                &record,
+                "did-webvh",
+            )
+            .await?;
+            let bytes = key.ed25519_signing_key_bytes()?;
+            encode_private_multibase(&KeyType::Ed25519, bytes.as_slice())
+        }
+    };
+
+    let secret = Secret::from_multibase(&private_key_multibase, None).map_err(|e| {
+        AppError::Internal(format!("failed to construct Secret from key {key_id}: {e}"))
+    })?;
+
+    Ok((secret, record.public_key.clone(), record))
+}
+
+/// Check whether a DID document (JSON) contains any DIDCommMessaging service.
+fn document_has_didcomm_service(doc: &serde_json::Value) -> bool {
+    doc.get("service")
+        .and_then(|s| s.as_array())
+        .is_some_and(|services| {
+            services.iter().any(|svc| {
+                svc.get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t == "DIDCommMessaging")
+                    || svc
+                        .get("type")
+                        .and_then(|t| t.as_array())
+                        .is_some_and(|types| {
+                            types
+                                .iter()
+                                .any(|t| t.as_str().is_some_and(|s| s == "DIDCommMessaging"))
+                        })
+            })
+        })
+}
+
+/// The hosting-server client for a create-DID reserve or publish.
+///
+/// Refuses when `config.vta_did` is `None`: every document to the host is
+/// issued and signed by this VTA's own DID, and there is none to issue as.
+async fn create_path_host_client<'a>(
+    did_resolver: &'a DIDCacheClient,
+    didcomm_bridge: &'a Arc<DIDCommBridge>,
+    vta_did: Option<&str>,
+    server: &WebvhServerRecord,
+    #[cfg(feature = "tsp")] tsp: Option<crate::operations::outbound::TspSender>,
+) -> Result<crate::webvh_host::WebvhHostClient<'a>, AppError> {
+    let vta_did = vta_did.ok_or_else(|| {
+        AppError::Validation(
+            "vta_did is not configured; the VTA needs its own DID to sign what it sends a webvh              hosting server (set `vta_did` in config / VTA_DID)"
+                .into(),
+        )
+    })?;
+    crate::webvh_host::WebvhHostClient::for_server(
+        &server.did,
+        vta_did,
+        did_resolver,
+        didcomm_bridge,
+        #[cfg(feature = "tsp")]
+        tsp,
+    )
+    .await
+}
+/// The `webvh/dids/create` gate: the caller must hold `KeyMint`.
+///
+/// `KeyMint`, not the admin role (Keyring VTI-23). Minting a DID mints its
+/// keys, which `initiator` is already trusted to do, so requiring admin made a
+/// least-privilege manager impossible for the persona lifecycle.
+///
+/// Reads the caller's entry when a keyspace is available, so a narrowing that
+/// removes `KeyMint` stops the next call — the rule every capability gate
+/// follows. `None` is for offline callers only; see
+/// [`CreateDidWebvhDeps::acl_ks`].
+/// A DID in a context `auth` cannot reach is answered as not held — the
+/// `notFound` every `vta/webvh/dids/*` task declares for it "whether or not the
+/// VTA holds it", and the answer `vta/dids/get` and the did:webs tasks give.
+/// `Forbidden` would confirm the DID exists to a caller with no business
+/// knowing.
+pub(crate) fn hide_unreachable(
+    auth: &AuthClaims,
+    context_id: &str,
+    did: &str,
+) -> Result<(), AppError> {
+    if auth.has_context_access(context_id) {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(format!("webvh DID not found: {did}")))
+    }
+}
+
+pub(crate) async fn ensure_may_mint(
+    acl_ks: Option<&KeyspaceHandle>,
+    auth: &AuthClaims,
+) -> Result<(), AppError> {
+    use vti_common::acl::{Capability, entry_has_capability, get_acl_entry, role_has_capability};
+
+    let may_mint = match acl_ks {
+        Some(ks) => match get_acl_entry(ks, &auth.did).await {
+            Ok(Some(entry)) => entry_has_capability(&entry, Capability::KeyMint),
+            // No entry: the role decides, as it does at every other gate.
+            Ok(None) => role_has_capability(&auth.role, Capability::KeyMint),
+            // A store error must not become a grant.
+            Err(e) => {
+                tracing::error!(
+                    error = %e, did = %auth.did,
+                    "could not read the ACL entry for the KeyMint check; refusing"
+                );
+                false
+            }
+        },
+        None => role_has_capability(&auth.role, Capability::KeyMint),
+    };
+    if may_mint {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "DID creation denied: {} does not carry the KeyMint capability",
+            auth.did
+        )))
+    }
+}
+
+pub async fn create_did_webvh(
+    deps: &CreateDidWebvhDeps<'_>,
+    auth: &AuthClaims,
+    mut params: CreateDidWebvhParams,
+    channel: &str,
+) -> Result<CreateDidWebvhResultBody, AppError> {
+    // Re-bind the bundled deps to the historical local names so the (large)
+    // body below is unchanged. All fields are `Copy` references, so this
+    // copies the borrows out of `*deps` rather than moving the struct.
+    let CreateDidWebvhDeps {
+        keys_ks,
+        imported_ks,
+        contexts_ks,
+        webvh_ks,
+        did_templates_ks,
+        audit,
+        seed_store,
+        config,
+        did_resolver,
+        didcomm_bridge,
+        acl_ks,
+        // `tsp` is deliberately not destructured here: every other field is a
+        // shared reference and so `Copy`, while a `TspSender` is not. Cloning
+        // it at the one place it is used keeps `*deps` a copy.
+        ..
+    } = *deps;
+
+    // Keyring VTI-Q11 (#1652): a caller that did not name `addTspService` gets
+    // the answer this VTA and its mediator can actually honour. A persona is
+    // minted through this path by a caller that sends no such field, which is
+    // why it advertised DIDComm only however TSP-capable the stack was.
+    // Resolved once, here, because both document paths below consume it.
+    let add_tsp_service =
+        document::resolve_add_tsp_service(params.add_tsp_service, config, did_resolver).await;
+    // Whether the caller asked for `#tsp` itself, rather than having it
+    // defaulted on: only an explicit request may refuse a document it cannot be
+    // added to.
+    let tsp_requested = params.add_tsp_service == Some(true);
+
+    // `KeyMint` decides *whether*; the context check below still bounds *where*.
+    ensure_may_mint(acl_ks, auth).await?;
+    auth.require_context(&params.context_id)?;
+
+    // No create repoints the context that holds this VTA's own identity: that
+    // is a re-identification (new keys installed, peers told), which setup
+    // does. A did:webs create has always refused it; a did:webvh one silently
+    // replaced the node's identity (`operations::dids::primary`).
+    if params.set_primary
+        && let Some(ctx) = crate::contexts::get_context(contexts_ks, &params.context_id).await?
+        && crate::operations::dids::primary::is_node_identity(config, ctx.did.as_deref())
+    {
+        return Err(AppError::Conflict(format!(
+            "context {} holds this VTA's own DID: a create cannot replace a node's identity. \
+             Create the DID with setPrimary false, or set the VTA up under another DID \
+             (`vta setup`)",
+            params.context_id
+        )));
+    }
+
+    // Template is mutually exclusive with raw did_document / did_log — it
+    // renders into did_document, so specifying both would ambiguously
+    // override.
+    if params.template.is_some() && (params.did_document.is_some() || params.did_log.is_some()) {
+        return Err(AppError::Validation(
+            "template is mutually exclusive with did_document and did_log".into(),
+        ));
+    }
+
+    // Validate did_document and did_log are mutually exclusive
+    if params.did_document.is_some() && params.did_log.is_some() {
+        return Err(AppError::Validation(
+            "did_document and did_log are mutually exclusive".into(),
+        ));
+    }
+
+    // Validate ka_key_id requires signing_key_id
+    if params.ka_key_id.is_some() && params.signing_key_id.is_none() {
+        return Err(AppError::Validation(
+            "ka_key_id requires signing_key_id".into(),
+        ));
+    }
+
+    // Validate exactly one of server_id / url is provided
+    let serverless = match (&params.server_id, &params.url) {
+        (Some(_), Some(_)) => {
+            return Err(AppError::Validation(
+                "server_id and url are mutually exclusive".into(),
+            ));
+        }
+        (None, None) => {
+            return Err(AppError::Validation(
+                "either server_id or url is required".into(),
+            ));
+        }
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+    };
+
+    // Resolve context
+    let mut ctx = crate::contexts::get_context(contexts_ks, &params.context_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("context not found: {}", params.context_id)))?;
+
+    let now = Utc::now();
+
+    // ── Final mode: client-provided pre-signed log entry ────────────
+    if let Some(ref did_log) = params.did_log {
+        // Final mode (a client-provided, pre-signed did.jsonl) is serverless-only.
+        // Publishing a pre-signed log to a hosting server would use the SCID as the
+        // mnemonic path segment with no prior slot reservation — which the host
+        // rejects (a base58 SCID is mixed-case, and the slot was never registered)
+        // — so a server-managed final-mode create can never succeed. No first-party
+        // flow uses it (setup's advanced `did_log` path is always serverless). Fail
+        // fast, before parsing the log, with an actionable error instead of a
+        // confusing downstream mnemonic-validation failure at the host. (D4-F2)
+        if !serverless {
+            return Err(AppError::Validation(
+                "final-mode create (a pre-signed `did_log`) is only supported \
+                 serverless — `server_id` must be unset. To create a server-hosted \
+                 DID, use template or did_document mode instead."
+                    .into(),
+            ));
+        }
+
+        let log_entry = LogEntry::deserialize_string(did_log, None)
+            .map_err(|e| AppError::Validation(format!("invalid did_log: {e}")))?;
+
+        let final_did_document = log_entry.get_did_document().map_err(|e| {
+            AppError::Validation(format!("failed to extract DID document from log: {e}"))
+        })?;
+        let final_did = final_did_document["id"]
+            .as_str()
+            .ok_or_else(|| AppError::Validation("DID document missing 'id' field".into()))?
+            .to_string();
+        let scid = log_entry.get_scid().unwrap_or_default().to_string();
+        let applied =
+            presentation::decide_for_log(params.did_method, &config.dids, &final_did_document)?;
+        let identity = presented_identity(&final_did, applied);
+
+        // Optionally set as primary DID
+        if params.set_primary {
+            ctx.did = Some(identity.context_did());
+            ctx.updated_at = now;
+            crate::contexts::store_context(contexts_ks, &ctx)
+                .await
+                .map_err(|e| AppError::Internal(format!("{e}")))?;
+        }
+
+        // Store DID record and log
+        let server_id_str = params
+            .server_id
+            .as_deref()
+            .unwrap_or("serverless")
+            .to_string();
+        // Pre-signed-log mode: we don't know the pre-rotation count or
+        // current fragment id without parsing the log. Use defensive
+        // defaults; the next `update_did_webvh` call performs a one-shot
+        // re-scan and persists the corrected values.
+        let did_record = WebvhDidRecord {
+            did: final_did.clone(),
+            server_id: server_id_str.clone(),
+            mnemonic: String::new(),
+            scid: scid.clone(),
+            context_id: params.context_id.clone(),
+            portable: params.portable,
+            log_entry_count: 1,
+            pre_rotation_count: 0,
+            next_fragment_id: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        webvh_store::store_did(webvh_ks, &did_record).await?;
+        webvh_store::store_did_log(webvh_ks, &final_did, did_log).await?;
+        record_scid_identity(webvh_ks, &final_did, applied).await?;
+        refresh_resolver_doc_from_log(did_resolver, &final_did, did_log, channel).await;
+
+        info!(
+            channel,
+            did = %identity.did,
+            log = %final_did,
+            context = %params.context_id,
+            "did:webvh created (final mode)"
+        );
+
+        return Ok(CreateDidWebvhResultBody {
+            did: identity.did,
+            context_id: params.context_id,
+            server_id: if serverless { None } else { params.server_id },
+            serverless: Some(serverless),
+            mnemonic: None,
+            scid,
+            portable: params.portable,
+            signing_key_id: String::new(),
+            ka_key_id: String::new(),
+            // Final mode publishes a document the caller already built from
+            // keys it already holds — nothing was minted here to report.
+            additional_key_ids: std::collections::BTreeMap::new(),
+            pre_rotation_key_count: 0,
+            created_at: now,
+            did_document: Some(final_did_document),
+            log_entry: Some(did_log.clone()),
+            did_method: Some(applied.method),
+            scid_also_known_as: Some(applied.alias),
+            webvh_did: Some(final_did.clone()),
+            scid_did_url: identity.scid_did_url,
+        });
+    }
+
+    // ── VTA-built or template mode ──────────────────────────────────
+
+    let label = params.label.as_deref().unwrap_or(&params.context_id);
+
+    // Track whether keys were user-specified (affects key record saving)
+    let user_specified_keys = params.signing_key_id.is_some();
+
+    // ── The template is resolved *before* the keys, because it says what
+    //    keys to mint ────────────────────────────────────────────────────
+    //
+    // It used to be resolved after, at render time, which is why a `keys` block
+    // could declare `algorithms: ["mldsa44", "ed25519"]` and get Ed25519: by the
+    // time anything read the block, the keys existed. `derive_entity_keys_with_
+    // preference` (#1532) was written for exactly this and had no caller.
+    //
+    // Resolution is a pure keyspace lookup, so moving it earlier changes nothing
+    // but the order.
+    let template_record = match params.template {
+        Some(ref template_name) => Some(
+            resolve_template_for_render(
+                did_templates_ks,
+                template_name,
+                params.template_context.as_deref(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
+    // A template that says `defaults.portable: false` is binding, not a hint:
+    // a profile that requires a non-portable DID (the Swiss Profile Anchor
+    // does) must not depend on every caller remembering `--portable false`,
+    // and `pnm` defaults to `true`. Only the safe direction is enforced — a
+    // template cannot make a DID portable that its caller asked not to be.
+    if template_record.as_ref().is_some_and(|r| {
+        r.template.defaults.get("portable") == Some(&serde_json::Value::Bool(false))
+    }) {
+        params.portable = false;
+    }
+
+    // The form and alias (VTI-VTA-036). Decided before any key is minted, so a
+    // request refused with `scidAliasRequired` leaves nothing behind.
+    let applied = presentation::decide(
+        params.did_method,
+        params.scid_also_known_as,
+        template_record
+            .as_ref()
+            .is_some_and(|r| presentation::template_forbids_alias(&r.template.defaults)),
+        &config.dids,
+    )?;
+
+    // What the template asks each slot to be minted as. A v1 template answers
+    // with the historical Ed25519/X25519 pair (`key_slots`), so this is the same
+    // question for both schema versions and there is no branch on version here.
+    let key_slots = template_record
+        .as_ref()
+        .map(|r| r.template.key_slots())
+        .unwrap_or_default();
+    let slot_plan = plan_key_slots(&key_slots)?;
+
+    // Extra slots are minted from the VTA's own seed. When the caller brings its
+    // own keys — `signing_key_id` or `pre_derived` — there is nothing to mint
+    // them from and nothing that may invent one on the caller's behalf, so the
+    // combination is refused by name. Without this the render fails anyway (the
+    // slot's placeholder goes unresolved) but says only that a token was left
+    // over, which does not point at the template/caller mismatch that caused it.
+    if !slot_plan.additional_signing.is_empty()
+        && (user_specified_keys || params.pre_derived.is_some())
+    {
+        let slots: Vec<&str> = slot_plan
+            .additional_signing
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect();
+        return Err(AppError::Validation(format!(
+            "template declares key slot(s) {slots:?} beyond the signing/key-agreement pair, but \
+             this request supplies its own keys. The VTA mints an extra slot from its own seed; \
+             it cannot do that for a DID whose keys you brought. Either drop the caller-supplied \
+             key ids and let the VTA derive, or use a template without the extra slot."
+        )));
+    }
+
+    // Load or derive entity keys
+    let (derived, active_seed_id) = if let Some(mut pre) = params.pre_derived.take() {
+        // ── Caller-derived keys ─────────────────────────────────────
+        // The caller already allocated the path indices and built its
+        // document from these keys. Deriving again here would allocate a
+        // second pair and store keys the document does not name.
+        let active_seed_id = get_active_seed_id(keys_ks)
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+        // Same normalisation the derive branch applies — didwebvh-rs keys
+        // the signing secret by its did:key verification-method id.
+        let pub_mb = pre
+            .signing_secret
+            .get_public_keymultibase()
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        pre.signing_secret.id = format!("did:key:{pub_mb}#{pub_mb}");
+
+        (pre, Some(active_seed_id))
+    } else if let Some(ref signing_key_id) = params.signing_key_id {
+        // ── User-specified keys ─────────────────────────────────────
+        let (mut signing_secret, signing_pub, signing_record) = load_key_as_secret(
+            keys_ks,
+            imported_ks,
+            contexts_ks,
+            seed_store,
+            audit,
+            signing_key_id,
+            KeyType::Ed25519,
+            auth,
+        )
+        .await?;
+
+        // Convert signing key ID to did:key format (required by didwebvh-rs)
+        let pub_mb = signing_secret
+            .get_public_keymultibase()
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        signing_secret.id = format!("did:key:{pub_mb}#{pub_mb}");
+
+        let (ka_secret, ka_pub, ka_path, ka_label, ka_key_type) =
+            if let Some(ref ka_key_id) = params.ka_key_id {
+                let (ka_secret, ka_pub, ka_record) = load_key_as_secret(
+                    keys_ks,
+                    imported_ks,
+                    contexts_ks,
+                    seed_store,
+                    audit,
+                    ka_key_id,
+                    KeyType::X25519,
+                    auth,
+                )
+                .await?;
+                (
+                    ka_secret,
+                    ka_pub,
+                    ka_record.derivation_path,
+                    ka_record
+                        .label
+                        .unwrap_or_else(|| format!("{label} key-agreement key")),
+                    ka_record.key_type,
+                )
+            } else {
+                // No KA key — use dummy values (won't be in the document)
+                (
+                    Secret::generate_ed25519(None, None),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    KeyType::X25519,
+                )
+            };
+
+        let derived = keys::DerivedEntityKeys {
+            signing_secret,
+            signing_path: signing_record.derivation_path.clone(),
+            signing_pub,
+            signing_priv: String::new(), // Not needed for DID creation
+            signing_label: signing_record
+                .label
+                .unwrap_or_else(|| format!("{label} signing key")),
+            signing_key_type: signing_record.key_type.clone(),
+            ka_secret,
+            ka_path,
+            ka_pub,
+            ka_priv: String::new(),
+            ka_label,
+            // From the stored records, because for an imported key the record
+            // is where the truth about its algorithm lives — assuming Ed25519
+            // here would mislabel an imported ML-DSA key at the one moment the
+            // system is being told what it is.
+            ka_key_type,
+            // Caller-supplied keys: the caller brought what it brought, and
+            // nothing here may mint a key it did not ask for. A template
+            // declaring extra slots against caller-supplied keys is refused
+            // below, where the document is about to be rendered without them.
+            additional_signing: Vec::new(),
+        };
+
+        // seed_id from the signing key record (may be None for imported)
+        (derived, signing_record.seed_id)
+    } else {
+        // ── VTA-derived keys ────────────────────────────────────────
+        let active_seed_id = get_active_seed_id(keys_ks)
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        let seed = load_seed_bytes(keys_ks, seed_store, Some(active_seed_id))
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+        let mut derived = keys::derive_entity_keys_with_preference(
+            &seed,
+            &ctx.base_path,
+            &format!("{label} signing key"),
+            &format!("{label} key-agreement key"),
+            keys_ks,
+            &log_entry_capable_signing(&slot_plan.signing)?,
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+        // Slots beyond the pair — a post-quantum signing key alongside the
+        // classical one, which is what lets the holder issue a credential
+        // carrying a proof from each.
+        for (slot, preference) in &slot_plan.additional_signing {
+            let key = keys::derive_additional_signing_key(
+                &seed,
+                &ctx.base_path,
+                slot,
+                &format!("{label} {slot} key"),
+                keys_ks,
+                preference,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+            derived.additional_signing.push(key);
+        }
+
+        // Convert signing key ID to did:key format (required by didwebvh-rs)
+        let pub_mb = derived
+            .signing_secret
+            .get_public_keymultibase()
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        derived.signing_secret.id = format!("did:key:{pub_mb}#{pub_mb}");
+
+        (derived, Some(active_seed_id))
+    };
+
+    // ── VTA identity: derive the `#sealed-transfer-0` key ──────────
+    //
+    // Minting this key here (before the DID doc is built) means it can
+    // be embedded as a verificationMethod from the start — no DID doc
+    // rev needed later. Only applies to the VTA's own identity; every
+    // other webvh DID (integrations, mediators) doesn't need it.
+    let sealed_transfer = if params.is_vta_identity && !user_specified_keys {
+        let seed_for_st = if let Some(sid) = active_seed_id {
+            load_seed_bytes(keys_ks, seed_store, Some(sid))
+                .await
+                .map_err(|e| AppError::Internal(format!("{e}")))?
+        } else {
+            return Err(AppError::Internal(
+                "is_vta_identity set but no active seed — VTA identity requires seed-derived keys"
+                    .into(),
+            ));
+        };
+        Some(
+            keys::derive_sealed_transfer_key(
+                &seed_for_st,
+                &ctx.base_path,
+                &format!("{label} sealed-transfer producer-assertion key"),
+                keys_ks,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?,
+        )
+    } else {
+        None
+    };
+
+    // Resolve URL: serverless uses user-provided URL, server-managed requests from server
+    let (url_str, mnemonic) = if serverless {
+        let url_str = params
+            .url
+            .as_ref()
+            .ok_or_else(|| AppError::Validation("url is required when serverless=true".into()))?
+            .clone();
+        // Validate the URL
+        let parsed_url =
+            Url::parse(&url_str).map_err(|e| AppError::Validation(format!("invalid url: {e}")))?;
+        WebVHURL::parse_url(&parsed_url)
+            .map_err(|e| AppError::Validation(format!("failed to parse WebVH URL: {e}")))?;
+        (url_str, None)
+    } else {
+        let server_id = params.server_id.as_ref().ok_or_else(|| {
+            AppError::Validation("server_id is required when serverless=false".into())
+        })?;
+        let server = webvh_store::get_server(webvh_ks, server_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("webvh server not found: {server_id}")))?;
+
+        let transport = create_path_host_client(
+            did_resolver,
+            didcomm_bridge,
+            config.vta_did.as_deref(),
+            &server,
+            #[cfg(feature = "tsp")]
+            deps.tsp.clone(),
+        )
+        .await?;
+        // Domain selection: `params.domain` is the explicit caller-
+        // supplied override (pnm CLI `--domain`). When omitted, the
+        // remote resolves via caller's ACL default → system default.
+        let uri_response = transport
+            .request_uri(params.path_mode.to_request_path(), params.domain.as_deref())
+            .await?;
+
+        // Validate the URL
+        let parsed_url = Url::parse(&uri_response.did_url)
+            .map_err(|e| AppError::Internal(format!("invalid did_url from server: {e}")))?;
+        WebVHURL::parse_url(&parsed_url)
+            .map_err(|e| AppError::Internal(format!("failed to parse WebVH URL: {e}")))?;
+        (uri_response.did_url, Some(uri_response.mnemonic))
+    };
+
+    // A template that declares slots but no key-agreement slot publishes no
+    // key-agreement key — the Swiss Profile Anchor forbids one — so none is
+    // recorded either. (`derive_entity_keys` still allocates its path; a record
+    // under an id the document never publishes would be the worse outcome.)
+    let template_declares_ka =
+        key_slots.is_empty() || key_slots.contains_key(vta_sdk::did_templates::SLOT_KA);
+    let has_ka = params.ka_key_id.is_some() || (!user_specified_keys && template_declares_ka);
+    // Whether the document publishes the update key (`signing`). A profile may
+    // keep it to the log's `updateKeys` alone; see `KeySlot::publish`.
+    let signing_published = key_slots
+        .get(vta_sdk::did_templates::SLOT_SIGNING)
+        .is_none_or(|slot| slot.publish);
+
+    // ── Template resolution + render ────────────────────────────────
+    //
+    // If the caller named a stored (or built-in) DID template, resolve it,
+    // inject ambient variables from the keys minted above plus config +
+    // context state, and render the result into `params.did_document`. The
+    // rest of the flow then treats it as a caller-supplied document.
+    //
+    // `{DID}` is passed through as a sentinel — `didwebvh-rs` substitutes
+    // it with the computed DID after SCID generation.
+    if let (Some(template_name), Some(record)) = (params.template.as_ref(), template_record) {
+        let mut vars = vta_sdk::did_templates::TemplateVars::new();
+        vars.insert_string("DID", "{DID}");
+        vars.insert_string("SIGNING_KEY_MB", derived.signing_pub.clone());
+        // A JWK form is offered where the key has one; ML-DSA keys have none,
+        // and a template asking for one anyway fails at render on the
+        // unresolved placeholder, rather than here for every template.
+        if let Ok(jwk) = document::public_jwk(&derived.signing_pub) {
+            vars.insert("SIGNING_KEY_JWK", jwk);
+        }
+        if has_ka {
+            vars.insert_string("KA_KEY_MB", derived.ka_pub.clone());
+            if let Ok(jwk) = document::public_jwk(&derived.ka_pub) {
+                vars.insert("KA_KEY_JWK", jwk);
+            }
+        }
+        // One placeholder per additional slot, under `slot_var`'s mechanical
+        // `{SLOT}_KEY_MB` name — the same rule the two above already follow.
+        // Not supplying it is not a quiet omission: the renderer refuses an
+        // unresolved placeholder, so a slot minted and not substituted fails
+        // here rather than publishing a hole.
+        for key in &derived.additional_signing {
+            vars.insert_string(
+                vta_sdk::did_templates::DidTemplate::slot_var(&key.slot),
+                key.public_multibase.clone(),
+            );
+            // The same key as a JWK, for a document that publishes
+            // `publicKeyJwk` (`DidTemplate::slot_var_jwk`).
+            if let Ok(jwk) = document::public_jwk(&key.public_multibase) {
+                vars.insert(
+                    vta_sdk::did_templates::DidTemplate::slot_var_jwk(&key.slot),
+                    jwk,
+                );
+            }
+        }
+        if let Some(ref vta_did) = config.vta_did {
+            vars.insert_string("VTA_DID", vta_did.clone());
+        }
+        if let Some(ref vta_url) = config.public_url {
+            vars.insert_string("VTA_URL", vta_url.clone());
+        }
+        vars.insert_string("CONTEXT_ID", params.context_id.clone());
+        if let Some(ref did) = ctx.did {
+            vars.insert_string("CONTEXT_DID", did.clone());
+        }
+        vars.insert_string("NOW", Utc::now().to_rfc3339());
+        for (k, v) in &params.template_vars {
+            vars.insert(k.clone(), v.clone());
+        }
+
+        let mut rendered = record.template.render(&vars).map_err(|e| {
+            AppError::Validation(format!("template '{template_name}' render failed: {e}"))
+        })?;
+        // A rendered template is treated as caller-supplied from here on, so it
+        // never reaches the builder `with_tsp_service` feeds below — which is how
+        // `add_tsp_service` came to be silently ignored for every templated DID.
+        // Apply it to the document itself, at the mediator the template names.
+        document::with_tsp_in_rendered_document(add_tsp_service, tsp_requested, &mut rendered)?;
+        params.did_document = Some(rendered);
+    }
+
+    // `#tsp` is appended here rather than inside the document builder because
+    // the builder is shared with the TEE bootstrap and the offline preview, and
+    // all three take `additional_services` as the extension point. The builder
+    // sorts `service[]` canonically (TSP > DIDComm > REST) once everything is
+    // appended, so position in this Vec does not matter.
+    let additional_services =
+        with_tsp_service(add_tsp_service, config, params.additional_services.take());
+
+    // Build DID document: use client-provided template or build internally
+    let did_document = match params.did_document {
+        Some(doc) => doc,
+        None if user_specified_keys => {
+            // Build document from user-specified keys (signing only, or signing + KA)
+            build_did_document_with_options(
+                &derived,
+                config,
+                has_ka,
+                params.add_mediator_service,
+                &additional_services,
+            )
+        }
+        None if sealed_transfer.is_some() => build_vta_did_document_with_sealed_transfer(
+            &derived,
+            sealed_transfer.as_ref().unwrap(),
+            config,
+            params.add_mediator_service,
+            &additional_services,
+        ),
+        None => build_did_document(
+            &derived,
+            config,
+            params.add_mediator_service,
+            &additional_services,
+        ),
+    };
+
+    // Validate DIDComm services require a KA key
+    if !has_ka && (params.add_mediator_service || document_has_didcomm_service(&did_document)) {
+        return Err(AppError::Validation(
+            "DIDCommMessaging services require a key-agreement key (ka_key_id)".into(),
+        ));
+    }
+
+    // Derive pre-rotation keys (requires seed)
+    let seed_for_pre_rotation = if params.pre_rotation_count > 0 {
+        let sid = match active_seed_id {
+            Some(id) => id,
+            None => get_active_seed_id(keys_ks)
+                .await
+                .map_err(|e| AppError::Internal(format!("{e}")))?,
+        };
+        Some(
+            load_seed_bytes(keys_ks, seed_store, Some(sid))
+                .await
+                .map_err(|e| AppError::Internal(format!("{e}")))?,
+        )
+    } else {
+        None
+    };
+    let (next_key_hashes, pre_rotation_keys) = if let Some(ref seed) = seed_for_pre_rotation {
+        derive_pre_rotation_keys(
+            seed,
+            &ctx.base_path,
+            label,
+            keys_ks,
+            params.pre_rotation_count,
+        )
+        .await?
+    } else {
+        (vec![], vec![])
+    };
+
+    // Build parameters
+    let parameters = WebVHParameters {
+        update_keys: Some(Arc::new(vec![derived.signing_pub.clone().into()])),
+        portable: Some(params.portable),
+        next_key_hashes: if next_key_hashes.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                next_key_hashes.iter().cloned().map(Into::into).collect(),
+            ))
+        },
+        ..Default::default()
+    };
+
+    // Create the DID
+    let create_config = CreateDIDConfig::builder()
+        .address(&url_str)
+        .authorization_key(derived.signing_secret.clone())
+        .did_document(did_document.clone())
+        .parameters(parameters)
+        // VTI-KEY-166: the did:scid DID URL in the first entry's alsoKnownAs.
+        .also_known_as_scid(applied.alias)
+        // No previous entry to be later than — see `next_version_time`. A
+        // follow-on update lands strictly after this by clamping against the
+        // entry actually written here, not by this being backdated.
+        .version_time(next_version_time(None).await)
+        .build()
+        .map_err(|e| AppError::Internal(format!("failed to build DID config: {e}")))?;
+
+    let result = create_did(create_config)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create DID: {e}")))?;
+
+    let final_did = result.did().to_string();
+    let scid = result
+        .log_entry()
+        .get_scid()
+        .unwrap_or_default()
+        .to_string();
+    let log_content = serde_json::to_string(result.log_entry())
+        .map_err(|e| AppError::Internal(format!("failed to serialize DID log: {e}")))?;
+
+    // ── The names the records take come from the document, not from here ──
+    //
+    // A key record's id is a verification-method id (`save_entity_key_records`,
+    // and `select_secret_kid` rule 1, which publishes it as the JWE kid). This
+    // block used to *assert* `#key-0` / `#key-1` instead of reading what was
+    // just published, so every DID minted from a template numbering its methods
+    // differently — `room` and `room-host` number from `#key-1` — stored records
+    // under names its own document does not carry. See `document::minted_vm_ids`
+    // for what that costs.
+    let additional_pubs: Vec<(String, String)> = derived
+        .additional_signing
+        .iter()
+        .map(|k| (k.slot.clone(), k.public_multibase.clone()))
+        .collect();
+    let mut vm_ids = document::minted_vm_ids(
+        &did_document,
+        &final_did,
+        &derived.signing_pub,
+        if has_ka {
+            Some(derived.ka_pub.as_str())
+        } else {
+            None
+        },
+        &additional_pubs,
+    );
+    // An update key the document does not publish has no method id of its own;
+    // it is named the way the log names it — its `did:key` — rather than given
+    // a `#key-0` the document never carries.
+    if !signing_published {
+        vm_ids.signing = format!("did:key:{pub_mb}#{pub_mb}", pub_mb = derived.signing_pub);
+    }
+    let ka_vm_id = vm_ids
+        .key_agreement
+        .clone()
+        .unwrap_or_else(|| format!("{final_did}#key-1"));
+
+    // Save key records
+    if !user_specified_keys {
+        // VTA-derived: save both signing and KA key records — or the signing
+        // record alone, for a template that publishes no key-agreement key.
+        if has_ka {
+            keys::save_entity_key_records_with_ids(
+                &vm_ids.signing,
+                &ka_vm_id,
+                &derived,
+                keys_ks,
+                Some(&params.context_id),
+                active_seed_id,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        } else {
+            keys::save_key_record(
+                keys_ks,
+                &vm_ids.signing,
+                &derived.signing_path,
+                derived.signing_key_type.clone(),
+                &derived.signing_pub,
+                &vm_ids.signing,
+                Some(&params.context_id),
+                active_seed_id,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        }
+
+        // Records for the extra signing slots, under the ids the published
+        // document gives them. A slot the document does not carry is a template
+        // that minted a key it never published — `check_key_slots` refuses that
+        // shape at authoring time, so reaching it here means the rendered
+        // document and the template disagree, and storing the key under a
+        // guessed id would hide that. Fail instead.
+        for key in &derived.additional_signing {
+            let vm_id = vm_ids.additional_signing.get(&key.slot).ok_or_else(|| {
+                AppError::Internal(format!(
+                    "key slot '{}' was minted but the published document for '{final_did}' has \
+                     no verificationMethod carrying its public key — the template and the \
+                     rendered document disagree about where that key goes",
+                    key.slot
+                ))
+            })?;
+            keys::save_additional_signing_key_record(
+                vm_id,
+                key,
+                keys_ks,
+                Some(&params.context_id),
+                active_seed_id,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        }
+
+        // Persist `#sealed-transfer-0` alongside `#key-0`/`#key-1`. Only
+        // populated when this DID is the VTA's own identity (see the
+        // derivation block above).
+        if let Some(ref st) = sealed_transfer {
+            keys::save_sealed_transfer_key_record(
+                &final_did,
+                st,
+                keys_ks,
+                Some(&params.context_id),
+                active_seed_id,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        }
+    } else {
+        // User-specified: save key records referencing the user's keys
+        keys::save_key_record(
+            keys_ks,
+            &vm_ids.signing,
+            &derived.signing_path,
+            // Carried from the derivation, not asserted here. A record that
+            // names the wrong algorithm sends a later signing operation to a
+            // suite the key cannot work in.
+            derived.signing_key_type.clone(),
+            &derived.signing_pub,
+            &derived.signing_label,
+            Some(&params.context_id),
+            active_seed_id,
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+
+        if has_ka {
+            keys::save_key_record(
+                keys_ks,
+                &ka_vm_id,
+                &derived.ka_path,
+                derived.ka_key_type.clone(),
+                &derived.ka_pub,
+                &derived.ka_label,
+                Some(&params.context_id),
+                active_seed_id,
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+        }
+    }
+
+    // Save pre-rotation key records
+    let pre_rotation_seed_id = active_seed_id.unwrap_or(0);
+    for (i, pk) in pre_rotation_keys.iter().enumerate() {
+        keys::save_key_record(
+            keys_ks,
+            &format!("{final_did}#pre-rotation-{i}"),
+            &pk.path,
+            SdkKeyType::Ed25519,
+            &pk.public_key,
+            &pk.label,
+            Some(&params.context_id),
+            Some(pre_rotation_seed_id),
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    }
+
+    // Index every minted key into the per-version `webvh_keys` keyspace so
+    // `update_did_webvh` can resolve handles by hash without legacy-scan
+    // fallbacks. Pre-rotation handles MUST be installed here — the webvh
+    // signing-key check on the first update consults `previous.next_key_hashes`,
+    // and the secret behind those hashes lives only at the BIP-32 paths
+    // captured by these handles. Without this, an update-with-pre-rotation
+    // path can't find the right secret.
+    let genesis_version_id = result
+        .log_entry()
+        .get_version_id_fields()
+        .map(|(n, h)| format!("{n}-{h}"))
+        .map_err(|e| AppError::Internal(format!("read genesis version id: {e}")))?;
+
+    let signing_hash = Secret::base58_hash_string(&derived.signing_pub)
+        .map_err(|e| AppError::Internal(format!("hash genesis signing pubkey: {e}")))?;
+    let now_ts = Utc::now();
+    let signing_handle = webvh_keys::WebvhKeyHandle {
+        scid: scid.clone(),
+        version_id: genesis_version_id.clone(),
+        hash: signing_hash,
+        public_key: derived.signing_pub.clone(),
+        derivation_path: derived.signing_path.clone(),
+        seed_id: active_seed_id,
+        role: webvh_keys::WebvhKeyRole::UpdateKey,
+        label: derived.signing_label.clone(),
+        created_at: now_ts,
+    };
+    webvh_keys::install(keys_ks, &signing_handle)
+        .await
+        .map_err(|e| AppError::Internal(format!("install genesis update-key handle: {e}")))?;
+
+    for (i, (hash, pk)) in next_key_hashes
+        .iter()
+        .zip(pre_rotation_keys.iter())
+        .enumerate()
+    {
+        let handle = webvh_keys::WebvhKeyHandle {
+            scid: scid.clone(),
+            version_id: genesis_version_id.clone(),
+            hash: hash.clone(),
+            public_key: pk.public_key.clone(),
+            derivation_path: pk.path.clone(),
+            seed_id: Some(pre_rotation_seed_id),
+            role: webvh_keys::WebvhKeyRole::PreRotation,
+            label: format!("genesis pre-rotation #{i}"),
+            created_at: now_ts,
+        };
+        webvh_keys::install(keys_ks, &handle).await.map_err(|e| {
+            AppError::Internal(format!("install genesis pre-rotation handle #{i}: {e}"))
+        })?;
+    }
+
+    // The identity it is given out as (VTI-KEY-165). Key records keep the
+    // log's own method ids; a did:scid identity's secrets are published under
+    // its DID by `select_secret_kid`.
+    let identity = presented_identity(&final_did, applied);
+
+    // Optionally set as primary DID
+    if params.set_primary {
+        ctx.did = Some(identity.context_did());
+        ctx.updated_at = now;
+        crate::contexts::store_context(contexts_ks, &ctx)
+            .await
+            .map_err(|e| AppError::Internal(format!("{e}")))?;
+    }
+
+    // Extract the rendered DID document from the just-built log entry.
+    // Shared by both branches so the returned `did_document` / `log_entry`
+    // shape is identical regardless of publish target — downstream flows
+    // (notably `provision_integration`) rely on these being populated.
+    let final_did_document = result
+        .log_entry()
+        .get_did_document()
+        .ok()
+        .unwrap_or(did_document);
+
+    if serverless {
+        // Serverless: skip publish but DO store the DID record and log locally.
+        // Create mints two verificationMethods, and `next_fragment_id` is one
+        // past the highest `#key-N` the document published — read rather than
+        // assumed, because a rotation allocating over a method id that is
+        // already live republishes that name under different key material.
+        let did_record = WebvhDidRecord {
+            did: final_did.clone(),
+            server_id: "serverless".to_string(),
+            mnemonic: String::new(),
+            scid: scid.clone(),
+            context_id: params.context_id.clone(),
+            portable: params.portable,
+            log_entry_count: 1,
+            pre_rotation_count: pre_rotation_keys.len() as u32,
+            next_fragment_id: vm_ids.next_fragment_id,
+            created_at: now,
+            updated_at: now,
+        };
+        webvh_store::store_did(webvh_ks, &did_record).await?;
+        webvh_store::store_did_log(webvh_ks, &final_did, &log_content).await?;
+        record_scid_identity(webvh_ks, &final_did, applied).await?;
+        refresh_resolver_doc_from_log(did_resolver, &final_did, &log_content, channel).await;
+
+        info!(
+            channel,
+            did = %identity.did,
+            log = %final_did,
+            context = %params.context_id,
+            "did:webvh created (serverless)"
+        );
+
+        Ok(CreateDidWebvhResultBody {
+            did: identity.did,
+            context_id: params.context_id,
+            server_id: None,
+            serverless: Some(true),
+            mnemonic: None,
+            scid,
+            portable: params.portable,
+            signing_key_id: vm_ids.signing.clone(),
+            ka_key_id: ka_vm_id.clone(),
+            additional_key_ids: vm_ids.additional_signing.clone(),
+            pre_rotation_key_count: pre_rotation_keys.len() as u32,
+            created_at: now,
+            did_document: Some(final_did_document),
+            log_entry: Some(log_content),
+            did_method: Some(applied.method),
+            scid_also_known_as: Some(applied.alias),
+            webvh_did: Some(final_did.clone()),
+            scid_did_url: identity.scid_did_url,
+        })
+    } else {
+        // Server-managed: publish, update context, store records
+        let server_id = params.server_id.as_ref().unwrap();
+        let mnemonic = mnemonic.as_ref().unwrap();
+
+        let server = webvh_store::get_server(webvh_ks, server_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("webvh server not found: {server_id}")))?;
+
+        let transport = create_path_host_client(
+            did_resolver,
+            didcomm_bridge,
+            config.vta_did.as_deref(),
+            &server,
+            #[cfg(feature = "tsp")]
+            deps.tsp.clone(),
+        )
+        .await?;
+        // Reuse the same `params.domain` selection the request_uri
+        // call above used. The remote already knows the slot's domain
+        // from the reservation, so this is a redundant override —
+        // sending it explicitly catches a misconfigured caller before
+        // the log lands on the wrong domain.
+        transport
+            .publish_did(mnemonic, &log_content, params.domain.as_deref())
+            .await?;
+
+        // Store DID record and log
+        let did_record = WebvhDidRecord {
+            did: final_did.clone(),
+            server_id: server_id.clone(),
+            mnemonic: mnemonic.clone(),
+            scid: scid.clone(),
+            context_id: params.context_id.clone(),
+            portable: params.portable,
+            log_entry_count: 1,
+            pre_rotation_count: pre_rotation_keys.len() as u32,
+            next_fragment_id: vm_ids.next_fragment_id,
+            created_at: now,
+            updated_at: now,
+        };
+        webvh_store::store_did(webvh_ks, &did_record).await?;
+        webvh_store::store_did_log(webvh_ks, &final_did, &log_content).await?;
+        // The host has the genesis log — `publish_did` above returned Ok — so
+        // record it as confirmed. The update orchestrator is otherwise the only
+        // writer of this marker, so without this it stays absent until the
+        // DID's first successful update, and "absent" then conflates *never
+        // published* with *hosted since creation*. The concurrency check reads
+        // it to tell a stale caller from a local head we failed to publish;
+        // leaving it empty makes a freshly-created DID indistinguishable from
+        // one whose publishes have never landed. Serverless creation
+        // deliberately does not set it — there is no host to confirm against.
+        webvh_store::set_published_version(webvh_ks, &final_did, &genesis_version_id).await?;
+        record_scid_identity(webvh_ks, &final_did, applied).await?;
+        refresh_resolver_doc_from_log(did_resolver, &final_did, &log_content, channel).await;
+
+        info!(
+            channel,
+            did = %identity.did,
+            log = %final_did,
+            context = %params.context_id,
+            server = %server_id,
+            "did:webvh created and published"
+        );
+
+        Ok(CreateDidWebvhResultBody {
+            did: identity.did,
+            context_id: params.context_id,
+            server_id: Some(server_id.clone()),
+            serverless: Some(false),
+            mnemonic: Some(mnemonic.clone()),
+            scid,
+            portable: params.portable,
+            signing_key_id: vm_ids.signing.clone(),
+            ka_key_id: ka_vm_id.clone(),
+            additional_key_ids: vm_ids.additional_signing.clone(),
+            pre_rotation_key_count: pre_rotation_keys.len() as u32,
+            created_at: now,
+            did_document: Some(final_did_document),
+            log_entry: Some(log_content),
+            did_method: Some(applied.method),
+            scid_also_known_as: Some(applied.alias),
+            webvh_did: Some(final_did.clone()),
+            scid_did_url: identity.scid_did_url,
+        })
+    }
+}
+
+/// The identity a new log is given out as, and its did:scid DID URL.
+struct PresentedIdentity {
+    /// The did:webvh DID, or the bare `did:scid:vh:1:<scid>` (VTI-KEY-165).
+    did: String,
+    /// `did:scid:vh:1:<scid>?src=…`, for a did:webvh DID (always one here).
+    scid_did_url: Option<String>,
+}
+
+impl PresentedIdentity {
+    /// What a context acting as this DID records: the did:webvh DID, or the
+    /// did:scid DID URL with `src` — the context's DID is what its holder is
+    /// given out as, so it carries the locator a recipient needs (VTI-KEY-163).
+    /// Comparisons against it are by DID (`did_scid::same_reference`).
+    fn context_did(&self) -> String {
+        if vta_sdk::did_scid::is_scid(&self.did) {
+            self.scid_did_url
+                .clone()
+                .unwrap_or_else(|| self.did.clone())
+        } else {
+            self.did.clone()
+        }
+    }
+}
+
+fn presented_identity(webvh_did: &str, applied: presentation::Presentation) -> PresentedIdentity {
+    let forms = vta_sdk::did_scid::scid_forms(webvh_did);
+    let did = match (&forms, applied.method) {
+        (Some((bare, _)), vta_sdk::did_scid::DidMethod::Scid) => bare.clone(),
+        _ => webvh_did.to_string(),
+    };
+    PresentedIdentity {
+        did,
+        scid_did_url: forms.map(|(_, url)| url),
+    }
+}
+
+/// Record the did:scid identity of a new log, where it has one to record: it
+/// is presented as the did:scid, or lists the alias. Lets every webvh/dids task
+/// take the did:scid DID, and seeds the resolver's did:scid sources at boot.
+async fn record_scid_identity(
+    webvh_ks: &KeyspaceHandle,
+    webvh_did: &str,
+    applied: presentation::Presentation,
+) -> Result<(), AppError> {
+    let presented = applied.method == vta_sdk::did_scid::DidMethod::Scid;
+    if !presented && !applied.alias {
+        return Ok(());
+    }
+    if let Some(identity) = webvh_store::ScidIdentity::of(webvh_did, presented, applied.alias) {
+        webvh_store::store_scid_identity(webvh_ks, &identity).await?;
+    }
+    Ok(())
+}
+
+/// How a DID deletion treats the copy of its log on a hosting server.
+///
+/// The default deletes the host copy as well and refuses when it cannot even
+/// try. [`local_only`](Self::local_only) is the explicit opt-in for the one case
+/// the default refuses: a DID whose hosting server is no longer registered here.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct DeleteDidOptions<'a> {
+    /// Delete the local record even though its hosting server is no longer
+    /// registered, leaving the published log on that host. Refused for a DID
+    /// whose server *is* registered (the host copy can be deleted there) and
+    /// for a serverless DID (there is no host copy).
+    pub local_only: bool,
+    /// Contexts going away in the same operation as this DID.
+    ///
+    /// A context that *acts as* a DID normally blocks its deletion — the
+    /// refusal exists so a context is never left pointing at an identifier
+    /// that no longer resolves. During a context-subtree cascade that
+    /// reasoning inverts: the context holding the DID is being deleted too, so
+    /// there is nothing left to strand, and honouring the blocker would make
+    /// the cascade impossible for exactly the contexts that have an identity.
+    ///
+    /// Narrow on purpose. It names the contexts in the delete set rather than
+    /// switching the check off, so a DID that some *other* context still acts
+    /// as is refused during a cascade exactly as it is anywhere else.
+    pub contexts_being_deleted: &'a [String],
+    /// The caller has already dealt with the host copy — removed it through
+    /// [`remove_host_copy`], or decided to leave it — and answers for it
+    /// itself. The deletion neither refuses over an unregistered server nor
+    /// contacts the host, and reports no `daemon_cleanup_error`.
+    ///
+    /// For `vta/contexts/delete/1.1`, which settles every host copy in the
+    /// subtree *before* any local record goes (so a refusal destroys nothing)
+    /// and so must not have each DID's deletion try the host a second time.
+    pub host_copy_settled: bool,
+}
+
+impl<'a> DeleteDidOptions<'a> {
+    /// Opt in to deleting only the local record of a DID whose hosting server
+    /// is no longer registered. See [`DeleteDidOptions::local_only`].
+    #[must_use]
+    pub fn local_only() -> Self {
+        Self {
+            local_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// Delete this DID as part of a cascade removing `contexts`. See
+    /// [`DeleteDidOptions::contexts_being_deleted`].
+    #[must_use]
+    pub fn within_context_deletion(contexts: &'a [String]) -> Self {
+        Self {
+            contexts_being_deleted: contexts,
+            ..Self::default()
+        }
+    }
+
+    /// The same, for a cascade that has already settled every host copy. See
+    /// [`DeleteDidOptions::host_copy_settled`].
+    #[must_use]
+    pub fn with_host_copy_settled(self) -> Self {
+        Self {
+            host_copy_settled: true,
+            ..self
+        }
+    }
+}
+
+/// What became of a DID's published log when a deletion tried to remove it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostCopy {
+    /// There is none: the DID is serverless.
+    None,
+    /// The host removed the log, or answered that it no longer holds it.
+    Removed,
+    /// Removal was not confirmed. The log may still resolve.
+    Unconfirmed {
+        /// The hosting server's id here, when the record names one.
+        server: Option<String>,
+        /// Why, for a human.
+        reason: String,
+    },
+}
+
+/// Remove `did`'s published log from its hosting server, and say what
+/// happened rather than failing.
+///
+/// Every way the host copy can fail to go — the server no longer registered
+/// here, no VTA DID to authenticate as, the host refusing or not answering —
+/// is [`HostCopy::Unconfirmed`], because the caller decides what an orphan
+/// means; an `Err` is reserved for this VTA's own store failing. A host that
+/// answers `notFound` or `alreadyDeleted` has, for this purpose, removed it:
+/// the state the caller asked for is the state the host is in.
+///
+/// Nothing local is touched, so running it again is harmless.
+pub async fn remove_host_copy(
+    deps: &WebvhDeps<'_>,
+    did: &str,
+    vta_did: Option<&str>,
+) -> Result<HostCopy, AppError> {
+    let record = webvh_store::get_did(deps.webvh_ks, did)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("webvh DID not found: {did}")))?;
+    if record.server_id == SERVERLESS_SERVER_ID {
+        return Ok(HostCopy::None);
+    }
+    let unconfirmed = |reason: String| HostCopy::Unconfirmed {
+        server: Some(record.server_id.clone()),
+        reason,
+    };
+    let Some(server) = webvh_store::get_server(deps.webvh_ks, &record.server_id).await? else {
+        return Ok(unconfirmed(format!(
+            "hosting server `{}` is no longer registered here, so the log could not be \
+             removed there",
+            record.server_id
+        )));
+    };
+    let Some(vta_did) = vta_did else {
+        return Ok(unconfirmed(format!(
+            "this VTA has no DID configured to authenticate to hosting server `{}`",
+            server.id
+        )));
+    };
+    match delete_log_on_server(deps, vta_did, &server, &record.mnemonic, None).await {
+        Ok(()) => Ok(HostCopy::Removed),
+        Err(AppError::NotFound(_) | AppError::Gone(_)) => {
+            info!(did = %did, server_id = %server.id, "host no longer holds the log; treating it as removed");
+            Ok(HostCopy::Removed)
+        }
+        Err(e) => Ok(unconfirmed(format!(
+            "hosting server `{}` did not remove the log: {e}",
+            server.id
+        ))),
+    }
+}
+
+/// Delete a DID, deleting its published log on the hosting server too.
+///
+/// Refuses a DID whose hosting server is no longer registered; see
+/// [`delete_did_webvh_with`] for the explicit local-only opt-in.
+pub async fn delete_did_webvh(
+    deps: &WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    vta_did: Option<&str>,
+    channel: &str,
+) -> Result<DeleteDidWebvhResultBody, AppError> {
+    delete_did_webvh_with(
+        deps,
+        auth,
+        did,
+        vta_did,
+        channel,
+        DeleteDidOptions::default(),
+    )
+    .await
+}
+
+/// [`delete_did_webvh`] with explicit [`DeleteDidOptions`].
+pub async fn delete_did_webvh_with(
+    deps: &WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    vta_did: Option<&str>,
+    channel: &str,
+    options: DeleteDidOptions<'_>,
+) -> Result<DeleteDidWebvhResultBody, AppError> {
+    auth.require_admin()?;
+
+    let record = webvh_store::get_did(deps.webvh_ks, did)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("webvh DID not found: {did}")))?;
+    // Mirror the context-scoping that create/get/get_log/list already
+    // enforce on this record. Without this check, any context-scoped
+    // admin could trigger remote deletion (via record.mnemonic) and
+    // local key cleanup of DIDs owned by other contexts on the same
+    // VTA. Answered as NotFound, as `vta/webvh/dids/delete/1.0` declares.
+    hide_unreachable(auth, &record.context_id, did)?;
+
+    // ---- Refuse before destroying anything --------------------------------
+    //
+    // A DID something still depends on must not be deleted out from under it.
+    // Cascading here would silently break a context or an advertised service;
+    // refusing tells the operator exactly what to unpick, per the workspace's
+    // "operator errors should suggest the fix" convention. There is no
+    // `--force`: the same call as `would_violate_last_service`, for the same
+    // reason — the escape hatch is what gets used at 2am.
+    let blockers = plan_did_deletion_with(deps, auth, did, vta_did, options)
+        .await?
+        .blockers;
+    if !blockers.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "{did} cannot be deleted — {} blocker{} to resolve first:\n{}",
+            blockers.len(),
+            if blockers.len() == 1 { "" } else { "s" },
+            blockers
+                .iter()
+                .map(|b| format!("  - {b}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+
+    // A caller that cannot reach the state a deletion must take with the DID
+    // cannot delete it. Half a deletion — the DID gone, its authorization and
+    // credentials left behind — is the failure this whole path exists to
+    // prevent, so it is refused rather than attempted.
+    let cascade = deps.delete_cascade.as_ref().ok_or_else(|| {
+        AppError::Internal(
+            "this code path cannot delete a DID: it has no access to the ACL, session and \
+             issued-credential keyspaces that must be cleaned up with it"
+                .into(),
+        )
+    })?;
+
+    // ---- Revoke before deleting -------------------------------------------
+    //
+    // Credentials the VTA issued naming this DID cannot be cleaned up: third
+    // parties hold copies, and deleting our record would destroy the only
+    // means of revoking them while leaving every copy in the wild valid
+    // forever. That is exactly the residue an ACL revoke left behind on the
+    // VTC, found in production.
+    //
+    // Revocation runs *first*, and deliberately: if anything later fails, the
+    // credentials are already dead and the DID still exists, which is
+    // recoverable by re-running. The other order leaves live credentials for a
+    // DID nobody can revoke through any more.
+    // Everything below runs for each name of the log: its did:webvh DID, and
+    // the did:scid DID it may be presented as, which is a distinct identity
+    // (VTI-KEY-164) and so holds its own credentials, ACL entry and sessions.
+    let names = names_of_log(deps.webvh_ks, did).await?;
+    let mut revoked = 0;
+    for name in &names {
+        revoked += revoke_credentials_for_did(cascade.issued_credentials_ks, name).await?;
+    }
+    if revoked > 0 {
+        info!(channel, did = %did, revoked, "revoked credentials issued to a DID being deleted");
+    }
+
+    // Resolve server for remote deletion. Track the outcome so the
+    // operator can act on a daemon-side orphan rather than seeing
+    // local cleanup succeed silently. (Spec / audit H4: surface the
+    // failure on the result body.)
+    let mut daemon_cleanup_error: Option<String> = None;
+    // Already removed (or knowingly left) by the caller, who reports it.
+    let server = if record.server_id == SERVERLESS_SERVER_ID || options.host_copy_settled {
+        None
+    } else {
+        match webvh_store::get_server(deps.webvh_ks, &record.server_id).await? {
+            Some(server) => Some(server),
+            // The opt-in the pre-flight check honoured: the host copy stays,
+            // and the result says so rather than reading as a full deletion.
+            None if options.local_only => {
+                let msg = format!(
+                    "deleted locally only: hosting server `{}` is not registered, so the \
+                     published log for {did} was not deleted there and may still resolve",
+                    record.server_id
+                );
+                tracing::warn!(did = %did, server_id = %record.server_id, "{msg}");
+                daemon_cleanup_error = Some(msg);
+                None
+            }
+            // Unregistered between the pre-flight check and here. Refuse for
+            // the reason the check does (VTI R2.1, Remote-First): dropping the
+            // record now would discard the only credentials that can delete the
+            // host copy. Credentials revoked above stay revoked, and re-running
+            // after re-registering the server completes the deletion.
+            None => {
+                return Err(AppError::Conflict(format!(
+                    "{did} cannot be deleted — {}",
+                    unregistered_server_refusal(did, &record.server_id)
+                )));
+            }
+        }
+    };
+    if let Some(server) = server {
+        match vta_did {
+            Some(vta_did_value) => {
+                if let Err(e) =
+                    delete_log_on_server(deps, vta_did_value, &server, &record.mnemonic, None).await
+                {
+                    tracing::warn!(
+                        did = %did,
+                        server_id = %server.id,
+                        error = %e,
+                        "did-hosting-daemon delete_did failed; continuing local cleanup but DID is now orphaned on the daemon"
+                    );
+                    daemon_cleanup_error = Some(format!(
+                        "daemon `{}` rejected delete: {e} — DID is orphaned on the daemon and \
+                         must be cleaned up out-of-band",
+                        server.id
+                    ));
+                }
+            }
+            None => {
+                let msg = format!(
+                    "VTA DID is not configured — skipping daemon-side delete on server `{}`. \
+                     Local record removed, but the daemon entry is now orphaned.",
+                    server.id
+                );
+                tracing::warn!(did = %did, "{msg}");
+                daemon_cleanup_error = Some(msg);
+            }
+        }
+    }
+
+    // Remove local DID record and log
+    webvh_store::delete_did(deps.webvh_ks, did).await?;
+    if let Some(identity) = webvh_store::get_scid_identity(deps.webvh_ks, did).await? {
+        webvh_store::delete_scid_identity(deps.webvh_ks, &identity.scid_did).await?;
+    }
+
+    // Clean up associated key records (best-effort).
+    //
+    // Over every `#key-N` the record says this DID ever allocated, not the two
+    // create used to assume: a template names its methods where it likes, and a
+    // rotation allocates further ones, so `#key-0` / `#key-1` left the records
+    // of a room, a room host, and every rotated DID behind — orphaned material
+    // for an identifier that no longer resolves. No early break, because the
+    // ids a rotation leaves behind are not contiguous with the live ones.
+    let key_bound = record.next_fragment_id.clamp(2, 1024);
+    for i in 0..key_bound {
+        let _ = deps
+            .keys_ks
+            .remove(keys::store_key(&format!("{did}#key-{i}")))
+            .await;
+    }
+    // Clean up pre-rotation key records (M4: bound to the record's
+    // declared count so a DID created with a high pre_rotation_count
+    // doesn't leak entries).
+    let pre_rotation_bound = std::cmp::max(record.pre_rotation_count, 32);
+    for i in 0..pre_rotation_bound {
+        let key_id = format!("{did}#pre-rotation-{i}");
+        let store_key = keys::store_key(&key_id);
+        if deps.keys_ks.get_raw(store_key.clone()).await?.is_none() {
+            break;
+        }
+        let _ = deps.keys_ks.remove(store_key).await;
+    }
+
+    // ---- Cascade the authorization that named it --------------------------
+    //
+    // An ACL entry outliving its subject is live authority for an identity
+    // that can no longer be resolved or rotated — strictly worse than an
+    // orphaned record, because it still grants. Sessions are authority already
+    // issued and go the same way.
+    let mut sessions_revoked = 0;
+    for name in &names {
+        vti_common::acl::delete_acl_entry(cascade.acl_ks, name).await?;
+        sessions_revoked += revoke_sessions_for_did(cascade.sessions_ks, name).await?;
+    }
+
+    info!(
+        channel,
+        did = %did,
+        credentials_revoked = revoked,
+        sessions_revoked,
+        "webvh DID deleted"
+    );
+    Ok(DeleteDidWebvhResultBody {
+        did: did.to_string(),
+        deleted: true,
+        daemon_cleanup_error,
+    })
+}
+
+/// What deleting `did` would do, computed without doing any of it.
+///
+/// One plan, produced by one function, used by both the preview and the
+/// deletion. The alternative — a preview that walks the state and a delete that
+/// walks it again — is two implementations of the same question that agree only
+/// as long as somebody keeps them agreeing. A preview that under-reports is
+/// worse than no preview: it is a promise the operator acted on.
+#[derive(Debug, Default)]
+pub struct DidDeletionPlan {
+    /// Things that still depend on the DID. Non-empty means the deletion is
+    /// refused; each line names the command that unpicks it.
+    pub blockers: Vec<String>,
+    /// Ids of credentials the VTA issued to this DID that would be revoked.
+    /// Named individually rather than counted: an operator deciding whether to
+    /// proceed is deciding about *these*, and a number cannot be checked
+    /// against what they expected.
+    pub credentials_to_revoke: Vec<String>,
+    /// How many live sessions would be ended.
+    pub sessions_to_revoke: usize,
+    /// Whether an ACL entry names this DID, and would go with it.
+    pub has_acl_entry: bool,
+}
+
+impl DidDeletionPlan {
+    /// Whether this deletion would destroy or revoke anything beyond the DID's
+    /// own records. Drives whether the CLI bothers to prompt — deleting a DID
+    /// nothing else touches does not need a ceremony.
+    #[must_use]
+    pub fn touches_anything_else(&self) -> bool {
+        !self.credentials_to_revoke.is_empty() || self.sessions_to_revoke > 0 || self.has_acl_entry
+    }
+}
+
+/// Compute what deleting `did` would do. Read-only: no writes, so a caller may
+/// run this to show an operator, and a refusal leaves the VTA untouched.
+pub async fn plan_did_deletion(
+    deps: &WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    vta_did: Option<&str>,
+) -> Result<DidDeletionPlan, AppError> {
+    plan_did_deletion_with(deps, auth, did, vta_did, DeleteDidOptions::default()).await
+}
+
+/// [`plan_did_deletion`] for a deletion run with `options`.
+pub async fn plan_did_deletion_with(
+    deps: &WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    vta_did: Option<&str>,
+    options: DeleteDidOptions<'_>,
+) -> Result<DidDeletionPlan, AppError> {
+    let blockers = delete_blockers(deps, auth, did, vta_did, options).await?;
+
+    // Without the cascade keyspaces there is nothing further to report — and
+    // the deletion itself will refuse for the same reason.
+    let Some(cascade) = deps.delete_cascade.as_ref() else {
+        return Ok(DidDeletionPlan {
+            blockers,
+            ..Default::default()
+        });
+    };
+
+    let mut credentials_to_revoke = Vec::new();
+    let mut sessions_to_revoke = 0;
+    let mut has_acl_entry = false;
+    for name in names_of_log(deps.webvh_ks, did).await? {
+        credentials_to_revoke
+            .extend(credentials_issued_to(cascade.issued_credentials_ks, &name).await?);
+        sessions_to_revoke += sessions_for_did(cascade.sessions_ks, &name).await?.len();
+        has_acl_entry |= vti_common::acl::get_acl_entry(cascade.acl_ks, &name)
+            .await?
+            .is_some();
+    }
+    Ok(DidDeletionPlan {
+        blockers,
+        credentials_to_revoke,
+        sessions_to_revoke,
+        has_acl_entry,
+    })
+}
+
+/// Every name a log is known by here: its did:webvh DID, and the did:scid DID
+/// recorded for it (VTI-KEY-164). Deleting the log retires both.
+async fn names_of_log(webvh_ks: &KeyspaceHandle, did: &str) -> Result<Vec<String>, AppError> {
+    let mut names = vec![did.to_string()];
+    if let Some(identity) = webvh_store::get_scid_identity(webvh_ks, did).await? {
+        names.push(identity.scid_did);
+    }
+    Ok(names)
+}
+
+/// Everything that still depends on `did`, as operator-facing lines naming the
+/// command that unpicks each one.
+///
+/// Read-only: this runs before any write, so a refusal leaves the VTA exactly
+/// as it found it.
+async fn delete_blockers(
+    deps: &WebvhDeps<'_>,
+    auth: &AuthClaims,
+    did: &str,
+    vta_did_value: Option<&str>,
+    options: DeleteDidOptions<'_>,
+) -> Result<Vec<String>, AppError> {
+    let mut blockers = Vec::new();
+
+    // A published log on a host this VTA can no longer reach. With the
+    // server's registration gone the delete cannot even be attempted there,
+    // and dropping the local record would throw away the credentials that
+    // delete it, leaving a live log nobody can update or remove. VTI R2.1
+    // (Remote-First): no local commit before the remote effect, so refuse
+    // unless the caller opted in to leaving the host copy behind.
+    // Skipped when the caller settled the host copy itself: an unregistered
+    // server is then one more unconfirmed copy it reports, not a blocker.
+    if let Some(record) = webvh_store::get_did(deps.webvh_ks, did)
+        .await?
+        .filter(|_| !options.host_copy_settled)
+    {
+        let serverless = record.server_id == SERVERLESS_SERVER_ID;
+        let registered = serverless
+            || webvh_store::get_server(deps.webvh_ks, &record.server_id)
+                .await?
+                .is_some();
+        match (registered, options.local_only) {
+            (false, false) => blockers.push(unregistered_server_refusal(did, &record.server_id)),
+            (false, true) | (true, false) => {}
+            // `local_only` exists for the unregistered case alone. Honoured
+            // anywhere else it would orphan a host copy that can be deleted,
+            // so it is refused rather than quietly ignored.
+            (true, true) if serverless => blockers.push(format!(
+                "--local-only was given, but {did} is serverless: there is no host copy to \
+                 leave behind. Delete it without --local-only"
+            )),
+            (true, true) => blockers.push(format!(
+                "--local-only was given, but hosting server `{}` is still registered, so the \
+                 published log can be deleted there. Delete {did} without --local-only",
+                record.server_id
+            )),
+        }
+    }
+
+    // The VTA's own DID. Deleting it does not decommission the VTA; it strands
+    // it — unable to authenticate to its mediator, unable to publish, and
+    // unable to be found by anyone holding its credentials.
+    let names = names_of_log(deps.webvh_ks, did).await?;
+    let names_it = |other: &str| {
+        names
+            .iter()
+            .any(|n| vta_sdk::did_scid::same_reference(n, other))
+    };
+    if vta_did_value.is_some_and(names_it) {
+        blockers.push(format!(
+            "this VTA's own DID ({did}) — deleting it would strand the VTA rather than              decommission it; change `vta_did` first if that is really the intent"
+        ));
+    }
+
+    // A context whose identity this DID is — unless that context is going away
+    // in the same operation, in which case there is nothing left to strand.
+    for ctx in crate::contexts::list_contexts(deps.contexts_ks).await? {
+        if ctx.did.as_deref().is_some_and(names_it)
+            && !options.contexts_being_deleted.contains(&ctx.id)
+        {
+            let id = &ctx.id;
+            blockers.push(format!(
+                "context `{id}` acts as this DID — reassign it first: \
+                 `pnm contexts update-did {id} <new-did>`, or leave the context with \
+                 no DID: `pnm contexts update-did {id} --clear`"
+            ));
+        }
+    }
+
+    let _ = auth;
+    Ok(blockers)
+}
+
+/// The `server_id` a DID record stores when no hosting server publishes it.
+const SERVERLESS_SERVER_ID: &str = "serverless";
+
+/// The refusal for a DID whose hosting server is no longer registered, naming
+/// the commands that get the operator unstuck.
+fn unregistered_server_refusal(did: &str, server_id: &str) -> String {
+    format!(
+        "its published log is on hosting server `{server_id}`, which is no longer registered \
+         here. The VTA cannot delete the log on that host, and deleting only the local record \
+         would discard the keys needed to remove it later while the DID keeps resolving. \
+         Register the server again, then retry the delete: \
+         `pnm did-mgmt servers add --id {server_id} --did <server-did>` \
+         (offline: `vta did-mgmt servers add --id {server_id} --did <server-did>`). \
+         If that host is gone for good, delete only the local record with \
+         `vta did-mgmt dids delete {did} --local-only` (offline, VTA stopped)"
+    )
+}
+
+/// Ids of the not-yet-revoked credentials the VTA issued to `did`.
+///
+/// The read half of [`revoke_credentials_for_did`], so the preview reports
+/// exactly the set the deletion will act on rather than its own approximation
+/// of it.
+async fn credentials_issued_to(
+    issued_credentials_ks: &KeyspaceHandle,
+    did: &str,
+) -> Result<Vec<String>, AppError> {
+    use crate::operations::credentials::IssuedCredentialRecord;
+
+    let mut ids = Vec::new();
+    for (_key, raw) in issued_credentials_ks
+        .prefix_iter_raw(b"cred:".to_vec())
+        .await?
+    {
+        let Ok(record) = serde_json::from_slice::<IssuedCredentialRecord>(&raw) else {
+            continue;
+        };
+        if record.holder == did && record.revoked_at.is_none() {
+            ids.push(record.id);
+        }
+    }
+    Ok(ids)
+}
+
+/// The live sessions held by `did`.
+///
+/// The read half of [`revoke_sessions_for_did`], for the same reason.
+async fn sessions_for_did(
+    sessions_ks: &KeyspaceHandle,
+    did: &str,
+) -> Result<Vec<String>, AppError> {
+    use vti_common::auth::session::list_sessions;
+
+    Ok(list_sessions(sessions_ks)
+        .await?
+        .into_iter()
+        .filter(|s| s.did == did)
+        .map(|s| s.session_id)
+        .collect())
+}
+
+/// Revoke every credential the VTA issued to `did`, returning how many moved.
+///
+/// Already-revoked records are left alone: revocation is a tombstone, and
+/// re-revoking would rewrite the timestamp that says when the credential
+/// actually stopped being good.
+async fn revoke_credentials_for_did(
+    issued_credentials_ks: &KeyspaceHandle,
+    did: &str,
+) -> Result<usize, AppError> {
+    use crate::operations::credentials::IssuedCredentialRecord;
+
+    let mut revoked = 0usize;
+    for (key, raw) in issued_credentials_ks
+        .prefix_iter_raw(b"cred:".to_vec())
+        .await?
+    {
+        // A record this build cannot parse is left alone rather than skipped
+        // silently-and-forgotten: it is not ours to rewrite, and failing the
+        // whole deletion over one unreadable row would be worse than leaving
+        // it for the operator to look at.
+        let Ok(mut record) = serde_json::from_slice::<IssuedCredentialRecord>(&raw) else {
+            tracing::warn!(
+                "unparseable issued-credential record skipped during DID deletion; \
+                 it may name the deleted DID and will not have been revoked"
+            );
+            continue;
+        };
+        if record.holder != did || record.revoked_at.is_some() {
+            continue;
+        }
+        record.revoked_at = Some(chrono::Utc::now().to_rfc3339());
+        record.revocation_reason = Some("holder DID deleted".to_string());
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|e| AppError::Internal(format!("re-encode credential record: {e}")))?;
+        issued_credentials_ks.insert_raw(key, bytes).await?;
+        revoked += 1;
+    }
+    Ok(revoked)
+}
+
+/// Delete every live session held by `did`.
+async fn revoke_sessions_for_did(
+    sessions_ks: &KeyspaceHandle,
+    did: &str,
+) -> Result<usize, AppError> {
+    use vti_common::auth::session::delete_session;
+
+    let ids = sessions_for_did(sessions_ks, did).await?;
+    for session_id in &ids {
+        delete_session(sessions_ks, session_id).await?;
+    }
+    Ok(ids.len())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// `derive_pre_rotation_keys` moved to `vta_keys::derivation` (a pure BIP-32 key
+// operation reused by TEE first-boot DID autogen); imported below.
+pub(crate) use crate::keys::derivation::derive_pre_rotation_keys;
+
+/// The keyspaces `delete_did_webvh_with` reaches, and what it does in each — the cascade's own
+/// statement, beside the code that does it.
+///
+/// `did_delete_labels_match_the_cascade` holds [`vta_keyspaces::did_delete_effect`] to exactly
+/// this list: a keyspace labelled `Cascade`, `Blocks` or `Revoke` must be here with that effect,
+/// and one here must be labelled so. Making a keyspace's cascade real means adding it here and
+/// moving its label off `Orphaned` in the same change.
+#[cfg(test)]
+const DID_DELETE_REACHES: &[(&str, vta_keyspaces::DidDeleteEffect)] = {
+    use vta_keyspaces::DidDeleteEffect::{Blocks, Cascade, Revoke};
+    &[
+        // The DID's key records and its own log.
+        (crate::keyspaces::KEYS, Cascade),
+        (crate::keyspaces::WEBVH, Cascade),
+        // The authorization that named it, and the sessions already issued on it.
+        (crate::keyspaces::ACL, Cascade),
+        (crate::keyspaces::SESSIONS, Cascade),
+        // What the VTA issued to it.
+        (crate::keyspaces::ISSUED_CREDENTIALS, Revoke),
+        // A context acting as it (`delete_blockers`).
+        (crate::keyspaces::CONTEXTS, Blocks),
+    ]
+};
+
+#[cfg(test)]
+mod did_delete_census {
+    use vta_keyspaces::{DidDeleteEffect, did_delete_effect};
+
+    /// A `Cascade`, `Blocks` or `Revoke` label is a claim that the DID deletion does that; hold
+    /// every label to the cascade's own list so none of them can claim work it does not do.
+    #[test]
+    fn did_delete_labels_match_the_cascade() {
+        for ks in crate::keyspaces::ALL {
+            let label = did_delete_effect(ks).expect("every keyspace is classified");
+            let reached = super::DID_DELETE_REACHES
+                .iter()
+                .find(|(name, _)| name == ks)
+                .map(|(_, effect)| *effect);
+            match label {
+                DidDeleteEffect::Cascade | DidDeleteEffect::Blocks | DidDeleteEffect::Revoke => {
+                    assert_eq!(
+                        reached,
+                        Some(label),
+                        "{ks} is labelled {label:?} but the DID deletion does not do that"
+                    );
+                }
+                _ => assert_eq!(
+                    reached, None,
+                    "{ks} is labelled {label:?} but the DID deletion reaches it"
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::store::Store;
+    use crate::webvh_store;
+    use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+    use didwebvh_rs::create::{CreateDIDConfig, create_did};
+    use serde_json::json;
+    use tempfile::TempDir;
+    use vti_common::acl::Role;
+    use vti_common::config::StoreConfig as VtiStoreConfig;
+
+    /// Pin the post-fetch context-scoping invariant that `delete_did_webvh`
+    /// enforces. A context-A admin must not be able to delete a DID record
+    /// owned by context B, even when the record exists and the caller has
+    /// `Role::Admin`. The full function is heavyweight (DIDComm bridge,
+    /// resolver, seed store) so this exercises the invariant against a
+    /// realistic planted record using the same `webvh_store::get_did` +
+    /// `hide_unreachable` sequence the operation runs first.
+    #[tokio::test]
+    async fn delete_did_webvh_blocks_cross_context_admin() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = Store::open(&VtiStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("open store");
+        let webvh_ks = store.keyspace(crate::keyspaces::WEBVH).expect("keyspace");
+
+        let now = Utc::now();
+        let did = "did:webvh:QmTest:example.com:abc";
+        webvh_store::store_did(
+            &webvh_ks,
+            &WebvhDidRecord {
+                did: did.to_string(),
+                server_id: "prod".to_string(),
+                mnemonic: "fixture-mnemonic".to_string(),
+                scid: "QmTest".to_string(),
+                context_id: "ctx-b".to_string(),
+                portable: false,
+                log_entry_count: 1,
+                pre_rotation_count: 0,
+                next_fragment_id: 1,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("plant did record");
+
+        let auth_a = AuthClaims {
+            did: "did:key:z6MkCtxAAdmin".to_string(),
+            role: Role::Admin,
+            allowed_contexts: vec!["ctx-a".to_string()],
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        };
+
+        // Mirror the prelude `delete_did_webvh` runs before any I/O.
+        auth_a.require_admin().expect("admin floor passes");
+        let record = webvh_store::get_did(&webvh_ks, did)
+            .await
+            .expect("get_did ok")
+            .expect("record present");
+        let err = hide_unreachable(&auth_a, &record.context_id, did)
+            .expect_err("context-A admin must not reach a ctx-b DID");
+        // NotFound, not Forbidden: the refusal must not confirm the DID exists.
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got: {err:?}"
+        );
+
+        // Sanity check: same call from a ctx-B admin passes.
+        let auth_b = AuthClaims {
+            did: "did:key:z6MkCtxBAdmin".to_string(),
+            role: Role::Admin,
+            allowed_contexts: vec!["ctx-b".to_string()],
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        };
+        hide_unreachable(&auth_b, &record.context_id, did)
+            .expect("ctx-B admin reaches a ctx-b DID");
+    }
+
+    fn claims_as(did: &str, role: Role) -> AuthClaims {
+        AuthClaims {
+            did: did.to_string(),
+            role,
+            allowed_contexts: vec!["acme".to_string()],
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        }
+    }
+
+    fn acl_keyspace() -> (TempDir, KeyspaceHandle) {
+        let dir = TempDir::new().expect("tempdir");
+        let store = Store::open(&VtiStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("open store");
+        let ks = store.keyspace(crate::keyspaces::ACL).expect("acl keyspace");
+        (dir, ks)
+    }
+
+    /// Keyring VTI-23: a least-privilege manager on `initiator` can mint a
+    /// persona. Before, `create_did_webvh` demanded the admin role.
+    #[tokio::test]
+    async fn an_initiator_may_mint_a_did() {
+        let (_dir, ks) = acl_keyspace();
+        ensure_may_mint(Some(&ks), &claims_as("did:key:zManager", Role::Initiator))
+            .await
+            .expect("initiator derives KeyMint");
+    }
+
+    /// A role that does not derive `KeyMint` is still refused.
+    #[tokio::test]
+    async fn a_reader_may_not_mint_a_did() {
+        let (_dir, ks) = acl_keyspace();
+        let err = ensure_may_mint(Some(&ks), &claims_as("did:key:zReader", Role::Reader))
+            .await
+            .expect_err("reader does not derive KeyMint");
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+    }
+
+    /// The entry is read, so a narrowing removing `KeyMint` binds the next call
+    /// — even for an admin. A role-only check would have let this through.
+    #[tokio::test]
+    async fn a_narrowing_without_key_mint_stops_the_next_mint() {
+        use vti_common::acl::{AclEntry, Capability, store_acl_entry};
+        let (_dir, ks) = acl_keyspace();
+        let auth = claims_as("did:key:zNarrowed", Role::Admin);
+        store_acl_entry(
+            &ks,
+            &AclEntry::new(&auth.did, Role::Admin, "did:key:zRoot")
+                .with_contexts(vec!["acme".to_string()])
+                .with_capabilities(vec![Capability::Sign]),
+        )
+        .await
+        .expect("store the narrowed entry");
+
+        let err = ensure_may_mint(Some(&ks), &auth)
+            .await
+            .expect_err("narrowed away, KeyMint is gone");
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+    }
+
+    /// Offline callers pass no keyspace and fall back to the role, which is
+    /// what reading the store would give them anyway (their DID is in no ACL).
+    #[tokio::test]
+    async fn without_a_keyspace_the_role_decides() {
+        ensure_may_mint(None, &claims_as("cli:setup", Role::Admin))
+            .await
+            .expect("the offline admin path still mints");
+    }
+
+    async fn sample_did_log_for_refresh() -> (String, String, serde_json::Value) {
+        use didwebvh_rs::parameters::Parameters as WebVHParameters;
+
+        let mut signing =
+            affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
+        let pub_mb = signing
+            .get_public_keymultibase()
+            .expect("public key multibase");
+        signing.id = format!("did:key:{pub_mb}#{pub_mb}");
+
+        let did_document = json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "{DID}",
+            "verificationMethod": [{
+                "id": "{DID}#key-0",
+                "type": "Multikey",
+                "controller": "{DID}",
+                "publicKeyMultibase": pub_mb,
+            }],
+            "authentication": ["{DID}#key-0"],
+            "assertionMethod": ["{DID}#key-0"],
+        });
+
+        let parameters = WebVHParameters {
+            update_keys: Some(Arc::new(vec![pub_mb.clone().into()])),
+            ..Default::default()
+        };
+
+        let cfg = CreateDIDConfig::builder()
+            .address("https://example.invalid/.well-known/did/did.jsonl")
+            .authorization_key(signing)
+            .did_document(did_document)
+            .parameters(parameters)
+            .build()
+            .expect("create did config");
+
+        let result = create_did(cfg).await.expect("create did");
+        let did = result.did().to_string();
+        let did_log = serde_json::to_string(result.log_entry()).expect("serialize did log entry");
+        let expected_doc_value =
+            crate::operations::protocol::document::current_document_from_log(&did_log)
+                .expect("current document from log");
+        (did, did_log, expected_doc_value)
+    }
+
+    #[tokio::test]
+    async fn refresh_resolver_doc_from_log_seeds_cache_from_log() {
+        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("resolver");
+        let (did, did_log, expected_doc_value) = sample_did_log_for_refresh().await;
+
+        refresh_resolver_doc_from_log(&resolver, &did, &did_log, "test").await;
+
+        let resolved = resolver
+            .resolve(&did)
+            .await
+            .expect("resolve from refreshed cache");
+        assert!(resolved.cache_hit, "expected cache hit after refresh");
+
+        let expected_doc =
+            serde_json::from_value(expected_doc_value).expect("deserialize expected did document");
+        assert_eq!(resolved.doc, expected_doc);
+    }
+
+    #[tokio::test]
+    async fn refresh_resolver_doc_from_log_preserves_cache_on_parse_failure() {
+        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("resolver");
+        let mut signing =
+            affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None);
+        let pub_mb = signing
+            .get_public_keymultibase()
+            .expect("public key multibase");
+        signing.id = format!("did:key:{pub_mb}#{pub_mb}");
+        let did = format!("did:key:{pub_mb}");
+
+        // A minimal did.jsonl line with a did:key state is enough to seed the
+        // cache with a known-good entry we can then assert survives a failed
+        // refresh.
+        let did_log = serde_json::to_string(&json!({
+            "versionId": "1-test",
+            "versionTime": "2026-01-01T00:00:00Z",
+            "parameters": {},
+            "state": {
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": did,
+            }
+        }))
+        .expect("serialize did log");
+
+        refresh_resolver_doc_from_log(&resolver, &did, &did_log, "test").await;
+        let seeded = resolver
+            .resolve(&did)
+            .await
+            .expect("resolve seeded DID from cache");
+        assert!(
+            seeded.cache_hit,
+            "sanity: DID should be served from cache after the good refresh"
+        );
+
+        // A failed refresh must be fail-safe: keep the last-known-good entry
+        // rather than evicting it (evicting would strand a non-network-resolvable
+        // self-DID). The entry stays cached.
+        refresh_resolver_doc_from_log(&resolver, &did, "not-a-valid-did-log", "test").await;
+
+        let after = resolver
+            .resolve(&did)
+            .await
+            .expect("resolve after failed refresh");
+        assert!(
+            after.cache_hit,
+            "after a failed refresh the prior cache entry must be preserved (still a cache hit)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod delete_cascade_tests {
+    use super::*;
+    use crate::operations::credentials::IssuedCredentialRecord;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    fn credential_ks() -> (KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("open store");
+        let ks = store
+            .keyspace(crate::keyspaces::ISSUED_CREDENTIALS)
+            .expect("issued_credentials ks");
+        (ks, dir)
+    }
+
+    async fn seed(ks: &KeyspaceHandle, id: &str, holder: &str, revoked: Option<&str>) {
+        let record = IssuedCredentialRecord {
+            id: id.to_string(),
+            holder: holder.to_string(),
+            credential: serde_json::json!({ "id": id }),
+            issued_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: "2027-01-01T00:00:00Z".to_string(),
+            revoked_at: revoked.map(str::to_string),
+            revocation_reason: None,
+        };
+        ks.insert_raw(
+            format!("cred:{id}").into_bytes(),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn load(ks: &KeyspaceHandle, id: &str) -> IssuedCredentialRecord {
+        let raw = ks
+            .get_raw(format!("cred:{id}").into_bytes())
+            .await
+            .unwrap()
+            .expect("record present");
+        serde_json::from_slice(&raw).unwrap()
+    }
+
+    /// The preview reports exactly the set the deletion acts on.
+    ///
+    /// One plan, one function, both callers. A preview computed separately from
+    /// the deletion agrees only as long as somebody keeps the two agreeing —
+    /// and a preview that under-reports is worse than none, because it is a
+    /// promise the operator acted on.
+    #[tokio::test]
+    async fn the_plan_names_the_credentials_the_deletion_would_revoke() {
+        let (ks, _dir) = credential_ks();
+        seed(&ks, "a", "did:key:zGone", None).await;
+        seed(&ks, "b", "did:key:zGone", None).await;
+        seed(&ks, "c", "did:key:zStays", None).await;
+        seed(&ks, "d", "did:key:zGone", Some("2026-02-02T00:00:00Z")).await;
+
+        let mut planned = credentials_issued_to(&ks, "did:key:zGone").await.unwrap();
+        planned.sort();
+        assert_eq!(
+            planned,
+            vec!["a".to_string(), "b".to_string()],
+            "an already-revoked credential is not offered up for revoking again, and \
+             another holder's is not in scope at all"
+        );
+
+        // And the deletion moves exactly that many.
+        let revoked = revoke_credentials_for_did(&ks, "did:key:zGone")
+            .await
+            .unwrap();
+        assert_eq!(revoked, planned.len());
+    }
+
+    /// A DID nothing else touches needs no ceremony — the prompt is for
+    /// consequences, not for deletions.
+    #[test]
+    fn a_plan_that_touches_nothing_else_needs_no_confirmation() {
+        assert!(!DidDeletionPlan::default().touches_anything_else());
+        assert!(
+            DidDeletionPlan {
+                has_acl_entry: true,
+                ..Default::default()
+            }
+            .touches_anything_else()
+        );
+        assert!(
+            DidDeletionPlan {
+                credentials_to_revoke: vec!["a".into()],
+                ..Default::default()
+            }
+            .touches_anything_else()
+        );
+        assert!(
+            DidDeletionPlan {
+                sessions_to_revoke: 1,
+                ..Default::default()
+            }
+            .touches_anything_else()
+        );
+    }
+
+    /// Credentials issued to the deleted DID are revoked — and *only* those.
+    ///
+    /// The blast radius matters as much as the effect: this runs during a
+    /// deletion, over every issued credential the VTA holds, and a `holder`
+    /// comparison that was slightly too loose would revoke other people's
+    /// credentials as a side effect of deleting one DID.
+    #[tokio::test]
+    async fn only_the_deleted_dids_credentials_are_revoked() {
+        let (ks, _dir) = credential_ks();
+        seed(&ks, "a", "did:key:zGone", None).await;
+        seed(&ks, "b", "did:key:zGone", None).await;
+        seed(&ks, "c", "did:key:zStays", None).await;
+
+        let revoked = revoke_credentials_for_did(&ks, "did:key:zGone")
+            .await
+            .expect("revoke");
+        assert_eq!(revoked, 2);
+
+        assert!(load(&ks, "a").await.revoked_at.is_some());
+        assert!(load(&ks, "b").await.revoked_at.is_some());
+        assert!(
+            load(&ks, "c").await.revoked_at.is_none(),
+            "another holder's credential must be untouched"
+        );
+    }
+
+    /// The record is revoked, never removed. Deleting it would destroy the only
+    /// evidence that the credential in somebody else's wallet is no longer good
+    /// — which is the whole reason this path revokes rather than cascades.
+    #[tokio::test]
+    async fn revocation_is_a_tombstone_not_a_deletion() {
+        let (ks, _dir) = credential_ks();
+        seed(&ks, "a", "did:key:zGone", None).await;
+
+        revoke_credentials_for_did(&ks, "did:key:zGone")
+            .await
+            .expect("revoke");
+
+        let record = load(&ks, "a").await;
+        assert!(record.revoked_at.is_some());
+        assert_eq!(
+            record.revocation_reason.as_deref(),
+            Some("holder DID deleted")
+        );
+        // The credential itself survives, so a verifier asking about it still
+        // gets an answer.
+        assert_eq!(record.credential["id"], "a");
+    }
+
+    /// An already-revoked credential keeps its original timestamp. Re-revoking
+    /// would rewrite when the credential actually stopped being good, which is
+    /// the one fact the record exists to carry.
+    #[tokio::test]
+    async fn an_already_revoked_credential_keeps_its_original_timestamp() {
+        let (ks, _dir) = credential_ks();
+        seed(&ks, "a", "did:key:zGone", Some("2026-02-02T00:00:00Z")).await;
+
+        let revoked = revoke_credentials_for_did(&ks, "did:key:zGone")
+            .await
+            .expect("revoke");
+        assert_eq!(revoked, 0, "already-revoked records are not counted again");
+        assert_eq!(
+            load(&ks, "a").await.revoked_at.as_deref(),
+            Some("2026-02-02T00:00:00Z")
+        );
+    }
+
+    /// Nothing to revoke is a successful no-op, not an error — a DID may
+    /// legitimately have been issued nothing.
+    #[tokio::test]
+    async fn a_did_with_no_credentials_revokes_none() {
+        let (ks, _dir) = credential_ks();
+        seed(&ks, "c", "did:key:zStays", None).await;
+        assert_eq!(
+            revoke_credentials_for_did(&ks, "did:key:zNothing")
+                .await
+                .expect("revoke"),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_slot_plan_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use vta_sdk::did_templates::{KeyPurpose, KeySlot};
+
+    fn slot(purpose: KeyPurpose, algorithms: &[&str]) -> KeySlot {
+        KeySlot {
+            purpose,
+            algorithms: algorithms.iter().map(|a| (*a).to_string()).collect(),
+            publish: true,
+        }
+    }
+
+    /// No template, or a v1 one, means the pair this stack has always minted.
+    /// `key_slots()` answers for both, so there is no schema-version branch —
+    /// and if this drifts, every v1 template starts minting something its
+    /// document does not describe.
+    #[test]
+    fn no_slots_means_the_historical_pair() {
+        let plan = plan_key_slots(&BTreeMap::new()).expect("empty is the default");
+        assert_eq!(plan.signing, vec![KeyType::Ed25519]);
+        assert!(plan.additional_signing.is_empty());
+    }
+
+    #[test]
+    fn a_signing_slot_keeps_its_declared_order() {
+        let slots = BTreeMap::from([
+            (
+                "signing".to_string(),
+                slot(KeyPurpose::Signing, &["mldsa44", "ed25519"]),
+            ),
+            (
+                "ka".to_string(),
+                slot(KeyPurpose::KeyAgreement, &["x25519"]),
+            ),
+        ]);
+        let plan = plan_key_slots(&slots).expect("valid");
+        assert_eq!(plan.signing, vec![KeyType::MlDsa44, KeyType::Ed25519]);
+        assert!(plan.additional_signing.is_empty());
+    }
+
+    #[test]
+    fn an_extra_signing_slot_is_planned_separately() {
+        let slots = BTreeMap::from([
+            (
+                "signing".to_string(),
+                slot(KeyPurpose::Signing, &["ed25519"]),
+            ),
+            (
+                "ka".to_string(),
+                slot(KeyPurpose::KeyAgreement, &["x25519"]),
+            ),
+            (
+                "pq-signing".to_string(),
+                slot(KeyPurpose::Signing, &["mldsa44"]),
+            ),
+        ]);
+        let plan = plan_key_slots(&slots).expect("valid");
+        assert_eq!(plan.signing, vec![KeyType::Ed25519]);
+        assert_eq!(
+            plan.additional_signing,
+            vec![("pq-signing".to_string(), vec![KeyType::MlDsa44])]
+        );
+    }
+
+    /// A second key-agreement key is refused rather than ignored. Minting one
+    /// would put a second `keyAgreement` entry in the document, which changes
+    /// which secret an inbound encrypted message resolves to
+    /// (`did_secrets::select_secret_kid`) — and nothing here decides that. The
+    /// failure would surface at a mediator as an undecryptable message, a long
+    /// way from the template that caused it.
+    #[test]
+    fn a_second_key_agreement_slot_is_refused() {
+        let slots = BTreeMap::from([
+            (
+                "signing".to_string(),
+                slot(KeyPurpose::Signing, &["ed25519"]),
+            ),
+            (
+                "ka".to_string(),
+                slot(KeyPurpose::KeyAgreement, &["x25519"]),
+            ),
+            (
+                "ka-2".to_string(),
+                slot(KeyPurpose::KeyAgreement, &["x25519"]),
+            ),
+        ]);
+        let err = plan_key_slots(&slots).expect_err("a second KA slot cannot be minted");
+        assert!(
+            err.to_string().contains("ka-2"),
+            "the refusal must name the slot: {err}"
+        );
+    }
+
+    /// An algorithm name this build does not know is refused **with the slot
+    /// that named it**. The derivation functions only see a `KeyType`, so by
+    /// the time one of them could complain the slot is gone — and "unknown
+    /// algorithm" without a slot is not actionable in a template with several.
+    #[test]
+    fn an_unknown_algorithm_is_refused_with_its_slot() {
+        let slots = BTreeMap::from([(
+            "signing".to_string(),
+            slot(KeyPurpose::Signing, &["falcon512"]),
+        )]);
+        let err = plan_key_slots(&slots).expect_err("unknown algorithm");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signing") && msg.contains("falcon512"),
+            "must name both the slot and the algorithm: {msg}"
+        );
+    }
+
+    /// Declaring slots but omitting the primary is refused: every DID this VTA
+    /// mints needs one, and `{SIGNING_KEY_MB}` has nothing to render from.
+    #[test]
+    fn slots_without_a_primary_signing_slot_are_refused() {
+        let slots = BTreeMap::from([(
+            "ka".to_string(),
+            slot(KeyPurpose::KeyAgreement, &["x25519"]),
+        )]);
+        let err = plan_key_slots(&slots).expect_err("no primary signing slot");
+        assert!(err.to_string().contains("signing"), "{err}");
+    }
+
+    /// The webvh log-entry constraint, at the level it is decided.
+    ///
+    /// `didwebvh` 1.0 mandates `eddsa-jcs-2022` for log-entry proofs, so a
+    /// preference list falls back past every post-quantum entry — exactly as it
+    /// would for an algorithm this build could not mint. A list with no
+    /// classical entry is refused rather than silently substituted: a template
+    /// authored to be post-quantum, minting classical and saying nothing, is
+    /// the failure the `keys` block exists to prevent.
+    #[test]
+    fn a_webvh_primary_signing_preference_falls_back_to_ed25519() {
+        assert_eq!(
+            log_entry_capable_signing(&[KeyType::MlDsa44, KeyType::Ed25519]).expect("falls back"),
+            vec![KeyType::Ed25519]
+        );
+
+        let err = log_entry_capable_signing(&[KeyType::MlDsa44, KeyType::MlDsa65])
+            .expect_err("no algorithm here can sign a log entry");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ed25519") && msg.contains("additional signing slot"),
+            "the refusal must say why and what to do instead: {msg}"
+        );
+    }
+}

@@ -1,0 +1,223 @@
+[package]
+name = "room-host"
+description = "Stores data-room records for rooms it does not govern — a delivery service, not a community"
+version = "0.1.0"
+edition.workspace = true
+# Not published. A deployable service binary, like `vtc-service`: nothing depends
+# on it as a library except `vta-service`'s tests, which take it as a path-only
+# dev-dependency, so a crates.io artifact would carry an API nobody consumes.
+publish = false
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "room-host"
+path = "src/main.rs"
+
+[dependencies]
+# Storage, wire types and authorization. The whole of what hosting a room needs —
+# no member lifecycle, no policy engine, no credential issuance, no admin UI.
+vti-rooms = { path = "../vti-rooms", version = "0.37" }
+# The store and AppError. Nothing else internal.
+vti-common = { path = "../vti-common", version = "0.66" }
+# The store-backed accepted-document-id record the VTA and the VTC keep (VTI-OPS-029).
+vti-trust-task-server = { path = "../vti-trust-task-server", version = "0.12" }
+# The `rooms/*` handlers, shared with the VTC behind one `RoomHost` trait (#2575).
+vti-rooms-host = { path = "../vti-rooms-host", version = "0.2" }
+vti-rooms-dtg = { path = "../vti-rooms-dtg" }
+# The room client, for pulling from a write-primary. Host-neutral despite the
+# name: a mirror reads its primary exactly as any member would, because that is
+# the only way to read a room.
+vtc-client = { path = "../vtc-client", version = "0.45" }
+
+axum = { workspace = true }
+# `retention_policy` needs a clock to compute a record's expiry.
+chrono = { workspace = true }
+# CORS only, and only when an operator asks for it — see `router_with_origins`.
+tower-http = { workspace = true, features = ["cors"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+affinidi-did-resolver-cache-sdk = { workspace = true }
+# `vti_rooms::watch::Signals` is an async trait object.
+async-trait = { workspace = true }
+
+# A room host and a VTC serve the same protocol, so they must speak the same
+# wire form: requests and responses are Trust Task documents, not bare JSON.
+trust-tasks-rs = { workspace = true }
+# The generated Trust Task wire types, at the versions VTI pins (CLAUDE.md,
+# "Pinning a task version").
+vti-specs = { path = "../vti-specs", version = "0.15" }
+uuid = { workspace = true }
+# Room-file chunks travel base64url in their Trust Task documents.
+base64 = { workspace = true }
+
+# ── Being reachable at a mediator. Off by default — see `src/didcomm.rs`. ──
+#
+# A host that is not told to be reachable opens no socket and needs no identity,
+# which is this crate's posture everywhere else too (network DID resolution off,
+# browser origins off). Opening a standing outbound connection to a third party
+# is a larger decision than either, so it is one an operator makes.
+affinidi-tdk = { workspace = true, optional = true }
+# `affinidi-messaging-sdk/tsp` is what compiles the real TSP unpack arm; without
+# it the transport drops every TSP frame with a log line and nothing else. The
+# facade forwards it on `main` since affinidi-tdk-rs#785 but in no published
+# release yet, so this asks for it directly — and would anyway, because it needs
+# `DidCommTransport` and `affinidi-messaging-core`'s shapes.
+affinidi-messaging-sdk = { workspace = true, optional = true, features = ["tsp"] }
+affinidi-messaging-core = { workspace = true, optional = true }
+# **The same secret storage every other service in this workspace uses.** The
+# host's identity is a private key; it belongs behind the same `[secrets]`
+# config and the same backends the VTA and VTC take, not in a file this crate
+# invented. See `didcomm::HostIdentity`.
+vti-secrets = { path = "../vti-secrets", version = "0.39", optional = true }
+# The session store behind `onboarding` — which backend is an operator's choice,
+# exactly as `[secrets]` is.
+vta-sdk = { path = "../vta-sdk", version = "0.90", optional = true }
+# Reading the `[secrets]` table out of a config file.
+toml = { workspace = true, optional = true }
+serde_ignored = { workspace = true, optional = true }
+affinidi-secrets-resolver = { workspace = true, optional = true }
+# `ENVELOPE_TYPE`, from the crate that defines the binding rather than a fourth
+# hand-written copy of the URI.
+trust-tasks-didcomm = { workspace = true, optional = true }
+# `TspHandler`: the TSP binding's own issuer-vs-sender comparison, beside
+# `DidcommHandler` above, rather than a hand-written one.
+trust-tasks-tsp = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+
+[features]
+default = ["jemalloc"]
+## Use jemalloc as the binary's global allocator (set in src/main.rs; a library
+## must never impose an allocator on its consumers). On by default: with the
+## system allocator (glibc malloc) freed pages are kept in the process's arenas,
+## so RSS ratchets up to its high-water mark and stays there — which reads as a
+## leak in monitoring even when the live heap is flat. jemalloc's decay-based
+## purging returns them, so RSS tracks live memory. Disable
+## (`--no-default-features`) to profile against the system allocator.
+jemalloc = ["dep:tikv-jemallocator"]
+
+## Test knobs a host's own and its consumers' tests need (`HostState::set_watch_signal_delay_ms`).
+## Never on in a served build: a host serving members keeps the spec's 2–6 s delay.
+test-support = ["vti-rooms/test-support"]
+keyring = ["vti-secrets/keyring"]
+config-secret = ["vti-secrets/config-seed"]
+aws-secrets = ["vti-secrets/aws-secrets"]
+gcp-secrets = ["vti-secrets/gcp-secrets"]
+azure-secrets = ["vti-secrets/azure-secrets"]
+vault-secrets = ["vti-secrets/vault-secrets"]
+k8s-secrets = ["vti-secrets/k8s-secrets"]
+## Enrol with a VTA: ephemeral `did:key` → operator grant → auto-rotate, the flow
+## the mediator, PNM and did-hosting already use. Separate from `didcomm` because
+## a host can be reachable without being governed by any VTA.
+## `affinidi-secrets-resolver` because the identity this feature fetches is a set of
+## `Secret`s — it is the return type of `onboarding::fetch_identity`, not an internal
+## detail. Without it `--features onboarding` alone did not compile at all; the
+## dependency arrived only via `didcomm`, so every build that had both hid it.
+onboarding = [
+    "dep:vti-secrets",
+    "dep:vta-sdk",
+    "dep:affinidi-secrets-resolver",
+    "dep:toml",
+    "dep:serde_ignored",
+    "vti-secrets/onboarding",
+]
+## Session storage for the enrolled identity. One is required by `onboarding`, and
+## which one is an operator's decision — the same shape as `[secrets]`.
+config-session = ["vta-sdk/config-session"]
+session-keyring = ["vta-sdk/keyring"]
+## Speak TSP to the **VTA**, as `vtc-service`, `vta-service`, `vtc-client` and
+## `pnm-cli` already do. Distinct from the `didcomm` feature, which is about
+## serving members: this is the control leg that fetches this host's identity.
+##
+## Not optional in practice against a VTA that advertises TSP, and the reason is
+## the *first* connect specifically. A pending-rotation session picks its
+## transport in `vta_sdk::session::rotation_endpoint`, whose TSP arm is matched
+## first and taken unconditionally; `connect_tsp_bounded` then fails a build
+## without this feature outright, with no fallback. Every *later* connect takes
+## the steady-state path, which falls back to DIDComm with a warning. So without
+## this, enrolment against a dual-transport VTA fails at the one step that
+## cannot retry, while a host that somehow got past it keeps working — which is
+## why this reads as intermittent rather than as a missing feature.
+tsp = ["onboarding", "vta-sdk/tsp"]
+## Serve Trust Tasks over DIDComm and TSP at a mediator, as well as over HTTP.
+##
+## Secret backends are opt-in on top, exactly as they are for the VTA and VTC —
+## a host with none configured keeps its identity in a plaintext file under
+## `--data-dir`, which is right for a laptop and not for anything else.
+didcomm = [
+    "dep:vti-secrets",
+    "dep:toml",
+    "dep:serde_ignored",
+    "dep:affinidi-tdk",
+    "dep:affinidi-messaging-sdk",
+    "dep:affinidi-messaging-core",
+    "dep:affinidi-secrets-resolver",
+    "dep:trust-tasks-didcomm",
+    "dep:trust-tasks-tsp",
+    "dep:futures-util",
+    # The watches' signal (`rooms/changed/0.1`): the workspace's transport selection by
+    # service type (`vta_sdk::protocol::matching`), the TSP binding's envelope, and the
+    # cross-mediator TSP send (`vti_common::tsp_route`).
+    "dep:vta-sdk",
+    "vta-sdk/tsp",
+    "vti-common/tsp",
+    # Signing this host's answers as its DID (`didcomm::AnswerSigner`): the workspace's
+    # Trust Task signer, `vta_sdk::trust_task_sign`.
+    "vta-sdk/client",
+]
+
+[dev-dependencies]
+# Credentials stating purposes, for the read-purpose tests (VTI-ACL-110).
+dtg-credentials = { workspace = true }
+# A mediator in-process, so the carrier round trip is tested against a real one
+# rather than a simulator. Everything `tests/carrier.rs` covers is packing,
+# routing, threading and acking — a simulator would be a second opinion about
+# exactly the parts that were wrong.
+affinidi-messaging-test-mediator = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+vti-rooms-dtg = { path = "../vti-rooms-dtg", features = ["test-support"] }
+
+# The `data_room` example drives this host with the real client, so it needs the
+# client's MLS layer and a throwaway signer. None of this reaches the binary.
+vtc-client = { path = "../vtc-client", features = ["mls"] }
+vta-sdk = { path = "../vta-sdk" }
+openmls_rust_crypto = { workspace = true }
+# Computing chunk digests the way an uploader does, in the room-file tests.
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+multibase = { workspace = true }
+base64 = { workspace = true }
+# A stand-in store that presigns reads, for the direct `rooms/blobs/get/0.2` tests.
+async-trait = { workspace = true }
+# The S3-shaped mock store and its presigner, for the direct-upload tests.
+vti-common = { path = "../vti-common", features = ["blob-presigned", "test-support"] }
+vti-rooms = { path = "../vti-rooms", features = ["test-support"] }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+
+# jemalloc for the binary (see the `jemalloc` feature). Not available on MSVC;
+# the cfg gate in src/main.rs falls back to the system allocator there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+# The workspace lint table with `unsafe_code` at `deny`, not `forbid` (#2658):
+# this crate exports jemalloc's `_rjem_malloc_conf` tuning symbol from
+# src/main.rs, which needs `#[unsafe(export_name)]`. That statement carries
+# `#[allow(unsafe_code)]` beside its SAFETY comment.
+# `scripts/check-workspace-lints.py` holds this table to `[workspace.lints]`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"

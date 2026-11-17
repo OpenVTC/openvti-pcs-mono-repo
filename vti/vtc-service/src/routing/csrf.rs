@@ -1,0 +1,707 @@
+//! CSRF protection for admin mutating endpoints (Phase 5 M5.2.2).
+//!
+//! ## What CSRF actually defends
+//!
+//! The only attack CSRF stops is a forged cross-site request riding
+//! the victim's **ambient cookie session**: the browser auto-attaches
+//! the `vtc_admin_session` cookie to a POST initiated by an attacker
+//! page, so the request authenticates as the victim. The defense is
+//! to require proof the request was *intended* — either a same-origin
+//! stamp the attacker can't forge, or a double-submit token the
+//! attacker can't read across origins.
+//!
+//! A request that carries **no session cookie** can't be
+//! authenticated-as-victim and therefore can't be a CSRF attack —
+//! there is nothing to protect. So CSRF is enforced **only on
+//! cookie-session requests**; everything else passes through and the
+//! per-route auth layer decides (returning a clean `401` for a
+//! genuinely unauthenticated call instead of a misleading
+//! `CsrfFailed`). This is the P3.2 fix: the earlier code gated *every*
+//! mutating request, so programmatic clients and credential-less
+//! probes alike got a 403 the threat model never warranted.
+//!
+//! ## Enforcement (cookie-session requests only)
+//!
+//! For a mutating request that carries the `vtc_admin_session`
+//! cookie, one of two checks must pass:
+//!
+//! 1. **`Sec-Fetch-Site: same-origin`** — modern browsers stamp
+//!    this header on fetches initiated from the same origin as the
+//!    receiving server. An attacker page's cross-site POST is stamped
+//!    `cross-site`, not `same-origin`.
+//! 2. **CSRF double-submit cookie** — the request must carry a
+//!    `csrf` cookie value that matches the `X-CSRF-Token` request
+//!    header. The cookie is set by the cookie-session mints
+//!    (`vtc/auth/admin-session/0.2` on `/v1/trust-tasks`,
+//!    `/v1/auth/passkey-login/finish`); an
+//!    attacker can't read it across origins to echo it in the header.
+//!
+//! Either check passing → request continues. Both failing → 403
+//! `CsrfFailed`.
+//!
+//! ## Pass-through (before enforcement)
+//!
+//! - **GET / HEAD / OPTIONS** are not state-mutating.
+//! - **`Authorization: Bearer` requests** are structurally
+//!   CSRF-immune: a browser never auto-attaches an `Authorization`
+//!   header the way it replays cookies, so a forged cross-site request
+//!   can't carry the bearer credential. Programmatic CLI / wallet /
+//!   SDK clients authenticate this way. Checked explicitly (and first)
+//!   so a bearer call still passes even if a stale session cookie
+//!   tags along — the auth extractor prefers the bearer token too.
+//! - **No `vtc_admin_session` cookie** — not a cookie session, so not
+//!   forgeable (see above). This subsumes the unauthenticated
+//!   bootstrap flows (the wallet `…/auth/*` routes, passkey login),
+//!   none of which carry a session cookie.
+//! - **[`CSRF_EXEMPT_PATHS`]** — an explicit belt-and-braces list for
+//!   the known unauthenticated bootstrap endpoints, kept so they pass
+//!   even on the off chance a request reaches them carrying a stale
+//!   session cookie (e.g. a re-login while an old cookie lingers).
+//!   Every entry is a live route (#2661).
+
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
+use axum::middleware::Next;
+use axum::response::IntoResponse;
+use serde_json::json;
+use subtle::ConstantTimeEq;
+
+// Single source of truth for the cookie name: the same constant the
+// auth extractor reads to authenticate a cookie session. If a new
+// auth cookie is ever added there, the CSRF gate must learn about it
+// too — keep them pinned to the same symbol so the coupling is loud.
+use vti_common::auth::extractor::{
+    ADMIN_REFRESH_COOKIE, ADMIN_SESSION_COOKIE, LEGACY_ADMIN_REFRESH_COOKIE,
+    LEGACY_ADMIN_SESSION_COOKIE,
+};
+
+/// The console's CSRF double-submit cookie. `__Host-`-prefixed (#2661) — it is
+/// `Path=/`, `Secure` and carries no `Domain` — so a sibling subdomain cannot
+/// plant a value of its own choosing.
+pub const ADMIN_CSRF_COOKIE: &str = "__Host-csrf";
+
+/// The name [`ADMIN_CSRF_COOKIE`] had before its `__Host-` prefix: read,
+/// after the prefixed name, for one release; never written, only cleared.
+pub const LEGACY_ADMIN_CSRF_COOKIE: &str = "csrf";
+
+/// Paths exempt from CSRF: unauth bootstrapping flows + the public
+/// form-post target. Each is documented in the module-level
+/// rationale. Every one is a live route — `every_csrf_exemption_names_a_live_route`
+/// (in `tests/it/cookie_session.rs`) holds that, so an exemption cannot outlive
+/// the route it was written for and quietly cover whatever is mounted there
+/// next (#2661).
+pub const CSRF_EXEMPT_PATHS: &[&str] = &[
+    // VTA-wallet header-exempt auth surface (unauthenticated bootstrap —
+    // no session cookie yet).
+    "/v1/wallet/auth/challenge",
+    "/v1/wallet/auth/",
+    // The member portal's wallet aliases, for the same reason.
+    "/v1/member/wallet/auth/challenge",
+    "/v1/member/wallet/auth/",
+    // `/v1/auth/refresh` was exempt here until the admin console gained a
+    // refresh cookie. While the only way to present a refresh token was
+    // to put it in the request body, the endpoint was structurally
+    // CSRF-immune: a cross-site page cannot read the token, so it cannot
+    // forge the request. A cookie the browser attaches on its own removes
+    // that property, and a forged refresh would rotate the victim's token
+    // out from under them — the attacker learns nothing (they cannot read
+    // the response) but the session is destroyed, which is a logout DoS.
+    //
+    // Removing the exemption costs the body-token callers nothing: an
+    // SDK/CLI refresh carries no session cookie, so `has_session_cookie`
+    // below lets it through unenforced. Only the browser path, which
+    // already sends `X-CSRF-Token` on every mutation, is now gated.
+    //
+    // `/v1/join-requests` (and its holder `…/{id}/accept`, `…/{id}/status`
+    // suffixes), `/v1/auth/challenge`, `/v1/auth/`,
+    // `/v1/install/claim/{start,finish}` and `/v1/admin/bootstrap` were
+    // exempt too; their routes are gone (each is a Trust Task on
+    // `/v1/trust-tasks` now), so the exemptions went with them (#2661).
+];
+
+/// Routes that read their credential from a cookie **whatever else the
+/// request carries**: the cookie refresh and sign-out of both applications.
+/// A bearer header does not stand in for the cookie there — the handler reads
+/// the cookie regardless — so it must not skip the CSRF check either (#2661).
+pub const COOKIE_READING_PATHS: &[&str] = &[
+    "/v1/auth/refresh",
+    "/v1/auth/sign-out",
+    "/v1/member/auth/refresh",
+    "/v1/member/sign-out",
+];
+
+/// True when the request carries an `Authorization: Bearer …` header **the
+/// extractors read** ([`vti_common::auth::extractor::bearer_token`]). Such a
+/// request authenticates by that header, which a browser never attaches on its
+/// own, so it is structurally CSRF-immune — see the module rationale. A
+/// header the extractors would not read (leading whitespace, an empty
+/// token) does not count: the request would authenticate by
+/// its cookie, so it is gated like any cookie request (#2661).
+fn has_bearer_auth(headers: &HeaderMap) -> bool {
+    vti_common::auth::extractor::bearer_token(headers).is_some_and(|t| !t.trim().is_empty())
+}
+
+/// True when `path` is exempt from CSRF enforcement: the bootstrapping
+/// flows in [`CSRF_EXEMPT_PATHS`].
+fn is_csrf_exempt(path: &str) -> bool {
+    CSRF_EXEMPT_PATHS.contains(&path)
+}
+
+/// True when the request carries either admin cookie — the credentials
+/// a CSRF attack can ride. Requests without one can't be
+/// authenticated-as-victim, so they're not a CSRF vector and skip
+/// enforcement (the auth layer 401s them if they're unauthenticated).
+///
+/// Both cookies count, not just the session one. `vtc_admin_refresh`
+/// authenticates `/v1/auth/refresh` all by itself, so a request holding
+/// only that one is every bit as forgeable as a request holding only the
+/// session cookie — and a browser whose access cookie has already lapsed
+/// is in exactly that state.
+fn has_session_cookie(headers: &HeaderMap, jar: &CookieJar) -> bool {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .map(|s| s.trim())
+        .filter_map(|kv| kv.split_once('='))
+        .any(|(name, _)| jar.session.contains(&name))
+}
+
+/// The request's CSRF cookie value for `jar`: the prefixed name first, then
+/// the name before the prefix.
+fn csrf_cookie_value<'a>(headers: &'a HeaderMap, jar: &CookieJar) -> Option<&'a str> {
+    jar.csrf.iter().find_map(|wanted| {
+        headers
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|s| s.split(';'))
+            .map(|s| s.trim())
+            .filter_map(|kv| kv.split_once('='))
+            .find_map(|(k, v)| (k == *wanted).then_some(v))
+    })
+}
+
+/// The cookies that authenticate a request on a given path, and the CSRF
+/// cookie that pairs with them.
+///
+/// Two applications share this origin. The console's cookies are `Path=/`;
+/// the member portal's session and refresh cookies are `Path=/v1/member`
+/// (`crate::member_portal`), and its double-submit value is
+/// `vtc_member_csrf` rather than `csrf`, so the two never overwrite each
+/// other's. Under `/v1/member/` only the member cookies authenticate anything —
+/// the member routes never read the console's — so they are the ones a forged
+/// request could ride, and the member CSRF value is the one to match.
+///
+/// Each name is listed with the one it had before its `__Host-` prefix, which
+/// is still read for one release (#2661) and so is still a credential a forged
+/// request could ride.
+struct CookieJar {
+    session: &'static [&'static str],
+    /// The CSRF cookie's names, the one to prefer first.
+    csrf: &'static [&'static str],
+}
+
+const ADMIN_JAR: CookieJar = CookieJar {
+    session: &[
+        ADMIN_SESSION_COOKIE,
+        ADMIN_REFRESH_COOKIE,
+        LEGACY_ADMIN_SESSION_COOKIE,
+        LEGACY_ADMIN_REFRESH_COOKIE,
+    ],
+    csrf: &[ADMIN_CSRF_COOKIE, LEGACY_ADMIN_CSRF_COOKIE],
+};
+
+const MEMBER_JAR: CookieJar = CookieJar {
+    session: &[
+        crate::member_portal::MEMBER_SESSION_COOKIE,
+        crate::member_portal::MEMBER_REFRESH_COOKIE,
+    ],
+    csrf: &[
+        crate::member_portal::MEMBER_CSRF_COOKIE,
+        crate::member_portal::LEGACY_MEMBER_CSRF_COOKIE,
+    ],
+};
+
+fn jar_for(path: &str) -> &'static CookieJar {
+    if path.starts_with("/v1/member/") {
+        &MEMBER_JAR
+    } else {
+        &ADMIN_JAR
+    }
+}
+
+/// Tower middleware function. Wire via
+/// `axum::middleware::from_fn(enforce)` at the parent-router level
+/// so the layer sees the full path including the API mount prefix
+/// (the exemption matcher compares against the post-nest URI).
+pub async fn enforce(request: Request, next: Next) -> Response<Body> {
+    // Method gate — only state-mutating verbs are checked.
+    match *request.method() {
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE => {}
+        _ => return next.run(request).await,
+    }
+
+    let path = request.uri().path();
+
+    // Bearer gate — programmatic clients authenticating with an
+    // `Authorization: Bearer` token are structurally CSRF-immune.
+    // Checked first so a bearer call passes even if a stale session
+    // cookie tags along (the auth extractor prefers bearer too) — except on
+    // the routes that read their cookie whatever the request carries.
+    if has_bearer_auth(request.headers()) && !COOKIE_READING_PATHS.contains(&path) {
+        return next.run(request).await;
+    }
+
+    // Path gate — explicit belt-and-braces exemption for the known
+    // unauth bootstrap flows.
+    if is_csrf_exempt(path) {
+        return next.run(request).await;
+    }
+
+    // Session-cookie gate — CSRF only protects cookie-session
+    // requests (ambient-credential replay is the entire threat). A
+    // request with no `vtc_admin_session` cookie can't be forged, so
+    // it passes here and the per-route auth layer returns a clean 401
+    // if it's actually unauthenticated.
+    let jar = jar_for(path);
+    if !has_session_cookie(request.headers(), jar) {
+        return next.run(request).await;
+    }
+
+    // Check 1 — modern browser stamp.
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .map(|v| v == HeaderValue::from_static("same-origin"))
+        .unwrap_or(false)
+    {
+        return next.run(request).await;
+    }
+
+    // Check 2 — double-submit cookie + matching header.
+    let cookie_token = csrf_cookie_value(request.headers(), jar);
+    let header_token = request
+        .headers()
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok());
+
+    // Constant-time comparison on the bytes. A naive `c == h` on a
+    // String would short-circuit at the first mismatching byte, which
+    // leaks prefix-match length over response timing. `ct_eq` runs
+    // in time proportional to the longer slice regardless of where
+    // the bytes diverge. Also gate on `len()` matching first so the
+    // unequal-length path doesn't fall into `ct_eq`'s zero-pad.
+    if let (Some(c), Some(h)) = (cookie_token, header_token)
+        && !c.is_empty()
+        && c.len() == h.len()
+        && bool::from(c.as_bytes().ct_eq(h.as_bytes()))
+    {
+        return next.run(request).await;
+    }
+
+    let body = json!({
+        "error": "CsrfFailed",
+        "message": "POST/PUT/PATCH/DELETE requests require Sec-Fetch-Site: same-origin or a matching csrf cookie + X-CSRF-Token header",
+    });
+    (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn ok() -> &'static str {
+        "ok"
+    }
+
+    /// A `Cookie` header value carrying the admin session cookie, so a
+    /// request looks like a real cookie session to the gate. The unit
+    /// `app()` has no auth layer, so the handler returns 200 once CSRF
+    /// passes — these tests assert the CSRF decision, not auth.
+    const SESSION_COOKIE: &str = "vtc_admin_session=jwt.header.sig";
+
+    fn app() -> Router {
+        Router::new()
+            .route("/v1/members", post(ok).get(ok))
+            .route("/v1/wallet/auth/challenge", post(ok))
+            .route("/v1/member/passkeys/register/start", post(ok))
+            .layer(axum::middleware::from_fn(enforce))
+    }
+
+    #[tokio::test]
+    async fn get_bypasses() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/members")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cookie_session_post_without_csrf_returns_403() {
+        // A real cookie session (carries `vtc_admin_session`) with no
+        // origin stamp and no csrf token is the genuine CSRF-exposed
+        // case → 403.
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .header("cookie", SESSION_COOKIE)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["error"], "CsrfFailed");
+    }
+
+    #[tokio::test]
+    async fn post_without_session_cookie_passes_csrf() {
+        // No bearer, no session cookie, no origin stamp: not a cookie
+        // session, so not a CSRF vector. CSRF passes it through; the
+        // auth layer (absent in this unit harness) is what would 401 a
+        // genuinely unauthenticated call. This is the P3.2 fix — the
+        // old code 403'd here, masking the auth layer's 401.
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cookie_session_post_with_sec_fetch_site_same_origin_passes() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .header("cookie", SESSION_COOKIE)
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cookie_session_post_with_matching_csrf_cookie_and_header_passes() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .header(
+                        "cookie",
+                        format!("{SESSION_COOKIE}; csrf=abc123; other=foo"),
+                    )
+                    .header("x-csrf-token", "abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cookie_session_post_with_non_matching_csrf_header_returns_403() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .header("cookie", format!("{SESSION_COOKIE}; csrf=abc123"))
+                    .header("x-csrf-token", "different")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn auth_challenge_post_bypasses() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/wallet/auth/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_post_without_cookie_or_origin_passes() {
+        // Programmatic CLI/SDK client: bearer token, no Sec-Fetch-Site,
+        // no csrf cookie. Structurally CSRF-immune → passes.
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .header("authorization", "Bearer eyJabc.def.ghi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .header("authorization", "bearer eyJabc.def.ghi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn non_bearer_authorization_scheme_on_cookie_session_stays_gated() {
+        // A `Basic` (or any non-bearer) Authorization header is not the
+        // CSRF-immune bearer case. With a real cookie session and no
+        // origin stamp / csrf token it must still 403 — the non-bearer
+        // scheme doesn't open the bearer skip.
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/members")
+                    .header("authorization", "Basic dXNlcjpwYXNz")
+                    .header("cookie", SESSION_COOKIE)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn session_cookie_detected_among_others() {
+        // The gate must find the session cookie regardless of position
+        // / surrounding pairs, and not false-positive on a lookalike.
+        let mut present = HeaderMap::new();
+        present.insert(
+            "cookie",
+            "foo=1; vtc_admin_session=abc; csrf=t".parse().unwrap(),
+        );
+        assert!(has_session_cookie(&present, &ADMIN_JAR));
+
+        let mut absent = HeaderMap::new();
+        absent.insert("cookie", "csrf=t; other_session=abc".parse().unwrap());
+        assert!(!has_session_cookie(&absent, &ADMIN_JAR));
+    }
+
+    async fn member_post(cookie: &str, header: Option<&str>) -> StatusCode {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/member/passkeys/register/start")
+            .header("cookie", cookie);
+        if let Some(h) = header {
+            req = req.header("x-csrf-token", h);
+        }
+        app()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn member_cookie_session_needs_the_member_csrf_pair() {
+        // A member cookie session with no token is gated...
+        assert_eq!(
+            member_post("vtc_member_session=j", None).await,
+            StatusCode::FORBIDDEN
+        );
+        // ...passes with the member pair...
+        assert_eq!(
+            member_post("vtc_member_session=j; vtc_member_csrf=m", Some("m")).await,
+            StatusCode::OK
+        );
+        // ...and the console's `csrf` value does not stand in for it: the two
+        // applications share an origin, and one must not satisfy the other.
+        assert_eq!(
+            member_post("vtc_member_session=j; csrf=a", Some("a")).await,
+            StatusCode::FORBIDDEN
+        );
+        // A refresh cookie alone is a credential too.
+        assert_eq!(
+            member_post("vtc_member_refresh=r", None).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn member_paths_use_the_member_jar_and_nothing_else_does() {
+        assert_eq!(jar_for("/v1/member/me").csrf[0], "__Host-vtc_member_csrf");
+        assert_eq!(jar_for("/v1/members").csrf[0], "__Host-csrf");
+        assert_eq!(jar_for("/v1/auth/refresh").csrf[0], "__Host-csrf");
+    }
+}
+
+/// #2661: the bearer skip agrees with the extractors, the cookie-reading
+/// routes are gated whatever else a request carries, and the `__Host-` names
+/// are what the gate pairs.
+#[cfg(test)]
+mod issue_2661_tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    async fn ok() -> &'static str {
+        "ok"
+    }
+
+    fn app() -> Router {
+        Router::new()
+            .route("/v1/members", post(ok))
+            .route("/v1/auth/refresh", post(ok))
+            .route("/v1/member/sign-out", post(ok))
+            .layer(axum::middleware::from_fn(enforce))
+    }
+
+    async fn status(uri: &str, headers: &[(&str, &str)]) -> StatusCode {
+        let mut req = Request::builder().method("POST").uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        app()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A header the extractor would not read leaves the request
+    /// authenticating by its cookie, so it opens no skip.
+    #[tokio::test]
+    async fn a_bearer_the_extractor_ignores_does_not_skip_the_gate() {
+        let cookie = ("cookie", "__Host-vtc_admin_session=jwt");
+        for auth in [" Bearer eyJ.a.b", "Bearer ", "Bearer    "] {
+            assert_eq!(
+                status("/v1/members", &[("authorization", auth), cookie]).await,
+                StatusCode::FORBIDDEN,
+                "{auth:?}"
+            );
+        }
+        assert_eq!(
+            status(
+                "/v1/members",
+                &[("authorization", "Bearer eyJ.a.b"), cookie]
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    /// Refresh and sign-out read their cookie whatever the request carries, so a
+    /// bearer does not exempt them.
+    #[tokio::test]
+    async fn cookie_reading_routes_are_gated_despite_a_bearer() {
+        let bearer = ("authorization", "Bearer eyJ.a.b");
+        assert_eq!(
+            status(
+                "/v1/auth/refresh",
+                &[bearer, ("cookie", "__Host-vtc_admin_refresh=r")]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(
+                "/v1/member/sign-out",
+                &[bearer, ("cookie", "vtc_member_session=s")]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // With no cookie there is nothing to forge.
+        assert_eq!(status("/v1/auth/refresh", &[bearer]).await, StatusCode::OK);
+    }
+
+    /// The double-submit pairs the prefixed names, and still the names before
+    /// the prefix for a browser signed in before the rename.
+    #[tokio::test]
+    async fn the_prefixed_and_legacy_csrf_cookies_both_pair() {
+        for cookie in [
+            "__Host-vtc_admin_session=jwt; __Host-csrf=t1",
+            "vtc_admin_session=jwt; csrf=t1",
+            "vtc_admin_session=jwt; __Host-csrf=t1; csrf=other",
+        ] {
+            assert_eq!(
+                status("/v1/members", &[("cookie", cookie), ("x-csrf-token", "t1")]).await,
+                StatusCode::OK,
+                "{cookie}"
+            );
+        }
+        assert_eq!(
+            status(
+                "/v1/members",
+                &[
+                    ("cookie", "__Host-vtc_admin_session=jwt; __Host-csrf=t1"),
+                    ("x-csrf-token", "t2")
+                ]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // The member portal's CSRF cookie, prefixed.
+        assert_eq!(
+            status(
+                "/v1/member/sign-out",
+                &[
+                    ("cookie", "vtc_member_session=s; __Host-vtc_member_csrf=m1"),
+                    ("x-csrf-token", "m1")
+                ]
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+}

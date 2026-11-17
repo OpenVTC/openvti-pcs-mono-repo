@@ -1,0 +1,1349 @@
+//! Authorizing an operation on a room.
+//!
+//! # The invariant this file exists to hold
+//!
+//! **Nothing here reads this service's ACL, member roster, or session state.** A room
+//! operation is authorized by an authority chain the *room* issued, verified against the
+//! room's own identifier. That is invariant I5 of the design note, and it is what makes a
+//! room portable: the moment a host's own state participates in a room decision, the room
+//! cannot move to another host and this service has joined its membership.
+//!
+//! It is also the easiest invariant in the design to lose by accident — one convenience
+//! lookup against `members_ks` "just to check", and the property is gone with every test
+//! still passing. [`AuthorizedAction`] is deliberately constructible only by
+//! [`authorize`], so a handler cannot skip the check and cannot substitute a different one.
+//!
+//! # Two halves, and why they are separated
+//!
+//! Authorizing a room operation has two parts, and only one of them belongs in a crate that
+//! anything can depend on:
+//!
+//! - **Shape.** Is there a chain at all, is it within the depth bound, is there a membership
+//!   credential, does a private room carry its subject binding? These need no credential
+//!   library, no DID resolution and no network. They live here.
+//! - **Cryptography.** Does each credential's proof verify, does the chain reach a root the
+//!   room issued, and does it confer the action being asked for? That needs a credential
+//!   library and a resolver, and it is reached through [`ChainVerifier`].
+//!
+//! The split is not squeamishness about dependencies. `verify_chain` and proof verification
+//! need `dtg-credentials`, which needs a DID resolver, which is a different thing on a VTC
+//! than on a standalone room host. Pinning either choice into this crate would make the
+//! storage layer un-reusable for the other. The trait is what lets **one** decision about
+//! what is safe to serve be shared by hosts that resolve DIDs differently.
+//!
+//! It also means a host that has configured no verifier cannot accidentally serve a sealed
+//! room: [`RefusesEverything`] is the only thing it has, and it refuses.
+//!
+//! # The shape checks run first, always
+//!
+//! [`authorize`] runs every shape check before it calls the verifier, and the order is
+//! load-bearing: depth is the cheapest check and the one that bounds the cost of
+//! verification, which is linear in chain length and runs on every operation.
+
+use vti_common::error::AppError;
+use vti_common::store::KeyspaceHandle;
+
+use crate::purpose::{ChainPurposes, PurposeDecision};
+use crate::revocation::{self, Presented, RevocationList, gate};
+use crate::wire::AuthorityPresentation;
+use crate::{Room, Visibility};
+
+/// Maximum links in an authority chain, including the root.
+///
+/// Verification is linear in chain length and runs on every operation, so an unbounded
+/// chain is a denial-of-service surface. The known uses need far less: a person attenuating
+/// to an agent is depth 2, that agent to a sub-agent is depth 3. A chain near this ceiling
+/// is a signal that authority is being re-delegated further than intended.
+pub const MAX_CHAIN_DEPTH: usize = 8;
+
+/// An action on a room.
+///
+/// Compared exactly and case-sensitively as wire strings, and **no action implies another**:
+/// `Admin` does not grant `Write` unless the credential lists both. Implication is how a
+/// permission model quietly widens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Read,
+    Write,
+    Curate,
+    Admin,
+}
+
+impl Action {
+    /// The wire form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Action::Read => "read",
+            Action::Write => "write",
+            Action::Curate => "curate",
+            Action::Admin => "admin",
+        }
+    }
+}
+
+/// The action a succession nomination grants, and the reason it is not an [`Action`].
+///
+/// A nomination is a VAC the room issues to a successor, and it has to grant *something*
+/// for a chain verifier to check it against. It must not grant `admin`: that would make the
+/// nominee an administrator today, which is precisely the power a nomination must withhold
+/// while the owner is present — the whole point is a right that lies dormant until the
+/// owner does.
+///
+/// So it grants `succeed`, which no room task accepts. It is redeemable through exactly one
+/// path, `rooms/owner/claim`, and only against a dormant room. Keeping it out of [`Action`]
+/// is what makes that true by construction rather than by discipline: [`authorize`] cannot
+/// be passed it, so no amount of future editing there can quietly turn a nomination into a
+/// working grant.
+pub const ACTION_SUCCEED: &str = "succeed";
+
+/// What a verifier concludes about a presentation.
+///
+/// Deliberately narrow: the caller gets the subject and the actions the chain confers, and
+/// nothing that would tempt it to re-derive a decision the verifier already made.
+#[derive(Debug, Clone)]
+pub struct VerifiedChain {
+    /// The party the leaf grants to — who may act.
+    pub subject: String,
+    /// The actions the chain confers, already narrowed by every link above the leaf.
+    pub actions: Vec<String>,
+    /// The member this authority descends from: the subject of the chain's **root**, the
+    /// party the room itself granted to. `None` where the tier withholds it (`private`).
+    ///
+    /// Distinct from [`Self::subject`], which is who may act — frequently an agent a member
+    /// attenuated a chain to, and an agent is not a member of anything. A host charging
+    /// usage to a member charges it here, so a member cannot multiply an allowance by
+    /// minting agents.
+    pub member: Option<String>,
+    /// Every credential the presentation carried — the membership credential (where the
+    /// tier discloses it) and each authority link — as far as a revocation list needs to
+    /// match them (`rooms/revocations/put`, *Matching*).
+    ///
+    /// A verifier that reports nothing here cannot be held to a list: [`authorize`] then
+    /// refuses a disclosing tier's presentation whenever the room's list withdraws anything.
+    pub presented: Presented,
+    /// The earliest instant at which any credential the presentation carried stops being
+    /// valid, where the verifier read one — what bounds a state a host keeps on the strength
+    /// of this presentation (`rooms/watch/0.1` Host item 5: a watch lapses no later). `None`
+    /// is "none of them expires", or a verifier that does not say.
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// The purposes the chain grants (VTI-ACL-102): those its leaf states, read by the
+    /// chain rule of `rooms/owner/issue-authority/0.3`, *Purposes along a chain* — a link
+    /// stating none takes its parent's. [`ChainPurposes::Any`] where no link states any.
+    ///
+    /// A verifier MUST refuse a chain in which a link states purposes its parent does not
+    /// grant (VTI-ACL-107), as it refuses one that widens actions.
+    pub purposes: ChainPurposes,
+}
+
+/// Cryptographic verification of a presentation.
+///
+/// One implementation per host, because the resolver differs; one *decision*, because both
+/// implementations answer the same question and [`authorize`] is the only caller.
+///
+/// # Contract
+///
+/// An implementation MUST verify, at minimum:
+///
+/// 1. every credential in the chain carries a valid proof;
+/// 2. the chain's root was issued by the room — a chain reaching any other party confers
+///    nothing here, however well-formed;
+/// 3. no link widens the actions or scope of its parent;
+/// 4. every link is within its validity window;
+/// 5. the membership credential and the chain describe the same subject;
+/// 6. the chain's leaf grants to `presenter` — the party the *transport* authenticated,
+///    not one named in the payload.
+///
+/// (5) is the pooling defence, and it is the verifier's because it needs both credentials
+/// parsed. On a `private` room it is proved in zero knowledge from the subject binding; on
+/// the disclosing tiers it is a comparison.
+///
+/// (6) is what stops a captured presentation being replayed. A presentation is a bearer
+/// object — it names what may be done, not who is doing it — so without binding it to the
+/// authenticated sender, anyone who observes one inherits it. `presenter` is therefore the
+/// DID a proof established, never a field a caller filled in.
+///
+/// Returning `Ok` for a chain that fails any of these is a privilege escalation, not a
+/// leniency: anyone can mint a well-formed VAC naming any scope and any action.
+/// Verification may need to resolve a DID, so this is async. Keeping it sync would force
+/// every implementation to either block a runtime thread or pre-resolve keys it cannot know
+/// it will need — and pre-resolution is how a verifier ends up trusting a cache instead of a
+/// signature. Same shape as `vti_common::auth::backend`, for the same reason.
+#[async_trait::async_trait]
+pub trait ChainVerifier: Send + Sync {
+    /// Verify `presentation` against `room` for `action`.
+    async fn verify(
+        &self,
+        room: &Room,
+        presentation: &AuthorityPresentation,
+        action: Action,
+        presenter: &str,
+    ) -> Result<VerifiedChain, AppError>;
+
+    /// Verify that `document` (a `RevocationList`, with its `proof`) is the room's own
+    /// statement: its proof verifies with a key `room`'s DID document lists for
+    /// `assertionMethod`, and names a verification method under the room's DID
+    /// (`rooms/revocations/put` item 2; `AuthorityPresentation`, *every credential is its
+    /// issuer's attestation*).
+    ///
+    /// Refuses by default, so a verifier that has not implemented it accepts no list —
+    /// and a host with none holds nothing it could be wrong about.
+    async fn verify_room_signature(
+        &self,
+        room: &Room,
+        _document: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        Err(AppError::Validation(format!(
+            "this host cannot verify room `{}`'s signature on a revocation list",
+            room.room_id
+        )))
+    }
+}
+
+/// The verifier a host has before it configures one.
+///
+/// A host with no credential library cannot check a chain, and a chain nobody checked
+/// authorizes nothing — so this refuses, rather than defaulting to permissive and relying on
+/// an operator to notice. It is the only safe default a fail-open seam can have.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RefusesEverything;
+
+#[async_trait::async_trait]
+impl ChainVerifier for RefusesEverything {
+    async fn verify(
+        &self,
+        room: &Room,
+        _presentation: &AuthorityPresentation,
+        _action: Action,
+        _presenter: &str,
+    ) -> Result<VerifiedChain, AppError> {
+        Err(AppError::Forbidden(format!(
+            "room `{}` has no chain verifier configured on this host, and a chain nobody \
+             verified authorizes nothing",
+            room.room_id
+        )))
+    }
+}
+
+/// Proof that [`authorize`] ran and allowed this operation.
+///
+/// Handlers take this rather than a presentation, so an operation that forgot to authorize
+/// does not compile — the same typestate discipline the workspace uses for verified wire
+/// forms. There is no public constructor.
+#[derive(Debug)]
+pub struct AuthorizedAction {
+    action: Action,
+    room_id: String,
+    verified: VerifiedChain,
+    /// The list this was authorized against, for credentials a task presents beside the
+    /// chain (a succession nomination).
+    held: Option<RevocationList>,
+    /// The room's gate, held until this value is dropped — which a handler does once what
+    /// it authorized has committed (`rooms/revocations/put`, *Enforcement* item 3).
+    _gate: Gate,
+}
+
+/// The room gate an authorization holds.
+#[derive(Debug)]
+pub(crate) enum Gate {
+    Shared(#[allow(dead_code)] gate::Shared),
+    Exclusive(#[allow(dead_code)] gate::Exclusive),
+}
+
+impl AuthorizedAction {
+    /// The action that was authorized.
+    pub fn action(&self) -> Action {
+        self.action
+    }
+    /// The room it was authorized against.
+    pub fn room_id(&self) -> &str {
+        &self.room_id
+    }
+    /// Who the chain says may act.
+    ///
+    /// This is the subject the *verifier* established, never one a caller supplied — which
+    /// is why a handler recording an author reads it from here.
+    pub fn subject(&self) -> &str {
+        &self.verified.subject
+    }
+    /// Everything the chain confers, which is at least the action asked for.
+    pub fn conferred(&self) -> &[String] {
+        &self.verified.actions
+    }
+    /// The member the chain descends from, where the tier discloses one
+    /// ([`VerifiedChain::member`]).
+    pub fn member(&self) -> Option<&str> {
+        self.verified.member.as_deref()
+    }
+    /// The credentials the presentation carried, as a transfer step that presents nothing
+    /// is later held to ([`revocation::Presented`]).
+    pub fn presented(&self) -> &Presented {
+        &self.verified.presented
+    }
+    /// When the first credential of the presentation stops being valid
+    /// ([`VerifiedChain::valid_until`]).
+    pub fn valid_until(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.verified.valid_until
+    }
+    /// The purposes the chain grants ([`VerifiedChain::purposes`]).
+    pub fn purposes(&self) -> &ChainPurposes {
+        &self.verified.purposes
+    }
+    /// Decide a read naming `requested`, or none, against the purposes the chain grants
+    /// (`rooms/records/get/0.4`, *Purpose of use*). Every read is purpose-bound: a version
+    /// that cannot name a purpose is decided as one naming none.
+    pub fn admit_purpose(&self, requested: Option<&str>) -> PurposeDecision {
+        self.verified.purposes.admit(requested)
+    }
+    /// Refuse unless `credential` — presented beside the chain, such as a succession
+    /// nomination — is withdrawn by none of the list this was authorized against. The same
+    /// opaque refusal as any withdrawn presentation.
+    pub fn also_unrevoked(&self, credential: &revocation::CredentialFacts) -> Result<(), AppError> {
+        match &self.held {
+            Some(list) if list.revokes(credential) => Err(withdrawn(&self.room_id)),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The refusal for a presentation a held list withdraws: the framework's standard
+/// `permissionDenied`, and nothing that says *why* — a distinct answer would tell whoever
+/// holds a captured credential that its withdrawal was noticed, and a removed party which
+/// host has caught up (`rooms/revocations/put`, *Opaque refusals*).
+pub(crate) fn withdrawn(room_id: &str) -> AppError {
+    AppError::Forbidden(format!(
+        "the presentation does not authorize this operation on room `{room_id}`"
+    ))
+}
+
+/// Proof that [`authorize_create`] ran and allowed a room to be registered.
+///
+/// Separate from [`AuthorizedAction`] because creating a room is the one operation no chain
+/// can authorize: at the moment it runs the room has issued nothing, so there is no
+/// credential in the world that speaks for it. The typestate is the same, though — a handler
+/// takes this rather than a payload, so a create that skipped the check does not compile.
+#[derive(Debug)]
+pub struct AuthorizedCreate {
+    room_id: String,
+    owner_did: String,
+}
+
+impl AuthorizedCreate {
+    /// The room being registered.
+    pub fn room_id(&self) -> &str {
+        &self.room_id
+    }
+    /// Its owner — necessarily also the party that signed the request.
+    pub fn owner_did(&self) -> &str {
+        &self.owner_did
+    }
+}
+
+/// Authorize registering a room: the presenter must be the party they name as owner.
+///
+/// # Why this is the check, and what it deliberately is not
+///
+/// Every other room operation is authorized by a chain the room issued. Create cannot be.
+/// The only signal a host has is the proof on the request document, so the only thing it can
+/// check is that the party signing is the party being recorded as accountable — and it must
+/// check that, because `ownerDid` is otherwise a field anyone can fill with anyone, and a
+/// host that took it on trust would record an owner nobody proved.
+///
+/// What this does **not** establish is control of the identifier. A party can still register
+/// a `roomId` they do not control while naming themselves owner, and so deny that id to its
+/// real owner on this host. That squat is a nuisance rather than a takeover — the row it
+/// creates confers nothing, because every subsequent verb needs credentials the real room
+/// issued and a squatter cannot mint them — and bounding it is quota and access control,
+/// which is the availability row of the trust model and belongs to whoever hosts. Proving
+/// control would mean the *room itself* signing its own registration; that is a stronger
+/// check, deliberately not required here, because it would exclude every owner whose room
+/// key is held somewhere that cannot sign a request document.
+///
+/// Failures are [`AppError::Forbidden`], as everywhere else in this file.
+pub fn authorize_create(
+    room_id: &str,
+    owner_did: &str,
+    presenter: &str,
+) -> Result<AuthorizedCreate, AppError> {
+    if room_id.trim().is_empty() {
+        return Err(AppError::Forbidden(
+            "a room must be registered under an identifier its owner minted".into(),
+        ));
+    }
+    if owner_did.trim().is_empty() {
+        return Err(AppError::Forbidden(
+            "a room must name an owner: it is the accountable party, and a room without one \
+             is a room nobody can be addressed about"
+                .into(),
+        ));
+    }
+    if presenter.trim().is_empty() {
+        return Err(AppError::Forbidden(
+            "no authenticated presenter; a registration nobody signed records an owner \
+             nobody proved"
+                .into(),
+        ));
+    }
+
+    // Compared with any fragment removed from either side. A proof's `verificationMethod`
+    // names a key *within* a DID document (`did:key:z6Mk…#z6Mk…`) while an owner is a DID,
+    // so a literal comparison would refuse correct requests depending on how the signer was
+    // spelled.
+    if did_of(presenter) != did_of(owner_did) {
+        return Err(AppError::Forbidden(format!(
+            "this registration was signed by `{}`, which is not the owner it names; a room \
+             is registered by the party accountable for it",
+            did_of(presenter)
+        )));
+    }
+
+    Ok(AuthorizedCreate {
+        room_id: room_id.trim().to_string(),
+        owner_did: did_of(owner_did).to_string(),
+    })
+}
+
+/// A DID with any verification-method fragment removed.
+fn did_of(did: &str) -> &str {
+    let did = did.trim();
+    did.split('#').next().unwrap_or(did)
+}
+
+/// Authorize `action` on `room` from `presentation`.
+///
+/// Returns [`AuthorizedAction`] on success. Every failure is [`AppError::Forbidden`], which
+/// the dispatch layer maps to the framework's `permission_denied` — the reason text
+/// distinguishes the cases for an operator reading logs, without telling a caller which
+/// part of their chain to adjust.
+///
+/// `revocations` is the host's [`crate::ROOM_REVOCATIONS_KEYSPACE`]: a presentation the
+/// room's held list withdraws is refused, and the room's gate is held — inside the returned
+/// [`AuthorizedAction`] — until the caller drops it, so a list accepted meanwhile waits for
+/// this operation to commit (`rooms/revocations/put`, *Enforcement*).
+pub async fn authorize(
+    room: &Room,
+    presentation: &AuthorityPresentation,
+    action: Action,
+    presenter: &str,
+    now: u64,
+    verifier: &dyn ChainVerifier,
+    revocations: &KeyspaceHandle,
+) -> Result<AuthorizedAction, AppError> {
+    let shared = gate::read(&room.room_id).await;
+    let held = held_list(revocations, &room.room_id).await?;
+    let verified = check(
+        room,
+        presentation,
+        action,
+        presenter,
+        now,
+        verifier,
+        held.as_ref(),
+        true,
+    )
+    .await?;
+    Ok(AuthorizedAction {
+        action,
+        room_id: room.room_id.clone(),
+        verified,
+        held,
+        _gate: Gate::Shared(shared),
+    })
+}
+
+/// The list this host holds for `room_id`, read for an authorization. A stored list that
+/// no longer reads is a corrupt store, and authorization fails closed on it.
+pub(crate) async fn held_list(
+    revocations: &KeyspaceHandle,
+    room_id: &str,
+) -> Result<Option<RevocationList>, AppError> {
+    match revocation::held(revocations, room_id).await? {
+        None => Ok(None),
+        Some(h) => h.parsed(room_id).map(Some).map_err(|e| {
+            tracing::error!(room = %room_id, error = %e, "the held revocation list does not read");
+            AppError::Internal(format!(
+                "this host's revocation list for room `{room_id}` does not read"
+            ))
+        }),
+    }
+}
+
+/// Authorize the delivery or reading of a room's revocation list
+/// (`rooms/revocations/{put,get}`): `admin`, verified against the list **already held**
+/// (put item 1), under the gate the caller holds.
+///
+/// Unlike [`authorize`], a read mirror is not refused: a list binds every host that serves
+/// the room, and `rooms/owner/revoke` delivers to mirrors too. Holding a list is not a
+/// write to anything a primary owns.
+pub(crate) async fn authorize_list_admin(
+    room: &Room,
+    presentation: &AuthorityPresentation,
+    presenter: &str,
+    now: u64,
+    verifier: &dyn ChainVerifier,
+    held: Option<RevocationList>,
+    gate: Gate,
+) -> Result<AuthorizedAction, AppError> {
+    let verified = check(
+        room,
+        presentation,
+        Action::Admin,
+        presenter,
+        now,
+        verifier,
+        held.as_ref(),
+        false,
+    )
+    .await?;
+    Ok(AuthorizedAction {
+        action: Action::Admin,
+        room_id: room.room_id.clone(),
+        verified,
+        held,
+        _gate: gate,
+    })
+}
+
+/// Every check [`authorize`] makes, against `held`.
+#[allow(clippy::too_many_arguments)]
+async fn check(
+    room: &Room,
+    presentation: &AuthorityPresentation,
+    action: Action,
+    presenter: &str,
+    now: u64,
+    verifier: &dyn ChainVerifier,
+    held: Option<&RevocationList>,
+    mirror_gate: bool,
+) -> Result<VerifiedChain, AppError> {
+    // Depth first: it is the cheapest check and the one that bounds the cost of every
+    // check after it — verification is linear in chain length and runs on every operation.
+    if presentation.authority.is_empty() {
+        return Err(AppError::Forbidden(
+            "no authority chain presented; a room operation is authorized by the chain, \
+             never by this service's own records"
+                .into(),
+        ));
+    }
+    if presentation.authority.len() > MAX_CHAIN_DEPTH {
+        return Err(AppError::Forbidden(format!(
+            "authority chain is {} deep, exceeding the maximum of {MAX_CHAIN_DEPTH}",
+            presentation.authority.len()
+        )));
+    }
+
+    if presentation.membership.trim().is_empty() {
+        return Err(AppError::Forbidden(
+            "no membership credential presented".into(),
+        ));
+    }
+
+    // The pooling defence. On a tier that withholds the subject, a presentation without a
+    // same-subject proof lets two parties combine one's membership with the other's
+    // authority and verify as a single party holding both. Checked here because its
+    // *absence* is a shape problem; whether a present one actually proves same-subject is
+    // the verifier's job.
+    if matches!(room.visibility, Visibility::Private) && presentation.subject_binding.is_none() {
+        return Err(AppError::Forbidden(
+            "a private room requires a subject binding proving the membership credential and \
+             the authority chain describe the same subject; without it two parties can pool \
+             credentials"
+                .into(),
+        ));
+    }
+
+    // A presentation names what may be done, not who is doing it, so an unbound one is a
+    // bearer token: whoever observes it inherits it. The presenter is the DID the request's
+    // own proof established.
+    if presenter.trim().is_empty() {
+        return Err(AppError::Forbidden(
+            "no authenticated presenter; a presentation not bound to the party that signed \
+             the request is replayable by anyone who observes it"
+                .into(),
+        ));
+    }
+
+    // A room whose epoch has expired is read-only until somebody renews it (§9). Nothing
+    // is destroyed, nothing is hidden, and reads keep working in every state — a lapse is a
+    // condition a member can notice and fix, not a punishment.
+    //
+    // `Admin` is exempt, and the exemption is what makes the state machine have an exit:
+    // minting an epoch *is* the renewal, so a gate that refused it would leave a lapsed
+    // room lapsed forever. It is checked before verification for the same reason depth is —
+    // no point verifying a chain for an operation the room cannot accept.
+    // A **mirror** serves reads and refuses everything else, and says where the
+    // writes go. This is not an authorization decision about the caller — their
+    // chain may confer exactly what they asked for — it is this host declaring
+    // it is not the room's write-primary. Checked before verification for the
+    // same reason as the two above: no point verifying a chain for an operation
+    // this host would not perform however good the chain was.
+    //
+    // `Admin` is *not* exempt here, unlike the lapse gate below. Minting an
+    // epoch is a write to the room's own row, and a mirror that accepted one
+    // would fork the lifecycle clock its primary owns — the room would be live
+    // on the copy and lapsed at home.
+    if let Some(primary) = &room.mirror_of
+        && mirror_gate
+        && action != Action::Read
+    {
+        return Err(AppError::Forbidden(format!(
+            "this host holds a read mirror of room `{}`; {} goes to the write-primary at {primary}",
+            room.room_id,
+            action.as_str()
+        )));
+    }
+
+    // A room its **owner archived** is frozen: reads keep working, and nothing else does
+    // but the owner's own `admin` acts — unarchiving is one, so the exemption is what
+    // gives the freeze an exit, exactly as it does for the lapse gate below. Like the
+    // mirror gate, a statement about the room rather than a judgement of the caller, and
+    // checked before verification for the same reason.
+    if room.frozen_at.is_some() && !matches!(action, Action::Read | Action::Admin) {
+        return Err(AppError::Forbidden(format!(
+            "room `{}` was archived by its owner and is read-only until it is unarchived; \
+             {} is refused, reads and export still work",
+            room.room_id,
+            action.as_str()
+        )));
+    }
+
+    let lifecycle = room.lifecycle(now);
+    if !matches!(action, Action::Admin) && !lifecycle.accepts_writes() && action != Action::Read {
+        return Err(AppError::Forbidden(format!(
+            "room `{}` is {} and accepts no writes until its epoch is renewed; reads and \
+             export still work, and a single `rooms/epoch/mint` restores it",
+            room.room_id,
+            lifecycle.as_str()
+        )));
+    }
+
+    // Everything above is shape. This is the decision.
+    let verified = verifier
+        .verify(room, presentation, action, presenter)
+        .await?;
+
+    // The verifier answers "what does this chain confer"; this asserts the answer covers
+    // what was asked. Two steps rather than one because a verifier that also decided
+    // sufficiency could quietly widen it — and because no action implies another, this is
+    // an exact membership test, not a comparison.
+    if !verified.actions.iter().any(|a| a == action.as_str()) {
+        return Err(AppError::Forbidden(format!(
+            "the chain confers {:?}, which does not include `{}`",
+            verified.actions,
+            action.as_str()
+        )));
+    }
+
+    // The verifier is contracted to bind the leaf to `presenter`, and this re-states it
+    // where the seam can see it. A verifier that returned some other subject would be
+    // authorizing one party's chain for another's request; catching that here means the
+    // property does not depend on every implementation remembering it.
+    if verified.subject != presenter {
+        return Err(AppError::Forbidden(format!(
+            "the chain grants to `{}`, not to the party that signed this request",
+            verified.subject
+        )));
+    }
+
+    // The room's withdrawals, on every link and the membership credential: a chain from
+    // which any link is withdrawn confers nothing (`rooms/revocations/put`, *Enforcement*
+    // item 1). Checked last because only a verified chain says which credentials these are.
+    if let Some(list) = held {
+        let at = chrono::DateTime::from_timestamp(now as i64, 0).unwrap_or_else(chrono::Utc::now);
+        if list.withdraws(room.visibility, &verified.presented, at) {
+            tracing::info!(room = %room.room_id, "a presentation the room's revocation list withdraws was refused");
+            return Err(withdrawn(&room.room_id));
+        }
+    }
+
+    Ok(verified)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::revocation::test_keyspace as revs;
+
+    fn room(visibility: Visibility) -> Room {
+        Room {
+            room_id: "did:key:zRoom".into(),
+            owner_did: "did:key:zOwner".into(),
+            visibility,
+            retention_policy: crate::RetentionPolicy::Chained,
+            anchor_cadence: Default::default(),
+            epoch: 1,
+            next_version: 1,
+            retention_days: 90,
+            epoch_expires_at: None,
+            created_at: 0,
+            updated_at: 0,
+            mirror_of: None,
+            record_retention: None,
+            last_prune: None,
+            signal_delay: Default::default(),
+            epoch_floor: None,
+            frozen_at: None,
+        }
+    }
+
+    /// The DID the request's own proof established.
+    const PRESENTER: &str = "did:key:zAgent";
+    /// Any time at all: the fixtures below have no epoch expiry, so they never lapse.
+    const NOW: u64 = 1_800_000_000;
+
+    fn presentation(depth: usize, binding: bool) -> AuthorityPresentation {
+        AuthorityPresentation {
+            membership: "vmc".into(),
+            authority: (0..depth).map(|i| format!("vac-{i}")).collect(),
+            subject_binding: binding.then(|| "binding".to_string()),
+        }
+    }
+
+    #[test]
+    fn an_owner_registers_their_own_room() {
+        let ok = authorize_create("did:key:zRoom", "did:key:zOwner", "did:key:zOwner")
+            .expect("an owner may register the room they are accountable for");
+        assert_eq!(ok.room_id(), "did:key:zRoom");
+        assert_eq!(ok.owner_did(), "did:key:zOwner");
+    }
+
+    /// The whole of the defect this check exists for: `ownerDid` is a payload field, so a
+    /// host that took it on trust would record an owner who never agreed to be one — and
+    /// would let anyone reachable fill its store with rooms attributed to other people.
+    #[test]
+    fn nobody_registers_a_room_owned_by_somebody_else() {
+        let err = authorize_create("did:key:zRoom", "did:key:zOwner", "did:key:zMallory")
+            .expect_err("a signer who is not the named owner must be refused");
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "must be Forbidden, was {err:?}"
+        );
+    }
+
+    /// An unsigned request has no presenter, and the empty string must not match an empty
+    /// owner — which is the shape a caller gets by omitting both.
+    #[test]
+    fn an_unsigned_registration_is_refused() {
+        assert!(authorize_create("did:key:zRoom", "did:key:zOwner", "").is_err());
+        assert!(authorize_create("did:key:zRoom", "", "").is_err());
+        assert!(authorize_create("", "did:key:zOwner", "did:key:zOwner").is_err());
+    }
+
+    /// A proof names a verification method, not a DID, so the fragment must not decide the
+    /// answer — in either direction.
+    #[test]
+    fn a_verification_method_fragment_is_not_a_different_party() {
+        assert!(
+            authorize_create(
+                "did:key:zRoom",
+                "did:key:zOwner",
+                "did:key:zOwner#z6MkKeyOne"
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_create(
+                "did:key:zRoom",
+                "did:key:zOwner#z6MkKeyOne",
+                "did:key:zOwner"
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_create(
+                "did:key:zRoom",
+                "did:key:zOwner",
+                "did:key:zOther#z6MkKeyOne"
+            )
+            .is_err(),
+            "a fragment must not make two different DIDs equal"
+        );
+    }
+
+    /// A mirror serves reads and refuses everything else, whatever the chain
+    /// says. This is the host declaring it is not the write-primary, not a
+    /// judgement about the caller — so it holds for a chain conferring the
+    /// action outright.
+    #[tokio::test]
+    async fn a_mirror_serves_reads_and_refuses_every_write() {
+        let mirror = Room {
+            mirror_of: Some("https://primary.example.org".into()),
+            record_retention: None,
+            last_prune: None,
+            signal_delay: Default::default(),
+            epoch_floor: None,
+            frozen_at: None,
+            ..room(Visibility::Open)
+        };
+
+        authorize(
+            &mirror,
+            &presentation(1, false),
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .expect("a read is what a mirror is for");
+
+        for action in [Action::Write, Action::Curate, Action::Admin] {
+            let err = authorize(
+                &mirror,
+                &presentation(1, false),
+                action,
+                PRESENTER,
+                NOW,
+                &Vouches::for_all(),
+                revs(),
+            )
+            .await
+            .expect_err("a mirror performs no writes");
+            // The refusal names where the write goes, per the workspace rule
+            // that an operator error should carry its own fix.
+            assert!(
+                matches!(&err, AppError::Forbidden(m) if m.contains("primary.example.org")),
+                "{action:?}: {err:?}"
+            );
+        }
+    }
+
+    /// `Admin` is exempt from the *lapse* gate — minting an epoch is the
+    /// renewal — but not from the mirror gate. A mirror that accepted an epoch
+    /// mint would fork the lifecycle clock its primary owns: live on the copy,
+    /// lapsed at home.
+    #[tokio::test]
+    async fn a_mirror_refuses_an_epoch_mint_even_though_a_lapsed_primary_would_not() {
+        let lapsed_mirror = Room {
+            mirror_of: Some("https://primary.example.org".into()),
+            record_retention: None,
+            last_prune: None,
+            signal_delay: Default::default(),
+            epoch_floor: None,
+            frozen_at: None,
+            epoch_expires_at: Some(NOW - 1),
+            ..room(Visibility::Open)
+        };
+        let err = authorize(
+            &lapsed_mirror,
+            &presentation(1, false),
+            Action::Admin,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .expect_err("renewal happens at the primary");
+        assert!(
+            matches!(&err, AppError::Forbidden(m) if m.contains("read mirror")),
+            "the mirror gate must answer first: {err:?}"
+        );
+    }
+
+    /// A room its owner archived is frozen (`vtc/rooms/community/archive/0.1`): a read and
+    /// the owner's own `admin` acts pass, every other action is refused — whatever the
+    /// chain confers, since the freeze is a statement about the room, not the caller.
+    #[tokio::test]
+    async fn a_frozen_room_serves_reads_and_admin_and_refuses_everything_else() {
+        let frozen = Room {
+            frozen_at: Some(NOW - 10),
+            ..room(Visibility::Open)
+        };
+
+        for action in [Action::Read, Action::Admin] {
+            authorize(
+                &frozen,
+                &presentation(1, false),
+                action,
+                PRESENTER,
+                NOW,
+                &Vouches::for_all(),
+                revs(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{action:?} must pass a freeze: {e:?}"));
+        }
+
+        for action in [Action::Write, Action::Curate] {
+            let err = authorize(
+                &frozen,
+                &presentation(1, false),
+                action,
+                PRESENTER,
+                NOW,
+                &Vouches::for_all(),
+                revs(),
+            )
+            .await
+            .expect_err("a frozen room accepts no writes");
+            assert!(
+                matches!(&err, AppError::Forbidden(m)
+                    if m.contains("archived by its owner") && m.contains("unarchived")),
+                "{action:?}: {err:?}"
+            );
+        }
+    }
+
+    /// `None` — every room stored before the freeze existed — is not frozen.
+    #[tokio::test]
+    async fn an_unfrozen_room_accepts_every_action_its_chain_confers() {
+        let open = room(Visibility::Open);
+        assert!(!open.is_frozen());
+        for action in [Action::Read, Action::Write, Action::Curate, Action::Admin] {
+            authorize(
+                &open,
+                &presentation(1, false),
+                action,
+                PRESENTER,
+                NOW,
+                &Vouches::for_all(),
+                revs(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{action:?}: {e:?}"));
+        }
+    }
+
+    /// A stored row without `frozenAt` reads back as not frozen, and a frozen one
+    /// round-trips.
+    #[test]
+    fn frozen_at_defaults_to_not_frozen_and_round_trips() {
+        let mut value = serde_json::to_value(room(Visibility::Open)).unwrap();
+        assert!(value.get("frozenAt").is_none(), "skip-if-none: {value}");
+        let back: Room = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back.frozen_at, None);
+        value["frozenAt"] = serde_json::json!(42);
+        let back: Room = serde_json::from_value(value).unwrap();
+        assert_eq!(back.frozen_at, Some(42));
+    }
+
+    /// A verifier that vouches for whatever it is handed.
+    ///
+    /// Stands in for the cryptographic half so the shape half can be tested on its own. It
+    /// is `#[cfg(test)]` on purpose — a permissive verifier is a privilege escalation, and
+    /// the only one shipped is [`RefusesEverything`].
+    struct Vouches(Vec<String>);
+
+    impl Vouches {
+        fn for_all() -> Self {
+            Self(
+                ["read", "write", "curate", "admin"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            )
+        }
+        fn read_only() -> Self {
+            Self(vec!["read".into()])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChainVerifier for Vouches {
+        async fn verify(
+            &self,
+            _room: &Room,
+            _presentation: &AuthorityPresentation,
+            _action: Action,
+            presenter: &str,
+        ) -> Result<VerifiedChain, AppError> {
+            Ok(VerifiedChain {
+                subject: presenter.to_string(),
+                actions: self.0.clone(),
+                member: Some(presenter.to_string()),
+                presented: Default::default(),
+                valid_until: None,
+                purposes: Default::default(),
+            })
+        }
+    }
+
+    /// A verifier that vouches for a chain granting to somebody else.
+    struct VouchesForSomeoneElse;
+
+    #[async_trait::async_trait]
+    impl ChainVerifier for VouchesForSomeoneElse {
+        async fn verify(
+            &self,
+            _room: &Room,
+            _presentation: &AuthorityPresentation,
+            _action: Action,
+            _presenter: &str,
+        ) -> Result<VerifiedChain, AppError> {
+            Ok(VerifiedChain {
+                subject: "did:key:zSomeoneElse".into(),
+                actions: vec!["read".into()],
+                member: Some("did:key:zSomeoneElse".into()),
+                presented: Default::default(),
+                valid_until: None,
+                purposes: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verified_presentation_authorizes_what_the_chain_confers() {
+        let ok = authorize(
+            &room(Visibility::Open),
+            &presentation(2, false),
+            Action::Write,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .expect("should authorize");
+        assert_eq!(ok.action(), Action::Write);
+        assert_eq!(ok.room_id(), "did:key:zRoom");
+        assert_eq!(
+            ok.subject(),
+            PRESENTER,
+            "the subject is the verifier's finding, never the caller's claim"
+        );
+    }
+
+    /// The whole point of the agent story: a chain conferring `read` writes nothing, and
+    /// the refusal comes from `authorize` rather than from any handler remembering to check.
+    #[tokio::test]
+    async fn a_read_only_chain_cannot_write() {
+        let err = authorize(
+            &room(Visibility::Open),
+            &presentation(2, false),
+            Action::Write,
+            PRESENTER,
+            NOW,
+            &Vouches::read_only(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("does not include `write`"),
+            "{err}"
+        );
+
+        authorize(
+            &room(Visibility::Open),
+            &presentation(2, false),
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &Vouches::read_only(),
+            revs(),
+        )
+        .await
+        .expect("but it reads");
+    }
+
+    /// `admin` does not follow from `write`. Implication is how a permission model widens.
+    #[tokio::test]
+    async fn no_action_implies_another() {
+        let err = authorize(
+            &room(Visibility::Open),
+            &presentation(1, false),
+            Action::Admin,
+            PRESENTER,
+            NOW,
+            &Vouches(vec!["read".into(), "write".into(), "curate".into()]),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("does not include `admin`"),
+            "{err}"
+        );
+    }
+
+    /// The chain is the authorization. Nothing else is.
+    #[tokio::test]
+    async fn an_empty_chain_authorizes_nothing() {
+        let err = authorize(
+            &room(Visibility::Open),
+            &presentation(0, false),
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("no authority chain"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_chain_past_the_ceiling_is_refused() {
+        let err = authorize(
+            &room(Visibility::Open),
+            &presentation(MAX_CHAIN_DEPTH + 1, false),
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("exceeding the maximum"), "{err}");
+    }
+
+    /// Depth is checked before the verifier runs, so an over-deep chain costs nothing to
+    /// refuse — which is the reason it is first.
+    #[tokio::test]
+    async fn the_shape_checks_run_before_the_verifier() {
+        struct Panics;
+        #[async_trait::async_trait]
+        impl ChainVerifier for Panics {
+            async fn verify(
+                &self,
+                _: &Room,
+                _: &AuthorityPresentation,
+                _: Action,
+                _: &str,
+            ) -> Result<VerifiedChain, AppError> {
+                panic!("the verifier must not be reached for a malformed presentation");
+            }
+        }
+
+        for p in [
+            presentation(0, false),
+            presentation(MAX_CHAIN_DEPTH + 1, false),
+        ] {
+            assert!(
+                authorize(
+                    &room(Visibility::Open),
+                    &p,
+                    Action::Read,
+                    PRESENTER,
+                    NOW,
+                    &Panics,
+                    revs()
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    /// Without this, two parties pool credentials and verify as one.
+    #[tokio::test]
+    async fn a_private_room_refuses_a_presentation_with_no_subject_binding() {
+        let err = authorize(
+            &room(Visibility::Private),
+            &presentation(2, false),
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("subject binding"), "{err}");
+    }
+
+    /// A host that has configured no verifier serves nothing — on any tier, not just the
+    /// sealed ones. Fail-closed is the only safe default for a seam like this.
+    #[tokio::test]
+    async fn a_host_with_no_verifier_authorizes_nothing() {
+        for v in [
+            Visibility::Open,
+            Visibility::Attributed,
+            Visibility::Private,
+        ] {
+            let err = authorize(
+                &room(v),
+                &presentation(2, true),
+                Action::Read,
+                PRESENTER,
+                NOW,
+                &RefusesEverything,
+                revs(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err}").contains("no chain verifier configured"),
+                "{v:?}: {err}"
+            );
+        }
+    }
+
+    /// A presentation is a bearer object. Without binding it to the signer, anyone who
+    /// observes one inherits it.
+    #[tokio::test]
+    async fn an_unbound_presentation_is_refused() {
+        let err = authorize(
+            &room(Visibility::Open),
+            &presentation(2, false),
+            Action::Read,
+            "   ",
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no authenticated presenter"),
+            "{err}"
+        );
+    }
+
+    /// The seam re-states the binding rather than trusting each verifier to remember it.
+    #[tokio::test]
+    async fn a_chain_granting_to_someone_else_is_refused() {
+        let err = authorize(
+            &room(Visibility::Open),
+            &presentation(2, false),
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &VouchesForSomeoneElse,
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("not to the party that signed this request"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_membership_credential_is_refused() {
+        let mut p = presentation(2, false);
+        p.membership = "  ".into();
+        let err = authorize(
+            &room(Visibility::Open),
+            &p,
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no membership credential"),
+            "{err}"
+        );
+    }
+
+    /// A lapsed room is read-only, and the refusal says how to fix it.
+    #[tokio::test]
+    async fn a_lapsed_room_refuses_writes_and_keeps_serving_reads() {
+        let mut r = room(Visibility::Open);
+        r.epoch_expires_at = Some(NOW - 1);
+
+        let err = authorize(
+            &r,
+            &presentation(2, false),
+            Action::Write,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("accepts no writes"), "{text}");
+        assert!(
+            text.contains("rooms/epoch/mint"),
+            "the refusal must say how to fix it: {text}"
+        );
+
+        authorize(
+            &r,
+            &presentation(2, false),
+            Action::Read,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .expect("a lapse hides nothing — reads keep working");
+    }
+
+    /// The exemption that gives the state machine an exit. Minting an epoch *is* the
+    /// renewal, so a gate that refused it would leave a lapsed room lapsed forever — and
+    /// that holds all the way to `Reclaimable`, because until the bytes are deleted the
+    /// members' choice is renew or export.
+    #[tokio::test]
+    async fn every_lapsed_state_still_accepts_the_operation_that_renews_it() {
+        let mut r = room(Visibility::Open);
+        r.retention_days = 90;
+
+        for (days_past_expiry, state) in [(1, "lapsed"), (31, "dormant"), (91, "reclaimable")] {
+            r.epoch_expires_at = Some(NOW - days_past_expiry * 24 * 60 * 60);
+            assert_eq!(
+                r.lifecycle(NOW).as_str(),
+                state,
+                "fixture should be {state}"
+            );
+
+            authorize(
+                &r,
+                &presentation(2, false),
+                Action::Admin,
+                PRESENTER,
+                NOW,
+                &Vouches::for_all(),
+                revs(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a {state} room must still accept a renewal: {e}"));
+
+            let err = authorize(
+                &r,
+                &presentation(2, false),
+                Action::Write,
+                PRESENTER,
+                NOW,
+                &Vouches::for_all(),
+                revs(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err}").contains("accepts no writes"),
+                "a {state} room must refuse ordinary writes: {err}"
+            );
+        }
+    }
+
+    /// Curation is a write. A room nobody has renewed should not be quietly reorganised.
+    #[tokio::test]
+    async fn a_lapsed_room_refuses_curation() {
+        let mut r = room(Visibility::Open);
+        r.epoch_expires_at = Some(NOW - 1);
+        let err = authorize(
+            &r,
+            &presentation(2, false),
+            Action::Curate,
+            PRESENTER,
+            NOW,
+            &Vouches::for_all(),
+            revs(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("accepts no writes"), "{err}");
+    }
+
+    /// No action implies another — the property that keeps a permission model from
+    /// widening quietly.
+    #[test]
+    fn actions_are_distinct_wire_strings() {
+        assert_eq!(Action::Read.as_str(), "read");
+        assert_eq!(Action::Admin.as_str(), "admin");
+        assert_ne!(Action::Admin.as_str(), Action::Write.as_str());
+    }
+}

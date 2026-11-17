@@ -1,0 +1,470 @@
+# Verifiable Trust Infrastructure — Documentation
+
+A guided tour of the workspace: what the VTA and VTC are, how to
+operate each one, how to integrate with them, and where the design
+decisions live.
+
+These documents describe **what this workspace does**. What a conforming
+implementation **must** do is the VTI specification: <https://trustoverip.github.io/dtgwg-vti-spec/>. Where the two
+disagree, the specification is correct — see
+[CONTRIBUTING.md](../CONTRIBUTING.md#the-specification).
+
+## How this tree is organised
+
+```mermaid
+graph LR
+    concepts["01-concepts/<br/>(shared)"]
+    vta["02-vta/<br/>(VTA operator + integrator)"]
+    vtc["03-vtc/<br/>(VTC operator + integrator)"]
+    ref["04-reference/<br/>(tables, paths, formats)"]
+    design["05-design-notes/<br/>(history + implementation)"]
+    hosts["06-witness/, 07-voting/<br/>(host services)"]
+
+    concepts --> vta
+    concepts --> vtc
+    vta -.-> vtc
+    vta --> ref
+    vtc --> ref
+    concepts -.-> design
+
+    classDef shared fill:#f5f5f5,stroke:#555,color:#111
+    classDef vta fill:#d4e6f9,stroke:#3a6fb0,color:#08305f
+    classDef vtc fill:#e9d7f7,stroke:#7e3fa6,color:#3a0a5a
+    classDef ref fill:#e8f5e9,stroke:#3e8e41,color:#1b3a1f
+    classDef design fill:#fff3e0,stroke:#c77a00,color:#5a3b00
+    class concepts shared
+    class vta vta
+    class vtc vtc
+    class ref ref
+    class design design
+```
+
+The dotted line from `02-vta/` to `03-vtc/` reflects the runtime
+relationship: a VTC is always provisioned **on top of** an existing
+VTA via the `vtc-host` DID template.
+
+## If you're trying to…
+
+| Task | Start here |
+|---|---|
+| Find out what is **required** rather than what is built | [The VTI specification](https://trustoverip.github.io/dtgwg-vti-spec/) — normative |
+| Understand VTI as a whole | [Overview](01-concepts/overview.md) |
+| Decide between VTA and VTC | [Root README — Which service do you need?](../README.md#which-service-do-you-need) |
+| Stand up a VTA from scratch | [VTA cold-start](02-vta/cold-start.md) |
+| Stand up a VTC on an existing VTA | [VTC getting started](03-vtc/getting-started.md) |
+| Get a new community's first admin signed in and its first vetter named | [VTC bootstrap runbook](03-vtc/bootstrap-runbook.md) |
+| Add at-rest encryption to a self-hosted (non-TEE) VTA | [Hardened configuration](02-vta/non-interactive-setup.md#hardened-configuration) |
+| Pick where to store the master seed | [VTA secret backends](02-vta/secret-backends.md) |
+| Deploy a VTA inside a Nitro Enclave | [TEE architecture](02-vta/tee-architecture.md) |
+| Build an app that uses a VTA | [VTA integration guide](02-vta/integration-guide.md) |
+| Use a VTA from Claude Code / Claude Desktop | [vta-mcp](02-vta/vta-mcp.md) |
+| Run or take part in a community from Claude Code / Claude Desktop | [vtc-mcp](03-vtc/vtc-mcp.md) |
+| Provision a mediator / webvh-host / custom integration | [Provision-integration](02-vta/provision-integration.md) |
+| Require a second person to approve an operation | [Approvals](02-vta/approvals.md) |
+| Understand the consent ceremony (DTTE) end to end | [Task consent](02-vta/task-consent.md) |
+| Create or run a data room | [Data rooms](02-vta/data-rooms.md) |
+| Test a data room on a VTC, end to end | [Data rooms on a VTC — a test run](03-vtc/data-rooms-quickstart.md) |
+| Apply to, or vet for, a hidden-vetting community from a client with no PCS (a mobile wallet) | [The VTA as hidden-vetting (PCS) engine](02-vta/pcs-engine.md) |
+| Configure community membership policy | [VTC community lifecycle](03-vtc/community-lifecycle.md) |
+| Update a custom Rego policy for the DTG Credentials v1 shapes | [Custom policies after the DTG v1 upgrade](03-vtc/policy-upgrade-dtg-v1.md) |
+| Host a public community website | [VTC website + admin UX](03-vtc/website-and-admin.md) |
+| Deploy a trust registry and wire a VTC to it | [Trust-registry deployment](03-vtc/trust-registry-deployment.md) |
+| Run a witness (issue Verifiable Witness Credentials) | [The witness host service](06-witness/README.md) |
+| Run a ballot box for community polls and elections | [The voting service](07-voting/README.md) |
+| Run a poll or election in a community | [Community elections](03-vtc/elections.md) |
+| Get a relationship witnessed, as a principal whose keys a VTA holds | [The VTA as a witnessed party](02-vta/witness-party.md) |
+| Receive, list and relay notifications (an election put to a member party) | [Notifications](02-vta/notifications.md) |
+| Who collects a persona DID's messages at its mediator: the VTA or a claiming client | [Collection](02-vta/collection.md) |
+| A community's received notifications and relay decisions | [Community notifications](03-vtc/notifications.md) |
+| Look up a BIP-32 path | [BIP-32 paths](04-reference/bip32-paths.md) |
+| Read the threat model | [Security model](01-concepts/security-model.md) |
+
+## Table of contents
+
+### Part I — Concepts (shared)
+
+Both VTA and VTC build on the same foundation. Read this first.
+
+- **[Overview](01-concepts/overview.md)** — what VTI is, what VTA
+  and VTC each do, how they relate, the technology stack, request
+  flow.
+- **[Architecture](01-concepts/architecture.md)** — workspace
+  layout, crate map, shared module structure, API surface, how to
+  add a new front-end binary.
+- **[Security model](01-concepts/security-model.md)** —
+  defense-in-depth, key lifecycle, threat model, attack trees,
+  cryptographic inventory, deployment checklist.
+
+### Part II — VTA
+
+How to operate, deploy, and integrate against a VTA.
+
+- **[Cold-start](02-vta/cold-start.md)** — bootstrap a VTA + WebVH
+  + mediator from scratch.
+- **[Non-interactive setup](02-vta/non-interactive-setup.md)** —
+  scripted VTA provisioning via `vta setup --from <file>` for CI,
+  sealed images, unattended bootstrap.
+- **[Hardened configuration](02-vta/non-interactive-setup.md#hardened-configuration)** —
+  enable storage encryption and sealed JWT key management for
+  self-hosted (non-TEE) deployments (`[hardened] enabled = true`).
+- **[Running under launchd (macOS)](02-vta/macos-launchd.md)** — run a
+  VTA as a LaunchAgent that starts at login and restarts after a crash;
+  why not a LaunchDaemon (Keychain), absolute paths, logs, upgrades.
+- **[Rate limiting](02-vta/rate-limiting.md)** — the per-IP limits on
+  unauthenticated routes (auth vs `did.jsonl`), `trust_xff_cidrs` and the
+  proxy trap, tuning at runtime with `pnm config update`, and telling a
+  VTA 429 from a mediator's or a proxy's.
+- **[Seal and unseal](02-vta/seal-and-unseal.md)** — what the
+  seal is, when it's set, how `vta unseal` works.
+- **[Secret-storage backends](02-vta/secret-backends.md)** — AWS,
+  GCP, Azure, HashiCorp Vault, OS keyring, KMS-TEE.
+- **[Feature flags](02-vta/feature-flags.md)** — Cargo feature
+  reference, deployment profiles, dependency graph.
+- **[TEE architecture](02-vta/tee-architecture.md)** — Nitro
+  Enclave deployment, KMS bootstrap, vsock store, attestation chain.
+- **[Integration guide](02-vta/integration-guide.md)** —
+  building a third-party app that consumes VTA-managed keys.
+- **[TSP](02-vta/tsp.md)** — the Trust Spanning Protocol transport:
+  how the protocol is chosen (TSP > DIDComm > REST, by service type),
+  enabling it, what a TSP-only build lacks, rollout status.
+- **[Mediator connection](02-vta/mediator-connection.md)** — how a VTA
+  establishes and keeps its mediator connection: the readiness gate,
+  reconnect backoff, `[mediator_readiness]`.
+- **[DIDComm protocol](02-vta/didcomm-protocol.md)** — superseded: the
+  bare-DIDComm message surface is gone; every operation is a Trust Task.
+- **[DIDComm protocol management](02-vta/didcomm-protocol-management.md)** —
+  superseded redirect to runtime service management, with the command
+  rename map.
+- **[DID templates](02-vta/did-templates.md)** — authoring,
+  uploading, resolution (context → global → built-in).
+- **[Provision-integration](02-vta/provision-integration.md)** —
+  the canonical flow for standing up mediators, webvh hosts, and
+  apps via DID templates and sealed-transfer.
+- **[Runtime service management](02-vta/runtime-service-management.md)** —
+  enable / disable / migrate REST + DIDComm services on a running
+  VTA without rebuilds.
+- **[Backup and restore](02-vta/backup-restore.md)** — the encrypted
+  full-state backup, portable between plain, hardened and Nitro VTAs;
+  what is not in it; staged, boot-applied restore.
+- **[Internal keys](02-vta/internal-keys.md)** — non-extractable signing
+  keys the VTA never gives out, not even in a backup or the mnemonic.
+- **[External accounts](02-vta/external-accounts.md)** — identities a VTA
+  holds at clouds and third-party services (an S3-compatible bucket), used by
+  bound integrations only through short-lived, sealed credentials.
+- **[Claim-type registry](02-vta/claim-type-registry.md)** — the types a
+  holder's attributes carry, and the sensitivity and disclosure each implies.
+- **[Contacts](02-vta/contacts.md)** — what peers disclosed, filed per
+  relationship, and the principal's own stars, petnames and lists.
+- **[Step-up policy](02-vta/step-up-policy.md)** — superseded redirect to
+  Approvals; maps the retired step-up floors to their replacements.
+- **[Approvals](02-vta/approvals.md)** — which tasks require
+  re-authentication or human consent before they run, managed at
+  runtime with `pnm approvals`.
+- **[Task consent (DTTE)](02-vta/task-consent.md)** — the approval
+  ceremony behind a `consent` rule: the wire, the timers, who may
+  approve, and what the approver sees. Companion infographic:
+  [task-consent-infographic.html](02-vta/task-consent-infographic.html).
+- **[Wallet sign-in UV keys](02-vta/wallet-sign-in-uv-keys.md)** — the
+  device keys that approve a wallet sign-in grant: hardware keys, PRF-sealed
+  keys, passkeys, a VTA-checked PIN with a guess limit, and approval on the
+  member's phone.
+- **[DID:WebVH update](02-vta/did-webvh-update.md)** — log-entry
+  format, rotation, hosting.
+- **[did:webs DIDs](02-vta/did-webs.md)** — alpha: create, host, update, rotate,
+  deactivate and act as did:webs persona, relationship and integration DIDs
+  (`pnm webs …`, `vta/webs/dids/*/0.1`); never a node's own identity (VTI-KEY-001).
+- **[Personal AI agents](02-vta/personal-ai-agents.md)** — provisioning
+  an agent its own identity, context, capabilities and kill switch.
+- **[Data rooms](02-vta/data-rooms.md)** — creating a room and
+  keeping it: the four topologies, the visibility tiers, inviting
+  members, equipping an agent through the oracle, renewal and
+  succession, and running a host.
+- **[vta-mcp](02-vta/vta-mcp.md)** — using a VTA from an MCP host
+  (Claude Code, Claude Desktop, an agent framework): what it exposes,
+  the security model, hardening flags, and how to see what it is doing.
+- **[Setup example](02-vta/examples/vta-setup.example.toml)** —
+  worked TOML for `vta setup --from`.
+- **[Example: agent memory + vta-mcp](02-vta/examples/agent-memory-with-vta-mcp.md)** —
+  two MCP servers, two identities, two contexts, one VTA.
+
+### Part III — VTC
+
+How to operate and integrate against a VTC.
+
+- **[Getting started](03-vtc/getting-started.md)** — a working VTC
+  in 10 minutes (assumes an already-running VTA).
+- **[Bootstrap runbook](03-vtc/bootstrap-runbook.md)** — after setup:
+  how the first admin authenticates, and the order that admits a
+  community's first vetter.
+- **[Architecture](03-vtc/architecture.md)** — VTC module layout,
+  keyspaces, dependency on the VTA.
+- **[Non-interactive setup](03-vtc/non-interactive-setup.md)** —
+  headless two-phase `vtc setup` for CI, images and Kubernetes.
+- **[Administrator access](03-vtc/admin-access.md)** — who counts as an
+  administrator, roles and capabilities, step-up and approvals, and what
+  stops one administrator taking a community over. Companion infographic:
+  [admin-access-infographic.html](03-vtc/admin-access-infographic.html).
+- **[Community lifecycle](03-vtc/community-lifecycle.md)** —
+  member CRUD, join requests, removal dispositions, policies.
+- **[Join criteria](03-vtc/join-criteria.md)** — the community's rules
+  for who may join and how: admission modes, credential, invitation and
+  vetting requirements, the defaults, and how they are changed.
+- **[Member directory](03-vtc/member-directory.md)** — the field schema,
+  members' cards, and how each viewer's projection is decided.
+- **[Community groups](03-vtc/groups.md)** — groups with identities of
+  their own: static and dynamic membership, managers, room and grant
+  bindings.
+- **[Member badges](03-vtc/badges.md)** — community and kudos badges,
+  awards, sharing outside the community.
+- **[Community boards](03-vtc/boards.md)** — ideas, notes, and an election
+  per accepted idea.
+- **[Rooms the community owns](03-vtc/community-rooms.md)** — turning on
+  community-owned data rooms and running one.
+- **[Room storage](03-vtc/room-storage.md)** — storage configs (local, S3,
+  GCS) for rooms' files, assignment and migration.
+- **[Git namespaces](03-vtc/git-namespaces.md)** — governing repositories
+  on the community's forges and publishing the rights to its trust registry.
+- **[Networks](03-vtc/networks.md)** — the community's side of Verifiable
+  Trust Network membership (`vtc/networks/*`).
+- **[OpenID4VP verifier identities](03-vtc/oid4vp-verifier.md)** — the
+  swiyu and EUDI verifier identities a VTC holds at its VTA to request
+  credentials from those wallets.
+- **[Backup and restore](03-vtc/backup-restore.md)** — the community's
+  password-encrypted backup, its scope and the restore.
+- **[Credentials](03-vtc/credentials.md)** — VMC, role VAC, statements (VSC), status
+  lists, renewal, DID rotation, custom endorsements.
+- **[Custom policies after the DTG v1 upgrade](03-vtc/policy-upgrade-dtg-v1.md)** —
+  what an uploaded Rego policy must change: `foreign_vac`, witness and
+  identity-verification shapes, role VACs, statement VSCs.
+- **[Credential delivery](03-vtc/credential-delivery.md)** — how an
+  admitted member receives its credentials, and the Eucalyptus
+  migration note for clients that read them from the verdict.
+- **[vtc-mcp](03-vtc/vtc-mcp.md)** — a community from an MCP host: an
+  administrator's or a member's AI assistant configuring and running it as
+  one identity over TSP, DIDComm or HTTPS, with the guides and workflows
+  shipped as prompts.
+- **[Trust-registry integration](03-vtc/trust-registry.md)** —
+  registry publish, membership sync, cross-community recognition.
+- **[Trust-registry deployment](03-vtc/trust-registry-deployment.md)** —
+  runbook for standing up a registry, sourcing its identity from a
+  VTA, and wiring a VTC to it.
+- **[Personhood + relationships](03-vtc/personhood-and-graph.md)** —
+  personhood assertion, VRC trust graph, custom endorsements.
+- **[Trusted witnesses](03-vtc/trusted-witnesses.md)** — the witnesses whose
+  VWCs count in this community (`witnesses.trusted`, empty by default), and
+  the outcome evidence a VWC must travel with.
+- **[Peer identity vetting](03-vtc/vetting.md)** — requiring existing
+  members to vet an applicant: vetting requirements in the join manifest,
+  what the host checks in each statement, and what the default join policy
+  decides.
+- **[Website + admin UX](03-vtc/website-and-admin.md)** — public
+  community website (live + managed modes), embedded admin SPA,
+  routing modes.
+- **[GeoIP: sign-in locations](03-vtc/geoip.md)** — the local
+  DB-IP / GeoLite2 database behind the city and country a wallet shows
+  at sign-in: download, `[geoip] database`, monthly refresh, attribution.
+- **[Admin UX plugins](03-vtc/admin-ui-plugins.md)** — third-party
+  plugin contract: on-disk layout, manifest schema, scope filters,
+  and the daemon's `admin_ui.plugin_dir` scan + serve.
+- **[Feature flags](03-vtc/feature-flags.md)** — VTC Cargo feature
+  reference.
+
+### Part IV — Reference
+
+- **[BIP-32 paths](04-reference/bip32-paths.md)** — the VTA's
+  hierarchical-key derivation specification.
+- **[CLI style](04-reference/cli-style.md)** — conventions for
+  flags, output, errors, and JSON modes across `vta`, `vtc`, `pnm`,
+  `cnm`.
+- **[Workspace engineering notes](04-reference/workspace-engineering-notes.md)** —
+  the long form of the release, test and CI rules in `CLAUDE.md`, with the
+  incidents behind each.
+
+### Part V — Design notes
+
+In-flight or historical design documents kept for context. These
+are implementer-facing rather than operator-facing, and each carries a status
+line at its top (proposal, implemented, superseded…). **This list is a
+selection**; the [design-notes directory](05-design-notes/) holds all of them.
+
+Notes the workspace `CLAUDE.md` treats as required reading before changing the
+area they cover:
+
+- **[Key custody](05-design-notes/key-custody.md)** — why choosing a
+  derivation path is holding a key, and the custody rules every
+  network-reachable key path follows.
+- **[TSP enablement](05-design-notes/tsp-enablement.md)** — the rollout
+  design for TSP beside DIDComm, the one client surface, one socket per DID.
+- **[VTC administrative roles](05-design-notes/vtc-admin-roles.md)** —
+  capability-based VTC authority: role ceilings, capabilities, resource
+  qualifiers.
+- **[ACL scope semantics](05-design-notes/acl-scope-semantics.md)** —
+  the *act* vs *confer* axis on an ACL entry.
+- **[Retry and idempotency](05-design-notes/retry-and-idempotency.md)** —
+  which layer owns retry, and the `idempotencyKey` contract.
+- **[vta-service decomposition](05-design-notes/vta-service-decomposition.md)** —
+  how the VTA crate was split, and where the program stops.
+- **[vtc-service decomposition](05-design-notes/vtc-service-decomposition.md)** —
+  the plan for the VTC crate: keyspace leaf, per-subsystem stores, the few
+  extractable subsystems, and why it stops much earlier than the VTA's.
+
+Others:
+
+- **[vtc-mcp](05-design-notes/vtc-mcp.md)** — implemented: a VTC twin of
+  `vta-mcp`. A native Trust Task client over TSP, then DIDComm (never a
+  `cnm` subprocess), one generic `vtc_call` catalogued from the pinned
+  specification bundles, an identity ladder (member persona, dedicated agent
+  entry), the shared local guard, and VTC knowledge shipped as MCP resources
+  and prompts for groups, boards, elections, data rooms, admission and
+  administration.
+- **[TSP Rev 3 migration](05-design-notes/tsp-rev3-migration.md)** — the
+  inventory of what this repository has to change for Trust Spanning Protocol
+  Rev 3, which is a flag day rather than a migration: nothing a Rev 2 peer packs
+  can be unpacked by a Rev 3 one, in either direction. The functional change is
+  one arm — answering a relationship invite — and the reason it matters is that
+  §7.2.2 makes a missing relationship a *silent* drop, so an unmigrated VTA
+  looks like a transport that accepts connections and never replies. Blocked on
+  an `affinidi-tdk` release; names the authorization decision that has to be
+  taken rather than arrived at.
+
+- **[Task version negotiation](05-design-notes/task-version-negotiation.md)** —
+  how two peers on different Trust Task versions find a common one, and the
+  versioning contract that has to exist first for "negotiate" to mean anything
+  more than "match exactly or fail". Proposes dropping semver's 0.x exemption
+  rather than adding a PATCH component, and explains why the sender speaking
+  *down* is what lets `deny_unknown_fields` stay. Design only; §2 is a proposal
+  for the shared registry.
+- **[Key roles — design](05-design-notes/key-roles.md)** — why durable identities split keys by role (attestation, operational, messaging, update, authenticator), protection boundaries, the external recovery key (and why not the VTA's BIP-32 seed), rotation vs revocation, approvals, method profiles, benefits and implications.
+- **[did:webs on KERI v2 — positions](05-design-notes/did-webs-keri-v2.md)** — why VTI's `did:webs` integration is KERI v2 and alpha, our position on each open v1/v2 question (stream versions, mixed logs, v2 designation schemas and their SAIDs, blindable registries, critical designations, superseding recovery), and the rule that every piece is checked both ways against keripy v2.
+- **[did:webs in the VTA](05-design-notes/did-webs-in-the-vta.md)** — creating, hosting, updating and acting as a `did:webs` persona, relationship or integration DID (level 1); why a service DID stays `did:webvh` / `did:scid:vh:1` (VTI-KEY-001); the `vta/webs/dids/*` family, keys, hosting and order of work.
+- **[Key roles — implementation plan](05-design-notes/key-roles-implementation.md)** —
+  the ordered PRs that implement method-neutral key roles (`vta/dids/*`): method
+  profiles, `keyRoles`, generated role keys outside the seed and every backup,
+  the external recovery key, preview-bound approval, and passkeys as
+  `authenticator` keys on a person's identity only. Each step is mapped to the
+  VTI-KEY requirements it satisfies and the Appendix F rows it closes.
+- **[Application-state store](05-design-notes/appstate-store.md)** — the
+  proposed third store (beside the secrets and credential vaults) for
+  versioned, namespaced, per-context application JSON: why agent memory
+  and both vaults are the wrong home, what the surface needs, and the
+  upstream spec dependency that has to land first. Design only.
+- **[Data rooms](05-design-notes/data-rooms.md)** —
+  shared, credential-governed, end-to-end-encryptable spaces for humans
+  and their AI agents, built from DTG credentials (VIC/VMC/VAC issued by
+  a room that is itself a DID-bearing DTG node): four host-neutral
+  topologies (personal VTA, in a VTC, cross-community, VRC peers), a
+  three-tier visibility ladder (`open`/`attributed`/`private` with
+  unlinkable BBS+ presentations), MLS (RFC 9420) as the group-key layer,
+  witnessed room DID logs, and renew-not-reap lifecycle. The operator
+  path through it is [Data rooms](02-vta/data-rooms.md).
+- **[Data rooms — concept document](05-design-notes/data-rooms-concept.html)** —
+  shareable, non-technical-audience write-up of the idea, benefits, design
+  and the case for the VAC, with diagrams of the four topologies, the
+  join flow, the trust stack and VAC attenuation. Open in a browser.
+- **[Data rooms — security review v2](05-design-notes/data-rooms-security-review-v2.md)** —
+  current end-to-end review of revision 3: sixteen findings across the
+  host-as-DS, witnesses, mirrors, quorums, attenuated agent capabilities
+  and the human surface; the threat model's central claim remains that
+  **the trust boundary is per operator, not per service**.
+  ([v1](05-design-notes/data-rooms-security-review-v1.md) is the dated
+  record of the revision-2 review that reshaped the design.)
+- **[Data rooms — files and the VTC experience](05-design-notes/data-rooms-files.md)** —
+  encrypted file attachments in a pluggable blob store (local, S3, Walrus), per-room
+  limits set by the hosting VTC, and the console and member-portal surfaces. In progress
+  (its §12 says which phases have landed).
+- **[The VTA as key authority for cloud and third-party accounts](05-design-notes/vta-external-accounts.md)** —
+  external accounts (AWS Roles Anywhere, GCP Workload Identity with pinned keys, presigned
+  S3, Sui signing) used by integrations through short-lived, downscoped, sealed credentials,
+  managed over Trust Tasks with consent from approvers' own DIDs. Partly implemented:
+  the presigned-S3 model is built ([operator guide](02-vta/external-accounts.md)).
+- **[Data rooms — epoch anchoring](05-design-notes/data-rooms-epoch-anchoring.md)** —
+  the one open *decision* in the rooms design: §9 says a renewal anchors the MLS
+  epoch authenticator and version watermark in the room's witnessed log, but not
+  where in the log entry they go. Three candidate shapes, the metadata cost of
+  a public anchor, and what settling it unblocks. Open question, not a plan.
+- **[VTC MVP spec](05-design-notes/vtc-mvp.md)** — full
+  specification for the VTC's Phase 0–5 build (the source of truth
+  the implementation tracks).
+- **[The VTC and the proof its tasks declare](05-design-notes/vtc-trust-task-proof-enforcement.md)** —
+  why the community's document dispatcher now holds a producer to the `proof`,
+  the `issuedAt` window and the replay bound its task's own specification
+  declares, on every transport (VTI-OPS-020/021/024/093). Re-derives the task
+  census from the router rather than trusting the divergence register, records
+  the transitional allowance made for the one shipping client that did not sign
+  and how its stated removal condition was met, and sets out the migration path
+  for the 49 tasks still served on a bearer token.
+- **[A community logo the VTC stores and serves](05-design-notes/vtc-community-logo.md)** —
+  implemented: why the logo is stored and served from the VTC's own origin,
+  why `logoUrl` is left alone, PNG only and no SVG, and where each security
+  property is held.
+- **[Signing from the admin console](05-design-notes/vtc-console-signing.md)** —
+  the successor to the note above. The admin SPA holds no key, so every bearer
+  route the migration would retire has to stay. Establishes the exact
+  `eddsa-jcs-2022` construction a browser must reproduce, reads the two working
+  browser implementations in the ecosystem (and a key-extractability bug in
+  one), and recommends treating a console signing key as a **credential of the
+  operator's existing admin DID** — a delegation enrolled like a passkey —
+  rather than an identity of its own, which self-promotion (VTI-OPS-050) would
+  block. Rejects server-side signing explicitly against VTI-OPS-021.
+- **[Runtime service management](05-design-notes/runtime-service-management.md)** —
+  design notes for the VTA's enable/disable/migrate REST + DIDComm
+  surface.
+- **[Store migration](05-design-notes/store-migration.md)** — the
+  enum-to-trait migration path for storage backends.
+- **[PNM setup with deferred VTA DID](05-design-notes/pnm-setup-deferred-vta-did.md)** —
+  the design behind the two-phase PNM setup that allows the VTA
+  DID to be bound after initial wallet provisioning.
+- **[DIDComm protocol management](05-design-notes/didcomm-protocol-management.md)** —
+  precursor design notes for the runtime service management work.
+- **[Approvals convergence](05-design-notes/approvals-convergence.md)** —
+  why a VTA answers "does this need another human?" in one place
+  rather than three, and what was retired to get there.
+- **[Trigger links](05-design-notes/trigger-link-design.md)** —
+  why a trigger link is an `https` URL with its parameters in the fragment,
+  not a DIDComm out-of-band or VCALM interaction URL.
+
+### Part VI — Host services
+
+Services a node depends on but does not embody, run apart from any VTA or VTC.
+
+- **[The witness host service](06-witness/README.md)** — `vti-witness`: up to
+  ten witness identities, provisioned from the operator's VTA with the
+  `dtg-witness` template and served over TSP and DIDComm; setup, configuration,
+  the correlators it warns about, and what a witness sees.
+- **[The voting service](07-voting/README.md)** — `vti-voting-service`:
+  ballot boxes for community elections, shared by any number of communities,
+  that never learn who voted.
+
+## Conventions
+
+- Cross-references use relative links so the docs work both on
+  GitHub and in any local Markdown viewer.
+- Code references in prose use the form `path/to/file.rs:line` so
+  IDEs can jump to them directly.
+- Wire-format snippets are JSON for narrative clarity; the actual
+  on-the-wire format is whatever the linked Rust types serialize
+  to (CBOR for sealed payloads, JSON for VPs/VCs).
+- Mermaid diagrams render natively on GitHub. Where a diagram and a
+  table convey the same information, both are kept — diagrams for
+  the layout, tables for the lookup.
+
+## Contributing to the docs
+
+If you're adding a new document:
+
+- **Shared concept (applies to both VTA and VTC)?** Add to
+  `01-concepts/`.
+- **VTA operator / integrator how-to?** Add to `02-vta/`.
+- **VTC operator / integrator how-to?** Add to `03-vtc/`.
+- **Pure reference (tables, paths, formats)?** Add to
+  `04-reference/`.
+- **Implementation-detail design brief?** Add to `05-design-notes/`.
+- **A host service's operator guide?** Add to `06-witness/` or `07-voting/`.
+
+`scripts/check-docs.py` fails CI when a page under `01-`–`04-`, `06-` or
+`07-` is missing from this index, or a relative link anywhere is broken.
+
+Update this index when you add or rename a chapter.
+Cross-references in the workspace `README.md` and `CLAUDE.md` may
+also need updating. The convention for paths inside Rust source
+comments is `docs/<section>/<file>.md`.

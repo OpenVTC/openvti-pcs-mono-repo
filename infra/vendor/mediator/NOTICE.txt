@@ -1,0 +1,17 @@
+This License does not grant permission to use the trade names, trademarks, service marks, or product names of the Licensor, except as required for reasonable and customary use in describing the origin of the Work and reproducing the content of the this notice when  they are further distributing this code.
+
+---
+
+## Third-party material in this repository
+
+This repository reproduces no third-party source code. Its dependencies are
+taken from crates.io (and, for the developer-only interop checks under
+`interop/`, from npm) under their own licences; `deny.toml` lists the
+licences the build accepts.
+
+`crates/affinidi-messaging-mediator/trust-tasks/` holds copies of Trust Task
+specification bundles published by the Trust Tasks registry
+(https://trusttasks.org). `crates/affinidi-messaging-mediator/trust-tasks.lock`
+records the registry URL and the SHA-256 digest of each bundle. They are
+reproduced unmodified and remain under the terms the registry publishes them
+with.

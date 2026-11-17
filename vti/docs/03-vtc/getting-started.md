@@ -1,0 +1,376 @@
+# Getting started with a VTC
+
+A working VTC in 10 minutes, assuming you already have an
+**already-running VTA**. If you don't, run through
+[`02-vta/cold-start.md`](../02-vta/cold-start.md) first — a VTC
+cannot exist without a VTA to mint its identity.
+
+## What you'll end up with
+
+```mermaid
+graph LR
+    VTA[VTA<br/>:8100]
+    VTC[VTC<br/>:8200]
+    Admin[Admin SPA<br/>/admin/*]
+    Public[Public site<br/>/]
+    Member[Member<br/>cnm-cli]
+
+    VTA -- vtc-host template<br/>at setup --> VTC
+    Admin --> VTC
+    Public --> VTC
+    Member -->|join request| VTC
+    Member -->|VMC + VAC| VTC
+
+    classDef vta fill:#d4e6f9,stroke:#3a6fb0,color:#08305f
+    classDef vtc fill:#e9d7f7,stroke:#7e3fa6,color:#3a0a5a
+    class VTA vta
+    class VTC,Admin,Public,Member vtc
+```
+
+A running `vtc` binary on port 8200 with:
+
+- A `vtc_did` minted by your VTA's `vtc-host` template.
+- A `config.toml` written by the setup wizard.
+- A populated fjall store at `<data_dir>/`.
+- An admin DID and a one-shot install URL. Claiming the URL is what
+  puts the admin DID on the VTC's (initially empty) ACL.
+- A default landing page at `GET /` and the admin SPA at
+  `/admin/*`.
+
+## Prerequisites
+
+- A running VTA reachable over HTTPS (`https://vta.example.com`).
+- An ephemeral admin DID authorised on the VTA for the context that
+  will host this VTC. The PNM CLI prints one during the VTC setup
+  wizard; you'll paste it into `pnm acl create --did ... --role
+  admin --contexts <ctx> --expires 1h`.
+- Rust 1.95.0+ + `cargo` on your local box.
+- OS keyring support (default — see the alternatives in the
+  [secret backends doc](../02-vta/secret-backends.md), which apply
+  equally to the VTC).
+
+## Setup flow
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant CLI as vtc CLI
+    participant VTA as VTA
+    participant VTC as vtc daemon
+
+    Op->>CLI: vtc setup
+    CLI->>Op: Prompt config path<br/>VTC base URL<br/>VTA DID<br/>context
+    CLI->>VTA: Resolve VTA DID<br/>(mediator + REST endpoint)
+    CLI->>Op: DIDComm messaging choice
+    CLI->>CLI: Mint ephemeral did:key<br/>(round-trip identity)
+    CLI->>Op: Print ephemeral DID
+    Op->>VTA: pnm contexts create / acl create<br/>--admin-did <eph> --admin-expires 1h --admin-handoff
+    Op->>CLI: Confirm ACL grant
+    CLI->>VTA: Authenticate ephemeral key<br/>List did-hosting servers + domains
+    CLI->>Op: Pick did-hosting server / domain / path<br/>then secrets backend
+    CLI->>VTA: Provision-integration<br/>(VP, template=vtc-host)
+    VTA->>VTA: Mint VTC keys<br/>Render template<br/>Issue admin VC<br/>Seal bundle
+    VTA-->>CLI: Sealed bundle (HPKE)
+    CLI->>CLI: Open bundle<br/>Write VtcKeyBundle + did.jsonl<br/>Write config.toml<br/>Initialise fjall keyspaces<br/>Mint install token
+    CLI->>Op: Print install URL
+    Op->>VTC: vtc (start daemon)
+    Op->>VTC: Open install URL in browser<br/>(WebAuthn passkey ceremony)
+    VTC-->>Op: Admin claimed
+```
+
+## Step 1 — Run the setup wizard
+
+```sh
+cargo run --package vtc-service -- setup
+```
+
+The wizard prompts:
+
+| # | Prompt | Notes |
+|---|---|---|
+| 1 | Config path | Default `config.toml` |
+| 2 | VTC base URL | The URL the daemon will publish (e.g. `https://community.example.com`) |
+| 3 | VTA DID | The VTA's `did:webvh:...` identifier. Transport endpoints are resolved from the DID document — no separate VTA URL prompt |
+| 4 | Context name | The context inside the VTA that will own this VTC (created via `cnm contexts create` if it doesn't already exist) |
+| 5 | DIDComm messaging | Use the VTA's mediator, supply a different one, or skip |
+
+The wizard prints an ephemeral `did:key` and pauses. **Authorise it
+on the VTA** (this is the operator's choice — it's how you prove
+to the VTA that you control this VTC provisioning attempt):
+
+```sh
+# On a workstation that has admin access to the VTA:
+pnm acl create \
+    --did "did:key:z6Mk..." \
+    --role admin \
+    --contexts mycommunity \
+    --expires 1h \
+    --handoff
+```
+
+Press Enter in the VTC setup wizard. Now that the ephemeral key is
+authorised, the wizard authenticates to the VTA and asks **where the
+VTC DID should be published**:
+
+- **DID method** — `did:webvh` (the default) or `did:webs` (alpha): a
+  level-1 KERI identifier the VTA publishes at a hosting server, with one
+  signing key and no post-quantum key. A did:webs has no serverless
+  option, and no `did.jsonl` is written for it — see
+  [A VTC as a did:webs](../02-vta/did-webs.md#a-vtc-as-a-didwebs).
+- **did-hosting server** — pick a registered DID-hosting server from
+  the VTA's live catalogue, or choose *serverless* to self-host the
+  `did.jsonl` at the VTC base URL.
+- **tenant domain** — when the chosen server is multi-tenant, pick
+  the domain the DID is allocated under (otherwise the server's
+  default is used). *(hosted mode only)*
+- **path** — the optional `<path>` label in
+  `did:webvh:<scid>:<host>:<path>`; blank lets the server assign one.
+  *(hosted mode only)* In **serverless** mode there is no path: the
+  DID is `did:webvh:<scid>:<host>`, which resolves to
+  `https://<host>/.well-known/did.jsonl` — the daemon serves it
+  itself, so the wizard doesn't prompt for a path.
+
+The picker enumerates the catalogue over whichever transport the VTA
+advertises (REST when available, otherwise DIDComm), and provisioning
+then runs over the auto-selected transport (DIDComm-first when both are
+advertised). If the VTA DID can't be resolved or reached, the wizard
+falls back to the VTA's own 0-or-1-server auto-selection (no path
+prompt — the VTA picks a server or self-hosts).
+
+It then drives the provision-integration round trip against the VTA,
+opens the sealed bundle, and writes:
+
+- `<data_dir>/did/<scid>.jsonl` — the `did:webvh` log entry the
+  daemon serves at `GET /.well-known/did.jsonl` (the URL the VTC's
+  own DID resolves to). Not for a did:webs, whose host serves its
+  `keri.cesr`.
+- `config.toml` — the VTC's runtime configuration.
+- The `VtcKeyBundle` to the configured secrets backend.
+- `<data_dir>/keys/admin-key.json` — the admin DID's private key material
+  (owner-only, `0600`; a re-run against the same data directory never
+  overwrites it and writes `admin-key.<timestamp>.json` beside it). Setup
+  prints only this path, never the key. Move it to wherever the client that
+  acts as the admin DID keeps its keys, then delete this copy.
+
+The wizard prints a one-shot **install URL**. Save it.
+
+### Non-interactive setup (`setup --from <toml>`)
+
+For CI, immutable images, or any unattended bring-up, provision from a
+TOML file instead of the prompts:
+
+```sh
+cargo run --package vtc-service -- setup --from vtc-setup.toml
+```
+
+The file mirrors the wizard's decisions — see the fully-commented
+[`docs/03-vtc/examples/vtc-setup.example.toml`](examples/vtc-setup.example.toml)
+for the schema.
+
+There's one wrinkle: provisioning authenticates to the VTA with an
+ephemeral `did:key` that must be ACL-authorised *before* setup runs, and
+a non-interactive run can't pause to grant it (the interactive wizard's
+"press Enter once authorised" step). So it's a **two-phase** flow — the
+same shape the mediator and did-hosting services use:
+
+1. Mint + persist an ephemeral setup key (phase 1), then grant its
+   `did:key` an admin ACL at the VTA:
+
+   ```sh
+   vtc setup --setup-key-out /srv/vtc/setup-key.json --context mycommunity
+   # prints the exact command to run next:
+   pnm contexts create --id mycommunity --name "VTC" \
+       --admin-did "did:key:z6Mk..." --admin-expires 1h --admin-handoff
+   # (or `pnm acl create ... --expires 1h --handoff` if the context already exists)
+   ```
+
+2. Point `setup_key_file` in the TOML at that persisted key and run
+   `setup --from`. Setup loads the key (it does not generate a fresh
+   one), provisions against the VTA, writes the same `did.jsonl` /
+   `config.toml` / sealed bundle as the interactive path, and prints a
+   terse `key=value` block (including the install URL + claim code).
+   The admin private key is never printed; like the interactive wizard,
+   phase 2 writes it to `<data_dir>/keys/admin-key.json` (`0600`) and
+   prints `admin_key_file=<path>`.
+
+For the full walkthrough — including the secret-store `backend` selector
+and a Kubernetes example — see
+[`non-interactive-setup.md`](non-interactive-setup.md).
+
+## Step 2 — Start the daemon
+
+```sh
+cargo run --package vtc-service
+```
+
+The daemon listens on `0.0.0.0:8200` by default (override via
+`VTC_SERVER_HOST` / `VTC_SERVER_PORT`). Verify:
+
+```sh
+curl http://localhost:8200/health
+```
+
+`200 OK` with a small JSON body.
+
+## Step 3 — Claim the admin passkey
+
+Open the install URL from step 1 in a browser. The page is the
+embedded admin SPA serving the install flow:
+
+1. You type the **claim code** the wizard printed alongside the URL.
+   URL + code travel through separate channels — a leaked URL alone
+   doesn't grant admin.
+2. The browser registers a passkey via WebAuthn — Ed25519 or P-256,
+   which is what platform passkeys and security keys create — and then
+   signs once with it, proving you hold it. Your administrator DID is
+   the **`did:key` of the passkey's own key**; the install URL names no
+   DID.
+3. The SPA sends `vtc/install/claim/passkey/start/0.1` and
+   `…/finish/0.1`, then `vtc/admin/bootstrap/0.1`. That last call
+   writes the first admin's ACL entry. **Until it runs, the VTC's ACL
+   is empty.** The admin DID the wizard printed is not made an
+   administrator by the claim; grant it with `vtc acl add` (the
+   [bootstrap runbook](bootstrap-runbook.md), Path B) if you want it to
+   administer the VTC too.
+4. The token row transitions `Issued` → `Consumed` and can never be
+   redeemed again.
+5. The page shows the passkey's admin DID. Sign in at `/admin/`
+   with the passkey.
+6. The console asks you to **Set up signing** for this browser —
+   name it and confirm with the same passkey. Every admin action is a
+   signed document, so this happens once per browser before the
+   dashboard appears, and again only if the key expires (30 days, with a
+   renewal reminder), is revoked, or the browser loses its storage. See
+   [Signing keys](website-and-admin.md#signing-keys--what-the-console-signs-with).
+
+A founder who signs in only with the VTA browser wallet picks the page's
+other option instead (install claim 0.3): the wallet signs the claim as the
+founder's own DID, and the plugin's approver device becomes their step-up
+factor — no passkey is registered
+([bootstrap runbook](bootstrap-runbook.md), Path C).
+
+If setup named a second administrator (`co_admin_did`), the claim writes
+both entries; if it was run with `--single-admin`, the community runs in
+single-administrator mode. A community with one administrator and neither
+cannot add a second community administrator online — see
+[`admin-access.md`](admin-access.md) §2 for the choices, and the roles,
+step-up and approvals every administrator works under.
+
+The page does not hand you a CLI credential. To authenticate a
+script or CLI, or to get the admin in without a browser, and for
+the order that admits a community's first vetter, follow the
+**[bootstrap runbook](bootstrap-runbook.md)**.
+
+## Step 4 — Configure policy (optional)
+
+Who may join is set by the community's **join criteria**
+([`join-criteria.md`](join-criteria.md)): manage them in the console under
+**Vetting → Requirements**. The default `join.rego` follows the criteria; an
+operator replaces it only to tighten. To upload and activate a policy of your
+own, use the console's **Policies** page, or sign `policy/upsert/0.3` and then
+`policy/activate/0.1` (there is no `cnm` command for either). Changing an
+authority purpose's policy is consent-gated and parks in the action list.
+
+See [`community-lifecycle.md`](community-lifecycle.md) for the
+canonical Rego inputs each policy receives and worked examples.
+
+## Step 5 — Receive your first join request
+
+A prospective member's wallet reads the community's published criteria
+(`vtc/join-requests/manifest/0.4`) and sends a signed
+`vtc/join-requests/submit/0.3` Trust Task — over TSP, DIDComm, or HTTPS
+(`POST /v1/trust-tasks`) — presenting what a criterion asks for. The VTC
+decides it under the governing criterion and the active `join.rego`
+([`join-criteria.md`](join-criteria.md)): an `automatic` criterion that is met
+admits at once; a `review` criterion refers the request to an administrator.
+
+Administrators decide referred requests on the console's **Join requests**
+page (or **Actions**), which signs `vtc/join-requests/decide/0.1`; `cnm` has
+no join command.
+
+The VTC issues a VMC + a role VAC, allocates a status-list
+slot for revocation, and delivers each credential to the member as
+its own `credential-exchange/issue` message — see
+[`credential-delivery.md`](credential-delivery.md).
+
+## Step 6 — Configure a public website (optional)
+
+By default the VTC serves a small in-tree landing page at `GET /`.
+To serve your own landing page instead, on the same host, export the
+built-in one, edit it, and point the daemon at it. The daemon re-reads
+it on every request, so later edits need no restart:
+
+```sh
+vtc website export /var/lib/community/landing
+```
+
+```toml
+# config.toml
+[website]
+landing_dir = "/var/lib/community/landing"
+```
+
+To publish a whole site that administrators deploy from the console or
+by bundle upload (on a host of its own):
+
+```toml
+# config.toml
+[website]
+root_dir = "/var/lib/community/site"
+deploy_mode = "live"          # or "managed" for generation-based deploys
+```
+
+Drop files into `/var/lib/community/site/` directly (`scp`, `rsync`,
+`git pull`) or upload a bundle via `POST /v1/website/deploy`. See
+[`website-and-admin.md`](website-and-admin.md) for the
+full surface.
+
+## Administering from `cnm`
+
+`cnm` keeps two kinds of identity, each minted on your machine and granted by
+an administrator rather than handed over:
+
+**Your personal VTA** — `cnm setup` onboards it the way `pnm setup` does:
+
+```sh
+cnm setup                      # interactive
+# or, scripted (one JSON line per phase on stdout, as `pnm setup` prints):
+cnm setup --name home          # {"slug":"home","admin_did":"did:key:…","state":"pending"}
+#   grant that DID: `vta import-did --did <did> --role admin` on the VTA host,
+#   `admin_did = "<did>"` in a new VTA's setup.toml, or
+#   `pnm acl create --did <did> --role admin --label cnm` from an admin's pnm
+cnm setup continue home --vta-did <personal VTA DID>
+```
+
+`continue` authenticates and rotates: the temporary DID is swapped for a fresh
+`did:key` and its ACL entry removed, so the DID you passed around does not stay
+live. Run before the grant, it prints the grant commands and stays resumable.
+If `pnm` on the same machine already administers that VTA, the wizard offers
+**Bootstrap from your existing pnm session**: it uses `pnm`'s session once to
+grant cnm's own new key (an unrestricted admin — creating a top-level context
+per community needs one), then rotates as above; `pnm`'s key is never copied.
+**I have a sealed bundle from an admin** remains for air-gapped or remote
+grants (`cnm bootstrap request`, then the armored bundle and its digest).
+
+**Each community** — `cnm community add` gives every community its own key, so
+communities you run are not linked by a shared identity
+([`admin-access.md`](admin-access.md) §1.5). See
+[`bootstrap-runbook.md`](bootstrap-runbook.md#cnm-needs-its-own-administrator-entry)
+for the grant and `cnm community continue`, which then rotates the granted key
+to a fresh one at the VTC (`acl/swap-key`); `cnm community rotate` does it again
+later.
+
+## Where to go next
+
+| If you want to… | Read |
+|---|---|
+| Authenticate the first admin, and admit the first vetter | [`bootstrap-runbook.md`](bootstrap-runbook.md) |
+| Add administrators, give them roles, and approve each other's actions | [`admin-access.md`](admin-access.md) |
+| Know how an admitted member receives its credentials | [`credential-delivery.md`](credential-delivery.md) |
+| Understand the module layout | [`architecture.md`](architecture.md) |
+| Author policies + manage members | [`community-lifecycle.md`](community-lifecycle.md) |
+| Issue credentials + revoke them | [`credentials.md`](credentials.md) |
+| Publish to a trust registry | [`trust-registry.md`](trust-registry.md) |
+| Assert personhood + manage the VRC graph | [`personhood-and-graph.md`](personhood-and-graph.md) |
+| Host a public website + admin UX | [`website-and-admin.md`](website-and-admin.md) |
+| See the full VTC spec | [`../05-design-notes/vtc-mvp.md`](../05-design-notes/vtc-mvp.md) |

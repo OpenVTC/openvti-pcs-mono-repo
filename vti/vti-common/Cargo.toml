@@ -1,0 +1,245 @@
+[package]
+name = "vti-common"
+description = "Shared server-side infrastructure for VTA and VTC services"
+readme = "README.md"
+version = "0.66.0"
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+encryption = ["dep:aes-gcm"]
+vsock-store = ["dep:tokio-vsock", "dep:libc"]
+# The durable TSP relationship store (`relationship_store`), shared by the VTA
+# and VTC to survive a restart without §7.2.2 dropping every peer's traffic.
+# Pulls `affinidi-messaging-sdk` (for `RelationshipKv`/`PersistentRelationshipStore`),
+# so it is off by default and only the TSP-speaking services turn it on.
+tsp = [
+  "dep:affinidi-messaging-sdk",
+  # `trust_task_push::TspPushTransport`: `atm.tsp()` and the TSP binding
+  # envelope.
+  "affinidi-tdk/tsp",
+  "vta-sdk/tsp",
+]
+# `host_session`: a host service's identity reached over TSP and DIDComm
+# through its own mediator session (the witness, the ballot box).
+host-session = ["tsp", "dep:trust-tasks-didcomm"]
+# Exposes `AuthClaims::unsafe_local_cli_super_admin` — a synthesizer that
+# produces a super-admin claim without any wire-level verification. Only
+# for the local/dev `vta` binary's CLI, where the trust boundary is the
+# OS process (not the network). NEVER enable in enclave builds.
+cli-synthesis = []
+# Test-only builders for authcrypt envelopes with a caller-chosen protected
+# header (`auth::authcrypt_test_support`), so the services' route tests can
+# drive the sender-binding guard with envelopes a conforming packer would never
+# emit. Also `store::test_fixture`, which opens test stores from a pre-built
+# template instead of creating (and fsyncing) every keyspace. NEVER enable in a
+# production build.
+test-support = ["dep:log"]
+# Shared WebAuthn / passkey infrastructure (types + storage). Services
+# (VTA, VTC) implement the `auth::passkey::PasskeyState` trait on their
+# `AppState` and gain reusable enrolment + login storage primitives. The
+# concrete route handlers ship in a follow-up so this feature stays
+# storage-only for now.
+passkey = ["dep:webauthn-rs", "dep:url"]
+# Interactive setup helpers (dialoguer prompts) shared between
+# `vta-service` and `vtc-service`'s setup wizards. Headless consumers
+# (TEE enclave, server runtime) skip this to avoid pulling in
+# `dialoguer` + its console deps. The prompts return services'
+# own config shapes (each service has its own `SecretsConfig`).
+setup = ["dep:dialoguer"]
+# Client-IP attribution for the per-IP rate limiters: the trusted-proxy key
+# extractor both services key their unauthenticated routes on. Shared because
+# getting `X-Forwarded-For` wrong is a rate-limit bypass, and one
+# implementation is one place to get it right. Off by default — only the two
+# services turn it on.
+rate-limit = ["dep:ipnetwork", "dep:affinidi-rate-limit"]
+# OpenAPI schema generation: derives `utoipa::ToSchema` on the shared wire
+# types the VTA + VTC services expose through their `OpenApiRouter` (the ACL
+# `Role`, session `SessionState`). Off by default and zero-cost when off —
+# only the services turn it on.
+openapi = ["dep:utoipa", "dep:utoipa-axum"]
+# Room file storage on S3-compatible object stores (AWS S3, R2, MinIO, B2),
+# through `object_store`. Off by default: a host storing files in a local
+# directory needs none of it. See `blob_store`.
+blob-s3 = ["dep:object_store", "object_store/aws"]
+# Room file storage on Google Cloud Storage, natively (not its S3
+# interoperability mode, which needs static HMAC keys).
+blob-gcs = ["dep:object_store", "object_store/gcp"]
+# Room file storage through presigned requests only (`blob_store::presigned`):
+# the store holds no credential, and asks a `Presigner` (a community's VTA
+# external account) for one request per operation.
+blob-presigned = ["reqwest/stream", "dep:quick-xml"]
+# The bounded regorus (Rego) engine both services evaluate policy with
+# (`policy_engine`): compile, the input-size cap and the CPU-time budget, in
+# one place (#2577). Off by default — only `vta-policy` and `vtc-service` turn
+# it on, and nothing else should pay for an interpreter.
+policy = ["dep:regorus"]
+
+[dependencies]
+# Rego interpreter behind `policy_engine` (feature `policy`). Workspace defaults
+# include `arc`, so a compiled `Engine` is `Send + Sync` and cheap to clone.
+regorus = { workspace = true, optional = true }
+# vta-sdk for the canonical auth wire shapes
+# (`protocols::auth::ChallengeResponse`, `AuthenticateResponse`,
+# `TokenBundle`). These are SIOPv2 / RFC 6749-shaped public types
+# that clients deserialise; the canonical `/auth/*` handlers in
+# `auth::handlers` mint them. Server depending on the public SDK
+# for wire types is intentional — they're the contract.
+#
+# `default-features = false` skips the optional client transports
+# (didcomm, sealed-transfer, etc.); we only consume the type
+# definitions in the default feature set.
+vta-sdk = { path = "../vta-sdk", version = "0.90", default-features = false, features = [
+  # The Trust-Task proof verifier lives there now; this crate re-exports it.
+  "proof-verify",
+] }
+async-trait = { workspace = true }
+# Durable OutboxStore backend (`outbox_store::VtiOutboxStore`) for the D1
+# delivery layer — the Guaranteed-send outbox, persisted via `store::Store`.
+affinidi-messaging-delivery = { workspace = true }
+# `trust_task_push`: the transport trait its TSP and REST transports implement,
+# and the HTTP client the REST one posts with.
+affinidi-messaging-core = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+# Durable TSP relationship store (`relationship_store::KeyspaceRelationshipKv`)
+# for the Rev 3 §7.2.2 recovery machinery — the `RelationshipKv`/
+# `PersistentRelationshipStore`/`EvictionPolicy` types the ATM is handed. Behind
+# the `tsp` feature so a non-TSP consumer never pulls the SDK into its graph.
+affinidi-messaging-sdk = { workspace = true, optional = true, features = [
+  "tsp",
+] }
+# `host_session`: the DIDComm binding envelope's type.
+trust-tasks-didcomm = { workspace = true, optional = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+chrono = { workspace = true }
+fjall = { workspace = true }
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "signal", "macros"] }
+# `CancellationToken` in `sender_order`.
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+# RFC 8785 canonical payload under the task-consent digest (`task_consent`).
+serde_json_canonicalizer = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+# Constant-time comparison of backup bundle tokens (`backup_transfer`).
+subtle = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+# Idempotency middleware buffers request + response bodies (bounded by
+# `MAX_BODY_BYTES`) so it can hash inputs + cache outputs.
+http-body-util = { workspace = true }
+# `audit::writer::AUDIT_CHAIN_RECOVERY_FAILURES` — same pattern and version as
+# `vta_audit::AUDIT_WRITE_FAILURES`, so the two counters compose on one
+# dashboard without a version mismatch between exporters.
+metrics = { workspace = true }
+
+# Secrets resolver (for error type)
+affinidi-tdk = { workspace = true }
+affinidi-secrets-resolver = { workspace = true }
+trust-tasks-rs = { workspace = true }
+trust-tasks-capability-client = { workspace = true }
+# DID resolution for SIOPv2 id_token verification (auth::siop). The
+# resolver + `DocumentExt` (from affinidi-tdk) turn an `iss` DID into the
+# Ed25519 verifying key. multibase decodes the `did:key` key for pinning.
+affinidi-did-resolver-cache-sdk = { workspace = true }
+multibase = { workspace = true }
+
+# Encryption (feature-gated; `rand` is non-optional and lives in the main
+# dep block since audit_key rotation also needs OS randomness).
+aes-gcm = { workspace = true, optional = true }
+# Non-optional: `slip10` wipes every intermediate HMAC block, and that must not
+# depend on whether a consumer happens to enable `encryption`.
+zeroize = { workspace = true, features = ["derive"] }
+
+# Vsock storage proxy client (feature-gated, Linux only)
+tokio-vsock = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+
+# OpenAPI: `#[derive(ToSchema)]` on shared wire types (`Role`, `SessionState`).
+# Optional + gated on the `openapi` feature so non-service consumers stay slim.
+utoipa = { workspace = true, optional = true }
+# utoipa-axum `UtoipaMethodRouter` layering for the OpenAPI-aware
+# Trust-Task route helpers (`trust_task::openapi`). Gated on `openapi`.
+utoipa-axum = { workspace = true, optional = true }
+
+# Passkey feature deps. `rand` / `uuid` / `hex` are non-optional and
+# live in the main dep block since audit + idempotency need them
+# unconditionally.
+webauthn-rs = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+# Setup feature: shared dialoguer prompts for VTA + VTC `vtc setup` /
+# `vta setup` interactive wizards.
+dialoguer = { workspace = true, optional = true }
+
+ipnetwork = { workspace = true, optional = true }
+affinidi-rate-limit = { workspace = true, optional = true }
+# Object-store backends for `blob_store` (S3, GCS). One crate for both, and it
+# takes a custom credential provider, which is where VTA-issued, room-scoped
+# credentials plug in later (data-rooms-files.md §7.4).
+object_store = { workspace = true, optional = true }
+# S3's XML answers to the multipart and listing requests a direct upload's
+# verification reads (`blob_store::presigned`). Already in the graph through
+# `object_store`.
+quick-xml = { version = "0.42", features = ["serialize"], optional = true }
+
+# Only for `store::test_fixture`'s stderr logger (feature `test-support`):
+# fjall reports why it poisoned a database through `log`, which tests
+# otherwise never print.
+log = { version = "0.4", optional = true }
+
+[dev-dependencies]
+log = "0.4"
+# `blob_store::presigned` also compiles for this crate's own tests without the
+# `blob-presigned` feature, and reads S3's XML answers.
+quick-xml = { version = "0.42", features = ["serialize"] }
+# Parses the config fixtures in the VaultConfig tests.
+toml = { workspace = true }
+tempfile = { workspace = true }
+# `base64` is now in the main `[dependencies]` (audit envelope encodes
+# 32-byte hashes as base64url strings).
+# Drives Router::oneshot in the trust_task router tests. Same pattern
+# vtc-service / vta-service use for integration tests.
+tower = { workspace = true, features = ["util"] }
+# Paused time for the rate-limit sweep test.
+tokio = { workspace = true, features = ["test-util"] }
+http-body-util = { workspace = true }
+# `blob_store::presigned` streams a staged file as a request body; its tests
+# run without the `blob-presigned` feature, so they ask for the same here.
+reqwest = { workspace = true, features = ["stream"] }
+# Captures `metrics` counters in-process so the audit chain-recovery tests can
+# assert what was emitted. Matches the `metrics 0.24` the crate records
+# through; no exporter is involved.
+metrics-util = { version = "0.20", features = ["debugging"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# `umask` in the secure_file tests, to prove a secret file is 0600 regardless
+# of the process file-creation mask.
+libc = { workspace = true }
+
+# The workspace lint table with `unsafe_code` at `deny`, not `forbid` (#2658):
+# this crate needs `unsafe` for `libc::umask` and `std::env::set_var` in its tests. Each such
+# statement carries `#[allow(unsafe_code)]` beside its SAFETY comment.
+# `scripts/check-workspace-lints.py` holds this table to `[workspace.lints]`.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"

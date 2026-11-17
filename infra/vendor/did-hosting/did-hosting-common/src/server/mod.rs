@@ -1,0 +1,176 @@
+//! Shared service plumbing for every DID hosting binary: configuration,
+//! storage, the ACL and auth, Trust Task dispatch and its transports
+//! (HTTPS, DIDComm, TSP), the service's own identity, domains, migrations,
+//! stats and the CLI subcommands the binaries share. Only compiled with the
+//! `server-core` feature; unstable, public so the binaries can compose it.
+
+pub mod acl;
+pub mod acl_removal;
+pub mod agent_name_index;
+pub mod assignment;
+pub mod assignment_seed;
+pub mod auth;
+pub mod backup;
+// Subcommand groups the service binaries share.
+#[cfg(feature = "server-core")]
+pub mod cli;
+pub mod cli_acl;
+pub mod cli_dids;
+pub mod cli_identity;
+pub mod cli_metrics;
+pub mod cli_trust_task;
+pub mod cli_tsp;
+pub mod config;
+pub mod did_index;
+pub mod didcomm_profile;
+pub mod didcomm_unpack;
+pub mod domain;
+pub mod domain_purge;
+pub mod error;
+pub mod health;
+pub mod identity;
+pub mod identity_drain;
+pub mod identity_rotate;
+pub mod identity_scid_alias;
+pub mod init;
+pub mod listener;
+pub mod log_limit;
+#[cfg(feature = "metrics")]
+pub mod metrics;
+pub mod migrations;
+pub mod mnemonic;
+pub mod operator_messages;
+#[cfg(feature = "passkey")]
+pub mod passkey;
+pub mod path_locks;
+pub mod pending_purge;
+pub mod problem_report;
+pub mod rate_limit;
+pub mod replay;
+pub mod scid_floors;
+pub mod secret_store;
+#[cfg(feature = "setup-wizard")]
+pub mod setup_prompts;
+pub mod setup_recipe;
+pub mod stats_collector;
+pub mod stats_tiers;
+pub mod store;
+// Background work as data, and the supervisor that runs and stops it.
+#[cfg(feature = "server-core")]
+pub mod supervise;
+// The Trust Tasks framework integration: dispatch, proof verification,
+// the sender-bound gate and outbound sends.
+#[cfg(feature = "server-core")]
+pub mod trust_tasks;
+// The Trust Tasks TSP binding envelope: reading whichever dialect a frame
+// arrives in and answering in the same one. Shared so the control plane and
+// the edge server cannot drift apart on the wire.
+#[cfg(feature = "server-core")]
+pub mod tsp_binding;
+// Inbound TSP relationship answering arm (Rev 3 §7.2.2). Gated behind
+// `server-core` because it names the messaging-service `HandlerContext` and
+// the TSP control-message types, which only the server-side listeners use.
+#[cfg(feature = "server-core")]
+pub mod tsp_relationship;
+// Durable TSP relationship store (Rev 3 §7.2.2 persistence). Gated behind
+// `server-core` because it names the messaging SDK's relationship-store types
+// and webvh's storage keyspaces, both server-only.
+#[cfg(feature = "server-core")]
+pub mod tsp_relationship_store;
+pub mod vta_setup;
+
+/// Axum middleware that sets security response headers on every response.
+///
+/// The defaults are conservative for an admin/management UI hosted on the
+/// control plane. Reverse-proxy operators can override these by stripping and
+/// re-injecting headers if the deployment needs to differ (e.g. CSP for an
+/// embedded iframe widget). See `docs/bootstrap_startup.md` for the policy.
+///
+/// Headers set:
+/// - `X-Content-Type-Options: nosniff` — block MIME sniffing.
+/// - `X-Frame-Options: DENY` — block framing/clickjacking. Mirrored by CSP
+///   `frame-ancestors 'none'` for browsers that prefer the modern directive.
+/// - `Content-Security-Policy: default-src 'self'; ...` — restrict resource
+///   loads to same-origin. Allows inline styles (the React/Expo bundle pulls
+///   styles from `<style>` tags); inline scripts are *not* allowed.
+/// - `Referrer-Policy: no-referrer` — prevent the enrollment URL from leaking
+///   via the `Referer` header on outbound link clicks. Invite links carry the
+///   token in the fragment, which is never sent; links issued before carried
+///   it in the query.
+/// - `Strict-Transport-Security: max-age=31536000` — pin TLS for one year on
+///   any caller that has reached us over HTTPS. Browsers ignore this header
+///   when delivered over plaintext HTTP, so it is harmless on plain-HTTP
+///   deployments.
+/// - `Cache-Control: no-store` — applied only when the handler hasn't set its
+///   own `Cache-Control`. Public DID-resolution endpoints set
+///   `Cache-Control: public, max-age=…` explicitly so CDNs and browsers can
+///   cache them; admin/API responses fall through to `no-store`.
+pub async fn security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; \
+             style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; \
+             connect-src 'self'; \
+             frame-ancestors 'none'; \
+             base-uri 'self'; \
+             form-action 'self'",
+        ),
+    );
+    headers.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        axum::http::HeaderValue::from_static("max-age=31536000"),
+    );
+    // Default to `no-store` for API / UI responses. Public DID-resolution
+    // handlers set `Cache-Control: public, max-age=…` explicitly so this
+    // middleware leaves their value untouched — DID logs are content-
+    // addressed and cacheable.
+    if !headers.contains_key(axum::http::header::CACHE_CONTROL) {
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    resp
+}
+
+/// CORS layer for public DID resolution.
+///
+/// DID documents (`did.jsonl`, `/.well-known/did.json`) are public,
+/// content-addressed, unauthenticated data. Browser-based resolvers and
+/// wallets fetch them cross-origin, so we advertise `Access-Control-Allow-Origin: *`
+/// to let any page read the response. Resolution is read-only, so only the
+/// safe methods are allowed.
+///
+/// This is deliberately permissive but safe: credentials are never reflected
+/// (wildcard origin forbids `Access-Control-Allow-Credentials: true`), and
+/// management (`POST /api/trust-tasks`) authenticates with signed documents
+/// and bearer JWTs rather than cookies — so a
+/// wildcard origin grants a cross-origin page nothing it could not already
+/// fetch server-to-server, while still blocking it from reading authenticated
+/// responses it has no token for.
+pub fn public_resolution_cors() -> tower_http::cors::CorsLayer {
+    use axum::http::Method;
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+        .allow_headers(tower_http::cors::Any)
+}

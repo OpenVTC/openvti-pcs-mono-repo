@@ -1,0 +1,435 @@
+//! The community's policy log and its self-hosted DID log on the
+//! signed-document spine.
+//!
+//! | task | authority (the signer's ACL row, read now) |
+//! |---|---|
+//! | `policy/list/0.3` | `Admin` |
+//! | `policy/get/0.1` | `Admin` |
+//! | `policy/active/0.1` | `Admin` |
+//! | `policy/upsert/0.3` | `Admin`, no context scope; for an authority purpose also a bound gesture + consent (VTI-VTC-022) |
+//! | `policy/activate/0.1` | `Admin`, no context scope; for an authority purpose also a bound gesture + consent (VTI-VTC-022) |
+//! | `vtc/policies/test/0.1` | `Admin` |
+//! | `did-management/did/register/0.1` | `Admin`, no context scope |
+//!
+//! Each is the question its bearer route asked: `AdminAuth` for the policy
+//! verbs, `SuperAdminAuth` for installing the community's DID log. Every one
+//! arrives here the same way over TSP, DIDComm or HTTPS.
+//!
+//! `policy/upsert` and `did/register` carry documents larger than the 64 KiB
+//! default (a Rego module, a DID's whole log), so the spine admits them at the
+//! limits [`super::size`] sets, for a signer with standing only.
+//!
+//! None of them has a REST route.
+//!
+//! `policy/list/0.3` has no purpose filter. The console asks for one purpose's
+//! revisions, so an `ext` member `org.openvtc.purpose` narrows the listing to
+//! it — the same key a revision's own `ext` names its purpose by.
+
+use super::routing::{Routes, on};
+use serde_json::Value;
+use trust_tasks_rs::{Payload, TrustTask};
+use uuid::Uuid;
+use vti_specs::did_management::did::register::v0_1 as did_register;
+use vti_specs::policy::{
+    activate::v0_1 as policy_activate, active::v0_1 as policy_active, get::v0_1 as policy_get,
+    list::v0_3 as policy_list, upsert::v0_3 as policy_upsert,
+};
+use vti_specs::vtc::policies::test::v0_1 as policy_test;
+
+use super::helpers::{
+    TrustTaskOutcome, app_error_to_reject, extended_code, reject_with_code, success_response,
+    task_error_to_reject,
+};
+use super::{JoinAuthCtx, admin_signer, parse_spec_payload};
+use crate::acl::Capability;
+use crate::error::AppError;
+use crate::policy::PolicyPurpose;
+use crate::policy::ops::{admin as policy_admin, read as policy_read};
+use crate::server::AppState;
+
+#[cfg(test)]
+pub(crate) const POLICY_TEST_TYPE: &str = <policy_test::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const POLICY_LIST_TYPE: &str = <policy_list::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const POLICY_GET_TYPE: &str = <policy_get::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const POLICY_ACTIVE_TYPE: &str = <policy_active::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const POLICY_ACTIVATE_TYPE: &str = <policy_activate::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const DID_REGISTER_TYPE: &str = <did_register::Payload as Payload>::TYPE_URI;
+
+pub(crate) const POLICY_UPSERT_TYPE: &str = <policy_upsert::Payload as Payload>::TYPE_URI;
+
+/// Register every task this family serves (#2579).
+pub(super) fn register(routes: Routes) -> Routes {
+    let routes =
+        on!(routes, policy_list::Payload => |state, ctx, doc| handle_list(state, ctx, doc));
+    let routes = on!(routes, policy_get::Payload => |state, ctx, doc| handle_get(state, ctx, doc));
+    let routes =
+        on!(routes, policy_active::Payload => |state, ctx, doc| handle_active(state, ctx, doc));
+    let routes =
+        on!(routes, policy_upsert::Payload => |state, ctx, doc| handle_upsert(state, ctx, doc));
+    let routes =
+        on!(routes, policy_activate::Payload => |state, ctx, doc| handle_activate(state, ctx, doc));
+    let routes =
+        on!(routes, policy_test::Payload => |state, ctx, doc| handle_test(state, ctx, doc));
+    on!(routes, did_register::Payload => |state, ctx, doc| handle_did_register(state, ctx, doc))
+}
+
+/// The signer as an administrator (the routes' `AdminAuth`), and its payload
+/// validated against the published schema.
+async fn admin_with<P>(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: &TrustTask<Value>,
+) -> Result<(crate::acl::AdminActor, P), TrustTaskOutcome>
+where
+    P: trust_tasks_rs::validate::ValidatedPayload + serde::de::DeserializeOwned,
+{
+    let actor = admin_signer(state, ctx, doc).await?;
+    let payload = parse_spec_payload::<P>(doc)?;
+    Ok((actor, payload))
+}
+
+/// A revision id, as the route's path parsed it.
+fn revision_id(doc: &TrustTask<Value>, raw: &str) -> Result<Uuid, TrustTaskOutcome> {
+    raw.parse().map_err(|_| {
+        app_error_to_reject(
+            doc,
+            &AppError::Validation(format!("policy id {raw:?} is not a UUID")),
+        )
+    })
+}
+
+async fn handle_list(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let query = match admin_with::<policy_list::Payload>(state, ctx, &doc).await {
+        Ok((_, query)) => query,
+        Err(reject) => return reject,
+    };
+    let mut purpose = None;
+    if let Some(raw) = doc.payload["ext"][policy_read::PURPOSE_EXT_KEY].as_str() {
+        match serde_json::from_value::<PolicyPurpose>(Value::String(raw.to_owned())) {
+            Ok(p) => purpose = Some(p),
+            Err(e) => {
+                return app_error_to_reject(
+                    &doc,
+                    &AppError::Validation(format!(
+                        "ext.{} {raw:?} is not a known purpose: {e}",
+                        policy_read::PURPOSE_EXT_KEY
+                    )),
+                );
+            }
+        }
+    }
+    match policy_read::list_policies_inner(state, query, purpose).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_get(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (_, payload) = match admin_with::<policy_get::Payload>(state, ctx, &doc).await {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let id = match revision_id(&doc, payload.id.as_str()) {
+        Ok(id) => id,
+        Err(reject) => return reject,
+    };
+    match policy_read::show_policy_inner(state, id).await {
+        Ok(response) => success_response(&doc, response),
+        Err(AppError::NotFound(message)) => reject_with_code(
+            &doc,
+            extended_code(policy_get::error_codes::NOT_FOUND.code),
+            message,
+            None,
+        ),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_active(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let query = match admin_with::<policy_active::Payload>(state, ctx, &doc).await {
+        Ok((_, query)) => query,
+        Err(reject) => return reject,
+    };
+    match policy_read::active_policies(state, query).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+/// `policy/upsert/0.3` — store a new revision.
+///
+/// **Unrestricted administrator** only, where it used to be any admin: a
+/// revision replaces the Rego that decides role changes, removal, joins,
+/// recognition, git rights, rooms and vetter eligibility, so a scoped admin
+/// could rewrite the rules that bound it (`vtc-action-list.md` §8.1, hole 3).
+/// For a purpose that decides authority ([`PolicyPurpose::decides_authority`])
+/// or recognition — the personhood policy
+/// ([`PolicyPurpose::decides_recognition`]) — it also takes the requester's
+/// gesture and another administrator's consent, bound to this document
+/// (**VTI-VTC-022**: policy may only refuse, and changing the policy that
+/// decides authority is gated; **VTI-APV-023**: so is changing who is
+/// recognised as a person).
+async fn handle_upsert(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    // Any `vtc.policy.admin` first, so a stranger learns nothing about the
+    // payload; then the one for this revision's purpose (`policy:<purpose>`,
+    // vtc-admin-roles.md §4–§5), once the payload says which it is.
+    let (actor, body) = match admin_with::<policy_upsert::Payload>(state, ctx, &doc).await {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    if let Err(e) =
+        crate::acl::require_any_capability(&state.acl_ks, &actor.did, Capability::PolicyAdmin).await
+    {
+        return app_error_to_reject(&doc, &e);
+    }
+    let purpose = match policy_admin::precheck_upload(&body) {
+        Ok(p) => p,
+        Err(e) => return app_error_to_reject(&doc, &e),
+    };
+    if let Err(e) = require_policy_admin(state, &actor.did, purpose).await {
+        return app_error_to_reject(&doc, &e);
+    }
+    // Refused for its own faults before anyone is asked to approve it
+    // (`vtc-action-list.md` §4.2); `upload_inner` checks again when it runs.
+    if purpose.requires_consent() {
+        match policy_admin::check_upload(state, &body).await {
+            Ok(()) => {}
+            Err(AppError::Conflict(message)) => {
+                return reject_with_code(
+                    &doc,
+                    extended_code(policy_upsert::error_codes::VERSION_CONFLICT.code),
+                    message,
+                    None,
+                );
+            }
+            Err(e) => return app_error_to_reject(&doc, &e),
+        }
+    }
+    if let Err(refusal) = gate_authority_policy(state, &actor, &doc, purpose, "Replace").await {
+        return refusal;
+    }
+    match policy_admin::upload_inner(state, &actor.did, body).await {
+        Ok(response) => success_response(&doc, response),
+        Err(AppError::Conflict(message)) => reject_with_code(
+            &doc,
+            extended_code(policy_upsert::error_codes::VERSION_CONFLICT.code),
+            message,
+            None,
+        ),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+/// `vtc.policy.admin @ policy:<purpose>` (vtc-admin-roles.md §4–§5).
+async fn require_policy_admin(
+    state: &AppState,
+    did: &str,
+    purpose: PolicyPurpose,
+) -> Result<(), AppError> {
+    crate::acl::require_capability(
+        &state.acl_ks,
+        did,
+        Capability::PolicyAdmin,
+        Some(&crate::acl::ResourceQualifier::Policy(purpose)),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The second party a change to a consent-gated policy takes, and nothing for
+/// any other purpose: one that decides authority (**VTI-VTC-022**) parks as
+/// [`Act::ChangeAuthorityPolicy`](crate::acl::admin_consent::Act::ChangeAuthorityPolicy),
+/// the personhood policy (**VTI-APV-023**) as
+/// [`Act::ChangeRecognitionPolicy`](crate::acl::admin_consent::Act::ChangeRecognitionPolicy).
+/// Both are approved by the other holders of `vtc.policy.admin @
+/// policy:<purpose>`; in single-administrator mode the requester's bound
+/// gesture stands in, at `Critical` ([`super::acl_tasks::settle_consent_gate`]).
+async fn gate_authority_policy(
+    state: &AppState,
+    actor: &crate::acl::AdminActor,
+    doc: &TrustTask<Value>,
+    purpose: PolicyPurpose,
+    verb: &str,
+) -> Result<(), TrustTaskOutcome> {
+    use crate::acl::admin_consent::Act;
+    let (act, summary) = if purpose.decides_authority() {
+        (
+            Act::ChangeAuthorityPolicy(purpose),
+            format!(
+                "{verb} the {} policy, which decides authority in this community",
+                purpose.as_str()
+            ),
+        )
+    } else if purpose.decides_recognition() {
+        (
+            Act::ChangeRecognitionPolicy(purpose),
+            format!(
+                "{verb} the {} policy, which decides who this community recognises as a person",
+                purpose.as_str()
+            ),
+        )
+    } else {
+        return Ok(());
+    };
+    super::acl_tasks::settle_consent_gate(
+        state,
+        actor,
+        doc,
+        act,
+        &format!("policy:{}", purpose.as_str()),
+        &summary,
+        &summary,
+    )
+    .await
+}
+
+/// `policy/activate/0.1` — put a revision in force for its purpose.
+///
+/// Unrestricted administrator only, and for a purpose that decides authority
+/// or recognition the gesture and another administrator's consent too — the
+/// same gate as [`handle_upsert`], for the same reasons (**VTI-VTC-022**,
+/// **VTI-APV-023**).
+async fn handle_activate(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, payload) = match admin_with::<policy_activate::Payload>(state, ctx, &doc).await {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    if let Err(e) =
+        crate::acl::require_any_capability(&state.acl_ks, &actor.did, Capability::PolicyAdmin).await
+    {
+        return app_error_to_reject(&doc, &e);
+    }
+    if payload.context_id.is_some() {
+        return app_error_to_reject(
+            &doc,
+            &AppError::Validation(
+                "this maintainer does not implement contextId: a VTC is a single community and \
+                 its policy bindings are community-wide"
+                    .into(),
+            ),
+        );
+    }
+    let id = match revision_id(&doc, payload.id.as_str()) {
+        Ok(id) => id,
+        Err(reject) => return reject,
+    };
+    let purpose =
+        match serde_json::from_value::<PolicyPurpose>(Value::String(payload.purpose.to_string())) {
+            Ok(p) => p,
+            Err(e) => {
+                return app_error_to_reject(
+                    &doc,
+                    &AppError::Validation(format!(
+                        "purpose {:?} is not one this community decides: {e}",
+                        payload.purpose.to_string()
+                    )),
+                );
+            }
+        };
+    let refuse = |doc: &TrustTask<Value>, e: AppError| match e {
+        AppError::NotFound(message) => reject_with_code(
+            doc,
+            extended_code(policy_activate::error_codes::NOT_FOUND.code),
+            message,
+            None,
+        ),
+        AppError::Conflict(message) => reject_with_code(
+            doc,
+            extended_code(policy_activate::error_codes::ALREADY_ACTIVE.code),
+            message,
+            None,
+        ),
+        e => app_error_to_reject(doc, &e),
+    };
+    // The stored revision's purpose decides the gate, not the one named.
+    let decides = match policy_admin::precheck_activate(state, id, Some(purpose)).await {
+        Ok(p) => p,
+        Err(e) => return refuse(&doc, e),
+    };
+    if let Err(e) = require_policy_admin(state, &actor.did, decides).await {
+        return app_error_to_reject(&doc, &e);
+    }
+    if let Err(refusal) = gate_authority_policy(state, &actor, &doc, decides, "Activate").await {
+        return refusal;
+    }
+    match policy_admin::activate_inner(state, &actor.did, id, Some(purpose)).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => refuse(&doc, e),
+    }
+}
+
+async fn handle_test(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, payload) = match admin_with::<policy_test::Payload>(state, ctx, &doc).await {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    if let Err(e) =
+        crate::acl::require_any_capability(&state.acl_ks, &actor.did, Capability::PolicyAdmin).await
+    {
+        return app_error_to_reject(&doc, &e);
+    }
+    let id = match revision_id(&doc, payload.id.as_str()) {
+        Ok(id) => id,
+        Err(reject) => return reject,
+    };
+    match policy_admin::test(state, &actor.did, id, payload).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => task_error_to_reject(&doc, &e),
+    }
+}
+
+/// `did-management/did/register/0.1` — the route's `SuperAdminAuth`: an
+/// administrator with no context scope.
+async fn handle_did_register(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    // Authority before the payload, as the route's extractor ran first.
+    let actor = match super::capable_signer(state, ctx, &doc, Capability::DidAdmin, None).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    let payload = match parse_spec_payload::<did_register::Payload>(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    match crate::community::ops::did_register::register_inner(state, &actor.did, payload).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}

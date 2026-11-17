@@ -1,0 +1,390 @@
+//! Top-level raw config schema (`[server]`, `[streaming]`, `[did_resolver]`,
+//! `[secrets]`, `[storage]`, and the `ConfigRaw` root).
+
+use crate::redact::redact_url;
+use serde::{Deserialize, Serialize};
+
+use crate::{LimitsConfigRaw, ProcessorsConfigRaw, SecurityConfigRaw, defaults};
+
+/// `[database]` section schema (raw, all-strings TOML form).
+///
+/// Defined here rather than imported from mediator-common: that crate gates its
+/// `database` module behind the `server` feature, so importing `DatabaseConfigRaw`
+/// would force this lean schema crate to depend on a build of mediator-common
+/// that exposes `database` without `server` — a publish-ordering hazard (the
+/// published mediator-common keeps `database` gated). The raw DB config is config
+/// schema, so it lives here; the resolved `DatabaseConfig` (with circuit-breaker
+/// tuning, used by the runtime `DatabaseHandler`) stays in mediator-common, and
+/// the mediator converts between them.
+///
+/// `Debug` is written by hand so `database_url` prints with its credentials
+/// replaced.
+#[derive(Serialize, Deserialize)]
+pub struct DatabaseConfigRaw {
+    /// A stored-function library to load in place of the one built into the
+    /// mediator. Absent or empty: the built-in library.
+    #[serde(default)]
+    pub functions_file: String,
+    pub database_url: String,
+    pub database_timeout: String,
+    pub scripts_path: Option<String>,
+    /// `"true"` to talk to a cluster-mode server. Absent means `"false"`.
+    #[serde(default)]
+    pub cluster_mode: String,
+    /// Consecutive failed database commands that open the circuit breaker.
+    /// At least 1; absent: 5. An unreadable value is refused.
+    #[serde(default)]
+    pub circuit_breaker_threshold: String,
+    /// Seconds an open circuit breaker waits before letting a probe command
+    /// through. Absent: 10. An unreadable value is refused.
+    #[serde(default)]
+    pub circuit_breaker_recovery_secs: String,
+}
+
+impl std::fmt::Debug for DatabaseConfigRaw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfigRaw")
+            .field("functions_file", &self.functions_file)
+            .field("database_url", &redact_url(&self.database_url))
+            .field("database_timeout", &self.database_timeout)
+            .field("scripts_path", &self.scripts_path)
+            .field("cluster_mode", &self.cluster_mode)
+            .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
+            .field(
+                "circuit_breaker_recovery_secs",
+                &self.circuit_breaker_recovery_secs,
+            )
+            .finish()
+    }
+}
+
+/// Every key at its [`defaults::database`](crate::defaults::database) value.
+/// `functions_file` is empty (the built-in stored-function library) and the
+/// optional keys are empty, as an absent key leaves them.
+impl Default for DatabaseConfigRaw {
+    fn default() -> Self {
+        Self {
+            functions_file: String::new(),
+            database_url: defaults::database::DATABASE_URL.to_string(),
+            database_timeout: defaults::database::DATABASE_TIMEOUT.to_string(),
+            scripts_path: None,
+            cluster_mode: String::new(),
+            circuit_breaker_threshold: String::new(),
+            circuit_breaker_recovery_secs: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub listen_address: String,
+    pub api_prefix: String,
+    pub admin_did: String,
+    /// Reverse proxies whose `X-Forwarded-For` header may be trusted.
+    ///
+    /// An empty list keeps the socket peer as the rate-limit key.
+    ///
+    /// List only proxies that *append* the connecting peer's address to
+    /// `X-Forwarded-For`, and make sure the mediator is reachable only through
+    /// them. The mediator charges the rightmost address that is not listed here,
+    /// so a proxy that forwards a client-supplied header unchanged, or a listener
+    /// exposed directly, lets clients choose their own rate-limit key.
+    ///
+    /// A catch-all range (`0.0.0.0/0`, `::/0`) is refused at startup
+    /// (`validate::check_trust_xff_cidrs`). An unreadable chain from a listed
+    /// proxy is refused with `400`. Has no effect when per-IP limiting is
+    /// disabled.
+    #[serde(default)]
+    pub trust_xff_cidrs: Vec<ipnet::IpNet>,
+    /// Client ranges allowed to read `/metrics`. The client address is
+    /// resolved as for per-IP rate limiting (through `trust_xff_cidrs`).
+    ///
+    /// Absent means loopback plus the private, unique-local, shared (CGNAT) and
+    /// link-local ranges, so an in-cluster or sidecar scraper keeps working
+    /// while a client on the public internet is refused. An empty list refuses
+    /// everyone.
+    #[serde(default)]
+    pub metrics_allow_cidrs: Option<Vec<ipnet::IpNet>>,
+    /// When set, `/metrics` also requires `Authorization: Bearer <token>`.
+    #[serde(default)]
+    pub metrics_bearer_token: Option<RedactedString>,
+    pub did_web_self_hosted: Option<String>,
+    /// Additional URL aliases the mediator should treat as
+    /// pointing at *itself* when resolving a routing-2.0 next-hop.
+    /// Each entry is a full URL (e.g. `"https://mediator.example.com"`);
+    /// host + port are extracted and compared against the next-hop's
+    /// service endpoint. `listen_address` is automatically included,
+    /// so this is only needed when the mediator is reachable via
+    /// hostnames or ports that differ from its bind address (e.g.,
+    /// behind a load balancer or reverse proxy).
+    #[serde(default)]
+    pub local_endpoints: Vec<String>,
+}
+
+/// A string that never appears in `Debug` output (a credential).
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedString(pub String);
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
+}
+
+/// Live streaming configuration
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamingConfig {
+    pub enabled: String,
+    pub uuid: String,
+}
+
+/// DID resolver configuration.
+///
+/// The conversion to the runtime `DIDCacheConfig` lives in the mediator
+/// (`crate::common::config::did_resolver_cache_config`, from the typed
+/// [`settings::did_resolver`](crate::settings::did_resolver)) so this crate stays
+/// free of the DID-resolver SDK.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DIDResolverConfig {
+    pub address: Option<String>,
+    pub cache_capacity: String,
+    pub cache_ttl: String,
+    pub network_timeout: String,
+    pub network_limit: String,
+}
+
+/// Every key at its [`defaults::did_resolver`](crate::defaults::did_resolver)
+/// value; no resolver `address` (resolve locally).
+impl Default for DIDResolverConfig {
+    fn default() -> Self {
+        use defaults::did_resolver as d;
+        Self {
+            address: None,
+            cache_capacity: d::CACHE_CAPACITY.to_string(),
+            cache_ttl: d::CACHE_TTL.to_string(),
+            network_timeout: d::NETWORK_TIMEOUT_MS.to_string(),
+            network_limit: d::NETWORK_LIMIT.to_string(),
+        }
+    }
+}
+
+/// `[secrets]` config section — the unified secret-storage backend.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SecretsConfigRaw {
+    /// Backend URL. Examples: `keyring://affinidi-mediator`,
+    /// `file:///var/lib/mediator/secrets.json`,
+    /// `aws_secrets://us-east-1/prod/mediator/`.
+    ///
+    /// Defaulted so a file that leaves it commented out (the shipped
+    /// template does, so the operator picks one) still parses; an empty value
+    /// is refused at startup by
+    /// [`check_secrets_backend`](crate::validate::check_secrets_backend),
+    /// which lists the choices.
+    #[serde(default)]
+    pub backend: String,
+    /// Maximum age for the cached VTA bundle (humantime format, e.g.
+    /// `"30d"` or `"12h"`). `None` or `"0"` means no expiry. Defaults to
+    /// 30 days when unset.
+    #[serde(default)]
+    pub cache_ttl: Option<String>,
+}
+
+/// Raw configuration deserialized from the TOML file, converted to the runtime
+/// `Config` in the mediator binary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfigRaw {
+    pub log_level: String,
+    pub log_json: String,
+    pub mediator_did: String,
+    pub server: ServerConfig,
+    pub database: DatabaseConfigRaw,
+    pub security: SecurityConfigRaw,
+    pub streaming: StreamingConfig,
+    pub did_resolver: DIDResolverConfig,
+    pub limits: LimitsConfigRaw,
+    pub processors: ProcessorsConfigRaw,
+    /// Unified secret backend — required whenever the mediator has any
+    /// persistent identity (which is effectively always).
+    pub secrets: SecretsConfigRaw,
+    /// Optional storage backend selector. Absent → Redis (legacy
+    /// behaviour, uses `[database]`). Present with `backend = "fjall"`
+    /// → embedded Fjall at `data_dir`, `[database]` is ignored.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+    /// Optional `[didcomm_v1]` section. Absent → DIDComm v1 is off, which is
+    /// also what a mediator built without the `didcomm-v1` feature does.
+    #[serde(default)]
+    pub didcomm_v1: Option<DidCommV1ConfigRaw>,
+}
+
+/// `[didcomm_v1]` section — Aries RFC 0019 support.
+///
+/// Requires the mediator to be built with the `didcomm-v1` feature; the binary
+/// warns and ignores the section otherwise, rather than pretending v1 traffic
+/// will be handled.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DidCommV1ConfigRaw {
+    /// Accept inbound DIDComm v1 forwards. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Accept a v1 forward that arrives **without** an authenticated session.
+    ///
+    /// Default `false`, which keeps this mediator's existing posture: every
+    /// inbound message rides an authenticated session.
+    ///
+    /// Aries mediators do the opposite — a `routing/1.0/forward` is anoncrypt'd
+    /// to the mediator's routing key by design, so the sender is anonymous and
+    /// the mediator applies the *recipient's* access list instead. A stock
+    /// Credo wallet has no way to complete this mediator's v2 challenge, so
+    /// `true` is required for real Aries interop and is a deliberate,
+    /// per-deployment loosening: it lets an unauthenticated party cause a store
+    /// write, bounded by the recipient's ACL, the message-size limit, and the
+    /// per-IP rate limiter.
+    #[serde(default)]
+    pub allow_unauthenticated_forwards: bool,
+    /// Let `keylist-update` register a routing key other than the one that
+    /// authenticated the request.
+    ///
+    /// Default `false`: a client may register only the verkey it authcrypted
+    /// the request with, which is the one key the mediator has seen it hold.
+    /// Coordinate-mediation 1.0 carries no proof that a client holds any
+    /// *other* key it lists, and Aries wallets register a fresh key per
+    /// connection, so `true` is required for stock Aries interop. With it on,
+    /// a key is registered to whichever account claims it first, and that
+    /// account receives forwards for it. The only exception is the key's own
+    /// holder, who can take the key over by adding it in a request that key
+    /// authenticates. The account must be able to receive, and
+    /// `max_routing_keys_per_account` still applies. The mediator warns at
+    /// startup when this is on.
+    #[serde(default)]
+    pub allow_unproven_routing_keys: bool,
+    /// Most routing keys one account may hold. Default
+    /// [`DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT`]. An add that would exceed it
+    /// is refused for that key; `0` refuses every add.
+    #[serde(default = "default_max_v1_routing_keys_per_account")]
+    pub max_routing_keys_per_account: u32,
+}
+
+/// Default for `[didcomm_v1] max_routing_keys_per_account`: kept as a name
+/// for existing users; the value is
+/// [`defaults::didcomm_v1::MAX_ROUTING_KEYS_PER_ACCOUNT`].
+pub const DEFAULT_MAX_V1_ROUTING_KEYS_PER_ACCOUNT: u32 =
+    defaults::didcomm_v1::MAX_ROUTING_KEYS_PER_ACCOUNT;
+
+fn default_max_v1_routing_keys_per_account() -> u32 {
+    defaults::didcomm_v1::MAX_ROUTING_KEYS_PER_ACCOUNT
+}
+
+impl Default for DidCommV1ConfigRaw {
+    fn default() -> Self {
+        use defaults::didcomm_v1 as d;
+        Self {
+            enabled: d::ENABLED,
+            allow_unauthenticated_forwards: d::ALLOW_UNAUTHENTICATED_FORWARDS,
+            allow_unproven_routing_keys: d::ALLOW_UNPROVEN_ROUTING_KEYS,
+            max_routing_keys_per_account: d::MAX_ROUTING_KEYS_PER_ACCOUNT,
+        }
+    }
+}
+
+/// `[storage]` section — selects the mediator's storage backend.
+/// Mirrors the wizard recipe shape so a `mediator.toml` produced by
+/// the wizard parses unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// `"redis"` (default) or `"fjall"`. Memory backend is not
+    /// exposed here — it's a tests-only backend.
+    pub backend: String,
+    /// On-disk path for the Fjall data directory. Required when
+    /// `backend = "fjall"`. The mediator creates this directory if
+    /// it doesn't exist.
+    #[serde(default)]
+    pub data_dir: Option<String>,
+    /// `[storage.fjall]` — memory tuning for the embedded Fjall backend.
+    /// Ignored when `backend = "redis"`: Redis holds its data in the Redis
+    /// *server*, so its memory is governed by `maxmemory` in `redis.conf`,
+    /// not by anything the mediator can set. See the memory-tuning guide.
+    #[serde(default)]
+    pub fjall: Option<FjallConfig>,
+}
+
+/// `[storage.fjall]` — memory knobs for the embedded Fjall backend.
+///
+/// Fjall ships with defaults sized for a general-purpose embedded database
+/// (32 MiB block cache, 64 MiB of memtable *per keyspace*, 512 MiB of journal).
+/// The mediator opens 15 keyspaces, so the stock per-keyspace memtable default
+/// alone allows ~896 MiB of write buffer. These knobs bring that down to a
+/// budget the operator chooses.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FjallConfig {
+    /// Block cache, in bytes. Caches decompressed data blocks read from disk;
+    /// this is the read-side memory and the first thing to raise for read
+    /// throughput. Default 16 MiB (Fjall's own default is 32 MiB).
+    #[serde(default = "default_fjall_block_cache")]
+    pub block_cache: String,
+    /// Total write-buffer (memtable) budget in bytes, divided across the
+    /// mediator's keyspaces by write weight. Default 32 MiB.
+    ///
+    /// **Applies at data-directory creation only.** Fjall persists each
+    /// keyspace's memtable size when the keyspace is first created and has no
+    /// runtime setter, so changing this against an existing `data_dir` has no
+    /// effect on already-created keyspaces. `max_journal` (below) bounds
+    /// unflushed memory on existing directories.
+    #[serde(default = "default_fjall_write_buffer")]
+    pub write_buffer: String,
+    /// Journal size ceiling in bytes. Default 128 MiB (Fjall's default is
+    /// 512 MiB).
+    ///
+    /// This is the load-bearing global bound. Fjall's own global write-buffer
+    /// cap (`max_write_buffer_size`) is a dead field in 3.1.x — declared, with a
+    /// setter, but never read — so there is *no* global memtable ceiling. What
+    /// does exist: when the journal exceeds this size, Fjall force-rotates the
+    /// keyspaces pinning the oldest journal, which flushes their memtables. So
+    /// this indirectly caps total unflushed memory, and unlike `write_buffer` it
+    /// takes effect on every open, including existing data directories.
+    ///
+    /// Lower = tighter memory, more frequent flushes (more write amplification).
+    #[serde(default = "default_fjall_max_journal")]
+    pub max_journal: String,
+    /// When a write the mediator acknowledges (a stored message, an enqueued
+    /// forward) is durable. Default `"buffered"`.
+    ///
+    /// - `"buffered"`: the write has reached the OS before it is
+    ///   acknowledged. Survives a crash of the mediator process; a power loss
+    ///   or kernel crash can lose what the OS had not written out yet.
+    /// - `"sync"`: the write is also synced to disk first, so it survives a
+    ///   power loss too, at the cost of a disk sync per acknowledged write
+    ///   (concurrent writes share syncs).
+    ///
+    /// Any other value is refused at startup.
+    #[serde(default = "default_fjall_durability")]
+    pub durability: String,
+}
+
+fn default_fjall_durability() -> String {
+    defaults::fjall::DURABILITY.to_string()
+}
+
+fn default_fjall_block_cache() -> String {
+    defaults::fjall::BLOCK_CACHE.to_string()
+}
+
+fn default_fjall_write_buffer() -> String {
+    defaults::fjall::WRITE_BUFFER.to_string()
+}
+
+fn default_fjall_max_journal() -> String {
+    defaults::fjall::MAX_JOURNAL.to_string()
+}
+
+impl Default for FjallConfig {
+    fn default() -> Self {
+        Self {
+            block_cache: default_fjall_block_cache(),
+            write_buffer: default_fjall_write_buffer(),
+            max_journal: default_fjall_max_journal(),
+            durability: default_fjall_durability(),
+        }
+    }
+}

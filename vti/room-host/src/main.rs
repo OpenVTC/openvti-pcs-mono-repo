@@ -1,0 +1,739 @@
+//! The `room-host` binary: parse the flags, open the store, serve.
+//!
+//! Everything else is in the library beside this, so the same router can be driven from a
+//! test or the `data_room` example without a socket.
+
+// jemalloc as the global allocator (the `jemalloc` feature, on by default).
+// glibc malloc keeps freed pages in its arenas rather than returning them, so
+// RSS ratchets to the high-water mark and never falls back — indistinguishable
+// from a leak on a memory graph. jemalloc purges freed pages back to the OS.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc tuning, read by jemalloc itself at startup via this well-known symbol.
+///
+/// `background_thread:true` runs the purger on its own thread, so freed pages
+/// are returned even while the process is idle (without it, purging only
+/// happens as a side effect of later allocator calls). `dirty_decay_ms` /
+/// `muzzy_decay_ms` are how long freed pages linger before being returned;
+/// 5s (default 10s) keeps RSS close to the live heap at negligible cost for an
+/// I/O-bound service.
+///
+/// The name is `_rjem_malloc_conf`, not `malloc_conf`: `tikv-jemalloc-sys`
+/// builds jemalloc with the `_rjem_` symbol prefix, so an unprefixed
+/// `malloc_conf` would be silently ignored.
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. This is the name jemalloc documents for
+/// exactly this, it is defined once (in the binary, never the library), and
+/// the value is the NUL-terminated static string jemalloc expects. The type is a
+/// reference to a fixed-size array, a thin pointer matching jemalloc's
+/// `const char *malloc_conf`; a `&[u8]` slice reference would be two words.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+use clap::Parser;
+
+/// The wrapper a `[secrets]` table arrives in, so the file reads the same as every other
+/// service's config rather than being a bare table this binary alone would accept.
+#[cfg(any(feature = "didcomm", feature = "onboarding"))]
+#[derive(serde::Deserialize)]
+struct SecretsFile {
+    #[serde(default)]
+    secrets: vti_secrets::SecretsConfig,
+}
+
+/// Parse a `--secrets` file, returning the dotted path of every key it carries
+/// that [`SecretsFile`] does not read.
+#[cfg(any(feature = "didcomm", feature = "onboarding"))]
+fn parse_secrets_file(text: &str) -> anyhow::Result<(SecretsFile, Vec<String>)> {
+    let mut unknown_keys = Vec::new();
+    let file = serde_ignored::deserialize(toml::Deserializer::parse(text)?, |key| {
+        unknown_keys.push(key.to_string())
+    })?;
+    Ok((file, unknown_keys))
+}
+
+use room_host::{FilesConfig, open_state_with_files, router_with_origins};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "room-host",
+    version,
+    about = "Store and serve data-room records"
+)]
+struct Args {
+    /// Where the record store lives.
+    #[arg(long, default_value = "./room-host-data")]
+    data_dir: std::path::PathBuf,
+    /// Serve Trust Tasks over HTTP at this address.
+    ///
+    /// **Opt-in**, and deliberately: a host reached through a mediator needs no HTTP surface
+    /// at all, and this used to default to `127.0.0.1:8300` — so a deployment that had
+    /// carefully arranged to need no ingress bound a port anyway, and announced it in a log
+    /// line naming an address nobody passed. The same rule the `didcomm` feature already
+    /// follows: a host not asked to be reachable somewhere does not open a socket there.
+    ///
+    /// Pass it for the HTTP mode, where the owner registers rooms over REST, or when
+    /// something local needs `/health`. A member reached by DID needs none of it.
+    #[arg(long)]
+    listen: Option<String>,
+    /// Resolve credential issuers over the network as well as locally.
+    ///
+    /// Off by default. A room's credentials are normally issued by a `did:webvh` room, so a
+    /// host without this serves almost nothing — but turning network resolution on means an
+    /// unauthenticated request can make this host fetch, so it is a decision an operator
+    /// makes rather than a default they inherit.
+    #[arg(long)]
+    resolve_dids: bool,
+    /// Origins allowed to reach this host from a browser. Repeatable.
+    ///
+    /// Off by default, and explicit origins only — no wildcard. A room's member may be a
+    /// web page, and without this a browser cannot reach this host at all: the response is
+    /// discarded before any script sees it, so the failure reads as a network error with
+    /// nothing in it about origins. Which sites may ask is an operator's decision; what the
+    /// answer is remains the credentials'.
+    #[arg(long = "allow-origin")]
+    allow_origin: Vec<String>,
+    /// Rooms this host **mirrors**: a JSON file naming each room's write-primary
+    /// and the read credentials this mirror presents to it.
+    ///
+    /// A mirrored room serves reads from the copy and refuses every write,
+    /// naming its primary. The file holds a private key, so it is hardened to
+    /// owner-only on load.
+    #[arg(long)]
+    mirror_config: Option<std::path::PathBuf>,
+    /// Be reachable at this mediator, as well as at `--listen`.
+    ///
+    /// The host connects as its own `did:peer:2` — minted into the data directory on first
+    /// use and stable thereafter, because a member's saved address names it — and serves the
+    /// same Trust Tasks over DIDComm and TSP that it serves over HTTP. What authorizes a
+    /// request does not change: the presenter is the document's own proof either way.
+    ///
+    /// Off by default. A host that is not asked to be reachable opens no socket and mints no
+    /// identity, which is the same posture `--resolve-dids` and `--allow-origin` take: a
+    /// capability is a decision an operator makes rather than one they inherit.
+    #[cfg(feature = "didcomm")]
+    #[arg(long)]
+    mediator_did: Option<String>,
+
+    /// A TOML file carrying a `[secrets]` table, in the shape the VTA and VTC take.
+    ///
+    /// Omitted, the host keeps its identity in a plaintext file under `--data-dir`. That is
+    /// the right default for running this on a laptop and the wrong one for a deployment: it
+    /// is a private key on whatever volume the container was given.
+    #[cfg(any(feature = "didcomm", feature = "onboarding"))]
+    #[arg(long)]
+    secrets: Option<std::path::PathBuf>,
+
+    /// Enrol with this VTA, so it can authorize this host to serve the rooms it governs.
+    ///
+    /// On first use the host mints a throwaway `did:key` and prints it for an operator to
+    /// grant; on the next start, once granted, it connects and rotates the throwaway away.
+    /// Off by default — a host serves rooms by the credentials they issued, and needs no VTA
+    /// of its own unless one is going to govern it.
+    #[cfg(feature = "onboarding")]
+    #[arg(long)]
+    vta_did: Option<String>,
+
+    /// The VTA context this host serves rooms for.
+    ///
+    /// Its DID is what this host serves *as*: the VTA mints it, publishes it, and holds the
+    /// keys, and this host fetches them at startup. So the identity a member resolves and
+    /// the identity this host seals with are the same by construction.
+    ///
+    /// The grant an operator makes on enrolment is for this context, and it is an `admin`
+    /// role **scoped to it**: the host fetches its DID's private keys at startup, and
+    /// releasing keys needs the `key-export` capability, which only an admin derives
+    /// (VTI-VTA-003). Scope it — an admin with no context is a super-admin.
+    #[cfg(feature = "onboarding")]
+    #[arg(long, default_value = "rooms")]
+    vta_context: String,
+
+    /// Seconds between mirror pulls.
+    ///
+    /// A mirror is not latency-critical — it serves a copy, and a client that
+    /// needs the newest record reads the primary — so the default is unhurried.
+    /// Shorter intervals cost the primary a listing per room per pass.
+    #[arg(long, default_value_t = 300)]
+    mirror_interval_secs: u64,
+
+    /// Accept, on an `open` room, a new version of a `message` or a `reaction` from a
+    /// member other than its original author.
+    ///
+    /// Off by default: this host refuses such a write with `permissionDenied`, as
+    /// `rooms/records/put/0.5` Host item 15 permits. Readers defend against it whatever the
+    /// host does; pass this when a room's own rules let members edit each other's messages.
+    /// Sealed rooms are unaffected — their host never sees a record's kind.
+    #[arg(long)]
+    allow_rewrites_by_others: bool,
+
+    /// A party this host registers rooms for (`rooms/create`), by DID. Repeatable. A
+    /// `#fragment` is ignored: the signer is compared by DID.
+    ///
+    /// With none named and no `--any-room-creator`, this host registers no rooms: it still
+    /// serves the rooms it holds and the ones it mirrors. Every room a stranger registers
+    /// is storage this host carries, so who may register is an operator's decision rather
+    /// than a default they inherit.
+    #[arg(long = "room-creator", value_name = "DID")]
+    room_creators: Vec<String>,
+
+    /// Register rooms for any party that signs as the owner it names, within
+    /// `--max-rooms-per-owner` and `--max-rooms`. For a host deliberately open to the
+    /// public.
+    #[arg(long, conflicts_with = "room_creators")]
+    any_room_creator: bool,
+
+    /// Rooms one owner may hold on this host. A courtesy limit: it counts by current
+    /// owner, so more DIDs or a transfer step around it. `--room-creator` and
+    /// `--max-rooms` are the bounds.
+    #[arg(long, default_value_t = room_host::creation::DEFAULT_MAX_ROOMS_PER_OWNER)]
+    max_rooms_per_owner: u64,
+
+    /// Rooms this host holds in total, mirrors included.
+    #[arg(long, default_value_t = room_host::creation::DEFAULT_MAX_ROOMS)]
+    max_rooms: u64,
+
+    #[command(flatten)]
+    files: FileArgs,
+}
+
+impl Args {
+    /// Who may register rooms here, from the flags.
+    fn room_creation(&self) -> room_host::creation::RoomCreation {
+        use room_host::creation::{Creators, RoomCreation};
+        let creators = if self.any_room_creator {
+            Creators::Any
+        } else if self.room_creators.is_empty() {
+            Creators::None
+        } else {
+            RoomCreation::only(&self.room_creators).creators
+        };
+        RoomCreation {
+            creators,
+            max_rooms_per_owner: self.max_rooms_per_owner,
+            max_rooms: self.max_rooms,
+        }
+    }
+}
+
+/// How this host stores room files. One storage config: a local directory, with
+/// the same limits for every room it serves. Sizes take `KiB`, `MiB` or `GiB`.
+#[derive(clap::Args, Debug)]
+struct FileArgs {
+    /// Refuse every file upload. Records without files are unaffected, and
+    /// files already stored are still served.
+    #[arg(long)]
+    files_disabled: bool,
+    /// Where committed files are stored. Default `<data-dir>/blobs`. Not part of
+    /// anything this host backs up: back it up beside the data directory.
+    #[arg(long)]
+    blob_dir: Option<std::path::PathBuf>,
+    /// The largest single file this host accepts, at most 1 GiB.
+    #[arg(long, value_parser = parse_size)]
+    max_file_bytes: Option<u64>,
+    /// Files per room.
+    #[arg(long)]
+    room_max_files: Option<u64>,
+    /// Largest file in a room.
+    #[arg(long, value_parser = parse_size)]
+    room_max_file_bytes: Option<u64>,
+    /// Total stored per room.
+    #[arg(long, value_parser = parse_size)]
+    room_max_bytes: Option<u64>,
+    /// Files each member may add to a room.
+    #[arg(long)]
+    member_max_files: Option<u64>,
+    /// Largest file a member may add.
+    #[arg(long, value_parser = parse_size)]
+    member_max_file_bytes: Option<u64>,
+    /// Total each member may store in a room.
+    #[arg(long, value_parser = parse_size)]
+    member_max_bytes: Option<u64>,
+    /// Total size of the room files this host stores, across every room, deleted files
+    /// awaiting collection included. `unlimited` sets no ceiling.
+    #[arg(long, value_parser = parse_capacity, default_value = DEFAULT_STORAGE_CAPACITY)]
+    storage_capacity_bytes: Capacity,
+    /// How long a file nothing names any more is kept before it is deleted.
+    #[arg(long, default_value_t = 168)]
+    orphan_grace_hours: u64,
+    /// How often deleted and abandoned files are collected.
+    #[arg(long, default_value_t = 600)]
+    blob_sweep_interval_secs: u64,
+}
+
+impl FileArgs {
+    fn config(&self) -> FilesConfig {
+        let mut limits = vti_rooms::blobs::HostLimits {
+            files_enabled: !self.files_disabled,
+            orphan_grace_secs: self.orphan_grace_hours * 3600,
+            storage_capacity_bytes: self.storage_capacity_bytes.0,
+            ..Default::default()
+        };
+        if let Some(v) = self.max_file_bytes {
+            limits.max_file_bytes = v;
+        }
+        let set = |slot: &mut Option<u64>, v: Option<u64>| {
+            if v.is_some() {
+                *slot = v;
+            }
+        };
+        set(&mut limits.room.max_files, self.room_max_files);
+        set(&mut limits.room.max_file_bytes, self.room_max_file_bytes);
+        set(&mut limits.room.max_bytes, self.room_max_bytes);
+        set(&mut limits.member.max_files, self.member_max_files);
+        set(
+            &mut limits.member.max_file_bytes,
+            self.member_max_file_bytes,
+        );
+        set(&mut limits.member.max_bytes, self.member_max_bytes);
+        FilesConfig {
+            limits,
+            store: self.blob_dir.as_ref().map(|dir| {
+                std::sync::Arc::new(vti_common::blob_store::local::LocalDirStore::new(dir))
+                    as std::sync::Arc<dyn vti_common::blob_store::BlobStore>
+            }),
+            config_id: None,
+        }
+    }
+}
+
+/// The host-wide storage ceiling when none is given: ten rooms at the default per-room
+/// limit. An operator with more disk raises it, or passes `unlimited`.
+const DEFAULT_STORAGE_CAPACITY: &str = "50GiB";
+
+/// A storage ceiling, or none (`unlimited`).
+#[derive(Debug, Clone, Copy)]
+struct Capacity(Option<u64>);
+
+/// A size ([`parse_size`]) or `unlimited`.
+fn parse_capacity(s: &str) -> Result<Capacity, String> {
+    if s.trim().eq_ignore_ascii_case("unlimited") {
+        Ok(Capacity(None))
+    } else {
+        parse_size(s).map(|n| Capacity(Some(n)))
+    }
+}
+
+/// `1048576`, `512KiB`, `100MiB` or `5GiB`.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (number, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => s.split_at(i),
+        None => (s, ""),
+    };
+    let n: u64 = number.parse().map_err(|_| {
+        format!("`{s}` is not a size: a number, optionally followed by KiB, MiB or GiB")
+    })?;
+    let scale = match unit.trim() {
+        "" | "B" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        other => return Err(format!("unknown size unit `{other}`; use KiB, MiB or GiB")),
+    };
+    n.checked_mul(scale)
+        .ok_or_else(|| format!("`{s}` is too large"))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "room_host=info".into()),
+        )
+        .init();
+
+    // The keyring is a process-wide default that the *consuming binary* installs — a
+    // library cannot, because the choice of platform store is the binary's. Without this,
+    // `--features session-keyring` compiles and then fails at the first session read with
+    // `No default store has been set, so cannot search or create entries`, which names the
+    // keyring crate's internals rather than the missing call. `vti-secrets`' own feature
+    // comment says to do this; nothing here did.
+    #[cfg(feature = "session-keyring")]
+    if let Err(e) = vta_sdk::keyring_init::install_default_store() {
+        anyhow::bail!(
+            "could not open the OS keyring for session storage: {e}. Build with \
+             `--features config-session` instead to keep sessions in a file under \
+             --data-dir, which is what a container or a headless server wants anyway."
+        );
+    }
+
+    let args = Args::parse();
+    let resolver = if args.resolve_dids {
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await?;
+        vti_common::auth::TrustTaskVmResolver::new(client)
+    } else {
+        vti_common::auth::TrustTaskVmResolver::did_key_only()
+    };
+    let state = open_state_with_files(&args.data_dir, resolver, args.files.config())?;
+    // Before a room is served: rows in the earlier, ambiguous key layout (#2382).
+    state.migrate_room_keys().await?;
+    state.set_refuse_rewrites_by_others(!args.allow_rewrites_by_others);
+    let creation = args.room_creation();
+    match &creation.creators {
+        room_host::creation::Creators::None => {
+            // A warning, not a note: an upgrade from a host that registered anyone's
+            // rooms lands here, and its owners' next `rooms/create` is refused.
+            let held = room_host::rooms_held(&state).await.unwrap_or(0);
+            tracing::warn!(
+                rooms_held = held,
+                "no --room-creator named: this host registers no new rooms. Rooms it \
+                 holds are still served. Pass --room-creator <DID> for each owner that \
+                 registers rooms here, or --any-room-creator for a host open to anyone"
+            );
+        }
+        room_host::creation::Creators::Only(dids) => tracing::info!(
+            creators = dids.len(),
+            max_rooms_per_owner = creation.max_rooms_per_owner,
+            max_rooms = creation.max_rooms,
+            "registering rooms for the named creators"
+        ),
+        room_host::creation::Creators::Any => tracing::warn!(
+            max_rooms_per_owner = creation.max_rooms_per_owner,
+            max_rooms = creation.max_rooms,
+            "--any-room-creator: registering rooms for any signer, within the room limits"
+        ),
+    }
+    state.set_room_creation(creation);
+
+    // Room files: deleted files past their grace window and abandoned uploads
+    // are collected on a timer. A pass that fails is logged and retried at the
+    // next tick; nothing it does is lost by waiting.
+    {
+        let files = state.files().clone();
+        let every = std::time::Duration::from_secs(args.files.blob_sweep_interval_secs.max(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                match files.sweep().await {
+                    Ok(stats) if stats != Default::default() => {
+                        tracing::info!(?stats, "room files collected")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "room-file collection failed"),
+                }
+            }
+        });
+    }
+
+    // The accepted-document-id record: rows past their retention are dropped on a
+    // timer. Reads already treat them as absent, so this only bounds the keyspace.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                tick.tick().await;
+                match state.sweep_accepted_ids().await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(removed = n, "expired accepted-id records swept"),
+                    Err(e) => tracing::warn!(error = %e, "accepted-id record sweep failed"),
+                }
+                // Watches whose lease ran out (`rooms/watch/0.1` Host item 5).
+                if let Err(e) = state.sweep_watches().await {
+                    tracing::warn!(error = %e, "room watch sweep failed");
+                }
+            }
+        });
+    }
+
+    // Mirrors start before the listener: a host that is going to serve a copy
+    // should begin catching up before it starts answering reads from it, and a
+    // config that does not parse is a startup failure rather than a warning
+    // discovered later.
+    if let Some(path) = &args.mirror_config {
+        let config = room_host::mirror::MirrorConfig::load(path)?;
+        tracing::info!(
+            rooms = config.rooms.len(),
+            interval_secs = args.mirror_interval_secs,
+            "mirroring rooms from their write-primaries"
+        );
+        tokio::spawn(room_host::mirror::run(
+            state.clone(),
+            config,
+            args.mirror_interval_secs,
+        ));
+    }
+
+    // One secrets store, used by both the VTA-identity cache and the self-minted identity.
+    // The same `[secrets]` shape the VTA and VTC take: with none configured this is a
+    // plaintext file under `--data-dir`, which is right for a laptop; a deployment points it
+    // at the secret manager it already runs.
+    #[cfg(any(feature = "didcomm", feature = "onboarding"))]
+    let identity_store = {
+        let secrets = match &args.secrets {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)?;
+                // A key the schema does not read — a typo'd `[secret]` table,
+                // say — would otherwise leave the default (plaintext) backend in
+                // place without a word. Warn with its dotted path (Keyring VTI-06).
+                let (file, unknown_keys) = parse_secrets_file(&text)?;
+                for key in &unknown_keys {
+                    tracing::warn!(
+                        "unknown key `{key}` in {} — ignored. Check for a typo or a key \
+                         placed in the wrong [section]; a key placed after a [table] \
+                         header belongs to that table.",
+                        path.display()
+                    );
+                }
+                file.secrets
+            }
+            // No `[secrets]` given: keep the identity in a cleartext file under `--data-dir`,
+            // and say so rather than doing it quietly. `vti-secrets` gates plaintext behind
+            // an explicit opt-in because for a VTA the secret is a BIP-32 master seed; for a
+            // host it is one service identity that holds no room keys and can read no record.
+            // That makes the default defensible, not invisible — an operator who is going to
+            // deploy this should be told once, here, rather than find out from the volume.
+            None => {
+                let mut config = vti_secrets::SecretsConfig::default();
+                config.backend = Some(vti_secrets::SecretBackend::Plaintext);
+                config.allow_plaintext = true;
+                tracing::warn!(
+                    data_dir = %args.data_dir.display(),
+                    "no --secrets given, so this host's identity is kept in a cleartext file \
+                     under --data-dir. Pass --secrets with a `[secrets]` table to use the \
+                     keyring or a secret manager, in the same shape the VTA and VTC take."
+                );
+                config
+            }
+        };
+        vti_secrets::create_seed_store(&secrets, &args.data_dir)?
+    };
+
+    // Enrolment first, because it can stop. A host awaiting a grant has nothing to serve
+    // and no identity to serve it under, and minting one before finding that out leaves a
+    // `did:peer` in the data directory that the VTA-governed path will never use.
+    //
+    // An operator who has to authorize this host should also find that out from the first
+    // line of output, not after a page of startup that implies it is working.
+    #[cfg(feature = "onboarding")]
+    let vta_identity = match args.vta_did.as_deref() {
+        None => None,
+        Some(vta_did) => match room_host::onboarding::enrol(&args.data_dir, vta_did)? {
+            room_host::onboarding::Enrolment::AwaitingGrant { ephemeral_did } => {
+                println!(
+                    "{}",
+                    room_host::onboarding::grant_instructions(&ephemeral_did, vta_did)
+                );
+                return Ok(());
+            }
+            room_host::onboarding::Enrolment::Enrolled => {
+                tracing::info!(vta = %vta_did, "enrolled with the VTA");
+                // The identity this host actually serves as. Fetched rather than minted:
+                // the VTA holds the context's DID and its keys, so what a member resolves
+                // and what this host seals with are the same by construction.
+                //
+                // The cache is the same secrets store the minted identity would use, so a
+                // VTA that is unreachable at boot costs this host nothing — it comes up on
+                // the identity it fetched last time. Without that, a VTA outage would stop
+                // every host enrolled with it, which is a far larger blast radius than the
+                // outage itself.
+                let identity = room_host::onboarding::fetch_identity(
+                    &args.data_dir,
+                    vta_did,
+                    &args.vta_context,
+                    identity_store.as_ref(),
+                )
+                .await?;
+                if !identity.fresh {
+                    tracing::warn!(
+                        did = %identity.did,
+                        "serving on the cached VTA identity — the VTA could not be reached"
+                    );
+                }
+                Some(identity)
+            }
+        },
+    };
+
+    // Before the listener, for the same reason mirrors start first: a host that is going to
+    // be reachable at a mediator should be reachable *by the time* it starts answering, and
+    // an identity that will not load is a startup failure rather than something discovered
+    // by the first member who cannot reach it.
+    #[cfg(feature = "didcomm")]
+    let mut mediator_task: Option<tokio::task::JoinHandle<()>> = None;
+    #[cfg(feature = "didcomm")]
+    if let Some(mediator_did) = args.mediator_did.clone() {
+        // Governed by a VTA: serve as the DID it holds for this context.
+        #[cfg(feature = "onboarding")]
+        let from_vta = vta_identity
+            .map(|vta| room_host::didcomm::HostIdentity::from_vta(vta.did, vta.secrets));
+        // Built without onboarding, there is no VTA to be governed by and nothing to fetch.
+        #[cfg(not(feature = "onboarding"))]
+        let from_vta: Option<room_host::didcomm::HostIdentity> = None;
+
+        let identity = match from_vta {
+            Some(identity) => identity,
+            // Ungoverned: mint a `did:peer:2` of this host's own, which encodes the mediator
+            // so `?at=<did>` remains a complete address with nothing to resolve.
+            None => {
+                room_host::didcomm::HostIdentity::load_or_mint(
+                    identity_store.as_ref(),
+                    &mediator_did,
+                )
+                .await?
+            }
+        };
+        // Printed, not only logged. It is this host's *address* — the thing a member puts
+        // after `?at=` — and an operator has to be able to copy it out of a terminal.
+        println!("host DID: {}", identity.did);
+        let state = state.clone();
+        mediator_task = Some(tokio::spawn(async move {
+            if let Err(e) = room_host::didcomm::serve(state, identity, mediator_did).await {
+                // Said in full because of what does *not* happen next: this task ends, the
+                // HTTP listener does not, and nothing retries. So the process stays up and
+                // a health check on `--listen` keeps passing while every member addressing
+                // this host by DID times out. An operator reading one line needs to know
+                // the host is half-dead rather than merely noisy.
+                tracing::error!(
+                    error = %e,
+                    "the mediator connection ended — this host is NO LONGER REACHABLE by DID, \
+                     and does not retry. HTTP on --listen is unaffected, so a health check \
+                     against that port will still pass. Restart the host."
+                );
+            }
+        }));
+    }
+
+    let Some(listen) = args.listen.clone() else {
+        // No HTTP surface at all. This is the arrangement the design is about — the host
+        // dials the mediator and nothing dials in — so it is a normal way to run rather
+        // than a misconfiguration. What it is *not* is a way to run with nothing serving
+        // anything, which is why the mediator task has to exist for this to be allowed.
+        #[cfg(feature = "didcomm")]
+        if let Some(task) = mediator_task {
+            if !args.allow_origin.is_empty() {
+                tracing::warn!(
+                    "--allow-origin was given without --listen, so there is no HTTP surface \
+                     for it to apply to and it has no effect"
+                );
+            }
+            tracing::info!(
+                data_dir = %args.data_dir.display(),
+                network_resolution = args.resolve_dids,
+                "room host ready — reachable by DID only, with no HTTP listener"
+            );
+            // Awaiting the mediator task means this exits when the connection ends, rather
+            // than idling as a process nothing can reach. With a listener the two are
+            // independent and that asymmetry is deliberate: there, something is still being
+            // served; here there would be nothing at all.
+            task.await?;
+            return Ok(());
+        }
+        anyhow::bail!(
+            "this host was asked to serve nobody: pass --listen <addr> to serve Trust Tasks \
+             over HTTP, or --mediator-did <did> to be reachable by DID (which needs \
+             `--features didcomm`)."
+        );
+    };
+
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    tracing::info!(
+        listen = %listen,
+        data_dir = %args.data_dir.display(),
+        network_resolution = args.resolve_dids,
+        "room host ready — storing records for rooms it does not govern"
+    );
+    axum::serve(listener, router_with_origins(state, &args.allow_origin)).await?;
+    Ok(())
+}
+
+#[cfg(all(test, any(feature = "didcomm", feature = "onboarding")))]
+mod secrets_file_tests {
+    use super::parse_secrets_file;
+
+    /// Keyring VTI-06: a misspelt table leaves the default backend in place;
+    /// the key is reported with its dotted path instead of vanishing.
+    #[test]
+    fn a_misplaced_key_is_reported_with_its_dotted_path() {
+        let (_, unknown) = parse_secrets_file("[secret]\nbackend = \"keyring\"\n").unwrap();
+        assert_eq!(unknown, vec!["secret".to_string()]);
+    }
+
+    #[test]
+    fn a_valid_file_reports_nothing() {
+        let (_, unknown) = parse_secrets_file("[secrets]\n").unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use room_host::creation::Creators;
+
+    fn args(extra: &[&str]) -> Args {
+        Args::try_parse_from(std::iter::once("room-host").chain(extra.iter().copied()))
+            .expect("flags parse")
+    }
+
+    #[test]
+    fn no_creator_flag_registers_no_rooms() {
+        assert_eq!(args(&[]).room_creation().creators, Creators::None);
+    }
+
+    #[test]
+    fn named_creators_and_the_open_opt_in() {
+        let named = args(&[
+            "--room-creator",
+            "did:key:zA",
+            "--room-creator",
+            "did:key:zB",
+        ]);
+        assert_eq!(
+            named.room_creation().creators,
+            Creators::Only(
+                ["did:key:zA", "did:key:zB"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(
+            args(&["--any-room-creator"]).room_creation().creators,
+            Creators::Any
+        );
+        assert!(
+            Args::try_parse_from([
+                "room-host",
+                "--any-room-creator",
+                "--room-creator",
+                "did:key:zA"
+            ])
+            .is_err(),
+            "the two are exclusive"
+        );
+    }
+
+    #[test]
+    fn storage_capacity_defaults_to_a_ceiling_and_can_be_lifted_explicitly() {
+        assert_eq!(
+            args(&[]).files.config().limits.storage_capacity_bytes,
+            Some(50 * (1 << 30))
+        );
+        assert_eq!(
+            args(&["--storage-capacity-bytes", "unlimited"])
+                .files
+                .config()
+                .limits
+                .storage_capacity_bytes,
+            None
+        );
+        assert_eq!(
+            args(&["--storage-capacity-bytes", "1GiB"])
+                .files
+                .config()
+                .limits
+                .storage_capacity_bytes,
+            Some(1 << 30)
+        );
+    }
+}

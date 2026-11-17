@@ -1,0 +1,269 @@
+[package]
+name = "did-hosting-control"
+description = "DID Hosting Control Plane — Unified management UI and service registry"
+version = "0.12.0"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+# `ui-dist/` is a build artifact (gitignored, produced by `npm run build:web`
+# via build.rs) but it MUST ship in the published tarball: the crate embeds it
+# with rust-embed, and `../did-hosting-ui` is a workspace sibling that
+# `cargo package` never collects. An explicit `include` is what overrides the
+# gitignore — which is also why publishing this crate needs
+# `cargo publish --allow-dirty` (cargo counts the untracked bundle as dirty).
+include = [
+  "src/**/*",
+  "tests/**/*",
+  "ui-dist/**/*",
+  "build.rs",
+  "README.md",
+]
+
+[lints]
+workspace = true
+
+[features]
+default = ["keyring", "store-fjall", "ui", "jemalloc"]
+# Use jemalloc as the `did-hosting-control` binary's global allocator (see the
+# dependency comment). On by default: with the system allocator the process
+# holds its RSS high-water mark for its lifetime. Disable
+# (`--no-default-features`) if you need to profile against the system allocator
+# or are building for a target jemalloc doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
+metrics = ["did-hosting-common/metrics"]
+# DID methods the control plane can accept publications for. The control
+# plane is the write side, so a method must be enabled here for
+# register/publish to verify and store it — enabling it only on the
+# server would serve a method nothing can put in the store.
+#
+# webvh and web need no feature here: their write paths predate the
+# method abstraction and are always compiled. webs is opt-in for the
+# same reason as everywhere else — it pulls the KERI stack.
+#
+# It also lets a `did:webs` outside the ACL register itself on a domain whose
+# operator enables it (`[[hosting.webs_self_register]]`), authenticated by its
+# own key event log — see `src/webs_self_register.rs`.
+method-webs = ["did-hosting-common/method-webs", "dep:affinidi-did-common"]
+ui = ["dep:rust-embed", "dep:mime_guess", "dep:tower"]
+keyring = ["did-hosting-common/keyring"]
+aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "did-hosting-common/aws-secrets"]
+gcp-secrets = [
+  "dep:google-cloud-secretmanager-v1",
+  "dep:google-cloud-auth",
+  "dep:bytes",
+  "did-hosting-common/gcp-secrets",
+]
+azure-secrets = [
+  "dep:azure_security_keyvault_secrets",
+  "dep:azure_identity",
+  "dep:azure_core",
+  "dep:futures",
+  "did-hosting-common/azure-secrets",
+]
+vault-secrets = ["did-hosting-common/vault-secrets"]
+k8s-secrets = ["did-hosting-common/k8s-secrets"]
+store-fjall = ["dep:fjall", "did-hosting-common/store-fjall"]
+store-redis = ["dep:redis", "did-hosting-common/store-redis"]
+# In-process test harness (`TestServer`) for this crate's own integration tests
+# and for downstream consumers that want to cover a control-plane path without
+# hand-assembling `AppState`. Enable via a `[dev-dependencies]` `features =
+# ["test-support"]` entry. Off by default — never compiled into a release.
+test-support = ["dep:tempfile"]
+store-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config", "did-hosting-common/store-dynamodb"]
+store-firestore = ["dep:firestore", "dep:futures", "did-hosting-common/store-firestore"]
+store-cosmosdb = ["dep:azure_data_cosmos", "dep:azure_core", "dep:futures", "did-hosting-common/store-cosmosdb"]
+# NOTE: passkey/WebAuthn is always compiled into the control plane — it is
+# enabled unconditionally via the `did-hosting-common` dependency below
+# (`features = [... "passkey" ...]`) and `webauthn-rs` is a non-optional
+# dependency. There is intentionally no `passkey` feature here: the routes,
+# AppState, and `build_webauthn` are wired without any cfg gate. The real
+# on/off switch is runtime config — WebAuthn is only initialised when
+# `public_url` is set; otherwise DID challenge/response auth is used.
+
+[lib]
+name = "did_hosting_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "did-hosting-control"
+path = "src/main.rs"
+
+[dependencies]
+agent-names = { workspace = true }
+did-hosting-common = { version = "0.12", path = "../did-hosting-common", features = ["server-core", "passkey", "setup-wizard"] }
+# vti-common consumed transitively via did-hosting-common, but
+# this crate also references `vti_common::auth::handlers::*` +
+# `AuthenticateInput` directly when dispatching to canonical
+# /auth/* handlers. Pinned to the same minor as the other three
+# declarations (did-hosting-common/-server, webvh-witness) and to
+# the workspace `vta-sdk = "0.38"` — see the lockstep note in
+# did-hosting-common/Cargo.toml.
+vti-common = { version = "0.66", default-features = false }
+async-trait = { workspace = true }
+# Local `.mmdb` GeoIP reader (`crate::geoip`) — never a third-party call.
+maxminddb = { workspace = true }
+# `[[geoip.networks]]` ranges; the same crate and line `did-hosting-common`
+# parses `trusted_proxies` with.
+ipnetwork = "0.21"
+# Trust Tasks framework — used by routes/trust_tasks.rs (the
+# /api/trust-tasks endpoint introduced in v0.7.1).
+#
+# `validate`: the workspace-wide framework validation policy is still
+# `AcceptUnvalidated` (see the note beside `run_pipeline` in
+# did-hosting-common) — this is not that. `auth/passkey/enroll/invite/update`
+# is the one payload whose spec `oneOf` (role alone, or `expiresAt` XOR
+# `extendBy`) has no Rust type shape, so its handler re-validates the raw
+# payload against the embedded schema directly via
+# `trust_tasks_rs::validate::ValidatedPayload`. That call needs this feature
+# compiled in; every other handler still relies on `deny_unknown_fields` +
+# newtypes alone.
+trust-tasks-rs = { workspace = true, features = ["validate"] }
+trust-tasks-https = { workspace = true }
+trust-tasks-didcomm = { workspace = true }
+trust-tasks-proof = { workspace = true }
+chrono = { workspace = true }
+# `method-webs` only: the document a self-registering did:webs's key event log
+# implies, which its registration's proof is checked against.
+affinidi-did-common = { workspace = true, optional = true }
+# Direct dep for signing the request leg of outbound approval Trust Tasks
+# (task-consent/request, auth/step-up/approve-request) with the control DID's
+# operational (`authentication`) key — see src/signing.rs and issue #147.
+affinidi-data-integrity = { workspace = true }
+affinidi-tdk = { workspace = true }
+affinidi-messaging-didcomm-service = { workspace = true }
+# TSP control-message type for `WebvhTspHandler::handle_control`'s signature;
+# the accept policy itself lives in `did_hosting_common::server::tsp_relationship`.
+affinidi-tsp = { workspace = true }
+affinidi-tdk-common = { workspace = true }
+affinidi-messaging-didcomm = { workspace = true }
+affinidi-secrets-resolver = { workspace = true }
+tokio-util = { workspace = true }
+affinidi-did-resolver-cache-sdk = { workspace = true }
+# Egress address-class guard for the registry URL validation (SSRF default-deny).
+affinidi-net-guard = "0.1"
+axum = { workspace = true }
+axum-extra = { workspace = true }
+clap = { workspace = true }
+dialoguer = { workspace = true }
+ed25519-dalek = { workspace = true }
+fjall = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true }
+multibase = { workspace = true }
+rand = { workspace = true }
+bip39 = "3"
+reqwest = { workspace = true }
+url = { workspace = true }
+rust-embed = { workspace = true, optional = true }
+webauthn-rs = { workspace = true }
+mime_guess = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+vta-sdk = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "compression-gzip", "compression-br"] }
+tower = { workspace = true, features = ["util"], optional = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-config = { version = "1", features = [
+  "behavior-version-latest",
+], optional = true }
+
+google-cloud-secretmanager-v1 = { version = "1", optional = true }
+google-cloud-auth = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+firestore = { version = "0.61", optional = true }
+futures = { version = "0.3", optional = true }
+azure_data_cosmos = { version = "1", features = [
+  "key_auth",
+], optional = true }
+azure_core = { version = "1.0", optional = true }
+azure_security_keyvault_secrets = { version = "1.0", optional = true }
+azure_identity = { version = "1.0", optional = true }
+# Enabled by the `test-support` feature so the in-process `TestServer` fixture
+# can open a temporary fjall store. Optional + non-default: a production build
+# never pulls it in.
+tempfile = { workspace = true, optional = true }
+
+# ── Allocator ────────────────────────────────────────────────────────────
+# jemalloc, used by the `did-hosting-control` binary only (set as the global
+# allocator in main.rs — a library must never impose an allocator on its
+# consumers).
+#
+# The default system allocator (glibc malloc on Linux) does not return the
+# memory of freed allocations to the OS promptly. The control plane's request
+# path is a sawtooth of short-lived allocations (Trust Task envelopes, DID logs
+# being verified, UI and API responses, store batches), and glibc retains those
+# arenas, so RSS ratchets up to its high-water mark and stays there. That reads
+# as a leak in monitoring even though the live heap is flat. jemalloc's
+# decay-based purging returns the pages, so RSS tracks live memory.
+#
+# Not available on MSVC; the cfg gate below falls back to the system allocator
+# there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow.workspace = true
+# The self-registration tests incept real did:webs identifiers, and sign as
+# their keys. Tests only: the service itself never holds KERI keys, and this
+# brings the KERI store (LMDB) into the test graph alone. The version is the
+# one `affinidi-did-webs` incepts with, so a test's AID is the created one's.
+affinidi-keri = "0.8"
+affinidi-keri-core = "0.8"
+# Creates those identifiers whole — inception and the designations naming
+# their DID, which 0.13 requires — as a real controller does (`create`).
+affinidi-did-webs = { workspace = true, features = ["create"] }
+# `validate` is also on in `[dependencies]` above now (the invite/update
+# handler uses it at runtime); kept explicit here too so the table's tests
+# can check any reply against the schema its type names
+# (`trust_tasks_rs::validate`) without depending on that staying true.
+trust-tasks-rs = { workspace = true, features = ["validate"] }
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+base64 = { workspace = true }
+# A software authenticator for the passkey enrolment tests (P-256 keys and
+# ECDSA signatures for real attestations and assertions). The same `openssl`
+# `webauthn-rs` already links, so it adds nothing to the graph.
+openssl = "0.10"
+# Embedded mediator fixture for in-process DIDComm flow tests.
+# Defaults to MemoryStore (no Redis required); spawns on 127.0.0.1:0.
+#
+# Carries its own `trust-tasks-rs` / `affinidi-tdk`, so it moves in lockstep
+# with the trust-tasks family in the root manifest — `^0.2` against a shipped
+# graph on trust-tasks 0.17 puts a second copy of both in the dev graph. See the
+# dev-graph note beside `vta-sdk` in the workspace Cargo.toml.
+#
+# 0.48.0 is the line built on affinidi-tdk 0.36 / trust-tasks-rs 0.36, the same
+# the root manifest now pins.
+affinidi-messaging-test-mediator = "0.52.0"
+# Self-dependency with `test-support` on, so this crate's own integration
+# tests compile the `test_support` module (and get `tempfile`) exactly as a
+# downstream consumer would via `features = ["test-support"]`.
+did-hosting-control = { path = ".", features = ["test-support"] }
+# `src/replication_e2e.rs` wires a control plane to a real hosting server
+# (edge) through each transport's entry points. The edge does not depend on
+# this crate, so there is no cycle.
+did-hosting-server = { path = "../did-hosting-server" }
+# `src/watcher_e2e.rs` fans syncs out to a real watcher the same way.
+webvh-watcher = { path = "../webvh-watcher" }
+# Same feature-unification trick as the self-dependency above: `did-hosting-common`
+# is already a regular `[dependencies]` entry, so this only *adds*
+# `test-support` (Cargo unifies to one instance) — needed by
+# `tests/mediator_replication_smoke.rs` for `ServiceIdentity::for_didcomm_test`.
+did-hosting-common = { path = "../did-hosting-common", features = ["server-core", "test-support"] }
+didwebvh-rs = { workspace = true }

@@ -1,0 +1,753 @@
+//! The access-control list: one [`AclEntry`] per DID, carrying its [`Role`],
+//! quotas and domain scope, stored in the `acl` keyspace and checked by every
+//! Trust Task row through [`check_acl`].
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use tracing::{debug, warn};
+
+use super::error::AppError;
+use super::store::KeyspaceHandle;
+
+/// Roles that determine which Trust Tasks a DID may perform.
+///
+/// The role of a JWT-authenticated (session) request also gates which
+/// `*Auth` extractor will accept it:
+/// - `Admin` → `AdminAuth` (and `AuthClaims`).
+/// - `Owner` → `AuthClaims` only; admin-only tasks reject.
+/// - `Service` → `ServiceAuth` (and `AuthClaims`); admin-only tasks
+///   reject.
+///
+/// `Service` is for backend service accounts that register with the
+/// control plane and push sync data. It is required by the
+/// `server/register` Trust Task (a server registering itself) and
+/// `server/stats-sync` (a server pushing stats deltas). A `Service`-role
+/// DID is accepted neither by admin-only tasks nor by the DID-management
+/// tasks a tenant would use — service accounts are deliberately scoped
+/// down.
+///
+/// `MetricsReader` is the narrowest role: it can read the service's
+/// `webvh_*` counters via `did-management/server/metrics/0.1` and nothing
+/// else. It is not accepted by any `*Auth` HTTP extractor, cannot manage
+/// the ACL, cannot operate on DIDs, and cannot push sync data. The
+/// `metrics` task gives a `MetricsReader` the `counters` only; the
+/// `gauges` (internal replication health) stay `Admin`-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum Role {
+    Admin,
+    Owner,
+    /// Service accounts (e.g. did-hosting-server registering with the control plane).
+    /// Can use the service-only Trust Tasks (`server/register`,
+    /// `server/stats-sync`); cannot perform admin management or tenant
+    /// DID-management tasks.
+    Service,
+    /// Read-only metrics role. Can read the `webvh_*` counters via
+    /// `server/metrics/0.1` and nothing else.
+    MetricsReader,
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Role::Admin => write!(f, "admin"),
+            Role::Owner => write!(f, "owner"),
+            Role::Service => write!(f, "service"),
+            Role::MetricsReader => write!(f, "metricsReader"),
+        }
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "admin" => Ok(Role::Admin),
+            "owner" => Ok(Role::Owner),
+            "service" => Ok(Role::Service),
+            "metricsReader" => Ok(Role::MetricsReader),
+            _ => Err(AppError::invalid(format!("unknown role: {s}"))),
+        }
+    }
+}
+
+/// An entry in the Access Control List.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclEntry {
+    pub did: String,
+    pub role: Role,
+    pub label: Option<String>,
+    pub created_at: u64,
+    #[serde(default)]
+    pub max_total_size: Option<u64>,
+    #[serde(default)]
+    pub max_did_count: Option<u64>,
+    /// Which domains this caller is authorised to operate on. Per
+    /// `docs/archive/multi-domain-spec.md` §3, `Admin` and `Service` roles
+    /// short-circuit this check upstream — `domains` is the per-Owner
+    /// authorisation rule.
+    ///
+    /// `#[serde(default)]` keeps backwards-compat: ACL entries stored
+    /// before domain scoping lack this field and deserialise as
+    /// `DomainScope::All`. A newly granted entry's scope comes from its
+    /// grant's `act` (`trust_tasks::entry::domains_for_act`).
+    #[serde(default)]
+    pub domains: super::domain::DomainScope,
+}
+
+impl AclEntry {
+    /// Return the effective maximum total DID document size for this account.
+    pub fn effective_max_total_size(&self, global_default: u64) -> u64 {
+        self.max_total_size.unwrap_or(global_default)
+    }
+
+    /// Return the effective maximum DID count for this account.
+    pub fn effective_max_did_count(&self, global_default: u64) -> u64 {
+        self.max_did_count.unwrap_or(global_default)
+    }
+}
+
+/// Keyed on the identity, so a did:scid presented with its `src` locator finds
+/// the entry recorded for the bare DID (VTI-KEY-160).
+fn acl_key(did: &str) -> String {
+    format!("acl:{}", crate::scid::strip_scid_src(did))
+}
+
+/// Maximum DID-string length we accept anywhere a DID is written by a
+/// caller — ACL entries, ownership transfers, etc. 2048 fits a
+/// `did:peer:2.*` with multiple inline keys (typical 600–1500 bytes)
+/// plus headroom. The one bound for every DID this service stores or looks
+/// up: `check_acl` and an auth challenge use it too, so an entry an
+/// administrator can create is one that can authorise.
+pub const MAX_DID_LEN: usize = 2048;
+
+/// Validate a DID-string supplied by an admin/owner before it lands in
+/// storage.
+///
+/// Trims surrounding whitespace and checks: not empty, does not exceed
+/// `MAX_DID_LEN`, starts with `did:`, contains no ASCII control chars.
+/// Returns the trimmed string on success so the caller stores the
+/// canonical form (a typo-trailing-space DID would otherwise silently
+/// mismatch all later `check_acl` lookups). A did:scid is returned without its
+/// `src` locator: the identity is the bare DID (VTI-KEY-160).
+///
+/// Used by ACL create/update routes and by the ownership-transfer path
+/// in `did_ops::change_did_owner` to guarantee the same shape of DIDs
+/// across all admin-facing write surfaces.
+pub fn validate_did_format(did: &str) -> Result<String, AppError> {
+    let trimmed = did.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::invalid("DID must not be empty"));
+    }
+    if trimmed.len() > MAX_DID_LEN {
+        return Err(AppError::invalid(format!(
+            "DID exceeds maximum length of {MAX_DID_LEN} characters"
+        )));
+    }
+    if !trimmed.starts_with("did:") {
+        return Err(AppError::invalid("DID must start with 'did:' scheme"));
+    }
+    if trimmed.chars().any(|c| c.is_ascii_control()) {
+        return Err(AppError::invalid(
+            "DID must not contain ASCII control characters",
+        ));
+    }
+    Ok(crate::scid::identity(trimmed))
+}
+
+/// Retrieve an ACL entry by DID.
+pub async fn get_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<Option<AclEntry>, AppError> {
+    acl.get(acl_key(did)).await
+}
+
+/// Store (create or overwrite) an ACL entry.
+pub async fn store_acl_entry(acl: &KeyspaceHandle, entry: &AclEntry) -> Result<(), AppError> {
+    acl.insert(acl_key(&entry.did), entry).await
+}
+
+/// Stage an ACL entry into `batch`, to be written with whatever else the batch
+/// carries (a passkey redemption writes the credential and the entry it
+/// authorises together).
+pub fn stage_acl_entry(
+    batch: &mut super::store::WriteBatch,
+    acl: &KeyspaceHandle,
+    entry: &AclEntry,
+) -> Result<(), AppError> {
+    batch.insert(acl, acl_key(&entry.did), entry)
+}
+
+/// Delete an ACL entry by DID.
+pub async fn delete_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<(), AppError> {
+    acl.remove(acl_key(did)).await
+}
+
+/// List all ACL entries.
+pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, AppError> {
+    let raw = acl.prefix_iter_raw("acl:").await?;
+    raw.into_iter()
+        .map(|(_, v)| serde_json::from_slice(&v).map_err(AppError::from))
+        .collect()
+}
+
+/// Count `Owner` ACL entries whose `domains` field is
+/// [`DomainScope::All`](crate::server::domain::DomainScope::All).
+///
+/// Surfaces the post-migration "how many owners still have
+/// unrestricted scope?" signal that the spec wants on a future
+/// admin dashboard. `Owner` entries stored before domain scoping
+/// deserialise with `DomainScope::All` (backwards-compat default); an
+/// ACL-lockdown tool would iterate the same set to migrate them to
+/// `AllowedWithDefault`.
+///
+/// Excludes `Admin` and `Service` roles — those are implicitly
+/// `All` regardless of the field and don't need migration.
+///
+/// O(n) over the ACL keyspace. Use sparingly on large ACLs;
+/// dashboards can cache the result.
+pub async fn count_all_scoped_owners(acl: &KeyspaceHandle) -> Result<u64, AppError> {
+    let entries = list_acl_entries(acl).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| {
+            matches!(e.role, Role::Owner)
+                && matches!(e.domains, crate::server::domain::DomainScope::All)
+        })
+        .count() as u64)
+}
+
+/// Idempotently seed the ACL with an `Admin` entry for the VTA DID that
+/// provisioned this deployment.
+///
+/// DID hosting is *managed through the VTA*: when a VTA provisions a
+/// webvh service it pins that VTA's DID (`config.vta.did`) and holds its
+/// authorization credential. The VTA then publishes agent `did.jsonl`
+/// documents to this service over the challenge-response auth flow,
+/// authenticating as its own VTA DID. Both the challenge handler and the
+/// publish handlers gate on the ACL, so without an entry the VTA's very
+/// first `POST /api/auth/challenge` is rejected with `403 DID not in
+/// ACL`. Seeding this entry at provisioning removes the manual
+/// `add-acl --role admin` step an operator would otherwise have to run
+/// for the VTA that already owns this deployment.
+///
+/// `Admin` is deliberate: the VTA publishes DID documents it does not
+/// own the storage path for, and `Admin` is the role that bypasses the
+/// per-DID ownership check on the publish endpoints (matching the role
+/// the operator would have granted by hand).
+///
+/// **Additive + idempotent.** If *any* ACL entry already exists for the
+/// VTA DID — whether from a prior run of this seed, an operator's manual
+/// `add-acl`, or a role the operator deliberately narrowed — it is left
+/// untouched and this returns `Ok(false)`. This never clobbers an
+/// existing entry and never touches any other DID's entry, so the
+/// operator's manual ACL management and the passkey/admin bootstrap are
+/// unaffected. Returns `Ok(true)` when a fresh entry was written.
+pub async fn seed_provisioning_vta_acl(
+    acl: &KeyspaceHandle,
+    vta_did: &str,
+) -> Result<bool, AppError> {
+    if get_acl_entry(acl, vta_did).await?.is_some() {
+        // An entry already exists — respect it (idempotent + never
+        // downgrade/override an operator's deliberate choice).
+        return Ok(false);
+    }
+
+    let entry = AclEntry {
+        did: vta_did.to_string(),
+        role: Role::Admin,
+        label: Some("provisioning VTA".into()),
+        created_at: super::auth::session::now_epoch(),
+        max_total_size: None,
+        max_did_count: None,
+        domains: super::domain::DomainScope::All,
+    };
+    store_acl_entry(acl, &entry).await?;
+    Ok(true)
+}
+
+/// Whether a [`check_acl`] failure is the ACL's answer (no entry, or a DID
+/// it cannot hold) rather than a failed lookup. Only the answer is a refusal:
+/// a failed lookup (a throttled store) says nothing about the caller, and
+/// refusing it as "not in the ACL" reads as a revoked grant.
+pub fn is_acl_refusal(e: &AppError) -> bool {
+    matches!(e, AppError::Forbidden(_) | AppError::Validation { .. })
+}
+
+/// Check whether a DID is in the ACL and return its role.
+///
+/// Returns `Forbidden` if the DID is not found.
+pub async fn check_acl(acl: &KeyspaceHandle, did: &str) -> Result<Role, AppError> {
+    if did.len() > MAX_DID_LEN {
+        return Err(AppError::invalid("DID exceeds maximum length"));
+    }
+    match get_acl_entry(acl, did).await? {
+        Some(entry) => {
+            debug!(did = %did, role = %entry.role, "ACL check passed");
+            Ok(entry.role)
+        }
+        None => {
+            warn!(did = %did, "ACL check denied: DID not in ACL");
+            Err(AppError::Forbidden(format!("DID not in ACL: {did}")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The tests that open a store are fjall-only (a fresh temp-dir store
+    // each); what only they use is unused on other backends.
+    #![cfg_attr(not(feature = "store-fjall"), allow(unused_imports, dead_code))]
+    use super::*;
+    use std::str::FromStr;
+
+    fn make_entry(max_total_size: Option<u64>, max_did_count: Option<u64>) -> AclEntry {
+        AclEntry {
+            did: "did:example:test".into(),
+            role: Role::Owner,
+            label: None,
+            created_at: 0,
+            max_total_size,
+            max_did_count,
+            domains: crate::server::domain::DomainScope::All,
+        }
+    }
+
+    // --- Backwards-compat: an AclEntry with no `domains` field ---
+
+    #[test]
+    fn legacy_acl_entry_deserialises_with_domains_default_all() {
+        // An entry stored before domain scoping has no `domains` field.
+        // The `#[serde(default)]` on `AclEntry::domains` must accept it
+        // and populate `DomainScope::All`. This invariant is load-
+        // bearing — operators with older stores must upgrade without
+        // their existing ACL entries becoming unreadable.
+        let legacy = r#"{
+            "did": "did:example:legacy",
+            "role": "owner",
+            "label": null,
+            "created_at": 1700000000,
+            "max_total_size": null,
+            "max_did_count": null
+        }"#;
+        let entry: AclEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(entry.did, "did:example:legacy");
+        assert!(matches!(
+            entry.domains,
+            crate::server::domain::DomainScope::All
+        ));
+    }
+
+    #[test]
+    fn entry_with_explicit_allowed_scope_round_trips() {
+        let original = AclEntry {
+            did: "did:example:scoped".into(),
+            role: Role::Owner,
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains: crate::server::domain::DomainScope::Allowed {
+                domains: vec!["a.example".into(), "b.example".into()],
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: AclEntry = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.domains,
+            crate::server::domain::DomainScope::Allowed { ref domains }
+                if domains == &["a.example", "b.example"]
+        ));
+    }
+
+    // --- Role parsing ---
+
+    #[test]
+    fn role_from_str_admin() {
+        assert_eq!(Role::from_str("admin").unwrap(), Role::Admin);
+    }
+
+    #[test]
+    fn role_from_str_owner() {
+        assert_eq!(Role::from_str("owner").unwrap(), Role::Owner);
+    }
+
+    #[test]
+    fn role_from_str_service() {
+        assert_eq!(Role::from_str("service").unwrap(), Role::Service);
+    }
+
+    #[test]
+    fn role_from_str_metricsreader() {
+        assert_eq!(
+            Role::from_str("metricsReader").unwrap(),
+            Role::MetricsReader
+        );
+    }
+
+    #[test]
+    fn role_from_str_unknown_returns_error() {
+        assert!(Role::from_str("superuser").is_err());
+    }
+
+    #[test]
+    fn role_display() {
+        assert_eq!(Role::Admin.to_string(), "admin");
+        assert_eq!(Role::Owner.to_string(), "owner");
+        assert_eq!(Role::Service.to_string(), "service");
+        assert_eq!(Role::MetricsReader.to_string(), "metricsReader");
+    }
+
+    /// `Display`, `FromStr`, and serde must agree on the wire string —
+    /// the ACL stores the role via serde, so a mismatch would make a
+    /// `metricsReader` entry unparseable by `FromStr` (and vice versa).
+    #[test]
+    fn metricsreader_display_fromstr_serde_agree() {
+        let serialized = serde_json::to_string(&Role::MetricsReader).unwrap();
+        assert_eq!(serialized, "\"metricsReader\"");
+        assert_eq!(Role::MetricsReader.to_string(), "metricsReader");
+        assert_eq!(
+            Role::from_str(&Role::MetricsReader.to_string()).unwrap(),
+            Role::MetricsReader
+        );
+        let back: Role = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back, Role::MetricsReader);
+    }
+
+    // --- effective_max_total_size ---
+
+    #[test]
+    fn effective_max_total_size_uses_override_when_set() {
+        let entry = make_entry(Some(500_000), None);
+        assert_eq!(entry.effective_max_total_size(1_000_000), 500_000);
+    }
+
+    #[test]
+    fn effective_max_total_size_falls_back_to_global() {
+        let entry = make_entry(None, None);
+        assert_eq!(entry.effective_max_total_size(1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn effective_max_total_size_override_zero_is_respected() {
+        let entry = make_entry(Some(0), None);
+        assert_eq!(entry.effective_max_total_size(1_000_000), 0);
+    }
+
+    // --- effective_max_did_count ---
+
+    #[test]
+    fn effective_max_did_count_uses_override_when_set() {
+        let entry = make_entry(None, Some(5));
+        assert_eq!(entry.effective_max_did_count(20), 5);
+    }
+
+    #[test]
+    fn effective_max_did_count_falls_back_to_global() {
+        let entry = make_entry(None, None);
+        assert_eq!(entry.effective_max_did_count(20), 20);
+    }
+
+    #[test]
+    fn effective_max_did_count_override_zero_is_respected() {
+        let entry = make_entry(None, Some(0));
+        assert_eq!(entry.effective_max_did_count(20), 0);
+    }
+
+    // --- serde backwards compatibility ---
+
+    #[test]
+    fn acl_entry_deserialize_without_limit_fields() {
+        let json = r#"{"did":"did:example:old","role":"admin","label":null,"created_at":100}"#;
+        let entry: AclEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.did, "did:example:old");
+        assert_eq!(entry.role, Role::Admin);
+        assert!(entry.max_total_size.is_none());
+        assert!(entry.max_did_count.is_none());
+    }
+
+    #[test]
+    fn acl_entry_deserialize_with_limit_fields() {
+        let json = r#"{"did":"did:example:new","role":"owner","label":"test","created_at":200,"max_total_size":500000,"max_did_count":10}"#;
+        let entry: AclEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.max_total_size, Some(500_000));
+        assert_eq!(entry.max_did_count, Some(10));
+    }
+
+    #[test]
+    fn acl_entry_roundtrip_serialization() {
+        let entry = make_entry(Some(1_000_000), Some(50));
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: AclEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.max_total_size, Some(1_000_000));
+        assert_eq!(deserialized.max_did_count, Some(50));
+    }
+
+    // --- validate_did_format ---
+
+    #[test]
+    fn validate_did_format_accepts_canonical() {
+        let did = "did:webvh:scid:host.example:tenant";
+        assert_eq!(validate_did_format(did).unwrap(), did);
+    }
+
+    #[test]
+    fn validate_did_format_trims_whitespace() {
+        // The bug this prevents: an admin pastes `"  did:web:tenant  "`,
+        // it lands as the storage key with whitespace, and every later
+        // `check_acl("did:web:tenant")` returns Forbidden.
+        let trimmed = validate_did_format("  did:web:tenant\n").unwrap();
+        assert_eq!(trimmed, "did:web:tenant");
+    }
+
+    #[test]
+    fn validate_did_format_rejects_empty() {
+        assert!(validate_did_format("").is_err());
+        assert!(validate_did_format("   ").is_err());
+    }
+
+    #[test]
+    fn validate_did_format_rejects_missing_did_prefix() {
+        let err = validate_did_format("example.com").unwrap_err();
+        assert!(matches!(err, AppError::Validation { .. }));
+    }
+
+    #[test]
+    fn validate_did_format_rejects_oversized() {
+        // MAX_DID_LEN bytes after "did:web:" prefix => well over the cap.
+        let did = format!("did:web:{}", "a".repeat(MAX_DID_LEN));
+        assert!(validate_did_format(&did).is_err());
+    }
+
+    #[test]
+    fn validate_did_format_accepts_realistic_did_peer() {
+        // A typical `did:peer:2.*` with two inline keys is ~700 bytes —
+        // pin that the cap accommodates them. Synthetic but representative.
+        let did = format!(
+            "did:peer:2.Vz6Mk{}.Ez6LS{}",
+            "x".repeat(300),
+            "y".repeat(300)
+        );
+        assert!(did.len() < MAX_DID_LEN);
+        assert!(validate_did_format(&did).is_ok());
+    }
+
+    #[test]
+    fn validate_did_format_rejects_control_chars() {
+        // Newline, tab, NUL, and BEL all rejected — protects against log-
+        // injection in the warning lines that include the DID, and against
+        // sneaky storage keys.
+        for ch in ["\n", "\t", "\0", "\x07"] {
+            let did = format!("did:web:tenant{ch}rest");
+            assert!(
+                validate_did_format(&did).is_err(),
+                "control char {:?} should be rejected",
+                ch
+            );
+        }
+    }
+
+    // ---- count_all_scoped_owners --------------------------------------
+
+    use crate::server::config::StoreConfig;
+    use crate::server::domain::DomainScope;
+    use crate::server::store::{KS_ACL, Store};
+
+    #[cfg(feature = "store-fjall")]
+    async fn fjall_store() -> Store {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        };
+        std::mem::forget(dir);
+        Store::open(&cfg).await.expect("open fjall")
+    }
+
+    fn entry(did: &str, role: Role, domains: DomainScope) -> AclEntry {
+        AclEntry {
+            did: did.into(),
+            role,
+            label: None,
+            created_at: 0,
+            max_total_size: None,
+            max_did_count: None,
+            domains,
+        }
+    }
+
+    /// A did:scid is recorded and found by its identity, the bare DID: an
+    /// admin who wrote the locator, or a caller whose issuer carries it, reaches
+    /// the same entry (VTI-KEY-160).
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn a_did_scid_entry_is_keyed_on_the_bare_did() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let presented = "did:scid:vh:1:Qm1?src=dids.example.org/alice";
+        let did = validate_did_format(presented).unwrap();
+        assert_eq!(did, "did:scid:vh:1:Qm1");
+        store_acl_entry(&ks, &entry(&did, Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            check_acl(&ks, "did:scid:vh:1:Qm1").await.unwrap(),
+            Role::Owner
+        );
+        assert_eq!(check_acl(&ks, presented).await.unwrap(), Role::Owner);
+        assert_eq!(
+            check_acl(&ks, "did:scid:vh:1:Qm1?src=elsewhere.example")
+                .await
+                .unwrap(),
+            Role::Owner
+        );
+        // The did:webvh form is a different identity (VTI-KEY-164).
+        assert!(
+            check_acl(&ks, "did:webvh:Qm1:dids.example.org:alice")
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_did_format_leaves_other_methods_alone() {
+        assert_eq!(
+            validate_did_format(" did:webvh:Qm1:a.example ").unwrap(),
+            "did:webvh:Qm1:a.example"
+        );
+        assert_eq!(
+            validate_did_format("did:example:1?src=x").unwrap(),
+            "did:example:1?src=x"
+        );
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn count_all_scoped_owners_counts_only_owner_all() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+
+        // Mix of roles + scopes — only Owner+All counts.
+        store_acl_entry(&ks, &entry("did:e:o1", Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+        store_acl_entry(&ks, &entry("did:e:o2", Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+        store_acl_entry(
+            &ks,
+            &entry(
+                "did:e:o3",
+                Role::Owner,
+                DomainScope::Allowed {
+                    domains: vec!["a.example".into()],
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        store_acl_entry(&ks, &entry("did:e:a1", Role::Admin, DomainScope::All))
+            .await
+            .unwrap();
+        store_acl_entry(&ks, &entry("did:e:s1", Role::Service, DomainScope::All))
+            .await
+            .unwrap();
+
+        let count = count_all_scoped_owners(&ks).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "must count only Owner+DomainScope::All; Admin / Service / scoped owners excluded"
+        );
+    }
+
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn count_all_scoped_owners_empty_acl_returns_zero() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        assert_eq!(count_all_scoped_owners(&ks).await.unwrap(), 0);
+    }
+
+    // ---- seed_provisioning_vta_acl (VTA-provisioned trust) -----------------
+
+    /// On a fresh ACL the provisioning VTA is authorised with an `Admin`
+    /// entry labelled "provisioning VTA", and `check_acl` then passes for
+    /// that DID — so the VTA's challenge/authenticate/publish flow is no
+    /// longer blocked by `403 DID not in ACL`.
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn seed_provisioning_vta_acl_creates_admin_entry() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let vta = "did:webvh:vta.example.com";
+
+        let created = seed_provisioning_vta_acl(&ks, vta).await.unwrap();
+        assert!(created, "a fresh entry must be written");
+
+        let entry = get_acl_entry(&ks, vta)
+            .await
+            .unwrap()
+            .expect("entry stored");
+        assert_eq!(entry.role, Role::Admin, "VTA must be Admin to publish");
+        assert_eq!(entry.label.as_deref(), Some("provisioning VTA"));
+        assert!(matches!(entry.domains, DomainScope::All));
+
+        // The publish/challenge gate now passes for the VTA DID.
+        assert_eq!(check_acl(&ks, vta).await.unwrap(), Role::Admin);
+    }
+
+    /// Idempotent: a second seed is a no-op that returns `false` and does
+    /// not alter the existing entry. Guards the online + offline setup
+    /// paths against duplicating or clobbering on re-run.
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn seed_provisioning_vta_acl_is_idempotent() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let vta = "did:webvh:vta.example.com";
+
+        assert!(seed_provisioning_vta_acl(&ks, vta).await.unwrap());
+        let created_at = get_acl_entry(&ks, vta).await.unwrap().unwrap().created_at;
+
+        // Second call: no write, no change.
+        assert!(
+            !seed_provisioning_vta_acl(&ks, vta).await.unwrap(),
+            "re-seeding an existing entry must be a no-op"
+        );
+        let entry = get_acl_entry(&ks, vta).await.unwrap().unwrap();
+        assert_eq!(
+            entry.created_at, created_at,
+            "existing entry left untouched"
+        );
+        assert_eq!(entry.role, Role::Admin);
+    }
+
+    /// An operator's deliberate ACL choice for the VTA DID (e.g. a
+    /// narrowed role set by hand) is never overridden by the seed. Proves
+    /// the seed is additive, not a relaxation/override of existing state.
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn seed_provisioning_vta_acl_respects_existing_operator_entry() {
+        let store = fjall_store().await;
+        let ks = store.keyspace(KS_ACL).unwrap();
+        let vta = "did:webvh:vta.example.com";
+
+        // Operator pre-seeds a narrower Owner entry.
+        store_acl_entry(&ks, &entry(vta, Role::Owner, DomainScope::All))
+            .await
+            .unwrap();
+
+        assert!(
+            !seed_provisioning_vta_acl(&ks, vta).await.unwrap(),
+            "must not overwrite an operator-set entry"
+        );
+        let entry = get_acl_entry(&ks, vta).await.unwrap().unwrap();
+        assert_eq!(
+            entry.role,
+            Role::Owner,
+            "operator's role choice must be preserved"
+        );
+    }
+}

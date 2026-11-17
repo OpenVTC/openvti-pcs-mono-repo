@@ -1,0 +1,820 @@
+#[cfg(feature = "tee")]
+mod attestation;
+mod auth;
+mod auth_portal;
+mod backup_blob;
+mod bootstrap;
+#[cfg(feature = "webvh")]
+mod did_webvh;
+mod health;
+#[cfg(feature = "webvh")]
+mod passkey_vms;
+pub mod rate_limit;
+#[cfg(feature = "webvh")]
+mod self_hosted_did;
+
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderName, HeaderValue, Method};
+use axum::routing::{get, post};
+use ipnetwork::IpNetwork;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+use crate::server::AppState;
+
+pub use rate_limit::{Limiter, Quota, QuotaSource, RateLimits};
+
+/// OpenAPI document root for the VTA REST surface.
+///
+/// The router is the single source of truth for *paths* — every handler
+/// annotated with `#[utoipa::path]` and registered via `routes!()` on the
+/// [`OpenApiRouter`] contributes its operation here, so the served
+/// `/openapi.json` cannot drift from the wired routes. This struct only seeds
+/// the document-level metadata (title/version) and the security scheme; it
+/// declares no `paths` of its own.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Verifiable Trust Agent (VTA) API",
+        description = "Key-management, DID-webvh, provisioning, and runtime \
+                       service-management REST surface of a Verifiable Trust Agent.",
+        version = env!("CARGO_PKG_VERSION"),
+    ),
+    modifiers(&SecurityAddon),
+)]
+pub struct ApiDoc;
+
+/// Registers the `bearer_jwt` HTTP-bearer security scheme referenced by
+/// authenticated operations' `security(("bearer_jwt" = []))`.
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "bearer_jwt",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        );
+    }
+}
+
+/// Serve the assembled OpenAPI document as JSON at `GET /openapi.json`.
+///
+/// Unauthenticated by design — the document describes the API *shape*, not any
+/// secret, and black-box conformance/fuzz tooling (schemathesis, RESTler)
+/// fetches it before it holds a token.
+async fn serve_openapi(api: utoipa::openapi::OpenApi) -> axum::Json<utoipa::openapi::OpenApi> {
+    axum::Json(api)
+}
+
+/// Maximum request body size (1 MB). Protects against memory exhaustion,
+/// especially critical in TEE deployments where enclave memory is limited.
+const MAX_BODY_SIZE: usize = 1024 * 1024;
+
+/// Tighter body cap for unauthenticated endpoints that drive expensive
+/// crypto on attacker-controlled bytes (DIDComm `pack`/`unpack`,
+/// signature verify, sealed-transfer parse). Sized to fit a generous
+/// JWE / sealed-transfer payload but reject 1 MB blob floods that the
+/// rate limiter alone cannot starve out.
+const UNAUTH_BODY_SIZE: usize = 64 * 1024;
+
+/// Body-size cap for the backup-descriptor blob endpoints. The whole
+/// point of the descriptor pattern is to escape the trust-task
+/// envelope's 1 MB cap, so this needs a much larger budget. 100 MB
+/// covers a typical-to-large VTA's full backup (keys + ACL +
+/// contexts + WebVH DID logs + audit). A future enhancement could
+/// make this config-driven, but baking the conservative ceiling in
+/// avoids an operator footgun (set-to-10-GB).
+///
+/// `pub(super)` so the blob upload handler can refuse a bundle whose
+/// declared size is over it. The handler reads at most the bundle's own
+/// declared size, so this is the ceiling, not the usual cap.
+pub(super) const BACKUP_BLOB_BODY_SIZE: usize = 100 * 1024 * 1024;
+
+/// Global per-request timeout. The REST surface runs on a current-thread
+/// runtime, so a handler that stalls on network I/O (a dead mediator, a
+/// slow remote DID host) would otherwise hold its connection — and a
+/// caller's patience — indefinitely. Generous on purpose: longer than any
+/// legitimate single request (local-fast backups, self-limiting mediator
+/// handshakes, a 100 MB blob transfer at modest bandwidth) but bounded, so
+/// "indefinite" becomes "120 s then 408". Not a substitute for the
+/// handshake/op-specific timeouts, which stay; this is the backstop.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Health-check route — served without the request/response trace layer.
+/// Minimal response only; detailed info requires authentication.
+pub fn health_router() -> Router<AppState> {
+    Router::new().route("/health", get(health::health))
+}
+
+/// Health-check route with the same CORS policy as the API surface.
+///
+/// `/health` is deliberately kept out of the trace + metrics layers
+/// (it's a high-frequency liveness probe and would swamp the logs),
+/// which is why `server.rs` merges it *after* those layers are applied
+/// to the main router. CORS, however, must still cover it: browser
+/// tools (e.g. `examples/vta-auth-demo`) probe `/health` cross-origin
+/// as their first connectivity check, and without an
+/// `Access-Control-Allow-Origin` header the browser blocks the read
+/// with an opaque "Failed to fetch". Apply the same origin allowlist
+/// here so the probe works whenever the API CORS is configured; an
+/// empty allowlist yields no layer (legacy no-cross-origin behaviour).
+pub fn health_router_with_cors(allowed_origins: &[String]) -> Router<AppState> {
+    let router = health_router();
+    match build_cors_layer(allowed_origins) {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+}
+
+/// Build a CORS layer from a list of allowed origins. Returns
+/// `None` when the list is empty — the caller must skip the layer
+/// in that case so a fresh-install VTA keeps the legacy
+/// no-cross-origin behaviour.
+///
+/// Cross-origin requests with `Authorization` headers don't carry
+/// browser credentials (no `allow_credentials`), so the bearer
+/// token is the only client-side state in the cross-origin path.
+/// Wildcard origins are deliberately not accepted — every allowed
+/// origin must be explicit so a misconfiguration can't let
+/// arbitrary sites borrow operator tokens.
+fn build_cors_layer(allowed_origins: &[String]) -> Option<CorsLayer> {
+    if allowed_origins.is_empty() {
+        return None;
+    }
+    // Filter:
+    //   - `*` — tower-http's `AllowOrigin::list` panics on the
+    //     wildcard. We deliberately don't fall through to
+    //     `AllowOrigin::any()` either; explicit origins only.
+    //   - malformed values that can't be parsed as a header value.
+    let parsed: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter(|o| !o.is_empty() && *o != "*")
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    if parsed.is_empty() {
+        // Either an operator passed only invalid entries (a
+        // typo'd config that should be visible in startup logs)
+        // or the original list was filtered down to nothing. Skip
+        // the layer rather than partially-apply CORS — a
+        // half-configured CORS surface is worse than none.
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(parsed))
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::PATCH])
+            .allow_headers([
+                HeaderName::from_static("content-type"),
+                HeaderName::from_static("authorization"),
+                HeaderName::from_static("x-backup-token"),
+            ])
+            .max_age(std::time::Duration::from_secs(60)),
+    )
+}
+
+pub fn router() -> Router<AppState> {
+    router_with_cors(&[], &[], QuotaSource::Fixed(RateLimits::default()))
+}
+
+/// Assemble the VTA REST surface as an [`OpenApiRouter`] — the single source
+/// of truth for both the wired routes and the served OpenAPI document. Routes
+/// registered via `routes!()` contribute their `#[utoipa::path]` operation;
+/// routes still on plain `.route(...)` are served but not yet described. Global
+/// layers (body cap, timeout, CORS) and the `/openapi.json` route are applied
+/// by [`router_with_cors`] after splitting.
+///
+/// `trust_xff_cidrs` selects the rate limiter's IP-attribution strategy. Empty
+/// (the default) keys on the socket peer — spoof-proof, and correct whenever
+/// clients reach the VTA directly. A non-empty list names the reverse proxies
+/// in front of the VTA, and only for a request whose peer is one of them does
+/// the limiter read `X-Forwarded-For`. Naming a proxy asserts that it
+/// appends to (or rewrites) `X-Forwarded-For` and that nothing else can reach
+/// the VTA's socket; never name a layer-4 (TCP) forwarder, which passes the
+/// client's own header through. See
+/// [`vti_common::rate_limit::TrustedProxyKeyExtractor`] for the rule, and
+/// `docs/02-vta/rate-limiting.md` for the operator view.
+///
+/// The router assembled here deliberately carries **no** synthetic-`ConnectInfo`
+/// middleware. A request with no peer has no un-spoofable anchor and must be
+/// refused, not attributed to a placeholder — a placeholder inside a trusted
+/// CIDR would hand the request its own `X-Forwarded-For`. `server::run` serves
+/// through `into_make_service_with_connect_info`, so a real peer is always
+/// present; only `tower::oneshot` test callers need one synthesised, and they
+/// layer it themselves (`test_support::build_test_app_with`).
+///
+/// `quotas` is where the per-IP limiters on the unauthenticated endpoints read
+/// their quotas (see [`rate_limit`] for which routes sit behind which). The
+/// running service passes [`QuotaSource::Live`] over the shared config, so a
+/// runtime `config/patch` of a rate-limit key applies without rebuilding this
+/// router; callers with no config (the OpenAPI spec builder) pass
+/// [`QuotaSource::Fixed`].
+///
+/// # Panics
+///
+/// If `trust_xff_cidrs` holds a range covering every address. Configuration
+/// loading refuses one by the same rule
+/// (`vti_common::rate_limit::deserialize_trusted_proxy_cidrs`), so only a list
+/// built in code can reach this.
+fn build_api_router(trust_xff_cidrs: &[IpNetwork], quotas: QuotaSource) -> OpenApiRouter<AppState> {
+    // One extractor for every limiter, so all of them key a client alike and
+    // share one log of a proxy's unreadable chains.
+    let extractor = vti_common::rate_limit::TrustedProxyKeyExtractor::new(trust_xff_cidrs.to_vec())
+        .expect("trust_xff_cidrs holds no catch-all range");
+    // Per-IP rate limiters on the unauthenticated endpoints, one bucket set
+    // per branch: `auth` (crypto on caller input), `did-log` (public log
+    // reads), `backup-blob`. Authenticated routes stay unthrottled — JWT auth
+    // is itself a gate, and legitimate operator traffic against the
+    // management plane shouldn't be rate-limited.
+    let unauth = OpenApiRouter::new()
+        // TEE first-boot claim (claim-DID signed, attested acknowledgement;
+        // GET names the DID a claim must sign)
+        .routes(routes!(bootstrap::request, bootstrap::claim_info))
+        // Passkey login (DID-VM-resolved WebAuthn assertions).
+        // Trust-task URIs: vta/auth/passkey-login-{start,finish}/1.0.
+        // Unauthenticated — the user has no session before
+        // passkey-login-finish issues the JWT.
+        .routes(routes!(auth::passkey_login_start))
+        .routes(routes!(auth::passkey_login_finish));
+    // Pre-session auth (`auth/challenge`, `auth/authenticate/{0.2,0.3}`,
+    // `auth/refresh/0.2`) is a Trust-Task family now, served on `/trust-tasks`
+    // below by a family-owned dispatch that runs ahead of the ACL gate — see
+    // `trust_tasks::auth`. The `/auth/challenge`, `/auth/` and `/auth/refresh`
+    // routes that stood here are gone.
+    // The public TEE attestation reads are Trust Tasks now
+    // (`vta/attestation/{status,report,config-report}/0.1`), served on
+    // `/trust-tasks` below to anonymous callers, behind this same limiter.
+    // Tighter body cap on unauth endpoints — see UNAUTH_BODY_SIZE.
+    // Applied after ALL auth-branch routes (including the cfg-gated ones) are
+    // registered so every POST on this branch (auth, attestation report)
+    // gets the 64 KB ceiling, not just the base set. Layered here (not
+    // globally) so authenticated endpoints keep MAX_BODY_SIZE for backup
+    // import etc.
+    let unauth = unauth.layer(DefaultBodyLimit::max(UNAUTH_BODY_SIZE));
+    let unauth = rate_limit::apply(unauth, Limiter::Auth, &extractor, &quotas);
+
+    // Public DID-log retrieval, on its own per-IP limiter. Resolving the
+    // VTA's DID precedes every client command and the mediator + readiness
+    // gate fetch the log too, while serving it is a store read with no crypto
+    // — so it must not spend the auth branch's budget (see `rate_limit`).
+    // Still unauthenticated, still rate-limited, still body-capped.
+    #[allow(unused_mut)]
+    let mut did_log = OpenApiRouter::new();
+    // TEE auto-generated did.jsonl — the same public log model.
+    #[cfg(feature = "tee")]
+    {
+        did_log = did_log.routes(routes!(attestation::did_log));
+    }
+    #[cfg(feature = "webvh")]
+    {
+        did_log = did_log
+            // Public did.jsonl retrieval — matches webvh's world-readable
+            // log model, security is cryptographic not access-gated.
+            .routes(routes!(did_webvh::get_did_log_public_handler))
+            // The VTA's own self-hosted did.jsonl at the canonical resolver
+            // paths (see `routes::self_hosted_did` for the security model).
+            .routes(routes!(self_hosted_did::get_vta_well_known_did_log_handler))
+            // Catch-all canonical did:webvh retrieval for pathful DIDs:
+            // `/<path>/did.jsonl`. Returns a bare 404 for every non-canonical
+            // path, so it is safe as an unauth fallback-style route.
+            //
+            // INVARIANT: this must stay the ONLY root-level wildcard route — a
+            // second `/{*...}` or an overlapping root `nest()` would conflict in
+            // axum's matcher. Static routes keep precedence, so real endpoints
+            // are never shadowed.
+            .route(
+                "/{*did_log_path}",
+                get(self_hosted_did::get_vta_canonical_did_log_handler),
+            );
+    }
+    // Same unauth body cap as the auth branch — these are GETs, so any body
+    // at all is unexpected.
+    let did_log = did_log.layer(DefaultBodyLimit::max(UNAUTH_BODY_SIZE));
+    let did_log = rate_limit::apply(did_log, Limiter::DidLog, &extractor, &quotas);
+
+    // Auth portal — same-origin popup target for cross-origin WebAuthn
+    // flows. Sits on its own router branch so:
+    //  - It's NOT behind the rate-limit layer (operator may refresh
+    //    repeatedly while testing).
+    //  - It's NOT behind UNAUTH_BODY_SIZE (the HTML response is
+    //    bigger than that; the cap is for inbound bodies but separate
+    //    branches keep the contract obvious).
+    //  - It's NOT behind CORS itself — the response is meant to be
+    //    loaded directly into a popup window same-origin, not fetched
+    //    cross-origin.
+    // See `routes::auth_portal` for the full security model.
+    let auth_portal_router =
+        OpenApiRouter::new().route("/auth/portal", get(auth_portal::portal_handler));
+
+    // `provision/integration` is a Trust Task only (TSP, DIDComm, or HTTPS on
+    // `/trust-tasks`); its `/bootstrap/provision-integration` route is gone.
+
+    // The Trust-Task dispatcher, at the one conformant path.
+    //
+    // The HTTPS binding POSTs to `<serviceEndpoint>/trust-tasks`, where
+    // `serviceEndpoint` is what the VTA advertises on its Trust-Task service
+    // entry — an ORIGIN in every deployment example, so a client built from the
+    // published binding asks for `/trust-tasks`. The `/api/trust-tasks` alt
+    // spelling this used to also serve is gone — this is a test deployment,
+    // and the SDK's own client is its only caller.
+    //
+    // It serves authenticated callers (their credential is the gate), a
+    // pre-session auth-family document (`trust_tasks::auth::owns`, checked
+    // first — no credential to gate on), and, for a public task, anonymous
+    // ones (`trust_tasks::PUBLIC_URIS`). The anonymous and pre-session
+    // requests are charged to the unauthenticated limiter; the authenticated
+    // ones are not, as on every other JWT-gated route.
+    let trust_tasks = OpenApiRouter::new().route(
+        "/trust-tasks",
+        post(crate::trust_tasks::dispatch_trust_task),
+    );
+    let trust_tasks = rate_limit::apply_trust_tasks(trust_tasks, &extractor, &quotas);
+
+    let router = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .merge(unauth)
+        .merge(did_log);
+    let router = router.merge(auth_portal_router);
+
+    // ACL, audit, config, contexts, did-templates and keys are Trust Tasks
+    // only now, dispatched on `/trust-tasks` (merged above); the REST routes
+    // that stood here (`routes::{acl,audit,config,contexts,did_templates,
+    // keys}`) are gone.
+    let router = router.merge(trust_tasks);
+
+    // TEE attestation routes (feature-gated). The unauthenticated ones
+    // (`status`, `report`, `did-log`) live on the rate-limited `unauth`
+    // branch above. `GET /attestation/mnemonic` (status-check read) and
+    // `POST /attestation/mnemonic` (always 403 over REST) are both gone: the
+    // status check is `vta/attestation/mnemonic-status/0.2` now, and the
+    // export is `vta/attestation/mnemonic-export/1.1` over DIDComm/TSP, or at
+    // first boot as a Trust Task over HTTPS — both dispatched on
+    // `/trust-tasks` (merged above).
+    // `GET /attestation/admin-credential` retired in Phase 3 —
+    // sealed-bootstrap Mode B replaces it via `POST /bootstrap/request`.
+
+    // Service management (`vta/services/*`) is Trust Tasks only, on
+    // `/trust-tasks`: the twenty `/services/*` routes and `/mediators/*` that
+    // stood here are removed. The SDK's `services` methods dispatch the tasks
+    // over whichever transport the client holds.
+
+    // WebVH server/DID management (list/add/update/remove servers, domains,
+    // reconcile, list/create/get/delete DIDs, the authenticated DID log read,
+    // register-with-server) is Trust Tasks only now, on `/trust-tasks`; the
+    // REST routes that stood here are gone. `did_webvh::get_did_log_public_handler`
+    // (a genuinely-public, unauthenticated did:webvh log read, unrelated to
+    // any of those) stays — it's registered on the `did_log` unauth branch
+    // above.
+    #[cfg(feature = "webvh")]
+    let router = router
+        // Passkey-as-verificationMethod enrolment. REST by design: this
+        // is the WebAuthn exception to "every remote operation is a Trust
+        // Task" — the browser driving the ceremony holds only a bearer
+        // from passkey-login, no DID key to sign a Trust Task. Declared in
+        // `deprecation::REST_EXCEPTIONS`; DID-holding clients use the
+        // `vta/passkey-vms/*` twins. Every route is gated by an admin
+        // bearer JWT (`AdminAuth`); there is no separate enrolment token.
+        .routes(routes!(passkey_vms::enroll_challenge_handler))
+        .routes(routes!(
+            passkey_vms::enroll_submit_handler,
+            passkey_vms::list_passkeys_handler
+        ))
+        .routes(routes!(passkey_vms::revoke_passkey_handler));
+
+    // VTA management: `POST /vta/restart` and `GET /metrics` are gone —
+    // they're `vta/management/reload-services/1.0` and `vta/metrics/show/0.1`
+    // Trust Tasks now, both dispatched on `/trust-tasks` (merged above).
+
+    // Backup-descriptor blob endpoints. NOT JWT-gated — the
+    // `X-Backup-Token` header IS the credential (one-shot for
+    // GET, bound to bundle_id, hashed server-side). Justified
+    // in `docs/05-design-notes/backup-descriptor-pattern.md`
+    // §"Auth model".
+    //
+    // Body limit: an explicit `BACKUP_BLOB_BODY_SIZE` (100 MB) layer —
+    // NOT `disable()`. The global `MAX_BODY_SIZE` (1 MB) is too small for
+    // backups (10s of MB), but `disable()` meant any future handler added
+    // to this branch silently inherited an *unlimited* body. The layer is
+    // a branch backstop at the ceiling the upload handler also enforces.
+    //
+    // The upload handler checks the bundle and token before it reads the
+    // body, then reads at most the bundle's declared size, with an idle
+    // timeout and a small cap on uploads in progress (`UploadSlots`).
+    //
+    // Rate-limited like the unauth branch: the token gate is real, but
+    // without throttling a client guessing bundle_ids gets free token
+    // checks.
+    let backup_blob_router = OpenApiRouter::new()
+        .routes(routes!(backup_blob::get_blob, backup_blob::post_blob))
+        .layer(DefaultBodyLimit::max(BACKUP_BLOB_BODY_SIZE))
+        .layer(axum::Extension(backup_blob::UploadSlots::new(
+            backup_blob::MAX_CONCURRENT_UPLOADS,
+        )));
+    let backup_blob_router =
+        rate_limit::apply(backup_blob_router, Limiter::BackupBlob, &extractor, &quotas);
+    let router = router.merge(backup_blob_router);
+
+    // `GET /health/details` used to sit here. It is now two Trust Tasks with
+    // fixed disclosure policies: `vta/health/details/0.1` (the public flags,
+    // any caller) and `vta/restore/status/0.1` (version + restore record,
+    // administrators only), both via `POST <base>/trust-tasks` like every other
+    // task. `GET /capabilities` went the same way in #1039: capability
+    // discovery is `spec/trust-task-discovery/0.3`.
+    router
+}
+
+/// The assembled OpenAPI 3.1 document describing the VTA REST surface.
+///
+/// Built from the same [`build_api_router`] assembly that wires the live
+/// routes, so the document cannot drift from what the service actually serves.
+/// Exposed for tests and offline emission; the running service serves this at
+/// `GET /openapi.json`.
+pub fn openapi_spec() -> utoipa::openapi::OpenApi {
+    // CORS attribution doesn't affect the documented surface; build with the
+    // safe default.
+    build_api_router(&[], QuotaSource::Fixed(RateLimits::default()))
+        .split_for_parts()
+        .1
+}
+
+/// Build the router and conditionally apply a CORS layer for the given list of
+/// allowed origins. Wraps [`build_api_router`] for callers (production VTA
+/// front-ends) that already hold a config; empty list = no layer = legacy
+/// behaviour.
+///
+/// # Panics
+///
+/// If `trust_xff_cidrs` holds a range covering every address (`0.0.0.0/0`,
+/// `::/0`). Configuration loading refuses one, so only a list built in code
+/// can reach this.
+pub fn router_with_cors(
+    allowed_origins: &[String],
+    trust_xff_cidrs: &[IpNetwork],
+    quotas: QuotaSource,
+) -> Router<AppState> {
+    // Finalise the OpenAPI document from the assembled router (paths come from
+    // the `routes!()` registrations) and recover a plain axum `Router` to layer
+    // + serve. Splitting here, *before* the global layers, lets `/openapi.json`
+    // be added as a sibling that the same global layers then wrap.
+    let (router, api) = build_api_router(trust_xff_cidrs, quotas).split_for_parts();
+    let router = router.route("/openapi.json", get(move || serve_openapi(api.clone())));
+
+    // Apply global request body size limit to protect enclave memory,
+    // plus the global request timeout backstop (no handler may hold a
+    // connection indefinitely). The blob branch's own 100 MB body limit,
+    // applied inner to this 1 MB global one, still wins for that branch
+    // (the inner layer sets the limit extension last).
+    let router =
+        router
+            .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+            .layer(TimeoutLayer::with_status_code(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                REQUEST_TIMEOUT,
+            ));
+
+    // Apply CORS conditionally — empty origin list = no layer at all
+    // (preserves the legacy no-cross-origin behaviour for production
+    // deployments that don't need browser-side fetch). CORS stays
+    // outermost so preflight handling and headers wrap the timeout.
+    match build_cors_layer(allowed_origins) {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+
+    #[test]
+    fn empty_list_disables_cors_entirely() {
+        assert!(build_cors_layer(&[]).is_none());
+    }
+
+    #[test]
+    fn explicit_origin_produces_layer() {
+        let layer = build_cors_layer(&["http://localhost:8000".to_string()]);
+        assert!(layer.is_some());
+    }
+
+    #[test]
+    fn invalid_origin_filtered_out_and_empty_result_returns_none() {
+        // `\n` is invalid in a header value. If it's the only entry,
+        // the filter empties the list and we end up at the
+        // no-layer branch — a fresh-install VTA shouldn't get a
+        // partially-applied CORS surface just because a config typo
+        // got past serde.
+        let bad_origin = "http://localhost:8000\n".to_string();
+        assert!(build_cors_layer(&[bad_origin]).is_none());
+    }
+
+    #[test]
+    fn wildcard_alone_yields_no_layer() {
+        // tower-http's `AllowOrigin::list` PANICS on the literal
+        // `*`. The build_cors_layer filter strips wildcards
+        // explicitly so an operator typo can't bring down the
+        // VTA at startup. (Wildcards would also expose bearer
+        // tokens to any origin, which is exactly the kind of
+        // config error we want to refuse — better empty than
+        // permissive.)
+        assert!(
+            build_cors_layer(&["*".to_string()]).is_none(),
+            "wildcard must be filtered to None, never partial-applied"
+        );
+    }
+
+    #[test]
+    fn wildcard_mixed_with_explicit_origins_drops_wildcard_keeps_others() {
+        // Defensive: a mixed list shouldn't break the layer
+        // build — the wildcard is dropped and the explicit
+        // entries remain.
+        let layer = build_cors_layer(&["*".to_string(), "http://localhost:8000".to_string()]);
+        assert!(layer.is_some());
+    }
+
+    #[test]
+    fn empty_origin_string_filtered() {
+        // Operator pastes a blank line into config — should be
+        // skipped, not turned into an empty header value.
+        let layer = build_cors_layer(&["".to_string(), "http://x".to_string()]);
+        assert!(layer.is_some());
+    }
+
+    #[test]
+    fn openapi_spec_describes_registered_routes() {
+        let spec = openapi_spec();
+        // The document-level metadata + security scheme are seeded by ApiDoc.
+        assert_eq!(spec.info.title, "Verifiable Trust Agent (VTA) API");
+        let schemes = &spec
+            .components
+            .as_ref()
+            .expect("components present once a route contributes a schema")
+            .security_schemes;
+        assert!(
+            schemes.contains_key("bearer_jwt"),
+            "bearer_jwt security scheme must be registered"
+        );
+        // `/capabilities` was this assertion's subject — the first route
+        // migrated to OpenAPI-aware registration — and the route is gone
+        // (#1039). Then `/auth/challenge` (also since retired: pre-session
+        // auth is a Trust-Task family on `/trust-tasks` now, not a dedicated
+        // REST route). Pin a different migrated route rather than deleting
+        // the check: what it is really asserting is that `routes!()`
+        // registration still lands operations in the served document, and
+        // that property did not go away with either route.
+        let passkey_start = spec
+            .paths
+            .paths
+            .get("/auth/passkey-login/start")
+            .expect("/auth/passkey-login/start operation must be in the spec");
+        assert!(
+            passkey_start.post.is_some(),
+            "/auth/passkey-login/start must document a POST operation"
+        );
+    }
+
+    /// REST routes that are not public, health or WebAuthn-ceremony routes,
+    /// paired with the reason they still have a dedicated REST mount instead
+    /// of being Trust-Task-document only.
+    ///
+    /// This, together with [`is_public_health_or_webauthn`], replaces a
+    /// representative-path list plus a path floor (`paths.len() >= N`): ACL,
+    /// audit, config, contexts, did-templates, keys and the webvh
+    /// server/DID-management routes all moved onto Trust Tasks in one pass
+    /// (#1858), and a floor only catches a *bulk* loss, never a route that
+    /// quietly regresses back from Trust-Task-only. This needs an edit only
+    /// when a route is *added*, which is exactly the moment a conscious
+    /// decision should be recorded.
+    const REST_EXCEPTIONS: &[(&str, &str, &str)] = &[
+        (
+            "POST",
+            "/bootstrap/request",
+            "sealed-bootstrap Mode B; there is no identity yet to sign a Trust Task document with",
+        ),
+        (
+            "GET",
+            "/bootstrap/request",
+            "the DID a Mode B claim signs, for a claimant that knows only the VTA's URL",
+        ),
+        (
+            "GET",
+            "/backup/blob/{bundle_id}",
+            "a raw sealed-bootstrap blob transfer, not representable as a Trust Task document",
+        ),
+        (
+            "POST",
+            "/backup/blob/{bundle_id}",
+            "a raw sealed-bootstrap blob transfer, not representable as a Trust Task document",
+        ),
+    ];
+
+    /// A WebAuthn ceremony step (the browser's `navigator.credentials` API
+    /// round-trips through `fetch`, so these can never be signed documents),
+    /// or a public, unauthenticated DID-log read (did:webvh's world-readable
+    /// log model — security is cryptographic, not access-gated).
+    fn is_public_health_or_webauthn(path: &str) -> bool {
+        path.starts_with("/health")
+            || path.contains("passkey")
+            || path == "/.well-known/did.jsonl"
+            || path == "/did/{did}/log"
+            || path == "/attestation/did-log"
+    }
+
+    /// Every REST route this service mounts is either a deliberate, reasoned
+    /// exception ([`REST_EXCEPTIONS`]) or self-evidently fine
+    /// ([`is_public_health_or_webauthn`]). A route that is neither — a new
+    /// one nobody reasoned about, or an old one regressing back from
+    /// Trust-Task-only — fails here by name.
+    #[test]
+    fn every_mounted_rest_route_is_justified() {
+        let spec = openapi_spec();
+        let mut unjustified = Vec::new();
+        for (path, item) in &spec.paths.paths {
+            for (method, op) in [
+                ("GET", &item.get),
+                ("POST", &item.post),
+                ("PATCH", &item.patch),
+                ("DELETE", &item.delete),
+                ("PUT", &item.put),
+            ] {
+                if op.is_none() {
+                    continue;
+                }
+                if is_public_health_or_webauthn(path) {
+                    continue;
+                }
+                if REST_EXCEPTIONS
+                    .iter()
+                    .any(|(m, p, _)| *m == method && *p == path)
+                {
+                    continue;
+                }
+                unjustified.push(format!("{method} {path}"));
+            }
+        }
+        unjustified.sort();
+        assert!(
+            unjustified.is_empty(),
+            "these REST routes are mounted but not reasoned about — add each to \
+             REST_EXCEPTIONS with the reason it still needs a dedicated REST mount, or confirm \
+             it belongs in `is_public_health_or_webauthn` and extend that instead:\n  {}",
+            unjustified.join("\n  ")
+        );
+
+        let stale: Vec<&str> = REST_EXCEPTIONS
+            .iter()
+            .filter(|(m, p, _)| {
+                spec.paths
+                    .paths
+                    .get(*p)
+                    .is_none_or(|item| op_for(item, m).is_none())
+            })
+            .map(|(_, p, _)| *p)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "REST_EXCEPTIONS entries for routes that are no longer mounted — remove them: \
+             {stale:?}"
+        );
+    }
+
+    fn op_for<'a>(
+        item: &'a utoipa::openapi::path::PathItem,
+        method: &str,
+    ) -> Option<&'a utoipa::openapi::path::Operation> {
+        match method {
+            "GET" => item.get.as_ref(),
+            "POST" => item.post.as_ref(),
+            "PATCH" => item.patch.as_ref(),
+            "DELETE" => item.delete.as_ref(),
+            "PUT" => item.put.as_ref(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn health_router_with_cors_builds_both_branches() {
+        // Both the with-origins (layer applied) and empty (no layer)
+        // branches must construct without panicking. `.layer(cors)`
+        // on a wildcard would panic inside tower-http, but
+        // `build_cors_layer` filters wildcards to `None` first — this
+        // guards the wiring that depends on that invariant.
+        let _with = health_router_with_cors(&["http://localhost:8000".to_string()]);
+        let _without = health_router_with_cors(&[]);
+        let _wildcard_only = health_router_with_cors(&["*".to_string()]);
+    }
+
+    #[test]
+    fn build_api_router_accepts_custom_rate_limit() {
+        // Constructing with non-default quotas must not panic.
+        let _ = build_api_router(
+            &[],
+            QuotaSource::Fixed(RateLimits::new(Quota::new(50, 100), Quota::new(2, 500))),
+        );
+        let _ = build_api_router(
+            &["127.0.0.1/32".parse().unwrap()],
+            QuotaSource::Fixed(RateLimits::new(Quota::new(1000, 2000), Quota::new(1, 1))),
+        );
+    }
+
+    #[test]
+    fn router_with_cors_passes_rate_limit_through() {
+        // The full router assembly with custom rate limits must not panic.
+        let _ = router_with_cors(
+            &[],
+            &[],
+            QuotaSource::Fixed(RateLimits::new(Quota::new(50, 100), Quota::new(3, 30))),
+        );
+    }
+
+    /// A `0` in any of the four `[server]` rate-limit keys reaches the
+    /// limiters, where a zero period or burst has no governor quota — the
+    /// `.expect()` building one would panic the REST thread. This asserts the
+    /// production clamp (`Quota::new`), not a test helper's: it goes through
+    /// the real router builders on both `trust_xff_cidrs` branches (empty and
+    /// non-empty), from a real `ServerConfig`. (The live path re-reads config
+    /// per request and clamps the same way; `rate_limit::tests` covers it.)
+    #[test]
+    fn zero_rate_limit_config_is_clamped_not_panicked() {
+        let server = {
+            let mut c = crate::config::ServerConfig::default();
+            c.rate_limit_interval_secs = 0;
+            c.rate_limit_burst = 0;
+            c.did_log_rate_limit_interval_secs = 0;
+            c.did_log_rate_limit_burst = 0;
+            c
+        };
+        let limits = QuotaSource::Fixed(RateLimits::from_server_config(&server));
+        let _ = build_api_router(&[], limits.clone());
+        let _ = build_api_router(&["127.0.0.1/32".parse().unwrap()], limits.clone());
+        let _ = router_with_cors(&[], &[], limits);
+    }
+}
+
+/// Pins the meaning of the two `[server]` rate-limit knobs on the limiter
+/// `rate_limit::Quota` builds (`RateLimiterState::per_period`): the interval
+/// is a *replenishment interval* (one token every `n` seconds), and the burst
+/// is how many requests get through back-to-back before throttling starts.
+///
+/// The wrapper (branch independence, the 429 contract) is covered in
+/// `rate_limit::tests`, the end-to-end wiring by the harness test
+/// `unauth_endpoint_rate_limit_returns_429_after_burst`, and the clamp by
+/// `cors_tests::zero_rate_limit_config_is_clamped_not_panicked` above.
+#[cfg(test)]
+mod rate_limit_tests {
+    use std::net::IpAddr;
+    use std::time::Duration;
+
+    use affinidi_rate_limit::RateLimiterState;
+
+    fn admitted_before_refusal(interval_secs: u64, burst: u32) -> u32 {
+        let limiter = RateLimiterState::per_period(Duration::from_secs(interval_secs), burst);
+        let client: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut admitted = 0;
+        while limiter.charge(client).is_ok() {
+            admitted += 1;
+            assert!(admitted <= burst, "the burst must end in a refusal");
+        }
+        admitted
+    }
+
+    #[test]
+    fn burst_2_rejects_third_request() {
+        assert_eq!(admitted_before_refusal(60, 2), 2);
+    }
+
+    #[test]
+    fn burst_5_allows_five_then_rejects() {
+        assert_eq!(admitted_before_refusal(60, 5), 5);
+    }
+
+    /// A refused client is told to come back after one interval: the
+    /// interval is seconds per token, so a bigger one is a tighter limit.
+    #[test]
+    fn the_interval_is_seconds_per_token() {
+        let limiter = RateLimiterState::per_period(Duration::from_secs(5), 1);
+        let client: IpAddr = "10.0.0.1".parse().unwrap();
+        limiter.charge(client).unwrap();
+        assert_eq!(limiter.charge(client).unwrap_err().retry_after_secs, 5);
+    }
+
+    /// A zero interval must make a limiter strict, never turn it off:
+    /// `RateLimiterState::per_period` reads a zero period as "no limit", so
+    /// the production path clamps it (`rate_limit::tests::
+    /// a_zero_quota_still_limits` holds the limiter it builds).
+    #[test]
+    fn a_zero_period_alone_would_disable_the_limiter() {
+        assert!(!RateLimiterState::per_period(Duration::ZERO, 10).is_enabled());
+    }
+}

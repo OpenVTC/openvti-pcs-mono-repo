@@ -1,0 +1,6990 @@
+//! Clap argument-parsing surface for the `pnm` CLI.
+//!
+//! Pure data definitions: every dispatcher lives in `crate::commands::*`.
+//! Helpers in this module (auth-routing, the retired `pnm mediator …`
+//! migration cue, the banner, the force-exit watchdog) are likewise
+//! parser-adjacent — they decide *which* dispatcher to call, never *how*
+//! the call is performed.
+
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Transport to use when connecting to the VTA.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum TransportOpt {
+    /// Prefer TSP when the VTA advertises it, else DIDComm, else REST.
+    /// Falls back loudly (a WARN naming the mediator) if an advertised TSP
+    /// endpoint doesn't answer.
+    #[default]
+    Auto,
+    /// Force TSP. Fails — rather than falling back — if the VTA advertises no
+    /// `#tsp` service or its TSP mediator doesn't answer.
+    Tsp,
+    /// Force DIDComm, ignoring an advertised `#tsp`. Recovers a VTA whose TSP
+    /// endpoint is broken but whose mediator is healthy.
+    Didcomm,
+    /// Force REST even when a mediator transport is advertised — recovers a VTA
+    /// whose mediator is unreachable.
+    Rest,
+}
+
+impl From<TransportOpt> for vta_sdk::session::TransportChoice {
+    fn from(opt: TransportOpt) -> Self {
+        match opt {
+            TransportOpt::Auto => Self::Auto,
+            TransportOpt::Tsp => Self::Tsp,
+            TransportOpt::Didcomm => Self::Didcomm,
+            TransportOpt::Rest => Self::Rest,
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    name = "pnm",
+    version,
+    // `-V` has meant `--verbose` here since before `--version` existed, so
+    // the version answers to the long flag only (#2592).
+    disable_version_flag = true,
+    about = "CLI for managing a personal Verifiable Trust Agent"
+)]
+pub(crate) struct Cli {
+    /// Print version
+    #[arg(long, action = clap::ArgAction::Version)]
+    pub(crate) version: Option<bool>,
+
+    /// Base URL of the VTA service (overrides config). A top-level flag: put it
+    /// before the subcommand (`--url` is also a subcommand argument on
+    /// several commands, so it cannot be global).
+    #[arg(long, env = "VTA_URL")]
+    pub(crate) url: Option<String>,
+
+    /// VTA slug to use (overrides default)
+    #[arg(short, long, env = "PNM_VTA", global = true)]
+    pub(crate) vta: Option<String>,
+
+    /// Enable verbose debug output (can also set RUST_LOG=debug)
+    #[arg(short = 'V', long, global = true)]
+    pub(crate) verbose: bool,
+
+    /// Show full identifiers (DIDs, key ids, template names, …) in
+    /// list output instead of the compact table view that may truncate
+    /// long values. Useful when you need to copy a complete ID.
+    #[arg(long, global = true)]
+    pub(crate) full_display: bool,
+
+    /// Resolve verified agent names for the DIDs shown.
+    ///
+    /// Off by default because it costs network: one DID resolution plus an
+    /// outbound fetch per name a document claims, per DID on screen. A name
+    /// is shown as this DID's only if resolving it leads back to that same
+    /// DID — `alsoKnownAs` alone is self-asserted, so a claim that does not
+    /// round-trip is marked `[unverified]` rather than believed.
+    #[arg(long, global = true)]
+    pub(crate) resolve_agent_names: bool,
+
+    /// Emit output as JSON instead of a human-readable table. Automatic when
+    /// stdout is not a terminal: `pnm acl get <did> | jq .role`.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+
+    /// Force a transport instead of auto-selecting. Auto prefers TSP, then
+    /// DIDComm, then REST. `tsp` / `didcomm` pin a mediator transport and fail
+    /// rather than fall back; `rest` skips both — the recovery path when a
+    /// mediator is unreachable.
+    #[arg(long, value_enum, default_value_t = TransportOpt::Auto, global = true)]
+    pub(crate) transport: TransportOpt,
+
+    /// Accept a VTA REST endpoint on a private network (RFC 1918, IPv6
+    /// unique-local, carrier-grade NAT, `*.internal` / `*.local` names) when
+    /// it comes from a DID document. Off by default: such an endpoint must
+    /// otherwise be a public host, or loopback for local development.
+    #[arg(
+        long,
+        global = true,
+        env = "VTA_ALLOW_PRIVATE_ENDPOINTS",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    pub(crate) allow_private_endpoints: bool,
+
+    #[command(subcommand)]
+    pub(crate) command: Commands,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum Commands {
+    /// Configure VTA URL and credentials.
+    ///
+    /// Bare `pnm setup` runs the interactive wizard. Non-interactive
+    /// phase-1 lives behind `--name`; phase-2 (supply a VTA DID for a
+    /// pending slug) lives under the `continue` subcommand.
+    ///
+    ///   # Interactive:
+    ///   pnm setup
+    ///
+    ///   # Non-interactive phase 1 (mint + park pending; JSON on stdout):
+    ///   pnm setup --name "My VTA"
+    ///   pnm setup --name "My VTA" --overwrite    # replace existing pending
+    ///
+    ///   # Phase 2 (interactive — prompts for VTA DID):
+    ///   pnm setup continue my-vta
+    ///
+    ///   # Phase 2 (non-interactive — JSON on stdout):
+    ///   pnm setup continue my-vta --vta-did did:webvh:...
+    Setup {
+        #[command(subcommand)]
+        command: Option<SetupCommands>,
+
+        /// Non-interactive phase 1: human-readable VTA name. Slugified
+        /// the same way as the interactive wizard. Combining with the
+        /// `continue` subcommand is an error, enforced at dispatch.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Non-interactive phase 1: overwrite an existing *pending*
+        /// setup for the same slug. Never overwrites a complete VTA —
+        /// use `pnm vta delete <slug>` first.
+        #[arg(long)]
+        overwrite: bool,
+    },
+
+    /// Check service health
+    Health {
+        /// Run the TSP probe from a throwaway, never-before-seen `did:key`
+        /// instead of your session identity. A DID minted at probe time can
+        /// have no pre-existing TSP relationship, so a `pong` proves a *cold*
+        /// relationship-free routed send (the §3 test). `messaging/ping` is
+        /// reachability-only, so the fresh DID needs no ACL entry.
+        #[arg(long)]
+        fresh: bool,
+    },
+
+    /// Authentication management
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+
+    /// Configuration management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+
+    /// Manage the VTA's advertised transport services (REST + DIDComm).
+    ///
+    /// Spec: docs/05-design-notes/runtime-service-management.md §5.1.
+    /// The previous `pnm mediator …` subcommand was retired in this
+    /// release; its functionality moved under
+    /// `pnm services didcomm {update,rollback,drain {list,cancel}}`.
+    Services {
+        #[command(subcommand)]
+        command: ServicesCommands,
+    },
+
+    /// Key management
+    Keys {
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+
+    /// Application context management
+    Contexts {
+        #[command(subcommand)]
+        command: ContextCommands,
+    },
+
+    /// Access control list management
+    Acl {
+        #[command(subcommand)]
+        command: AclCommands,
+    },
+
+    /// Which tasks need re-authentication or human consent before they run
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommands,
+    },
+
+    /// Answer a consent request as an approver: verify it, compare its code,
+    /// and sign the decision
+    Consent {
+        #[command(subcommand)]
+        command: ConsentCommands,
+    },
+
+    /// Hand-authored Rego policy modules (power-user surface; for approval
+    /// requirements use `pnm approvals`)
+    Policy {
+        #[command(subcommand)]
+        command: PolicyModuleCommands,
+    },
+
+    // `pnm step-up policy …` lived here. It managed `[auth.step_up]` — the
+    // config floors — which no longer exist: `pnm approvals` and `pnm policy`
+    // are the whole surface now, and they speak the one model the gate reads.
+    /// Device management for Service consumers (personal AI agents, companions)
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommands,
+    },
+
+    /// Secrets vault for Service consumers (list, release, store secrets)
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommands,
+    },
+
+    /// Credential store — the W3C credentials the holder *holds*
+    /// (invitations, memberships, roles). Distinct from `vault` (secrets):
+    /// receive/query/get plus the archival lifecycle
+    /// (archive/delete/restore/purge).
+    CredVault {
+        #[command(subcommand)]
+        command: CredVaultCommands,
+    },
+
+    /// Your own identity — the attributes you hold about yourself, the faces that
+    /// show a set of them together, which face each persona wears where, and
+    /// what other people have told you.
+    ///
+    /// Your attributes and your faces sit ABOVE every trust context. Reaching
+    /// them needs a credential granted `persona-holder`, and no role carries it
+    /// — administering every context is not permission to read what sits above
+    /// them. Grant it with `pnm acl update <did> --capabilities
+    /// persona-holder`. Wearing, contacts and what leaves are context-scoped
+    /// and take `--context`.
+    Persona {
+        #[command(subcommand)]
+        command: PersonaCommands,
+    },
+
+    /// Generate auth credentials for applications and services
+    AuthCredential {
+        #[command(subcommand)]
+        command: AuthCredentialCommands,
+    },
+
+    /// Manage the controller's DIDs and the DID-hosting servers
+    /// they live on.
+    ///
+    /// `pnm did-mgmt servers {add,list,update,delete}` manages the
+    /// controller's view of registered DID-hosting servers (the
+    /// daemons that publish `did:webvh:*` logs). `pnm did-mgmt
+    /// dids {…}` operates on the DIDs themselves (create, edit,
+    /// delete, list, get, get-log, register).
+    ///
+    /// Matches the `vta_sdk::protocols::did_management` SDK module,
+    /// which is the umbrella for both lifecycle and server-
+    /// registration operations on the controller side. (The
+    /// daemon-side hosting trust-tasks live under
+    /// `spec/did-hosting/*` and are a separate concern.)
+    ///
+    /// Replaced the earlier `pnm webvh …` surface, whose hidden alias
+    /// was retired after its one-release deprecation window. The DID
+    /// method itself remains `did:webvh`; only the operator UX
+    /// category was renamed.
+    DidMgmt {
+        #[command(subcommand)]
+        command: DidMgmtCommands,
+    },
+
+    /// did:webs DIDs (alpha): persona, relationship, integration and service
+    /// DIDs on KERI, created and hosted by the VTA.
+    Webs {
+        #[command(subcommand)]
+        command: WebsCommands,
+    },
+
+    /// Audit log management
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
+
+    /// Backup and restore VTA data
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
+    },
+
+    /// VTA connection management
+    Vta {
+        #[command(subcommand)]
+        command: VtaCommands,
+    },
+
+    /// Sealed-transfer bootstrap (consumer side).
+    Bootstrap {
+        #[command(subcommand)]
+        command: BootstrapCommands,
+    },
+
+    /// DID document template management.
+    ///
+    /// Phase 1 surface is offline-only: validate a template file, or scaffold
+    /// a starter by forking a built-in. Later phases will add list/create/
+    /// update/delete commands that hit the VTA.
+    #[command(name = "did-templates")]
+    DidTemplates {
+        #[command(subcommand)]
+        command: DidTemplateCommands,
+    },
+
+    /// Manage the VTA's per-context agent memory — the key/value notes an
+    /// agent reads before it answers.
+    ///
+    /// Backed by the `spec/vta/memory/{put,list,delete}/0.1` Trust Tasks.
+    /// Two gates apply, both server-side: the capability (`MemoryRead` to
+    /// recall, `MemoryWrite` to plant / forget / wipe) and access to
+    /// `--context`, which is the isolation boundary — a caller scoped to one
+    /// context can never reach another's memory.
+    #[command(name = "memory")]
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+
+    /// The notifications this VTA holds for you — an election you were told of, and who
+    /// passed it on.
+    ///
+    /// Backed by the `vta/notifications/{list,show,dismiss,deposit}/0.1` Trust Tasks
+    /// (VTI-NTF-050). A notification is no evidence that you may take part: open the thing
+    /// it points at from its holder, when you choose to. Listing, reading and dismissing tell
+    /// nobody anything.
+    #[command(name = "notifications")]
+    Notifications {
+        #[command(subcommand)]
+        command: NotificationsCommands,
+    },
+
+    /// Who collects your personas' messages at their mediator — this VTA, one of your
+    /// clients under a claim, or nobody and why.
+    ///
+    /// Backed by the `vta/collection/{claim,release,list}/0.1` and
+    /// `vta/collection/settings/{show,set}/0.1` Trust Tasks (VTI-NTF-080 – 098). A mediator
+    /// permits one connection per DID, so a client that collects for a persona itself claims
+    /// it first and connects only once the claim is granted. The VTA collects for every
+    /// unclaimed persona of a context unless collection by default is disabled there.
+    #[command(name = "collection")]
+    Collection {
+        #[command(subcommand)]
+        command: CollectionCommands,
+    },
+
+    /// Manage the external accounts this VTA holds at clouds and third-party
+    /// services, and the integrations bound to them.
+    ///
+    /// Backed by the `external/*/0.1` Trust Tasks. Management needs
+    /// `external-accounts-manage` in `--context`; changes may be held for
+    /// other administrators' consent under `pnm approvals`. A secret is never
+    /// a command-line argument: `secret-set` reads it without echo and seals
+    /// it in this process.
+    #[command(name = "external")]
+    External {
+        #[command(subcommand)]
+        command: ExternalCommands,
+    },
+
+    /// Act in a data room — a shared space governed by credentials the room
+    /// itself issued, not by this VTA's ACL.
+    ///
+    /// Every command talks to two services and never confuses them: your VTA
+    /// mints a presentation (and opens sealed records), and the room's **host**
+    /// stores the bytes. The credentials and the group key stay in the VTA;
+    /// this CLI never holds either.
+    ///
+    /// Needs the `roomPresent` capability, and `roomOpen` to read a sealed
+    /// room. Issuing a room's credentials is the *owner's* job and is not here:
+    /// it needs the room's own signing key.
+    #[command(name = "rooms")]
+    Rooms {
+        #[command(subcommand)]
+        command: RoomCommands,
+    },
+
+    /// Vote in your community's polls and elections. Your VTA holds every key: it signs your
+    /// requests to the community as your membership DID, unblinds your ticket, and builds each
+    /// cast under a key made for it alone; this CLI posts the cast to the ballot box itself.
+    ///
+    /// Needs the `pcsVoter` capability in the context your membership persona lives in.
+    #[command(name = "elections")]
+    Elections {
+        #[command(subcommand)]
+        command: ElectionCommands,
+    },
+
+    /// Take part in your community's boards: propose ideas, leave notes, and take the tickets
+    /// for the ideas put to a vote. Your VTA signs every request as your identity at the
+    /// community (`vault/sign-trust-task`); voting on an idea is `pnm elections`.
+    ///
+    /// Needs the `SignTrustTask` capability, and `pcsVoter` for `take-tickets`.
+    #[command(name = "boards")]
+    Boards {
+        #[command(subcommand)]
+        command: BoardCommands,
+    },
+
+    /// Operate an Affinidi messaging mediator as a DID this VTA manages.
+    #[command(name = "messaging")]
+    Messaging {
+        #[command(subcommand)]
+        command: MessagingCommands,
+    },
+    /// Print a shell completion script (#2592).
+    ///
+    ///   pnm completions bash > ~/.local/share/bash-completion/completions/pnm
+    ///   pnm completions zsh  > "${fpath[1]}/_pnm"
+    ///   pnm completions fish > ~/.config/fish/completions/pnm.fish
+    Completions {
+        /// The shell to generate for.
+        shell: clap_complete::Shell,
+    },
+}
+
+/// The community a member votes in, and who they are there.
+#[derive(clap::Args)]
+pub(crate) struct ElectionTarget {
+    /// Base URL of the community's Trust Task endpoint (e.g. `https://vtc.example.com/v1`).
+    #[arg(long)]
+    pub(crate) vtc: String,
+    /// The community's DID.
+    #[arg(long)]
+    pub(crate) vtc_did: String,
+    /// Your membership DID at the community: a persona your VTA holds.
+    #[arg(long)]
+    pub(crate) member: String,
+    /// The VTA context that persona lives in; your voter keys are derived there.
+    #[arg(long)]
+    pub(crate) context: String,
+}
+
+/// The community a member uses boards at, and who they are there.
+#[derive(clap::Args)]
+pub(crate) struct BoardTarget {
+    /// Base URL of the community's Trust Task endpoint (e.g. `https://vtc.example.com/v1`).
+    #[arg(long)]
+    pub(crate) vtc: String,
+    /// The community's DID.
+    #[arg(long)]
+    pub(crate) vtc_did: String,
+    /// Your membership DID at the community: the identity your VTA's vault entry for it holds.
+    #[arg(long)]
+    pub(crate) member: String,
+    /// The vault entry to sign as. Default: your one active entry for the community as
+    /// `--member`.
+    #[arg(long)]
+    pub(crate) entry: Option<String>,
+}
+
+/// What an idea says: its title, what it covers, and where it is filed.
+#[derive(clap::Args, Default)]
+pub(crate) struct IdeaText {
+    #[arg(long)]
+    pub(crate) title: Option<String>,
+    /// What the idea covers, and who should come.
+    #[arg(long)]
+    pub(crate) description: Option<String>,
+    /// One of the board's formats (e.g. Discussion, Talk, Workshop), where it states them.
+    #[arg(long)]
+    pub(crate) format: Option<String>,
+    /// One of the board's topics, where it states them.
+    #[arg(long)]
+    pub(crate) topic: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BoardCommands {
+    /// The boards you can see.
+    List {
+        /// Only boards in this status: open, closed or archived.
+        #[arg(long)]
+        status: Option<String>,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// One board and its ideas, lane by lane, with each open idea's election.
+    Show {
+        board_id: String,
+        /// Only ideas in these states (proposed, open, selected, notSelected, declined, merged,
+        /// withdrawn). Repeat for several.
+        #[arg(long = "state")]
+        states: Vec<String>,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// Propose an idea while the board takes proposals. It is shown under your name.
+    Propose {
+        board_id: String,
+        #[command(flatten)]
+        idea: IdeaText,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// Change your idea while it is still proposed.
+    Update {
+        idea_id: String,
+        #[command(flatten)]
+        idea: IdeaText,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// Withdraw your idea while it is still proposed.
+    Withdraw {
+        idea_id: String,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// The notes on a board, or on one of its ideas.
+    Notes {
+        board_id: String,
+        /// Only this idea's notes.
+        #[arg(long)]
+        idea: Option<String>,
+        /// Every note on the board, its ideas' included.
+        #[arg(long, conflicts_with = "idea")]
+        all: bool,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// Add a note to a board, or to one of its ideas. It is shown under your name.
+    Note {
+        board_id: String,
+        text: String,
+        #[arg(long)]
+        idea: Option<String>,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// Withdraw one of your notes.
+    WithdrawNote {
+        note_id: String,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+    /// Take your ticket for every idea open for votes, each in its own request a few seconds
+    /// apart. Vote later, one idea at a time, with `pnm elections vote`.
+    TakeTickets {
+        board_id: String,
+        /// The VTA context your membership persona lives in; your voter keys are derived there.
+        #[arg(long)]
+        context: String,
+        #[command(flatten)]
+        target: BoardTarget,
+    },
+}
+
+/// A membership credential you choose to present, for an election whose roll is the holders of
+/// a membership credential (VTI-VOT-025). Presenting it shows the community that you are a
+/// member of the party that issued it.
+#[derive(clap::Args, Default)]
+pub(crate) struct MembershipPresenting {
+    /// The membership credential's handle in your VTA's vault. `ticket` presents it when it
+    /// claims the ticket; `show` presents it in the read, to see an election put to the members
+    /// of a party that is itself a member of the community, which it shows nobody else.
+    #[arg(long)]
+    pub(crate) membership_credential: Option<String>,
+    /// The DID you were told the election's roll names. Your VTA presents the credential only
+    /// where that DID issued it (VTI-VOT-016); `ticket` with it also presents in its read.
+    #[arg(long, requires = "membership_credential")]
+    pub(crate) member_of: Option<String>,
+}
+
+/// The election a trustee serves, and who the trustee is.
+#[derive(clap::Args)]
+pub(crate) struct TrusteeTarget {
+    /// The community's DID: the registrar that registered the election.
+    #[arg(long)]
+    pub(crate) community: String,
+    /// The ballot box's DID (the manifest's `ballotBox`).
+    #[arg(long)]
+    pub(crate) ballot_box: String,
+    /// Your trustee DID: a persona your VTA holds, named in the manifest's `trustees.dids`.
+    #[arg(long)]
+    pub(crate) trustee: String,
+    /// The VTA context that persona lives in.
+    #[arg(long)]
+    pub(crate) context: String,
+}
+
+/// A trustee's commands for a sealed or tallied-encrypted election.
+#[derive(Subcommand)]
+pub(crate) enum TrusteeCommands {
+    /// Where the trustees' ceremony stands, as the ballot box reports it to you.
+    Status {
+        election_id: String,
+        #[command(flatten)]
+        target: TrusteeTarget,
+    },
+    /// Take every step the ceremony needs of you now: enrol, deal, confirm or answer a
+    /// complaint, keep your key share, and after close decrypt.
+    ///
+    /// Safe to run again at any time; with `--watch` it keeps going until nothing more is
+    /// needed of you.
+    Step {
+        election_id: String,
+        /// Ask again every 30 seconds until the result is out.
+        #[arg(long)]
+        watch: bool,
+        #[command(flatten)]
+        target: TrusteeTarget,
+    },
+}
+
+/// A member's election commands.
+#[derive(Subcommand)]
+pub(crate) enum ElectionCommands {
+    /// The elections the community lets you vote in.
+    List {
+        #[command(flatten)]
+        target: ElectionTarget,
+    },
+    /// One election: its questions, schedule, and what you are told about its ballot box.
+    Show {
+        election_id: String,
+        #[command(flatten)]
+        target: ElectionTarget,
+        #[command(flatten)]
+        presenting: MembershipPresenting,
+    },
+    /// Take your ticket for an election, and nothing else.
+    ///
+    /// Take it early — before voting opens, or well before you vote — so the cast that
+    /// follows cannot be paired with it by when each arrived.
+    Ticket {
+        election_id: String,
+        #[command(flatten)]
+        target: ElectionTarget,
+        #[command(flatten)]
+        presenting: MembershipPresenting,
+    },
+    /// Vote with the ticket your VTA holds.
+    ///
+    /// With no ticket held this takes one and stops: run it again later to vote, or pass
+    /// `--now`. A later vote replaces an earlier one where the election allows it. Run the same
+    /// command again if the ballot box did not answer.
+    Vote {
+        election_id: String,
+        /// An answer to a choice question, as `question=option`. Repeat for each question,
+        /// and for each option of a multi-select. Optional questions left out are abstained.
+        #[arg(long = "answer")]
+        answers: Vec<String>,
+        /// The whole ballot as JSON (`voting/ballot/cast` `Ballot`), for questions `--answer`
+        /// cannot express.
+        #[arg(long, conflicts_with = "answers")]
+        ballot: Option<std::path::PathBuf>,
+        /// Cast in the same run that takes the ticket. The community and the ballot box could
+        /// then pair your ticket with your ballot by time.
+        #[arg(long)]
+        now: bool,
+        /// Send the cast at once rather than after a random pause of up to 20 seconds.
+        #[arg(long)]
+        no_delay: bool,
+        #[command(flatten)]
+        target: ElectionTarget,
+    },
+    /// After voting closes, check that each cast you made is in the board the community kept at
+    /// close (VTI-VOT-053) — also once the board the election was opened on is deleted.
+    ///
+    /// Your VTA keeps your receipts; the proof that each is on the board comes from the ballot
+    /// box over this connection, never through your VTA or the community. A missing cast is
+    /// reported and the command fails: your VTA keeps the receipt as evidence.
+    Verify {
+        election_id: String,
+        #[command(flatten)]
+        target: ElectionTarget,
+    },
+    /// Serve as a trustee of a sealed or tallied-encrypted election: your VTA holds your
+    /// transport key and your share of the election key, and signs every step as you.
+    ///
+    /// Needs the `pcsTrustee` capability in the context your trustee persona lives in.
+    #[command(subcommand)]
+    Trustee(TrusteeCommands),
+}
+
+/// Mediator operations as a VTA-managed DID.
+#[derive(Subcommand)]
+pub(crate) enum MessagingCommands {
+    /// Open the mediator console as a DID from one of your contexts.
+    ///
+    /// An administrator account sees the whole mediator — statistics, every
+    /// account's queues, any account's messages, the audit log, live traffic;
+    /// any other account manages its own queues and messages. Which one is up
+    /// to the mediator's record of the DID.
+    ///
+    /// The console needs the DID's private keys for the session, so its
+    /// verification-method keys are exported with `keys/export-secret`: this
+    /// needs the `KeyExport` capability and every export is audited
+    /// (VTI-VTA-003). The keys stay in memory and are gone when the console
+    /// closes. `--as-session` uses pnm's own identity instead and exports
+    /// nothing.
+    Console {
+        /// Context whose DID to act as. Asked for when omitted and there is
+        /// more than one.
+        #[arg(long)]
+        context: Option<String>,
+        /// The DID to act as, when a context holds several. Asked for when
+        /// omitted and the choice is ambiguous.
+        #[arg(long, conflicts_with = "as_session")]
+        did: Option<String>,
+        /// Mediator DID. Defaults to the DID document's DIDCommMessaging
+        /// service, then this pnm's configured mediator.
+        #[arg(long)]
+        mediator: Option<String>,
+        /// Act as this pnm session's own did:key.
+        #[arg(long, conflicts_with = "context")]
+        as_session: bool,
+    },
+
+    /// Give another DID an account role at a mediator — typically a browser
+    /// wallet's holder, so its console can look inside the relay it uses.
+    ///
+    /// Acts as a DID from one of your contexts (the mediator's administrator,
+    /// usually) exactly as `console` does, and needs the same key export.
+    /// `admin` lets the account see the whole mediator — every account's
+    /// queues, the audit log, configuration and live traffic; `standard`
+    /// takes that away. `rootAdmin` is deliberately not offered: it can read
+    /// other accounts' message bodies and change a running mediator, which is
+    /// not a standing to hand to a key held in a browser.
+    Grant {
+        /// The DID to change (the mediator knows it by its hash).
+        target: String,
+        /// The role to give it.
+        #[arg(long, value_enum)]
+        role: GrantRole,
+        /// Context whose DID to act as.
+        #[arg(long)]
+        context: Option<String>,
+        /// The DID to act as, when a context holds several.
+        #[arg(long, conflicts_with = "as_session")]
+        did: Option<String>,
+        /// Mediator DID. Defaults to the acting DID's DIDCommMessaging
+        /// service, then this pnm's configured mediator.
+        #[arg(long)]
+        mediator: Option<String>,
+        /// Act as this pnm session's own did:key.
+        #[arg(long, conflicts_with = "context")]
+        as_session: bool,
+    },
+}
+
+/// The roles `pnm messaging grant` may give.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum GrantRole {
+    /// Sees the whole mediator.
+    Admin,
+    /// Sees only its own account.
+    Standard,
+}
+
+/// Member-side room verbs. Each mints its own presentation for exactly the
+/// action it performs — `read` for list/get, `write` for put, `curate` for
+/// curate, `admin` for renew — so a member who holds less is refused by their
+/// own VTA rather than by the host.
+// Parsed once per invocation; `Put`'s flags are what make it large.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+pub(crate) enum RoomCommands {
+    /// Remember a room's host, host DID and signing key, and make it the room
+    /// every `pnm rooms …` command means when it names none (#2590).
+    ///
+    /// Stored values become defaults: a flag on the command line still wins,
+    /// and `--help` shows the default in force. `owner register`, `offers
+    /// accept` and `keys welcome` remember what they learn on their own. With
+    /// no room, lists what is remembered (`*` marks the default).
+    Use {
+        /// The room's DID.
+        room: Option<String>,
+        /// Base URL of the host storing the room.
+        #[arg(long, requires = "room")]
+        host: Option<String>,
+        /// The host's DID.
+        #[arg(long, requires = "room")]
+        host_did: Option<String>,
+        /// The room's signing key id (for an owner's verbs).
+        #[arg(long = "signing-key", requires = "room")]
+        signing_key: Option<String>,
+        /// Forget the room instead.
+        #[arg(long, requires = "room", conflicts_with_all = ["host", "host_did", "signing_key"])]
+        forget: bool,
+    },
+
+    /// List the room's records. Metadata only — never bodies.
+    List {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the host storing the room.
+        #[arg(long)]
+        host: String,
+        /// The host's DID — the recipient the request document names.
+        ///
+        /// It does not affect how the presentation is bound. That is always to
+        /// the DID you authenticate as, so a captured one is worthless to
+        /// whoever captured it whether this is given or not.
+        #[arg(long)]
+        host_did: Option<String>,
+        /// Only records whose key starts with this.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Only records at or after this version — the incremental-sync
+        /// watermark.
+        #[arg(long)]
+        since_version: Option<u64>,
+        /// Show at most this many. With `--newest`, the page size to read from the head
+        /// (default 50).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Open the conversation at its head: your VTA lists the room newest first
+        /// (`rooms/keys/browse/0.6`, the host's `rooms/records/list/0.8`) and stops after
+        /// `--pages` pages. Needs `--host-did`.
+        #[arg(long)]
+        newest: bool,
+        /// With `--newest`: how many host pages to read (default 1).
+        #[arg(long, requires = "newest")]
+        pages: Option<u64>,
+        /// With `--newest`: continue from the cursor an earlier `--newest` printed, to read
+        /// the page before it.
+        #[arg(long, requires = "newest")]
+        cursor: Option<String>,
+        /// With `--newest`: only records below this version — "load older" from the lowest
+        /// version already shown, with no cursor to keep (`rooms/keys/browse/0.6`, the
+        /// host's `rooms/records/list/0.8`).
+        #[arg(long, requires = "newest")]
+        before_version: Option<u64>,
+    },
+
+    /// Read several records at once through your VTA (`rooms/keys/read/0.2`): it
+    /// fetches each from the host as you, checks it, and opens it, and answers each key on
+    /// its own — the record, or why that key was not read. With `--newest`, the newest
+    /// records of the conversation instead of named keys.
+    Read {
+        /// Record keys, in the order to show them.
+        #[arg(required_unless_present = "newest", conflicts_with = "newest")]
+        keys: Vec<String>,
+        /// Read the conversation's newest records, in the order they were written: your
+        /// VTA lists the room newest first (`rooms/keys/browse/0.6`) and reads that page.
+        #[arg(long)]
+        newest: bool,
+        /// With `--newest`: how many records to read from the head (default 50).
+        #[arg(long, requires = "newest")]
+        limit: Option<usize>,
+        /// With `--newest`: how many host pages to read (default 1).
+        #[arg(long, requires = "newest")]
+        pages: Option<u64>,
+        /// With `--newest`: continue from the cursor an earlier `--newest` printed.
+        #[arg(long, requires = "newest")]
+        cursor: Option<String>,
+        /// With `--newest`: only records below this version — "load older" from the lowest
+        /// version already read (`rooms/keys/browse/0.6`).
+        #[arg(long, requires = "newest")]
+        before_version: Option<u64>,
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the host storing the room. Unused by this command, which reaches the
+        /// host through your VTA; accepted so a `get` line can be turned into a `read`.
+        #[arg(long)]
+        host: Option<String>,
+        /// The host's DID. Your VTA resolves it and reads as you.
+        #[arg(long)]
+        host_did: String,
+    },
+
+    /// Read one record, decrypting through your VTA when it is sealed.
+    Get {
+        /// Record key.
+        key: String,
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the host storing the room.
+        #[arg(long)]
+        host: String,
+        /// The host's DID: the recipient the request names.
+        #[arg(long)]
+        host_did: Option<String>,
+    },
+
+    /// Write a record. On an `attributed` or `private` room the record is a
+    /// body you sign, sealed by your VTA (`rooms/keys/seal`) under the room's
+    /// current epoch; on `open` it goes in the clear.
+    Put {
+        /// Record key. On a sealed tier keys must be opaque; on `open` they may
+        /// be descriptive.
+        key: String,
+        /// The record body (markdown — written for a human, recalled by an
+        /// agent). With `--react`, the reaction is the body.
+        #[arg(required_unless_present = "react", conflicts_with = "react")]
+        body: Option<String>,
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+        /// One-line title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Precondition: `0` means create-only, `n` requires the stored record
+        /// to be at version `n`. A mismatch reports the version you lost to.
+        #[arg(long)]
+        expected_version: Option<u64>,
+        /// What kind of claim the record is: `declared` (your own statement — the
+        /// default), `observed`, `verified` (name the evidence), `inferred`, or
+        /// `unstated`. Signed inside the body on a sealed room; on an open room it is
+        /// stored unsigned beside the text. For readers to show and weigh, never
+        /// authority.
+        #[arg(long)]
+        basis: Option<String>,
+        /// Your own estimate, 0 to 1, that the record is right.
+        #[arg(long)]
+        confidence: Option<f64>,
+        /// Cite a record of this room in support: `KEY`, or `KEY@VERSION` to cite
+        /// what it said then. Repeatable. Never fetched by a reader.
+        #[arg(long = "cite-record")]
+        cite_records: Vec<String>,
+        /// Cite a credential in support, by its `id`. Repeatable. Never fetched.
+        #[arg(long = "cite-credential")]
+        cite_credentials: Vec<String>,
+        /// A purpose the record may be used for, as an absolute IRI (for example
+        /// `https://w3id.org/dpv#ServicePersonalisation`). Repeatable.
+        #[arg(long = "purpose")]
+        purposes: Vec<String>,
+        /// The permitted use in words, such as "renewal negotiation only".
+        #[arg(long)]
+        use_note: Option<String>,
+        /// When you stop standing behind the record as current (RFC 3339).
+        /// Readers hide it after that; it is not deleted.
+        #[arg(long)]
+        valid_until: Option<String>,
+        /// What kind of record this is: `message`, `note`, … (lowerCamelCase). Only where
+        /// the room's profile lists `kind` in its record members.
+        #[arg(long, conflicts_with = "react")]
+        kind: Option<String>,
+        /// The record this one answers: `KEY`, or `KEY@VERSION`. Only where the room's
+        /// profile lists `inReplyTo`.
+        #[arg(long, value_name = "KEY[@VERSION]", conflicts_with = "react")]
+        reply_to: Option<String>,
+        /// React to `--to` with this (an emoji, a word): a record of kind `reaction`
+        /// answering it. Only where the room's profile lists `kind` and `inReplyTo`.
+        #[arg(long, value_name = "VALUE", requires = "to")]
+        react: Option<String>,
+        /// The record `--react` reacts to: `KEY`, or `KEY@VERSION`.
+        #[arg(
+            long,
+            value_name = "KEY[@VERSION]",
+            requires = "react",
+            conflicts_with = "body"
+        )]
+        to: Option<String>,
+    },
+
+    /// Your name in a room — what the room's other members see beside your records. A
+    /// record of kind `memberProfile`, written by you into the room (sealed on `attributed`
+    /// and `private` rooms), and only where the room's profile lists `kind` and
+    /// `memberProfile` in its record members. It names you in this room only, and is your
+    /// own claim: nobody verifies it.
+    Name {
+        #[command(subcommand)]
+        command: RoomNameCommands,
+    },
+
+    /// Watch rooms: your VTA asks the host for one content-free signal the first time each
+    /// room moves past `--since`, at an address of its own, and passes it on to this
+    /// client (`rooms/keys/changed`), then nothing until you watch again — so a wallet
+    /// learns a room changed without polling, and needs no address of its own. Needs
+    /// `read`.
+    ///
+    /// The signal says only that the room moved; read the room to learn what. With
+    /// `--via-host`, the host signals `--address` instead — a DID you receive at — and your
+    /// VTA only completes the request as the member (`rooms/keys/act/0.12`).
+    Watch {
+        /// A room to watch; repeat for up to 64 rooms at one host.
+        #[arg(long = "room", required = true)]
+        room_ids: Vec<String>,
+        /// Base URL of the host storing the room. Needed with `--via-host`; otherwise used
+        /// only to find your member in an `open` room.
+        #[arg(long, required_if_eq("via_host", "true"))]
+        host: Option<String>,
+        /// The host's DID: the request's recipient, and who the signal comes from.
+        #[arg(long)]
+        host_did: String,
+        /// The member to watch as. Omitted, the one your VTA lists for the rooms.
+        #[arg(long, conflicts_with = "via_host")]
+        member: Option<String>,
+        /// Arm the host's watch yourself, at `--address`, instead of asking your VTA to
+        /// watch for you.
+        #[arg(long, requires = "address")]
+        via_host: bool,
+        /// With `--via-host`: the DID the signal is sent to — one you receive at, reached
+        /// through its mediator, and use for watches only; never your own DID, your VTA's
+        /// or the member's. On a `private` room, one you use for that one watch.
+        #[arg(long, requires = "via_host")]
+        address: Option<String>,
+        /// The highest version of the room you have read to. Omitted, the host takes the
+        /// room's latest, and a change made since your last read is not signalled.
+        #[arg(long, conflicts_with = "cancel")]
+        since: Option<u64>,
+        /// How long the watch lasts if it does not fire, such as `7d` or `12h` (at least
+        /// 60 seconds, at most 30 days). The host may grant less.
+        #[arg(long, conflicts_with = "cancel")]
+        lease: Option<String>,
+        /// End the watches on these rooms instead.
+        #[arg(long)]
+        cancel: bool,
+        /// Watch live, as a tail of the room: your VTA passes on a signal each time the
+        /// room changes (at most one a second), not just the first, and this prints each
+        /// one until Ctrl-C, renewing the watch about every minute and cancelling it on
+        /// exit (`rooms/keys/watch/0.2`). Only on a room whose signal delay is `none` —
+        /// `pnm rooms signal-delay set --none` changes it — and only while you are
+        /// reading the room.
+        #[arg(long, conflicts_with_all = ["cancel", "via_host"])]
+        live: bool,
+    },
+
+    /// Change a record's standing. Needs `curate`, which `write` does not imply.
+    Curate {
+        /// Record key.
+        key: String,
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+        /// New status: `active`, `deprecated` or `retracted`. `retracted` is a
+        /// tombstone — the body goes, the key and version stay.
+        #[arg(long)]
+        status: Option<String>,
+        /// Pin the record.
+        #[arg(long, conflicts_with = "unpin")]
+        pin: bool,
+        /// Unpin it.
+        #[arg(long)]
+        unpin: bool,
+        /// Why, for the room's trail. Member-authored free text.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Renew an open room by minting its next epoch. Needs `admin`.
+    ///
+    /// This is what keeps a room live, and it is the whole defence against a
+    /// hostile succession claim: an owner who renews is safe without thinking
+    /// about it. A sealed room (`attributed` / `private`) is refused: renew it
+    /// with `pnm rooms owner group-renew`, which advances its group with it.
+    Renew {
+        /// The epoch to mint — your group's epoch plus one.
+        epoch: u32,
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+        /// Why, recorded with the renewal.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Drop the room's epoch key chain below an epoch (`rooms/epoch/prune/0.2`).
+    /// Needs `admin`. IRREVERSIBLE, for every member.
+    ///
+    /// The host erases the chain's rungs below `--before-epoch` and keeps the
+    /// room's epoch floor, so history sealed under those epochs can no longer
+    /// be derived from the host by anyone — a member who restarts, moves device
+    /// or joins later. Members' VTAs discard the rungs they already derived at
+    /// or below the floor as soon as they next learn it, and refuse to derive
+    /// below it. The records stay; the ability to open them goes. Nothing a
+    /// member has already read or copied out is recalled.
+    ///
+    /// Prints what becomes unreadable and asks before sending; without a
+    /// terminal it refuses unless `--yes` is given.
+    Prune {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the host storing the room.
+        #[arg(long)]
+        host: String,
+        /// The host's DID: the recipient the request names.
+        #[arg(long)]
+        host_did: Option<String>,
+        /// Drop every rung below this epoch. Must be below the room's current
+        /// epoch: pruning at it would drop the whole chain.
+        #[arg(long)]
+        before_epoch: u32,
+        /// Why, for the room's audit trail — the only record of intent a prune
+        /// leaves. Keep member identifiers and record content out of it.
+        #[arg(long)]
+        reason: String,
+        /// Prune without asking. Required when there is no terminal to ask.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// The room's records as a whole: how long it keeps them (its record
+    /// retention) and removing what that rule makes eligible. Both need `admin`.
+    Records {
+        #[command(subcommand)]
+        command: RoomRecordsCommands,
+    },
+
+    /// The room's signal delay: whether its host waits a few seconds, at random, before
+    /// it sends a watch signal (`randomised`, the default), or sends it as soon as a write
+    /// is stored (`none`, for a room used as a conversation). The room's setting, read by
+    /// every member — no watcher can change it for itself.
+    SignalDelay {
+        #[command(subcommand)]
+        command: RoomSignalDelayCommands,
+    },
+
+    /// Put a file in a room or fetch one, or seal and open one locally.
+    ///
+    /// Each file is sealed and opened here with that one file's key from your
+    /// VTA. The file's bytes never pass through the VTA, and the host only ever
+    /// holds ciphertext.
+    File {
+        #[command(subcommand)]
+        command: RoomFileCommands,
+    },
+
+    /// Your VTA as a room's key holder: join a room's group from an
+    /// invitation, apply its commits, and see which rooms it holds.
+    ///
+    /// Every verb is a call to your own VTA, which holds the group key; none
+    /// leaves it.
+    Keys {
+        #[command(subcommand)]
+        command: RoomKeysCommands,
+    },
+
+    /// The room's own profile — its name, description, tags and emoji, as every
+    /// member sees it. Kept inside the room, sealed on `attributed` and `private`
+    /// rooms where the host cannot read it or tell it from any other record.
+    ///
+    /// Every verb is a call to your own VTA, which finds the profile (only a key
+    /// holder can compute where it is), checks who wrote it, and reaches the host
+    /// as you (`rooms/keys/profile/{read,write}`).
+    Profile {
+        #[command(subcommand)]
+        command: RoomProfileCommands,
+    },
+
+    /// The owner's verbs, run by your VTA: register the room with a host, issue
+    /// its credentials in the room's name, and hold the owner's half of its
+    /// group. Neither the room's signing key nor any group key leaves it.
+    Owner {
+        #[command(subcommand)]
+        command: RoomOwnerCommands,
+    },
+
+    /// A community's offers of its rooms to you: list them, and accept one.
+    ///
+    /// Each request is signed as the DID the community addressed its offer to — a
+    /// persona your VTA holds — by your VTA (`rooms/keys/act`), and sent to the
+    /// community unchanged. On a sealed room your VTA mints the KeyPackage and joins
+    /// with the Welcome the community answers with.
+    Offers {
+        #[command(subcommand)]
+        command: RoomOffersCommands,
+    },
+
+    /// Every room the community has offered you and where each stands — offered,
+    /// joined, accepted but not finished, suspended or removed, and whether the room
+    /// itself is archived or being removed — as your member portal and
+    /// OpenVTC show it too: the community's record (`vtc/rooms/memberships/list`),
+    /// signed as you by your VTA (`rooms/keys/act/0.10`), beside your VTA's own
+    /// (`rooms/keys/list`).
+    Memberships {
+        /// Base URL of the community's Trust Task endpoint (e.g.
+        /// `https://vtc.example.com/v1`).
+        #[arg(long)]
+        vtc: String,
+        /// The community's DID.
+        #[arg(long)]
+        vtc_did: String,
+        /// The DID the community addressed its offers to: a persona your VTA holds.
+        #[arg(long)]
+        member: String,
+    },
+
+    /// Register a room with a host, signed with this CLI's own key — for a
+    /// standalone `room-host` or testing.
+    ///
+    /// This names this CLI's session `did:key` as the room's owner, so the owner
+    /// is the client rather than a persona your VTA holds. On a community (VTC)
+    /// host use `pnm rooms owner register` instead: a VTC creates rooms only for
+    /// its members, and your VTA signs that request as your persona.
+    ///
+    /// The only verb needing no presentation — the room has issued nothing yet,
+    /// so the host checks this request's own proof instead.
+    Create {
+        /// The room's DID, which you minted before this call.
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the host. A VTC's includes its `/v1` mount.
+        #[arg(long)]
+        host: String,
+        /// The host's DID. A VTC refuses a document not addressed to it, so give
+        /// it for a VTC.
+        #[arg(long)]
+        host_did: Option<String>,
+        /// Fixed for the life of the room.
+        #[arg(long, default_value = "open", value_parser = ROOM_VISIBILITY)]
+        visibility: String,
+        /// How long the host holds the room after it lapses. Default 90 days.
+        #[arg(long)]
+        retention_days: Option<u32>,
+    },
+}
+
+/// A room's visibility: what `rooms create` / `rooms owner register` accept,
+/// so a typo is refused here rather than by the host (#2590).
+const ROOM_VISIBILITY: [&str; 3] = ["open", "attributed", "private"];
+
+/// External accounts (`external/*/0.1`).
+#[derive(Subcommand)]
+pub(crate) enum ExternalCommands {
+    /// List the accounts in a context (archived ones only with `--state archived`).
+    List {
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        /// `active`, `suspended` or `archived`.
+        #[arg(long)]
+        state: Option<String>,
+        /// Only accounts of this auth model (e.g. `s3-static-presign`).
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Show one account: settings, bindings, public material — never a secret.
+    Get {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+    },
+    /// Create an account. `--settings` is the model's settings as JSON, or
+    /// `@file`; it carries `model` and never a secret.
+    Create {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long, value_name = "JSON|@FILE")]
+        settings: String,
+    },
+    /// Change an account's label or settings (settings are replaced whole).
+    Update {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, value_name = "JSON|@FILE")]
+        settings: Option<String>,
+    },
+    /// Set a static model's secret. Read without echo (or from stdin when
+    /// piped), sealed here to a single-use wrapping key, never shown again.
+    SecretSet {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+    },
+    /// Bind a consumer DID to the account (replaces its existing binding).
+    Bind {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long, value_name = "DID")]
+        consumer: String,
+        /// An object-key prefix the consumer may be issued for, e.g.
+        /// `rooms/`. Repeat for several.
+        #[arg(long = "prefix")]
+        prefixes: Vec<String>,
+        /// `put`, `get` or `delete`. Repeat for several.
+        #[arg(long = "action")]
+        actions: Vec<String>,
+        /// The longest credential lifetime it may request: `N[s|m|h|d|w]`, or
+        /// seconds.
+        #[arg(long, default_value = "900", value_parser = vta_cli_common::duration::secs_arg_u32)]
+        max_ttl: u32,
+        /// Issuances per minute.
+        #[arg(long, default_value_t = 60)]
+        rate: u32,
+    },
+    /// Remove a consumer's binding.
+    Unbind {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long, value_name = "DID")]
+        consumer: String,
+    },
+    /// What to set up at the provider for this account, generated.
+    Setup {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+    },
+    /// Exercise the account end to end and record the report.
+    Probe {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+    },
+    /// The kill switch: refuse every issuance at once.
+    Suspend {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Return a suspended account to service.
+    Resume {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Retire an account from service, keeping its record.
+    Archive {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Bring an archived account back, suspended.
+    Restore {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Delete an archived account for good; its id is never reused. Asks
+    /// first on a terminal; without one needs `--yes`.
+    Delete {
+        id: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        reason: Option<String>,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Ask for a credential as a bound consumer. Printed still sealed.
+    Issue {
+        account: String,
+        #[arg(long = "context", value_name = "ID")]
+        context: String,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long = "action")]
+        actions: Vec<String>,
+        /// A presign batch (`external/credentials/issue/0.3`, `PresignBatch`) as
+        /// JSON, or `@file` to read it: up to 64 operations on one object of an
+        /// `s3-static-presign` account. Replaces `--prefix`/`--action`.
+        #[arg(long, conflicts_with_all = ["prefix", "actions"])]
+        presign: Option<String>,
+        /// How long the credential lasts: `N[s|m|h|d|w]`, or seconds.
+        #[arg(long, default_value = "900", value_parser = vta_cli_common::duration::secs_arg_u32)]
+        ttl: u32,
+    },
+}
+
+/// `pnm rooms owner …`.
+// The shared `Group` prefix is the verb: clap derives `group-create`, `group-add` and
+// `group-remove` from these names, and the issuance verbs will sit beside them.
+#[allow(clippy::enum_variant_names)]
+#[derive(Subcommand)]
+pub(crate) enum RoomOwnerCommands {
+    /// Register the room with its host (`rooms/owner/register`). Your VTA sends
+    /// `rooms/create` itself, signed as `--owner`, then delivers the room's
+    /// revocation list there and says whether it is in force. A room whose list
+    /// is not is served without its withdrawals: deliver it with `pnm rooms owner
+    /// revoke --host` (no withdrawal) — never by registering again.
+    ///
+    /// The owner must be a persona DID your VTA holds the signing key for, in a
+    /// context you act in — typically a `did:webvh` minted there — never this
+    /// CLI's key. On a community (VTC) host the owner must also be a member of
+    /// that community. Mint the room's own DID first (`pnm did-mgmt dids create
+    /// --template room`).
+    Register {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The host's DID — your VTA resolves it to reach the host.
+        #[arg(long)]
+        host_did: String,
+        /// The owner's persona DID: the accountable party, whose key signs the
+        /// registration. A DID your VTA holds, not your CLI's key.
+        #[arg(long)]
+        owner: String,
+        /// Fixed for the life of the room.
+        #[arg(long, value_parser = ROOM_VISIBILITY)]
+        visibility: String,
+        /// How long the host holds the room after it lapses (the host's default
+        /// when absent, 90 days on a VTC or `room-host`).
+        #[arg(long)]
+        retention_days: Option<u64>,
+        /// `chained` (history stays readable across membership changes) or
+        /// `fromJoin`. Immutable; absent takes the host's default for good.
+        #[arg(long, value_parser = ["chained", "fromJoin"])]
+        retention_policy: Option<String>,
+        /// A room used as a conversation: no wait before its watch signals
+        /// (`--signal-delay none`), retracted messages' tombstones kept 7 days and
+        /// messages 365 days unless pinned, unless `--signal-delay`,
+        /// `--tombstone-days` or `--record-days` say otherwise. Registers at
+        /// `rooms/owner/register/0.3`.
+        #[arg(long)]
+        chat: bool,
+        /// `randomised` (the default: the host waits a few seconds, at random, before a
+        /// watch signal) or `none` (it sends as soon as a write is stored). Changed later
+        /// with `pnm rooms signal-delay set`.
+        #[arg(long)]
+        signal_delay: Option<String>,
+        /// Days a retracted record's tombstone is kept (1 to 36500): the room's record
+        /// retention, changed later with `pnm rooms records retention set`.
+        #[arg(long)]
+        tombstone_days: Option<u64>,
+        /// Days a record is kept after it last changed, pinned ones excepted (1 to 36500).
+        #[arg(long)]
+        record_days: Option<u64>,
+    },
+    /// Invite a party to the room (`rooms/owner/invite`): mint a Verifiable
+    /// Invitation Credential in the room's name and write it to `--out`.
+    ///
+    /// Deliver it to the joiner directly. Their VTA requires it to mint a
+    /// KeyPackage (`pnm rooms keys key-package`) and consumes it on joining
+    /// (`pnm rooms keys welcome`).
+    Invite {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room's signing key id, as printed when its DID was minted.
+        /// `pnm rooms use <room> --signing-key <id>` remembers it.
+        #[arg(long = "signing-key")]
+        signing_key: String,
+        /// The joiner's persona DID — a DID their VTA holds for them, not their
+        /// CLI's key. `--member`, as `group-add` names the same person;
+        /// `--subject` is the older name (#2590).
+        #[arg(long = "member", visible_alias = "subject")]
+        subject: String,
+        /// When the invitation expires, RFC 3339 (`2027-01-01T00:00:00Z`).
+        #[arg(long, conflicts_with = "valid_for")]
+        valid_until: Option<String>,
+        /// When the invitation expires, from now: `N[s|m|h|d|w]` (e.g. `7d`).
+        /// `--expires`, as every lapsing grant spells it (#2589); `--valid-for`
+        /// is the older name.
+        #[arg(long = "expires", visible_alias = "valid-for", value_name = "DURATION")]
+        valid_for: Option<String>,
+        /// Where to write the invitation (the credential's JSON).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Issue a member the room's membership credential
+    /// (`rooms/owner/issue-membership`) — the room's statement that the subject
+    /// is a member.
+    ///
+    /// `--out` writes it for delivery; `--store` also keeps it in this VTA's
+    /// credential vault, for when the subject is your own persona.
+    IssueMembership {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room's signing key id, as printed when its DID was minted.
+        #[arg(long = "signing-key")]
+        signing_key: String,
+        /// The member's persona DID — a DID their VTA holds, not a CLI's key.
+        #[arg(long)]
+        subject: String,
+        /// When it expires, RFC 3339. Absent: no expiry of its own.
+        #[arg(long, conflicts_with = "valid_for")]
+        valid_until: Option<String>,
+        /// When it expires, from now: `N[s|m|h|d|w]`. `--expires`, as every
+        /// lapsing grant spells it (#2589); `--valid-for` is the older name.
+        #[arg(long = "expires", visible_alias = "valid-for", value_name = "DURATION")]
+        valid_for: Option<String>,
+        /// Where to write the credential (JSON).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Also store it in this VTA's credential vault (`cred-vault receive`).
+        #[arg(long)]
+        store: bool,
+    },
+    /// Grant authority in the room (`rooms/owner/issue-authority`): mint an
+    /// authority credential conferring `--action`s on the subject.
+    ///
+    /// An expiry is required — a chain root is withdrawn by nothing else.
+    /// `curate` is not implied by `write`; `admin` advances epochs and admits
+    /// members.
+    IssueAuthority {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room's signing key id, as printed when its DID was minted.
+        #[arg(long = "signing-key")]
+        signing_key: String,
+        /// The member's persona DID — a DID their VTA holds, not a CLI's key.
+        #[arg(long)]
+        subject: String,
+        /// `read`, `write`, `curate` or `admin`. Repeat, or separate with commas.
+        #[arg(long = "action", value_delimiter = ',', required = true)]
+        actions: Vec<String>,
+        /// When it expires, RFC 3339. One of this or `--expires` is required.
+        #[arg(
+            long,
+            conflicts_with = "valid_for",
+            required_unless_present = "valid_for"
+        )]
+        valid_until: Option<String>,
+        /// When it expires, from now: `N[s|m|h|d|w]` (e.g. `90d`). `--expires`,
+        /// as every lapsing grant spells it (#2589); `--valid-for` is the older
+        /// name.
+        #[arg(long = "expires", visible_alias = "valid-for", value_name = "DURATION")]
+        valid_for: Option<String>,
+        /// Where to write the credential (JSON).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Also store it in this VTA's credential vault (`cred-vault receive`).
+        #[arg(long)]
+        store: bool,
+    },
+    /// Found the room's group with you as its only member
+    /// (`rooms/owner/group/create`). Needed before anything is written to an
+    /// `attributed` or `private` room. Register the room first.
+    GroupCreate {
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room's signing key id, as printed when its DID was minted.
+        #[arg(long = "signing-key")]
+        signing_key: String,
+        /// Your persona DID — the subject of your room credentials, which your
+        /// leaf identifies. A DID your VTA holds, not this CLI's key.
+        #[arg(long)]
+        member: String,
+    },
+    /// Admit a member from the KeyPackage their key holder minted
+    /// (`rooms/owner/group/add`). Your VTA advances the room at its host, then
+    /// writes the Welcome to `--out` for you to deliver to the member's key
+    /// holder (`rooms/keys/welcome`) — never through the host.
+    GroupAdd {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room host's DID: where the epoch advances.
+        #[arg(long)]
+        host_did: String,
+        /// The persona DID being admitted — the subject of their invitation.
+        #[arg(long)]
+        member: String,
+        /// The member's KeyPackage, base64url: a file, or `-` for stdin.
+        #[arg(long)]
+        key_package: String,
+        /// Why, carried to the host's epoch advance.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Where to write the Welcome (JSON: `welcome`, `ratchetTree`, `epoch`).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Remove a member from the room (`rooms/owner/group/remove/0.4`). On an
+    /// attributed room your VTA first withdraws their credentials at the host —
+    /// signed as the room with `--signing-key`, refused from then on, and anything
+    /// they delegated with them — and then removes their leaf and advances the
+    /// room. A private room cannot withdraw one member, so there it removes the
+    /// leaf alone and their credentials stay valid until they expire. It recalls
+    /// nothing they already read.
+    GroupRemove {
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room host's DID: where the withdrawal goes and the epoch advances.
+        #[arg(long)]
+        host_did: String,
+        /// The persona DID being removed — the one its leaf was admitted as.
+        #[arg(long)]
+        member: String,
+        /// The room's signing key id, to withdraw their credentials at the host as
+        /// the room. Required on an attributed room; not needed on a private one,
+        /// where nothing is withdrawn.
+        #[arg(long = "signing-key")]
+        signing_key_id: Option<String>,
+        /// Another host serving the room (a mirror), delivered the withdrawal too.
+        /// Repeatable.
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// When the last credential the room issued them expires (RFC 3339), after
+        /// which the withdrawal can be dropped from the room's list.
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// Why, carried to the host's epoch advance. Never put in the list.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Withdraw credentials the room issued (`rooms/owner/revoke`): your VTA signs
+    /// the room's next revocation list as the room and delivers it to every host
+    /// you name, which refuses what it withdraws from then on. With no withdrawal,
+    /// re-delivers the list your VTA holds — to a host the room moved to, or one
+    /// that did not answer.
+    Revoke {
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room's signing key id, as printed when its DID was minted.
+        #[arg(long = "signing-key")]
+        signing_key_id: String,
+        /// Every host serving the room: primary, mirrors, one it is moving to.
+        /// Repeatable; at least one.
+        #[arg(long = "host", required = true)]
+        hosts: Vec<String>,
+        /// A party to withdraw: every credential naming them as subject or issuer
+        /// issued until now (re-admitting them later works). Repeatable.
+        #[arg(long = "subject")]
+        subjects: Vec<String>,
+        /// One credential to withdraw, by its `id`. Repeatable.
+        #[arg(long = "credential")]
+        credentials: Vec<String>,
+        /// Withdraw every credential the room issued until now, from everyone — the
+        /// only withdrawal a private room can apply. Re-issue to those who remain.
+        #[arg(long)]
+        reset: bool,
+        /// When the withdrawn credentials expire anyway (RFC 3339).
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// Why, for your own record. Never put in the list.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Renew a sealed room (`rooms/owner/group/renew`): your VTA advances the
+    /// room's group with a commit that changes no membership, and the room at
+    /// its host with it — host first. The only correct renewal of an
+    /// `attributed` or `private` room; `pnm rooms renew` is for open rooms.
+    /// Every remaining member then applies the commit with
+    /// `pnm rooms keys commit --host`.
+    GroupRenew {
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room host's DID: where the epoch advances.
+        #[arg(long)]
+        host_did: String,
+        /// Why, carried to the host's epoch advance.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+/// `pnm rooms offers …` — rooms a community has offered you.
+#[derive(Subcommand)]
+pub(crate) enum RoomOffersCommands {
+    /// List the rooms the community has offered you (`vtc/rooms/offers/list`), each
+    /// with what it is for when the community says (its description, from list 0.2).
+    List {
+        /// Base URL of the community's Trust Task endpoint (e.g.
+        /// `https://vtc.example.com/v1`).
+        #[arg(long)]
+        vtc: String,
+        /// The community's DID.
+        #[arg(long)]
+        vtc_did: String,
+        /// The DID the community addressed its offers to: a persona your VTA holds.
+        #[arg(long)]
+        member: String,
+    },
+    /// Accept an offer (`vtc/rooms/offers/accept`): store its credentials in your
+    /// VTA, have it mint a KeyPackage on a sealed room, and join with the Welcome.
+    Accept {
+        /// The offered room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the community's Trust Task endpoint.
+        #[arg(long)]
+        vtc: String,
+        /// The community's DID.
+        #[arg(long)]
+        vtc_did: String,
+        /// The DID the community addressed the offer to: a persona your VTA holds.
+        #[arg(long)]
+        member: String,
+        /// Retry an acceptance whose answer was lost with the KeyPackage it carried
+        /// (a file): the identical request is answered with the same Welcome. Your
+        /// VTA must have minted it for this member and room.
+        #[arg(long)]
+        key_package: Option<String>,
+    },
+    /// Collect a renewal of a room you are in (`vtc/rooms/offers/list/0.4`): store its
+    /// membership and authority in your VTA in place of the ones they renew.
+    Renew {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the community's Trust Task endpoint.
+        #[arg(long)]
+        vtc: String,
+        /// The community's DID.
+        #[arg(long)]
+        vtc_did: String,
+        /// The DID the community addressed its offers to: a persona your VTA holds.
+        #[arg(long)]
+        member: String,
+    },
+}
+
+/// `pnm rooms keys …` — your VTA as a room's key holder.
+#[derive(Subcommand)]
+pub(crate) enum RoomKeysCommands {
+    /// Mint a KeyPackage for a room you were invited to
+    /// (`rooms/keys/key-package`) and write it, base64url, to `--out`.
+    ///
+    /// Send that file to the room's owner, who admits it with
+    /// `pnm rooms owner group-add --key-package`. Its private half stays in your
+    /// VTA for fourteen days, or until the Welcome that admits you is processed.
+    KeyPackage {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The invitation the owner sent (`rooms owner invite --out`): a file, or
+        /// `-` for stdin.
+        #[arg(long)]
+        invitation: String,
+        /// Where to write the KeyPackage.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Join the room's group from the Welcome the owner sent
+    /// (`rooms/keys/welcome`). Consumes the invitation.
+    Welcome {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The same invitation the KeyPackage was minted against.
+        #[arg(long)]
+        invitation: String,
+        /// The Welcome file `pnm rooms owner group-add --out` wrote, or `-`.
+        #[arg(long)]
+        welcome: String,
+    },
+    /// Apply the commits that move the room's group on (`rooms/keys/commit`).
+    ///
+    /// Every membership change after you joined produces one, and a missed one
+    /// leaves records sealed since unopenable. With `--host`, fetch every commit
+    /// this VTA lacks from the host's relay (`rooms/epoch/commits`, needs `read`)
+    /// and apply them in order — the usual way. With `--commit`, apply one
+    /// delivered to you as a file.
+    Commit {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// One commit, base64url: a file, or `-` for stdin.
+        #[arg(
+            long,
+            conflicts_with = "host",
+            requires = "epoch",
+            required_unless_present = "host"
+        )]
+        commit: Option<String>,
+        /// The room epoch the commit produces — as the host relays it and as
+        /// `group-add` printed it.
+        #[arg(long)]
+        epoch: Option<u64>,
+        /// Base URL of the room's host. A VTC's includes its `/v1` mount.
+        #[arg(long)]
+        host: Option<String>,
+        /// The host's DID. A VTC refuses a document not addressed to it, so give
+        /// it for a VTC.
+        #[arg(long, requires = "host")]
+        host_did: Option<String>,
+    },
+    /// Fetch the room's history from its host so records sealed before you
+    /// joined open (`rooms/keys/backfill`).
+    ///
+    /// Your VTA asks the host for the epoch key chain and keeps it, walking down
+    /// until it reads the whole retained history or the host has no more. Run it
+    /// once after `keys welcome`, and whenever `rooms get` says a record is older
+    /// than this VTA can reach.
+    Backfill {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// The host's DID. Your VTA resolves it and makes the call itself.
+        #[arg(long)]
+        host_did: String,
+    },
+    /// Which rooms your VTA holds a group for, each with the member it holds it
+    /// as, its room epoch, how far back it reads, and your own name for it
+    /// (`rooms/keys/list`). Key custody, not membership.
+    List {
+        /// Also show the name each room gives itself, read from this host
+        /// (`rooms/keys/profile/read`). A community's rooms are all on the
+        /// community's host, so its DID names them all.
+        #[arg(long)]
+        host_did: Option<String>,
+    },
+    /// Your own private name, description, notes and tags for a room you hold
+    /// (`rooms/keys/label`). Kept by your VTA for you alone: never sent to the
+    /// room, its host or a community.
+    ///
+    /// Each detail given replaces the one stored; the rest stay. `--tag` replaces
+    /// the whole set. Removing the last detail removes the label.
+    #[command(group(
+        clap::ArgGroup::new("change")
+            .required(true)
+            .multiple(true)
+            .args([
+                "label", "description", "notes", "tags",
+                "remove_label", "remove_description", "remove_notes", "remove_tags",
+            ])
+    ))]
+    Label {
+        /// The room's DID.
+        room_id: String,
+        /// The member the label is for: the DID `pnm rooms keys list` shows the
+        /// room held as. A room held as two personas keeps a label for each.
+        #[arg(long)]
+        member: String,
+        /// Your name for the room (one line, up to 128 characters).
+        #[arg(long, conflicts_with = "remove_label")]
+        label: Option<String>,
+        /// What the room is to you (up to 1000 characters).
+        #[arg(long, conflicts_with = "remove_description")]
+        description: Option<String>,
+        /// Longer notes (up to 4000 characters).
+        #[arg(long, conflicts_with = "remove_notes")]
+        notes: Option<String>,
+        /// A tag (repeat for up to 16); replaces every tag the room had.
+        #[arg(long = "tag", conflicts_with = "remove_tags")]
+        tags: Vec<String>,
+        /// Remove your name for the room.
+        #[arg(long)]
+        remove_label: bool,
+        /// Remove your description.
+        #[arg(long)]
+        remove_description: bool,
+        /// Remove your notes.
+        #[arg(long)]
+        remove_notes: bool,
+        /// Remove every tag.
+        #[arg(long)]
+        remove_tags: bool,
+    },
+    /// Mark a room read — or, with `--unread`, unread again — on every one of your
+    /// devices (`rooms/keys/read-marker/set`). Your VTA keeps the marker for you alone:
+    /// never sent to the room, its host or a community. `pnm rooms keys list` shows it.
+    ///
+    /// Read only moves the marker forward: a device that has read further keeps its
+    /// marker, and the answer says so. `--unread` without `--version` marks the whole
+    /// room unread.
+    MarkRead {
+        /// The room's DID.
+        room_id: String,
+        /// The member the marker is for: the DID `pnm rooms keys list` shows the room
+        /// held as. A room held as two personas keeps a marker for each.
+        #[arg(long)]
+        member: String,
+        /// The highest room version you have seen the room to (as `pnm rooms list`
+        /// returns versions). Required unless `--unread`.
+        #[arg(long, required_unless_present = "unread")]
+        version: Option<u64>,
+        /// The host's `createdAt` of the newest message you have seen, exactly as the
+        /// host returned it.
+        #[arg(long, requires = "version")]
+        created_at: Option<String>,
+        /// Mark unread again: take this marker even when it is behind the one held —
+        /// the message after `--version` onwards shows as unread.
+        #[arg(long)]
+        unread: bool,
+    },
+}
+
+/// `pnm rooms name …` — your own name in a room (`memberProfile`).
+#[derive(Subcommand)]
+pub(crate) enum RoomNameCommands {
+    /// Set your name in the room: one line, at most 64 characters. Writes a new version
+    /// of the name record you already hold, or your first one.
+    Set {
+        /// The name the room's other members should call you.
+        name: String,
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the host storing the room.
+        #[arg(long)]
+        host: String,
+        /// The host's DID. Needed to read the room's profile, which must permit names.
+        #[arg(long)]
+        host_did: Option<String>,
+    },
+    /// Withdraw your name in the room: a new version of your name record with an empty
+    /// name, after which readers show you as they would had you written none.
+    Clear {
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+    },
+}
+
+/// `pnm rooms profile …` — the room's own profile.
+#[derive(Subcommand)]
+pub(crate) enum RoomProfileCommands {
+    /// Show what the room calls itself, and whether somebody without the standing
+    /// to tried to rename it.
+    Show {
+        #[arg(long = "room")]
+        room_id: String,
+        /// The room host's DID. Your VTA resolves it and reads as you.
+        #[arg(long)]
+        host_did: String,
+        /// Which of your members to read as, where you hold more than one in the room.
+        #[arg(long)]
+        member: Option<String>,
+    },
+    /// Set the room's profile. Takes `write` and `curate` or `admin` in the room.
+    ///
+    /// What you do not give is carried over from the current profile; the
+    /// `--no-*` flags drop it.
+    Set {
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host_did: String,
+        /// The room's name: one line, up to 128 characters.
+        #[arg(long)]
+        name: Option<String>,
+        /// What the room is for, up to 1000 characters.
+        #[arg(long, conflicts_with = "no_description")]
+        description: Option<String>,
+        /// Drop the description.
+        #[arg(long)]
+        no_description: bool,
+        /// A tag the room files itself under (`a-z0-9-`, up to 32). Repeat; replaces
+        /// the current tags.
+        #[arg(long = "tag", conflicts_with = "no_tags")]
+        tags: Vec<String>,
+        /// Drop every tag.
+        #[arg(long)]
+        no_tags: bool,
+        /// One emoji shown beside the name.
+        #[arg(long, conflicts_with = "no_emoji")]
+        emoji: Option<String>,
+        /// Drop the emoji.
+        #[arg(long)]
+        no_emoji: bool,
+        /// The optional record members the room's writers may use, comma separated:
+        /// `kind`, `inReplyTo`, `writtenAt`, `editedAt`, `width`, `height`, `preview`,
+        /// and `memberProfile` (with `kind`: members may write their names — `pnm rooms
+        /// name set`). Replaces the current list. List one only once every reader the room
+        /// expects accepts it — a reader that predates a member refuses records
+        /// carrying it, and one that predates this list refuses the profile.
+        #[arg(
+            long = "record-members",
+            value_delimiter = ',',
+            conflicts_with = "no_record_members"
+        )]
+        record_members: Vec<String>,
+        /// Drop the list: writers may use none of the optional record members.
+        #[arg(long)]
+        no_record_members: bool,
+        #[arg(long)]
+        member: Option<String>,
+    },
+    /// Clear the room's profile: retract it at the current epoch. Takes `curate`.
+    Clear {
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host_did: String,
+        #[arg(long)]
+        member: Option<String>,
+    },
+}
+
+/// `pnm rooms records …` — the room's record retention, and pruning under it.
+#[derive(Subcommand)]
+pub(crate) enum RoomRecordsCommands {
+    /// Remove the records the room's record retention makes eligible: old
+    /// retracted tombstones, old records, or both. IRREVERSIBLE, for every
+    /// member — the room keeps only a mark that records went. Needs `admin`.
+    ///
+    /// Always asks the host first what would go (a dry run) and shows it; then
+    /// asks before removing anything. Without a terminal it refuses unless
+    /// `--yes` is given.
+    Prune {
+        /// The room's DID.
+        #[arg(long = "room")]
+        room_id: String,
+        /// Base URL of the host storing the room.
+        #[arg(long)]
+        host: String,
+        /// The host's DID: the recipient the request names.
+        #[arg(long)]
+        host_did: Option<String>,
+        /// What to remove: `retracted` (tombstones older than the retention's
+        /// tombstone days), `aged` (records of any standing, pinned ones
+        /// excepted, older than its record days). Repeatable; both by default.
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Why, for the room's audit trail — the only account of intent a prune
+        /// leaves. Keep member identifiers and record content out of it.
+        #[arg(long)]
+        reason: String,
+        /// Only report what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Prune without asking. Required when there is no terminal to ask.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// The room's record retention: show it, or replace it.
+    Retention {
+        #[command(subcommand)]
+        command: RoomRetentionCommands,
+    },
+}
+
+/// `pnm rooms records retention …`.
+#[derive(Subcommand)]
+pub(crate) enum RoomRetentionCommands {
+    /// Show the record retention in force and the room's latest prune
+    /// (`rooms/info/0.3`). Needs `read`.
+    Show {
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+    },
+    /// Replace the record retention whole: members you leave out are no longer
+    /// stated. Nothing is removed until somebody prunes. Needs `admin`.
+    Set {
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+        /// Days a retracted record's tombstone is kept (1 to 36500).
+        #[arg(long)]
+        tombstone_days: Option<u32>,
+        /// Days a record is kept after it last changed, pinned ones excepted
+        /// (1 to 36500).
+        #[arg(long)]
+        record_days: Option<u32>,
+        /// Clear the retention: no record is eligible by age.
+        #[arg(long, conflicts_with_all = ["tombstone_days", "record_days"])]
+        clear: bool,
+        /// Why, for the room's audit trail. Keep member identifiers and record
+        /// content out of it.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// `pnm rooms signal-delay …`.
+#[derive(Subcommand)]
+pub(crate) enum RoomSignalDelayCommands {
+    /// Show the room's signal delay (`rooms/info/0.4`). Needs `read`.
+    Show {
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+    },
+    /// Change the room's signal delay (`rooms/signal-delay/set/0.1`). Needs `admin`.
+    ///
+    /// What `none` gives up: the wait keeps a signal's time from marking one write. In a
+    /// busy room that costs little; in a quiet one, a write followed by a signal at once
+    /// tells anyone who sees both reach and leave the host when the writer wrote, and that
+    /// writer and watcher share the room.
+    Set {
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+        /// Send signals as soon as a write is stored: for a room used as a conversation.
+        #[arg(
+            long,
+            conflicts_with = "randomised",
+            required_unless_present = "randomised"
+        )]
+        none: bool,
+        /// Wait a few seconds, at random, before each signal — the default.
+        #[arg(long)]
+        randomised: bool,
+        /// Why, for the room's audit trail. Keep member identifiers and record content
+        /// out of it.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// `pnm rooms file …`.
+#[derive(Subcommand)]
+pub(crate) enum RoomFileCommands {
+    /// Put a file in a room: seal it, upload the ciphertext, and write a record
+    /// that names it.
+    ///
+    /// On `attributed` and `private` the file's name, type, size and digest are
+    /// inside the signed, sealed body; the host learns only that the record has a
+    /// file, and its ciphertext size. On `open` the file is sealed under a key
+    /// minted for it alone, and the record states the file and that key in the
+    /// clear: the host and every member can open it, the storage cannot.
+    Put {
+        /// The file to put.
+        path: std::path::PathBuf,
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+        /// A title for the record, sealed with it (in the clear on `open`).
+        #[arg(long)]
+        title: Option<String>,
+        /// A one-line description, sealed with it (in the clear on `open`).
+        #[arg(long)]
+        description: Option<String>,
+        /// A tag, sealed with the record. Repeatable.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Pad to the next Padmé size, so the stored size does not fingerprint a
+        /// known document. At most 12 % larger.
+        #[arg(long)]
+        pad: bool,
+    },
+    /// Fetch a record's file, refusing one that is not exactly what its author
+    /// signed.
+    Get {
+        /// The record's key, as `file put` or `rooms list` printed it.
+        key: String,
+        #[arg(long = "room")]
+        room_id: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        host_did: Option<String>,
+        /// Where to write the file. Must not exist. Defaults to the file's own
+        /// name, in the current directory.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Seal a local file for a room: writes the sealed chunks, `blob.json` (what a
+    /// host checks) and `file.json` (what goes inside the sealed record body).
+    Seal {
+        /// The file to seal.
+        path: std::path::PathBuf,
+        #[arg(long = "room")]
+        room_id: String,
+        /// A new directory to write into.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Pad to the next Padmé size, so the stored size does not fingerprint a
+        /// known document. At most 12 % larger.
+        #[arg(long)]
+        pad: bool,
+    },
+    /// Open a sealed file directory, refusing a file that is not the one its
+    /// author signed.
+    Open {
+        /// A directory `seal` wrote, or one assembled from a download.
+        dir: std::path::PathBuf,
+        #[arg(long = "room")]
+        room_id: String,
+        /// Where to write the file. Must not exist.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum CollectionCommands {
+    /// Show a context's collection-by-default setting — who last changed it and when, and
+    /// whether the operator has suspended collection — with a count of its personas by who
+    /// collects for them.
+    Status {
+        /// TARGET SCOPE: the context to show.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+    /// Enable collection by default for a context: the VTA collects for every persona there
+    /// no client has claimed, including any it had stopped for a conflict. Needs
+    /// administrative authority over the context.
+    Enable {
+        /// TARGET SCOPE: the context to change (not its ancestors or descendants).
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+    /// Disable collection by default for a context: the VTA stops collecting for every
+    /// unclaimed persona there and closes those connections before it answers. Do this
+    /// while a client that collects without claiming is in use. Claims still work. Needs
+    /// administrative authority over the context.
+    Disable {
+        /// TARGET SCOPE: the context to change (not its ancestors or descendants).
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+    /// Claim a persona DID — or renew your claim — so that you, not the VTA, collect for it
+    /// until the granted end. Connect only after this succeeds.
+    Claim {
+        /// TARGET SCOPE: the context the persona belongs to.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+        /// The persona DID to collect for.
+        #[arg(long, value_name = "DID")]
+        identifier: String,
+        /// How long the claim should last: `N[s|m|h|d|w]` or seconds, 1m–30d
+        /// (the VTA may grant less). Twenty-four hours (`24h`) is the
+        /// recommended lease.
+        #[arg(long, value_name = "DURATION", value_parser = collection_lease_secs)]
+        duration: Option<i64>,
+    },
+    /// Release the claim for a persona DID: yours ends at once (stop collecting first);
+    /// another client's ends at its stated end without renewal.
+    Release {
+        /// TARGET SCOPE: the context the persona belongs to.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+        /// The persona DID whose claim to release.
+        #[arg(long, value_name = "DID")]
+        identifier: String,
+    },
+    /// List who collects for each persona DID of a context.
+    List {
+        /// TARGET SCOPE: the context to list.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+        /// Only this identifier.
+        #[arg(long, value_name = "DID")]
+        identifier: Option<String>,
+        /// Only identifiers with this collector.
+        #[arg(long, value_parser = ["vta", "client", "none"])]
+        collector: Option<String>,
+        /// The most items to return (1–200).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Continue from a previous page's cursor (same filters).
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum NotificationsCommands {
+    /// List the notifications held in a context, most recently received first.
+    List {
+        /// TARGET SCOPE: the context whose notifications to list.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+        /// Only notifications of this kind (e.g. `election`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only notifications whose thing is held by this DID (e.g. one community).
+        #[arg(long = "held-by", value_name = "DID")]
+        held_by: Option<String>,
+        /// Also list dismissed ones.
+        #[arg(long)]
+        include_dismissed: bool,
+        /// Also list withdrawn and lapsed ones still held.
+        #[arg(long)]
+        include_lapsed: bool,
+        /// The most items to return (1–200).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Continue from a previous page's cursor (same filters).
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Show one held notification with the document that delivered it, as received.
+    Show {
+        /// The record identifier `list` printed.
+        record_id: String,
+        /// TARGET SCOPE: the context it is held in.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+    /// Dismiss one held notification: it leaves the default list, and nobody is told.
+    Dismiss {
+        /// The record identifier `list` printed.
+        record_id: String,
+        /// TARGET SCOPE: the context it is held in.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+    /// Hand the VTA a notification received for one of its DIDs elsewhere — a persona DID
+    /// whose mediator socket another client holds — exactly as received
+    /// (`vta/notifications/deposit/0.1`). The VTA verifies it and decides by its own
+    /// acceptance policy, as for a direct delivery; the answer is the same receipt whatever
+    /// it decided.
+    Deposit {
+        /// A file holding the `notifications/notify` or `notifications/relay` document as
+        /// received (`-` for stdin). Never edit it: its proofs cover it as it is.
+        file: String,
+        /// TARGET SCOPE: the context the addressed DID belongs to.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+}
+
+/// CRUD over the agent's memory. `plant` creates/updates, `recall` reads,
+/// `delete` deletes one entry, and `wipe` deletes every entry in the context.
+///
+/// Each carries a hidden alias so an operator reading the Trust Task names
+/// finds the command they expect (`put`, `list`, `clear`), and `forget` — the
+/// name `delete` had before removal commands were standardised on `delete` —
+/// keeps working.
+#[derive(Subcommand)]
+pub(crate) enum MemoryCommands {
+    /// Plant a memory: store `value` under `key` so the agent recalls it.
+    ///
+    /// Upsert — re-planting the same key overwrites the old value.
+    #[command(alias = "put")]
+    Plant {
+        /// Memory key, unique within the context (e.g. `favorite-color`).
+        key: String,
+        /// The value to store (e.g. `green`). Not a secret store — tokens,
+        /// passwords and keys belong in `pnm vault`.
+        value: String,
+        /// TARGET SCOPE: the context whose memory to write.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+
+    /// Recall what the agent knows: list every memory in the context, or
+    /// just the one at `key`.
+    #[command(alias = "list")]
+    Recall {
+        /// Show only this key. Omit to list the whole context.
+        key: Option<String>,
+        /// TARGET SCOPE: the context whose memory to read.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+        /// What you will use what you read for (`personalisation`,
+        /// `taskExecution`, `analytics`, `modelTraining`, or an absolute IRI).
+        /// Needed when your ACL entry lists more than one purpose; recorded in
+        /// the audit trail either way.
+        #[arg(long, value_name = "PURPOSE")]
+        purpose: Option<String>,
+    },
+
+    /// Delete a single memory by key — the agent forgets just that fact.
+    #[command(alias = "forget")]
+    Delete {
+        /// The memory key to delete.
+        key: String,
+        /// TARGET SCOPE: the context whose memory to write.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+    },
+
+    /// Delete every memory in the context. Prompts for confirmation unless
+    /// `--yes`; requires `--yes` in `--json` mode.
+    ///
+    /// There is no bulk-delete Trust Task, so this deletes entries one by one
+    /// (N round-trips, not atomic). Re-running is safe and resumes if a delete
+    /// fails partway. Needs both memory capabilities: it lists (`MemoryRead`)
+    /// before it deletes (`MemoryWrite`).
+    #[command(alias = "clear")]
+    Wipe {
+        /// TARGET SCOPE: the context whose memory to wipe.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+        /// Skip the confirmation prompt (automation only). `--force` is
+        /// accepted as a hidden alias.
+        #[arg(long = "yes", short = 'y', alias = "force")]
+        yes: bool,
+    },
+
+    /// Who read or changed the context's memory, and when — newest first,
+    /// from the audit trail (needs what `pnm audit list` needs).
+    ///
+    /// Items are named by a keyed commitment, never by key: a memory key is
+    /// personal data, which the audit trail must not hold (VTI-AUD-005).
+    #[command(alias = "audit")]
+    History {
+        /// TARGET SCOPE: the context whose memory activity to show.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context: String,
+        /// Only this actor's activity (an agent's DID).
+        #[arg(long)]
+        actor: Option<String>,
+        /// From this time, RFC 3339 (e.g. 2026-11-01T00:00:00Z). Inclusive.
+        #[arg(long)]
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        /// Until this time, RFC 3339. Exclusive.
+        #[arg(long)]
+        to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Show at most this many rows.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SetupCommands {
+    /// Finish a pending VTA setup by supplying the VTA DID.
+    ///
+    /// Interactive when `--vta-did` is omitted; non-interactive with
+    /// JSON stdout when supplied. The ephemeral `did:key` minted in
+    /// phase 1 is preserved — this command only binds the VTA DID and
+    /// flips the session to `PendingRotation`.
+    Continue {
+        /// Slug identifying the pending VTA (see `pnm vta list`).
+        slug: String,
+
+        /// VTA DID to bind (non-interactive). Must start with `did:`.
+        #[arg(long)]
+        vta_did: Option<String>,
+
+        /// VTA REST URL (required for did:key DIDs that cannot advertise a service endpoint).
+        #[arg(long)]
+        vta_url: Option<String>,
+
+        /// Mediator DID for DIDComm transport. When set, PNM uses DIDComm
+        /// without needing to discover the mediator from the DID doc or REST.
+        #[arg(long)]
+        mediator_did: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ClaimDidCommands {
+    /// Mint a claim DID and print it. Each run mints a new one.
+    Create {
+        /// Deprecated: store the key under this slug, as older pnm did.
+        #[arg(long, hide = true)]
+        slug: Option<String>,
+    },
+    /// Deprecated: print the claim DID of a key stored under a slug.
+    #[command(hide = true)]
+    Show {
+        #[arg(long)]
+        slug: String,
+    },
+    /// Remove the claim key, e.g. when its VTA was never created or is gone.
+    Discard {
+        /// The claim DID printed by `claim-did create`.
+        #[arg(long, required_unless_present = "slug", conflicts_with = "slug")]
+        claim_did: Option<String>,
+        /// Deprecated: the slug a key from older pnm is stored under.
+        #[arg(long, hide = true)]
+        slug: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BootstrapCommands {
+    /// Generate an ephemeral keypair and emit a BootstrapRequest for the producer.
+    ///
+    /// The X25519 secret is stored on disk under
+    /// `~/.config/pnm/bootstrap-secrets/<bundle_id>.key` (mode 0600). The
+    /// emitted JSON file contains only the public key, a fresh nonce, and an
+    /// optional label — no secrets cross the boundary.
+    Request {
+        /// Output path for the BootstrapRequest JSON.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Optional human-readable label visible to the operator.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Open an armored sealed bundle returned by the producer.
+    ///
+    /// `--expect-digest <hex>` is required by default. Use `--no-verify-digest`
+    /// to opt out (with a warning) — there is no silent TOFU.
+    ///
+    /// By default this only inspects the bundle: the payload summary is
+    /// printed and nothing is written. Pass `--out <PATH>` to also write
+    /// the admin `CredentialBundle` as JSON for services that read one
+    /// from a file (e.g. the trust registry's `TR_VTA_CREDENTIAL`).
+    ///
+    /// Only a successful `--out` write consumes the single-use bootstrap
+    /// secret. Inspecting keeps it, so the bundle can still be installed.
+    Open {
+        /// Path to the armored bundle file.
+        #[arg(long)]
+        bundle: std::path::PathBuf,
+        /// Write the extracted admin credential to this path as JSON
+        /// (created 0600). Only valid for `AdminCredential` and
+        /// `ContextProvision` payloads. The bundle must be anchored: by
+        /// `--expect-digest`, or by a signature from `--expect-vta-did`.
+        /// When `--expect-vta-did` is given, the credential must be for
+        /// that VTA.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Expected SHA-256 digest, communicated out-of-band by the producer.
+        #[arg(long)]
+        expect_digest: Option<String>,
+        /// Skip out-of-band digest verification (testing only — prints a warning).
+        #[arg(long)]
+        no_verify_digest: bool,
+        /// Pin the VTA DID out-of-band. When supplied and the payload
+        /// is `TemplateBootstrap`, the VC is verified end-to-end
+        /// against this DID (pinned-DID check + issuer-pubkey
+        /// extraction + Data Integrity verify + validity window).
+        /// Without this flag, verification is digest-only.
+        #[arg(long)]
+        expect_vta_did: Option<String>,
+    },
+
+    /// Manage the ephemeral DID that authorizes a TEE VTA's first-boot admin
+    /// claim.
+    ///
+    /// Create it before the VTA, supply the printed DID at VTA creation, then
+    /// run `connect` with `--claim-did`. The private key stays in the OS
+    /// keyring and is removed once the claim succeeds.
+    ClaimDid {
+        #[command(subcommand)]
+        command: ClaimDidCommands,
+    },
+
+    /// One-command TEE first-boot bootstrap against a running VTA.
+    ///
+    /// Signs a claim on the VTA's DID with the claim DID given by
+    /// `--claim-did`, POSTs it to `/bootstrap/request`, and
+    /// verifies the attested acknowledgement: the VTA enrolled the claim DID
+    /// itself as its bootstrap admin (it mints no key for you). Then
+    /// authenticates as the claim DID, hands that entry over to a long-term
+    /// did:key minted here, and destroys the claim key. Only works against a
+    /// fresh TEE VTA that has not yet bootstrapped an admin — the carve-out
+    /// closes permanently on first success; re-running after an interrupted
+    /// hand-over resumes it.
+    ///
+    /// For non-TEE VTAs use `pnm setup` (temp did:key + ACL grant +
+    /// auto-rotate on first connect).
+    Connect {
+        /// VTA DID to resolve locally (did:webvh verifies the SCID and log).
+        /// Bootstrap uses the REST endpoint advertised in its DID document.
+        #[arg(long, required_unless_present = "vta_url", conflicts_with = "vta_url")]
+        vta_did: Option<String>,
+        /// Explicit base URL fallback when the VTA DID is not yet resolvable.
+        /// Unlike --vta-did, this does not pin the VTA's identity.
+        #[arg(long, required_unless_present = "vta_did", conflicts_with = "vta_did")]
+        vta_url: Option<String>,
+        /// Pin the enclave image measurement (PCR0, hex). Required: the
+        /// acknowledgement carries no bundle and no digest, so the attested
+        /// image is the anchor — refuse to bootstrap unless the attested PCR0
+        /// matches. Match the value baked into the KMS key policy (see the TEE
+        /// runbook).
+        #[arg(long, required_unless_present = "no_verify_pcr0")]
+        expect_pcr0: Option<String>,
+        /// Accept any genuine Nitro enclave image (testing only — prints a
+        /// warning). Without a PCR0 pin, any enclave build can answer the claim.
+        #[arg(long, conflicts_with = "expect_pcr0")]
+        no_verify_pcr0: bool,
+        /// Pin the EIF signing-certificate measurement (PCR8, hex). As
+        /// `--expect-pcr0`, but for the signing cert.
+        #[arg(long)]
+        expect_pcr8: Option<String>,
+        /// Public claim DID printed by `claim-did create` and supplied at VTA
+        /// creation. Selects the claim key in the OS keyring. Never the private key.
+        /// Without it, the key stored under the slug by older pnm is used.
+        #[arg(long)]
+        claim_did: Option<String>,
+        /// Slug to register this VTA under in pnm config (default: tail of
+        /// the VTA DID). Required with --vta-url.
+        #[arg(long)]
+        slug: Option<String>,
+    },
+
+    /// Generate a VP-framed BootstrapRequest for the provision-integration
+    /// flow (consumer side).
+    ///
+    /// Mints an ephemeral Ed25519 keypair, persists the seed under
+    /// `~/.config/pnm/bootstrap-secrets/<bundle_id>.key`, and writes a
+    /// signed VP naming the target DID template (e.g.
+    /// `didcomm-mediator`, `did-host-http`, `did-host-http-didcomm`) + variables. Hand the
+    /// JSON to the VTA operator. Counterpart to `vta bootstrap
+    /// provision-request` — same wire shape, same on-disk layout,
+    /// different default seed directory.
+    ///
+    /// See `docs/02-vta/provision-integration.md` for the flow.
+    ProvisionRequest {
+        /// DID template name the VTA should render: a built-in or an
+        /// operator-uploaded custom template.
+        #[arg(long, long_help = crate::cli::template_name_help())]
+        template: String,
+        /// Template variable, repeat for each binding. Format `KEY=VALUE`.
+        /// Values are parsed as JSON when possible; otherwise treated as
+        /// a string.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+        /// Hint the target VTA context.
+        #[arg(long)]
+        context_hint: Option<String>,
+        /// Opt into long-term admin-DID rollover (typically
+        /// `--admin-template vta-admin`).
+        #[arg(long)]
+        admin_template: Option<String>,
+        /// Freshness window in hours for the VP's `validUntil`. Default
+        /// 168 (7 days).
+        #[arg(long, value_name = "HOURS", default_value_t = 168.0)]
+        validity_hours: f64,
+        /// Free-form human label echoed back in audit logs.
+        #[arg(long)]
+        label: Option<String>,
+        /// Output path for the signed BootstrapRequest JSON.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Send a VP-framed BootstrapRequest to the configured VTA as the
+    /// `provision/integration` Trust Task, writing the returned armored sealed
+    /// bundle to disk.
+    ///
+    /// Mirrors the offline `vta bootstrap provision-integration` command;
+    /// the difference is purely the transport — the VTA runs the same
+    /// shared library function regardless of how the request arrived.
+    ProvisionIntegration {
+        /// Path to the VP-framed BootstrapRequest JSON (emitted by the
+        /// integration's operator via `pnm bootstrap request`).
+        #[arg(long)]
+        request: std::path::PathBuf,
+        /// VTA context to provision into. If the request carries a
+        /// `contextHint`, this flag must either match it or be omitted.
+        #[arg(long)]
+        context: Option<String>,
+        /// Producer assertion mode. `did-signed` (default) signs with
+        /// the VTA's assertion key; `pinned-only` is a dev/test
+        /// escape hatch.
+        #[arg(long, default_value = "did-signed")]
+        assertion: String,
+        /// Override for the VC's `validUntil` window, in seconds.
+        #[arg(long, value_name = "SECONDS")]
+        vc_validity_seconds: Option<i64>,
+        /// Output path for the armored bundle.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Create the target context inline if it doesn't already
+        /// exist on the VTA. Requires **super-admin** role; ordinary
+        /// context-admin callers get `Forbidden` against a missing
+        /// context. Idempotent — no-op when the context already
+        /// exists. Mirrors `vta bootstrap provision-integration
+        /// --create-context`.
+        #[arg(long)]
+        create_context: bool,
+        /// How wide the minted admin's ACL entry should be: `context`
+        /// (default) binds it to `--context` alone; `unrestricted` binds it
+        /// to no context at all, which is what an ACL reads as a super-admin
+        /// — authority over every context this VTA holds now and every one
+        /// created later.
+        ///
+        /// This does not replace `--context`, which is still required and
+        /// still says where the admin DID is minted and where its owner keeps
+        /// its own configuration. The two are different questions: an
+        /// operator console needs authority everywhere *and* one ordinary
+        /// context to store its state in.
+        ///
+        /// `unrestricted` requires the calling DID to be a super-admin
+        /// itself; a context-scoped admin gets `Forbidden` rather than a
+        /// quietly narrowed entry.
+        #[arg(long, default_value = "context", value_parser = ["context", "unrestricted"])]
+        admin_scope: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DidTemplateCommands {
+    /// Validate a DID template file against the v1 schema.
+    ///
+    /// Runs offline — never talks to the VTA. Reports whether the file
+    /// parses, its placeholders are all declared, and its reserved/required
+    /// variables are well-formed.
+    Validate {
+        /// Path to a template JSON file to validate.
+        file: std::path::PathBuf,
+    },
+
+    /// Scaffold a starter template by forking an embedded built-in.
+    ///
+    /// Emits JSON on stdout so it can be redirected to a file for editing.
+    /// `kind` accepts either a full built-in name (`pnm did-templates
+    /// list-builtins` lists them) or a short role alias: `mediator`
+    /// (`didcomm-mediator`), `agent` (`ai-agent`), `did-hosting` / `hosting` /
+    /// `daemon` (`did-host-http`), `control` (`did-host-http-didcomm`), and
+    /// `witness` / `watcher` / `server` (`did-host-didcomm`). The legacy
+    /// `webvh-*` and `did-hosting-*` template names were retired — use the
+    /// canonical `did-host-*` names.
+    Init {
+        /// Built-in kind or alias to fork.
+        kind: String,
+    },
+
+    /// List every built-in template shipped with this SDK.
+    #[command(name = "list-builtins")]
+    ListBuiltins,
+
+    /// List DID templates stored on the VTA.
+    ///
+    /// Without `--context`, lists global-scope templates (visible across
+    /// every context). With `--context X`, lists templates scoped to X.
+    List {
+        /// FILTER: scope the listing to one context. Omit for global scope.
+        /// Does not merge in the other scope — use `list-builtins` for
+        /// built-ins.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Show a stored template by name.
+    ///
+    /// Without `--rendered`, prints the raw record. With `--rendered`, the
+    /// server renders the template using `--var KEY=VALUE` pairs.
+    Show {
+        /// Template name as stored on the VTA.
+        name: String,
+        /// LOOKUP SCOPE: which scope to search for the named template.
+        /// Omit for global scope.
+        #[arg(long)]
+        context: Option<String>,
+        /// Render the template rather than showing its raw record.
+        #[arg(long)]
+        rendered: bool,
+        /// `KEY=VALUE` — supply a template variable. Repeatable.
+        #[arg(long = "var", value_parser = parse_key_value)]
+        vars: Vec<(String, String)>,
+    },
+
+    /// Upload a new template.
+    ///
+    /// Without `--context`: global scope (super admin only). With
+    /// `--context X`: context scope (context admin or super admin).
+    Create {
+        /// Path to a template JSON file.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// TARGET SCOPE: create the template in this context's scope
+        /// instead of global. Requires context-admin access to the context.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Replace a stored template.
+    Update {
+        /// Template name as stored on the VTA.
+        name: String,
+        /// Path to the replacement JSON file. Its `name` field must match.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// TARGET SCOPE: operate on this context's stored template instead
+        /// of the global one.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Delete a stored template. Asks first on a terminal; without one
+    /// needs `--yes`.
+    Delete {
+        /// Template name.
+        name: String,
+        /// TARGET SCOPE: operate on this context's stored template instead
+        /// of the global one.
+        #[arg(long)]
+        context: Option<String>,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Export a stored template to stdout as a portable JSON file.
+    ///
+    /// Strips server provenance so the output can be edited and re-uploaded
+    /// via `create --file`. Pipe into a file or `jq` for scripted workflows.
+    Export {
+        /// Template name.
+        name: String,
+        /// LOOKUP SCOPE: export from this context's scope instead of global.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Compare a local template file against the VTA-stored version.
+    ///
+    /// Shows every JSON path whose value differs, exits non-zero when the
+    /// two diverge (so it plugs into drift-detection scripts).
+    Diff {
+        /// Template name.
+        name: String,
+        /// Path to the local template JSON file.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// LOOKUP SCOPE: fetch the stored template from this context's scope
+        /// instead of global.
+        #[arg(long)]
+        context: Option<String>,
+    },
+}
+
+pub(crate) fn parse_key_value(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got '{s}'"))?;
+    Ok((k.to_string(), v.to_string()))
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BackupCommands {
+    /// Export VTA state to an encrypted backup file
+    Export {
+        /// Include audit logs in the backup
+        #[arg(long)]
+        include_audit: bool,
+        /// Output file path (default: `vta-backup-<timestamp>.vtabak`)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+        /// Replace the output file if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Read the backup password from this file, or `-` for stdin. Without
+        /// it, PNM_BACKUP_PASSWORD is read, then the terminal is asked (no echo).
+        /// With none of them and no terminal, the command fails rather than
+        /// wait: a scheduled backup names one (#2585).
+        #[arg(long, value_name = "PATH|-")]
+        password_file: Option<std::path::PathBuf>,
+    },
+    /// Import VTA state from an encrypted backup file.
+    ///
+    /// The backup may come from any kind of VTA — plain, hardened or a Nitro
+    /// enclave — and restores into any kind. The VTA restarts to apply it.
+    Import {
+        /// Path to the .vtabak backup file
+        file: std::path::PathBuf,
+        /// Preview only — show what would be imported without applying
+        #[arg(long)]
+        preview: bool,
+        /// Allow the backup to replace a *different* identity this VTA already
+        /// runs as — disaster recovery onto a freshly set-up VTA, which minted
+        /// a DID of its own. Without it a backup of another DID is refused.
+        #[arg(long)]
+        replace_identity: bool,
+        /// Read the backup password from this file, or `-` for stdin. Without
+        /// it, PNM_BACKUP_PASSWORD is read, then the terminal is asked (no echo).
+        /// With none of them and no terminal, the command fails rather than
+        /// wait: a scheduled backup names one (#2585).
+        #[arg(long, value_name = "PATH|-")]
+        password_file: Option<std::path::PathBuf>,
+        /// Replace the VTA's data without asking (needed when there is no
+        /// terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum VtaCommands {
+    /// List configured VTAs
+    List,
+    /// Set the default VTA
+    Use { slug: String },
+    /// Delete a VTA connection from this machine: its local config entry and
+    /// stored credential.
+    ///
+    /// Local only — the VTA itself, and the ACL entry that authorises this
+    /// credential on it, are untouched. Revoke that with `pnm acl delete`
+    /// before deleting the connection if the credential should stop working.
+    #[command(alias = "remove")]
+    Delete {
+        slug: String,
+        /// Skip the confirmation prompt. `--force` is accepted as a hidden
+        /// alias.
+        #[arg(long = "yes", short = 'y', alias = "force")]
+        yes: bool,
+    },
+    /// Show current VTA details
+    Info,
+    /// Show the VTA's DID as a QR code, for a phone (Keyring) to scan.
+    ///
+    /// The code carries the bare DID and nothing else, so it is safe to show
+    /// on a shared screen. Offline: the DID comes from this machine's config
+    /// (`--vta` picks which VTA).
+    Qr {
+        /// Encode this DID instead of the VTA's.
+        #[arg(long)]
+        did: Option<String>,
+        /// Also write the code to this file as an SVG image.
+        #[arg(long, value_name = "FILE.svg")]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Restart the VTA service (soft restart — reloads config and reconnects)
+    Restart,
+    /// Open a sealed `vta/attestation/mnemonic-export/1.1` backup bundle.
+    Mnemonic {
+        #[command(subcommand)]
+        command: MnemonicCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MnemonicCommands {
+    /// Decrypt a sealed mnemonic-export bundle with the local key that
+    /// requested it, and print the words to this terminal.
+    ///
+    /// Fully offline: the bundle was sealed to an ephemeral key this machine
+    /// generated (`pnm bootstrap request` / the VTA's signed first-boot
+    /// response), and that key's seed is read from the same
+    /// `bootstrap-secrets` store `pnm bootstrap open` uses.
+    Open {
+        /// Path to the armored sealed bundle.
+        #[arg(long)]
+        bundle: std::path::PathBuf,
+        /// The SHA-256 digest the VTA printed out-of-band when it exported
+        /// the bundle. Confirm it before trusting what decrypts.
+        #[arg(long)]
+        expect_digest: Option<String>,
+        /// Skip the out-of-band digest check. The HPKE seal still limits who
+        /// can read the bundle, but nothing then confirms this is the exact
+        /// bundle the VTA produced rather than one swapped in transit.
+        #[arg(long)]
+        no_verify_digest: bool,
+        /// Also write the mnemonic to this file (0600). Omit this: the
+        /// words then go to the terminal only, which is the safer default
+        /// for a root secret — a file can be synced, backed up or copied
+        /// without your noticing.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Overwrite `--out` if it already exists.
+        #[arg(long, requires = "out")]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum WebvhCommands {
+    /// Add a WebVH server
+    AddServer {
+        /// Server identifier
+        #[arg(long)]
+        id: String,
+        /// Server DID (its DID document must advertise TSPTransport, DIDCommMessaging,
+        /// TrustTaskHTTPS, or WebVHHosting at an https:// origin)
+        #[arg(long)]
+        did: String,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List configured WebVH servers
+    ListServers,
+    /// Update a WebVH server
+    UpdateServer {
+        /// Server identifier to update
+        id: String,
+        /// New label (empty string to clear)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Delete a WebVH server
+    DeleteServer {
+        /// Server identifier to delete
+        id: String,
+        /// Go ahead without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Create a WebVH DID
+    CreateDid {
+        /// Application context ID
+        #[arg(long)]
+        context: String,
+        /// WebVH server ID (mutually exclusive with --did-url)
+        #[arg(long)]
+        server: Option<String>,
+        /// DID URL for serverless creation (mutually exclusive with --server)
+        #[arg(long)]
+        did_url: Option<String>,
+        /// Optional path on the WebVH server
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional hosting domain on the target server. When the
+        /// remote backplane serves multiple tenant domains, name the
+        /// one this DID should live on; otherwise the server resolves
+        /// via your ACL default → its system default. An unknown
+        /// domain comes back as a `did-management:unknownDomain`
+        /// error. Use `pnm did-mgmt dids list-domains --server <id>` to
+        /// see what's configured. Ignored in serverless mode.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Make the DID portable (default: true)
+        #[arg(long, default_value = "true")]
+        portable: bool,
+        /// Add a mediator service endpoint
+        #[arg(long)]
+        mediator_service: bool,
+        /// Additional service endpoints (JSON array)
+        #[arg(long)]
+        services: Option<String>,
+        /// Number of pre-rotation keys to generate
+        #[arg(long, default_value = "0")]
+        pre_rotation: u32,
+        /// Path to a JSON file containing a DID Document template (template mode)
+        #[arg(long)]
+        did_document: Option<String>,
+        /// Path to a did.jsonl file containing a pre-signed log entry (final mode)
+        #[arg(long)]
+        did_log: Option<String>,
+        /// Do not set this DID as the primary DID for the context
+        #[arg(long)]
+        no_primary: bool,
+        /// Use an existing key ID as the signing verification method
+        #[arg(long)]
+        signing_key: Option<String>,
+        /// Use an existing key ID as the key-agreement verification method
+        #[arg(long)]
+        ka_key: Option<String>,
+        /// Name of a stored DID template to render into the DID document.
+        /// Mutually exclusive with `--did-document` and `--did-log`.
+        #[arg(long)]
+        template: Option<String>,
+        /// Look up the template in this context's scope first. Defaults to
+        /// the DID's own `--context` so context-local templates shadow
+        /// global ones naturally.
+        #[arg(long)]
+        template_context: Option<String>,
+        /// `KEY=VALUE` — supply a template variable. Repeatable.
+        #[arg(long = "var", value_parser = parse_key_value)]
+        vars: Vec<(String, String)>,
+        /// Present the DID as its did:webvh (`webvh`) or its did:scid:vh:1 DID
+        /// (`scid`). Default: the VTA's `[dids] default_did_method`.
+        #[arg(long, value_name = "webvh|scid")]
+        did_method: Option<vta_sdk::did_scid::DidMethod>,
+        /// List the did:scid alias in alsoKnownAs (`true`/`false`). Default: the
+        /// VTA's `[dids] scid_also_known_as`.
+        #[arg(long, value_name = "BOOL")]
+        scid_also_known_as: Option<bool>,
+    },
+    /// Edit an existing WebVH DID document.
+    ///
+    /// **Interactive (default):** opens the latest DID document in
+    /// `$EDITOR`, then walks a Confirm/Input chain for the webvh
+    /// parameters (pre-rotation, watchers, TTL, audit label),
+    /// confirms, and publishes a new LogEntry.
+    ///
+    /// **Non-interactive:** supply `--document <file>` (and
+    /// optionally per-field flags) or `--options-file <file>` for
+    /// scripted updates. Witness changes need `--options-file`
+    /// because the multibase-id wire shape is awkward to express
+    /// on the command line.
+    ///
+    /// The DID's top-level `id` is treated as a permanent
+    /// commitment from the first LogEntry — changing it in the
+    /// editor is rejected before publish.
+    EditDid {
+        /// The DID to edit.
+        #[arg(long)]
+        did: String,
+        /// Path to a JSON file with the new DID document. Skips
+        /// `$EDITOR`.
+        #[arg(long)]
+        document: Option<std::path::PathBuf>,
+        /// Path to a JSON file with a full UpdateDidWebvhBody
+        /// (document + every parameter). Mutually exclusive with
+        /// the per-field flags below.
+        #[arg(long)]
+        options_file: Option<std::path::PathBuf>,
+        /// Override the pre-rotation count (0 disables).
+        #[arg(long)]
+        pre_rotation: Option<u32>,
+        /// New TTL in seconds.
+        #[arg(long)]
+        ttl: Option<u32>,
+        /// Replace the watcher set with these URLs (repeatable).
+        #[arg(long = "watcher")]
+        watchers: Vec<String>,
+        /// Disable watchers entirely (mutually exclusive with
+        /// `--watcher`).
+        #[arg(long)]
+        no_watchers: bool,
+        /// Audit label for this update.
+        #[arg(long)]
+        label: Option<String>,
+        /// Skip the final "Publish?" confirmation prompt. Useful
+        /// for scripted runs. `--yes`, as on every
+        /// other command; `--no-confirm` is still accepted (#2591).
+        #[arg(long = "yes", short = 'y', alias = "no-confirm")]
+        no_confirm: bool,
+    },
+    /// List or remove the did:scid alias of an existing DID
+    /// (`vta/webvh/dids/update/1.1`).
+    ///
+    /// Every did:webvh log is also `did:scid:vh:1:<scid>`; the two are one
+    /// subject only while the document lists `did:scid:vh:1:<scid>?src=…` in
+    /// `alsoKnownAs` (VTI-KEY-164). The VTA derives the DID URL. Like any
+    /// document change this publishes an entry and ROTATES the DID's update
+    /// key. A DID this VTA presents as its did:scid cannot lose its alias.
+    #[command(group(
+        clap::ArgGroup::new("alias")
+            .required(true)
+            .args(["list", "remove"])
+    ))]
+    ScidAliasDid {
+        /// The DID (its did:webvh or did:scid form).
+        #[arg(long)]
+        did: String,
+        /// List the did:scid DID URL in `alsoKnownAs`.
+        #[arg(long, visible_alias = "on")]
+        list: bool,
+        /// Remove every did:scid entry for this log from `alsoKnownAs`.
+        #[arg(long, visible_alias = "off")]
+        remove: bool,
+        /// Audit label for this update.
+        #[arg(long)]
+        label: Option<String>,
+        /// Skip the "Publish?" confirmation prompt. `--yes`, as on every
+        /// other command; `--no-confirm` is still accepted (#2591).
+        #[arg(long = "yes", short = 'y', alias = "no-confirm")]
+        no_confirm: bool,
+    },
+    /// Register an existing serverless WebVH DID with a webvh hosting server.
+    ///
+    /// Pushes the local `did.jsonl` to the host atomically (single
+    /// batched write — no resolver gap) and flips the DID's
+    /// `server_id` so future `pnm services …` mutations auto-publish
+    /// there. Useful when the VTA was set up serverless and a host
+    /// became available later.
+    ///
+    /// Refused if the DID is already server-managed.
+    RegisterDid {
+        /// The serverless WebVH DID to promote.
+        #[arg(long)]
+        did: String,
+        /// Registered server id (from `pnm did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+        /// Take over a slot owned by a different DID. Honoured only
+        /// when this VTA authenticates to the host as an admin. An
+        /// owner re-registering their own slot is idempotent and
+        /// always succeeds without `--force`.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Optional hosting domain on the target server. When the
+        /// remote serves multiple tenant domains, name the one this
+        /// DID should land on; otherwise the server resolves via the
+        /// usual chain.
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// List hosting domains a server makes available to this VTA.
+    ///
+    /// Asks the configured webvh server with the
+    /// `did-management/me/domains` Trust Task and prints the
+    /// caller-scoped subset. Use this to
+    /// discover legitimate `--domain` values for `pnm did-mgmt
+    /// create-did` / `register-did` before the first call. The
+    /// system default is flagged with `(default)`.
+    ListDomains {
+        /// Registered server id (from `pnm did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+    },
+    /// Compare a hosting server's DIDs against this VTA's records.
+    ///
+    /// Reports two divergences. **On the host but not here** is an
+    /// orphan: the host serves a DID this VTA has no key for, so no
+    /// update to it can ever be signed. It is what a delete leaves
+    /// behind when the host call fails — the local record goes
+    /// anyway. **Here but not on the host** is usually a create whose
+    /// publish never landed.
+    ///
+    /// Read-only: it repairs nothing, because the two want opposite
+    /// remedies. Requires an unrestricted admin — the host has no
+    /// view of contexts, so its listing cannot be context-scoped.
+    Reconcile {
+        /// Registered server id (from `pnm did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+    },
+    /// List DIDs, of every method
+    ListDids {
+        /// FILTER: only show DIDs belonging to this context.
+        #[arg(long)]
+        context: Option<String>,
+        /// FILTER: only show DIDs hosted by this server.
+        #[arg(long)]
+        server: Option<String>,
+        /// FILTER: only these methods (`webvh`, `scid:vh`, `webs`, `key`). Repeatable.
+        #[arg(long = "method")]
+        methods: Vec<String>,
+    },
+    /// Which DID methods the VTA holds, lists and creates
+    DidMethods,
+    /// Get details of a DID, of any method
+    GetDid {
+        /// The DID to look up
+        did: String,
+    },
+    /// Delete a WebVH DID
+    DeleteDid {
+        /// The DID to delete
+        did: String,
+        /// Go ahead without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Rename this DID's key records to the verification-method ids its
+    /// published document carries.
+    ///
+    /// The repair for a DID minted before the agent read its own document when
+    /// naming them — `room` and `room-host` number their methods from `#key-1`
+    /// while create stored records from `#key-0`, so the document's `#key-1`
+    /// named the signing key and the keystore's named the x25519 one.
+    ///
+    /// `keys rename` cannot do this: its identifier gate refuses `:` and `#` so
+    /// that a rename is not a back door into verification-method-shaped names.
+    /// Here every target comes from the DID's own log and records are matched
+    /// to methods by public key, so a key already renamed away from its method
+    /// id is still found.
+    RealignDidKeys {
+        /// The DID whose key records to realign.
+        did: String,
+        /// Show what would move, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print the raw `did.jsonl` log for a webvh DID the VTA knows.
+    ///
+    /// Snapshot from provisioning time — not a live resolver. Use for
+    /// audit, debugging, or republication fallback.
+    ///
+    /// The VTA's endpoint is public (webvh logs are world-readable by
+    /// design), so this runs without a session token.
+    DidLog {
+        /// The DID to retrieve the log for.
+        did: String,
+        /// Optional output file; stdout if omitted.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+// ── pnm did-mgmt {servers,dids} (new surface) ───────────────────────
+//
+// Restructured replacement for `pnm webvh …`. The variant fields are
+// duplicated from `WebvhCommands` so the new structure can stand on
+// its own, then `From<DidMgmtCommands> for WebvhCommands` converts
+// into the legacy enum so the existing `commands::webvh::run` handler
+// stays the single source of business logic. Drop the legacy enum +
+// conversion in the next minor release.
+
+/// Two-tier split: server-registration management vs DID lifecycle.
+//
+// `Servers` and `Dids` carry large subcommand enums (16+ field
+// variants); clippy flags the size delta but boxing CLI variants is
+// not idiomatic for clap-derive surfaces. Each variant is only ever
+// alive transiently inside `main`, so the heap-vs-stack trade-off is
+// immaterial.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+pub(crate) enum DidMgmtCommands {
+    /// Manage registered DID-hosting servers.
+    Servers {
+        #[command(subcommand)]
+        command: DidMgmtServerCommands,
+    },
+    /// Manage DIDs hosted by a registered server or published serverlessly.
+    Dids {
+        #[command(subcommand)]
+        command: DidMgmtDidCommands,
+    },
+    /// Manage agent names — human-memorable `domain/@name` shortcuts that
+    /// resolve to one of your hosted DIDs.
+    ///
+    /// Binding a name edits the DID document's `alsoKnownAs` and republishes
+    /// the signed log. That claim is what authorises the hosting server to
+    /// serve the `/@name` redirect, so a name only ever resolves for a DID
+    /// that has actually claimed it.
+    AgentNames {
+        #[command(subcommand)]
+        command: DidMgmtAgentNameCommands,
+    },
+}
+
+/// `pnm did-mgmt agent-names {…}` — bind and inspect agent names.
+#[derive(Subcommand)]
+pub(crate) enum DidMgmtAgentNameCommands {
+    /// Bind a name to a hosted DID.
+    Set {
+        /// The hosted DID to bind the name to.
+        #[arg(long)]
+        did: String,
+        /// The name's local part — no `@`, 2-63 chars of `[a-z0-9-]`,
+        /// alphanumeric at both ends. The domain comes from the DID.
+        #[arg(long)]
+        name: String,
+    },
+    /// Release a name entirely, freeing it for anyone else to claim.
+    ///
+    /// Not a delete of anything this DID keeps: once released, the name can be
+    /// claimed by any DID on the hosting domain. To stop a name resolving while
+    /// keeping it reserved to this DID, use `disable` instead. Asks first on
+    /// a terminal; without one needs `--yes`.
+    Remove {
+        #[arg(long)]
+        did: String,
+        #[arg(long)]
+        name: String,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Park a name: stop it resolving, keep it reserved to this DID.
+    Disable {
+        #[arg(long)]
+        did: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Bring a parked name back into service.
+    Enable {
+        #[arg(long)]
+        did: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// List every name bound to a DID, including parked ones.
+    List {
+        #[arg(long)]
+        did: String,
+    },
+    /// Check whether a name is free on the DID's hosting domain.
+    Check {
+        #[arg(long)]
+        did: String,
+        #[arg(long)]
+        name: String,
+    },
+}
+
+/// `pnm did-mgmt servers {…}` — controller-side server registry.
+#[derive(Subcommand)]
+pub(crate) enum DidMgmtServerCommands {
+    /// Add a DID-hosting server to the controller's registry.
+    Add {
+        /// Server identifier (operator-chosen, must be unique).
+        #[arg(long)]
+        id: String,
+        /// Server DID (its DID document must advertise TSPTransport,
+        /// DIDCommMessaging, TrustTaskHTTPS, or WebVHHosting at an
+        /// https:// origin).
+        #[arg(long)]
+        did: String,
+        /// Human-readable label.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List registered DID-hosting servers.
+    List,
+    /// Update a registered DID-hosting server.
+    Update {
+        /// Server identifier to update.
+        id: String,
+        /// New label (empty string to clear).
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Delete a registered DID-hosting server from the controller's
+    /// registry.
+    ///
+    /// Only the registry row goes. DIDs registered against the server keep
+    /// naming it, and nothing is deleted from the server itself — the command
+    /// lists any such DIDs so they are not left pointing at a missing id.
+    #[command(alias = "remove")]
+    Delete {
+        /// Server identifier to delete.
+        id: String,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// `pnm did-mgmt dids {…}` — DID lifecycle.
+//
+// Same large-variant-size rationale as `DidMgmtCommands` above: clap
+// surfaces own these enums transiently inside `main`; boxing each
+// variant would obscure the derive-driven CLI surface for negligible
+// benefit.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+pub(crate) enum DidMgmtDidCommands {
+    /// Create a DID hosted on a registered server, or serverless via
+    /// `--did-url`.
+    Create {
+        /// Application context ID
+        #[arg(long)]
+        context: String,
+        /// DID-hosting server ID (mutually exclusive with --did-url)
+        #[arg(long)]
+        server: Option<String>,
+        /// DID URL for serverless creation (mutually exclusive with --server)
+        #[arg(long)]
+        did_url: Option<String>,
+        /// Optional path on the DID-hosting server
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional hosting domain on the target server. Discover
+        /// available values with `pnm did-mgmt dids list-domains --server <id>`.
+        /// Omit to use the server's caller-default → system-default
+        /// resolution chain. Ignored in serverless mode.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Make the DID portable (default: true)
+        #[arg(long, default_value = "true")]
+        portable: bool,
+        /// Add a mediator service endpoint
+        #[arg(long)]
+        mediator_service: bool,
+        /// Additional service endpoints (JSON array)
+        #[arg(long)]
+        services: Option<String>,
+        /// Number of pre-rotation keys to generate
+        #[arg(long, default_value = "0")]
+        pre_rotation: u32,
+        /// Path to a JSON file containing a DID Document template (template mode)
+        #[arg(long)]
+        did_document: Option<String>,
+        /// Path to a did.jsonl file containing a pre-signed log entry (final mode)
+        #[arg(long)]
+        did_log: Option<String>,
+        /// Do not set this DID as the primary DID for the context
+        #[arg(long)]
+        no_primary: bool,
+        /// Use an existing key ID as the signing verification method
+        #[arg(long)]
+        signing_key: Option<String>,
+        /// Use an existing key ID as the key-agreement verification method
+        #[arg(long)]
+        ka_key: Option<String>,
+        /// Name of a stored DID template to render into the DID document.
+        /// Mutually exclusive with `--did-document` and `--did-log`.
+        #[arg(long)]
+        template: Option<String>,
+        /// Look up the template in this context's scope first. Defaults
+        /// to the DID's own `--context` so context-local templates
+        /// shadow global ones naturally.
+        #[arg(long)]
+        template_context: Option<String>,
+        /// `KEY=VALUE` — supply a template variable. Repeatable.
+        #[arg(long = "var", value_parser = parse_key_value)]
+        vars: Vec<(String, String)>,
+        /// Present the DID as its did:webvh (`webvh`) or its did:scid:vh:1 DID
+        /// (`scid`). Default: the VTA's `[dids] default_did_method`.
+        #[arg(long, value_name = "webvh|scid")]
+        did_method: Option<vta_sdk::did_scid::DidMethod>,
+        /// List the did:scid alias in alsoKnownAs (`true`/`false`). Default: the
+        /// VTA's `[dids] scid_also_known_as`.
+        #[arg(long, value_name = "BOOL")]
+        scid_also_known_as: Option<bool>,
+    },
+    /// Edit an existing DID document.
+    ///
+    /// **Interactive (default):** opens the latest DID document in
+    /// `$EDITOR`, then walks a Confirm/Input chain for the webvh
+    /// parameters (pre-rotation, watchers, TTL, audit label),
+    /// confirms, and publishes a new LogEntry.
+    ///
+    /// **Non-interactive:** supply `--document <file>` (and
+    /// optionally per-field flags) or `--options-file <file>` for
+    /// scripted updates. Witness changes need `--options-file`
+    /// because the multibase-id wire shape is awkward to express
+    /// on the command line.
+    Edit {
+        /// The DID to edit.
+        #[arg(long)]
+        did: String,
+        /// Path to a JSON file with the new DID document. Skips
+        /// `$EDITOR`.
+        #[arg(long)]
+        document: Option<std::path::PathBuf>,
+        /// Path to a JSON file with a full UpdateDidWebvhBody
+        /// (document + every parameter). Mutually exclusive with
+        /// the per-field flags below.
+        #[arg(long)]
+        options_file: Option<std::path::PathBuf>,
+        /// Override the pre-rotation count (0 disables).
+        #[arg(long)]
+        pre_rotation: Option<u32>,
+        /// New TTL in seconds.
+        #[arg(long)]
+        ttl: Option<u32>,
+        /// Replace the watcher set with these URLs (repeatable).
+        #[arg(long = "watcher")]
+        watchers: Vec<String>,
+        /// Disable watchers entirely (mutually exclusive with
+        /// `--watcher`).
+        #[arg(long)]
+        no_watchers: bool,
+        /// Audit label for this update.
+        #[arg(long)]
+        label: Option<String>,
+        /// Skip the final "Publish?" confirmation prompt. `--yes`, as on every
+        /// other command; `--no-confirm` is still accepted (#2591).
+        #[arg(long = "yes", short = 'y', alias = "no-confirm")]
+        no_confirm: bool,
+    },
+    /// List or remove the did:scid alias of an existing DID
+    /// (`vta/webvh/dids/update/1.1`).
+    ///
+    /// Every did:webvh log is also `did:scid:vh:1:<scid>`; the two are one
+    /// subject only while the document lists `did:scid:vh:1:<scid>?src=…` in
+    /// `alsoKnownAs` (VTI-KEY-164). The VTA derives the DID URL. Like any
+    /// document change this publishes an entry and ROTATES the DID's update
+    /// key. A DID this VTA presents as its did:scid cannot lose its alias.
+    #[command(group(
+        clap::ArgGroup::new("alias")
+            .required(true)
+            .args(["list", "remove"])
+    ))]
+    ScidAlias {
+        /// The DID (its did:webvh or did:scid form).
+        #[arg(long)]
+        did: String,
+        /// List the did:scid DID URL in `alsoKnownAs`.
+        #[arg(long, visible_alias = "on")]
+        list: bool,
+        /// Remove every did:scid entry for this log from `alsoKnownAs`.
+        #[arg(long, visible_alias = "off")]
+        remove: bool,
+        /// Audit label for this update.
+        #[arg(long)]
+        label: Option<String>,
+        /// Skip the "Publish?" confirmation prompt. `--yes`, as on every
+        /// other command; `--no-confirm` is still accepted (#2591).
+        #[arg(long = "yes", short = 'y', alias = "no-confirm")]
+        no_confirm: bool,
+    },
+    /// Register an existing serverless DID with a registered
+    /// DID-hosting server.
+    ///
+    /// Pushes the local `did.jsonl` to the host atomically and flips
+    /// the DID's `server_id` so future updates auto-publish there.
+    /// Useful when the VTA was set up serverless and a host became
+    /// available later. Refused if the DID is already server-managed.
+    Register {
+        /// The serverless DID to promote.
+        #[arg(long)]
+        did: String,
+        /// Registered server id (from `pnm did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+        /// Take over a slot owned by a different DID. Honoured only
+        /// when this VTA authenticates to the host as an admin. An
+        /// owner re-registering their own slot is idempotent and
+        /// always succeeds without `--force`.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Optional hosting domain on the target server. Discover
+        /// available values with `pnm did-mgmt dids list-domains --server <id>`.
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// List DIDs, of every method the VTA holds (did:webvh, did:scid,
+    /// did:webs, did:key).
+    List {
+        /// FILTER: only show DIDs belonging to this context.
+        #[arg(long)]
+        context: Option<String>,
+        /// FILTER: only show DIDs hosted by this DID-hosting server.
+        #[arg(long)]
+        server: Option<String>,
+        /// FILTER: only these methods (`webvh`, `scid:vh`, `webs`, `key`). Repeatable.
+        #[arg(long = "method")]
+        methods: Vec<String>,
+    },
+    /// Which DID methods the VTA holds, lists and will create now.
+    Methods,
+    /// Get details of a single DID, of any method.
+    Get {
+        /// The DID to look up.
+        did: String,
+    },
+    /// Delete a DID. Asks first on a terminal; without one needs `--yes`.
+    Delete {
+        /// The DID to delete.
+        did: String,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Rename this DID's key records to the verification-method ids its
+    /// published document carries.
+    ///
+    /// The repair for a DID whose records were named before the agent read its
+    /// own document. Matches records to methods by public key, so a key already
+    /// renamed away from its method id is still found — which `keys rename`
+    /// cannot undo, its gate refusing `:` and `#` by design.
+    RealignKeys {
+        /// The DID whose key records to realign.
+        did: String,
+        /// Show what would move, and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print the raw `did.jsonl` log for a DID the VTA knows.
+    ///
+    /// The VTA's stored copy, including every entry it has appended
+    /// since mint (`dids edit`, service changes) — not a live
+    /// resolver. Use it to deliver a self-hosted DID's extended log
+    /// (for a community: `cnm did-log install --file <out>`), for
+    /// audit, or for republication.
+    GetLog {
+        /// The DID to retrieve the log for.
+        did: String,
+        /// Optional output file; stdout if omitted.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// List the hosting domains a registered server makes available.
+    ///
+    /// Asks the server with the `did-management/me/domains` Trust
+    /// Task and prints the caller-scoped subset. Use this to discover legitimate
+    /// `--domain` values for `pnm did-mgmt dids create` /
+    /// `pnm did-mgmt dids register` before the first call. The
+    /// system default is flagged with `(default)`.
+    ListDomains {
+        /// Registered server id (from `pnm did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+    },
+    /// Compare a hosting server's DIDs against this VTA's records.
+    ///
+    /// Reports two divergences. **On the host but not here** is an
+    /// orphan: the host serves a DID this VTA has no key for, so no
+    /// update to it can ever be signed. It is what a delete leaves
+    /// behind when the host call fails — the local record goes
+    /// anyway. **Here but not on the host** is usually a create whose
+    /// publish never landed.
+    ///
+    /// Read-only: it repairs nothing, because the two want opposite
+    /// remedies. Requires an unrestricted admin — the host has no
+    /// view of contexts, so its listing cannot be context-scoped.
+    Reconcile {
+        /// Registered server id (from `pnm did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+    },
+}
+
+impl From<DidMgmtCommands> for WebvhCommands {
+    /// Bridge the new structured surface into the legacy flat
+    /// `WebvhCommands` so `commands::webvh::run` remains the single
+    /// dispatch site. Drop together with the legacy enum in the next
+    /// minor release.
+    fn from(cmd: DidMgmtCommands) -> Self {
+        match cmd {
+            DidMgmtCommands::Servers { command } => match command {
+                DidMgmtServerCommands::Add { id, did, label } => {
+                    WebvhCommands::AddServer { id, did, label }
+                }
+                DidMgmtServerCommands::List => WebvhCommands::ListServers,
+                DidMgmtServerCommands::Update { id, label } => {
+                    WebvhCommands::UpdateServer { id, label }
+                }
+                DidMgmtServerCommands::Delete { id, yes } => {
+                    WebvhCommands::DeleteServer { id, yes }
+                }
+            },
+            // Intercepted in `main.rs` before this bridge is reached — agent
+            // names are a new surface and deliberately have no legacy
+            // `WebvhCommands` equivalent to bridge into.
+            DidMgmtCommands::AgentNames { .. } => {
+                unreachable!("agent-names is dispatched before the legacy bridge")
+            }
+            DidMgmtCommands::Dids { command } => match command {
+                DidMgmtDidCommands::Create {
+                    context,
+                    server,
+                    did_url,
+                    path,
+                    domain,
+                    label,
+                    portable,
+                    mediator_service,
+                    services,
+                    pre_rotation,
+                    did_document,
+                    did_log,
+                    no_primary,
+                    signing_key,
+                    ka_key,
+                    template,
+                    template_context,
+                    vars,
+                    did_method,
+                    scid_also_known_as,
+                } => WebvhCommands::CreateDid {
+                    context,
+                    server,
+                    did_url,
+                    path,
+                    domain,
+                    label,
+                    portable,
+                    mediator_service,
+                    services,
+                    pre_rotation,
+                    did_document,
+                    did_log,
+                    no_primary,
+                    signing_key,
+                    ka_key,
+                    template,
+                    template_context,
+                    vars,
+                    did_method,
+                    scid_also_known_as,
+                },
+                DidMgmtDidCommands::Edit {
+                    did,
+                    document,
+                    options_file,
+                    pre_rotation,
+                    ttl,
+                    watchers,
+                    no_watchers,
+                    label,
+                    no_confirm,
+                } => WebvhCommands::EditDid {
+                    did,
+                    document,
+                    options_file,
+                    pre_rotation,
+                    ttl,
+                    watchers,
+                    no_watchers,
+                    label,
+                    no_confirm,
+                },
+                DidMgmtDidCommands::ScidAlias {
+                    did,
+                    list,
+                    remove,
+                    label,
+                    no_confirm,
+                } => WebvhCommands::ScidAliasDid {
+                    did,
+                    list,
+                    remove,
+                    label,
+                    no_confirm,
+                },
+                DidMgmtDidCommands::Register {
+                    did,
+                    server,
+                    force,
+                    domain,
+                } => WebvhCommands::RegisterDid {
+                    did,
+                    server,
+                    force,
+                    domain,
+                },
+                DidMgmtDidCommands::List {
+                    context,
+                    server,
+                    methods,
+                } => WebvhCommands::ListDids {
+                    context,
+                    server,
+                    methods,
+                },
+                DidMgmtDidCommands::Methods => WebvhCommands::DidMethods,
+                DidMgmtDidCommands::Get { did } => WebvhCommands::GetDid { did },
+                DidMgmtDidCommands::Delete { did, yes } => WebvhCommands::DeleteDid { did, yes },
+                DidMgmtDidCommands::RealignKeys { did, dry_run } => {
+                    WebvhCommands::RealignDidKeys { did, dry_run }
+                }
+                DidMgmtDidCommands::GetLog { did, out } => WebvhCommands::DidLog { did, out },
+                DidMgmtDidCommands::ListDomains { server } => WebvhCommands::ListDomains { server },
+                DidMgmtDidCommands::Reconcile { server } => WebvhCommands::Reconcile { server },
+            },
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AuthCommands {
+    /// Clear stored credentials and tokens
+    Logout,
+    /// Show current authentication status
+    Status,
+    /// Sign an unseal challenge with this PNM's stored admin key.
+    ///
+    /// Pair with `vta unseal`: when the VTA prints a 64-character hex
+    /// challenge, run `pnm auth sign-challenge <hex>` and paste the
+    /// resulting signature back into the unseal prompt. The cold-start
+    /// alternative — when PNM isn't usable yet — is `vta auth
+    /// sign-challenge --did <did> --challenge <hex>`, which signs from
+    /// the VTA's local fjall keystore (daemon must be stopped).
+    SignChallenge {
+        /// The 32-byte challenge in hex (exactly as printed by `vta
+        /// unseal`).
+        challenge: String,
+    },
+    /// Print the current access token (JWT) to stdout. Use only for
+    /// debugging or for pasting into a tool that needs a bearer
+    /// credential (e.g. the `examples/vta-auth-demo/` browser
+    /// harness). The token is sensitive — don't share it.
+    ///
+    /// If no token is cached, performs a fresh authentication first.
+    /// Fails if PNM hasn't been set up (`pnm setup`).
+    ShowToken,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommands {
+    /// Get current configuration
+    Get,
+    /// Update configuration
+    Update {
+        // `--community-vta-did` is deliberately absent: the VTA's own identity
+        // is set at setup and immutable at runtime (canonical config/patch
+        // reports it under `rejected`). There is no flag to attempt it with.
+        /// VTA name
+        #[arg(long)]
+        community_vta_name: Option<String>,
+        /// Public URL for this VTA
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Auth rate limiter (auth, bootstrap, attestation; also sizes the
+        /// backup-blob limiter): SECONDS PER TOKEN, 1-3600. Not a rate —
+        /// lower is looser. Applied live, no restart.
+        #[arg(long, value_name = "SECS")]
+        rate_limit_interval_secs: Option<u64>,
+        /// Auth rate limiter burst: requests one client IP may send
+        /// back-to-back, 1-10000. Applied live; changing it resets that
+        /// limiter's buckets.
+        #[arg(long, value_name = "N")]
+        rate_limit_burst: Option<u32>,
+        /// DID-log rate limiter (public did.jsonl routes): SECONDS PER TOKEN,
+        /// 1-3600. Lower is looser. Applied live, no restart.
+        #[arg(long, value_name = "SECS")]
+        did_log_rate_limit_interval_secs: Option<u64>,
+        /// DID-log rate limiter burst, 1-10000. Applied live; changing it
+        /// resets that limiter's buckets.
+        #[arg(long, value_name = "N")]
+        did_log_rate_limit_burst: Option<u32>,
+    },
+    /// Manage the remote DID-resolver cache URL stored in
+    /// `~/.config/pnm/config.toml`. When set, PNM dispatches every DID
+    /// resolution to that WebSocket endpoint (typically the same
+    /// `affinidi-did-resolver-cache-server` the local VTA points at)
+    /// instead of resolving in-process.
+    ///
+    /// Examples:
+    ///   pnm config resolver-url                            # show current value
+    ///   pnm config resolver-url ws://127.0.0.1:4445/did/v1/ws
+    ///   pnm config resolver-url --unset                    # clear, resolve locally
+    ResolverUrl {
+        /// WebSocket URL of the resolver-cache server. Omit to print
+        /// the current value.
+        url: Option<String>,
+        /// Clear the configured resolver URL. PNM will resolve DIDs
+        /// in-process again.
+        #[arg(long, conflicts_with = "url")]
+        unset: bool,
+    },
+}
+
+// ── Unified `pnm services …` surface (spec §5.1) ──────────────────
+//
+// Replaces the earlier `pnm services {enable,disable} didcomm` and
+// `pnm mediator …` subcommands. The retired surfaces redirect via
+// the `pnm mediator …` migration cue (handled by main()'s clap
+// error path) so operators with stale scripts get a clear pointer.
+
+#[derive(Subcommand)]
+pub(crate) enum ServicesCommands {
+    /// Show currently-advertised transport services.
+    List,
+    /// Manage TSP advertisement (the `#tsp` `TSPTransport` service
+    /// entry advertising the VTA's TSP-VID mediator DID).
+    Tsp {
+        #[command(subcommand)]
+        command: TspCommands,
+    },
+    /// Manage REST advertisement.
+    Rest {
+        #[command(subcommand)]
+        command: RestCommands,
+    },
+    /// Manage DIDComm advertisement.
+    Didcomm {
+        #[command(subcommand)]
+        command: DidcommCommands,
+    },
+    /// Manage WebAuthn-RP advertisement (the browser-facing
+    /// passkey-login surface advertised at `#vta-webauthn` on the
+    /// VTA's DID document).
+    Webauthn {
+        #[command(subcommand)]
+        command: WebauthnCommands,
+    },
+    /// Show inbound-message attribution by mediator and sender.
+    /// (Replaces `pnm mediator report`.)
+    Report {
+        /// Lower bound (RFC 3339, e.g. 2026-04-29T15:00:00Z).
+        #[arg(long)]
+        since: Option<String>,
+        /// Upper bound (RFC 3339).
+        #[arg(long)]
+        until: Option<String>,
+        /// Output format: `json` (default) or `table`.
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TspCommands {
+    /// Add a `#tsp` service entry advertising `--mediator-did` (the
+    /// VTA's TSP VID).
+    Enable {
+        #[arg(long = "mediator-did")]
+        mediator_did: String,
+    },
+    /// Replace the mediator DID on the existing `#tsp` entry.
+    Update {
+        #[arg(long = "mediator-did")]
+        mediator_did: String,
+    },
+    /// Remove the `#tsp` entry. Refused when TSP is the only
+    /// advertised transport (spec §3.2 — at least one must remain).
+    Disable,
+    /// Fail-forward the most recent TSP mutation by re-applying the
+    /// snapshotted prior state (spec §3.5a).
+    Rollback,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RestCommands {
+    /// Add a `#vta-rest` service entry advertising `--url`.
+    Enable {
+        #[arg(long)]
+        url: String,
+    },
+    /// Replace the URL on the existing `#vta-rest` entry.
+    Update {
+        #[arg(long)]
+        url: String,
+    },
+    /// Remove the `#vta-rest` entry. Refused when DIDComm is also
+    /// disabled (spec §3.2 — at least one transport must remain).
+    Disable,
+    /// Fail-forward the most recent REST mutation by re-applying
+    /// the snapshotted prior state (spec §3.5a).
+    Rollback,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WebauthnCommands {
+    /// Add a `#vta-webauthn` service entry advertising `--url`
+    /// (typically the auth-portal URL, e.g.
+    /// `https://vta.example.com/auth/portal`).
+    Enable {
+        #[arg(long)]
+        url: String,
+    },
+    /// Replace the URL on the existing `#vta-webauthn` entry.
+    Update {
+        #[arg(long)]
+        url: String,
+    },
+    /// Remove the `#vta-webauthn` entry AND strip every passkey
+    /// verificationMethod from the DIDs this VTA controls. Operators
+    /// must re-enrol passkeys after re-enabling. Refused when
+    /// disabling WebAuthn would leave no transport advertised.
+    Disable,
+    /// Fail-forward the most recent WebAuthn mutation by re-applying
+    /// the snapshotted prior state.
+    Rollback,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DidcommCommands {
+    /// Enable DIDComm. Requires a mediator DID and super-admin auth.
+    /// The VTA must currently be REST-only.
+    Enable {
+        #[arg(long)]
+        mediator_did: String,
+        /// Provision this VTA's ACL on the target mediator before the handshake.
+        #[arg(long, conflicts_with = "force")]
+        setup_acl: bool,
+        /// Skip handshake steps 2-5 (DID resolution always runs).
+        #[arg(long)]
+        force: bool,
+        /// Trust-ping round-trip timeout in seconds (default 10).
+        #[arg(long)]
+        handshake_timeout: Option<u64>,
+        /// Maximum time to wait for the restarted DIDComm listener (default 300).
+        #[arg(long, conflicts_with = "no_wait")]
+        wait_secs: Option<u64>,
+        /// Return after the enable response without polling readiness.
+        #[arg(long, conflicts_with = "wait_secs")]
+        no_wait: bool,
+    },
+    /// Update which mediator the `#vta-didcomm` entry advertises.
+    /// (Replaces `pnm mediator migrate`.) Runs the pre-promotion
+    /// handshake; the prior mediator's listener stays up until
+    /// `--drain-ttl` expires so in-flight messages can drain.
+    Update {
+        #[arg(long = "mediator-did", visible_alias = "to")]
+        new_mediator_did: String,
+        /// Provision this VTA's ACL on the target mediator before the handshake.
+        #[arg(long, conflicts_with = "force")]
+        setup_acl: bool,
+        /// Drain window for the prior mediator: `N[s|m|h|d|w]` or seconds.
+        /// Default: 24h per spec §3.6.
+        #[arg(long, default_value = "86400", value_parser = vta_cli_common::duration::secs_arg)]
+        drain_ttl: u64,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        handshake_timeout: Option<u64>,
+    },
+    /// Disable DIDComm. The current mediator's listener stays up
+    /// for `--drain-ttl` seconds so in-flight messages drain.
+    /// Default: 24h per spec §3.6.
+    Disable {
+        /// 0 = immediate teardown over REST transport. Server
+        /// enforces a 1h minimum when invoked over DIDComm
+        /// transport (spec §3.6). `N[s|m|h|d|w]` or seconds.
+        #[arg(long, default_value = "86400", value_parser = vta_cli_common::duration::secs_arg)]
+        drain_ttl: u64,
+    },
+    /// Fail-forward the most recent DIDComm mutation by re-applying
+    /// the snapshotted prior state. (Replaces `pnm mediator
+    /// rollback`.)
+    Rollback {
+        /// Drain window for the demoted mediator (seconds) when
+        /// the rollback dispatches into update / disable. Default:
+        /// 24h. Omitted = use server-side default. `N[s|m|h|d|w]` or seconds.
+        #[arg(long, value_parser = vta_cli_common::duration::secs_arg)]
+        drain_ttl: Option<u64>,
+    },
+    /// Drain-set management.
+    Drain {
+        #[command(subcommand)]
+        command: DrainCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DrainCommands {
+    /// Show currently-draining mediators.
+    List,
+    /// Cancel a drain entry. Drops the listener for that mediator
+    /// immediately. Refuses if the named DID is the active mediator
+    /// (use `services didcomm disable` instead).
+    Cancel {
+        #[arg(long)]
+        mediator_did: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ContextCommands {
+    /// List all application contexts
+    List,
+    /// Get a context by ID
+    Get {
+        /// Context ID (e.g. "vta")
+        id: String,
+    },
+    /// Create a new application context, optionally with an admin ACL entry.
+    ///
+    /// Without `--admin-did` the command just creates the context (historical
+    /// behaviour). Supply `--admin-did` to atomically grant that DID admin
+    /// access scoped to the new context.
+    ///
+    /// The admin ACL entry is **permanent** by default. Pass `--admin-expires`
+    /// to make it a **setup ACL** that auto-expires if the admin never claims
+    /// it — useful when the DID was minted on a fresh `pnm setup` and you
+    /// want an automatic safety window.
+    Create {
+        /// Context path: a slug (lowercase alphanumeric + hyphens), or slugs
+        /// joined by `/` to nest (e.g. `acme/eng`). Nesting requires admin of
+        /// the parent; a top-level context is super-admin only.
+        #[arg(long)]
+        id: String,
+        /// Human-readable name
+        #[arg(long)]
+        name: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        /// DID to grant admin access to (must start with `did:`). When set,
+        /// creates an ACL entry with role=admin scoped to this context.
+        #[arg(long)]
+        admin_did: Option<String>,
+        /// Human-readable label for the admin ACL entry.
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Setup-ACL expiry — accepts `N[s|m|h|d|w]` (e.g. `24h`, `7d`).
+        /// When set, the admin ACL entry auto-expires via the server's ACL
+        /// sweeper; the expectation is that the admin authenticates and
+        /// rotates to a fresh did:key before expiry. Without this flag the
+        /// entry is permanent. Requires `--admin-did`.
+        #[arg(long, requires = "admin_did")]
+        admin_expires: Option<String>,
+        /// Also grant the admin DID authority over the **holder's own
+        /// identity** — the attribute pool, the profiles built over it, and the
+        /// disclosure history — by adding the `persona-holder` capability.
+        ///
+        /// That identity sits above every trust context, and no role reaches
+        /// it — not a context-scoped admin, and not a super-admin either.
+        /// Without this flag a client provisioned here can administer its own
+        /// context and nothing of the holder's; with it, it can manage the
+        /// holder's identity **without** gaining any authority over other
+        /// contexts. Grant it to a client that is the holder's own — OpenVTC, a
+        /// personal agent — and not to an integration.
+        ///
+        /// Super-admin only, like every grant of holder authority.
+        #[arg(long, requires = "admin_did")]
+        admin_holder: bool,
+        /// Mark the admin entry as a **one-time hand-off** (VTI-ACL-054): the
+        /// admin DID may roll over once, while the entry is live, to a long-term
+        /// admin DID the VTA mints for it (provision-integration with an admin
+        /// template). The long-term admin is bounded by your own authority, and
+        /// takes your expiry rather than this entry's. Without it, the rollover
+        /// is refused because the long-term admin would outlive this entry.
+        /// Requires `--admin-expires`.
+        #[arg(long, requires = "admin_expires")]
+        admin_handoff: bool,
+    },
+    /// Update an existing context
+    Update {
+        /// Context ID
+        id: String,
+        /// New name
+        #[arg(long)]
+        name: Option<String>,
+        /// Set the DID for this context
+        #[arg(long, conflicts_with = "clear_did")]
+        did: Option<String>,
+        /// Clear this context's DID, leaving it with no identity of its own.
+        /// The DID is not deleted. Sent as `vta/contexts/update-did/1.1`, so
+        /// it needs only admin over the context.
+        #[arg(long)]
+        clear_did: bool,
+        /// New description
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Update the DID for a context (context admin or super admin)
+    UpdateDid {
+        /// Context ID
+        id: String,
+        /// The new DID to assign
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        did: Option<String>,
+        /// Clear the context's DID instead, leaving it with no identity of its
+        /// own. The DID is not deleted.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Delete an application context and all associated resources
+    Delete {
+        /// Context ID
+        id: String,
+        /// Skip the confirmation prompt. `--force` / `-f` are accepted as
+        /// hidden aliases.
+        #[arg(long = "yes", short = 'y', alias = "force", short_alias = 'f')]
+        yes: bool,
+        /// Finish the deletion even if a DID's hosting server cannot confirm
+        /// removing its published log (down, refusing, or no longer
+        /// registered). Those DIDs may keep resolving and removing them is
+        /// then up to you. Without it you are shown them and asked; `--yes`
+        /// does not answer that question.
+        #[arg(long)]
+        abandon_host_copies: bool,
+    },
+    /// Create a context and mint a sealed admin credential for its first admin.
+    ///
+    /// The admin did:key is generated locally by the CLI and registered via
+    /// `POST /acl`; the VTA never sees the private key. The minted credential
+    /// is sealed to the `--recipient` and printed as an armored bundle.
+    Bootstrap {
+        /// Context path (e.g. `acme` or `acme/eng`)
+        #[arg(long)]
+        id: String,
+        /// Human-readable name
+        #[arg(long)]
+        name: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        /// Admin label
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Path to a BootstrapRequest JSON file produced by `pnm bootstrap request`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519). The X25519 pubkey HPKE seals to
+        /// is derived locally.
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+    },
+    /// Provision a new application context with a portable config bundle
+    ///
+    /// Creates a context, generates admin credentials, and optionally creates a
+    /// WebVH DID. Emits an armored sealed bundle (`-----BEGIN VTA SEALED BUNDLE-----`)
+    /// containing everything an application needs to connect, authenticate,
+    /// and self-administer its context. Pass `--recipient <file>` with a
+    /// `BootstrapRequest` JSON (produced by `pnm bootstrap request --out`) or
+    /// `--recipient-pubkey` + `--recipient-nonce` inline.
+    Provision {
+        /// Context path (e.g. `acme` or `acme/eng`)
+        #[arg(long)]
+        id: String,
+        /// Human-readable name
+        #[arg(long)]
+        name: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        /// Admin label
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Create a DID using this WebVH server (mutually exclusive with --did-url)
+        #[arg(long)]
+        server: Option<String>,
+        /// Create a DID at this URL for self-hosting (mutually exclusive with --server)
+        #[arg(long)]
+        did_url: Option<String>,
+        /// Explicit path label for the DID on the hosting server (e.g.
+        /// `acme-eng`). Omit to let the host auto-assign one. Pass
+        /// `.well-known` for the reserved root slot. Same selector as
+        /// `pnm did-mgmt dids create --path`.
+        #[arg(long)]
+        did_path: Option<String>,
+        /// Make the DID portable (default: true)
+        #[arg(long, default_value = "true")]
+        portable: bool,
+        /// Add a mediator service endpoint to the DID
+        #[arg(long)]
+        mediator_service: bool,
+        /// Number of pre-rotation keys to generate
+        #[arg(long, default_value = "0")]
+        pre_rotation: u32,
+        /// Path to a BootstrapRequest JSON file produced by `pnm bootstrap request`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519). The X25519 pubkey HPKE seals to
+        /// is derived locally.
+        /// Requires --recipient-nonce. Mutually exclusive with --recipient.
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex (32 chars).
+        /// Requires --recipient-did. Mutually exclusive with --recipient.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+    },
+    /// Regenerate a provision bundle for an existing context.
+    ///
+    /// The DID's operational keys (signing, KA, any pre-rotation) are
+    /// auto-included in the bundle. `--admin-key` separately picks which
+    /// existing VTA-stored Ed25519 key's seed backs the admin credential
+    /// — the `did:key` the mediator operator uses to authenticate back
+    /// to the VTA for ACL-gated operations. Omit to interactively select
+    /// from existing keys or create a new one.
+    Reprovision {
+        /// Context ID to reprovision
+        #[arg(long)]
+        id: String,
+        /// Key ID of an existing VTA-stored Ed25519 key whose seed backs
+        /// the exported admin credential. Kept as `--key` for backward
+        /// compatibility.
+        #[arg(long = "admin-key", alias = "key")]
+        admin_key: Option<String>,
+        /// Label for a newly created admin key (used when no
+        /// `--admin-key` is provided and the interactive prompt selects
+        /// "create new").
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Path to a BootstrapRequest JSON file produced by `pnm bootstrap request`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519). The X25519 pubkey HPKE seals to
+        /// is derived locally.
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AclCommands {
+    /// List ACL entries
+    List {
+        /// FILTER: narrow the listing to one context. Omit to see every entry
+        /// visible to you. See --direction for which way this reads.
+        #[arg(long)]
+        context: Option<String>,
+        /// Which way --context reads along the context hierarchy:
+        /// `acting-in` (default) — who may act IN the context: entries scoped
+        /// to it or to an ancestor of it;
+        /// `subtree` — what is granted BENEATH it: entries scoped to it or to
+        /// a descendant, i.e. the grants a revocation sweep must cut;
+        /// `any` — both.
+        #[arg(long, requires = "context")]
+        direction: Option<String>,
+    },
+    /// Get an ACL entry by DID
+    #[command(visible_alias = "show")]
+    Get {
+        /// DID to look up
+        did: String,
+    },
+    /// Create an ACL entry.
+    ///
+    /// Not idempotent — errors with 409 Conflict if an entry already exists
+    /// for the given DID. To change an existing entry's role use `pnm acl
+    /// change-role`, which carries the compare-and-swap `pnm acl update`
+    /// refuses to do without. For its context list and everything else, use
+    /// `pnm acl update`. To revoke access use `pnm acl delete`.
+    #[command(visible_alias = "grant")]
+    Create {
+        /// DID to grant access to. Positional, as on `get`, `update` and
+        /// `delete` (#2591); `--did <DID>` is still accepted.
+        #[arg(required_unless_present = "did_flag")]
+        did: Option<String>,
+        /// The DID, as a flag (the older spelling).
+        #[arg(long = "did", value_name = "DID", conflicts_with = "did", hide = true)]
+        did_flag: Option<String>,
+        /// Role: admin, initiator, application, or reader
+        #[arg(long)]
+        role: String,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Comma-separated context IDs. Omit the flag entirely to leave the
+        /// list empty — which means *unrestricted* only for `--role admin`
+        /// (super admin) and *no access at all* for every other role. Do not
+        /// pass `--contexts ''`: that parses to one context named empty-string,
+        /// not to an empty list, and is rejected.
+        #[arg(long, value_delimiter = ',')]
+        contexts: Vec<String>,
+        /// Optional expiry — accepts `N[s|m|h|d|w]` (e.g. `24h`, `7d`). When
+        /// set, the server's ACL sweeper removes the entry after the deadline.
+        /// Without this flag the entry is permanent.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Mark the entry as a **one-time hand-off** (VTI-ACL-054): its subject
+        /// may roll over once, while the entry is live, to a successor bounded
+        /// by your own authority and expiry instead of this entry's. Requires
+        /// `--expires`.
+        #[arg(long, requires = "expires")]
+        handoff: bool,
+        /// DID of the delegated AAL2 step-up approver for this subject
+        /// (`stepUp.approver`) — the VID that ratifies the subject's step-ups
+        /// when policy `mode: delegated` applies (e.g. the holder's phone).
+        #[arg(long)]
+        step_up_approver: Option<String>,
+        /// Per-entry step-up override (`self` | `delegated`) raising the system
+        /// floor for this subject (`stepUp.require`). Omit for none.
+        #[arg(long)]
+        step_up_require: Option<String>,
+        /// Grant approve-authority over ALL contexts: this DID may *approve*
+        /// (confer) a change across every context while being able to *act* in
+        /// none. Super-admin only. Pair with `--role reader` and simply omit
+        /// `--contexts`.
+        #[arg(long)]
+        approve_all: bool,
+        /// Grant approve-authority scoped to these contexts (comma-separated):
+        /// may confer them via approval, cannot act in them. Ignored when
+        /// `--approve-all` is set.
+        #[arg(long, value_delimiter = ',')]
+        approve_contexts: Vec<String>,
+        /// Restrict this DID to invoking the signing oracle on exactly these
+        /// key ids (comma-separated). Intersects with `--contexts` — it can
+        /// only narrow, never widen. Omit the flag for no filter (every key
+        /// the contexts reach). Do not pass `--allowed-keys ''`: an empty
+        /// string is not an id and is rejected.
+        #[arg(long, value_delimiter = ',')]
+        allowed_keys: Option<Vec<String>>,
+        /// Narrow the new entry to exactly these capabilities (comma-separated,
+        /// kebab-case: `vault-read`, `memory-read`, `room-present`, …).
+        ///
+        /// Set at creation so the entry is never briefly wider than intended —
+        /// the window a grant-then-narrow pair leaves open. Every name must be
+        /// one the role already carries; one that is not is refused. Omit for
+        /// everything the role implies.
+        ///
+        /// `persona-holder` is the exception: no role carries it, so it is a
+        /// *grant* rather than a narrowing — it adds authority over the holder's
+        /// own identity without removing anything the role has, and only an
+        /// unscoped holder credential may confer it.
+        #[arg(long, value_delimiter = ',')]
+        capabilities: Option<Vec<String>>,
+        /// What the subject may use the content it reads for (comma-separated:
+        /// `personalisation`, `taskExecution`, `analytics`, `modelTraining`, or
+        /// absolute IRIs). Omit for `any`, which never includes
+        /// `modelTraining`. An agent's entry should list what its task needs
+        /// (VTI-VTA-044); every memory read it makes is then held to them.
+        #[arg(long, value_delimiter = ',')]
+        purposes: Option<Vec<String>>,
+    },
+    /// Change a subject's role, guarded by a compare-and-swap.
+    ///
+    /// `--from` is the role you believe they hold. If another admin has
+    /// moved them since you looked, the change is refused rather than
+    /// silently overwriting theirs — re-read with `pnm acl get` and retry.
+    ChangeRole {
+        /// DID of the entry whose role is changing. Positional, as on `get`,
+        /// `update` and `delete` (#2591); `--did <DID>` is still accepted.
+        #[arg(required_unless_present = "did_flag")]
+        did: Option<String>,
+        /// The DID, as a flag (the older spelling).
+        #[arg(long = "did", value_name = "DID", conflicts_with = "did", hide = true)]
+        did_flag: Option<String>,
+        /// The role the subject currently holds
+        #[arg(long = "from")]
+        from_role: String,
+        /// The role to move them to
+        #[arg(long = "to")]
+        to_role: String,
+        /// Optional rationale, recorded in the audit log
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Change an ACL entry's label, contexts, expiry or approve-authority.
+    ///
+    /// Not the role — that needs `pnm acl change-role` and its
+    /// compare-and-swap. Passing `--role` here is refused rather than
+    /// silently ignored.
+    Update {
+        /// DID of the entry to update
+        did: String,
+        /// New role.
+        ///
+        /// Refused — role changes need `pnm acl change-role`, which carries
+        /// the compare-and-swap. Kept here so the error can name the exact
+        /// replacement command rather than reading as an unknown flag.
+        #[arg(long)]
+        role: Option<String>,
+        /// New label
+        #[arg(long)]
+        label: Option<String>,
+        /// New comma-separated context IDs
+        #[arg(long, value_delimiter = ',')]
+        contexts: Option<Vec<String>>,
+        /// Set the delegated step-up approver VID (`stepUp.approver`). Pass an
+        /// empty string to clear it; omit to leave it unchanged.
+        #[arg(long)]
+        step_up_approver: Option<String>,
+        /// Set the per-entry step-up override (`self` | `delegated`). Pass an
+        /// empty string to clear it; omit to leave it unchanged.
+        #[arg(long)]
+        step_up_require: Option<String>,
+        /// Grant approve-authority over ALL contexts. Super-admin only.
+        #[arg(long, conflicts_with_all = ["approve_contexts", "approve_none"])]
+        approve_all: bool,
+        /// Replace approve-authority with exactly these contexts
+        /// (comma-separated). Requires the caller to administer each.
+        #[arg(long, value_delimiter = ',', conflicts_with = "approve_none")]
+        approve_contexts: Option<Vec<String>>,
+        /// Revoke this entry's approve-authority entirely.
+        ///
+        /// An explicit flag rather than an empty list, because "confer
+        /// nothing" and "leave the scope alone" are different intents and an
+        /// empty value cannot mean both. Omitting all three approve flags
+        /// leaves the scope unchanged.
+        #[arg(long)]
+        approve_none: bool,
+        /// Replace the signing-oracle key filter with exactly these key ids
+        /// (comma-separated). Intersects with the entry's contexts — it can
+        /// only narrow. Narrowing binds the subject's next sign request.
+        /// Omit to leave the filter unchanged.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            conflicts_with = "allowed_keys_unrestricted"
+        )]
+        allowed_keys: Option<Vec<String>>,
+        /// Remove the signing-oracle key filter entirely — the subject may
+        /// again use every key its contexts reach. A privilege increase, and
+        /// its own flag because an empty `--allowed-keys` cannot mean both
+        /// "no keys at all" and "no filter".
+        #[arg(long)]
+        allowed_keys_unrestricted: bool,
+        /// Narrow this entry to exactly these capabilities (comma-separated,
+        /// kebab-case: `vault-read`, `memory-read`, `room-present`, …).
+        ///
+        /// It can only narrow: every name must be one the entry's role already
+        /// carries, and one that is not is refused rather than dropped. Omit to
+        /// leave the narrowing unchanged.
+        ///
+        /// `persona-holder` is the exception — a *grant*, not a narrowing. No
+        /// role carries it, it adds authority over the holder's own identity
+        /// without removing anything the role has, and only an unscoped holder
+        /// credential may confer it. Naming it alone therefore leaves the rest
+        /// of the entry's authority intact rather than narrowing it to nothing.
+        #[arg(long, value_delimiter = ',', conflicts_with = "capabilities_all")]
+        capabilities: Option<Vec<String>>,
+        /// Remove the narrowing — the entry holds everything its role implies.
+        ///
+        /// A privilege increase, and its own flag for the same reason
+        /// `--allowed-keys-unrestricted` is: an empty `--capabilities` cannot
+        /// mean both "narrowed to nothing" and "not narrowed at all".
+        #[arg(long)]
+        capabilities_all: bool,
+        /// Replace the purposes the subject may use what it reads for
+        /// (comma-separated, as on `acl create`). Narrowing them is a privilege
+        /// reduction, applied at the subject's next read. Omit to leave them
+        /// unchanged.
+        #[arg(long, value_delimiter = ',', conflicts_with = "purposes_any")]
+        purposes: Option<Vec<String>>,
+        /// Set the purposes to `any` (never `modelTraining`).
+        #[arg(long)]
+        purposes_any: bool,
+        /// Optional rationale, recorded in the audit log (`acl/update/0.3`
+        /// `reason`).
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Delete an ACL entry. Irreversible: asks first on a terminal, and
+    /// without one needs `--yes`.
+    #[command(visible_alias = "revoke")]
+    Delete {
+        /// DID of the entry to delete
+        did: String,
+        /// Optional rationale, recorded in the audit log (`acl/revoke/0.3`
+        /// `reason`).
+        #[arg(long)]
+        reason: Option<String>,
+        /// Delete without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// `pnm consent …` — answer a consent request this VTA raised, as an approver.
+#[derive(Subcommand)]
+pub(crate) enum ConsentCommands {
+    /// Verify a consent request and show what it asks. Sends nothing.
+    Show {
+        /// The request: a request document, the requester's refusal body, or
+        /// its `details` (`-` reads stdin).
+        request: std::path::PathBuf,
+    },
+    /// Approve a consent request, after comparing its match code.
+    Approve {
+        /// The request: a request document, the requester's refusal body, or
+        /// its `details` (`-` reads stdin).
+        request: std::path::PathBuf,
+        /// The code the requester's screen shows. Without it you are asked to
+        /// type it; approval never proceeds on a code nobody compared.
+        #[arg(long)]
+        match_code: Option<String>,
+        /// A note recorded with the decision (at most 500 characters).
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Deny a consent request. The requester has to ask again.
+    Deny {
+        /// The request: a request document, the requester's refusal body, or
+        /// its `details` (`-` reads stdin).
+        request: std::path::PathBuf,
+        /// Why, recorded with the decision (at most 500 characters).
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+/// `pnm approvals …` — which tasks need an additional human decision before
+/// they run, and who may give it.
+#[derive(Subcommand)]
+pub(crate) enum ApprovalsCommands {
+    /// Show the approval rules and the approver sets they draw on.
+    List,
+    /// Require approval for a task type (replaces any existing rule for it).
+    Require {
+        /// Trust Task Type URI, e.g.
+        /// `https://trusttasks.org/spec/acl/grant/0.3`.
+        task_type: String,
+        /// Require the caller to re-authenticate (AAL2) — no third party.
+        #[arg(long, conflicts_with = "consent")]
+        reauth: bool,
+        /// Require named approvers to sign off on this exact payload.
+        #[arg(long, requires = "set")]
+        consent: bool,
+        /// Approver set the approvals must come from (consent only).
+        #[arg(long)]
+        set: Option<String>,
+        /// Distinct approvals needed (consent only, default 1).
+        #[arg(long)]
+        min: Option<u32>,
+        /// Bar the requester from counting toward the threshold, forcing a
+        /// genuinely second party (consent only).
+        #[arg(long)]
+        exclude_requester: bool,
+        /// Apply only in these contexts. Omit for every context.
+        #[arg(long, value_delimiter = ',')]
+        context: Vec<String>,
+    },
+    /// Stop requiring approval for a task type.
+    Remove {
+        /// Trust Task Type URI.
+        task_type: String,
+        /// Remove only the rule scoped to exactly these contexts.
+        #[arg(long, value_delimiter = ',')]
+        context: Option<Vec<String>>,
+    },
+    /// Manage the named approver sets.
+    Approvers {
+        #[command(subcommand)]
+        command: ApproversCommands,
+    },
+    /// Explain what a task requires, and whether that can be satisfied.
+    Explain {
+        /// Trust Task Type URI.
+        task_type: String,
+        /// Context to explain for (default `default`).
+        #[arg(long)]
+        context: Option<String>,
+    },
+}
+
+/// `pnm approvals approvers …`
+#[derive(Subcommand)]
+pub(crate) enum ApproversCommands {
+    /// Add a DID to an approver set (creating the set if new).
+    Add {
+        /// Set name.
+        set: String,
+        /// Approver DID.
+        did: String,
+    },
+    /// Remove a DID from an approver set.
+    Remove {
+        /// Set name.
+        set: String,
+        /// Approver DID.
+        did: String,
+    },
+}
+
+/// `pnm policy …` — hand-authored Rego policy management (the power-user
+/// surface). For "this task needs approval", reach for `pnm approvals` instead:
+/// it writes one reserved row through this same family, with the rules
+/// validated and the Rego generated for you.
+#[derive(Subcommand)]
+pub(crate) enum PolicyModuleCommands {
+    /// List stored policy modules.
+    List {
+        /// Only policies applying in this context (an unscoped policy applies
+        /// everywhere, so it always matches).
+        #[arg(long)]
+        context: Option<String>,
+        /// Skip disabled policies.
+        #[arg(long)]
+        enabled_only: bool,
+    },
+    /// Show one policy module, including its Rego source.
+    Show {
+        /// Policy id.
+        id: String,
+    },
+    /// Create or revise a policy from a Rego file.
+    Upsert {
+        /// Policy id. Omit to let the VTA allocate one.
+        #[arg(long)]
+        id: Option<String>,
+        /// Human-readable name (required by the canonical shape).
+        #[arg(long)]
+        name: String,
+        /// Path to the Rego source (or `-` for stdin).
+        #[arg(long)]
+        module: String,
+        #[arg(long)]
+        description: Option<String>,
+        /// Contexts this policy applies in. Omit for all contexts.
+        #[arg(long, value_delimiter = ',')]
+        context: Vec<String>,
+        /// Higher runs first; the first policy to return a decision wins.
+        #[arg(long)]
+        priority: Option<i32>,
+        /// Store the policy without enabling it.
+        #[arg(long)]
+        disabled: bool,
+        /// Optimistic concurrency: fail unless the stored row is at this
+        /// version. Read it with `policy show`.
+        #[arg(long)]
+        expected_version: Option<u64>,
+    },
+    /// Delete a policy module.
+    Delete {
+        /// Policy id.
+        id: String,
+        /// Fail unless the stored row is at this version.
+        #[arg(long)]
+        expected_version: Option<u64>,
+        /// Operator rationale, recorded in the audit log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+/// `pnm device …` — manage `DeviceBinding`s for Service consumers (personal AI
+/// agents, companions). See `docs/02-vta/personal-ai-agents.md`.
+#[derive(Subcommand)]
+pub(crate) enum DeviceCommands {
+    /// List registered devices. Optionally filter to one Service kind.
+    List {
+        /// Filter to a Service consumer kind, e.g. `ai-agent`.
+        #[arg(long)]
+        service_kind: Option<String>,
+    },
+    /// Register the authenticated DID as a device (its DID must already be in
+    /// the ACL). Defaults to a `service` consumer of kind `ai-agent`.
+    Register {
+        /// Service kind for `consumerKind` (default `ai-agent`).
+        #[arg(long, default_value = "ai-agent")]
+        service_kind: String,
+        /// Human-readable device/agent name.
+        #[arg(long)]
+        display_name: String,
+        /// Platform string (e.g. `linux`, `macos`).
+        #[arg(long)]
+        platform: Option<String>,
+        /// Optional HPKE public key (multibase) for sealed delivery.
+        #[arg(long)]
+        hpke_public_key: Option<String>,
+    },
+    /// Disable a device by id (kept on record; can no longer authenticate).
+    Disable {
+        /// The `deviceId` to disable.
+        device_id: String,
+    },
+    /// Remotely wipe a lost/compromised device (marks it wiped + disabled).
+    Wipe {
+        /// The `deviceId` to wipe.
+        device_id: String,
+        /// Human-readable reason (recorded for the audit trail).
+        #[arg(long)]
+        reason: String,
+        /// How aggressively to wipe: cache, cache-and-keys, or full.
+        #[arg(long, default_value = "cache-and-keys")]
+        scope: String,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Record a device's push WakeHandle and return the trigger allowlist.
+    SetWake {
+        /// Gateway DID (DIDComm) or URL (HTTPS).
+        #[arg(long)]
+        gateway: String,
+        /// Opaque wake handle issued by the push gateway.
+        #[arg(long)]
+        handle: String,
+        /// Suggested trigger types (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        suggested_triggers: Vec<String>,
+    },
+    /// Refresh `lastSeenAt`; returns server time + any queued operations.
+    Heartbeat {
+        /// Updated platform string, if changed.
+        #[arg(long)]
+        platform: Option<String>,
+    },
+}
+
+/// `pnm vault …` — Service-consumer secrets vault. Secret-bearing operations
+/// (`upsert`, `release`) use `didcomm-authcrypt` and require DIDComm transport.
+#[derive(Subcommand)]
+pub(crate) enum VaultCommands {
+    /// List vault-entry metadata (no secrets). `VaultRead`. By default only
+    /// active entries are shown — use `--status` for the archive/trash views.
+    List {
+        /// Path to a JSON filter object (or `-` for stdin). Omit for all.
+        #[arg(long)]
+        filters_file: Option<String>,
+        /// Lifecycle view: `active` (default), `archived`, `deleted`, or `all`.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Show a single entry's metadata by id (no secret). `VaultRead`.
+    Get {
+        /// The vault entry id.
+        id: String,
+    },
+    /// Delete an entry by id. Default is a RECOVERABLE soft delete (restore
+    /// with `vault restore` until the grace window lapses); `--force` makes it
+    /// an immediate, irreversible hard delete (the same as `vault purge`).
+    /// `VaultWrite`.
+    Delete {
+        /// The vault entry id.
+        id: String,
+        /// Expected current version (reject on mismatch).
+        #[arg(long)]
+        expected_version: Option<u32>,
+        /// Skip the grace window and hard-delete immediately (NO recovery).
+        #[arg(long)]
+        force: bool,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Archive an entry: hide it from the default list and refuse it for use,
+    /// while keeping it restorable with `vault unarchive`. `VaultWrite`.
+    Archive {
+        /// The vault entry id.
+        id: String,
+        /// Expected current version (reject on mismatch).
+        #[arg(long)]
+        expected_version: Option<u32>,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Return an archived entry to active. `VaultWrite`.
+    Unarchive {
+        /// The vault entry id.
+        id: String,
+        /// Expected current version (reject on mismatch).
+        #[arg(long)]
+        expected_version: Option<u32>,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Restore (undelete) a soft-deleted entry — only works inside the grace
+    /// window before the sweeper purges it. `VaultWrite`.
+    Restore {
+        /// The vault entry id.
+        id: String,
+        /// Expected current version (reject on mismatch).
+        #[arg(long)]
+        expected_version: Option<u32>,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Permanently delete an entry, skipping any grace window — the same as
+    /// `vault delete --force`, and the usual way to empty an already
+    /// soft-deleted entry out of the trash. IRREVERSIBLE. `VaultWrite`.
+    Purge {
+        /// The vault entry id.
+        id: String,
+        /// Expected current version (reject on mismatch).
+        #[arg(long)]
+        expected_version: Option<u32>,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Create/update an entry. `VaultWrite`. `--entry-file` carries the entry
+    /// fields (`contextId`, `targets`, `label`, `secretKind`, …);
+    /// `--secret-file` (optional) is the cleartext secret, sealed before send.
+    Upsert {
+        /// Path to the entry-fields JSON (or `-` for stdin).
+        #[arg(long)]
+        entry_file: String,
+        /// Path to the cleartext `VaultSecret` JSON to seal (or `-` for stdin).
+        #[arg(long)]
+        secret_file: Option<String>,
+    },
+    /// Release a secret sealed to the caller and print the cleartext.
+    /// `FillRelease`. Requires DIDComm transport.
+    Release {
+        /// The vault entry id.
+        id: String,
+        /// Path to a JSON site-target object (or `-` for stdin).
+        #[arg(long)]
+        target_file: Option<String>,
+    },
+    /// Mint a session as the entry's principal. `ProxyLogin`. `--file` is the
+    /// full wire request JSON.
+    ProxyLogin {
+        /// Path to the request JSON (or `-` for stdin).
+        #[arg(long)]
+        file: String,
+    },
+    /// Sign a Trust Task envelope as the entry's principal. `SignTrustTask`.
+    /// `--file` is the full wire request JSON.
+    SignTrustTask {
+        /// Path to the request JSON (or `-` for stdin).
+        #[arg(long)]
+        file: String,
+    },
+}
+
+/// Credential-store subcommands (`pnm cred-vault …`). The store holds the
+/// W3C credentials the holder *holds*; bodies are presentable VCs (plain
+/// JSON, no sealed envelope). Read paths gate on `VaultRead`, `receive` on
+/// `VaultWrite`, and the archival lifecycle on the new `CredentialWrite`.
+#[derive(Subcommand)]
+pub(crate) enum CredVaultCommands {
+    /// Verify + store a received credential (e.g. an invitation). `VaultWrite`.
+    Receive {
+        /// Path to the credential VC JSON (or `-` for stdin).
+        #[arg(long)]
+        credential_file: String,
+        /// Storage id override (defaults to the VC's own `id`).
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Filtered (DCQL-shaped) search over held credentials → body-free
+    /// descriptors. At least one filter field is required. `VaultRead`.
+    Query {
+        /// Path to a JSON filter object (or `-` for stdin): any of `type`,
+        /// `communityDid`, `issuerDid`, `purpose`, `status`.
+        #[arg(long)]
+        filter_file: String,
+    },
+    /// Fetch one held credential's full body by id, for presentation.
+    /// `VaultRead`.
+    Get {
+        /// The credential id.
+        id: String,
+    },
+    /// Archive a credential: hide it from query and refuse presentation,
+    /// while keeping it restorable with `cred-vault unarchive`.
+    /// `CredentialWrite`.
+    Archive {
+        /// The credential id.
+        id: String,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Return an archived credential to active. `CredentialWrite`.
+    Unarchive {
+        /// The credential id.
+        id: String,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Delete a credential. Default is a RECOVERABLE soft delete (restore
+    /// with `cred-vault restore` until the grace window lapses); `--force`
+    /// hard-deletes immediately, no recovery (the same as `cred-vault purge`).
+    /// `CredentialWrite`.
+    Delete {
+        /// The credential id.
+        id: String,
+        /// Skip the grace window and hard-delete immediately (NO recovery).
+        #[arg(long)]
+        force: bool,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Restore (undelete) a soft-deleted credential — only inside the grace
+    /// window before the sweeper purges it. `CredentialWrite`.
+    Restore {
+        /// The credential id.
+        id: String,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Permanently delete a credential (and its index rows), skipping any
+    /// grace window — the same as `cred-vault delete --force`, and the usual
+    /// way to empty an already soft-deleted credential out of the trash.
+    /// IRREVERSIBLE. `CredentialWrite`.
+    Purge {
+        /// The credential id.
+        id: String,
+        /// Rationale recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AuthCredentialCommands {
+    /// Generate a new auth credential (did:key minted locally + ACL entry)
+    /// and seal it to the given recipient.
+    Create {
+        /// Role: admin, initiator, application, or reader
+        #[arg(long)]
+        role: String,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Comma-separated context IDs (empty = unrestricted)
+        #[arg(long, value_delimiter = ',')]
+        contexts: Vec<String>,
+        /// Path to a BootstrapRequest JSON file produced by `pnm bootstrap request`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519). The X25519 pubkey HPKE seals to
+        /// is derived locally.
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum AuditCommands {
+    /// Verify the audit log's hash chain
+    Verify,
+    /// List audit log entries with optional filtering
+    List {
+        /// Start time, RFC 3339 (e.g. 2026-07-01T00:00:00Z). Inclusive.
+        #[arg(long)]
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        /// End time, RFC 3339. Exclusive.
+        #[arg(long)]
+        to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Filter by action — exact match (e.g. "auth.challenge", "key.create")
+        #[arg(long)]
+        action: Option<String>,
+        /// Filter by actor DID
+        #[arg(long)]
+        actor: Option<String>,
+        /// Filter by outcome — exact match (e.g. "success", "denied")
+        #[arg(long)]
+        outcome: Option<String>,
+        /// Filter by context ID. Required unless you are an unrestricted admin.
+        #[arg(long)]
+        context_id: Option<String>,
+        /// Continuation cursor printed by the previous page. Pass it back
+        /// verbatim; do not change the filters when resuming.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Page size (default 50, max 200)
+        #[arg(long)]
+        page_size: Option<u64>,
+    },
+    /// Manage audit log retention
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RetentionCommands {
+    /// Get the current retention period
+    Get,
+    /// Set the retention period (super-admin only)
+    Set {
+        /// Number of days to retain audit logs (1-365)
+        #[arg(long)]
+        days: u32,
+    },
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum KeyCommands {
+    /// Create a new key.
+    ///
+    /// Not idempotent — every invocation mints a fresh key record (even with
+    /// identical arguments). Use `pnm keys list` to discover existing keys
+    /// in a context first if you're trying to avoid duplicates.
+    Create {
+        /// Key type: ed25519, x25519, p256, mldsa44 or mldsa65 (the last two are
+        /// post-quantum signing, FIPS 204)
+        #[arg(long)]
+        key_type: String,
+        /// BIP-32 derivation path (auto-derived from context if omitted)
+        #[arg(long)]
+        derivation_path: Option<String>,
+        /// Read a BIP-39 mnemonic phrase from this file, or `-` for stdin
+        /// (asked without echo on a terminal). Never on the command line,
+        /// where shell history and `ps` keep it (#2584).
+        #[arg(long, value_name = "PATH|-")]
+        mnemonic_file: Option<std::path::PathBuf>,
+        /// Deprecated: puts the phrase on the command line. Use
+        /// `--mnemonic-file`.
+        #[arg(long, hide = true, conflicts_with = "mnemonic_file")]
+        mnemonic: Option<String>,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// TARGET SCOPE: store the new key under this context. Required
+        /// unless you're a super admin creating a context-less key (rare).
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context_id: Option<String>,
+        /// Create a NON-RECOVERABLE internal key.
+        ///
+        /// Generated from the system CSPRNG, NOT derived from your BIP-39 seed,
+        /// excluded from backups, and never exported by any surface — the VTA
+        /// will only ever sign with it. If this VTA's storage is lost the key is
+        /// gone permanently, along with every signature it was the sole
+        /// authority for. Cannot sign did:webvh log entries; may be a signing
+        /// verificationMethod inside a DID document.
+        #[arg(long)]
+        internal: bool,
+        /// Skip the internal-key confirmation prompt (automation only).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Import an externally-created private key
+    Import {
+        /// Key type: ed25519, x25519, or p256 (post-quantum keys cannot be
+        /// imported — use `keys create` to have the VTA derive one)
+        #[arg(long)]
+        key_type: String,
+        /// Multibase-encoded private key
+        #[arg(long)]
+        private_key: Option<String>,
+        /// Path to private key file
+        #[arg(long)]
+        private_key_file: Option<std::path::PathBuf>,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// TARGET SCOPE: store the imported key under this context.
+        #[arg(long = "context", alias = "context-id", value_name = "ID")]
+        context_id: Option<String>,
+    },
+    /// Get a key by ID
+    Get {
+        /// Key ID
+        key_id: String,
+        /// Reveal private key material (multibase)
+        #[arg(long)]
+        secret: bool,
+    },
+    /// Revoke (invalidate) a key. Irreversible: asks first on a terminal,
+    /// and without one needs `--yes`.
+    Revoke {
+        /// Key ID
+        key_id: String,
+        /// Optional rationale, recorded in the audit log (`keys/revoke/0.1`
+        /// `reason`).
+        #[arg(long)]
+        reason: Option<String>,
+        /// Revoke without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Set whether a key's private half may ever be released.
+    ///
+    /// `--exportable false` tells the VTA to refuse every future export of the
+    /// key. It can still be *used* — signing, key agreement — so anything that
+    /// asks the VTA to act with the key keeps working; only handing the
+    /// material out stops.
+    ///
+    /// The two directions do not cost the same. Restricting a key needs admin
+    /// of its context; releasing one that is restricted needs strictly more:
+    /// super-admin, or a fresh step-up on your session. That asymmetry is the
+    /// point — a restriction the party who imposed it can lift unilaterally
+    /// protects against accident but not against someone holding that party's
+    /// credentials.
+    ///
+    /// The value is required and there is no toggle: the state is absolute, so
+    /// re-running a command whose output you did not see lands where you asked
+    /// rather than undoing it.
+    SetExportability {
+        /// Key ID
+        key_id: String,
+        /// Whether the private half may be released.
+        #[arg(long)]
+        exportable: bool,
+    },
+    /// Rename a key
+    Rename {
+        /// Current key ID
+        key_id: String,
+        /// New key ID
+        new_key_id: String,
+    },
+    /// List all keys
+    List {
+        /// Maximum number of keys to return
+        #[arg(long, default_value = "50")]
+        limit: u64,
+        /// Continue from a previous page: the `nextCursor` it printed
+        #[arg(long)]
+        cursor: Option<String>,
+        /// FILTER: only keys with this status (`active` or `revoked`).
+        #[arg(long)]
+        status: Option<String>,
+        /// FILTER: only keys belonging to this context.
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Export secret key material for one or more keys
+    Secrets {
+        /// Key IDs to export (omit to export all active keys in --context)
+        key_ids: Vec<String>,
+        /// REFERENCE: export every active key in this context when no
+        /// `key_ids` are supplied.
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Export a portable DID secrets bundle for a context as an armored
+    /// sealed bundle. The recipient runs `pnm bootstrap open` to decrypt.
+    Bundle {
+        /// Application context ID whose DID and keys to bundle
+        context: String,
+        /// Path to a BootstrapRequest JSON file produced by `pnm bootstrap request`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519). The X25519 pubkey HPKE seals to
+        /// is derived locally.
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+    },
+    /// Seal one P-256 key that no DID publishes to a recipient, as an armored
+    /// bundle — e.g. an EUDI verifier's access-certificate key, for
+    /// `vtc oid4vp install`. A DID's keys go through `pnm keys bundle`.
+    BundleKey {
+        /// The key's id (`pnm keys list`)
+        key_id: String,
+        /// Path to the recipient's request JSON (`vtc oid4vp request`,
+        /// `pnm bootstrap request`).
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519).
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+        /// Write the armored bundle here instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Write a certificate signing request (PKCS#10, PEM) for a key that stays
+    /// in the VTA — e.g. an EUDI verifier's access-certificate key, used by
+    /// the VTC through the VTA. The VTA builds the request from these
+    /// attributes and the key's own public key. Needs the `sign-csr`
+    /// capability.
+    SignCsr {
+        /// The key's id (`pnm keys list`); P-256 or Ed25519
+        key_id: String,
+        /// CN: the common name
+        #[arg(long)]
+        common_name: String,
+        /// O: the organisation name
+        #[arg(long)]
+        organization: Option<String>,
+        /// organizationIdentifier, e.g. `VATDE-123456789` or `LEIXG-…`
+        #[arg(long)]
+        organization_identifier: Option<String>,
+        /// C: an ISO 3166-1 alpha-2 country code, e.g. `DE`
+        #[arg(long)]
+        country: Option<String>,
+        /// ST: state or province
+        #[arg(long)]
+        state: Option<String>,
+        /// L: locality
+        #[arg(long)]
+        locality: Option<String>,
+        /// OU: an organisational unit (repeatable)
+        #[arg(long = "organizational-unit")]
+        organizational_units: Vec<String>,
+        /// serialNumber attribute of the subject
+        #[arg(long)]
+        serial_number: Option<String>,
+        /// emailAddress in the subject (prefer `--email`, a subject
+        /// alternative name)
+        #[arg(long)]
+        email_address: Option<String>,
+        /// A dNSName subject alternative name (repeatable)
+        #[arg(long)]
+        dns: Vec<String>,
+        /// A URI subject alternative name (repeatable)
+        #[arg(long)]
+        uri: Vec<String>,
+        /// An rfc822Name subject alternative name (repeatable)
+        #[arg(long)]
+        email: Vec<String>,
+        /// Write the PEM here instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// List seed generations
+    Seeds,
+    /// Rotate to a new seed generation. Asks first on a terminal, and
+    /// without one needs `--yes`.
+    RotateSeed {
+        /// Read the BIP-39 mnemonic for the new seed from this file, or `-`
+        /// for stdin (asked without echo on a terminal). Random if omitted.
+        #[arg(long, value_name = "PATH|-")]
+        mnemonic_file: Option<std::path::PathBuf>,
+        /// Deprecated: puts the phrase on the command line. Use
+        /// `--mnemonic-file`.
+        #[arg(long, hide = true, conflicts_with = "mnemonic_file")]
+        mnemonic: Option<String>,
+        /// Rotate without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// Returns true if this command requires authentication.
+pub(crate) fn requires_auth(cmd: &Commands) -> bool {
+    // VTA restart requires auth; other VTA subcommands don't
+    if matches!(
+        cmd,
+        Commands::Vta {
+            command: VtaCommands::Restart
+        }
+    ) {
+        return true;
+    }
+    // did-templates has both offline (Validate/Init/ListBuiltins) and online
+    // (List/Show/Create/Update/Delete) subcommands — the former run without
+    // authentication, the latter need a VTA connection.
+    if let Commands::DidTemplates { command } = cmd {
+        return is_online_template_cmd(command);
+    }
+    // Bootstrap has mostly offline subcommands, but
+    // ProvisionIntegration bridges to the authenticated endpoint.
+    if let Commands::Bootstrap { command } = cmd {
+        return matches!(command, BootstrapCommands::ProvisionIntegration { .. });
+    }
+    // `pnm config resolver-url …` is purely local — it mutates the
+    // PNM config file at `~/.config/pnm/config.toml` and never talks
+    // to the VTA. Other `pnm config` subcommands hit REST endpoints
+    // and need auth.
+    if let Commands::Config {
+        command: ConfigCommands::ResolverUrl { .. },
+    } = cmd
+    {
+        return false;
+    }
+    !matches!(
+        cmd,
+        Commands::Health { .. }
+            | Commands::Auth { .. }
+            | Commands::Setup { .. }
+            | Commands::Vta { .. }
+            | Commands::Bootstrap { .. }
+            | Commands::Completions { .. }
+            | Commands::Rooms {
+                command: RoomCommands::Use { .. }
+            }
+    )
+}
+
+pub(crate) fn is_online_template_cmd(cmd: &DidTemplateCommands) -> bool {
+    !matches!(
+        cmd,
+        DidTemplateCommands::Validate { .. }
+            | DidTemplateCommands::Init { .. }
+            | DidTemplateCommands::ListBuiltins
+    )
+}
+
+/// Translate a retired `pnm mediator …` invocation into the
+/// equivalent `pnm services didcomm …` command, or `None` if the
+/// args don't match a retired shape. Operates on `args()` directly
+/// so it runs before clap rejects the unknown subcommand.
+pub(crate) fn retired_mediator_redirect<I, S>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let argv: Vec<String> = args
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .skip(1) // drop the binary name
+        .filter(|a| !a.starts_with('-')) // ignore global flags like --json
+        .collect();
+
+    if argv.first().map(|s| s.as_str()) != Some("mediator") {
+        return None;
+    }
+
+    Some(match argv.get(1).map(|s| s.as_str()) {
+        Some("migrate") => "pnm services didcomm update --mediator-did <did>".to_string(),
+        Some("rollback") => "pnm services didcomm rollback".to_string(),
+        Some("report") => "pnm services report".to_string(),
+        Some("drain") => match argv.get(2).map(|s| s.as_str()) {
+            Some("cancel") => "pnm services didcomm drain cancel --mediator-did <did>".to_string(),
+            Some("list") => "pnm services didcomm drain list".to_string(),
+            _ => "pnm services didcomm drain {list|cancel}".to_string(),
+        },
+        _ => "pnm services --help".to_string(),
+    })
+}
+
+/// Print the PNM banner.
+///
+/// Only called when stderr is a terminal — a human is watching. Piped or
+/// redirected, it is six lines of noise in front of whatever the caller
+/// actually wanted, so the caller never sees it. Colour is dropped when
+/// `NO_COLOR` is set; the block glyphs are text, not escapes, so the logo
+/// still reads.
+pub(crate) fn print_banner() {
+    use vta_cli_common::startup::banner_color;
+    let (cyan, magenta, yellow, dim, reset) = (
+        banner_color("\x1b[36m"),
+        banner_color("\x1b[35m"),
+        banner_color("\x1b[33m"),
+        banner_color("\x1b[2m"),
+        banner_color("\x1b[0m"),
+    );
+
+    eprintln!(
+        r#"
+{cyan} ██████╗  {magenta}███╗   ██╗ {yellow}███╗   ███╗{reset}
+{cyan} ██╔══██╗ {magenta}████╗  ██║ {yellow}████╗ ████║{reset}
+{cyan} ██████╔╝ {magenta}██╔██╗ ██║ {yellow}██╔████╔██║{reset}
+{cyan} ██╔═══╝  {magenta}██║╚██╗██║ {yellow}██║╚██╔╝██║{reset}
+{cyan} ██║      {magenta}██║ ╚████║ {yellow}██║ ╚═╝ ██║{reset}
+{cyan} ╚═╝      {magenta}╚═╝  ╚═══╝ {yellow}╚═╝     ╚═╝{reset}
+{dim}  Personal Network Manager v{version}{reset}
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+    );
+}
+
+/// Spawn a Ctrl-C / SIGTERM watcher that lets a second signal force the
+/// process out. Operations like a stuck mediator handshake can hold the
+/// async runtime for tens of seconds even though the runtime itself
+/// observed the signal — without this, the operator has no escape.
+/// `collection claim --duration`: a duration (`24h`) or seconds, held to the
+/// 1-minute – 30-day range the claim takes (#2589).
+fn collection_lease_secs(s: &str) -> Result<i64, String> {
+    let n = vta_cli_common::duration::secs_arg_i64(s)?;
+    if (60..=2_592_000).contains(&n) {
+        Ok(n)
+    } else {
+        Err(format!(
+            "{s} is {n} seconds; a claim lasts 60 to 2592000 (1m to 30d)"
+        ))
+    }
+}
+
+pub(crate) fn install_force_exit_handler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    tokio::spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            if SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst) {
+                eprintln!("\nForcing exit.");
+                std::process::exit(crate::exit::INTERRUPTED);
+            }
+            eprintln!("\nShutting down — press Ctrl-C again to force exit.");
+        }
+    });
+}
+
+/// Long help for a `--template` flag: the built-ins this build ships, read
+/// from `vta_sdk::did_templates::BUILTIN_NAMES` so the help cannot name a
+/// retired template (#2635).
+pub(crate) fn template_name_help() -> String {
+    format!(
+        "DID template name the VTA should render: a built-in ({}) or an \
+         operator-uploaded custom template.",
+        vta_sdk::did_templates::BUILTIN_NAMES.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod config_update_flag_tests {
+    use super::*;
+
+    /// `vta_sdk::rate_limit` prints `pnm config update --rate-limit-… <N>` as
+    /// the runtime fix for a VTA 429. Parse exactly those flags, so a renamed
+    /// flag fails here rather than in front of an operator.
+    #[test]
+    fn config_update_accepts_the_flags_the_sdk_hint_prints() {
+        for flags in [
+            vta_sdk::rate_limit::VTA_RUNTIME_FLAGS,
+            vta_sdk::rate_limit::VTA_DID_LOG_RUNTIME_FLAGS,
+        ] {
+            let args: Vec<&str> = std::iter::once("pnm")
+                .chain(
+                    flags
+                        .split_whitespace()
+                        .map(|t| if t == "<N>" { "7" } else { t }),
+                )
+                .collect();
+            assert!(
+                Cli::try_parse_from(&args).is_ok(),
+                "pnm must accept the SDK hint `{flags}`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_connect_flag_tests {
+    use super::*;
+
+    const CLAIM_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    #[test]
+    fn bootstrap_connect_accepts_either_target() {
+        for (flag, value) in [
+            ("--vta-did", "did:webvh:scid:vta.example.com"),
+            ("--vta-url", "https://vta.example.com:8443"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "pnm",
+                    "bootstrap",
+                    "connect",
+                    flag,
+                    value,
+                    "--claim-did",
+                    CLAIM_DID,
+                    "--expect-pcr0",
+                    "abcd",
+                ])
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn older_claim_did_command_lines_still_parse() {
+        for args in [
+            &[
+                "connect",
+                "--slug",
+                "acme",
+                "--vta-did",
+                "did:webvh:scid:vta.example.com",
+                "--expect-pcr0",
+                "abcd",
+            ][..],
+            &["claim-did", "create", "--slug", "acme"],
+            &["claim-did", "show", "--slug", "acme"],
+            &["claim-did", "discard", "--slug", "acme"],
+            &["claim-did", "discard", "--claim-did", CLAIM_DID],
+        ] {
+            let argv = ["pnm", "bootstrap"].iter().chain(args).copied();
+            assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
+        }
+        let neither = Cli::try_parse_from(["pnm", "bootstrap", "claim-did", "discard"]);
+        assert!(neither.is_err());
+    }
+
+    #[test]
+    fn bootstrap_connect_requires_exactly_one_target() {
+        let missing = Cli::try_parse_from(["pnm", "bootstrap", "connect"])
+            .err()
+            .unwrap();
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let conflicting = Cli::try_parse_from([
+            "pnm",
+            "bootstrap",
+            "connect",
+            "--vta-did",
+            "did:webvh:scid:vta.example.com",
+            "--vta-url",
+            "https://vta.example.com",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(conflicting.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn didcomm_enable_accepts_setup_acl_but_not_with_force() {
+        assert!(
+            Cli::try_parse_from([
+                "pnm",
+                "services",
+                "didcomm",
+                "enable",
+                "--mediator-did",
+                "did:web:mediator.example",
+                "--setup-acl",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "pnm",
+                "services",
+                "didcomm",
+                "enable",
+                "--mediator-did",
+                "did:web:mediator.example",
+                "--setup-acl",
+                "--force",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn didcomm_update_accepts_setup_acl_but_not_with_force() {
+        assert!(
+            Cli::try_parse_from([
+                "pnm",
+                "services",
+                "didcomm",
+                "update",
+                "--mediator-did",
+                "did:web:mediator.example",
+                "--setup-acl",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "pnm",
+                "services",
+                "didcomm",
+                "update",
+                "--mediator-did",
+                "did:web:mediator.example",
+                "--setup-acl",
+                "--force",
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn transport_defaults_to_auto() {
+        let cli = Cli::try_parse_from(["pnm", "health"]).unwrap();
+        assert_eq!(cli.transport, TransportOpt::Auto);
+    }
+
+    #[test]
+    fn transport_rest_parses() {
+        let cli = Cli::try_parse_from(["pnm", "--transport", "rest", "health"]).unwrap();
+        assert_eq!(cli.transport, TransportOpt::Rest);
+    }
+
+    #[test]
+    fn transport_rejects_unknown_value() {
+        assert!(Cli::try_parse_from(["pnm", "--transport", "bogus", "health"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod memory_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// The scope flag is required, never defaulted. A super-admin's context
+    /// check passes for any id and the memory tasks don't require the context
+    /// to exist, so a defaulted id would read and write a context that isn't
+    /// there and look like an empty one. Clap refusing is the whole guard.
+    #[test]
+    fn every_memory_subcommand_requires_a_context() {
+        for args in [
+            vec!["pnm", "memory", "plant", "k", "v"],
+            vec!["pnm", "memory", "recall"],
+            vec!["pnm", "memory", "delete", "k"],
+            vec!["pnm", "memory", "wipe"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} parsed without --context"
+            );
+        }
+    }
+
+    #[test]
+    fn context_id_stays_accepted_as_an_alias() {
+        let cli =
+            Cli::try_parse_from(["pnm", "memory", "recall", "--context-id", "agent"]).unwrap();
+        let Commands::Memory {
+            command: MemoryCommands::Recall { context, key, .. },
+        } = cli.command
+        else {
+            panic!("expected memory recall");
+        };
+        assert_eq!(context, "agent");
+        assert_eq!(key, None);
+    }
+
+    /// `--yes` is the workspace's skip-the-prompt flag (`pnm keys create
+    /// --yes`); `--force` means "hard-delete" on the vault commands. Renamed
+    /// to match, with the old spelling kept working.
+    #[test]
+    fn wipe_takes_yes_and_still_honours_force() {
+        for flag in ["--yes", "-y", "--force"] {
+            let cli =
+                Cli::try_parse_from(["pnm", "memory", "wipe", "--context", "agent", flag]).unwrap();
+            let Commands::Memory {
+                command: MemoryCommands::Wipe { yes, .. },
+            } = cli.command
+            else {
+                panic!("expected memory wipe");
+            };
+            assert!(yes, "{flag} did not set yes");
+        }
+    }
+
+    #[test]
+    fn trust_task_verbs_alias_the_command_names() {
+        for (alias, expect_plant) in [("put", true), ("plant", true)] {
+            let cli = Cli::try_parse_from(["pnm", "memory", alias, "k", "v", "--context", "agent"])
+                .unwrap();
+            let Commands::Memory { command } = cli.command else {
+                panic!("expected memory");
+            };
+            assert_eq!(
+                matches!(command, MemoryCommands::Plant { .. }),
+                expect_plant
+            );
+        }
+        for alias in ["list", "recall"] {
+            assert!(Cli::try_parse_from(["pnm", "memory", alias, "--context", "agent"]).is_ok());
+        }
+        // `delete` is the name; `forget` was, before removal commands were
+        // standardised on `delete`, and stays a hidden alias.
+        for alias in ["delete", "forget"] {
+            let cli = Cli::try_parse_from(["pnm", "memory", alias, "k", "--context", "agent"])
+                .unwrap_or_else(|e| panic!("{alias}: {e}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Commands::Memory {
+                        command: MemoryCommands::Delete { .. }
+                    }
+                ),
+                "{alias} did not parse as memory delete"
+            );
+        }
+        for alias in ["clear", "wipe"] {
+            assert!(Cli::try_parse_from(["pnm", "memory", alias, "--context", "agent"]).is_ok());
+        }
+    }
+}
+
+/// How a value should be typed on the wire.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ValueTypeOpt {
+    /// Taken literally. `--value` is used as-is, not parsed as JSON.
+    String,
+    Number,
+    Boolean,
+    /// An ISO-8601 date, carried as a string.
+    Date,
+    /// A JSON object. `--value` is parsed.
+    Object,
+}
+
+/// Where a value came from — which decides how it may be presented.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ProvenanceOpt {
+    /// The holder typed it. True of most of an address book.
+    #[default]
+    SelfAsserted,
+    /// Backed by a held credential. Requires `--credential-id` and
+    /// `--claim-path`.
+    CredentialBacked,
+    /// Minted by the agent — a relay address, a per-verifier alias. Requires
+    /// `--generator`.
+    Generated,
+    /// Taken from a source you connected or supplied — a profile, a CV — that
+    /// nobody signed. Requires `--source`.
+    Derived,
+}
+
+/// How strongly a credential-backed claim is hidden when presented, most
+/// private first.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ProofRungOpt {
+    /// Proves a statement over the claim without disclosing it.
+    Predicate,
+    /// Discloses only what is needed, unlinkably — two presentations cannot be
+    /// joined.
+    Derived,
+    /// Discloses only what is needed, but carries the issuer's signature
+    /// unchanged, so two presentations ARE linkable.
+    SelectiveDisclosure,
+    /// Discloses the whole credential.
+    Whole,
+}
+
+/// `pnm persona …` — the holder's own identity.
+#[derive(Subcommand)]
+pub(crate) enum PersonaCommands {
+    /// Your attributes — what you say about yourself, each held once.
+    ///
+    /// Sits above every context, so it needs an agent credential with no
+    /// context restriction, or one granted `persona-holder`. A context admin
+    /// holding neither is refused.
+    Attribute {
+        #[command(subcommand)]
+        command: PersonaAttributeCommands,
+    },
+    /// Faces — the sets of attributes you show together. Same authority as your
+    /// attributes: above every context.
+    Profile {
+        #[command(subcommand)]
+        command: PersonaProfileCommands,
+    },
+    /// Wearing — which face a persona wears in a given context.
+    Binding {
+        #[command(subcommand)]
+        command: PersonaBindingCommands,
+    },
+    /// Contacts — what other people have told you about themselves.
+    Contact {
+        #[command(subcommand)]
+        command: PersonaContactCommands,
+    },
+    /// What leaves — see it before it goes, then let it go.
+    Disclosure {
+        #[command(subcommand)]
+        command: PersonaDisclosureCommands,
+    },
+    /// Faces and wearing that live INSIDE one context, built only from values
+    /// typed there — they cannot reach your attributes.
+    Local {
+        #[command(subcommand)]
+        command: PersonaLocalCommands,
+    },
+    /// Report how linkable a value, an attribute or a face would make you — "same
+    /// person to anyone who sees both". Reads only; writes nothing.
+    ///
+    /// Note the inversion: a credential shown WHOLE links you more than a value
+    /// you simply said, because the issuer's signature is identical everywhere
+    /// it goes — while a derived proof links you less.
+    Correlate {
+        /// Analyse one attribute you hold.
+        #[arg(long = "attribute-id")]
+        attribute_id: Option<String>,
+        /// Analyse a whole face.
+        #[arg(long = "profile-id")]
+        profile_id: Option<String>,
+        /// Analyse a value that is NOT stored — "what would happen if I gave
+        /// them this". Path to a JSON document, or `-` for stdin.
+        #[arg(long = "candidate-file")]
+        candidate_file: Option<String>,
+    },
+    /// Worlds — the parts of your life you have named, and which faces and
+    /// attributes belong to each.
+    ///
+    /// A world is an arrangement and nothing more: deleting one leaves every
+    /// face and attribute exactly where it was. It never contains anything, so
+    /// it cannot take anything with it.
+    World {
+        #[command(subcommand)]
+        command: PersonaWorldCommands,
+    },
+    /// The claim-type registry this VTA resolves against — what each type means,
+    /// how a client should mask it, and what it takes to let it leave.
+    ///
+    /// Read it rather than assuming: the registry is what decides whether a
+    /// value is hidden on screen and whether letting it go needs a fresh
+    /// authentication.
+    ClaimTypes,
+    /// List the output formats this VTA can produce, and what each DISCARDS.
+    /// Worth running before a preview: one that drops where an attribute came from
+    /// turns "my employer attested this" into something you merely said.
+    ///
+    /// Open to any authenticated caller — it names nothing about you, and a
+    /// context-scoped operator about to request a disclosure needs it.
+    Renderers,
+}
+
+/// `pnm persona attribute …`
+// Parsed once and matched in `main`, like the other subcommand enums here that
+// carry this allow; boxing `Put`'s flags would obscure the derive for nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+pub(crate) enum PersonaAttributeCommands {
+    /// Store one attribute about the holder. Omit `--attribute-id` to create.
+    Put {
+        /// Vocabulary token naming what this is — `name.legal`,
+        /// `phone.mobile`, `address.postal`. Dotted, most-general first;
+        /// `x:` opens an extension namespace.
+        #[arg(long = "type")]
+        claim_type: String,
+        /// The value. Taken literally for `--value-type string` and `date`;
+        /// parsed as JSON otherwise.
+        #[arg(long)]
+        value: String,
+        /// What the value is.
+        #[arg(long = "value-type", value_enum, default_value = "string")]
+        value_type: ValueTypeOpt,
+        /// The holder's own name for it — "work mobile", "the flat".
+        #[arg(long)]
+        label: Option<String>,
+        /// Where the value came from.
+        #[arg(long, value_enum, default_value = "self-asserted")]
+        provenance: ProvenanceOpt,
+        /// Vault id of the backing credential. Required for
+        /// `--provenance credential-backed`.
+        #[arg(long = "credential-id")]
+        credential_id: Option<String>,
+        /// RFC 6901 JSON Pointer to the claim inside that credential, e.g.
+        /// `/credentialSubject/familyName`. Required for
+        /// `--provenance credential-backed`.
+        #[arg(long = "claim-path")]
+        claim_path: Option<String>,
+        /// Issuer of the backing credential. Advisory — a consumer verifies
+        /// the credential rather than trusting this.
+        #[arg(long = "issuer-did")]
+        issuer_did: Option<String>,
+        /// The rung this claim should be presented at.
+        #[arg(long, value_enum)]
+        proof: Option<ProofRungOpt>,
+        /// Names the minting scheme, e.g. `relayEmail`. Required for
+        /// `--provenance generated`.
+        #[arg(long)]
+        generator: Option<String>,
+        /// Mint a distinct value per verifier. Defaults to true server-side,
+        /// and there is rarely a reason to turn it off.
+        #[arg(long = "per-verifier")]
+        per_verifier: Option<bool>,
+        /// For `--provenance derived`: the kind of source — `github`,
+        /// `cvUpload` — never a handle or URL, since it is shown to whoever
+        /// you disclose the value to.
+        #[arg(long)]
+        source: Option<String>,
+        /// For `--provenance derived`: when the value was taken (RFC 3339).
+        /// Defaults to now.
+        #[arg(long = "derived-at")]
+        derived_at: Option<String>,
+        /// A credential in your vault in which someone endorses this value.
+        /// Repeatable. The value stays whatever its provenance says.
+        #[arg(long = "endorsement", value_name = "CREDENTIAL_ID")]
+        endorsements: Vec<String>,
+        /// Update an existing attribute, or make a create idempotent.
+        #[arg(long = "attribute-id")]
+        attribute_id: Option<String>,
+        /// Require the attribute to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// Enumerate the pool. Metadata only unless `--values` is given.
+    List {
+        /// Match a dotted prefix — `phone` returns `phone.mobile` and
+        /// `phone.work`.
+        #[arg(long = "type-prefix")]
+        type_prefix: Option<String>,
+        /// Include the values themselves. This turns a listing into a read of
+        /// the holder's identity, so it is opt-in.
+        #[arg(long)]
+        values: bool,
+        /// Also show the sensitive ones — cards, passports, phone numbers.
+        /// Widens `--values`; on its own it shows nothing extra, because it
+        /// can never be the flag that puts plaintext on your screen.
+        #[arg(long)]
+        sensitive: bool,
+        /// Include attributes whose backing credential can no longer be
+        /// re-derived. On by default — a holder deciding what to present needs
+        /// to see what went stale, not have it quietly omitted.
+        #[arg(long = "include-stale")]
+        include_stale: Option<bool>,
+        /// Page size.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroU64>,
+        /// Continuation token from a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Remove an attribute. Refused while a profile still references it
+    /// unless `--cascade` is given.
+    Delete {
+        /// The attribute id.
+        #[arg(long = "attribute-id")]
+        attribute_id: String,
+        /// Also drop every profile entry referencing it.
+        #[arg(long)]
+        cascade: bool,
+        /// Require the attribute to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// Permanently remove earlier versions your agent kept because a face pins
+    /// them — an old name after a name change. Faces that pinned a removed
+    /// version show nothing for it afterwards; they are listed. `persona
+    /// attribute list` shows what is kept, and for which face.
+    PurgeVersion {
+        /// The attribute id.
+        #[arg(long = "attribute-id")]
+        attribute_id: String,
+        /// A kept version to remove. Repeatable; omit to remove every kept
+        /// version. The current value is never removed here — that is
+        /// `delete`.
+        #[arg(long = "version")]
+        versions: Vec<u64>,
+    },
+    /// Make values a context-local face carries reusable across your faces.
+    /// The face moves into the pool, keeping its id and everyone wearing it.
+    /// One-way: a value made reusable cannot be made local again.
+    Promote {
+        /// The trust context the local face lives in.
+        #[arg(long)]
+        context: String,
+        /// The context-local face.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// Position of an entry to promote, counting from 0, as `persona local
+        /// profile get` lists them. Repeatable.
+        #[arg(long = "entry", required = true)]
+        entries: Vec<u64>,
+        /// The face's version as you read it. Required: a position into a face
+        /// edited since would promote a different value than you chose.
+        #[arg(long = "expected-version")]
+        expected_version: u64,
+    },
+}
+
+/// `pnm persona profile …`
+#[derive(Subcommand)]
+pub(crate) enum PersonaProfileCommands {
+    /// Create or update a profile. Supply entries with `--ref` (repeatable,
+    /// for the simple "just show these attributes" case) or `--entries-file`
+    /// for the full shape.
+    Put {
+        /// The holder's name for this projection — "work", "gaming".
+        #[arg(long)]
+        name: String,
+        /// Reference a pool attribute, live. Repeatable.
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+        /// The attribute this face calls itself by — its `displayName`. A face
+        /// may show several names (a legal one, a preferred one); this says
+        /// which one is the face's own. Added as a live reference if it is not
+        /// already one of the `--ref`s.
+        #[arg(long = "display-name", conflicts_with = "entries_file")]
+        display_name: Option<String>,
+        /// Path to a JSON array of profile entries (or `-` for stdin). Each
+        /// is one of `{"ref":…}`, `{"ref":…,"pinVersion":n}`,
+        /// `{"ref":…,"override":{…}}` or `{"inline":{…}}`, and any of them may
+        /// add `"slot":"displayName"` (or another role) — unique per face.
+        #[arg(long = "entries-file", conflicts_with = "refs")]
+        entries_file: Option<String>,
+        /// Tag a credential as belonging with this profile. Repeatable.
+        #[arg(long = "credential-ref")]
+        credential_refs: Vec<String>,
+        /// Let this face be worn only in this context. Repeatable. Omit both
+        /// this and `--reach-anywhere` to keep the face's current reach.
+        #[arg(
+            long = "reach-only",
+            value_name = "CONTEXT",
+            conflicts_with = "reach_anywhere"
+        )]
+        reach_only: Vec<String>,
+        /// Let this face be worn in any context again.
+        #[arg(long = "reach-anywhere")]
+        reach_anywhere: bool,
+        /// Update an existing profile, or make a create idempotent.
+        #[arg(long = "profile-id")]
+        profile_id: Option<String>,
+        /// Require the profile to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// Compose a face for one context, where it is asked for — and wear it
+    /// there with `--persona-did`. Typed values stay in this face unless you
+    /// share them: a face of only `--claim`s lives in the context alone; any
+    /// `--share` or `--held` makes a face in your pool, worn here.
+    Compose {
+        /// The trust context the face is for.
+        #[arg(long)]
+        context: String,
+        /// Your name for the face. Never shown to anyone.
+        #[arg(long)]
+        name: String,
+        /// A value to show here and nowhere else, as `TYPE=VALUE`
+        /// (`name.display=Ada`). Repeatable.
+        #[arg(long = "claim", value_name = "TYPE=VALUE")]
+        claims: Vec<String>,
+        /// A value to make reusable across your faces, as `TYPE=VALUE`. One
+        /// you already keep is reused rather than copied. Repeatable.
+        #[arg(long = "share", value_name = "TYPE=VALUE")]
+        shared: Vec<String>,
+        /// An attribute you already keep, by id. Repeatable.
+        #[arg(long = "held", value_name = "ATTRIBUTE_ID")]
+        held: Vec<String>,
+        /// Path to a JSON array of claims (or `-` for stdin), for values that
+        /// are not strings or claims that need a slot or label. Each is
+        /// `{"type":…,"valueType":…,"value":…,"share":"local"|"pool"}` or
+        /// `{"attributeId":…}`, either with an optional `"slot"`.
+        #[arg(long = "claims-file", conflicts_with_all = ["claims", "shared", "held"])]
+        claims_file: Option<String>,
+        /// Wear the face as this persona in the context.
+        #[arg(long = "persona-did", conflicts_with = "wear")]
+        persona_did: Option<String>,
+        /// Wear the face here as the persona you already use in this context.
+        #[arg(long)]
+        wear: bool,
+        /// What the context may call the face. Needs the face worn.
+        #[arg(long)]
+        label: Option<String>,
+        /// When wearing it here ends on its own (RFC 3339). The face is then
+        /// retired if it is worn nowhere else. Needs the face worn.
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// Where a face is worn now, and where it may be.
+    Usage {
+        /// The face.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// The context of a context-local face. Omit for a face in your pool.
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// What a face has done, oldest first: made, worn, taken off, what it told
+    /// whom, when a value it shows changed. Never a value.
+    Timeline {
+        /// The face.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// The context of a context-local face. Omit for a face in your pool.
+        #[arg(long)]
+        context: Option<String>,
+        /// Only events at or after this time (RFC 3339).
+        #[arg(long)]
+        since: Option<String>,
+        /// Continue from a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Page size.
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Read one profile.
+    Get {
+        /// The profile id.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// Resolve entries against the pool and show what the profile would
+        /// actually present, rather than how it is built.
+        #[arg(long)]
+        resolve: bool,
+    },
+    /// Enumerate profiles.
+    List {
+        /// Page size.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroU64>,
+        /// Continuation token.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Include faces you have retired.
+        #[arg(long = "include-retired")]
+        include_retired: bool,
+    },
+    /// Stop wearing a face anywhere, and keep it: it is taken off every
+    /// context, left out of pickers, and cannot be worn until reinstated.
+    /// Nothing it carries or told anyone is removed.
+    Retire {
+        /// The face.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// The context of a context-local face. Omit for a face in your pool.
+        #[arg(long)]
+        context: Option<String>,
+        /// Require the face to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// Make a retired face wearable again. It is worn nowhere until you wear
+    /// it somewhere.
+    Reinstate {
+        /// The face.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// The context of a context-local face. Omit for a face in your pool.
+        #[arg(long)]
+        context: Option<String>,
+        /// Require the face to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// Remove a profile. Refused while a persona still presents under it
+    /// unless `--unbind` is given.
+    Delete {
+        /// The profile id.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// Also clear every binding pointing at it. Those personas will
+        /// present nothing until rebound.
+        #[arg(long)]
+        unbind: bool,
+        /// Require the profile to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+}
+
+/// `pnm persona binding …`
+#[derive(Subcommand)]
+pub(crate) enum PersonaBindingCommands {
+    /// Decide what a context sees. The profile is resolved above the context
+    /// and a COPY of its values is written in — the context never reads back
+    /// into the pool. Omit `--profile-id` to clear the binding.
+    Set {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The persona DID presenting in it. Omit to use the persona you
+        /// already use in this context; refused when there is none or several.
+        #[arg(long = "persona-did")]
+        persona_did: Option<String>,
+        /// The profile to project. Omit to clear.
+        #[arg(long = "profile-id")]
+        profile_id: Option<String>,
+        /// Attribute ids disclosed in this context without asking.
+        /// Repeatable.
+        #[arg(long = "public")]
+        public_entries: Vec<String>,
+        /// What this context may call the face. The context is never told
+        /// your own name for it; omit this and it is given no name at all.
+        #[arg(long)]
+        label: Option<String>,
+        /// When wearing the face here ends on its own (RFC 3339, e.g.
+        /// 2026-10-05T18:00:00Z). The face is then retired if it is worn
+        /// nowhere else — never deleted.
+        #[arg(long, requires = "profile_id")]
+        until: Option<String>,
+        /// Require the binding to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// What one persona presents in one context.
+    Get {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The persona DID.
+        #[arg(long = "persona-did")]
+        persona_did: String,
+    },
+    /// Every persona bound in one context.
+    List {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// Page size.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroU64>,
+        /// Continuation token.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+}
+
+/// `pnm persona contact …`
+#[derive(Subcommand, Debug)]
+pub(crate) enum PersonaWorldCommands {
+    /// List the worlds you have named.
+    List {
+        /// Page size to ask for — never a cap. Follow --cursor to the end.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroU64>,
+        /// Continue a previous listing.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Name a world, or replace one.
+    ///
+    /// BOTH lists replace. Omitting --face empties the world's faces rather
+    /// than leaving them alone, so pass the list you want to end up with —
+    /// `persona world list` shows what is there now.
+    Put {
+        /// What you call it — "Work", "Home", "Play". Only you ever see it.
+        #[arg(long)]
+        name: String,
+        /// Its colour: slate, indigo, teal, moss, sand, clay, rose or plum.
+        #[arg(long)]
+        colour: WorldColourOpt,
+        /// One or two emoji shown beside the name.
+        #[arg(long)]
+        icon: Option<String>,
+        /// A face belonging to it. Repeatable. A face belongs to at most one
+        /// world.
+        #[arg(long = "face")]
+        face_ids: Vec<String>,
+        /// An attribute belonging to it. Repeatable. An attribute may belong
+        /// to several — a mobile number is genuinely both work and home.
+        #[arg(long = "attribute")]
+        attribute_ids: Vec<String>,
+        /// Replace an existing world instead of creating one.
+        #[arg(long = "world-id")]
+        facet_id: Option<String>,
+        /// Refuse the write unless the world is still at this version. Pass 0
+        /// to create only.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// Unname a world. Every face and attribute in it stays where it was.
+    Delete {
+        /// The world to remove.
+        #[arg(long = "world-id")]
+        facet_id: String,
+        /// Refuse the delete unless the world is still at this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+}
+
+/// The eight colours a world may carry, as the specification names them.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum WorldColourOpt {
+    Slate,
+    Indigo,
+    Teal,
+    Moss,
+    Sand,
+    Clay,
+    Rose,
+    Plum,
+}
+
+impl WorldColourOpt {
+    /// The token the specification names this colour by. The generated
+    /// `FacetColour` parses these; clap's own kebab-casing happens to agree,
+    /// but the mapping is written out so a renamed variant cannot silently
+    /// start sending a colour the schema refuses.
+    pub(crate) fn as_spec_token(self) -> &'static str {
+        match self {
+            Self::Slate => "slate",
+            Self::Indigo => "indigo",
+            Self::Teal => "teal",
+            Self::Moss => "moss",
+            Self::Sand => "sand",
+            Self::Clay => "clay",
+            Self::Rose => "rose",
+            Self::Plum => "plum",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum PersonaContactCommands {
+    /// Record what a peer disclosed. Writes a new revision rather than
+    /// overwriting, so what they told you in March survives them changing it
+    /// in April.
+    Put {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The DID the disclosure came from.
+        #[arg(long = "subject-did")]
+        subject_did: String,
+        /// Which of the holder's own personas knows this contact. Required —
+        /// a contact filed against no persona is one you cannot later reason
+        /// about disclosing to.
+        #[arg(long = "known-by")]
+        known_by_persona: String,
+        /// Path to the disclosed document JSON (or `-` for stdin):
+        /// `{"claims":[…]}`.
+        #[arg(long = "document-file")]
+        document_file: String,
+        /// A credential received alongside it. Repeatable.
+        #[arg(long = "credential-ref")]
+        credential_refs: Vec<String>,
+        /// The holder's private annotation. Never disclosed.
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// Read one contact.
+    Get {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The contact id.
+        #[arg(long = "contact-id")]
+        contact_id: String,
+        /// Read one specific revision instead of the current one.
+        #[arg(long)]
+        rev: Option<std::num::NonZeroU64>,
+        /// Return every retained revision.
+        #[arg(long = "history")]
+        include_history: bool,
+    },
+    /// Enumerate contacts in one context.
+    List {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// Only contacts filed against this persona.
+        #[arg(long = "known-by")]
+        known_by_persona: Option<String>,
+        /// Only contacts whose current revision is newer than this
+        /// (RFC 3339).
+        #[arg(long = "changed-since")]
+        changed_since: Option<String>,
+        /// Page size.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroU64>,
+        /// Continuation token.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Forget a contact.
+    Delete {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The contact id.
+        #[arg(long = "contact-id")]
+        contact_id: String,
+    },
+}
+
+/// `pnm persona disclosure …`
+#[derive(Subcommand)]
+pub(crate) enum PersonaDisclosureCommands {
+    /// Show exactly what would be revealed, and to whom. Signs nothing and
+    /// sends nothing.
+    ///
+    /// This is the only screen between a request and the holder's identity
+    /// leaving the machine, and the `previewId` it returns is the ONLY way to
+    /// reach `present` — there is no single-call form.
+    Preview {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The persona that would present. Its binding supplies the profile.
+        #[arg(long = "persona-did")]
+        persona_did: String,
+        /// Who would receive it.
+        #[arg(long = "verifier-did")]
+        verifier_did: String,
+        /// A claim type the verifier asked for. Repeatable. Omit to preview
+        /// everything the bound profile would present.
+        #[arg(long = "claim")]
+        requested_claims: Vec<String>,
+        /// The verifier's stated reason, carried into the preview and the
+        /// disclosure record.
+        #[arg(long)]
+        purpose: Option<String>,
+        /// Which output format to prepare for. Omit for the canonical one.
+        /// See `persona renderers` for what each one discards.
+        #[arg(long)]
+        renderer: Option<String>,
+    },
+    /// Hand over what the preview showed. Consumes the preview — a replay is
+    /// refused rather than riding the earlier decision.
+    Present {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The preview being acted on.
+        #[arg(long = "preview-id")]
+        preview_id: String,
+        /// Verifier-supplied nonce binding the disclosure to this exchange.
+        #[arg(long)]
+        challenge: Option<String>,
+        /// Path to a JSON object (or `-` for stdin) asking for the disclosure
+        /// as a self-issued credential rather than a bare document.
+        #[arg(long = "mint-file")]
+        mint_file: Option<String>,
+    },
+    /// What was disclosed, to whom, when. Omit `--context` to read across
+    /// every context — which is a holder-scoped read and gated as one.
+    History {
+        /// Narrow to one trust context.
+        #[arg(long)]
+        context: Option<String>,
+        /// Narrow to one verifier.
+        #[arg(long = "verifier-did")]
+        verifier_did: Option<String>,
+        /// Narrow to one claim type.
+        #[arg(long = "type")]
+        attribute_type: Option<String>,
+        /// Only disclosures after this instant (RFC 3339).
+        #[arg(long)]
+        since: Option<String>,
+        /// Page size.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroU64>,
+        /// Continuation token.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+}
+
+/// `pnm persona local …`
+#[derive(Subcommand)]
+pub(crate) enum PersonaLocalCommands {
+    /// Profiles that live inside one context.
+    Profile {
+        #[command(subcommand)]
+        command: PersonaLocalProfileCommands,
+    },
+    /// Bind a persona DID to a context-local profile.
+    Binding {
+        #[command(subcommand)]
+        command: PersonaLocalBindingCommands,
+    },
+}
+
+/// `pnm persona local profile …`
+#[derive(Subcommand)]
+pub(crate) enum PersonaLocalProfileCommands {
+    /// Create or update a context-local profile.
+    ///
+    /// Entries are inline values only. A profile built inside a context
+    /// cannot reference, pin or override an attribute in the holder's pool —
+    /// that is the boundary, and it is enforced by the schema rather than by
+    /// this command.
+    Put {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The holder's name for it.
+        #[arg(long)]
+        name: String,
+        /// Path to a JSON array of entries (or `-` for stdin). Each is
+        /// `{"inline":{"type":…,"value":…,"valueType":…,"provenance":{…}}}`.
+        #[arg(long = "entries-file")]
+        entries_file: String,
+        /// Update an existing local profile, or make a create idempotent.
+        #[arg(long = "profile-id")]
+        profile_id: Option<String>,
+        /// Require the profile to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+    /// Read one context-local profile.
+    Get {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The profile id.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+    },
+    /// Enumerate a context's own profiles.
+    List {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// Page size.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroU64>,
+        /// Continuation token.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Remove a context-local profile.
+    Delete {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The profile id.
+        #[arg(long = "profile-id")]
+        profile_id: String,
+        /// Also clear any local binding pointing at it.
+        #[arg(long)]
+        unbind: bool,
+    },
+}
+
+/// `pnm persona local binding …`
+#[derive(Subcommand)]
+pub(crate) enum PersonaLocalBindingCommands {
+    /// Bind a persona DID to a context-local profile. Omit `--profile-id` to
+    /// clear.
+    Set {
+        /// The trust context.
+        #[arg(long)]
+        context: String,
+        /// The persona DID.
+        #[arg(long = "persona-did")]
+        persona_did: String,
+        /// The context-local profile. Omit to clear.
+        #[arg(long = "profile-id")]
+        profile_id: Option<String>,
+        /// What this context may call the face. The context is never told
+        /// your own name for it; omit this and it is given no name at all.
+        #[arg(long)]
+        label: Option<String>,
+        /// When wearing the face here ends on its own (RFC 3339, e.g.
+        /// 2026-10-05T18:00:00Z). The face is then retired if it is worn
+        /// nowhere else — never deleted.
+        #[arg(long, requires = "profile_id")]
+        until: Option<String>,
+        /// Require the binding to be at exactly this version.
+        #[arg(long = "expected-version")]
+        expected_version: Option<u64>,
+    },
+}
+
+#[cfg(test)]
+mod removal_verb_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Deleting a connection drops the stored credential too, so the
+    /// confirmation is the default and `--yes` is the explicit opt-out.
+    #[test]
+    fn vta_delete_defaults_to_confirming() {
+        let cli = Cli::try_parse_from(["pnm", "vta", "delete", "my-vta"]).unwrap();
+        let Commands::Vta {
+            command: VtaCommands::Delete { slug, yes },
+        } = cli.command
+        else {
+            panic!("expected `vta delete`");
+        };
+        assert_eq!(slug, "my-vta");
+        assert!(!yes);
+    }
+
+    /// `vta qr` runs offline off the config, so it takes no positional
+    /// argument; `--did` and `--out` are the only knobs.
+    #[test]
+    fn vta_qr_parses_with_and_without_flags() {
+        let cli = Cli::try_parse_from(["pnm", "vta", "qr"]).unwrap();
+        let Commands::Vta {
+            command: VtaCommands::Qr { did, out },
+        } = cli.command
+        else {
+            panic!("expected `vta qr`");
+        };
+        assert!(did.is_none() && out.is_none());
+
+        let cli = Cli::try_parse_from([
+            "pnm",
+            "vta",
+            "qr",
+            "--did",
+            "did:key:z6Mk",
+            "--out",
+            "vta.svg",
+        ])
+        .unwrap();
+        let Commands::Vta {
+            command: VtaCommands::Qr { did, out },
+        } = cli.command
+        else {
+            panic!("expected `vta qr`");
+        };
+        assert_eq!(did.as_deref(), Some("did:key:z6Mk"));
+        assert_eq!(out.as_deref(), Some(std::path::Path::new("vta.svg")));
+    }
+
+    /// `remove` was the name before removal commands were standardised on
+    /// `delete`, and `--force` was its prompt-skip flag. Both stay accepted so
+    /// no script breaks.
+    #[test]
+    fn vta_delete_keeps_remove_and_force() {
+        for verb in ["delete", "remove"] {
+            for flag in ["--yes", "-y", "--force"] {
+                let cli = Cli::try_parse_from(["pnm", "vta", verb, "my-vta", flag])
+                    .unwrap_or_else(|e| panic!("{verb} {flag}: {e}"));
+                let Commands::Vta {
+                    command: VtaCommands::Delete { yes, .. },
+                } = cli.command
+                else {
+                    panic!("expected `vta delete` from `{verb}`");
+                };
+                assert!(yes, "{verb} {flag} did not set yes");
+            }
+        }
+    }
+
+    #[test]
+    fn did_mgmt_servers_delete_keeps_remove() {
+        for verb in ["delete", "remove"] {
+            let cli = Cli::try_parse_from(["pnm", "did-mgmt", "servers", verb, "host-1"])
+                .unwrap_or_else(|e| panic!("{verb}: {e}"));
+            let Commands::DidMgmt {
+                command:
+                    DidMgmtCommands::Servers {
+                        command: DidMgmtServerCommands::Delete { id, .. },
+                    },
+            } = cli.command
+            else {
+                panic!("expected `did-mgmt servers delete` from `{verb}`");
+            };
+            assert_eq!(id, "host-1");
+        }
+    }
+
+    /// Prompt-skip on `contexts delete` is `--yes`; the old `--force` / `-f`
+    /// spellings still parse.
+    #[test]
+    fn contexts_delete_takes_yes_and_still_honours_force() {
+        for flag in ["--yes", "-y", "--force", "-f"] {
+            let cli = Cli::try_parse_from(["pnm", "contexts", "delete", "ctx", flag])
+                .unwrap_or_else(|e| panic!("{flag}: {e}"));
+            let Commands::Contexts {
+                command: ContextCommands::Delete { yes, .. },
+            } = cli.command
+            else {
+                panic!("expected contexts delete");
+            };
+            assert!(yes, "{flag} did not set yes");
+        }
+    }
+
+    /// On the vault commands `--force` keeps its one meaning — skip the soft
+    /// delete — and `purge` stays a working synonym for it.
+    #[test]
+    fn vault_delete_force_and_purge_both_parse() {
+        for argv in [
+            vec!["pnm", "vault", "delete", "e1", "--force"],
+            vec!["pnm", "vault", "purge", "e1"],
+            vec!["pnm", "cred-vault", "delete", "c1", "--force"],
+            vec!["pnm", "cred-vault", "purge", "c1"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!("{argv:?} should parse: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod world_colour_tests {
+    use super::WorldColourOpt;
+    use clap::ValueEnum;
+
+    /// Every colour the CLI offers is a token the specification names. The
+    /// mapping is written out rather than derived, so this is what catches a
+    /// renamed variant that would otherwise send a colour the schema refuses.
+    #[test]
+    fn every_offered_colour_is_a_token_the_spec_names() {
+        let tokens: Vec<&str> = WorldColourOpt::value_variants()
+            .iter()
+            .map(|c| c.as_spec_token())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "slate", "indigo", "teal", "moss", "sand", "clay", "rose", "plum"
+            ],
+        );
+    }
+}
+
+#[cfg(test)]
+mod acl_update_hint_tests {
+    use super::*;
+
+    /// The persona refusal (`vta-service` `trust_tasks/persona.rs`) and
+    /// `pnm persona --help` both tell an operator to run this. `pnm acl update`
+    /// takes the entry's DID positionally; the hint used to print `--did`,
+    /// which clap rejects, so the one command offered as the fix did not run.
+    #[test]
+    fn acl_update_accepts_the_persona_holder_grant_the_hints_print() {
+        let did = "did:key:z6MkExampleHolder";
+        assert!(
+            Cli::try_parse_from([
+                "pnm",
+                "acl",
+                "update",
+                did,
+                "--capabilities",
+                "persona-holder",
+            ])
+            .is_ok(),
+            "the printed grant must parse"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "pnm",
+                "acl",
+                "update",
+                "--did",
+                did,
+                "--capabilities",
+                "persona-holder",
+            ])
+            .is_err(),
+            "`--did` is not a flag of `acl update`; a hint spelling it that way is wrong"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rooms_prune_flag_tests {
+    use super::*;
+
+    /// The command `pnm rooms prune` prints as the fix for `notAhead` or a missing
+    /// confirmation parses as written.
+    #[test]
+    fn rooms_prune_accepts_the_command_its_hints_print() {
+        assert!(
+            Cli::try_parse_from([
+                "pnm",
+                "rooms",
+                "prune",
+                "--room",
+                "did:webvh:Qm:example.com:rooms:northwind",
+                "--host",
+                "https://host.example",
+                "--host-did",
+                "did:web:host.example",
+                "--before-epoch",
+                "6",
+                "--reason",
+                "retention window",
+                "--yes",
+            ])
+            .is_ok()
+        );
+    }
+
+    /// A prune leaves no record of intent but its reason, so the CLI asks for one.
+    #[test]
+    fn rooms_prune_requires_a_reason_and_a_floor() {
+        for missing in ["--reason", "--before-epoch"] {
+            let mut args = vec![
+                "pnm",
+                "rooms",
+                "prune",
+                "--room",
+                "did:example:room",
+                "--host",
+                "https://host.example",
+                "--before-epoch",
+                "2",
+                "--reason",
+                "why",
+            ];
+            let at = args.iter().position(|a| *a == missing).unwrap();
+            args.drain(at..at + 2);
+            let err = Cli::try_parse_from(&args).err().unwrap();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{missing}"
+            );
+        }
+    }
+}
+
+/// `pnm webs …` — the `vta/webs/dids/*/0.1` Trust Tasks, and `create/0.2`.
+#[derive(Subcommand)]
+pub(crate) enum WebsCommands {
+    /// Create a did:webs in a context and publish it to a hosting server
+    Create {
+        /// The context the DID belongs to.
+        #[arg(long)]
+        context: String,
+        /// Registered hosting server id (`pnm did-mgmt servers list`). The
+        /// server must run with did:webs support (`method-webs`).
+        #[arg(long)]
+        server: String,
+        /// Slot path before the AID, e.g. `people` (lowercase segments).
+        #[arg(long)]
+        path: Option<String>,
+        /// Hosting domain; the server's default when left out.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Operator-facing label, never published.
+        #[arg(long)]
+        label: Option<String>,
+        /// Designate `#didcomm` through this VTA's mediator.
+        #[arg(long)]
+        didcomm: bool,
+        /// Designate `#tsp` through this VTA's mediator (`--tsp=false` to
+        /// refuse it; left out, the VTA decides from what its stack serves).
+        #[arg(long)]
+        tsp: Option<bool>,
+        /// A further alias to designate (repeatable).
+        #[arg(long = "also-known-as")]
+        also_known_as: Vec<String>,
+        /// Make it the context's primary DID.
+        #[arg(long)]
+        set_primary: bool,
+        /// The DID class: `relationship`, `persona` or `service`
+        /// (`vta/webs/dids/create/0.2`). A `service` DID is level 1 and alpha,
+        /// and needs `[dids] webs_service_dids` on the VTA. Left out, the
+        /// classless 0.1 create is sent.
+        #[arg(long, value_parser = ["relationship", "persona", "service"])]
+        class: Option<String>,
+        /// A DID template to shape the services and aliases from, instead of
+        /// `--didcomm`, `--tsp` and `--also-known-as`. Needs `--class`.
+        #[arg(long, requires = "class", conflicts_with_all = ["didcomm", "tsp", "also_known_as"])]
+        template: Option<String>,
+        /// Look the template up in this context's scope first, then global,
+        /// then the built-ins.
+        #[arg(long, requires = "template")]
+        template_context: Option<String>,
+        /// `KEY=VALUE` — a template variable. Repeatable.
+        #[arg(long = "var", value_parser = parse_key_value, requires = "template")]
+        vars: Vec<(String, String)>,
+    },
+    /// Show a did:webs this VTA holds
+    Get {
+        did: String,
+        /// Also print its published `keri.cesr`.
+        #[arg(long)]
+        keri_cesr: bool,
+    },
+    /// List did:webs DIDs
+    List {
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long)]
+        server: Option<String>,
+        /// Include deactivated DIDs.
+        #[arg(long)]
+        include_deactivated: bool,
+    },
+    /// Replace designated services, the key agreement key or aliases (no key change)
+    Update {
+        did: String,
+        /// The whole service set, replacing what stands: `didcomm`, `tsp`,
+        /// `didcomm,tsp`, or `none`.
+        #[arg(long)]
+        services: Option<String>,
+        /// Designate a freshly derived key agreement key.
+        #[arg(long)]
+        rotate_key_agreement: bool,
+        /// The further aliases, replacing those in force (repeatable).
+        #[arg(long = "also-known-as", conflicts_with = "clear_aliases")]
+        also_known_as: Vec<String>,
+        /// Withdraw every further alias.
+        #[arg(long)]
+        clear_aliases: bool,
+        /// Refuse unless the DID is still at this version (`<sn>:<said>`).
+        #[arg(long)]
+        expect_version: Option<String>,
+    },
+    /// Rotate to the committed successor key
+    Rotate {
+        did: String,
+        /// Refuse unless the DID's current version is this one.
+        #[arg(long = "expected-version", alias = "expect-version")]
+        expect_version: Option<String>,
+    },
+    /// Deactivate the DID for good and remove its slot from the host. Asks
+    /// first on a terminal; without one needs `--yes`.
+    Delete {
+        did: String,
+        /// Refuse unless the DID's current version is this one.
+        #[arg(long = "expected-version", alias = "expect-version")]
+        expect_version: Option<String>,
+        /// Go ahead without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}

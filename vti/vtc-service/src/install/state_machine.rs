@@ -1,0 +1,1188 @@
+//! Install-token state machine.
+//!
+//! Implements **M0.4.2** of the VTC MVP Phase 0 plan. Adopts the
+//! claim-window pattern from `webvh-common::server::passkey::store`
+//! (plan **D12**): an in-flight WebAuthn ceremony locks out
+//! concurrent claims for [`ENROLLMENT_CLAIM_WINDOW_SECS`] (5
+//! minutes) but is **not** consumed until the ceremony succeeds —
+//! a failed ceremony leaves the token redeemable by the legitimate
+//! operator after the window expires.
+//!
+//! Storage:
+//!
+//! - `install:token:<jti>` → [`InstallTokenState`] (`Issued` /
+//!   `Consumed`).
+//!
+//! Every install token (first-admin setup and ongoing
+//! `vtc admin invite`s) carries the same row shape. The earlier
+//! "carve-out" global lockdown is gone — invites are now gated by
+//! the per-row [`InstallTokenState::Issued::claim_secret_hash`]
+//! out-of-band secret + the existing `AdminAuth` on the
+//! invite-mint endpoint. See `claim_secret` module for the hashing
+//! helpers.
+//!
+//! Concurrency: every transition takes [`super::INSTALL_TOKEN_LOCK`]
+//! before reading + writing state. The lock serialises across
+//! Axum tasks so two `start_claim` calls on the same JTI cannot
+//! both pass the "claimed_at not set within the window" check.
+
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use super::INSTALL_TOKEN_LOCK;
+use crate::error::AppError;
+use vti_common::store::KeyspaceHandle;
+
+/// How long an in-flight WebAuthn ceremony locks out concurrent
+/// claims on the same install token. Tracks the same value as
+/// `vti_common::auth::passkey::ENROLLMENT_CLAIM_WINDOW_SECS` (300 s).
+/// Duplicated locally rather than depending on the `passkey` feature
+/// of `vti-common` — the install state machine doesn't need anything
+/// else from that module, and feature-gating one constant through
+/// the dependency tree adds more friction than it's worth. M0.5 will
+/// switch to the shared constant when it enables the `passkey`
+/// feature.
+pub const ENROLLMENT_CLAIM_WINDOW_SECS: u64 = 300;
+
+const TOKEN_KEY_PREFIX: &[u8] = b"install:token:";
+const EMERGENCY_PENDING_KEY: &[u8] = b"install:emergency_pending";
+/// The second unrestricted admin `vtc setup` was given (VTI-APV-014), waiting
+/// for the install bootstrap to write it beside the first.
+const CO_ADMIN_KEY: &[u8] = b"install:co_admin";
+/// ACL writes made offline, daemon stopped, waiting for the daemon to audit
+/// them (`install:break_glass:<uuid>`).
+const BREAK_GLASS_PREFIX: &[u8] = b"install:break_glass:";
+/// The administrator entry a **wallet** invitation wrote at mint, keyed by the
+/// invitation's jti (`install:invite_grant:<jti>`) — see [`InviteGrant`].
+const INVITE_GRANT_PREFIX: &[u8] = b"install:invite_grant:";
+
+fn invite_grant_key(jti: &Uuid) -> Vec<u8> {
+    let mut out = INVITE_GRANT_PREFIX.to_vec();
+    out.extend_from_slice(jti.to_string().as_bytes());
+    out
+}
+
+fn token_key(jti: &Uuid) -> Vec<u8> {
+    let mut out = TOKEN_KEY_PREFIX.to_vec();
+    out.extend_from_slice(jti.to_string().as_bytes());
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Per-token state held in the `install` keyspace.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum InstallTokenState {
+    /// Issued but not yet successfully consumed. `claimed_at` is set
+    /// when a `start_claim` call is in progress; the window
+    /// expires after [`ENROLLMENT_CLAIM_WINDOW_SECS`] so a failed
+    /// ceremony doesn't permanently lock the token.
+    Issued {
+        /// Wall-clock expiry; once exceeded, the token cannot
+        /// progress to `Consumed`.
+        exp: DateTime<Utc>,
+        /// Raw 32 cnonce bytes; the WebAuthn ceremony's
+        /// `clientDataJSON.challenge` is validated against this.
+        #[serde(with = "raw_bytes_b64")]
+        cnonce: [u8; 32],
+        /// Raw 32 ephemeral Ed25519 private key bytes. Only present
+        /// in `Issued`; nulled on transition to `Consumed`.
+        #[serde(with = "raw_bytes_b64")]
+        ephemeral_signing_key: [u8; 32],
+        /// Wall-clock when an in-flight `start_claim` set the
+        /// ceremony lock. `None` means no ceremony has been
+        /// initiated since issuance.
+        claimed_at: Option<DateTime<Utc>>,
+        /// Argon2id PHC hash of the out-of-band claim code the
+        /// invitee must supply at claim-start. `None` for
+        /// pre-claim-secret rows (legacy data and first-admin
+        /// install tokens minted by older builds); the route
+        /// handler treats `None` as "no secret required" so the
+        /// migration is friction-free. New invites always set
+        /// this. See `super::claim_secret`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claim_secret_hash: Option<String>,
+        /// Target admin DID the invite was minted for. Mirrors
+        /// the JWT's `admin_did` claim so the daemon can surface
+        /// it on the invites list without decoding the (gone)
+        /// install URL. `None` for legacy rows persisted before
+        /// this field landed. New invites always set it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin_did: Option<String>,
+        /// The authority a **passkey** invitation was issued with — one whose
+        /// token names no DID, because the administrator's DID is derived from
+        /// the passkey at `vtc/install/claim/passkey/finish/0.1`. On a
+        /// community that already has an administrator, finish writes the
+        /// derived DID's entry with exactly this authority (finish item 9);
+        /// on a fresh one `vtc/admin/bootstrap` writes the founder's.
+        /// `None` on a wallet invitation (its token names the DID, whose entry
+        /// the invite wrote) and on rows persisted before this field landed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authority: Option<Box<InvitedAuthority>>,
+    },
+    /// Ceremony succeeded — token is permanently spent. Retained for
+    /// idempotency / audit; a later `start_claim` for the same JTI
+    /// returns [`AppError::Unauthorized`].
+    Consumed {
+        at: DateTime<Utc>,
+        /// Target admin DID the invite was minted for, copied
+        /// forward from the `Issued` state on transition so the
+        /// invites-list UI can render the consumer alongside the
+        /// jti. `None` on legacy rows persisted before this field
+        /// landed; new consumptions always set it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin_did: Option<String>,
+        /// `true` when the token was a **passkey** invitation — its row
+        /// recorded an [`InvitedAuthority`] — so `vtc/admin/invites/list/0.2`
+        /// can still report its `kind` once it is spent. `false` on a wallet
+        /// invitation and on rows consumed before this field landed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        passkey: bool,
+    },
+}
+
+/// The authority a passkey invitation confers on whoever completes it: the ACL
+/// entry `vtc/install/claim/passkey/finish/0.1` item 9 writes for the derived
+/// DID, decided when the invitation was issued and recorded with it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvitedAuthority {
+    /// The administrative authority the entry carries.
+    pub admin: crate::acl::AdminAuthority,
+    /// The administrator who issued the invitation, recorded as the entry's
+    /// `delegated_by`; `None` when the operator issued it from the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_by: Option<String>,
+    /// What issued it (`vtc-cli/<version>`, `vtc-setup`, …), the entry's
+    /// `created_by`.
+    pub issued_via: String,
+    /// The entry's label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl InvitedAuthority {
+    /// A community administrator with the full ceiling, issued from the host
+    /// (`vtc-admin-roles.md` §9: setup, `vtc admin invite`, the emergency
+    /// bootstrap).
+    pub fn community_admin(issued_via: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            admin: crate::acl::AdminAuthority::community_admin(),
+            invited_by: None,
+            issued_via: issued_via.into(),
+            label: Some(label.into()),
+        }
+    }
+}
+
+/// The administrator entry a **wallet** invitation wrote when it was issued
+/// (`vtc/admin/invites/create/0.2` item 3 writes it then), recorded beside the
+/// invitation so the entry stays **provisional** until the claim (#2660).
+///
+/// The entry is written with `expires_at` set to the invitation's own expiry,
+/// so an invitation nobody claims leaves an entry that confers nothing once it
+/// lapses. `vtc/install/claim/finish/0.3` makes it permanent, and
+/// `vtc/admin/invites/revoke/0.1` — which withdraws the authority an
+/// invitation confers — removes it. Either acts only on the entry exactly as
+/// the invitation wrote it ([`Self::is_unchanged`]): an entry someone has since
+/// rewritten is theirs, not the invitation's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InviteGrant {
+    /// The DID the invitation names, whose entry it wrote.
+    pub did: String,
+    /// The entry's `created_at`, as written.
+    pub created_at: u64,
+    /// The entry's `expires_at`, as written — the invitation's expiry.
+    pub expires_at: u64,
+}
+
+impl InviteGrant {
+    /// Whether `entry` is still exactly the provisional entry this invitation
+    /// wrote: same DID and creation time, the invitation's expiry, never
+    /// updated since.
+    pub fn is_unchanged(&self, entry: &crate::acl::VtcAclEntry) -> bool {
+        entry.did == self.did
+            && entry.created_at == self.created_at
+            && entry.expires_at == Some(self.expires_at)
+            && entry.updated_at.is_none()
+    }
+}
+
+/// Written by hand so the ephemeral signing key never reaches a log: a derived `Debug` would print it.
+impl std::fmt::Debug for InstallTokenState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Issued {
+                exp,
+                cnonce,
+                ephemeral_signing_key: _,
+                claimed_at,
+                claim_secret_hash,
+                admin_did,
+                authority,
+            } => f
+                .debug_struct("Issued")
+                .field("exp", exp)
+                .field("cnonce", cnonce)
+                .field("ephemeral_signing_key", &"<redacted>")
+                .field("claimed_at", claimed_at)
+                .field("claim_secret_hash", claim_secret_hash)
+                .field("admin_did", admin_did)
+                .field("authority", authority)
+                .finish(),
+            Self::Consumed {
+                at,
+                admin_did,
+                passkey,
+            } => f
+                .debug_struct("Consumed")
+                .field("at", at)
+                .field("admin_did", admin_did)
+                .field("passkey", passkey)
+                .finish(),
+        }
+    }
+}
+
+mod raw_bytes_b64 {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const B64: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&B64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        let v = B64.decode(&s).map_err(serde::de::Error::custom)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+    }
+}
+
+/// Successful [`InstallTokenStore::start_claim`] outcome. The
+/// caller hands `ephemeral_signing_key` + `cnonce` to the WebAuthn
+/// route handler; on ceremony success the route calls
+/// [`InstallTokenStore::finish_claim`] to consume.
+pub struct StartClaimOutcome {
+    pub ephemeral_signing_key: Zeroizing<[u8; 32]>,
+    pub cnonce: [u8; 32],
+    /// Stored Argon2id PHC hash of the out-of-band claim code.
+    /// `None` for legacy / no-secret rows. Informational only: the
+    /// route handler verifies the operator-supplied code via
+    /// [`InstallTokenStore::peek_secret_hash`] **before** calling
+    /// `start_claim`, so a wrong code can't stamp the ceremony lock
+    /// (P0.21). Retained here for diagnostics and store-level tests.
+    pub claim_secret_hash: Option<String>,
+}
+
+/// Written by hand so the ephemeral signing key never reaches a log: a derived `Debug` would print it.
+impl std::fmt::Debug for StartClaimOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartClaimOutcome")
+            .field("ephemeral_signing_key", &"<redacted>")
+            .field("cnonce", &self.cnonce)
+            .field("claim_secret_hash", &self.claim_secret_hash)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+/// Wraps the `install` keyspace with the state-machine semantics.
+/// Cheap to clone (the underlying handle is `Arc`-shared).
+#[derive(Clone)]
+pub struct InstallTokenStore {
+    ks: KeyspaceHandle,
+}
+
+impl InstallTokenStore {
+    pub fn new(ks: KeyspaceHandle) -> Self {
+        Self { ks }
+    }
+
+    /// Persist a freshly-minted token's state.
+    ///
+    /// `claim_secret_hash` is the Argon2id PHC string for the
+    /// out-of-band code the invitee must supply at claim-start.
+    /// Pass `None` to mint a "URL-only" install token — kept for
+    /// the legacy first-admin path and tests; new code paths
+    /// always supply a hash.
+    ///
+    /// `admin_did` is the target DID the invite is for. Mirrors
+    /// the JWT's `admin_did` claim so the daemon can surface it
+    /// on the invites list. `None` is accepted for backwards
+    /// compatibility with tests that didn't track the DID; the
+    /// production mint paths always pass it.
+    ///
+    /// Caller must hold no other lock on the install keyspace; we
+    /// take [`INSTALL_TOKEN_LOCK`] internally for the write so
+    /// concurrent mints + transitions on the same JTI serialise.
+    pub async fn record_issued(
+        &self,
+        jti: &Uuid,
+        cnonce: [u8; 32],
+        ephemeral_signing_key: [u8; 32],
+        exp: DateTime<Utc>,
+        claim_secret_hash: Option<String>,
+        admin_did: Option<String>,
+    ) -> Result<(), AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let state = InstallTokenState::Issued {
+            exp,
+            cnonce,
+            ephemeral_signing_key,
+            claimed_at: None,
+            claim_secret_hash,
+            admin_did,
+            authority: None,
+        };
+        self.ks.insert(token_key(jti), &state).await
+    }
+
+    /// Persist a freshly-minted **passkey** invitation: its token names no
+    /// DID, and `authority` is what the administrator it makes will hold
+    /// (`vtc/install/claim/passkey/finish/0.1` item 9).
+    pub async fn record_issued_passkey(
+        &self,
+        jti: &Uuid,
+        cnonce: [u8; 32],
+        ephemeral_signing_key: [u8; 32],
+        exp: DateTime<Utc>,
+        claim_secret_hash: Option<String>,
+        authority: InvitedAuthority,
+    ) -> Result<(), AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let state = InstallTokenState::Issued {
+            exp,
+            cnonce,
+            ephemeral_signing_key,
+            claimed_at: None,
+            claim_secret_hash,
+            admin_did: None,
+            authority: Some(Box::new(authority)),
+        };
+        self.ks.insert(token_key(jti), &state).await
+    }
+
+    /// Lift the ceremony lock [`Self::start_claim`] set, without consuming
+    /// anything: a refused passkey finish spends its challenges, and the
+    /// installer must be able to start again at once rather than wait out
+    /// the window (`vtc/install/claim/passkey/finish:possessionUnproven`).
+    pub async fn release_claim(&self, jti: &Uuid) -> Result<(), AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let key = token_key(jti);
+        if let Some(InstallTokenState::Issued {
+            exp,
+            cnonce,
+            ephemeral_signing_key,
+            claimed_at: Some(_),
+            claim_secret_hash,
+            admin_did,
+            authority,
+        }) = self.ks.get(key.clone()).await?
+        {
+            let next = InstallTokenState::Issued {
+                exp,
+                cnonce,
+                ephemeral_signing_key,
+                claimed_at: None,
+                claim_secret_hash,
+                admin_did,
+                authority,
+            };
+            self.ks.insert(key, &next).await?;
+        }
+        Ok(())
+    }
+
+    /// Begin a WebAuthn ceremony on `jti`.
+    ///
+    /// Returns `Ok(StartClaimOutcome)` if the token is `Issued`,
+    /// not expired, and no concurrent ceremony has set `claimed_at`
+    /// within the [`ENROLLMENT_CLAIM_WINDOW_SECS`] window. Sets
+    /// `claimed_at` as a side-effect so a second concurrent caller
+    /// sees the in-progress lock. The `StartClaimOutcome` carries
+    /// the stored `claim_secret_hash` (if any) so the route
+    /// handler can verify the operator-supplied claim code before
+    /// issuing the WebAuthn challenge.
+    ///
+    /// Errors with [`AppError::Unauthorized`] on every other state
+    /// — the structured detail stays out of the response for
+    /// defence in depth.
+    pub async fn start_claim(&self, jti: &Uuid) -> Result<StartClaimOutcome, AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+
+        let key = token_key(jti);
+        let state: Option<InstallTokenState> = self.ks.get(key.clone()).await?;
+        let state =
+            state.ok_or_else(|| AppError::Unauthorized("install token not found".into()))?;
+
+        match state {
+            InstallTokenState::Consumed { .. } => {
+                Err(AppError::Unauthorized("install token consumed".into()))
+            }
+            InstallTokenState::Issued {
+                exp,
+                cnonce,
+                ephemeral_signing_key,
+                claimed_at,
+                claim_secret_hash,
+                admin_did,
+                authority,
+            } => {
+                let now = Utc::now();
+                if now >= exp {
+                    return Err(AppError::Unauthorized("install token expired".into()));
+                }
+                if let Some(prev) = claimed_at {
+                    let elapsed = now - prev;
+                    if elapsed < Duration::seconds(ENROLLMENT_CLAIM_WINDOW_SECS as i64) {
+                        return Err(AppError::Conflict(
+                            "install ceremony already in progress".into(),
+                        ));
+                    }
+                }
+                let next = InstallTokenState::Issued {
+                    exp,
+                    cnonce,
+                    ephemeral_signing_key,
+                    claimed_at: Some(now),
+                    claim_secret_hash: claim_secret_hash.clone(),
+                    admin_did,
+                    authority,
+                };
+                self.ks.insert(key, &next).await?;
+                Ok(StartClaimOutcome {
+                    cnonce,
+                    ephemeral_signing_key: Zeroizing::new(ephemeral_signing_key),
+                    claim_secret_hash,
+                })
+            }
+        }
+    }
+
+    /// Complete the ceremony — transitions `Issued` → `Consumed`.
+    /// Errors with [`AppError::Unauthorized`] if the token is already
+    /// consumed or expired.
+    ///
+    /// The caller (M0.5 `/install/claim/finish` handler) calls this
+    /// **only** after the WebAuthn assertion validates against the
+    /// `cnonce` and the candidate DID signature has been verified.
+    pub async fn finish_claim(&self, jti: &Uuid) -> Result<(), AppError> {
+        self.finish_claim_as(jti, None).await
+    }
+
+    /// [`Self::finish_claim`], recording `admin_did` as the DID the token was
+    /// consumed for — a passkey claim's derived DID, which the token itself
+    /// never named. `None` keeps the DID the row was issued for.
+    pub async fn finish_claim_as(
+        &self,
+        jti: &Uuid,
+        admin_did_override: Option<String>,
+    ) -> Result<(), AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let key = token_key(jti);
+        let state: Option<InstallTokenState> = self.ks.get(key.clone()).await?;
+        let state =
+            state.ok_or_else(|| AppError::Unauthorized("install token not found".into()))?;
+        match state {
+            InstallTokenState::Consumed { .. } => {
+                Err(AppError::Unauthorized("install token consumed".into()))
+            }
+            InstallTokenState::Issued {
+                exp,
+                admin_did,
+                authority,
+                ..
+            } => {
+                let now = Utc::now();
+                if now >= exp {
+                    return Err(AppError::Unauthorized("install token expired".into()));
+                }
+                let next = InstallTokenState::Consumed {
+                    at: now,
+                    admin_did: admin_did_override.or(admin_did),
+                    passkey: authority.is_some(),
+                };
+                self.ks.insert(key, &next).await
+            }
+        }
+    }
+
+    /// Stamp the `install:emergency_pending` marker carrying the
+    /// operator's hostname + the wall-clock at CLI-invoke time. The
+    /// daemon reads + consumes the marker on next boot via
+    /// [`Self::take_pending_emergency`] and emits the
+    /// `EmergencyBootstrapInvoked` audit event from it.
+    pub async fn mark_emergency_pending(
+        &self,
+        pending: PendingEmergencyBootstrap,
+    ) -> Result<(), AppError> {
+        self.ks
+            .insert(EMERGENCY_PENDING_KEY.to_vec(), &pending)
+            .await
+    }
+
+    /// Read + delete the pending-emergency-bootstrap marker. The
+    /// daemon calls this once at startup; a returned `Some(...)`
+    /// fires the `EmergencyBootstrapInvoked` audit event. Subsequent
+    /// startups (after the marker is consumed) see `None`.
+    ///
+    /// Held under [`INSTALL_TOKEN_LOCK`] so a concurrent caller (a
+    /// second boot path racing with a CLI invocation, or two test
+    /// helpers in the same process) can't both observe the marker
+    /// and emit two audit envelopes for the same emergency. Mirrors
+    /// the read-then-write discipline every other transition in this
+    /// module follows.
+    pub async fn take_pending_emergency(
+        &self,
+    ) -> Result<Option<PendingEmergencyBootstrap>, AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let key = EMERGENCY_PENDING_KEY.to_vec();
+        let value: Option<PendingEmergencyBootstrap> = self.ks.get(key.clone()).await?;
+        if value.is_some() {
+            self.ks.remove(key).await?;
+        }
+        Ok(value)
+    }
+
+    /// Read the pending-emergency-bootstrap marker **without** deleting it.
+    /// The daemon raises the acknowledge item it calls for (VTI-VTC-023) and
+    /// only then clears the marker ([`Self::clear_pending_emergency`]), so a
+    /// crash between the two raises it again rather than losing it (R2.1).
+    pub async fn peek_pending_emergency(
+        &self,
+    ) -> Result<Option<PendingEmergencyBootstrap>, AppError> {
+        self.ks.get(EMERGENCY_PENDING_KEY.to_vec()).await
+    }
+
+    /// Delete the pending-emergency-bootstrap marker once it has been acted on.
+    pub async fn clear_pending_emergency(&self) -> Result<(), AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        self.ks.remove(EMERGENCY_PENDING_KEY.to_vec()).await
+    }
+
+    /// Record the co-admin `vtc setup` was given. One per install: a later
+    /// call replaces it, which only a re-run of setup can make.
+    pub async fn record_co_admin(&self, did: &str) -> Result<(), AppError> {
+        self.ks
+            .insert(CO_ADMIN_KEY.to_vec(), &did.to_string())
+            .await
+    }
+
+    /// Read and delete the co-admin record. The install bootstrap calls this
+    /// once, when it writes the first admin, so the co-admin is installed
+    /// exactly once and never by a later request.
+    pub async fn take_co_admin(&self) -> Result<Option<String>, AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let key = CO_ADMIN_KEY.to_vec();
+        let value: Option<String> = self.ks.get(key.clone()).await?;
+        if value.is_some() {
+            self.ks.remove(key).await?;
+        }
+        Ok(value)
+    }
+
+    /// Queue an ACL write made offline for the daemon to audit on its next
+    /// boot. The offline commands hold no audit writer — the running daemon
+    /// does — so, like the emergency-bootstrap marker, the fact is left here
+    /// and the daemon writes the row.
+    pub async fn record_break_glass(&self, pending: &PendingBreakGlassAcl) -> Result<(), AppError> {
+        let mut key = BREAK_GLASS_PREFIX.to_vec();
+        key.extend_from_slice(uuid::Uuid::new_v4().to_string().as_bytes());
+        self.ks.insert(key, pending).await
+    }
+
+    /// Every queued break-glass write with its store key, oldest first,
+    /// **without** deleting any. The daemon raises each as an acknowledge item
+    /// (VTI-VTC-023) and then clears it ([`Self::clear_break_glass`]), so a
+    /// crash between the two raises it again — idempotently, by the key —
+    /// rather than losing it (R2.1).
+    pub async fn pending_break_glass(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, PendingBreakGlassAcl)>, AppError> {
+        let mut out = Vec::new();
+        for (key, value) in self.ks.prefix_iter_raw(BREAK_GLASS_PREFIX.to_vec()).await? {
+            match serde_json::from_slice::<PendingBreakGlassAcl>(&value) {
+                Ok(p) => out.push((key, p)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "dropping an unreadable break-glass record");
+                    self.ks.remove(key).await?;
+                }
+            }
+        }
+        out.sort_by_key(|(_, p)| p.invoked_at);
+        Ok(out)
+    }
+
+    /// Delete one queued break-glass write once it has been acted on.
+    pub async fn clear_break_glass(&self, key: Vec<u8>) -> Result<(), AppError> {
+        self.ks.remove(key).await
+    }
+
+    /// Read and delete every queued break-glass write, oldest first by the
+    /// time it was made.
+    pub async fn take_break_glass(&self) -> Result<Vec<PendingBreakGlassAcl>, AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let mut out = Vec::new();
+        for (key, value) in self.ks.prefix_iter_raw(BREAK_GLASS_PREFIX.to_vec()).await? {
+            match serde_json::from_slice::<PendingBreakGlassAcl>(&value) {
+                Ok(p) => out.push(p),
+                Err(e) => tracing::warn!(error = %e, "dropping an unreadable break-glass record"),
+            }
+            self.ks.remove(key).await?;
+        }
+        out.sort_by_key(|p| p.invoked_at);
+        Ok(out)
+    }
+
+    /// Record the provisional administrator entry wallet invitation `jti`
+    /// wrote ([`InviteGrant`]).
+    pub async fn record_invite_grant(
+        &self,
+        jti: &Uuid,
+        grant: &InviteGrant,
+    ) -> Result<(), AppError> {
+        self.ks.insert(invite_grant_key(jti), grant).await
+    }
+
+    /// Read and delete the provisional-entry record of invitation `jti`, if
+    /// it wrote one.
+    pub async fn take_invite_grant(&self, jti: &Uuid) -> Result<Option<InviteGrant>, AppError> {
+        let Some(raw) = self.ks.take_raw(invite_grant_key(jti)).await? else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_slice(&raw).ok())
+    }
+
+    /// Every provisional-entry record naming `did`, with its invitation's jti.
+    pub async fn invite_grants_for(&self, did: &str) -> Result<Vec<(Uuid, InviteGrant)>, AppError> {
+        let mut out = Vec::new();
+        for (k, v) in self
+            .ks
+            .prefix_iter_raw(INVITE_GRANT_PREFIX.to_vec())
+            .await?
+        {
+            let Some(jti) = k
+                .strip_prefix(INVITE_GRANT_PREFIX)
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .and_then(|s| s.parse::<Uuid>().ok())
+            else {
+                continue;
+            };
+            if let Ok(grant) = serde_json::from_slice::<InviteGrant>(&v)
+                && grant.did == did
+            {
+                out.push((jti, grant));
+            }
+        }
+        Ok(out)
+    }
+
+    /// List every persisted install-token state row keyed by `jti`.
+    /// Used by the `/v1/admin/invites` list surface. Returns the
+    /// (jti, state) pairs; the handler derives status (Issued /
+    /// Consumed / Expired) and strips secret material before
+    /// emitting wire JSON.
+    pub async fn list_tokens(&self) -> Result<Vec<(Uuid, InstallTokenState)>, AppError> {
+        let raw = self.ks.prefix_iter_raw(TOKEN_KEY_PREFIX.to_vec()).await?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (k, v) in raw {
+            let Some(suffix) = k.strip_prefix(TOKEN_KEY_PREFIX) else {
+                continue;
+            };
+            let Ok(jti_str) = std::str::from_utf8(suffix) else {
+                continue;
+            };
+            let Ok(jti) = jti_str.parse::<Uuid>() else {
+                continue;
+            };
+            match serde_json::from_slice::<InstallTokenState>(&v) {
+                Ok(state) => out.push((jti, state)),
+                Err(e) => {
+                    tracing::warn!(error = %e, %jti, "skipping unparseable install token state")
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Peek a token's state row without mutating it. Used by the
+    /// invite revoke surface to refuse `Consumed` rows before any
+    /// destructive call.
+    pub async fn get_token(&self, jti: &Uuid) -> Result<Option<InstallTokenState>, AppError> {
+        self.ks.get(token_key(jti)).await
+    }
+
+    /// Peek the stored Argon2id claim-secret hash for an `Issued`
+    /// token **without** taking the ceremony lock or stamping
+    /// `claimed_at`.
+    ///
+    /// Returns `Some(hash)` only for an `Issued` row that carries a
+    /// hash; `None` for a missing / consumed / no-secret row. The
+    /// `claim/start` route verifies the operator-supplied code
+    /// against this **before** calling [`Self::start_claim`], so a
+    /// wrong code can never stamp the 300 s ceremony lock and grief
+    /// the legitimate operator (P0.21). The authoritative not-found /
+    /// consumed / expired / concurrency checks stay in `start_claim`.
+    pub async fn peek_secret_hash(&self, jti: &Uuid) -> Result<Option<String>, AppError> {
+        match self.get_token(jti).await? {
+            Some(InstallTokenState::Issued {
+                claim_secret_hash, ..
+            }) => Ok(claim_secret_hash),
+            _ => Ok(None),
+        }
+    }
+
+    /// Delete a token's state row. Used by the invite revoke
+    /// surface after a [`Self::get_token`] check has confirmed
+    /// the row is not `Consumed`. Returns `true` if a row was
+    /// removed.
+    pub async fn delete_token(&self, jti: &Uuid) -> Result<bool, AppError> {
+        let _guard = INSTALL_TOKEN_LOCK.lock().await;
+        let key = token_key(jti);
+        let existed: Option<InstallTokenState> = self.ks.get(key.clone()).await?;
+        if existed.is_some() {
+            self.ks.remove(key).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// State persisted to `install:emergency_pending` by the
+/// `vtc admin emergency-bootstrap` CLI. The daemon consumes it on
+/// next boot and feeds it into [`crate::audit`]'s
+/// `EmergencyBootstrapInvoked` event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingEmergencyBootstrap {
+    pub operator_hostname: String,
+    pub invoked_at: DateTime<Utc>,
+    /// The DIDs whose access it changed: the recovery DID it installs as the
+    /// new administrator, then every administrator it wiped — what the
+    /// acknowledge item's `vtc/operator/offline-write/0.2` record names.
+    /// Empty in a marker written before it was recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dids: Vec<String>,
+}
+
+/// An ACL write an offline command made with the daemon stopped — the
+/// break-glass. It bypassed the consent and attrition rules the daemon
+/// enforces (VTI-APV-014, VTI-APV-009) by design, so the daemon audits it on
+/// its next boot as exactly that.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBreakGlassAcl {
+    /// The command that wrote it, e.g. `vtc acl add`.
+    pub command: String,
+    /// `grant` or `remove`.
+    pub action: String,
+    pub did: String,
+    /// The role written; empty for a removal.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub contexts: Vec<String>,
+    pub operator_hostname: String,
+    pub invoked_at: DateTime<Utc>,
+    /// The administrators holding a role when the write was made — who must
+    /// acknowledge it (VTI-VTC-023). Empty in a marker written before this
+    /// was recorded; the daemon then asks every administrator.
+    #[serde(default)]
+    pub admins: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    fn temp_store() -> (InstallTokenStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = Store::open(&cfg).expect("store");
+        let ks = store.keyspace("install-test").expect("ks");
+        (InstallTokenStore::new(ks), dir)
+    }
+
+    async fn issue(store: &InstallTokenStore, ttl: i64) -> Uuid {
+        issue_with_hash(store, ttl, None).await
+    }
+
+    async fn issue_with_hash(
+        store: &InstallTokenStore,
+        ttl: i64,
+        claim_secret_hash: Option<String>,
+    ) -> Uuid {
+        let jti = Uuid::new_v4();
+        let exp = Utc::now() + Duration::seconds(ttl);
+        store
+            .record_issued(
+                &jti,
+                [0xAB; 32],
+                [0xCD; 32],
+                exp,
+                claim_secret_hash,
+                Some("did:key:zTestAdmin".to_string()),
+            )
+            .await
+            .unwrap();
+        jti
+    }
+
+    #[tokio::test]
+    async fn start_then_finish_consumes_token() {
+        let (store, _dir) = temp_store();
+        let jti = issue(&store, 600).await;
+
+        let outcome = store.start_claim(&jti).await.unwrap();
+        assert_eq!(outcome.cnonce, [0xAB; 32]);
+        assert_eq!(*outcome.ephemeral_signing_key, [0xCD; 32]);
+
+        store.finish_claim(&jti).await.unwrap();
+        // Second finish returns "consumed".
+        let err = store.finish_claim(&jti).await.expect_err("second finish");
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn finish_preserves_admin_did_in_consumed_row() {
+        // Regression: the consumed-state row used to drop the target
+        // DID, which made the invites-list UI render "unknown" for
+        // every successfully-claimed invite. The DID must survive
+        // the Issued → Consumed transition so the audit surface
+        // stays useful.
+        let (store, _dir) = temp_store();
+        let jti = issue(&store, 600).await;
+        store.start_claim(&jti).await.unwrap();
+        store.finish_claim(&jti).await.unwrap();
+
+        let row = store.get_token(&jti).await.unwrap().expect("token row");
+        match row {
+            InstallTokenState::Consumed { admin_did, .. } => {
+                assert_eq!(admin_did.as_deref(), Some("did:key:zTestAdmin"));
+            }
+            _ => panic!("expected Consumed state after finish_claim"),
+        }
+    }
+
+    #[tokio::test]
+    async fn second_concurrent_start_within_window_is_rejected() {
+        let (store, _dir) = temp_store();
+        let jti = issue(&store, 600).await;
+
+        let _first = store.start_claim(&jti).await.unwrap();
+        // Immediately try a second start — the claim window is 5
+        // minutes, so this must be rejected.
+        let err = store.start_claim(&jti).await.expect_err("conflict");
+        assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn retry_after_window_succeeds() {
+        let (store, _dir) = temp_store();
+        let jti = issue(&store, 600).await;
+
+        let _first = store.start_claim(&jti).await.unwrap();
+        // Backdate `claimed_at` past the window so the next call
+        // sees a stale lock and overwrites it.
+        let key = token_key(&jti);
+        let mut state: InstallTokenState = store.ks.get(key.clone()).await.unwrap().unwrap();
+        if let InstallTokenState::Issued {
+            ref mut claimed_at, ..
+        } = state
+        {
+            *claimed_at =
+                Some(Utc::now() - Duration::seconds((ENROLLMENT_CLAIM_WINDOW_SECS as i64) + 10));
+        }
+        store.ks.insert(key, &state).await.unwrap();
+
+        let _retry = store.start_claim(&jti).await.expect("retry after window");
+    }
+
+    #[tokio::test]
+    async fn expired_token_rejected_on_start() {
+        let (store, _dir) = temp_store();
+        let jti = issue(&store, -1).await;
+        let err = store.start_claim(&jti).await.expect_err("expired");
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn expired_token_rejected_on_finish() {
+        let (store, _dir) = temp_store();
+        let jti = issue(&store, 600).await;
+        let _ = store.start_claim(&jti).await.unwrap();
+
+        // Backdate the expiry to now-1s.
+        let key = token_key(&jti);
+        let mut state: InstallTokenState = store.ks.get(key.clone()).await.unwrap().unwrap();
+        if let InstallTokenState::Issued { ref mut exp, .. } = state {
+            *exp = Utc::now() - Duration::seconds(1);
+        }
+        store.ks.insert(key, &state).await.unwrap();
+
+        let err = store.finish_claim(&jti).await.expect_err("expired");
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn claim_secret_hash_is_surfaced_in_outcome() {
+        let (store, _dir) = temp_store();
+        let hash = "$argon2id$test-stub".to_string();
+        let jti = issue_with_hash(&store, 600, Some(hash.clone())).await;
+        let outcome = store.start_claim(&jti).await.unwrap();
+        assert_eq!(outcome.claim_secret_hash.as_deref(), Some(hash.as_str()));
+    }
+
+    #[tokio::test]
+    async fn no_hash_when_token_minted_without_secret() {
+        let (store, _dir) = temp_store();
+        let jti = issue(&store, 600).await;
+        let outcome = store.start_claim(&jti).await.unwrap();
+        assert!(outcome.claim_secret_hash.is_none());
+    }
+
+    // ---- P0.21: peek the claim-secret hash without locking ----
+
+    #[tokio::test]
+    async fn peek_secret_hash_does_not_set_claim_lock() {
+        // The whole point of P0.21: reading the stored hash to verify the
+        // operator's code must NOT stamp `claimed_at`, so a wrong code
+        // followed immediately by the correct one isn't locked out.
+        let (store, _dir) = temp_store();
+        let hash = "$argon2id$stub".to_string();
+        let jti = issue_with_hash(&store, 600, Some(hash.clone())).await;
+
+        assert_eq!(
+            store.peek_secret_hash(&jti).await.unwrap().as_deref(),
+            Some(hash.as_str())
+        );
+
+        // The ceremony lock must still be unset after a peek.
+        match store.get_token(&jti).await.unwrap().unwrap() {
+            InstallTokenState::Issued { claimed_at, .. } => {
+                assert!(claimed_at.is_none(), "peek must not set the ceremony lock");
+            }
+            _ => panic!("expected Issued"),
+        }
+
+        // And a subsequent real start still succeeds (lock was never taken),
+        // even after an arbitrary number of prior peeks.
+        let _ = store.peek_secret_hash(&jti).await.unwrap();
+        store.start_claim(&jti).await.expect("start after peek");
+    }
+
+    #[tokio::test]
+    async fn peek_secret_hash_none_for_no_secret_consumed_and_missing() {
+        let (store, _dir) = temp_store();
+
+        // Issued without a secret → None (nothing to verify).
+        let no_secret = issue(&store, 600).await;
+        assert!(store.peek_secret_hash(&no_secret).await.unwrap().is_none());
+
+        // Missing row → None (start_claim is authoritative for not-found).
+        assert!(
+            store
+                .peek_secret_hash(&Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Consumed row → None (no secret check on a spent token).
+        let consumed = issue_with_hash(&store, 600, Some("$argon2id$stub".into())).await;
+        store.start_claim(&consumed).await.unwrap();
+        store.finish_claim(&consumed).await.unwrap();
+        assert!(store.peek_secret_hash(&consumed).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_token_returns_unauthorized() {
+        let (store, _dir) = temp_store();
+        let phantom_jti = Uuid::new_v4();
+        let err = store
+            .start_claim(&phantom_jti)
+            .await
+            .expect_err("not found");
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn state_machine_serde_round_trip() {
+        let state = InstallTokenState::Issued {
+            exp: Utc::now() + Duration::seconds(60),
+            cnonce: [0xAB; 32],
+            ephemeral_signing_key: [0xCD; 32],
+            claimed_at: Some(Utc::now()),
+            claim_secret_hash: Some("$argon2id$stub".into()),
+            admin_did: Some("did:key:zSerdeRoundTrip".into()),
+            authority: Some(Box::new(InvitedAuthority::community_admin(
+                "test",
+                "round trip",
+            ))),
+        };
+        let s = serde_json::to_string(&state).unwrap();
+        let back: InstallTokenState = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, state);
+    }
+
+    #[tokio::test]
+    async fn issued_row_without_hash_field_deserializes() {
+        // Legacy rows persisted before the claim-secret field
+        // existed must still parse — `serde(default)` on the
+        // new field makes this work.
+        let legacy_json = serde_json::json!({
+            "status": "issued",
+            "exp": "2099-01-01T00:00:00Z",
+            "cnonce": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+            "ephemeral_signing_key": "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0",
+            "claimed_at": null
+        });
+        let state: InstallTokenState = serde_json::from_value(legacy_json).unwrap();
+        match state {
+            InstallTokenState::Issued {
+                claim_secret_hash, ..
+            } => {
+                assert!(claim_secret_hash.is_none());
+            }
+            _ => panic!("expected Issued"),
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// P0.7 accept criterion: the on-disk bytes for an issued install
+    /// token do not contain the (base64) ephemeral signing key — i.e. the
+    /// `install` keyspace is encrypted at rest. We prove it by writing the
+    /// *same* token to a bare and an encrypted store and showing the
+    /// plaintext fragment present in the former is absent in the latter.
+    #[tokio::test]
+    async fn issued_token_is_encrypted_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = Store::open(&cfg).unwrap();
+        let exp = Utc::now() + Duration::seconds(600);
+        let admin = "did:key:zTestAdmin".to_string();
+
+        // Bare write — confirms the secret is plaintext-visible without
+        // encryption (the pre-P0.7 state we're fixing).
+        let plain_jti = Uuid::new_v4();
+        let plain_ks = store.keyspace("install-plain").unwrap();
+        InstallTokenStore::new(plain_ks.clone())
+            .record_issued(
+                &plain_jti,
+                [0xAB; 32],
+                [0xCD; 32],
+                exp,
+                None,
+                Some(admin.clone()),
+            )
+            .await
+            .unwrap();
+        let plaintext = plain_ks
+            .get_raw(token_key(&plain_jti))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            contains(&plaintext, admin.as_bytes()),
+            "sanity: admin DID is plaintext-visible in an unencrypted store"
+        );
+
+        // Encrypted write — the same secret must not be on disk in clear.
+        let key = [0x77; 32];
+        let enc_jti = Uuid::new_v4();
+        let enc_store =
+            InstallTokenStore::new(store.keyspace("install").unwrap().with_encryption(key));
+        enc_store
+            .record_issued(
+                &enc_jti,
+                [0xAB; 32],
+                [0xCD; 32],
+                exp,
+                None,
+                Some(admin.clone()),
+            )
+            .await
+            .unwrap();
+
+        let on_disk = store
+            .keyspace("install")
+            .unwrap()
+            .get_raw(token_key(&enc_jti))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(on_disk.starts_with(b"VAE1"), "value must be encrypted");
+        assert!(
+            !contains(&on_disk, admin.as_bytes()),
+            "admin DID must not appear in ciphertext"
+        );
+        assert!(
+            !contains(&on_disk, &plaintext),
+            "the plaintext token blob must not appear verbatim on disk"
+        );
+
+        // And the encrypted store reads the token back intact.
+        assert!(enc_store.get_token(&enc_jti).await.unwrap().is_some());
+    }
+
+    /// P0.7: a boot over a pre-encryption store still reads existing rows.
+    /// A token written in plaintext is migrated in place and an encrypted
+    /// store then reads it back.
+    #[tokio::test]
+    async fn legacy_plaintext_token_survives_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = Store::open(&cfg).unwrap();
+        let exp = Utc::now() + Duration::seconds(600);
+
+        // Legacy plaintext write.
+        let jti = Uuid::new_v4();
+        InstallTokenStore::new(store.keyspace("install").unwrap())
+            .record_issued(&jti, [0xAB; 32], [0xCD; 32], exp, None, None)
+            .await
+            .unwrap();
+
+        // Boot-time migration (mirrors what `server::run` does).
+        let key = [0x99; 32];
+        let migrated = store
+            .keyspace("install")
+            .unwrap()
+            .migrate_to_encrypted(key)
+            .await
+            .unwrap();
+        assert_eq!(migrated, 1);
+
+        // The encrypted store reads the pre-existing token.
+        let enc_store =
+            InstallTokenStore::new(store.keyspace("install").unwrap().with_encryption(key));
+        let outcome = enc_store.start_claim(&jti).await.unwrap();
+        assert_eq!(*outcome.ephemeral_signing_key, [0xCD; 32]);
+    }
+}

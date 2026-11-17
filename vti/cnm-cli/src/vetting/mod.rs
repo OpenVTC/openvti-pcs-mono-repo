@@ -1,0 +1,1263 @@
+//! `cnm vetting …` — the community-admin side of peer identity vetting.
+//!
+//! Every command drives the VTC's vetting admin surface through
+//! [`vtc_client::VtcClient`] as signed Trust Tasks: naming a vetter and
+//! revoking a grant (`vtc/vetting/vetters/grant/0.1`,
+//! `vtc/endorsements/revoke/0.1` — a grant is withdrawn like any endorsement),
+//! the automatic-grant configuration
+//! (`vtc/vetting/auto-grant/{show,update}/0.1`), the community's branding
+//! (`vtc/community/branding/{show,update}/0.1`) and the statement withdrawal
+//! notices (`vtc/vetting/revocations/list/0.1`).
+//!
+//! `bootstrap-pgp` seeds the first vetters from an existing OpenPGP web of
+//! trust; its graph and link logic is the pure [`wot`] and [`plan`] pair.
+//!
+//! Every command needs a community-admin identity, and authenticates to the
+//! VTC itself, with the VTC's DID as the audience (see [`crate::vtc`]), and
+//! fails with the fix when the VTC refuses. There are no retries here: a
+//! failed call is reported, not repeated.
+
+mod bootstrap;
+pub mod plan;
+#[cfg(test)]
+mod test_web;
+pub mod wot;
+
+use chrono::{DateTime, Utc};
+use clap::{Subcommand, ValueEnum};
+use ratatui::layout::Constraint;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Cell, Row, Table};
+use serde_json::{Value, json};
+use vta_cli_common::display::did_cell;
+use vta_cli_common::duration::{humanize_duration, parse_duration_secs};
+use vta_cli_common::render::{
+    BOLD, DIM, GREEN, RESET, YELLOW, bin_name, is_full_display, is_json_output, print_full_entry,
+    print_full_list_title, print_json, print_widget,
+};
+use vtc_client::join_requests::manifest::v0_4::{
+    CommunityBranding, CommunityBrandingAccentColor, CommunityBrandingDisplayName,
+};
+use vtc_client::vetting::vetters::grant::v0_1 as grant_wire;
+use vtc_client::vetting::{
+    AutoGrantConfig, AutoGrantStatus, CheckShape, GrantOrigin, MAX_AUTO_GRANT_SWEEP_MINUTES,
+    MAX_VETTER_GRANT_VALIDITY_SECONDS, MIN_AUTO_GRANT_SWEEP_MINUTES,
+    MIN_VETTER_GRANT_VALIDITY_SECONDS, VetterGrantRow,
+};
+use vtc_client::{VtcClient, VtcError};
+
+pub use bootstrap::BootstrapPgpArgs;
+
+use vta_sdk::session::TransportChoice;
+
+use crate::vtc::{self as vtc_target, VtcTarget};
+
+type CliResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// `cnm vetting …`
+#[derive(Subcommand)]
+pub enum VettingCommands {
+    /// Vetter grants: list them, name a member a vetter, withdraw a grant, or
+    /// deliver a grant credential again.
+    Vetters {
+        #[command(subcommand)]
+        command: VetterCommands,
+    },
+
+    /// Automatic vetter grants: the sweep that names vetters by the
+    /// `vetterEligibility` policy.
+    #[command(name = "auto-grant")]
+    AutoGrant {
+        #[command(subcommand)]
+        command: AutoGrantCommands,
+    },
+
+    /// How the community presents itself to an applicant's client
+    /// (`join-requests/manifest/0.4` branding).
+    Branding {
+        #[command(subcommand)]
+        command: BrandingCommands,
+    },
+
+    /// What the community asks an applicant to tell it about themselves
+    /// (`join-requests/manifest/0.4` `requestedAttributes`). Answers are the
+    /// applicant's own statement, never verified; ask for a credential in a
+    /// criterion when you need one that is.
+    Ask {
+        #[command(subcommand)]
+        command: AskCommands,
+    },
+
+    /// Vetting statement withdrawal notices, and the admissions each touches.
+    Revocations,
+
+    /// Seed vetters from an OpenPGP web of trust.
+    ///
+    /// Members link their OpenPGP key to their member DID with a clearsigned
+    /// statement (`openvtc-link: <memberDid>`). Every active member whose
+    /// linked key is within --max-depth certification hops of a root key, and
+    /// who holds no live grant, is named a vetter. Run with --dry-run first.
+    #[command(name = "bootstrap-pgp")]
+    BootstrapPgp(BootstrapPgpArgs),
+}
+
+/// `cnm vetting vetters …`
+#[derive(Subcommand)]
+pub enum VetterCommands {
+    /// Every vetter grant, newest first.
+    List,
+    /// Name a current member a vetter.
+    Grant {
+        /// The member's DID.
+        member_did: String,
+        /// How long the grant is valid: `N[s|m|h|d|w]`, one day to two years
+        /// (e.g. `180d`). The community's default of one year when absent.
+        /// `--expires`, as every lapsing grant spells it (#2589); `--validity`
+        /// is the older name.
+        #[arg(long = "expires", visible_alias = "validity", value_name = "DURATION")]
+        validity: Option<String>,
+    },
+    /// Withdraw a vetter grant. The vetter's statements stop counting and
+    /// their profile is deleted.
+    Revoke {
+        /// The grant's endorsement id, from `cnm vetting vetters list`.
+        endorsement_id: String,
+    },
+}
+
+/// `cnm vetting auto-grant …`
+#[derive(Subcommand)]
+pub enum AutoGrantCommands {
+    /// The configuration and the last sweep.
+    Show,
+    /// Change the configuration. Values not given keep their current setting.
+    Set {
+        /// Turn the sweep on (`true`) or off (`false`).
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Minutes between sweeps, 5–1440.
+        #[arg(long)]
+        sweep_minutes: Option<u32>,
+        /// Validity of a grant the sweep issues: `N[s|m|h|d|w]`, one day to
+        /// two years.
+        #[arg(long)]
+        validity: Option<String>,
+    },
+}
+
+/// `cnm vetting branding …`
+#[derive(Subcommand)]
+pub enum BrandingCommands {
+    /// The community's branding.
+    Show,
+    /// Change the branding. Values not given keep their current setting.
+    Set {
+        /// The name an applicant's client shows, 1–128 characters.
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Accent colour, `#rrggbb`.
+        #[arg(long)]
+        accent_color: Option<String>,
+        /// Logo, an `https` URL of at most 2048 characters.
+        #[arg(long)]
+        logo_url: Option<String>,
+        /// Remove a value: `display-name`, `accent-color` or `logo-url`
+        /// (comma-separated or repeated).
+        #[arg(long, value_enum, value_delimiter = ',')]
+        clear: Vec<BrandingField>,
+    },
+}
+
+/// `cnm vetting ask …`
+#[derive(Subcommand)]
+pub enum AskCommands {
+    /// What the community asks applicants for now.
+    Show,
+    /// Replace what the community asks for. Omit every flag, or pass
+    /// `--nothing`, to ask for nothing.
+    Set {
+        /// A claim type every applicant must answer, e.g. `name.display`.
+        /// Repeatable.
+        #[arg(long = "require")]
+        require: Vec<String>,
+        /// A claim type an applicant may decline, e.g. `address.country`.
+        /// Repeatable.
+        #[arg(long = "optional")]
+        optional: Vec<String>,
+        /// Why you ask, shown to the applicant before they answer:
+        /// `<type>=<words>`. Repeatable.
+        #[arg(long = "purpose")]
+        purpose: Vec<String>,
+        /// Ask for nothing.
+        #[arg(long, conflicts_with_all = ["require", "optional", "purpose"])]
+        nothing: bool,
+    },
+}
+
+/// Build the requested-attribute list from the `ask set` flags, in the order
+/// given — required first. Refuses a purpose for a type that is not asked, and
+/// a type asked both ways.
+fn requested_from_flags(
+    require: &[String],
+    optional: &[String],
+    purpose: &[String],
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut purposes = std::collections::BTreeMap::new();
+    for p in purpose {
+        let (t, words) = p
+            .split_once('=')
+            .ok_or_else(|| format!("--purpose {p}: expected `<type>=<words>`"))?;
+        purposes.insert(t.trim().to_string(), words.trim().to_string());
+    }
+    if let Some(both) = require.iter().find(|t| optional.contains(t)) {
+        return Err(format!("{both} is both --require and --optional; pick one"));
+    }
+    if let Some(stray) = purposes
+        .keys()
+        .find(|t| !require.contains(t) && !optional.contains(t))
+    {
+        return Err(format!("--purpose names {stray}, which is not asked for"));
+    }
+    Ok(require
+        .iter()
+        .map(|t| (t, true))
+        .chain(optional.iter().map(|t| (t, false)))
+        .map(|(t, required)| {
+            let mut o = serde_json::json!({ "type": t, "required": required });
+            if let Some(w) = purposes.get(t) {
+                o["purpose"] = serde_json::json!(w);
+            }
+            o
+        })
+        .collect())
+}
+
+async fn cmd_ask_show(vtc: &VtcClient) -> CliResult {
+    let asked = vtc
+        .requested_attributes()
+        .await
+        .map_err(|e| guidance(e, Op::AskShow))?;
+    print_asked(&asked)
+}
+
+async fn cmd_ask_set(
+    vtc: &VtcClient,
+    require: Vec<String>,
+    optional: Vec<String>,
+    purpose: Vec<String>,
+) -> CliResult {
+    let list = requested_from_flags(&require, &optional, &purpose)?;
+    let requested = serde_json::from_value::<
+        Vec<vtc_client::join_requests::manifest::v0_4::ResponseRequestedAttributesItem>,
+    >(serde_json::Value::Array(list))
+    .map_err(|e| {
+        format!(
+            "{e}.
+A type is a claim-type token such as `name.display` or `x:handle`; a purpose              is at most 256 characters."
+        )
+    })?;
+    let stored = vtc
+        .set_requested_attributes(&requested)
+        .await
+        .map_err(|e| guidance(e, Op::AskSet))?;
+    if !is_json_output() {
+        println!("{GREEN}✓{RESET} Applicants are now asked for this.");
+    }
+    print_asked(&stored)
+}
+
+fn print_asked(
+    asked: &[vtc_client::join_requests::manifest::v0_4::ResponseRequestedAttributesItem],
+) -> CliResult {
+    if is_json_output() {
+        println!("{}", serde_json::to_string_pretty(asked)?);
+        return Ok(());
+    }
+    if asked.is_empty() {
+        println!("Applicants are asked for nothing about themselves.");
+        return Ok(());
+    }
+    for a in asked {
+        let kind = if a.required { "required" } else { "optional" };
+        match &a.purpose {
+            Some(p) => println!("  {} ({kind}) — {}", a.type_.as_str(), p.as_str()),
+            None => println!("  {} ({kind})", a.type_.as_str()),
+        }
+    }
+    println!(
+        "Answers are the applicant's own statement. Ask for a credential in a criterion when you \
+         need one that is verified."
+    );
+    Ok(())
+}
+
+/// A branding member `--clear` can remove.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BrandingField {
+    DisplayName,
+    AccentColor,
+    LogoUrl,
+}
+
+/// Run a `cnm vetting` command.
+///
+/// Naming and withdrawing a vetter are signed Trust Tasks over the transport
+/// `transport` picks ([`vtc_target::connect_for_tasks`]); the rest have no
+/// Trust Task served yet and use a bearer token ([`connect`]).
+pub async fn run(
+    command: VettingCommands,
+    keyring_key: &str,
+    target: &VtcTarget,
+    transport: TransportChoice,
+) -> CliResult {
+    if let VettingCommands::BootstrapPgp(args) = command {
+        // The keyring, roots and links are read and checked before any call to
+        // the community, so a mistake in them costs no round trip.
+        return bootstrap::run(args, keyring_key, target, transport).await;
+    }
+    let vtc = match &command {
+        VettingCommands::Vetters {
+            command: VetterCommands::Grant { .. } | VetterCommands::Revoke { .. },
+        } => {
+            vtc_target::connect_for_tasks(keyring_key, target, transport)
+                .await?
+                .client
+        }
+        _ => connect(keyring_key, target).await?,
+    };
+    let outcome = run_command(command, &vtc).await;
+    vtc.shutdown().await;
+    outcome
+}
+
+async fn run_command(command: VettingCommands, vtc: &VtcClient) -> CliResult {
+    match command {
+        VettingCommands::Vetters { command } => match command {
+            VetterCommands::List => cmd_vetters_list(vtc).await,
+            VetterCommands::Grant {
+                member_did,
+                validity,
+            } => cmd_vetters_grant(vtc, &member_did, validity.as_deref()).await,
+            VetterCommands::Revoke { endorsement_id } => {
+                cmd_vetters_revoke(vtc, &endorsement_id).await
+            }
+        },
+        VettingCommands::AutoGrant { command } => match command {
+            AutoGrantCommands::Show => cmd_auto_grant_show(vtc).await,
+            AutoGrantCommands::Set {
+                enabled,
+                sweep_minutes,
+                validity,
+            } => cmd_auto_grant_set(vtc, enabled, sweep_minutes, validity.as_deref()).await,
+        },
+        VettingCommands::Ask { command } => match command {
+            AskCommands::Show => cmd_ask_show(vtc).await,
+            AskCommands::Set {
+                require,
+                optional,
+                purpose,
+                nothing: _,
+            } => cmd_ask_set(vtc, require, optional, purpose).await,
+        },
+        VettingCommands::Branding { command } => match command {
+            BrandingCommands::Show => cmd_branding_show(vtc).await,
+            BrandingCommands::Set {
+                display_name,
+                accent_color,
+                logo_url,
+                clear,
+            } => {
+                let change = BrandingChange {
+                    display_name,
+                    accent_color,
+                    logo_url,
+                    clear,
+                };
+                cmd_branding_set(vtc, change).await
+            }
+        },
+        VettingCommands::Revocations => cmd_revocations(vtc).await,
+        VettingCommands::BootstrapPgp(_) => unreachable!("handled above"),
+    }
+}
+
+/// A community-admin [`VtcClient`] holding a bearer token, authenticated to
+/// the VTC with the VTC's DID as the audience — for the verbs with no Trust
+/// Task served yet.
+async fn connect(keyring_key: &str, target: &VtcTarget) -> CliResult<VtcClient> {
+    Ok(vtc_target::connect(keyring_key, target).await?.client)
+}
+
+// ---------------------------------------------------------------------------
+// vetters
+// ---------------------------------------------------------------------------
+
+async fn cmd_vetters_list(vtc: &VtcClient) -> CliResult {
+    let list = vtc
+        .list_vetter_grants()
+        .await
+        .map_err(|e| guidance(e, Op::VettersList))?;
+    if is_json_output() {
+        print_json(&list.vetters)?;
+        return Ok(());
+    }
+    if list.vetters.is_empty() {
+        println!("No vetter grants.");
+        println!(
+            "  {DIM}Name a member a vetter with `{} vetting vetters grant <memberDid>`.{RESET}",
+            bin_name()
+        );
+        return Ok(());
+    }
+    let now = Utc::now();
+    if is_full_display() {
+        print_full_list_title("Vetter grants", list.vetters.len());
+        for row in &list.vetters {
+            print_full_entry(&[
+                ("Member", &row.member_did),
+                ("Status", grant_status(row, now)),
+                ("Origin", origin_label(row.origin)),
+                ("Valid from", &date(row.valid_from)),
+                ("Valid until", &row.valid_until.map_or("—".into(), date)),
+                ("Endorsement", &row.endorsement_id),
+                ("Credential", &row.credential_id),
+                ("Profile", &profile_label(row)),
+            ]);
+        }
+        return Ok(());
+    }
+
+    let header = Row::new(vec![
+        "Member",
+        "Status",
+        "Origin",
+        "Valid Until",
+        "Endorsement ID",
+        "Profile",
+    ])
+    .style(header_style())
+    .bottom_margin(1);
+    let rows: Vec<Row> = list
+        .vetters
+        .iter()
+        .map(|row| {
+            let status = grant_status(row, now);
+            let status_style = match status {
+                "live" => Style::default().fg(Color::Green),
+                "revoked" => Style::default().fg(Color::Red),
+                _ => Style::default().fg(Color::Yellow),
+            };
+            Row::new(vec![
+                did_cell(&row.member_did),
+                Cell::from(status).style(status_style),
+                Cell::from(origin_label(row.origin)),
+                Cell::from(row.valid_until.map_or("—".into(), date)),
+                Cell::from(row.endorsement_id.clone()),
+                Cell::from(profile_label(row)),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(30),
+            Constraint::Length(12),
+            Constraint::Length(7),
+            Constraint::Length(11),
+            Constraint::Length(36),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .column_spacing(2)
+    .block(bordered(format!(
+        " Vetter grants ({}) ",
+        list.vetters.len()
+    )));
+    print_widget(table, height(list.vetters.len()));
+    println!(
+        "  {DIM}Withdraw a grant with `{bin} vetting vetters revoke <endorsementId>`; \
+         `{bin} --full-display vetting vetters list` shows every DID in full.{RESET}",
+        bin = bin_name()
+    );
+    Ok(())
+}
+
+/// The `vtc/vetting/vetters/grant/0.1` payload naming `member_did`.
+pub(crate) fn grant_payload(
+    member_did: &str,
+    validity_seconds: Option<u64>,
+) -> CliResult<grant_wire::Payload> {
+    let validity_seconds = validity_seconds
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| "the grant validity is too large")?;
+    grant_wire::Payload::try_from(
+        grant_wire::Payload::builder()
+            .member_did(member_did)
+            .validity_seconds(validity_seconds),
+    )
+    .map_err(|e| format!("{member_did} cannot be named in a vetter grant: {e}").into())
+}
+
+async fn cmd_vetters_grant(vtc: &VtcClient, member_did: &str, validity: Option<&str>) -> CliResult {
+    let validity_seconds = validity
+        .map(|v| parse_grant_validity("--expires", v))
+        .transpose()?;
+    let result = vtc
+        .grant_vetter(&grant_payload(member_did, validity_seconds)?)
+        .await
+        .map_err(|e| guidance(e, Op::Grant { member_did }))?;
+    let grant = &result.grant;
+    if is_json_output() {
+        let mut value = serde_json::to_value(grant)?;
+        value["created"] = json!(result.created);
+        print_json(&value)?;
+        return Ok(());
+    }
+    if result.created {
+        println!("{GREEN}✓{RESET} Named {member_did} a vetter.");
+    } else {
+        println!(
+            "{YELLOW}!{RESET} {member_did} already holds a live vetter grant — nothing new was \
+             issued."
+        );
+        if validity_seconds.is_some() {
+            println!(
+                "  {DIM}--validity applies to a new grant only. To change it, revoke this grant \
+                 and grant again.{RESET}"
+            );
+        }
+    }
+    println!("  Endorsement:  {}", grant.endorsement_id.as_str());
+    println!("  Credential:   {}", grant.credential_id.as_str());
+    println!(
+        "  Valid:        {} → {}",
+        date(grant.valid_from),
+        date(grant.valid_until)
+    );
+    println!(
+        "  {DIM}Withdraw it with `{} vetting vetters revoke {}`.{RESET}",
+        bin_name(),
+        grant.endorsement_id.as_str()
+    );
+    Ok(())
+}
+
+async fn cmd_vetters_revoke(vtc: &VtcClient, endorsement_id: &str) -> CliResult {
+    let revoked = vtc
+        .revoke_endorsement(endorsement_id)
+        .await
+        .map_err(|e| guidance(e, Op::Revoke { endorsement_id }))?;
+    if is_json_output() {
+        print_json(&revoked)?;
+        return Ok(());
+    }
+    println!(
+        "{GREEN}✓{RESET} Revoked endorsement {} (credential {}) at {}.",
+        revoked.endorsement_id, revoked.revocation.credential_id, revoked.revocation.revoked_at
+    );
+    println!(
+        "  {DIM}A vetter whose grant is revoked no longer counts toward any join, and their \
+         profile is removed from listings.{RESET}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// auto-grant
+// ---------------------------------------------------------------------------
+
+async fn cmd_auto_grant_show(vtc: &VtcClient) -> CliResult {
+    let status = vtc
+        .auto_grant()
+        .await
+        .map_err(|e| guidance(e, Op::AutoGrantShow))?;
+    print_auto_grant(&status)
+}
+
+async fn cmd_auto_grant_set(
+    vtc: &VtcClient,
+    enabled: Option<bool>,
+    sweep_minutes: Option<u32>,
+    validity: Option<&str>,
+) -> CliResult {
+    if enabled.is_none() && sweep_minutes.is_none() && validity.is_none() {
+        return Err(format!(
+            "nothing to change. Pass at least one of --enabled <true|false>, --sweep-minutes \
+             <{MIN_AUTO_GRANT_SWEEP_MINUTES}–{MAX_AUTO_GRANT_SWEEP_MINUTES}> or --validity \
+             <duration>.\nSee the current configuration with `{} vetting auto-grant show`.",
+            bin_name()
+        )
+        .into());
+    }
+    let validity_seconds = validity
+        .map(|v| parse_grant_validity("--validity", v))
+        .transpose()?;
+    if let Some(m) = sweep_minutes
+        && !(MIN_AUTO_GRANT_SWEEP_MINUTES..=MAX_AUTO_GRANT_SWEEP_MINUTES).contains(&m)
+    {
+        return Err(format!(
+            "--sweep-minutes {m} is out of range: the sweep runs every \
+             {MIN_AUTO_GRANT_SWEEP_MINUTES} to {MAX_AUTO_GRANT_SWEEP_MINUTES} minutes (a day). \
+             Try `--sweep-minutes 60`."
+        )
+        .into());
+    }
+    // PUT replaces the whole configuration and an absent member takes its
+    // default, so start from what is stored: `--sweep-minutes 30` alone must
+    // not quietly switch the sweep off.
+    let current = vtc
+        .auto_grant()
+        .await
+        .map_err(|e| guidance(e, Op::AutoGrantShow))?;
+    let config = merged_auto_grant(&current, enabled, sweep_minutes, validity_seconds);
+    config
+        .check_shape()
+        .map_err(|e| format!("the automatic-grant configuration is out of bounds: {e}"))?;
+    let stored = vtc
+        .configure_auto_grant(&config)
+        .await
+        .map_err(|e| guidance(e, Op::AutoGrantSet))?;
+    if !is_json_output() {
+        println!("{GREEN}✓{RESET} Automatic vetter grants updated.");
+    }
+    print_auto_grant(&stored)
+}
+
+fn merged_auto_grant(
+    current: &AutoGrantStatus,
+    enabled: Option<bool>,
+    sweep_minutes: Option<u32>,
+    validity_seconds: Option<u64>,
+) -> AutoGrantConfig {
+    AutoGrantConfig {
+        enabled: enabled.unwrap_or(current.enabled),
+        sweep_minutes: Some(sweep_minutes.unwrap_or(current.sweep_minutes)),
+        validity_seconds: Some(validity_seconds.unwrap_or(current.validity_seconds)),
+    }
+}
+
+fn print_auto_grant(status: &AutoGrantStatus) -> CliResult {
+    if is_json_output() {
+        print_json(status)?;
+        return Ok(());
+    }
+    let enabled = if status.enabled {
+        format!("{GREEN}on{RESET}")
+    } else {
+        format!("{YELLOW}off{RESET}")
+    };
+    println!("  Enabled:        {enabled}");
+    println!("  Sweep every:    {} minutes", status.sweep_minutes);
+    println!(
+        "  Grant validity: {}",
+        humanize_duration(status.validity_seconds)
+    );
+    match &status.last_sweep {
+        Some(sweep) => println!(
+            "  Last sweep:     {} — {} granted, {} revoked, {} errors",
+            sweep.ran_at.to_rfc3339(),
+            sweep.granted,
+            sweep.revoked,
+            sweep.errors
+        ),
+        None => println!("  Last sweep:     {DIM}none yet{RESET}"),
+    }
+    if !status.enabled {
+        println!(
+            "  {DIM}Turn it on with `{} vetting auto-grant set --enabled true`. Which members it \
+             names is the `vetterEligibility` policy's decision.{RESET}",
+            bin_name()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// branding
+// ---------------------------------------------------------------------------
+
+async fn cmd_branding_show(vtc: &VtcClient) -> CliResult {
+    let branding = vtc
+        .branding()
+        .await
+        .map_err(|e| guidance(e, Op::BrandingShow))?;
+    print_branding(&branding)
+}
+
+/// The `branding set` flags.
+#[derive(Debug, Default)]
+struct BrandingChange {
+    display_name: Option<String>,
+    accent_color: Option<String>,
+    logo_url: Option<String>,
+    clear: Vec<BrandingField>,
+}
+
+async fn cmd_branding_set(vtc: &VtcClient, change: BrandingChange) -> CliResult {
+    if change.display_name.is_none()
+        && change.accent_color.is_none()
+        && change.logo_url.is_none()
+        && change.clear.is_empty()
+    {
+        return Err(format!(
+            "nothing to change. Pass --display-name, --accent-color, --logo-url or --clear \
+             <field>.\nSee the current branding with `{} vetting branding show`.",
+            bin_name()
+        )
+        .into());
+    }
+    let current = vtc
+        .branding()
+        .await
+        .map_err(|e| guidance(e, Op::BrandingShow))?;
+    let branding = merged_branding(current, change)?;
+    branding.check_shape().map_err(|e| {
+        format!(
+            "the branding is out of bounds: {e}.\nA display name is 1–128 characters, an accent \
+             colour `#rrggbb`, and a logo an https URL of at most 2048 characters."
+        )
+    })?;
+    let stored = vtc
+        .set_branding(&branding)
+        .await
+        .map_err(|e| guidance(e, Op::BrandingSet))?;
+    if !is_json_output() {
+        println!("{GREEN}✓{RESET} Branding updated.");
+    }
+    print_branding(&stored)
+}
+
+/// Apply `change` over `current`. PUT replaces the whole branding, so a value
+/// the operator did not mention is carried over rather than cleared.
+fn merged_branding(
+    mut current: CommunityBranding,
+    change: BrandingChange,
+) -> CliResult<CommunityBranding> {
+    for field in &change.clear {
+        let set = match field {
+            BrandingField::DisplayName => change.display_name.is_some(),
+            BrandingField::AccentColor => change.accent_color.is_some(),
+            BrandingField::LogoUrl => change.logo_url.is_some(),
+        };
+        if set {
+            return Err(format!(
+                "--clear {} and a new value for it were both given; pass one or the other",
+                field
+                    .to_possible_value()
+                    .map(|v| v.get_name().to_string())
+                    .unwrap_or_default()
+            )
+            .into());
+        }
+        match field {
+            BrandingField::DisplayName => current.display_name = None,
+            BrandingField::AccentColor => current.accent_color = None,
+            BrandingField::LogoUrl => current.logo_url = None,
+        }
+    }
+    if let Some(name) = change.display_name {
+        current.display_name = Some(
+            CommunityBrandingDisplayName::try_from(name)
+                .map_err(|e| format!("--display-name: {e}"))?,
+        );
+    }
+    if let Some(color) = change.accent_color {
+        current.accent_color = Some(
+            CommunityBrandingAccentColor::try_from(color)
+                .map_err(|e| format!("--accent-color must be #rrggbb: {e}"))?,
+        );
+    }
+    if change.logo_url.is_some() {
+        current.logo_url = change.logo_url;
+    }
+    Ok(current)
+}
+
+fn print_branding(branding: &CommunityBranding) -> CliResult {
+    if is_json_output() {
+        print_json(branding)?;
+        return Ok(());
+    }
+    let unset = format!("{DIM}(not set){RESET}");
+    let show = |v: Option<&str>| v.map_or_else(|| unset.clone(), str::to_owned);
+    println!(
+        "  Display name:  {}",
+        show(branding.display_name.as_ref().map(|v| v.as_str()))
+    );
+    println!(
+        "  Accent colour: {}",
+        show(branding.accent_color.as_ref().map(|v| v.as_str()))
+    );
+    println!("  Logo URL:      {}", show(branding.logo_url.as_deref()));
+    if branding.display_name.is_none()
+        && branding.accent_color.is_none()
+        && branding.logo_url.is_none()
+    {
+        println!(
+            "  {DIM}No branding is published on the join manifest. Set it with `{} vetting \
+             branding set --display-name …`.{RESET}",
+            bin_name()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// revocations
+// ---------------------------------------------------------------------------
+
+async fn cmd_revocations(vtc: &VtcClient) -> CliResult {
+    let notices = vtc
+        .vetting_revocations()
+        .await
+        .map_err(|e| guidance(e, Op::Revocations))?;
+    if is_json_output() {
+        print_json(&notices)?;
+        return Ok(());
+    }
+    if notices.is_empty() {
+        println!("No vetting statement has been withdrawn.");
+        return Ok(());
+    }
+    if is_full_display() {
+        print_full_list_title("Statement withdrawals", notices.len());
+        for n in &notices {
+            print_full_entry(&[
+                ("Recorded", &n.recorded_at.to_rfc3339()),
+                ("Vetter", &n.issuer),
+                ("Statement", &n.statement_id),
+                ("Digest", &n.statement_digest_multibase),
+                ("Reason", n.reason.as_deref().unwrap_or("—")),
+                ("Review", &n.review_state),
+                ("Members", &join_or_dash(&n.affected_members)),
+                ("Join requests", &join_or_dash(&n.affected_join_requests)),
+            ]);
+        }
+        return Ok(());
+    }
+    let header = Row::new(vec![
+        "Recorded",
+        "Vetter",
+        "Statement",
+        "Reason",
+        "Review",
+        "Affected Members",
+    ])
+    .style(header_style())
+    .bottom_margin(1);
+    let rows: Vec<Row> = notices
+        .iter()
+        .map(|n| {
+            let review = if n.review_state == "needsReview" {
+                Cell::from("needs review").style(Style::default().fg(Color::Yellow))
+            } else {
+                Cell::from("no admission")
+            };
+            Row::new(vec![
+                Cell::from(date(n.recorded_at)),
+                did_cell(&n.issuer),
+                Cell::from(n.statement_id.clone()),
+                Cell::from(n.reason.clone().unwrap_or_else(|| "—".into())),
+                review,
+                Cell::from(n.affected_members.len().to_string()),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(11),
+            Constraint::Min(30),
+            Constraint::Min(30),
+            Constraint::Length(15),
+            Constraint::Length(13),
+            Constraint::Length(16),
+        ],
+    )
+    .header(header)
+    .column_spacing(2)
+    .block(bordered(format!(
+        " Statement withdrawals ({}) ",
+        notices.len()
+    )));
+    print_widget(table, height(notices.len()));
+    let pending = notices
+        .iter()
+        .filter(|n| n.review_state == "needsReview")
+        .count();
+    if pending > 0 {
+        println!(
+            "  {BOLD}{pending}{RESET} {DIM}withdrawal(s) touch a current membership. \
+             `{} --full-display vetting revocations` names the members and join requests; the \
+             vetting facts a request was decided on are on that join request in the admin \
+             console.{RESET}",
+            bin_name()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Errors that say what to do
+// ---------------------------------------------------------------------------
+
+/// Which call failed, so a status can be read as the operator's situation.
+#[derive(Debug, Clone, Copy)]
+enum Op<'a> {
+    VettersList,
+    Grant { member_did: &'a str },
+    Revoke { endorsement_id: &'a str },
+    AutoGrantShow,
+    AutoGrantSet,
+    BrandingShow,
+    BrandingSet,
+    AskShow,
+    AskSet,
+    Revocations,
+    Members,
+}
+
+impl Op<'_> {
+    /// The verb, for a refusal that means the VTC does not serve it at all
+    /// (a `404` on the rare bearer route still mounted, or the spine's
+    /// `unsupportedType`/`unsupportedVersion` for a signed document).
+    fn route(&self) -> &'static str {
+        match self {
+            Self::VettersList | Self::Grant { .. } => "vtc/vetting/vetters/grant",
+            Self::Revoke { .. } => "vtc/endorsements/revoke",
+            Self::AutoGrantShow | Self::AutoGrantSet => "vtc/vetting/auto-grant",
+            Self::BrandingShow | Self::BrandingSet => "vtc/community/branding",
+            Self::AskShow | Self::AskSet => "vtc/community/requested-attributes",
+            Self::Revocations => "vtc/vetting/revocations/list",
+            Self::Members => "vtc/members/list",
+        }
+    }
+}
+
+/// Turn a client error into an operator error that names the fix.
+fn guidance(err: VtcError, op: Op<'_>) -> Box<dyn std::error::Error> {
+    let bin = bin_name();
+    let message = match err {
+        VtcError::Http { status: 401, .. } => "the VTC refused this command's token (401). It \
+             was minted moments ago, so the VTC has likely revoked the session or changed its \
+             signing key; re-run the command."
+            .to_string(),
+        VtcError::Http { status: 403, .. } => format!(
+            "this identity is not a community admin (403); vetting administration is admin-only.\n\
+             `{bin} auth status` shows the DID it authenticates as (Client DID). Give it an admin \
+             entry in the VTC's ACL. On the VTC host, with the daemon stopped:\n  \
+             vtc --config <config.toml> acl add --did <client-did> --role admin"
+        ),
+        VtcError::Http { status, body } => {
+            let detail = human_message(&body);
+            match (op, status) {
+                (Op::Grant { member_did }, 400) => format!(
+                    "the community refused to name {member_did} a vetter: {detail}\n\
+                     Only a current member can be a vetter. Check the DID is the member's DID \
+                     (not their PGP key or email), and if they have applied, approve their join \
+                     request first; then re-run `{bin} vetting vetters grant {member_did}`."
+                ),
+                (Op::Revoke { endorsement_id }, 404) => format!(
+                    "there is no endorsement {endorsement_id}.\nList the vetter grants with \
+                     `{bin} vetting vetters list` and pass the Endorsement ID column (not the \
+                     member DID or credential id)."
+                ),
+                (Op::Revoke { endorsement_id }, 400) => format!(
+                    "`{endorsement_id}` is not an endorsement id: {detail}\nEndorsement ids are \
+                     UUIDs; copy one from `{bin} vetting vetters list`."
+                ),
+                (Op::AutoGrantSet, 400) => format!(
+                    "the community refused the automatic-grant configuration: {detail}\n\
+                     --sweep-minutes is {MIN_AUTO_GRANT_SWEEP_MINUTES}–{MAX_AUTO_GRANT_SWEEP_MINUTES} \
+                     and --validity one day to two years."
+                ),
+                (Op::AutoGrantSet, 503) => format!(
+                    "the community refused to change automatic grants because its audit log is \
+                     not configured ({detail}). Configure the VTC's audit writer and retry."
+                ),
+                (Op::AskSet, 400) => format!(
+                    "the community refused the list: {detail}\nEach type once, at most 32, and a \
+                     purpose of at most 256 characters."
+                ),
+                (Op::BrandingSet, 400) => format!(
+                    "the community refused the branding: {detail}\nA display name is 1–128 \
+                     characters, an accent colour `#rrggbb`, and a logo an https URL of at most \
+                     2048 characters."
+                ),
+                (_, 404) => format!(
+                    "the VTC does not serve {} (404) — it predates the vetter registry.\nUpgrade \
+                     the VTC to a release with peer identity vetting.",
+                    op.route()
+                ),
+                (_, _) => format!("the VTC answered HTTP {status}: {detail}"),
+            }
+        }
+        VtcError::Transport(e) => format!(
+            "could not reach the VTC: {e}.\nCheck the community is up and its URL resolves with \
+             `{bin} health`."
+        ),
+        VtcError::NotAuthenticated => {
+            format!("no token for the VTC; re-run the command (`{bin}` authenticates on each run).")
+        }
+        other => other.to_string(),
+    };
+    message.into()
+}
+
+/// The `message` or `error` of a JSON error body, else the body itself.
+fn human_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            ["message", "error", "detail"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(Value::as_str).map(str::to_string))
+        })
+        .unwrap_or_else(|| {
+            if body.is_empty() {
+                "no detail".into()
+            } else {
+                body.to_string()
+            }
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a grant validity flag and check it against the grant bounds.
+fn parse_grant_validity(flag: &str, value: &str) -> CliResult<u64> {
+    let secs = parse_duration_secs(value)
+        .map_err(|e| format!("{flag} {value}: {e}. Use N[s|m|h|d|w], e.g. `{flag} 365d`"))?;
+    if !(MIN_VETTER_GRANT_VALIDITY_SECONDS..=MAX_VETTER_GRANT_VALIDITY_SECONDS).contains(&secs) {
+        return Err(format!(
+            "{flag} {value} is {}; a vetter grant is valid for one day to two years. Try `{flag} \
+             365d`.",
+            humanize_duration(secs)
+        )
+        .into());
+    }
+    Ok(secs)
+}
+
+fn grant_status(row: &VetterGrantRow, now: DateTime<Utc>) -> &'static str {
+    if row.revoked {
+        "revoked"
+    } else if row.live {
+        "live"
+    } else if row.valid_until.is_some_and(|u| u <= now) {
+        "expired"
+    } else {
+        "not member"
+    }
+}
+
+fn origin_label(origin: GrantOrigin) -> &'static str {
+    match origin {
+        GrantOrigin::Auto => "auto",
+        GrantOrigin::Manual => "manual",
+    }
+}
+
+fn profile_label(row: &VetterGrantRow) -> String {
+    let Some(p) = &row.profile else {
+        return "—".into();
+    };
+    let mut parts = vec![if p.listed { "listed" } else { "unlisted" }.to_string()];
+    if let Some(name) = &p.display_name {
+        parts.push(name.clone());
+    }
+    if let Some(country) = &p.country {
+        parts.push(country.clone());
+    }
+    if p.event_count > 0 {
+        parts.push(format!("{} events", p.event_count));
+    }
+    parts.join(" · ")
+}
+
+fn date(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%d").to_string()
+}
+
+fn join_or_dash(items: &[String]) -> String {
+    if items.is_empty() {
+        "—".into()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn header_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn bordered(title: String) -> Block<'static> {
+    Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(Color::DarkGray))
+}
+
+fn height(rows: usize) -> u16 {
+    u16::try_from(rows).unwrap_or(u16::MAX - 4) + 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grant_validity_is_bounded_with_a_suggestion() {
+        assert_eq!(
+            parse_grant_validity("--validity", "365d").unwrap(),
+            31_536_000
+        );
+        let err = parse_grant_validity("--validity", "3h")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("one day to two years") && err.contains("365d"),
+            "{err}"
+        );
+        let err = parse_grant_validity("--validity", "3y")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("N[s|m|h|d|w]"), "{err}");
+    }
+
+    #[test]
+    fn auto_grant_set_keeps_what_it_was_not_told_to_change() {
+        let current = AutoGrantStatus {
+            enabled: true,
+            sweep_minutes: 60,
+            validity_seconds: 31_536_000,
+            last_sweep: None,
+        };
+        let config = merged_auto_grant(&current, None, Some(30), None);
+        assert!(
+            config.enabled,
+            "--sweep-minutes alone must not turn the sweep off"
+        );
+        assert_eq!(config.sweep_minutes, Some(30));
+        assert_eq!(config.validity_seconds, Some(31_536_000));
+        let off = merged_auto_grant(&current, Some(false), None, None);
+        assert!(!off.enabled);
+        assert_eq!(off.sweep_minutes, Some(60));
+    }
+
+    #[test]
+    fn branding_set_merges_clears_and_refuses_a_contradiction() {
+        let current: CommunityBranding = serde_json::from_value(json!({
+            "displayName": "Linux Kernel",
+            "accentColor": "#1a2b3c",
+            "logoUrl": "https://kernel.example/logo.svg",
+        }))
+        .unwrap();
+        let merged = merged_branding(
+            current.clone(),
+            BrandingChange {
+                accent_color: Some("#000000".into()),
+                clear: vec![BrandingField::LogoUrl],
+                ..BrandingChange::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            merged.display_name.as_ref().map(|v| v.as_str()),
+            Some("Linux Kernel")
+        );
+        assert_eq!(
+            merged.accent_color.as_ref().map(|v| v.as_str()),
+            Some("#000000")
+        );
+        assert!(merged.logo_url.is_none());
+
+        let err = merged_branding(
+            current.clone(),
+            BrandingChange {
+                accent_color: Some("red".into()),
+                ..BrandingChange::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--accent-color"), "{err}");
+
+        let err = merged_branding(
+            current,
+            BrandingChange {
+                logo_url: Some("https://x.example/l.svg".into()),
+                clear: vec![BrandingField::LogoUrl],
+                ..BrandingChange::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--clear logo-url"), "{err}");
+    }
+
+    #[test]
+    fn errors_name_the_command_that_fixes_them() {
+        let revoke = guidance(
+            VtcError::Http {
+                status: 404,
+                body: r#"{"error":"not found"}"#.into(),
+            },
+            Op::Revoke {
+                endorsement_id: "did:key:zWrong",
+            },
+        )
+        .to_string();
+        assert!(revoke.contains("vetting vetters list"), "{revoke}");
+
+        let grant = guidance(
+            VtcError::Http {
+                status: 400,
+                body: r#"{"message":"did:key:zX is not a current member"}"#.into(),
+            },
+            Op::Grant {
+                member_did: "did:key:zX",
+            },
+        )
+        .to_string();
+        assert!(
+            grant.contains("is not a current member") && grant.contains("approve their join"),
+            "{grant}"
+        );
+
+        let old_vtc = guidance(
+            VtcError::Http {
+                status: 404,
+                body: String::new(),
+            },
+            Op::AutoGrantShow,
+        )
+        .to_string();
+        assert!(old_vtc.contains("vtc/vetting/auto-grant") && old_vtc.contains("Upgrade"));
+    }
+
+    #[test]
+    fn ask_set_builds_required_then_optional_with_purposes() {
+        let list = requested_from_flags(
+            &["name.display".into()],
+            &["address.country".into()],
+            &["name.display=So members know what to call you".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::Value::Array(list),
+            serde_json::json!([
+                { "type": "name.display", "required": true,
+                  "purpose": "So members know what to call you" },
+                { "type": "address.country", "required": false },
+            ])
+        );
+        assert!(requested_from_flags(&["a.b".into()], &["a.b".into()], &[]).is_err());
+        assert!(requested_from_flags(&[], &[], &["a.b=why".into()]).is_err());
+    }
+}

@@ -1,0 +1,859 @@
+//! The daemon's `config.toml` ([`DaemonConfig`]): which services to enable,
+//! and the per-service configs derived from it for the embedded server,
+//! control plane, witness and watcher.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use did_hosting_common::server::config::{
+    AuthConfig, FeaturesConfig, FjallTuning, HostingConfig, IdentityConfig, IdentityMode,
+    LogConfig, SecretsConfig, ServerConfig, StoreConfig,
+};
+use did_hosting_common::server::error::AppError;
+
+/// Daemon-level configuration combining all services.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Shared listener config (single port for all services).
+    #[serde(default = "default_server")]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+
+    // Shared identity
+    pub server_did: Option<String>,
+    pub mediator_did: Option<String>,
+    pub public_url: Option<String>,
+    pub did_hosting_url: Option<String>,
+
+    // Store locations
+    #[serde(default = "default_store")]
+    pub store: StoreConfig,
+    #[serde(default = "default_witness_store")]
+    pub witness_store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep both stores' memory use
+    /// inside the pod's Kubernetes limit. Shared by `store` and
+    /// `witness_store` — this is a pod-level setting, not a per-store one.
+    /// Every field defaults to `None` (fjall's own defaults, unchanged).
+    /// See [`did_hosting_common::server::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: FjallTuning,
+
+    // Server-specific
+    #[serde(default)]
+    pub limits: did_hosting_server::config::LimitsConfig,
+
+    // Witness-specific
+    #[serde(default)]
+    pub vta: did_hosting_common::server::config::VtaConfig,
+
+    // Control-specific
+    #[serde(default)]
+    pub registry: did_hosting_control::config::RegistryConfig,
+
+    /// Feature flags (didcomm, tsp, http_listener).
+    #[serde(default)]
+    pub features: FeaturesConfig,
+
+    /// How the daemon obtains its own identity (VTA-provisioned or self-managed).
+    #[serde(default)]
+    pub identity: IdentityConfig,
+    /// Bounds of the anti-replay cache for signed Trust Tasks (`[replay]`;
+    /// env `DAEMON_REPLAY_*`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_common::server::config::ReplayConfig::is_default"
+    )]
+    pub replay: did_hosting_common::server::config::ReplayConfig,
+    /// Local GeoIP database (`[geoip]`; env `DAEMON_GEOIP_DATABASE`) for the
+    /// city and country a wallet shows for a sign-in request. Reaches the
+    /// embedded control plane, which answers wallet sign-in.
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::GeoIpConfig::is_default"
+    )]
+    pub geoip: did_hosting_control::config::GeoIpConfig,
+    /// How fast the periodic statistics flush may write (`[stats_flush]`; env
+    /// `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND`).
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::StatsFlushConfig::is_default"
+    )]
+    pub stats_flush: did_hosting_control::config::StatsFlushConfig,
+    /// Which DIDs keep 5-minute statistics (`[stats]`; env `DAEMON_STATS_*`).
+    /// Reaches the embedded control plane, which writes the statistics.
+    #[serde(
+        default,
+        skip_serializing_if = "did_hosting_control::config::StatsTierConfig::is_default"
+    )]
+    pub stats: did_hosting_control::config::StatsTierConfig,
+
+    /// Multi-domain hosting settings (T18). `bootstrap_domains` seeds
+    /// the `domains` keyspace on first boot when no entries exist;
+    /// `unassigned_purge_grace` controls the retain-then-purge window
+    /// for domains the control plane has unassigned from this server.
+    #[serde(default)]
+    pub hosting: HostingConfig,
+
+    /// Which services to enable
+    #[serde(default)]
+    pub enable: EnableConfig,
+
+    #[serde(skip)]
+    pub config_path: PathBuf,
+}
+
+fn default_server() -> ServerConfig {
+    ServerConfig {
+        host: "0.0.0.0".to_string(),
+        port: 8534,
+        trusted_proxies: Vec::new(),
+        client_ipv6_prefix: did_hosting_common::server::config::default_client_ipv6_prefix(),
+        trusted_proxy_cidrs: Vec::new(),
+        resolve_cache: Default::default(),
+        resolve_rate_limit: Default::default(),
+    }
+}
+
+fn default_store() -> StoreConfig {
+    StoreConfig {
+        data_dir: PathBuf::from("data/daemon/store"),
+        ..StoreConfig::default()
+    }
+}
+
+fn default_witness_store() -> StoreConfig {
+    StoreConfig {
+        data_dir: PathBuf::from("data/daemon/witness"),
+        ..StoreConfig::default()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnableConfig {
+    #[serde(default = "default_true")]
+    pub server: bool,
+    #[serde(default = "default_true")]
+    pub witness: bool,
+    #[serde(default)]
+    pub watcher: bool,
+    #[serde(default = "default_true")]
+    pub control: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for EnableConfig {
+    fn default() -> Self {
+        Self {
+            server: true,
+            witness: true,
+            watcher: false,
+            control: true,
+        }
+    }
+}
+
+/// The reserved key prefix [`witness_store_shares_main_data`] writes under,
+/// in the ACL keyspace. ACL entries are read under `acl:` only, so a probe is
+/// never taken for an entry.
+pub const STORE_PROBE_PREFIX: &str = "store-probe:";
+
+/// Whether `witness` reads the same data as `main`, found by trying it: a
+/// random value is written under a reserved key in `main`'s ACL keyspace and
+/// looked for through `witness`'s, then removed (on every path). The witness
+/// and the control plane both keep their ACL in that keyspace, so a hit means
+/// the embedded witness would share the control plane's ACL. Comparing the two
+/// configs instead would miss spellings that name the same data (a Redis URL
+/// with and without its default port, a region from the environment, two
+/// paths to one directory).
+pub async fn witness_store_shares_main_data(
+    main: &did_hosting_common::server::store::Store,
+    witness: &did_hosting_common::server::store::Store,
+) -> Result<bool, AppError> {
+    use did_hosting_common::server::store::KS_ACL;
+    let main_acl = main.keyspace_consistent(KS_ACL)?;
+    let witness_acl = witness.keyspace_consistent(KS_ACL)?;
+    // A fresh random value: the public half of a throwaway Ed25519 key.
+    let nonce = affinidi_tdk::secrets_resolver::secrets::Secret::generate_ed25519(None, None)
+        .get_public_keymultibase()
+        .map_err(|e| AppError::Internal(format!("cannot make a probe value: {e}")))?;
+    let key = format!("{STORE_PROBE_PREFIX}{nonce}");
+    main_acl
+        .insert_raw(key.clone(), nonce.clone().into_bytes())
+        .await?;
+    let seen = witness_acl.get_raw(key.clone()).await;
+    let removed = main_acl.remove(key).await;
+    let seen = seen?;
+    removed?;
+    Ok(seen.as_deref() == Some(nonce.as_bytes()))
+}
+
+/// The refusal when [`witness_store_shares_main_data`] finds the stores
+/// shared.
+pub fn shared_witness_store_refusal() -> String {
+    "[witness_store] reaches the same data as [store], so the embedded witness would share \
+     the control plane's ACL, and every `service` entry there (each registered edge) could \
+     have the witness sign. Give [witness_store] its own data: a different `data_dir`, Redis \
+     database or server, `dynamodb_table_prefix` (for example \"webvh-witness\"), \
+     `firestore_database` or `cosmosdb_database`. To keep the witness identities and its \
+     ACL, copy the `witnesses` and `acl` keyspaces into the new location first (see the \
+     CHANGELOG)."
+        .to_string()
+}
+
+impl DaemonConfig {
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
+        let path = Self::resolve_path(config_path);
+
+        if !path.exists() {
+            return Err(AppError::Config(format!(
+                "configuration file not found: {}",
+                path.display()
+            )));
+        }
+
+        let contents = std::fs::read_to_string(&path).map_err(AppError::Io)?;
+        Self::from_toml(&contents, path)
+    }
+
+    /// Where [`Self::load`] reads the configuration: `config_path`, else
+    /// `DAEMON_CONFIG_PATH`, else `config.toml`.
+    pub fn resolve_path(config_path: Option<PathBuf>) -> PathBuf {
+        config_path
+            .or_else(|| std::env::var("DAEMON_CONFIG_PATH").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("config.toml"))
+    }
+
+    /// Parse a daemon configuration from its TOML text (as read from `path`)
+    /// and apply the environment overrides, exactly as [`Self::load`] does.
+    pub fn from_toml(contents: &str, path: PathBuf) -> Result<Self, AppError> {
+        let mut config = toml::from_str::<DaemonConfig>(contents)
+            .map_err(|e| AppError::Config(format!("failed to parse {}: {e}", path.display())))?;
+
+        config.config_path = path;
+
+        // Apply env overrides
+        macro_rules! env_opt {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    $field = Some(v);
+                }
+            };
+        }
+
+        env_opt!("DAEMON_SERVER_DID", config.server_did);
+        env_opt!("DAEMON_MEDIATOR_DID", config.mediator_did);
+        env_opt!("DAEMON_PUBLIC_URL", config.public_url);
+        env_opt!("DAEMON_DID_HOSTING_URL", config.did_hosting_url);
+        did_hosting_common::server::config::apply_hosting_env_overrides(
+            "DAEMON",
+            &mut config.hosting,
+        )?;
+
+        if let Ok(v) = std::env::var("DID_HOSTING_IDENTITY_MODE") {
+            config.identity.mode = match v.to_ascii_lowercase().as_str() {
+                "vta" => IdentityMode::Vta,
+                "self-managed" | "selfmanaged" => IdentityMode::SelfManaged,
+                other => {
+                    return Err(AppError::Config(format!(
+                        "invalid DID_HOSTING_IDENTITY_MODE '{other}' (expected 'vta' or 'self-managed')"
+                    )));
+                }
+            };
+        }
+
+        // The overrides every binary shares, under `DAEMON_`: features,
+        // server (host, port, trusted proxies), log, store, auth and secrets —
+        // `DAEMON_STORE_REDIS_URL`, `DAEMON_SECRETS_AWS_SECRET_NAME`, … as
+        // `docs/bootstrap_startup.md` documents for every prefix.
+        did_hosting_common::server::config::apply_env_overrides(
+            "DAEMON",
+            &mut config.features,
+            &mut config.server,
+            &mut config.log,
+            &mut config.store,
+            &mut config.auth,
+            &mut config.secrets,
+        )?;
+        // The witness store is the daemon's second store: `DAEMON_WITNESS_STORE_*`.
+        did_hosting_common::server::config::apply_store_env_overrides(
+            "DAEMON_WITNESS_STORE",
+            &mut config.witness_store,
+        )?;
+        // DAEMON_SERVER_RESOLVE_CACHE_* — Cache-Control on DID resolution.
+        config.server.resolve_cache.apply_env_overrides("DAEMON")?;
+        // DAEMON_REPLAY_* — anti-replay cache bounds. Also validates `[replay]`.
+        config.replay.apply_env_overrides("DAEMON")?;
+        // DAEMON_GEOIP_DATABASE — the local sign-in location database.
+        config.geoip.apply_env_overrides("DAEMON");
+        // DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND. Also validates `[stats_flush]`.
+        config.stats_flush.apply_env_overrides("DAEMON")?;
+        // DAEMON_STATS_MODE / _PROMOTE_PER_HOUR / _DEMOTE_PER_HOUR /
+        // _MAX_FINE_DIDS. Also validates `[stats]`.
+        config.stats.apply_env_overrides("DAEMON")?;
+        // DAEMON_SERVER_RESOLVE_RATE_LIMIT_* — per-address limit on resolution.
+        config
+            .server
+            .resolve_rate_limit
+            .apply_env_overrides("DAEMON")?;
+
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `did_hosting_common::server::config::apply_fjall_env_overrides`.
+        did_hosting_common::server::config::apply_fjall_env_overrides(&mut config.fjall)?;
+
+        // Normalize
+        if let Some(ref mut url) = config.public_url {
+            *url = url.trim_end_matches('/').to_string();
+        }
+        if let Some(ref mut url) = config.did_hosting_url {
+            *url = url.trim_end_matches('/').to_string();
+        }
+
+        Ok(config)
+    }
+
+    /// Build a did-hosting-server AppConfig from the daemon config.
+    pub fn server_config(&self) -> did_hosting_server::config::AppConfig {
+        did_hosting_server::config::AppConfig {
+            features: self.features_config(),
+            server_did: self.server_did.clone(),
+            mediator_did: self.mediator_did.clone(),
+            public_url: self.public_url.clone(),
+            server: self.server.clone(),
+            log: self.log.clone(),
+            store: self.store.clone(),
+            fjall: self.fjall,
+            auth: self.auth.clone(),
+            hosting: self.hosting.clone(),
+            secrets: self.secrets.clone(),
+            limits: self.limits.clone(),
+            replication: Default::default(),
+            control_did: None,
+            vta: self.vta.clone(),
+            stats: did_hosting_server::config::StatsConfig::default(),
+            // Carried through for completeness. The embedded server runs no
+            // DIDComm listener of its own, so its rotation path is inert — the
+            // daemon's control plane owns the identity.
+            identity: self.identity.clone(),
+            replay: self.replay.clone(),
+            config_path: self.config_path.clone(),
+        }
+    }
+
+    /// Build a webvh-witness AppConfig from the daemon config.
+    pub fn witness_config(&self) -> webvh_witness::config::AppConfig {
+        webvh_witness::config::AppConfig {
+            features: self.features_config(),
+            server_did: self.server_did.clone(),
+            mediator_did: self.mediator_did.clone(),
+            server: self.server.clone(),
+            log: self.log.clone(),
+            store: self.witness_store.clone(),
+            fjall: self.fjall,
+            secrets: self.secrets.clone(),
+            vta: self.vta.clone(),
+            // Carried through for completeness. The daemon's control plane owns
+            // the only DIDComm listener, so the embedded witness's rotation path
+            // is inert — its `didcomm_service` slot is never filled.
+            identity: self.identity.clone(),
+            replay: self.replay.clone(),
+            config_path: self.config_path.clone(),
+        }
+    }
+
+    /// Build a webvh-watcher AppConfig from the daemon config.
+    pub fn watcher_config(&self) -> webvh_watcher::config::AppConfig {
+        webvh_watcher::config::AppConfig {
+            // The embedded watcher serves resolution only: it has no DID and
+            // no listener of its own (see `build_watcher`).
+            features: self.features_config(),
+            server_did: None,
+            mediator_did: None,
+            server: self.server.clone(),
+            log: self.log.clone(),
+            store: self.store.clone(),
+            fjall: self.fjall,
+            secrets: self.secrets.clone(),
+            vta: self.vta.clone(),
+            identity: self.identity.clone(),
+            replay: self.replay.clone(),
+            sync: Default::default(),
+            config_path: self.config_path.clone(),
+        }
+    }
+
+    /// Build a did-hosting-control AppConfig from the daemon config.
+    pub fn control_config(&self) -> did_hosting_control::config::AppConfig {
+        did_hosting_control::config::AppConfig {
+            features: self.features_config(),
+            server_did: self.server_did.clone(),
+            mediator_did: self.mediator_did.clone(),
+            public_url: self.public_url.clone(),
+            did_hosting_url: self.did_hosting_url.clone(),
+            server: self.server.clone(),
+            log: self.log.clone(),
+            store: self.store.clone(),
+            fjall: self.fjall,
+            auth: self.auth.clone(),
+            secrets: self.secrets.clone(),
+            vta: self.vta.clone(),
+            registry: self.registry.clone(),
+            trust_tasks: did_hosting_control::config::TrustTasksConfig::default(),
+            hosting: self.hosting.clone(),
+            // The daemon's control plane owns the only DIDComm listener, so it
+            // is the one that rotates — it needs the daemon's grace period, not
+            // a default.
+            identity: self.identity.clone(),
+            replay: self.replay.clone(),
+            geoip: self.geoip.clone(),
+            stats_flush: self.stats_flush,
+            stats: self.stats,
+            config_path: self.config_path.clone(),
+        }
+    }
+
+    fn features_config(&self) -> FeaturesConfig {
+        FeaturesConfig {
+            didcomm: self.features.didcomm,
+            tsp: self.features.tsp,
+            http_listener: self.features.http_listener,
+            agent_names: self.features.agent_names,
+            deployment_mode: did_hosting_common::server::config::DeploymentMode::Daemon,
+        }
+    }
+}
+
+/// What the shared subcommands read: the daemon's own configuration, with the
+/// embedded witness's store for `--witness`.
+impl did_hosting_common::server::cli::ServiceConfig for DaemonConfig {
+    fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+    fn store(&self) -> &StoreConfig {
+        &self.store
+    }
+    fn secrets(&self) -> &SecretsConfig {
+        &self.secrets
+    }
+    fn server_did(&self) -> Option<&str> {
+        self.server_did.as_deref()
+    }
+    fn mediator_did(&self) -> Option<&str> {
+        self.mediator_did.as_deref()
+    }
+    fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
+    }
+    fn features(&self) -> &FeaturesConfig {
+        &self.features
+    }
+    fn hosting(&self) -> &HostingConfig {
+        &self.hosting
+    }
+    fn identity(&self) -> &IdentityConfig {
+        &self.identity
+    }
+    fn server(&self) -> &ServerConfig {
+        &self.server
+    }
+    fn auth(&self) -> &AuthConfig {
+        &self.auth
+    }
+    fn witness_store(&self) -> Option<&StoreConfig> {
+        Some(&self.witness_store)
+    }
+}
+
+impl did_hosting_control::cli::StatsSettings for DaemonConfig {
+    fn stats_flush(&self) -> &did_hosting_control::config::StatsFlushConfig {
+        &self.stats_flush
+    }
+    fn stats_tiers(&self) -> &did_hosting_control::config::StatsTierConfig {
+        &self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn open(dir: &std::path::Path) -> did_hosting_common::server::store::Store {
+        did_hosting_common::server::store::Store::open(&StoreConfig {
+            data_dir: dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// One store reached through both handles (what any spelling of the
+    /// same Redis URL, DynamoDB prefix and region, or database gives) is
+    /// found shared; two stores are not; the probe leaves nothing behind.
+    #[tokio::test]
+    async fn a_witness_store_reaching_the_main_data_is_found_by_trying_it() {
+        use did_hosting_common::server::store::KS_ACL;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let main = open(a.path()).await;
+        let witness = open(b.path()).await;
+
+        assert!(witness_store_shares_main_data(&main, &main).await.unwrap());
+        assert!(
+            !witness_store_shares_main_data(&main, &witness)
+                .await
+                .unwrap()
+        );
+        // A handle cloned from the main store is the same data too.
+        assert!(
+            witness_store_shares_main_data(&main, &main.clone())
+                .await
+                .unwrap()
+        );
+
+        for store in [&main, &witness] {
+            let left = store
+                .keyspace(KS_ACL)
+                .unwrap()
+                .prefix_iter_raw(STORE_PROBE_PREFIX)
+                .await
+                .unwrap();
+            assert!(left.is_empty(), "probe removed");
+        }
+    }
+
+    /// The default layout gives the witness its own directory.
+    #[test]
+    fn the_default_daemon_layout_keeps_the_witness_store_separate() {
+        assert_ne!(default_store().data_dir, default_witness_store().data_dir);
+    }
+    use std::io::Write;
+
+    /// Minimal self-managed config: `[identity] mode = "self-managed"`,
+    /// no `[vta]` block at all (back-compat with existing parsers).
+    const SELF_MANAGED_TOML: &str = r#"
+public_url = "https://daemon.example.com"
+did_hosting_url = "https://daemon.example.com"
+
+[identity]
+mode = "self-managed"
+
+[server]
+host = "0.0.0.0"
+port = 8534
+
+[log]
+level = "info"
+format = "text"
+
+[store]
+data_dir = "data/daemon/store"
+
+[witness_store]
+data_dir = "data/daemon/witness"
+
+[auth]
+
+[secrets]
+"#;
+
+    /// Minimal VTA-mode config (the back-compat case — no `[identity]`
+    /// block at all, so the loader must default `identity.mode` to `Vta`).
+    const VTA_DEFAULT_TOML: &str = r#"
+public_url = "https://daemon.example.com"
+did_hosting_url = "https://daemon.example.com"
+
+[server]
+host = "0.0.0.0"
+port = 8534
+
+[log]
+level = "info"
+format = "text"
+
+[store]
+data_dir = "data/daemon/store"
+
+[witness_store]
+data_dir = "data/daemon/witness"
+
+[auth]
+
+[secrets]
+
+[vta]
+url = "https://vta.example.com"
+did = "did:webvh:vta.example.com"
+context_id = "webvh"
+"#;
+
+    fn write_temp_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).expect("create config");
+        f.write_all(contents.as_bytes()).expect("write config");
+        (dir, path)
+    }
+
+    /// What the setup wizard and recipe write (a serialised `DaemonConfig`)
+    /// loads back under the strict parser; misspelt keys are refused.
+    #[test]
+    fn a_written_config_loads_and_typos_are_refused() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let mut cfg = DaemonConfig::load(Some(path.clone())).expect("load");
+        cfg.features.didcomm = true;
+        cfg.features.http_listener = true;
+        cfg.hosting.disable_purge_grace =
+            did_hosting_common::server::config::GracePeriod::parse("3d").unwrap();
+        cfg.enable.watcher = true;
+        std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        let loaded = DaemonConfig::load(Some(path.clone())).expect("written config loads");
+        assert!(loaded.features.didcomm && loaded.features.http_listener);
+        assert!(loaded.enable.watcher);
+        assert_eq!(
+            loaded
+                .control_config()
+                .hosting
+                .disable_purge_grace
+                .as_secs(),
+            3 * 86_400
+        );
+        assert_eq!(
+            loaded.control_config().features.deployment_mode,
+            did_hosting_common::server::config::DeploymentMode::Daemon
+        );
+
+        for bad in [
+            "[enable]\nwitnes = false\n",
+            "[limits]\nupload_limit = 5\n",
+            "[hosting]\nunassigned_purge_grace = \"2 weeks\"\n",
+            "public_ulr = \"https://x.example.com\"\n",
+        ] {
+            let (_dir, path) = write_temp_config(&format!("{SELF_MANAGED_TOML}\n{bad}"));
+            assert!(DaemonConfig::load(Some(path)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn loads_self_managed_config_with_empty_vta() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+
+        let cfg = DaemonConfig::load(Some(path)).expect("load self-managed config");
+
+        assert_eq!(cfg.identity.mode, IdentityMode::SelfManaged);
+        assert!(cfg.vta.url.is_none(), "vta.url should be None");
+        assert!(cfg.vta.did.is_none(), "vta.did should be None");
+        assert!(
+            cfg.vta.context_id.is_none(),
+            "vta.context_id should be None"
+        );
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://daemon.example.com")
+        );
+    }
+
+    /// The shared `DAEMON_*` overrides reach the store, secrets, auth and
+    /// features settings, as they do for every other binary's prefix, and
+    /// `DAEMON_WITNESS_STORE_*` reaches the witness store.
+    ///
+    /// The process environment is shared by every test in this binary, and
+    /// these variables would redirect other tests' stores and secrets, so the
+    /// checks run in a child process: this test re-runs itself with the
+    /// variables set on the child alone.
+    #[test]
+    fn the_shared_env_overrides_apply_under_the_daemon_prefix() {
+        const CHILD: &str = "DAEMON_ENV_OVERRIDE_TEST_CHILD";
+        const NAME: &str = "config::tests::the_shared_env_overrides_apply_under_the_daemon_prefix";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("DAEMON_STORE_DYNAMODB_TABLE_PREFIX", "daemon-main")
+                .env(
+                    "DAEMON_WITNESS_STORE_DYNAMODB_TABLE_PREFIX",
+                    "daemon-witness",
+                )
+                .env("DAEMON_SECRETS_AWS_SECRET_NAME", "daemon-secret")
+                .env("DAEMON_AUTH_CHALLENGE_TTL", "123")
+                .env("DAEMON_FEATURES_AGENT_NAMES", "false")
+                .status()
+                .expect("run the child test");
+            assert!(status.success(), "the child test failed");
+            return;
+        }
+
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load with overrides");
+        assert_eq!(
+            cfg.store.dynamodb_table_prefix.as_deref(),
+            Some("daemon-main")
+        );
+        assert_eq!(
+            cfg.witness_store.dynamodb_table_prefix.as_deref(),
+            Some("daemon-witness")
+        );
+        assert_eq!(
+            cfg.secrets.aws_secret_name.as_deref(),
+            Some("daemon-secret")
+        );
+        assert_eq!(cfg.auth.challenge_ttl, 123);
+        assert!(!cfg.features.agent_names);
+    }
+
+    /// `[replay]` reaches the embedded control plane, witness and watcher,
+    /// the services that hold a replay cache; without it the defaults apply,
+    /// and an inconsistent table stops the load.
+    #[test]
+    fn replay_bounds_reach_the_embedded_services() {
+        use did_hosting_common::server::config::ReplayConfig;
+
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.control_config().replay, ReplayConfig::default());
+
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[replay]\nmax_entries = 200000\nmax_entries_per_signer = 50000\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let expected = ReplayConfig {
+            max_entries: 200_000,
+            max_entries_per_signer: 50_000,
+        };
+        assert_eq!(cfg.control_config().replay, expected);
+        assert_eq!(cfg.witness_config().replay, expected);
+        assert_eq!(cfg.watcher_config().replay, expected);
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[replay]\nmax_entries_per_signer = 2000000\n");
+        let (_dir, path) = write_temp_config(&toml);
+        assert!(DaemonConfig::load(Some(path)).is_err());
+    }
+
+    /// `[geoip]` reaches the embedded control plane, which answers wallet
+    /// sign-in; without it no database is configured.
+    #[test]
+    fn geoip_database_reaches_the_control_plane() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.control_config().geoip.database, None);
+
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[geoip]\ndatabase = \"/var/lib/did-hosting/geoip/dbip-city-lite.mmdb\"\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(
+            cfg.control_config().geoip.database.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/did-hosting/geoip/dbip-city-lite.mmdb"
+            ))
+        );
+    }
+
+    /// `[stats_flush]` sets the daemon's own flush budget and reaches the
+    /// embedded control plane; a zero budget stops the load. (The
+    /// `DAEMON_STATS_FLUSH_MAX_ROWS_PER_SECOND` parsing is the control plane's
+    /// `StatsFlushConfig::apply_env_overrides`, tested there: setting a
+    /// `DAEMON_*` variable here would race the other load tests.)
+    #[test]
+    fn stats_flush_budget_is_read_from_the_file() {
+        let (_dir, path) = write_temp_config(SELF_MANAGED_TOML);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.stats_flush.rows_per_flush(), 200, "default unchanged");
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats_flush]\nmax_rows_per_second = 5\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        assert_eq!(cfg.stats_flush.rows_per_flush(), 50);
+        assert_eq!(cfg.control_config().stats_flush.max_rows_per_second, 5);
+
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats_flush]\nmax_rows_per_second = 0\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let err = DaemonConfig::load(Some(path)).expect_err("zero defers every row");
+        assert!(err.to_string().contains("max_rows_per_second"), "{err}");
+    }
+
+    /// `[stats]` reaches the embedded control plane; thresholds without a
+    /// gap stop the load.
+    #[test]
+    fn stats_tiers_are_read_from_the_file() {
+        let toml = format!("{SELF_MANAGED_TOML}\n[stats]\nmode = \"coarse\"\nmax_fine_dids = 5\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let stats = cfg.control_config().stats;
+        assert_eq!(stats.mode, did_hosting_control::config::StatsMode::Coarse);
+        assert_eq!(stats.max_fine_dids, 5);
+
+        let toml =
+            format!("{SELF_MANAGED_TOML}\n[stats]\npromote_per_hour = 10\ndemote_per_hour = 10\n");
+        let (_dir, path) = write_temp_config(&toml);
+        let err = DaemonConfig::load(Some(path)).expect_err("no gap");
+        assert!(err.to_string().contains("demote_per_hour"), "{err}");
+    }
+
+    /// `[[geoip.networks]]` reaches the control plane; a bad range or label
+    /// stops the load and says which entry.
+    #[test]
+    fn geoip_named_networks_are_checked_at_load() {
+        let toml = format!(
+            "{SELF_MANAGED_TOML}\n[[geoip.networks]]\ncidr = \"10.20.0.0/16\"\nlocation = \" Sydney office \"\n\n[[geoip.networks]]\ncidr = \"192.0.2.7\"\nlocation = \"VPN\"\n"
+        );
+        let (_dir, path) = write_temp_config(&toml);
+        let cfg = DaemonConfig::load(Some(path)).expect("load");
+        let nets = cfg.control_config().geoip.networks;
+        assert_eq!(nets.len(), 2);
+        assert_eq!(nets[0].cidr.to_string(), "10.20.0.0/16");
+        assert_eq!(nets[0].location, "Sydney office");
+        assert_eq!(nets[1].cidr.to_string(), "192.0.2.7/32");
+
+        let long = "x".repeat(129);
+        for (cidr, location, needle) in [
+            ("10.0.0.0/33", "Office", "10.0.0.0/33"),
+            ("office-lan", "Office", "office-lan"),
+            ("10.0.0.0/8", "", "10.0.0.0/8"),
+            ("10.0.0.0/8", "Bad\\u0007", "10.0.0.0/8"),
+            ("10.0.0.0/8", long.as_str(), "128"),
+        ] {
+            let toml = format!(
+                "{SELF_MANAGED_TOML}\n[[geoip.networks]]\ncidr = \"{cidr}\"\nlocation = \"{location}\"\n"
+            );
+            let (_dir, path) = write_temp_config(&toml);
+            let err = DaemonConfig::load(Some(path)).unwrap_err().to_string();
+            assert!(err.contains(needle), "{cidr} / {location}: {err}");
+        }
+    }
+
+    #[test]
+    fn loads_vta_config_without_identity_block_defaults_to_vta() {
+        // Back-compat: existing VTA-mode configs don't have an `[identity]`
+        // block. The loader must default `identity.mode = Vta`.
+        let (_dir, path) = write_temp_config(VTA_DEFAULT_TOML);
+
+        let cfg = DaemonConfig::load(Some(path)).expect("load VTA-default config");
+
+        assert_eq!(
+            cfg.identity.mode,
+            IdentityMode::Vta,
+            "missing [identity] block should default to Vta"
+        );
+        assert_eq!(cfg.vta.url.as_deref(), Some("https://vta.example.com"));
+        assert_eq!(cfg.vta.did.as_deref(), Some("did:webvh:vta.example.com"));
+    }
+
+    // DID_HOSTING_IDENTITY_MODE env-override coverage lives in did-hosting-common's
+    // IdentityMode parsing tests. A daemon-level env test would race
+    // against parallel tests in the same process (env vars are
+    // process-wide), and the daemon's override code is just a 3-arm
+    // match — not worth a serialised mutex harness.
+}

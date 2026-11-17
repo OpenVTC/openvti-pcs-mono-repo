@@ -1,0 +1,1253 @@
+//! Delivery-layer construction + protocol-routed inbound loop (D2 P2a).
+//!
+//! Mirrors `vtc-service::messaging`: build an ATM + bounded-websocket
+//! `ATMProfile` for the VTA's DID against the configured mediator, wrap it in a
+//! [`DidCommTransport`], back an outbox with [`VtiOutboxStore`], and drive
+//! [`MessagingService`]. Inbound is protocol-routed off
+//! [`MessagingService::subscribe`]: DIDComm frames go to
+//! [`super::router::dispatch`] (after the `#620` verified-sender-or-none rule
+//! stamps `Message::from`); TSP frames go to
+//! [`super::tsp_inbound::dispatch_one`] and their reply is sealed + routed back
+//! over the same mediator socket.
+//!
+//! The service is built [`MessagingService::with_receipts`]: a message that
+//! asks for a delivery receipt (a DIDComm `delivery_id` header, a TSP
+//! envelope's `deliveryId`) is receipted to its authenticated sender once it
+//! has been handed off, over the binding it arrived on (VTI-TRN-061). The
+//! consume half is always active, so a receipt settles the VTA's own sends —
+//! only from the party each was addressed to (VTI-TRN-062).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use affinidi_messaging_core::{Inbound, InboundKind, MessageTransport, Protocol, ReceivedMessage};
+#[cfg(feature = "didcomm")]
+use affinidi_messaging_delivery::Delivery;
+use affinidi_messaging_delivery::{MessagingService, OutboxStore};
+#[cfg(feature = "didcomm")]
+use affinidi_messaging_didcomm::Message;
+use affinidi_tdk::common::TDKSharedState;
+use affinidi_tdk::common::config::TDKConfig;
+use affinidi_tdk::messaging::config::ATMConfig;
+use affinidi_tdk::messaging::profiles::ATMProfile;
+use affinidi_tdk::messaging::{ATM, DidCommTransport};
+use affinidi_tdk::secrets_resolver::SecretsResolver;
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use vti_common::outbox_store::VtiOutboxStore;
+
+#[cfg(feature = "didcomm")]
+use crate::messaging::router::{self, VtaState};
+use crate::messaging::sender_order::{FrameOrder, SenderOrder};
+#[cfg(feature = "didcomm")]
+use crate::messaging::shim::{DIDCommResponse, ProblemReport, ServiceProblemReport};
+use crate::server::AppState;
+use crate::store::KeyspaceHandle;
+
+/// The live delivery-layer wiring for the VTA's mediator socket, returned by
+/// [`build_messaging`]. The `service` is published into the outbound bridge and
+/// drives the inbound loop; `atm` + `profile` pack/seal replies (DIDComm via
+/// `pack_encrypted`, TSP via `tsp().send_routed`).
+pub struct VtaMessaging {
+    pub service: Arc<MessagingService>,
+    pub atm: Arc<ATM>,
+    pub profile: Arc<ATMProfile>,
+    /// This session's TSP transport, built once here rather than per frame.
+    ///
+    /// Not an `Option`: the profile above is registered against a mediator, so
+    /// if it cannot route, nothing about this session works and
+    /// [`build_messaging`] refuses rather than coming up able to receive and
+    /// not to answer. That half-working state is exactly what this whole
+    /// arrangement replaced.
+    #[cfg(feature = "tsp")]
+    pub tsp: crate::messaging::tsp_transport::TspTransport,
+    /// Whether this session is collecting its mediator inbox (written by the
+    /// inbox watch [`run_inbound_loop`] runs alongside the dispatcher).
+    pub inbox: vti_common::inbox::InboxWatch,
+    /// Recipients the mediator refused `limits.queue.peer` for: reported once
+    /// each rather than once per reply, and not sent relationship accepts while
+    /// they stay refused.
+    pub uncollected: Arc<vti_common::inbox::UncollectedPeers>,
+}
+
+/// Capacity of the SDK's unprocessable-frame channel. Reports only — the SDK
+/// decides each frame's fate whether or not anyone reads this, and a lagging
+/// reader still counts what it missed.
+const UNPROCESSABLE_CHANNEL_CAPACITY: usize = 64;
+
+/// Build the delivery-layer [`MessagingService`] over a [`DidCommTransport`]
+/// bound to the VTA's single mediator websocket.
+///
+/// Mirrors `vtc-service::messaging::build_messaging`: a fresh TDK seeded with
+/// the VTA's secrets (and the app's DID resolver, so the listener sees the same
+/// seeded self-DID cache entry the REST path does), an ATM, a profile against
+/// the mediator, then a **bounded** `profile_enable_websocket` (the connect can
+/// hang) before the transport is bound. The `outbox` keyspace backs
+/// `Guaranteed` sends durably (unused by P2a's `BestEffort`-only sends, but
+/// `MessagingService::new` requires a store).
+pub async fn build_messaging(
+    secrets: Vec<Secret>,
+    vta_did: &str,
+    mediator_did: &str,
+    outbox_ks: KeyspaceHandle,
+    pushes_ks: KeyspaceHandle,
+    relationships_ks: KeyspaceHandle,
+    relationship_drop_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    did_resolver: Option<&DIDCacheClient>,
+    resolver_url: Option<&str>,
+) -> Result<VtaMessaging, String> {
+    // Reuse the app's initialized resolver when available so the listener sees
+    // the same seeded self-DID cache entry; else fall back to resolver-url mode.
+    let mut builder = TDKConfig::builder().with_load_environment(false);
+    if let Some(dr) = did_resolver {
+        builder = builder.with_did_resolver(dr.clone());
+    } else {
+        // No app resolver (auth init failed). Build one with the same bounds a
+        // configured node gets rather than the SDK's unbounded-by-us defaults,
+        // so this path cannot hold a peer's document longer than the rest of
+        // the node would.
+        let resolver_config = vta_sdk::resolver::build_verifier_did_cache_config(
+            resolver_url,
+            vti_common::config::DID_CACHE_TTL_DEFAULT_SECS,
+            vti_common::config::DID_CACHE_CAPACITY_DEFAULT,
+        );
+        builder = builder.with_did_resolver_config(resolver_config);
+    }
+    let tdk_config = builder
+        .build()
+        .map_err(|e| format!("build TDK config: {e}"))?;
+
+    let tdk = TDKSharedState::new(tdk_config)
+        .await
+        .map_err(|e| format!("create TDK shared state: {e}"))?;
+    for secret in secrets {
+        tdk.secrets_resolver().insert(secret).await;
+    }
+
+    // Persist TSP relationship state in the encrypted `relationships` keyspace so
+    // it survives a restart. Without it, a restarted VTA forgets every peer and
+    // — by Rev 3 §7.2.2 — silently drops their traffic until each re-handshakes
+    // (design note `docs/05-design-notes/tsp-relationship-recovery.md`, D1). Only
+    // the `tsp` build has a relationship store to configure; a DIDComm-only build
+    // does not use the keyspace.
+    // Frames the SDK cannot unpack are deleted by the SDK itself — the one
+    // owner of that decision (see `vti_common::inbox`): at once when the bytes
+    // are bad, after an hour of repeats when the failure looked transient, and
+    // never when the frame was sent to a key the VTA has not loaded. Stated
+    // here rather than left to the default because the VTA relies on it. The
+    // channel only feeds the inbox health count.
+    let atm_config_builder = ATMConfig::builder()
+        .with_delete_unprocessable(true)
+        .with_unprocessable_message_channel(UNPROCESSABLE_CHANNEL_CAPACITY);
+    #[cfg(feature = "tsp")]
+    let atm_config_builder = atm_config_builder
+        .with_relationship_store(Arc::new(
+            affinidi_messaging_sdk::PersistentRelationshipStore::new(
+                crate::messaging::tsp_relationship_store::KeyspaceRelationshipKv::new(
+                    relationships_ks,
+                ),
+            ),
+        ))
+        // D8: the gate increments this on every §7.2.2 drop; a startup task
+        // samples it into the telemetry sink (`drop_telemetry_loop`).
+        .with_relationship_drop_counter(relationship_drop_counter.clone());
+    #[cfg(not(feature = "tsp"))]
+    let _ = (relationships_ks, &relationship_drop_counter); // used only by `tsp`
+
+    let atm = Arc::new(
+        ATM::new(
+            atm_config_builder
+                .build()
+                .map_err(|e| format!("build ATM config: {e}"))?,
+            Arc::new(tdk),
+        )
+        .await
+        .map_err(|e| format!("create ATM: {e}"))?,
+    );
+
+    let profile = ATMProfile::new(
+        &atm,
+        None,
+        vta_did.to_string(),
+        Some(mediator_did.to_string()),
+    )
+    .await
+    .map_err(|e| format!("create ATM profile: {e}"))?;
+
+    // Register with the ATM (`live_stream: false` — the websocket is enabled
+    // explicitly, bounded, just below). The VTA's listener lives for the whole
+    // process, so this is not about reclaiming anything today; it is what makes
+    // stopping the socket *possible at all*. `ATM::graceful_shutdown` stops
+    // websockets by iterating the profile map, so an unregistered profile's
+    // transport survives every shutdown path there is (vta-sdk #830). A listener
+    // whose socket cannot be stopped short of `exit()` is a trap for the next
+    // person who adds a shutdown path here.
+    let profile = atm
+        .profile_add(&profile, false)
+        .await
+        .map_err(|e| format!("register ATM profile: {e}"))?;
+
+    // Built here, where a failure can still refuse the session. The profile was
+    // constructed with `Some(mediator_did)` a few lines up, so this only fails
+    // if that stopped being true — and a session whose profile cannot route is
+    // worse than no session, because the inbound loop would still run and the
+    // VTA would answer nothing.
+    #[cfg(feature = "tsp")]
+    let tsp = match crate::messaging::tsp_transport::TspTransport::new(
+        (*atm).clone(),
+        profile.clone(),
+    ) {
+        Some(t) => t,
+        None => {
+            atm.graceful_shutdown().await;
+            return Err(
+                "the profile registered for this session carries no mediator, so it can neither                  send nor unseal over TSP"
+                    .to_string(),
+            );
+        }
+    };
+
+    // ── Past this point the ATM owns a registered profile and a live (or
+    // half-open) mediator websocket, so every error path MUST tear it down. ──
+    //
+    // There is no `Drop` impl on `ATM`: dropping it *abandons* the websocket
+    // task rather than ending it, and an abandoned socket keeps auto-reconnecting
+    // on its own timer while holding the mediator's one-socket-per-DID slot — so
+    // the next attempt gets evicted as `duplicate-channel` and the two reconnect
+    // loops duel. `graceful_shutdown` is what actually stops it (it iterates the
+    // profile map calling `stop_websocket`). This matters far more now that a
+    // failed connect is *retried* by `server::MessagingConnect`: without the
+    // teardown, that loop would leak one duelling socket per attempt.
+    let transport = match connect_transport(&atm, &profile).await {
+        Ok(transport) => transport,
+        Err(e) => {
+            atm.graceful_shutdown().await;
+            return Err(e);
+        }
+    };
+
+    let outbox: Arc<dyn OutboxStore> = Arc::new(VtiOutboxStore::new(outbox_ks));
+    // Receipts are emitted for every message that asks for one, as this VTA's
+    // own DID (VTI-TRN-061); consumed ones settle the VTA's sends (VTI-TRN-062).
+    // Clone transport + outbox before the constructor consumes them: the
+    // background loops need their own handles.
+    let service = Arc::new(MessagingService::with_receipts(
+        transport.clone(),
+        outbox.clone(),
+        Arc::new(affinidi_tdk::messaging::delivery::AtmReceiptPacker::new(
+            (*atm).clone(),
+            profile.clone(),
+        )),
+    ));
+    // Durable outbox: drain sends due entries + retries; outbox-drain confirms
+    // Delivered on recipient pickup; confirmation sweep settles expired entries.
+    // Dormant in P2a (no Guaranteed sends yet) but wired for P2b + restart
+    // resilience.
+    tokio::spawn(affinidi_messaging_delivery::drain_loop(
+        outbox.clone(),
+        service.primary_handle(),
+        Duration::from_secs(2),
+    ));
+    tokio::spawn(affinidi_messaging_delivery::outbox_drain_loop(
+        service.primary_handle(),
+        outbox.clone(),
+        Duration::from_secs(10),
+    ));
+    // With the service's receipt reach: a relayed entry to a recipient not
+    // known to send receipts settles unconfirmable, not lost (VTI-TRN-064).
+    tokio::spawn(vti_common::outbox_store::confirmation_loop(
+        outbox.clone(),
+        Duration::from_secs(30),
+        service.receipt_reach(),
+    ));
+    // Settled entries are removed a week after their delivery window closed
+    // (`VtiOutboxStore::terminal_before`), so the outbox holds what is in
+    // flight and a recent history, not every send ever made (#2550). Hourly:
+    // nothing waits on it. The first pass clears a backlog from before reaping
+    // existed.
+    tokio::spawn(affinidi_messaging_delivery::reap::reap_loop(
+        outbox.clone(),
+        Duration::from_secs(60 * 60),
+        affinidi_messaging_delivery::reap::TERMINAL_RETENTION,
+    ));
+    // Trust Task pushes over TSP and REST (`crate::messaging::push`), each a
+    // named transport with its own drain on the same durable outbox. The
+    // outbox poll above already confirms TSP collection, because the mediator
+    // lists TSP and DIDComm messages in one outbox.
+    crate::messaging::push::register_transports(
+        &service,
+        outbox.clone(),
+        pushes_ks,
+        &atm,
+        &profile,
+        mediator_did,
+    );
+
+    Ok(VtaMessaging {
+        service,
+        atm,
+        profile,
+        #[cfg(feature = "tsp")]
+        tsp,
+        inbox: vti_common::inbox::InboxWatch::new(),
+        uncollected: Arc::new(vti_common::inbox::UncollectedPeers::new()),
+    })
+}
+
+/// Enable the mediator websocket (bounded) and bind the [`DidCommTransport`]
+/// over it.
+///
+/// Split out of [`build_messaging`] so the two fallible steps that leave a live
+/// socket behind have a *single* error chokepoint the caller can tear down from
+/// — see the comment at the call site.
+async fn connect_transport(
+    atm: &Arc<ATM>,
+    profile: &Arc<ATMProfile>,
+) -> Result<Arc<dyn MessageTransport>, String> {
+    // Bounded — a `did:webvh` mediator websocket connect can hang.
+    //
+    // NB: when this timeout fires, the `profile_enable_websocket` future is
+    // dropped mid-flight, so the SDK's own `cleanup_failed_websocket` (which its
+    // internal error path relies on) never runs. The caller's
+    // `graceful_shutdown` is what compensates — do not "simplify" this to a bare
+    // `?` that skips it.
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        atm.profile_enable_websocket(profile),
+    )
+    .await
+    {
+        Ok(res) => res.map_err(|e| format!("enable websocket: {e}"))?,
+        Err(_) => {
+            return Err(
+                "timeout enabling websocket to mediator after 30s — mediator may be unreachable"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(Arc::new(
+        DidCommTransport::new((**atm).clone(), profile.clone())
+            .await
+            .map_err(|e| format!("bind DidComm transport: {e}"))?,
+    ))
+}
+
+/// Drive inbound dispatch off [`MessagingService::subscribe`] until shutdown.
+///
+/// For each inbound: DIDComm → rehydrate the plaintext [`Message`], stamp the
+/// **cryptographically-authenticated** sender onto `from` (`#620`), enforce the
+/// framework `MessagePolicy` equivalent (encrypted AND authenticated
+/// non-anonymous sender, for every type), dispatch, and pack + `send` any reply
+/// authcrypt to the sender. TSP →
+/// [`super::tsp_inbound::dispatch_one`], sealing + routing the reply back over
+/// the same mediator socket.
+///
+/// `reconnects` bounds what the inbox watch does about a receive leg that is
+/// not delivering. It outlives the session (the supervisor holds it), so a
+/// rebuilt session inherits the backoff rather than starting a fresh budget.
+pub async fn run_inbound_loop(
+    messaging: Arc<VtaMessaging>,
+    app_state: AppState,
+    vta_did: String,
+    shutdown: CancellationToken,
+    reconnects: Arc<vti_common::inbox::ReconnectGovernor>,
+) {
+    // Handler state for the DIDComm dispatcher only — TSP's spine entry
+    // (`tsp_inbound::dispatch_one`) takes `AppState` directly, so a TSP-only
+    // build never assembles this.
+    #[cfg(feature = "didcomm")]
+    let vta_state = Arc::new(VtaState::from(&app_state));
+    let mut stream = messaging.service.subscribe();
+    info!("VTA messaging connected to mediator — inbound messages will be processed");
+
+    // Handlers run concurrently, bounded by a semaphore.
+    //
+    // This loop used to `await` `handle_inbound` inline, so the VTA processed
+    // exactly one inbound frame at a time — across BOTH protocols, since one
+    // mediator websocket carries DIDComm and TSP together (one socket per DID).
+    // A single slow handler therefore stalled every other caller's traffic, and
+    // a hanging one wedged inbound messaging entirely.
+    //
+    // Spawning is safe because the dispatch spine is already concurrent: the
+    // REST route runs `dispatch_trust_task_core` under axum with no such
+    // serialisation, so handlers cannot have been relying on it.
+    //
+    // Bounded rather than unbounded: an unbounded spawn turns a burst (or a
+    // hostile sender) into unbounded task and memory growth. At the cap, the
+    // loop waits for a permit — degrading to the old serialised behaviour under
+    // extreme load instead of falling over.
+    const MAX_INFLIGHT_INBOUND: usize = 32;
+    let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_INBOUND));
+
+    // Spawning gives up arrival order, and one ordering matters: a TSP
+    // relationship request must be answered before the traffic its sender sent
+    // after it (Keyring VTI-43 — a reply sent ahead of our `XRFA` lands on a
+    // relationship the peer does not have yet, and is dropped). The ticket is
+    // taken HERE, on the reader, because only the reader sees arrival order;
+    // `sender_order` has the full reasoning, including why this is a barrier
+    // rather than a per-sender FIFO.
+    let sender_order = SenderOrder::new();
+
+    // Collect what live delivery missed, and notice when nothing is being
+    // delivered at all. The VTA had no catch-up before this (the VTC has had
+    // one since VTI-50), so a missed live push waited for the next reconnect,
+    // and a mediator that stopped delivering to a connected socket went
+    // unnoticed while every peer's replies queued against this DID.
+    //
+    // When the watch sees the receive leg dead it first reconnects the socket
+    // (`reconnect_websocket`): that re-registers for live delivery and makes
+    // the mediator redeliver the inbox, and keeps this session — its published
+    // bridge, its in-memory TSP state, the requests in flight on other paths.
+    // Only when a reconnect did not help, or the transport would not take the
+    // request, does it end the session, so the supervisor
+    // (`server::MessagingConnect`) builds a new one. Ending the session used to
+    // be the only remedy, taken every time three checks in a row went
+    // unanswered — about every 90 s plus the supervisor's backoff, for as long
+    // as the mediator was not delivering. `reconnects` bounds both (R1.4).
+    let mut watch = tokio::spawn(vti_common::inbox::run_inbox_watch(
+        messaging.atm.clone(),
+        messaging.profile.clone(),
+        messaging
+            .service
+            .primary_transport()
+            .map(|t| t.connection_state()),
+        messaging.inbox.clone(),
+        reconnects,
+    ));
+    let unprocessable = messaging.atm.get_unprocessable_message_channel().map(|rx| {
+        tokio::spawn(vti_common::inbox::run_unprocessable_report(
+            rx,
+            messaging.inbox.clone(),
+        ))
+    });
+
+    loop {
+        tokio::select! {
+            exit = &mut watch => {
+                match exit {
+                    Ok(vti_common::inbox::WatchExit::NotDelivering) => warn!(
+                        "ending the mediator session so it is rebuilt: the socket reports \
+                         connected but nothing is being delivered to it, and reconnecting \
+                         the socket did not fix that"
+                    ),
+                    Err(e) => warn!(error = %e, "inbox watch ended unexpectedly; reconnecting"),
+                }
+                break;
+            }
+            maybe = stream.next() => {
+                let Some(inbound) = maybe else {
+                    warn!("VTA inbound stream ended — messaging dispatcher stopping");
+                    break;
+                };
+
+                // Acquire before spawning so the cap actually bounds in-flight
+                // work; the permit is released when the handler task ends.
+                let permit = match Arc::clone(&inflight).acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("inbound concurrency semaphore closed — stopping");
+                        break;
+                    }
+                };
+
+                let ticket = sender_order
+                    .admit(inbound.message.sender.as_deref(), frame_order(&inbound));
+
+                let messaging = Arc::clone(&messaging);
+                let app_state = app_state.clone();
+                #[cfg(feature = "didcomm")]
+                let vta_state = Arc::clone(&vta_state);
+                let vta_did = vta_did.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    // Held to the end of the handler: dropping a barrier's
+                    // ticket is what releases the frames queued behind it.
+                    ticket.ready().await;
+                    let _ticket = ticket;
+                    // Two call sites rather than one with a `#[cfg]` argument:
+                    // attributes on call arguments are not stable, while
+                    // attributes on the parameter (below) and on a statement
+                    // are.
+                    #[cfg(feature = "didcomm")]
+                    handle_inbound(inbound, &messaging, &app_state, &vta_state, &vta_did).await;
+                    #[cfg(not(feature = "didcomm"))]
+                    handle_inbound(inbound, &messaging, &app_state, &vta_did).await;
+                });
+            }
+            _ = shutdown.cancelled() => {
+                info!("VTA messaging stopping (shutdown signalled)");
+                break;
+            }
+        }
+    }
+    watch.abort();
+    if let Some(unprocessable) = unprocessable {
+        unprocessable.abort();
+    }
+    info!("VTA messaging stopped");
+}
+
+/// How one inbound frame takes part in per-sender ordering.
+///
+/// Only TSP has relationship state for a reply to race: a relationship-control
+/// frame is a barrier, TSP application traffic follows it. DIDComm frames are
+/// unordered, as they always were — there is no handshake a reply can overtake.
+fn frame_order(inbound: &Inbound) -> FrameOrder {
+    match inbound.message.protocol {
+        Protocol::TSP => match inbound.kind {
+            InboundKind::RelationshipControl { .. } => FrameOrder::Barrier,
+            _ => FrameOrder::Follower,
+        },
+        _ => FrameOrder::Unordered,
+    }
+}
+
+/// Route one inbound frame by protocol.
+async fn handle_inbound(
+    inbound: Inbound,
+    messaging: &Arc<VtaMessaging>,
+    app_state: &AppState,
+    #[cfg(feature = "didcomm")] vta_state: &Arc<VtaState>,
+    vta_did: &str,
+) {
+    match inbound.message.protocol {
+        #[cfg(feature = "didcomm")]
+        Protocol::DIDComm => {
+            handle_didcomm(inbound, messaging, app_state, vta_state, vta_did).await;
+        }
+        // Mirror of the TSP arm below: a mediator that routes both protocols
+        // can hand a TSP-only VTA a DIDComm frame, and dropping it with a
+        // named reason beats a panic or a silent discard.
+        #[cfg(not(feature = "didcomm"))]
+        Protocol::DIDComm => {
+            let _ = (messaging, app_state, vta_did);
+            warn!(
+                "received an inbound DIDComm frame but the `didcomm` feature is disabled — dropping"
+            );
+        }
+        #[cfg(feature = "tsp")]
+        Protocol::TSP => {
+            handle_tsp(inbound, messaging, app_state).await;
+        }
+        #[cfg(not(feature = "tsp"))]
+        Protocol::TSP => {
+            warn!("received an inbound TSP frame but the `tsp` feature is disabled — dropping");
+        }
+        // DIDComm v1 (Aries RFC 0019) is a different protocol wearing a similar
+        // name: it shares no wire format, no algorithms and no identifier scheme
+        // with v2.1, so it must NOT fall through to `handle_didcomm`. The VTA
+        // speaks v2.1 only, so this is a drop, and a deliberate one.
+        Protocol::DIDCommV1 => {
+            warn!("received an inbound DIDComm v1 frame; this VTA speaks v2.1 only — dropping");
+        }
+        // `Protocol` is `#[non_exhaustive]` upstream, so a new variant is a minor
+        // release away and must not break the build — nor take the process down.
+        //
+        // Emphatically not `todo!()` (which is what rustc suggests): this runs on
+        // every inbound frame from the mediator, so a panic here is a remotely
+        // triggerable crash — any peer that sends a protocol we don't know yet
+        // would kill the listener. Unknown protocol, unknown frame, drop it and
+        // say so.
+        other => {
+            warn!(
+                protocol = ?other,
+                "received an inbound frame in a protocol this VTA does not implement — dropping"
+            );
+        }
+    }
+}
+
+/// Outcome of the framework `MessagePolicy` gate for one inbound DIDComm frame,
+/// factored out of [`handle_didcomm`] so the policy is unit-testable without a
+/// live mediator socket. See [`inbound_gate`].
+#[cfg(feature = "didcomm")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InboundGate {
+    /// The frame was not encrypted — reply `bad_request` ("must be encrypted").
+    NotEncrypted,
+    /// Encrypted, but the sender is anonymous or not cryptographically
+    /// verified — reply `unauthorized`. This is the branch that stops a
+    /// plaintext/forged sender from reaching a handler.
+    Unauthenticated,
+    /// Encrypted with a cryptographically-verified, non-anonymous sender —
+    /// dispatch to the handler as this DID.
+    Authenticated(String),
+}
+
+#[cfg(feature = "didcomm")]
+impl InboundGate {
+    /// The dispatchable sender DID, or `None` for a rejected frame.
+    fn authenticated_sender(&self) -> Option<&str> {
+        match self {
+            InboundGate::Authenticated(did) => Some(did.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Apply the framework `MessagePolicy` that gated EVERY route before dispatch:
+/// `require_encrypted(true)` + `require_authenticated(true)` +
+/// `allow_anonymous_sender(false)` (framework `middleware/policy.rs::check`).
+///
+/// Reads the transport-reported flags off the inbound [`ReceivedMessage`]:
+/// `message.encrypted`, `message.sender`, and `message.verified` (whether the
+/// transport *cryptographically authenticated* the sender). The only
+/// dispatchable frame is an encrypted one whose sender is both present and
+/// verified — so a plaintext frame (`encrypted == false`), an anonymous read
+/// (`sender == None`), or an unverified/forged sender (`verified == false`)
+/// is refused. Applied for ALL message types — not per-handler — so a handler
+/// that does not authorise at all (TEE status/
+/// attestation) still cannot be reached by an unauthenticated or anonymous
+/// sender, exactly as the removed middleware layer guaranteed. There is NO
+/// discovery exemption: the old policy layer required authcrypt for discovery
+/// too, so requiring it here is behaviour-preserving.
+#[cfg(feature = "didcomm")]
+fn inbound_gate(message: &ReceivedMessage) -> InboundGate {
+    if !message.encrypted {
+        return InboundGate::NotEncrypted;
+    }
+    match message.sender.as_deref() {
+        // `Some` iff the sender is cryptographically authenticated;
+        // absence collapses the framework's NotAuthenticated / AnonymousSender
+        // / MissingSenderDid violations into one branch.
+        Some(did) if message.verified => InboundGate::Authenticated(did.to_string()),
+        _ => InboundGate::Unauthenticated,
+    }
+}
+
+/// The reply to a DIDComm frame [`inbound_gate`] refused.
+///
+/// # A Trust Task is refused in its own vocabulary (Keyring VTI-27)
+///
+/// A frame the gate turns away never reaches the router, so it never reaches
+/// the Trust-Task spine either — and this used to answer every such frame with a
+/// DIDComm problem-report, including a Trust Task in the binding envelope. A
+/// conformant Trust-Task client reads the envelope type of its reply; a
+/// problem-report is not an envelope, so a client keyed on it saw no error at
+/// all, only the absence of a result. Every other refusal of a Trust Task —
+/// the ACL's, the proof binding's, the handler's — is a signed
+/// `trust-task-error` in the envelope, so this one is too: `permissionDenied`,
+/// because an unauthenticated sender is a sender with no standing.
+///
+/// A problem-report stays the answer for everything that is not a Trust Task
+/// in the envelope: there is no document to answer in kind.
+///
+/// An inbound *error* document is terminal and gets nothing, whatever the
+/// gate decided — the same rule `accept_from_proven_sender` applies, and for
+/// the same reason: answering an error with an error is how one failure becomes
+/// an exchange that only a mediator's rate limit ends.
+#[cfg(feature = "didcomm")]
+async fn gate_refusal(
+    gate: &InboundGate,
+    msg: &Message,
+    app_state: &AppState,
+) -> Option<DIDCommResponse> {
+    let (why, report): (&str, fn(&str) -> ProblemReport) = match gate {
+        InboundGate::NotEncrypted => ("DIDComm message must be encrypted", |m| {
+            ProblemReport::bad_request(m)
+        }),
+        InboundGate::Unauthenticated => (
+            "DIDComm message must be authenticated (authcrypt) with a non-anonymous sender",
+            |m| ProblemReport::unauthorized(m),
+        ),
+        InboundGate::Authenticated(_) => return None,
+    };
+
+    if msg.typ != trust_tasks_didcomm::ENVELOPE_TYPE {
+        return Some(DIDCommResponse::problem_report(report(why)));
+    }
+    if matches!(
+        vta_sdk::inbound::classify(&msg.body),
+        vta_sdk::inbound::Inbound::Error
+    ) {
+        warn!(
+            reason = why,
+            "refused an inbound trust-task error at the DIDComm gate — terminal, not answered"
+        );
+        return None;
+    }
+
+    let body = serde_json::to_vec(&msg.body).unwrap_or_default();
+    let outcome = crate::trust_tasks::sign_response(
+        app_state,
+        crate::trust_tasks::reject_trust_task(
+            &body,
+            trust_tasks_rs::RejectReason::PermissionDenied {
+                reason: why.to_string(),
+            },
+        ),
+    )
+    .await;
+    match serde_json::from_slice::<serde_json::Value>(&outcome.body) {
+        Ok(doc) => {
+            Some(DIDCommResponse::new(trust_tasks_didcomm::ENVELOPE_TYPE, doc).thid(msg.id.clone()))
+        }
+        // A refusal this service built itself always parses; if it somehow did
+        // not, a problem-report beats silence.
+        Err(e) => {
+            warn!(error = %e, "could not read back a gate refusal document");
+            Some(DIDCommResponse::problem_report(report(why)))
+        }
+    }
+}
+
+/// DIDComm inbound: rehydrate, stamp the verified sender, gate encryption,
+/// dispatch, pack + send the reply.
+#[cfg(feature = "didcomm")]
+async fn handle_didcomm(
+    inbound: Inbound,
+    messaging: &Arc<VtaMessaging>,
+    app_state: &AppState,
+    vta_state: &Arc<VtaState>,
+    vta_did: &str,
+) {
+    let mut msg: Message = match serde_json::from_slice(&inbound.message.payload) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "failed to parse inbound DIDComm message — dropping");
+            return;
+        }
+    };
+
+    // #620: the ONLY trusted sender is the cryptographically-authenticated one
+    // (`sender` filtered by `verified`, applied inside [`inbound_gate`]).
+    // Capture the plaintext `from` first — solely as a best-effort *reply
+    // address* for anoncrypt public reads (never for auth) — then overwrite
+    // `from` so every handler's `ctx.sender_did` sees
+    // only the proven sender (or `None`, which those reject).
+    let plaintext_from = msg.from.clone();
+    let gate = inbound_gate(&inbound.message);
+    let auth_sender = gate.authenticated_sender().map(str::to_string);
+    msg.from = auth_sender.clone();
+
+    // The reply target: the authenticated sender when present, else the
+    // plaintext `from` (a public read may arrive anoncrypt).
+    let reply_to = auth_sender.clone().or(plaintext_from);
+    let msg_id = msg.id.clone();
+    let message_type = msg.typ.clone();
+    let start = std::time::Instant::now();
+
+    // Faithful in-loop translation of the framework `MessagePolicy` — see
+    // [`inbound_gate`] for the full rationale (enforced for ALL message types,
+    // no discovery exemption).
+    let reply = match &gate {
+        InboundGate::NotEncrypted | InboundGate::Unauthenticated => {
+            gate_refusal(&gate, &msg, app_state).await
+        }
+        InboundGate::Authenticated(_) => {
+            let ctx = crate::messaging::shim::HandlerContext {
+                sender_did: auth_sender.clone(),
+            };
+            router::dispatch(msg, ctx, vta_state.clone(), app_state.clone()).await
+        }
+    };
+
+    info!(
+        target: "didcomm_server::request",
+        message_type = %message_type,
+        sender = %auth_sender.as_deref().unwrap_or("<anon>"),
+        status = if reply.is_some() { "ok(response)" } else { "ok(empty)" },
+        latency = ?start.elapsed(),
+        "Request processed"
+    );
+
+    let Some(reply) = reply else {
+        return;
+    };
+    // Held to the end of this function: the restart fires once the reply is
+    // sent, or on whichever path gives up on sending it.
+    let _restart = reply.restart.then(|| app_state.restart_gate.fire_on_drop());
+    let Some(to) = reply_to else {
+        warn!(
+            reply_type = %reply.type_,
+            "computed a DIDComm reply but the inbound message had no sender/from to reply to — dropping"
+        );
+        return;
+    };
+
+    let reply_id = uuid::Uuid::new_v4().to_string();
+    let thid = reply.thid.unwrap_or(msg_id);
+    let reply_msg = Message::build(reply_id, reply.type_, reply.body)
+        .from(vta_did.to_string())
+        .to(to.clone())
+        .thid(thid)
+        .finalize();
+    match messaging
+        .atm
+        .pack_encrypted(&reply_msg, &to, Some(vta_did), Some(vta_did))
+        .await
+    {
+        Ok((packed, _)) => {
+            match messaging
+                .service
+                .send(&to, packed.into_bytes(), Delivery::BestEffort)
+                .await
+            {
+                Ok(_) => messaging.uncollected.observe_delivered(&to),
+                Err(e) => {
+                    if !messaging.uncollected.observe_send(
+                        &to,
+                        "DIDComm reply",
+                        vti_common::inbox::messaging_refused_recipient_not_collecting(&e),
+                    ) {
+                        warn!(recipient = %to, error = %e, "failed to send DIDComm reply");
+                    }
+                }
+            }
+        }
+        Err(e) => warn!(recipient = %to, error = %e, "failed to pack DIDComm reply"),
+    }
+}
+
+/// TSP inbound: dispatch on the shared Trust-Task spine and seal + route the
+/// reply back to the proven sender VID over the same mediator socket, mirroring
+/// the framework's `TspResponse` handling.
+///
+/// The route's first hop is read off this session's own profile rather than
+/// taken as an argument. It is the same value either way — `build_messaging`
+/// registers the profile against that mediator — but one of the two can go stale
+/// and the other cannot, and threading it here meant carrying a `mediator_did`
+/// down through `run_inbound_loop` and `handle_inbound`, past a DIDComm arm that
+/// discards it.
+#[cfg(feature = "tsp")]
+async fn handle_tsp(inbound: Inbound, messaging: &Arc<VtaMessaging>, app_state: &AppState) {
+    let Some(sender_vid) = inbound.message.sender.clone() else {
+        warn!("inbound TSP frame has no authenticated sender VID — dropping");
+        return;
+    };
+
+    // A relationship request is not traffic and must not reach the Trust Task
+    // spine: it carries no envelope, so dispatching it would answer a perfectly
+    // valid control message with "this is not a Trust Task envelope".
+    //
+    // The transport has already RECORDED it (affinidi-messaging-sdk 0.26.4),
+    // which is what admits the application messages that follow. What is left
+    // is the authorization decision, and that is this VTA's to make.
+    if let affinidi_messaging_core::InboundKind::RelationshipControl {
+        request,
+        thread_digest,
+        reply_expected,
+        introduces,
+    } = &inbound.kind
+    {
+        handle_tsp_control(
+            &sender_vid,
+            *request,
+            *thread_digest,
+            *reply_expected,
+            introduces.as_deref(),
+            messaging,
+        )
+        .await;
+        return;
+    }
+
+    let reply = crate::messaging::tsp_inbound::dispatch_one_with_restart(
+        app_state,
+        &inbound.message.payload,
+        &sender_vid,
+    )
+    .await;
+    // Taken before the empty-body return, so an outcome with nothing to send
+    // releases its restart here rather than on the 30s backstop.
+    let _restart = reply.restart.then(|| app_state.restart_gate.fire_on_drop());
+    if reply.body.is_empty() {
+        return;
+    }
+    // Routed through the sender's mediator when it is not ours — see
+    // `vti_common::tsp_route::send_reply`. `send_to` routes `[ours, sender]`,
+    // which a sender on another mediator never receives.
+    match messaging.tsp.send_reply(&sender_vid, &reply.body).await {
+        Ok(()) => messaging.uncollected.observe_delivered(&sender_vid),
+        Err(e) => {
+            // A per-peer refusal is the client not collecting its own inbox —
+            // its replies queue at the mediator until the cap refuses more.
+            // One warning per recipient says so (R6.4); one per reply, every
+            // 30 s for as long as the client retried, said only "failed".
+            if !messaging.uncollected.observe_send(
+                &sender_vid,
+                "TSP reply",
+                vti_common::inbox::refused_recipient_not_collecting(&e),
+            ) {
+                warn!(recipient = %sender_vid, error = %e, "failed to send TSP reply");
+            }
+        }
+    }
+}
+
+/// Answer one inbound TSP relationship request (§7.2), or decline to.
+///
+/// The policy is [`decide_control`](crate::messaging::tsp_inbound::decide_control)
+/// — a pure function, tested without a socket — and it deliberately performs
+/// **no ACL check**: the ACL gate lives at the Trust Task layer, which can
+/// answer a peer with a named `permissionDenied` envelope rather than a control
+/// message its application never sees. `decide_control`'s docs carry the full
+/// reasoning and the test that forced it.
+///
+/// Nothing here can fail the listener. A reply that cannot be sent is logged
+/// and dropped, because the alternative is a VTA that stops receiving because
+/// one peer became unreachable mid-answer.
+#[cfg(feature = "tsp")]
+async fn handle_tsp_control(
+    sender_vid: &str,
+    request: affinidi_messaging_core::RelationshipRequest,
+    thread_digest: [u8; 32],
+    reply_expected: bool,
+    introduces: Option<&str>,
+    messaging: &Arc<VtaMessaging>,
+) {
+    use crate::messaging::tsp_inbound::{ControlDecision, decide_control};
+
+    let atm = messaging.atm.clone();
+    let profile = messaging.profile.clone();
+
+    match decide_control(request, reply_expected) {
+        // A peer refused `limits.queue.peer` moments ago is not collecting its
+        // inbox, so an accept cannot reach it either. Such a client re-invites
+        // after every reply timeout (vta-sdk's §7.2.2 D4 self-repair), and each
+        // answer was another refused send and another warning, every 30 s. The
+        // relationship is already recorded, so traffic still flows; the first
+        // invite after `UNCOLLECTED_WINDOW` is answered again.
+        ControlDecision::Accept
+            if messaging
+                .uncollected
+                .is_marked(sender_vid, std::time::Instant::now()) =>
+        {
+            tracing::debug!(
+                sender = %sender_vid, ?request,
+                "recorded an inbound TSP relationship request; not answering — the peer is not \
+                 collecting its mediator inbox",
+            );
+        }
+        ControlDecision::Accept => {
+            match atm
+                .tsp()
+                .accept_relationship(&profile, sender_vid, thread_digest)
+                .await
+            {
+                Ok(state) => {
+                    messaging.uncollected.observe_delivered(sender_vid);
+                    info!(
+                        sender = %sender_vid, ?request, ?state, introduced = ?introduces,
+                        "accepted an inbound TSP relationship request",
+                    )
+                }
+                Err(e) => {
+                    // A concurrent accept to the same peer may have completed
+                    // the relationship first (`accept_refusal_is_benign`): then
+                    // this invite was answered, and saying otherwise is wrong.
+                    let after = atm.tsp().relationship_state(&profile, sender_vid).await;
+                    if matches!(after, Ok(s) if vti_common::relationship_store::accept_refusal_is_benign(s))
+                    {
+                        tracing::debug!(
+                            sender = %sender_vid, ?request, error = %e,
+                            "a TSP relationship accept was refused because a concurrent accept \
+                             to the same peer completed the relationship first; the invite is \
+                             answered",
+                        );
+                    } else if !messaging.uncollected.observe_send(
+                        sender_vid,
+                        "TSP relationship accept",
+                        vti_common::inbox::refused_recipient_not_collecting(&e),
+                    ) {
+                        warn!(
+                            sender = %sender_vid, error = %e,
+                            "could not send a TSP relationship accept; the relationship stays \
+                             recorded, so traffic still flows, but the peer sees no answer",
+                        )
+                    }
+                }
+            }
+        }
+        // Reached only when the transport's own §7.3 answer failed to send
+        // (affinidi-messaging-sdk 0.27.1: `reply_expected` = "still owed").
+        // The relationship is already forgotten, so this must be
+        // `answer_cancellation`, which sends without running the state machine;
+        // `cancel_relationship` refuses `SendCancel` out of `None`, which is
+        // how the peer went unanswered before (Keyring VTI-38). For a
+        // cancellation, `thread_digest` is the relationship digest the peer
+        // named — the one the answer has to name back.
+        ControlDecision::Cancel(why) => {
+            match atm
+                .tsp()
+                .answer_cancellation(&profile, sender_vid, thread_digest)
+                .await
+            {
+                Ok(_) => info!(
+                    sender = %sender_vid, ?request, reason = %why,
+                    "answered an inbound TSP relationship cancellation (§7.3) after the \
+                     transport's own answer failed",
+                ),
+                Err(e) => warn!(
+                    sender = %sender_vid, reason = %why, error = %e,
+                    "could not send the §7.3 answer to a TSP relationship cancellation; \
+                     the relationship is forgotten on this side, but the peer sees no answer",
+                ),
+            }
+        }
+        ControlDecision::Nothing => info!(
+            sender = %sender_vid, ?request,
+            "recorded an inbound TSP relationship request; no answer is due",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InboundGate, inbound_gate};
+    use affinidi_messaging_core::{Protocol, ReceivedMessage};
+
+    const SENDER: &str = "did:key:z6MkSenderUnderTest";
+
+    /// A minimal inbound [`ReceivedMessage`] carrying the three flags the gate
+    /// reads; the rest are fixed filler (the gate ignores them).
+    fn received(encrypted: bool, sender: Option<&str>, verified: bool) -> ReceivedMessage {
+        ReceivedMessage {
+            id: "urn:uuid:test".to_string(),
+            sender: sender.map(str::to_string),
+            recipient: "did:key:z6MkRecipient".to_string(),
+            payload: Vec::new(),
+            protocol: Protocol::DIDComm,
+            verified,
+            encrypted,
+        }
+    }
+
+    /// The happy path: an encrypted frame from a verified, non-anonymous
+    /// sender is dispatched as that DID.
+    #[test]
+    fn encrypted_and_verified_sender_is_authenticated() {
+        assert_eq!(
+            inbound_gate(&received(true, Some(SENDER), true)),
+            InboundGate::Authenticated(SENDER.to_string()),
+        );
+    }
+
+    /// Core case: an encrypted frame whose sender is present but
+    /// NOT cryptographically verified (a forged / plaintext-authenticated
+    /// `from`) must be refused — never dispatched as that DID.
+    #[test]
+    fn unverified_sender_is_rejected() {
+        assert_eq!(
+            inbound_gate(&received(true, Some(SENDER), false)),
+            InboundGate::Unauthenticated,
+        );
+        // And it must NOT leak the forged DID as a dispatchable sender.
+        assert_eq!(
+            inbound_gate(&received(true, Some(SENDER), false)).authenticated_sender(),
+            None,
+        );
+    }
+
+    /// An anonymous read (anoncrypt: encrypted, no sender) is refused — no
+    /// handler runs for an unauthenticated caller, matching the framework's
+    /// `allow_anonymous_sender(false)`.
+    #[test]
+    fn anonymous_encrypted_sender_is_rejected() {
+        assert_eq!(
+            inbound_gate(&received(true, None, false)),
+            InboundGate::Unauthenticated,
+        );
+        // Even a "verified" flag with no sender DID can't authenticate.
+        assert_eq!(
+            inbound_gate(&received(true, None, true)),
+            InboundGate::Unauthenticated,
+        );
+    }
+
+    /// A plaintext frame (the exact forged-sender exploit shape: forged `from`,
+    /// no encryption) is refused at the encryption gate, before the sender is
+    /// even considered.
+    #[test]
+    fn plaintext_frame_is_rejected() {
+        assert_eq!(
+            inbound_gate(&received(false, Some(SENDER), false)),
+            InboundGate::NotEncrypted,
+        );
+        // Not-encrypted dominates: even a "verified" plaintext sender is
+        // refused (an unreachable flag combo in practice, but the gate must
+        // never dispatch an unencrypted frame).
+        assert_eq!(
+            inbound_gate(&received(false, Some(SENDER), true)),
+            InboundGate::NotEncrypted,
+        );
+        assert_eq!(
+            inbound_gate(&received(false, Some(SENDER), true)).authenticated_sender(),
+            None,
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_order_tests {
+    use super::frame_order;
+    use crate::messaging::sender_order::FrameOrder;
+    use affinidi_messaging_core::{
+        Inbound, InboundAck, InboundKind, Protocol, ReceivedMessage, RelationshipRequest,
+    };
+
+    fn inbound(protocol: Protocol) -> Inbound {
+        Inbound::new(
+            ReceivedMessage {
+                id: "urn:uuid:test".to_string(),
+                sender: Some("did:peer:2.phone".to_string()),
+                recipient: "did:key:z6MkRecipient".to_string(),
+                payload: Vec::new(),
+                protocol,
+                verified: true,
+                encrypted: true,
+            },
+            None,
+            InboundAck("ack".into()),
+        )
+    }
+
+    /// VTI-43: the invite is the barrier its sender's Trust Tasks wait behind.
+    #[test]
+    fn a_tsp_relationship_request_is_a_barrier() {
+        let xrfi = inbound(Protocol::TSP).with_kind(InboundKind::RelationshipControl {
+            request: RelationshipRequest::Invite,
+            thread_digest: [7u8; 32],
+            reply_expected: false,
+            introduces: None,
+        });
+        assert_eq!(frame_order(&xrfi), FrameOrder::Barrier);
+    }
+
+    #[test]
+    fn tsp_traffic_follows() {
+        assert_eq!(frame_order(&inbound(Protocol::TSP)), FrameOrder::Follower);
+    }
+
+    /// DIDComm has no relationship handshake to overtake, so it keeps its
+    /// previous, fully concurrent behaviour.
+    #[test]
+    fn didcomm_is_unordered() {
+        assert_eq!(
+            frame_order(&inbound(Protocol::DIDComm)),
+            FrameOrder::Unordered
+        );
+    }
+}
+
+/// Keyring VTI-27 at the DIDComm gate: a frame refused for its transport
+/// authentication — anoncrypt, a forged sender, plaintext — never reaches the
+/// router, so it used to be answered with a problem-report even when it carried
+/// a Trust Task in the binding envelope.
+#[cfg(all(test, feature = "didcomm"))]
+mod keyring_vti_27_gate {
+    use super::{InboundGate, gate_refusal};
+    use crate::test_support::build_signing_test_app_state;
+    use affinidi_messaging_didcomm::Message;
+    use serde_json::{Value, json};
+    use trust_tasks_didcomm::ENVELOPE_TYPE;
+
+    fn message(typ: &str, body: Value) -> Message {
+        Message::build(
+            format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            typ.to_string(),
+            body,
+        )
+        .finalize()
+    }
+
+    fn request() -> Value {
+        json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": "https://trusttasks.org/spec/keys/list/0.2",
+            "issuer": "did:key:z6MkForgedSender",
+            "payload": {},
+        })
+    }
+
+    /// An enveloped request refused at the gate is a signed `permissionDenied`
+    /// `trust-task-error` in the envelope, threaded to the message — for both
+    /// gate refusals.
+    #[tokio::test]
+    async fn vti_27_a_gate_refused_trust_task_is_a_signed_trust_task_error() {
+        let (app_state, _dir) = build_signing_test_app_state().await;
+        for gate in [InboundGate::Unauthenticated, InboundGate::NotEncrypted] {
+            let req = request();
+            let msg = message(ENVELOPE_TYPE, req.clone());
+            let reply = gate_refusal(&gate, &msg, &app_state)
+                .await
+                .expect("a refused request is answered");
+            assert_eq!(reply.type_, ENVELOPE_TYPE, "{gate:?}: {:?}", reply.body);
+            assert_eq!(reply.thid.as_deref(), Some(msg.id.as_str()), "{gate:?}");
+            let doc = &reply.body;
+            assert_eq!(
+                doc["type"].as_str(),
+                Some(
+                    crate::trust_tasks::framework_error_type_uri()
+                        .to_string()
+                        .as_str()
+                ),
+                "{gate:?}: {doc}"
+            );
+            assert_eq!(
+                doc["payload"]["code"], "permissionDenied",
+                "{gate:?}: {doc}"
+            );
+            assert_eq!(doc["threadId"], req["id"], "{gate:?}: {doc}");
+            assert!(doc.get("proof").is_some(), "{gate:?}: unsigned: {doc}");
+        }
+    }
+
+    /// Anything that is not a Trust Task in the envelope keeps the
+    /// problem-report: there is no document to answer in kind.
+    #[tokio::test]
+    async fn a_gate_refused_non_trust_task_is_still_a_problem_report() {
+        let (app_state, _dir) = build_signing_test_app_state().await;
+        for (gate, code) in [
+            (InboundGate::Unauthenticated, "e.p.msg.unauthorized"),
+            (InboundGate::NotEncrypted, "e.p.msg.bad-request"),
+        ] {
+            let msg = message("https://didcomm.org/trust-ping/2.0/ping", json!({}));
+            let reply = gate_refusal(&gate, &msg, &app_state)
+                .await
+                .expect("answered");
+            assert_eq!(reply.type_, vta_sdk::protocols::PROBLEM_REPORT_TYPE);
+            assert_eq!(reply.body["code"], code, "{gate:?}");
+        }
+    }
+
+    /// An inbound error is terminal: refused at the gate or not, it is never
+    /// answered, or two peers trade errors until a rate limit stops them.
+    #[tokio::test]
+    async fn a_gate_refused_trust_task_error_is_not_answered() {
+        let (app_state, _dir) = build_signing_test_app_state().await;
+        let error = json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "threadId": "urn:uuid:11111111-1111-1111-1111-111111111111",
+            "type": "https://trusttasks.org/spec/trust-task-error/0.5",
+            "payload": { "code": "permissionDenied", "message": "no" },
+        });
+        let msg = message(ENVELOPE_TYPE, error);
+        assert!(
+            gate_refusal(&InboundGate::Unauthenticated, &msg, &app_state)
+                .await
+                .is_none()
+        );
+    }
+
+    /// An authenticated frame is not the gate's to answer.
+    #[tokio::test]
+    async fn an_authenticated_frame_gets_no_gate_refusal() {
+        let (app_state, _dir) = build_signing_test_app_state().await;
+        let msg = message(ENVELOPE_TYPE, request());
+        assert!(
+            gate_refusal(
+                &InboundGate::Authenticated("did:key:z6MkSender".into()),
+                &msg,
+                &app_state
+            )
+            .await
+            .is_none()
+        );
+    }
+}

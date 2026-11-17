@@ -1,0 +1,4702 @@
+//! The VTC's schema-conformance sweep (#1059): every Trust Task this service
+//! binds to a **published** `spec/vtc/*` URI must carry that URI's wire shape.
+//!
+//! ## Why this exists
+//!
+//! `vtc-service/tests/trust_task_manifest.rs` already runs two parity checks,
+//! and both are about *identity*, not *shape*:
+//! `every_bound_task_is_published_or_excepted` (coverage) and
+//! `every_bound_canonical_task_exists_in_the_registry` (the URI resolves in
+//! `vti_specs::schema_index`). Neither looks at a payload, and there is
+//! no runtime validation on this side either — the document dispatcher's
+//! `parse_payload` (`trust_tasks/helpers.rs:59`) is a bare
+//! `serde_json::from_value`, and the REST layer's Trust-Task gate checks the
+//! header URI, not the body. So a VTC response could diverge arbitrarily from
+//! the schema its URI names and every gate in the repo stayed green.
+//!
+//! This is the check `vta-service` got in #857
+//! (`vta-service/src/trust_tasks/conformance.rs`), whose module docs name the
+//! defect class: *"Nothing checked correctness: that a task bound to a
+//! published URI actually speaks that URI's schema."* The VTC never got the
+//! equivalent. This file is it, and it deliberately follows that file's shape
+//! — witness table, derived census, mechanical non-vacuity — rather than
+//! inventing a second idiom for the same job.
+//!
+//! ## How it works
+//!
+//! The URI census is **derived, not hand-maintained**, from the two places
+//! this service binds a task:
+//!
+//! - the REST tower layers (`tt` / `ttl` in `routes/mod.rs`), which cannot be
+//!   enumerated from a built `Router`, so they are read as source text — the
+//!   same blunt-but-confined technique `tests/trust_task_manifest.rs` uses;
+//! - [`super::dispatched_uris`], the document dispatcher's own list, which is
+//!   what REST-as-document, DIDComm and TSP all route through.
+//!
+//! That union, filtered to what `schema_index::schema_for` resolves, is the
+//! scope. Every URI in it MUST have an entry in [`table`]: a [`Witness`]
+//! carrying a representative request and response, or an annotated
+//! [`Conformance::KnownDrift`] debt entry.
+//!
+//! ## Scope: `spec/vtc/*` only
+//!
+//! The VTC also binds 36 URIs in the shared `spec/{acl,audit,auth,config,
+//! policy}/*` families. Those are **not** covered here, and that is a stated
+//! limit rather than an oversight: #1059 scopes to the VTC's own family, and
+//! the shared families are served by both daemons, so witnessing them belongs
+//! with a decision about which service's response shape is canonical. The
+//! mechanism below is prefix-parameterised at exactly one place
+//! ([`VTC_PREFIX`]), so widening it later is a one-line change plus the
+//! witnesses.
+//!
+//! ## Both sides are schema-validated, not just parsed
+//!
+//! Each witness's request must parse as the generated `specs::…::Payload` and
+//! its response as `specs::…::Response` — the generated types carry
+//! `deny_unknown_fields` plus the spec's required set, so parsing them is
+//! itself an assertion. But parsing alone is strictly weaker than the schema:
+//! serde reads `null` into an `Option<T>` where JSON Schema types the member
+//! `"string"` and refuses it, and serde ignores `const` / `enum` / `pattern`
+//! entirely. `submit/0.1`'s response `status` is `const: "pending"`; nothing
+//! in the generated struct enforces that.
+//!
+//! So both sides are also validated against their embedded schema. This is
+//! where the VTC harness can be stricter than the VTA's, which validates the
+//! request only and says so: the VTA's note ("the codegen emits
+//! `ValidatedPayload` for `Payload` but not for `Response`") was true of the
+//! 0.4/0.5 codegen and is **stale** at the 0.11 series this workspace pins —
+//! `trust-tasks-rs` now emits `impl Payload for Response` with the response
+//! schema inlined, and `validate::ValidatedPayload` is a blanket impl over
+//! `Payload`. Since a response schema is the thing #1059 is about, this file
+//! uses it.
+//!
+//! ## The table is keyed by type, not by URI literal
+//!
+//! [`checked!`] takes the generated `Payload` / `Response` types and reads the
+//! URI off the first one, `<P as Payload>::TYPE_URI`. Two reasons, both about
+//! the check keeping its teeth:
+//!
+//! 1. A hand-written URI literal can be paired with the wrong generated type,
+//!    and the sweep would then cheerfully validate `members/list`'s response
+//!    against `members/show`'s schema and report conformance.
+//! 2. The census scans this crate's source for `spec/vtc/` literals. If this
+//!    file contained any, it would find its own table and the stale-witness
+//!    direction of the coverage assertion would be vacuous — a witness would
+//!    prove itself in scope.
+//!
+//! ## Non-vacuity is enforced mechanically
+//!
+//! Every witness is drifted (an unknown member injected) after the good case
+//! passes, and the drifted form MUST be rejected on both sides — a schema
+//! that accepts anything cannot produce a green row. The VTA learned this the
+//! expensive way: its `acl/update` defect survived three PRs because "adding a
+//! forbidden member makes this fail" passed while the body was *already*
+//! failing for an unrelated reason.
+//!
+//! [`Conformance::KnownDrift`] carries the same treatment in reverse. A debt
+//! entry states which side diverges and carries the real fixtures, and the
+//! sweep asserts that the named side **fails** and the other side **passes**.
+//! A prose-only debt note would be unfalsifiable: it could not tell you when
+//! the drift was fixed, and it could not tell you it had been mis-diagnosed.
+//! This is the one place this file's shape differs from the VTA's
+//! `KnownDrift(&'static str)`, and the reason is that the VTA's arm is empty
+//! — it has never had to describe a real divergence, and the VTC's has 33 on
+//! day one.
+//!
+//! ## When this fails
+//!
+//! A newly bound published URI with no witness fails the coverage assertion
+//! **by design** — add a witness, or a `KnownDrift` entry with a stated
+//! reason. A witness for a URI nothing binds any more fails the same
+//! assertion from the other direction, and that direction is what tells you a
+//! fold landed.
+
+// `get`/`list` 0.3 and `members/list`/`memberships/list` 0.1 are superseded and still
+// served, so their samples stay; their generated types are marked deprecated.
+#![allow(deprecated)]
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use chrono::DateTime;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+
+use trust_tasks_rs::Payload;
+use trust_tasks_rs::validate::ValidatedPayload;
+
+use super::dispatched_uris;
+
+/// The one place the sweep's family scope is written down. See the module
+/// docs' "Scope" section for why it is `vtc/` and not `spec/`.
+const VTC_PREFIX: &str = "https://trusttasks.org/spec/vtc/";
+
+// ─── The census ──────────────────────────────────────────────────────────
+
+/// Every `spec/vtc/*` URI this service binds, from both binding mechanisms.
+///
+/// REST bindings are attached as tower layers, so a built `Router` cannot be
+/// enumerated for them and this reads the wiring sites as source text —
+/// exactly as `tests/trust_task_manifest.rs` does, and for the same reason.
+/// It is blunt, but the wiring is confined to `src/routes/` and a false
+/// positive here is a compile-visible string, not a silent pass.
+fn bound_uris() -> BTreeSet<String> {
+    let mut found: BTreeSet<String> = dispatched_uris()
+        .iter()
+        .filter(|u| u.starts_with(VTC_PREFIX))
+        .map(|u| (*u).to_owned())
+        .collect();
+    collect_from_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut found,
+    );
+    found
+}
+
+/// Recursively harvest `"https://trusttasks.org/spec/vtc/…"` string literals.
+///
+/// Only literals count: doc comments carry `{verb}`-style URI templates that
+/// are documentation, not bindings. The `#response` fragment is trimmed —
+/// a response variant publishes under its request's URI.
+fn collect_from_dir(dir: &Path, out: &mut BTreeSet<String>) {
+    for entry in std::fs::read_dir(dir).expect("read source dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_from_dir(&path, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        // Hidden vetting's modules (`vetting/pcs*.rs`) are compiled only with `vetting-pcs`;
+        // without it their literals bind nothing, and scanning them would demand witnesses
+        // for tasks this build cannot serve.
+        if !cfg!(feature = "vetting-pcs")
+            && path.parent().is_some_and(|d| d.ends_with("vetting"))
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("pcs"))
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        for (idx, _) in text.match_indices(VTC_PREFIX) {
+            if idx == 0 || !text[..idx].ends_with('"') {
+                continue;
+            }
+            let rest = &text[idx..];
+            let Some(end) = rest.find('"') else { continue };
+            let uri = rest[..end].split('#').next().expect("split yields a head");
+            out.insert(uri.to_owned());
+        }
+    }
+}
+
+/// The sweep's scope: bound ∩ published. Derived, never hand-listed.
+/// Published means a schema in either index: the deprecated prebuilt
+/// `trust_tasks_rs` one, or the versions the `vti-specs` crates pin — which
+/// alone carry a version newer than the last `trust-tasks-rs` release.
+pub(super) fn resolved_uris() -> BTreeSet<String> {
+    bound_uris()
+        .into_iter()
+        .filter(|u| vti_specs::schema_index::schema_for(u).is_some())
+        .collect()
+}
+
+// ─── Witnesses ───────────────────────────────────────────────────────────
+
+type ParseFn = fn(Value) -> Result<(), String>;
+type ValidateFn = fn(&Value) -> Result<(), String>;
+
+fn parses<T: DeserializeOwned>(v: Value) -> Result<(), String> {
+    serde_json::from_value::<T>(v)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Validate against the spec's own embedded schema.
+///
+/// Not the same check as [`parses`], and the gap is the point: serde accepts
+/// `null` into an `Option<T>` the schema types `"string"`, and it ignores
+/// `const`, `enum`, `pattern` and `minLength` outright. `submit/0.1`'s
+/// response `status` is `const: "pending"` — no generated struct enforces
+/// that, only this does.
+fn validates<T: ValidatedPayload>(v: &Value) -> Result<(), String> {
+    T::validate_value(v).map_err(|e| e.to_string())
+}
+
+/// A representative request/response pair for one bound, published URI.
+///
+/// Built from the VTC's own wire types wherever one exists, so the assertion
+/// is about **our emission** rather than a hand-typed fixture. A transcription
+/// only proves that someone can type JSON the schema accepts: it stops
+/// tracking the producer the moment the producer changes, and stays green
+/// while live traffic fails. Where a fixture is transcribed, the entry says
+/// why.
+struct Witness {
+    uri: &'static str,
+    request: Value,
+    parse_request: ParseFn,
+    validate_request: ValidateFn,
+    response: Value,
+    parse_response: ParseFn,
+    validate_response: ValidateFn,
+}
+
+/// Which side of a [`Conformance::KnownDrift`] entry is expected to fail.
+///
+/// Named per side rather than "something fails" so a debt entry cannot pass
+/// on the wrong evidence — the failure mode the VTA's module docs record for
+/// `acl/update`, where an assertion held for an unrelated reason.
+/// Unconstructed while the drift table is empty. Kept, with the macro below,
+/// because they are the vocabulary for *recording* a divergence — and a table
+/// with no way to say "this diverges, on this side, for this reason" invites
+/// the next author to leave a real divergence unrecorded rather than write the
+/// machinery back. Deleting them would make the zero look permanent instead of
+/// current.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Request,
+    Response,
+    /// Unconstructed as of #1102, because every both-sided entry closed —
+    /// kept because `Side` is the vocabulary for describing a divergence, and
+    /// deleting a legitimate case because today's table happens not to use it
+    /// pushes the next author toward the wrong one. Recording a both-sided
+    /// drift as `Response` is precisely the mis-diagnosis
+    /// `known_drift_entries_still_diverge_where_they_say_they_do` exists to
+    /// catch, and it caught it twice while this table was being built.
+    #[allow(dead_code)]
+    Both,
+}
+
+impl Side {
+    fn request_diverges(self) -> bool {
+        matches!(self, Side::Request | Side::Both)
+    }
+    fn response_diverges(self) -> bool {
+        matches!(self, Side::Response | Side::Both)
+    }
+}
+
+enum Conformance {
+    Checked(Witness),
+    /// Known non-conformance, kept visible, falsifiable and counted instead of
+    /// silently tolerated. Every entry names the drift precisely enough that
+    /// the fix needs no re-diagnosis, and carries real fixtures so the sweep
+    /// can assert the drift is still there.
+    #[allow(dead_code)]
+    KnownDrift {
+        reason: &'static str,
+        side: Side,
+        witness: Witness,
+    },
+}
+
+impl Conformance {
+    fn witness(&self) -> &Witness {
+        match self {
+            Conformance::Checked(w) => w,
+            Conformance::KnownDrift { witness, .. } => witness,
+        }
+    }
+}
+
+/// A conforming witness. `$p` / `$r` are the generated `Payload` /
+/// `Response` types — the URI is read off `$p`, never written as a literal
+/// (see the module docs).
+macro_rules! checked {
+    ($p:ty, $r:ty, $req:expr, $resp:expr) => {
+        Conformance::Checked(Witness {
+            uri: <$p as Payload>::TYPE_URI,
+            request: $req,
+            parse_request: parses::<$p>,
+            validate_request: validates::<$p>,
+            response: $resp,
+            parse_response: parses::<$r>,
+            validate_response: validates::<$r>,
+        })
+    };
+}
+
+/// An annotated divergence. Same fixtures as [`checked!`], plus the side that
+/// is expected to fail and why.
+#[allow(unused_macros)]
+macro_rules! drift {
+    ($p:ty, $r:ty, $side:expr, $req:expr, $resp:expr, $reason:expr) => {
+        Conformance::KnownDrift {
+            reason: $reason,
+            side: $side,
+            witness: Witness {
+                uri: <$p as Payload>::TYPE_URI,
+                request: $req,
+                parse_request: parses::<$p>,
+                validate_request: validates::<$p>,
+                response: $resp,
+                parse_response: parses::<$r>,
+                validate_response: validates::<$r>,
+            },
+        }
+    };
+}
+
+fn to_v<T: serde::Serialize>(t: T) -> Value {
+    serde_json::to_value(t).expect("serialize fixture")
+}
+
+// ─── Shared fixture values ───────────────────────────────────────────────
+
+const DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+const OTHER_DID: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+const COMMUNITY_DID: &str = "did:web:community.example";
+const REQUEST_ID: &str = "5b8f1d4e-9c2a-4f6b-8e31-7a0c5d9e2f14";
+const TS: &str = "2026-08-23T00:00:00Z";
+
+/// The disclosure statement a community with only the base fields publishes,
+/// generated as `directory::disclosure::statement` generates it.
+fn base_disclosure() -> Value {
+    crate::directory::disclosure::build(
+        &crate::directory::fields::base_fields(),
+        crate::directory::model::Settings::default().default_listing,
+        crate::directory::disclosure::Served::this_build(
+            &crate::directory::model::Settings::default(),
+        ),
+    )
+    .expect("the base schema gives a statement")
+}
+
+/// A received notification as `crate::notifications::inbox` answers it (`ReceivedNotification`),
+/// with one relay decision.
+fn sample_received_notification() -> serde_json::Value {
+    use crate::notifications::inbox::{ReceivedNotification, RelayDecision, Selection};
+    let at = DateTime::parse_from_rfc3339("2027-03-01T09:00:02Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let rec = ReceivedNotification {
+        record_id: "rn-4Tq8Zr2Lw9Ks6Pm1".into(),
+        originator: "did:web:community.example".into(),
+        relayed_by: vec![],
+        delivered_by: "did:web:community.example".into(),
+        notification: json!({
+            "notificationId": "ntf-7Qk2p9Xv3mR8",
+            "revision": 1,
+            "kind": "election",
+            "subject": {
+                "heldBy": "did:web:community.example",
+                "id": "board-2027",
+                "openWith": vta_sdk::notifications::ELECTION_OPEN_WITH,
+            },
+            "audience": "did:web:partner.example",
+            "status": "available",
+            "relayable": true,
+            "validUntil": "2027-03-15T00:00:00Z",
+        }),
+        revision: 1,
+        kind: "election".into(),
+        relayable: true,
+        withdrawn: false,
+        valid_until: None,
+        received_at: at,
+        document: json!({}),
+        relay_decisions: vec![RelayDecision {
+            decided_at: at,
+            decided_by: "did:web:carol.example".into(),
+            recipients: Selection::AllMembers,
+            recipient_count: 42,
+            revision: 1,
+            disclosure_acknowledged: true,
+        }],
+        relayed_to: vec![],
+        keep_until: at,
+    };
+    rec.to_wire(at)
+}
+
+/// A network membership as `crate::networks` stores and answers it — the shared
+/// `vtc/_shared/0.7` `NetworkMembership` — with its admins group registered.
+fn sample_network_membership() -> serde_json::Value {
+    use crate::networks::{Membership, RegisteredGroup, State};
+    let at = DateTime::parse_from_rfc3339("2026-11-03T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let cred = |issuer: &str, subject: &str| {
+        json!({
+            "type": ["VerifiableCredential", "DTGCredential", "StatementCredential"],
+            "issuer": issuer,
+            "credentialSubject": { "id": subject },
+        })
+    };
+    let net = "did:example:whn";
+    let vtc = "did:example:community";
+    let group = "did:example:community-admins";
+    serde_json::to_value(Membership {
+        network: net.into(),
+        url: "https://whn.example.org".into(),
+        name: Some("World Health Network".into()),
+        state: State::Acknowledged,
+        listing: cred(net, vtc),
+        grant: Some(cred(net, vtc)),
+        acknowledgement: Some(cred(vtc, net)),
+        repudiation: None,
+        groups: vec![RegisteredGroup {
+            role: "admins".into(),
+            group_id: "admins".into(),
+            group_did: group.into(),
+            endpoint: "https://community.example.org/v1/trust-tasks".into(),
+            registration: cred(vtc, group),
+            acceptance: cred(net, group),
+            registered_at: at,
+        }],
+        joined_at: Some(at),
+        updated_at: at,
+    })
+    .unwrap()
+}
+
+fn sample_binding() -> crate::groups::bindings::Binding {
+    crate::groups::bindings::Binding {
+        binding_id: "gb_P2k8W5qYc6Vd1MsKAAAAAA".into(),
+        group_id: "grp_W5k2N8xRb3Qz7TpLAAAAAA".into(),
+        binding: json!({ "kind": "room", "roomId": "did:key:z6MkRoom", "actions": ["read"], "validFor": "P30D" }),
+        state: "active".into(),
+        created_at: chrono::DateTime::parse_from_rfc3339("2026-10-20T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        created_by: "did:example:administrator".into(),
+        reason: "The working group's room.".into(),
+        delegated_by: None,
+    }
+}
+
+/// A note as `directory::notes` stores it.
+fn admin_note() -> crate::directory::notes::Note {
+    crate::directory::notes::Note {
+        note_id: "note_Q2xhcmFRMmxoY21GUk1t".into(),
+        entry_id: DIRECTORY_ENTRY.into(),
+        author: "did:example:administrator".into(),
+        created_at: "2026-10-19T09:00:00Z".parse().unwrap(),
+        text: Some("Spoke at the June meetup.".into()),
+        follow_up: Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()),
+        redacts: None,
+        redacted_by: None,
+    }
+}
+
+/// A group as `groups::wire` answers it to one of its managers.
+fn group_wire() -> Value {
+    json!({
+        "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA",
+        "groupDid": "did:webvh:QmScid:groups.example:grp",
+        "name": "Identity WG",
+        "description": "Where the community works on identity.",
+        "kind": "static",
+        "joinPolicy": "request",
+        "visibility": "members",
+        "showMembers": "groupMembers",
+        "issuesCredentials": true,
+        "carriesAuthority": false,
+        "createdAt": "2026-10-19T09:00:00Z",
+        "updatedAt": "2026-10-19T09:00:00Z",
+        "createdBy": DIRECTORY_ENTRY,
+        "memberCount": 0,
+        "managers": [],
+        "credentialAuthorityValidUntil": "2027-10-19T09:00:00Z",
+    })
+}
+
+/// A stored picture's reference, as `directory::images` answers it.
+fn stored_picture() -> Value {
+    json!({ "sha256": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b", "mediaType": "image/jpeg", "size": 18342 })
+}
+
+/// An external card as a member signs it: their public values mapped as
+/// `directory::external::expected_members` maps them, with their proof.
+fn published_card() -> Value {
+    let mut public = serde_json::Map::new();
+    public.insert("displayName".into(), json!("Carol Example"));
+    let mut card = json!({
+        "@type": "Card",
+        "version": "1.0",
+        "uid": format!("{}{DIRECTORY_ENTRY}", crate::directory::external::UID_PREFIX),
+        "issuer": "did:example:carol",
+    });
+    for (k, v) in crate::directory::external::expected_members(
+        DIRECTORY_ENTRY,
+        &crate::directory::fields::base_fields(),
+        &public,
+    ) {
+        card[k] = v;
+    }
+    card["proof"] = json!({
+        "type": "DataIntegrityProof",
+        "cryptosuite": "eddsa-jcs-2022",
+        "verificationMethod": "did:example:carol#key-1",
+        "created": "2026-10-19T09:10:00Z",
+        "proofPurpose": "assertionMethod",
+        "proofValue": "z58DAdFfa9SkqZMVPxAQpic7ndSayn1PzZs6ZjWp1CktyGesjuTSwRdoWhAfGFCF5bppETSTojQCrfFPP2oumHKtz",
+    });
+    card
+}
+
+/// A directory entry identifier, as `directory::cards::new_entry_id` mints one.
+const DIRECTORY_ENTRY: &str = "dir_Q7m2K9xVb4Tz8LpRaB3c";
+
+/// A base field as `vtc/directory/fields/*` answer it.
+fn directory_field() -> Value {
+    serde_json::to_value(
+        crate::directory::fields::base_fields()
+            .into_iter()
+            .find(|f| f.key == "displayName")
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// A card as its member reads it.
+fn directory_card() -> Value {
+    let mut c = crate::directory::cards::fresh(
+        DID,
+        &crate::directory::model::Settings::default(),
+        Some("Carol"),
+        chrono::Utc::now(),
+    );
+    c.entry_id = DIRECTORY_ENTRY.into();
+    c.visibility.insert(
+        "pronouns".into(),
+        crate::directory::model::Audience::Members,
+    );
+    c.wire()
+}
+const ACTION_ID: &str = "act-5b8f1d4e9c2a4f6b8e317a0c5d9e2f14";
+
+/// An action as `crate::admin_actions` renders one: open with the caller's
+/// challenge, or closed. The summary and digest are the real renderer's.
+fn sample_action(open: bool) -> serde_json::Value {
+    use crate::admin_actions::summary;
+    let type_uri = "https://trusttasks.org/spec/acl/grant/0.2";
+    let payload = json!({ "entry": {
+        "subject": OTHER_DID,
+        "role": "community-admin",
+        "act": { "scope": "all" },
+        "keys": { "scope": "none" },
+        "capabilities": { "scope": "ceiling" },
+    } });
+    let mut action = json!({
+        "actionId": ACTION_ID,
+        "category": "approval",
+        "kind": summary::KIND_GRANT_AUTHORITY,
+        "typeUri": type_uri,
+        "requester": "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH",
+        "status": if open { "open" } else { "cancelled" },
+        "createdAt": TS,
+        "expiresAt": "2026-08-26T00:00:00Z",
+        "approvals": [],
+        "summary": summary::render(summary::KIND_GRANT_AUTHORITY, type_uri, &payload),
+        "payloadDigest": summary::payload_digest(&payload).unwrap(),
+        "payload": payload,
+        "callerRole": if open { "approver" } else { "requester" },
+        "requesterOpenActions": 1,
+        "threshold": 1,
+        "ext": { "org.openvtc": { "approverCount": 1, "requesterRecentActions": 1, "burst": false } },
+    });
+    if open {
+        action["approversRemaining"] = json!(1);
+        action["challenge"] = json!("c".repeat(64));
+    } else {
+        action["closedAt"] = json!(TS);
+        action["closedReason"] = json!("cancelledByRequester");
+    }
+    action
+}
+
+/// A cooling-off as `_shared/0.2` renders one (VTI-APV-019): category
+/// `coolingOff`, `landsAt`, no threshold, expiry or approvals remaining; open
+/// and cancellable by its requester, or landed.
+fn sample_cooling_off(open: bool, caller_role: &str) -> serde_json::Value {
+    use crate::admin_actions::summary;
+    let type_uri = "https://trusttasks.org/spec/acl/revoke/0.2";
+    let payload = json!({ "subject": OTHER_DID, "revocation": { "kind": "entry" } });
+    let mut action = json!({
+        "actionId": ACTION_ID,
+        "category": "coolingOff",
+        "kind": summary::KIND_REDUCE_AUTHORITY,
+        "typeUri": type_uri,
+        "requester": DID,
+        "status": if open { "open" } else { "completed" },
+        "createdAt": TS,
+        "landsAt": "2026-08-24T00:00:00Z",
+        "approvals": [],
+        "summary": summary::render(summary::KIND_REDUCE_AUTHORITY, type_uri, &payload),
+        "payloadDigest": summary::payload_digest(&payload).unwrap(),
+        "payload": payload,
+        "callerRole": caller_role,
+        "requesterOpenActions": 1,
+        "ext": { "org.openvtc": { "approverCount": 0, "requesterRecentActions": 1, "burst": false } },
+    });
+    if open {
+        action["cancellableBy"] = json!("requester");
+    } else {
+        action["closedAt"] = json!(TS);
+        action["closedReason"] = json!("landedAfterCoolingOff");
+    }
+    action
+}
+
+/// A room the community owns, as `vtc/rooms/community/*` answers it.
+/// `CommunityRoomV3`: `CommunityRoomV2`, the room's `status`, its suspended admissions.
+fn sample_community_room_v3(status: serde_json::Value) -> serde_json::Value {
+    let mut v = sample_community_room_v2();
+    v["status"] = status;
+    v["suspended"] = json!(2);
+    v
+}
+
+fn sample_community_room_v2() -> serde_json::Value {
+    json!({
+        "room": {
+            "roomId": "did:key:z6MkRoom", "ownerDid": "did:example:community",
+            "visibility": "attributed", "retentionPolicy": "chained", "epoch": 1,
+            "lifecycle": "live", "retentionDays": 90,
+            "epochExpiresAt": "2027-01-12T10:00:00Z",
+            "createdAt": "2026-10-14T10:00:00Z", "updatedAt": "2026-10-14T10:00:00Z",
+        },
+        "label": "Board pack",
+        "storageConfig": "local",
+        "admitted": 0,
+        "offered": 1,
+        "ownerAuthorityValidUntil": "2027-10-14T10:00:00Z",
+        "createdBy": "did:key:z6MkAdmin",
+        "description": "Papers for the board's meetings.",
+        "tags": ["board", "finance"],
+        "detailsUpdatedAt": "2026-10-15T09:30:01Z",
+        "detailsUpdatedBy": "did:key:z6MkAdmin",
+    })
+}
+
+/// A room's migration as `vti_rooms::blobs` records it.
+fn sample_migration() -> vti_rooms::blobs::Migration {
+    serde_json::from_value(json!({
+        "migrationId": "6f1c2b3a-4d5e-4f60-8172-93a4b5c6d7e8",
+        "roomId": "did:key:z6MkRoom",
+        "toConfig": "eu",
+        "fromConfigs": ["local"],
+        "state": "running",
+        "totalFiles": 12,
+        "totalBytes": 48234496,
+        "doneFiles": 3,
+        "doneBytes": 1024,
+        "requestedBy": "did:key:zAdmin",
+        "reason": "retiring local",
+        "startedAt": 0,
+        "updatedAt": 0,
+    }))
+    .expect("a migration record")
+}
+
+/// A migration paused after its retries, which the runner will try again by itself.
+fn sample_paused_migration() -> vti_rooms::blobs::Migration {
+    let mut m = serde_json::to_value(sample_migration()).expect("a migration record");
+    m["state"] = json!("paused");
+    m["pausedCause"] = json!("destination");
+    m["lastError"] = json!("put to eu: 503 SlowDown");
+    m["nextAttemptAt"] = json!(1_791_000_000u64);
+    serde_json::from_value(m).expect("a migration record")
+}
+
+/// An `ambient` `s3` config at 0.2, assuming a named role.
+fn sample_storage_config_v2() -> serde_json::Value {
+    json!({
+        "id": "eu-s3-instance",
+        "label": "EU — S3 (instance role)",
+        "settings": { "kind": "s3", "region": "eu-west-1", "bucket": "northwind-rooms-eu" },
+        "auth": { "mode": "ambient", "roleArn": "arn:aws:iam::123456789012:role/northwind-rooms-writer" },
+        "state": "active",
+        "createdBy": "did:key:z6MkAdmin",
+        "createdAt": "2026-10-12T09:00:00Z",
+    })
+}
+
+/// Its facts at 0.2: a mode the host no longer permits reads `notAllowed`.
+fn sample_storage_facts_v2() -> serde_json::Value {
+    json!({
+        "rooms": 0,
+        "files": 0,
+        "bytes": 0,
+        "pendingDeleteBytes": 0,
+        "credential": { "status": "notAllowed" },
+        "health": {},
+    })
+}
+
+/// An operator's offline write as an acknowledge item names it: the record
+/// type `vtc/operator/offline-write/0.2`, with the record as its payload.
+/// A replaced custom role, as `crate::acl::roles` stores it.
+fn sample_role() -> crate::acl::roles::RoleDefinition {
+    crate::acl::roles::RoleDefinition {
+        name: "events-team".into(),
+        description: Some("Runs the public pages and event invitations.".into()),
+        ceiling: vec![
+            "vtc.surface.admin".parse().unwrap(),
+            "git.repo.manage@git-ns:github.com/acme".parse().unwrap(),
+        ],
+        approve_scope: vec!["vtc.surface.admin".parse().unwrap()],
+        created_at: 1_790_000_000,
+        created_by: "did:key:z6MkDefiner".into(),
+        updated_at: Some(1_790_000_600),
+        updated_by: Some("did:key:z6MkReplacer".into()),
+    }
+}
+
+fn sample_offline_write() -> serde_json::Value {
+    use crate::admin_actions::{OPERATOR_OFFLINE_WRITE_URI, summary};
+    let payload = json!({
+        "command": "emergencyBootstrap",
+        "dids": [DID, OTHER_DID],
+        "host": "vtc-host-1",
+        "writtenAt": TS,
+    });
+    json!({
+        "actionId": ACTION_ID,
+        "category": "acknowledge",
+        "kind": summary::KIND_OPERATOR_WRITE,
+        "typeUri": OPERATOR_OFFLINE_WRITE_URI,
+        "requester": COMMUNITY_DID,
+        "status": "open",
+        "createdAt": TS,
+        "approvals": [{ "subject": DID, "decidedAt": TS }],
+        "approversRemaining": 1,
+        "summary": summary::render(summary::KIND_OPERATOR_WRITE, OPERATOR_OFFLINE_WRITE_URI, &payload),
+        "payloadDigest": summary::payload_digest(&payload).unwrap(),
+        "payload": payload,
+        "callerRole": "acknowledger",
+        "ext": { "org.openvtc": { "severity": "critical", "acknowledgedByMe": true } },
+    })
+}
+
+/// A signed VC as this service emits one. Opaque to every schema below
+/// (`vmc` / `roleVac` / `vec` / `vic` are all `type: object`), so one shape
+/// serves them all rather than eight near-copies.
+fn credential() -> Value {
+    json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2"],
+        "id": "urn:uuid:2f9c1d4e-7a3b-4c5d-8e6f-1a2b3c4d5e6f",
+        "type": ["VerifiableCredential", "MembershipCredential"],
+        "issuer": COMMUNITY_DID,
+        "credentialSubject": { "id": DID },
+        "validFrom": TS,
+        "proof": {
+            "type": "DataIntegrityProof",
+            "cryptosuite": "eddsa-jcs-2022",
+            "created": TS,
+            "verificationMethod": "did:web:community.example#key-0",
+            "proofPurpose": "assertionMethod",
+            "proofValue": "z3FXQdBGauhBXNZeYPvKjDkxU8vJmYKq1LrGe4tHnGZk9",
+        },
+    })
+}
+
+/// A `MemberResponse` as `members/ops/read.rs` serialises one, with
+/// every optional populated. Shared by list / show / update, which all
+/// return this type.
+fn member_response() -> Value {
+    json!({
+        "did": DID,
+        "role": "member",
+        "label": "Ada",
+        "joinedAt": TS,
+        "publishConsent": true,
+        "departurePreference": "tombstone",
+        "statusListIndex": 4211,
+        "currentVmcId": "urn:uuid:2f9c1d4e-7a3b-4c5d-8e6f-1a2b3c4d5e6f",
+        "currentRoleVacId": "urn:uuid:8ab13f70-2c4d-4e5f-9a0b-1c2d3e4f5a6b",
+        "extensions": { "org": "acme" },
+        "personhood": true,
+        "personhoodAssertedAt": TS,
+        "joinedViaInvitation": true,
+        "memberVmcId": "urn:uuid:c0de1234-5678-4abc-9def-0123456789ab",
+        "memberVmcReceivedAt": TS,
+    })
+}
+
+/// A `members/credentials/0.1` response as the route emits one.
+///
+/// Built by the production projection
+/// (`members::ops::credentials::credentials_response`) over a member row
+/// populated the way issuance and receipt populate it, not transcribed: a
+/// fixture typed by hand here would keep passing after the projection changed.
+fn member_credentials_response() -> Value {
+    let mut member = crate::members::Member::fresh(DID);
+    let mut role_vac = credential();
+    role_vac["id"] = json!("urn:uuid:8ab13f70-2c4d-4e5f-9a0b-1c2d3e4f5a6b");
+    role_vac["type"] = json!([
+        "VerifiableCredential",
+        "DTGCredential",
+        "AuthorityCredential"
+    ]);
+    member.record_issued_credentials(credential(), role_vac);
+    let mut ack = credential();
+    ack["id"] = json!("urn:uuid:c0de1234-5678-4abc-9def-0123456789ab");
+    ack["issuer"] = json!(DID);
+    ack["credentialSubject"] = json!({ "id": COMMUNITY_DID, "digestMultibase": "zQmExample" });
+    member.record_member_vmc("urn:uuid:c0de1234-5678-4abc-9def-0123456789ab", ack, true);
+    to_v(
+        crate::members::ops::credentials::credentials_response(&member)
+            .expect("a populated member projects"),
+    )
+}
+
+/// A completed direct admission, as `ceremony::admission::admit_directly`
+/// returns one, with the credentials [`credential`] stands for.
+/// A moderator's entry, as a completed `vtc/members/role/set` leaves it.
+fn role_set_entry() -> crate::acl::VtcAclEntry {
+    crate::acl::VtcAclEntry {
+        did: DID.into(),
+        role: crate::acl::VtcRole::Moderator,
+        label: None,
+        admin: crate::acl::VtcRole::Moderator.implied_authority(),
+        delegated_by: Some(COMMUNITY_DID.into()),
+        created_at: 1_700_000_000,
+        created_by: COMMUNITY_DID.into(),
+        updated_at: Some(1_700_000_100),
+        updated_by: Some(COMMUNITY_DID.into()),
+        expires_at: None,
+        resource_grants: Vec::new(),
+        group_grants: Vec::new(),
+        label_set_by_subject: false,
+        suspension: None,
+    }
+}
+
+fn admitted(label: Option<&str>) -> crate::ceremony::admission::Admitted {
+    let vc = || serde_json::from_value(credential()).expect("the fixture credential parses");
+    crate::ceremony::admission::Admitted {
+        subject: DID.into(),
+        role: crate::acl::VtcRole::Moderator,
+        label: label.map(Into::into),
+        returning: false,
+        approval: crate::ceremony::admission::Approval::Approved,
+        creds: crate::ceremony::execute::AdmitOutcome {
+            vmc: vc(),
+            role_vac: vc(),
+            status_list_index: 7,
+        },
+    }
+}
+
+/// The `CommunityProfile` this service serialises
+/// (`community/profile.rs:73`). Carried by profile show/update and by the
+/// config export document.
+/// The `CommunityProfile` this service serialises.
+///
+/// Built from the **real struct**, not hand-written. The hand-written version
+/// omitted `personhood`, which the type always serialises — and that omission
+/// promoted `config/export` and `config/import` to `checked!` in #1097 on a
+/// shape the service does not send. A fixture can understate as easily as it
+/// can overstate, and understating is the dangerous direction: it makes a
+/// non-conformant route look green. Constructing the type means the compiler
+/// refuses to let this drift again.
+fn community_profile() -> Value {
+    let mut p = crate::community::CommunityProfile::new(COMMUNITY_DID, "Example Community");
+    p.description = "A demo community.".into();
+    p.logo_url = Some("https://community.example/logo.png".into());
+    p.public_url = Some("https://community.example".into());
+    p.contact_email = Some("ops@community.example".into());
+    p.language = "en".into();
+    p.relationship_identifier_default = "pairwise".into();
+    p.created_at = TS.parse().expect("fixture timestamp");
+    p.extensions = json!({ "tier": "gold" });
+    serde_json::to_value(p).expect("CommunityProfile serialises")
+}
+
+/// The `BackupEnvelope` (`backup.rs:63`) — canonical, and the same object on
+/// both the export response and the import request.
+fn backup_envelope() -> Value {
+    json!({
+        "version": 1,
+        "format": "vtc-backup-v1",
+        "createdAt": TS,
+        "sourceDid": COMMUNITY_DID,
+        "sourceVersion": "0.9.0",
+        "kdf": {
+            "algorithm": "argon2id",
+            "salt": "c2FsdC1iYXNlNjR1cmwtMzJieXRlcw",
+            "mCost": 65536,
+            "tCost": 3,
+            "pCost": 1,
+        },
+        "encryption": { "algorithm": "aes-256-gcm", "nonce": "bm9uY2UtMTJieXRl" },
+        "includesAudit": true,
+        "ciphertext": "3q2-7wAAAAAAAAAAAAAAAA",
+    })
+}
+
+/// The `Paginated<T>` wrapper as `vti-common/src/pagination/mod.rs` serialises
+/// it — camelCase throughout, wrapper and items alike.
+///
+/// The wrapper carried no `rename_all` until this witness caught it, so it sent
+/// `next_cursor` / `total_estimate` against schemas that have always said
+/// `nextCursor` / `totalEstimate`. One missing attribute, five drifting list
+/// tasks, and a direct R3.1 violation of the same class as #656/#658.
+/// The `Paginated<T>` wrapper as this service emits one.
+///
+/// No `totalEstimate`: the member is `skip_serializing_if = "Option::is_none"`
+/// and nothing in the workspace ever sets it to `Some`, so it never reaches
+/// the wire. This fixture carried an invented `12` until #1099, which made
+/// conforming routes look non-conformant against the list schemas that do not
+/// define it.
+fn paginated(items: Value) -> Value {
+    json!({ "items": items, "nextCursor": "eyJsYXN0S2V5Ijoi" })
+}
+
+/// A `JoinRequest` as `join/mod.rs:81` serialises one. No member carries
+/// `skip_serializing_if`, so all ten are always on the wire.
+fn join_request() -> Value {
+    // `policyDecision` is absent, not `null` — the component types it
+    // `object` where it types `vpClaims` and `decision` `["object", "null"]`,
+    // so a `null` there is a type error rather than an empty value. The row
+    // sent one until #1099.
+    json!({
+        "id": REQUEST_ID,
+        "applicantDid": DID,
+        "vp": { "type": ["VerifiablePresentation"] },
+        "vpClaims": { "email": "ada@example.com" },
+        "submittedAt": TS,
+        "status": "pending",
+        "registryConsent": true,
+        "extensions": { "org": "acme" },
+        "decision": null,
+    })
+}
+
+const VEC_ID: &str = "urn:uuid:11111111-1111-4111-8111-111111111111";
+
+/// One row, with whatever issuance receipt the caller can supply.
+///
+/// Serialised from the real `EndorsementRow`, not hand-written — see the
+/// `endorsements/revoke` note in the table (#1095) for why that matters.
+fn endorsement_row(
+    issued: crate::endorsements::ops::CredentialReference,
+) -> crate::endorsements::ops::EndorsementRow {
+    crate::endorsements::ops::EndorsementRow {
+        endorsement_id: "11111111-1111-4111-8111-111111111111"
+            .parse()
+            .expect("fixture uuid"),
+        type_uri: "https://skills.example.com/v1/rust".into(),
+        subject_did: DID.into(),
+        issued,
+        status_list_index: 42,
+        claim: json!({ "level": "expert" }),
+        revoked_at: None,
+    }
+}
+
+/// The row a `list` / `show` sends: the handle and the mint time. The expiry
+/// is not on the stored row, and the credential itself rides on `issue` alone.
+fn endorsement() -> Value {
+    serde_json::to_value(endorsement_row(
+        crate::endorsements::ops::CredentialReference {
+            credential_id: VEC_ID.into(),
+            issued_at: Some(TS.parse().expect("fixture timestamp")),
+            expires_at: None,
+        },
+    ))
+    .expect("EndorsementRow serialises")
+}
+
+/// An `EndorsementType` row as `endorsement_types/mod.rs:42` serialises one.
+fn endorsement_type() -> Value {
+    json!({
+        "typeUri": "https://skills.example.com/v1/rust",
+        "claimSchema": { "type": "object" },
+        "description": "Rust proficiency",
+        "createdAt": TS,
+        "createdByDid": OTHER_DID,
+    })
+}
+
+fn uuid() -> uuid::Uuid {
+    uuid::Uuid::parse_str(REQUEST_ID).expect("fixture uuid parses")
+}
+
+// ─── b2 admin surface fixtures ───────────────────────────────────────────
+
+const SCHEMA_TYPE: &str = "https://schemas.example.com/membership/v1";
+
+/// The branding the store holds, round-tripped through the stored type.
+fn branding() -> Value {
+    let b: vta_sdk::protocols::join_requests::manifest::v0_4::CommunityBranding =
+        serde_json::from_value(json!({
+            "displayName": "Example Community",
+            "accentColor": "#1a2b3c",
+            "logoUrl": "https://community.example/logo.png",
+        }))
+        .expect("branding fixture parses");
+    to_v(b)
+}
+
+/// The requested attributes the store holds, round-tripped through the type.
+fn requested_attributes() -> Value {
+    let r: Vec<vta_sdk::protocols::join_requests::manifest::v0_4::ResponseRequestedAttributesItem> =
+        serde_json::from_value(json!([
+            { "type": "name.display", "required": true, "purpose": "To greet you" },
+            { "type": "address.country", "required": false },
+        ]))
+        .expect("requested attributes fixture parses");
+    to_v(r)
+}
+
+fn join_discovery() -> Value {
+    to_v(crate::community::join_discovery::JoinDiscovery { public: false })
+}
+
+fn schema_entry() -> Value {
+    to_v(crate::schemas::SchemaEntry {
+        type_uri: SCHEMA_TYPE.into(),
+        dtg_type: Some("MembershipCredential".into()),
+        credential_schema: Some(json!({ "type": "object" })),
+        kind: crate::schemas::SchemaKind::Accepts,
+        description: Some("Membership evidence".into()),
+        created_at: TS.parse().expect("fixture timestamp"),
+        created_by_did: OTHER_DID.into(),
+    })
+}
+
+fn dcql_query() -> Value {
+    json!({
+        "credentials": [{
+            "id": "membership",
+            "format": "dc+sd-jwt",
+            "meta": { "vct_values": [SCHEMA_TYPE] },
+            "claims": [{ "path": ["givenName"] }]
+        }]
+    })
+}
+
+/// As `accepts/{register,list,show}/0.2` answer it: the store's wire form.
+fn accepts_criterion() -> Value {
+    let mut c = crate::schemas::accepts::AcceptsCriterion::new(
+        "membership",
+        crate::schemas::accepts::Admission::Automatic,
+        OTHER_DID,
+    );
+    c.query = Some(dcql_query());
+    c.credential_issuers = Some(crate::schemas::accepts::CredentialIssuers::Recognised);
+    c.description = Some("A membership credential".into());
+    c.created_at = TS.parse().expect("fixture timestamp");
+    c.to_wire()
+}
+
+fn auto_grant_status() -> Value {
+    to_v(vta_sdk::protocols::vetting::AutoGrantStatus {
+        enabled: true,
+        sweep_minutes: 60,
+        validity_seconds: 31_536_000,
+        last_sweep: Some(vta_sdk::protocols::vetting::AutoGrantSweep {
+            ran_at: TS.parse().expect("fixture timestamp"),
+            granted: 2,
+            revoked: 0,
+            errors: 0,
+        }),
+    })
+}
+
+/// A website file's content hash (`WebsiteEtag`): lowercase hex SHA-256.
+const SITE_ETAG: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+// ─── The witness table ───────────────────────────────────────────────────
+
+/// The number of annotated divergences. Asserted, so the debt can shrink but
+/// not grow unnoticed — the same discipline `UNPUBLISHED_CANONICAL_OK` in
+/// `tests/trust_task_manifest.rs` applies to unpublished URIs.
+///
+/// **0 of 58.** Every Trust Task this service binds now speaks the schema it
+/// publishes, on both sides.
+///
+/// It was 33 when the sweep landed on 2026-08-24. Keeping the constant at zero
+/// is the point: it can no longer shrink, so the only thing it can do is catch
+/// a regression, which is what an asserted count is for. A new task that
+/// diverges must add a `drift!` entry and raise this deliberately.
+///
+/// **How the 33 actually closed**, because the distribution is not what the
+/// sweep predicted:
+///
+/// - **10** by correcting this service's wire shapes — missing envelopes,
+///   wrong member names, a `null` where the schema said `object`.
+/// - **19** on dependency bumps alone, because the specs had already moved and
+///   these notes had not.
+/// - **4** by correcting the *specification*, not the service, once it turned
+///   out the published shape was the weaker one: a binding no browser can
+///   produce, a payload that was a replayable impersonation token, and a
+///   `const` that could express one of four outcomes.
+///
+/// That last group is the one worth remembering. A conformance table makes
+/// divergence visible but says nothing about which side is wrong, and the
+/// sentence *"the schema requires X and the service omits X"* reads as an
+/// accusation against the implementation. Twice it was the schema. Once —
+/// `install/claim` — the requirement had been built, found impossible in a
+/// browser, and removed two months **before** the specification demanding it
+/// was written, and this table recorded that as the service being behind on a
+/// security control.
+///
+/// **Two failure modes to expect if you extend this table.**
+///
+/// *Read the pin before believing a note.* This catches the service drifting
+/// from the spec and is blind to the spec moving toward the service.
+///
+/// *A hand-written fixture can understate as well as overstate.* #1097
+/// promoted two entries on a fixture that omitted a member the real type
+/// always sends — a false green, the one direction this table must never fail
+/// in. Fixtures built from the real types cannot do that; roughly twenty
+/// remain hand-written.
+///
+/// To re-measure rather than re-read: add a throwaway test that walks
+/// `table()` printing the actual parse or schema error for every entry.
+/// `invalid type: string, expected struct IssuedCredential` is a sentence no
+/// amount of re-reading prose will produce.
+const KNOWN_DRIFT_COUNT: usize = 0;
+
+/// Every bound, published `spec/vtc/*` URI, with the request and response the
+/// VTC actually speaks.
+///
+/// **Fixtures are transcribed, not typed, and that is a debt.** The VTA's
+/// sweep records why: a transcription "only proves someone can type valid
+/// JSON: it stops tracking the producer the moment the producer changes, and
+/// stays green while live traffic fails". Typed fixtures are not reachable
+/// from here today — most of `routes/` is `mod x;`, private to `routes`, so
+/// naming `MemberResponse` would mean widening a dozen modules to
+/// `pub(crate)` in production code to satisfy a test. That is a real change
+/// with its own argument, and mixing it into the change that first adds the
+/// sweep would make both harder to review. Every fixture below therefore
+/// cites the `file:line` of the type it transcribes, so the next reader can
+/// check it in one hop.
+///
+/// The exception is the join / member ceremony family, whose wire types live
+/// in `vta-sdk` and are reachable: those are built from the real type, which
+/// is the stronger form and is also where #1059's two named divergences are.
+///
+/// **The difference between the two forms was measured, not assumed.** Adding
+/// `#[serde(rename = "state")]` to `MemberVmcReceiptBody.status`
+/// (`vta-sdk/src/protocols/members.rs:170`) fails this sweep — the typed
+/// witness re-serialises and the rename shows up. Adding
+/// `#[serde(rename = "wasRemoved")]` to `RemoveResponse.removed`
+/// (`members/ops/remove.rs`) does **not** — the transcribed witness
+/// keeps asserting the old spelling and the sweep stays green while the
+/// service breaks. That is the exact cost of the transcription, and it is why
+/// converting the table to typed fixtures is worth its own change rather than
+/// being a nicety.
+#[allow(clippy::too_many_lines)]
+fn table() -> Vec<Conformance> {
+    use vta_sdk::protocols::join_requests as jr;
+    use vta_sdk::protocols::members as mem;
+    use vti_specs::vtc as s;
+
+    #[allow(unused_mut)]
+    let mut table = vec![
+        // ─── received notifications (`crate::notifications::inbox`) ──
+        checked!(
+            s::notifications::list::v0_1::Payload,
+            s::notifications::list::v0_1::Response,
+            json!({ "kind": "election", "includeLapsed": false, "limit": 50 }),
+            json!({ "items": [sample_received_notification()] })
+        ),
+        checked!(
+            s::notifications::show::v0_1::Payload,
+            s::notifications::show::v0_1::Response,
+            json!({ "recordId": "rn-4Tq8Zr2Lw9Ks6Pm1" }),
+            json!({ "item": sample_received_notification(),
+                    "document": { "type": "https://trusttasks.org/spec/notifications/notify/0.1" } })
+        ),
+        checked!(
+            s::notifications::relay::v0_1::Payload,
+            s::notifications::relay::v0_1::Response,
+            json!({ "recordId": "rn-4Tq8Zr2Lw9Ks6Pm1",
+                    "recipients": { "scope": "group", "groupId": "grp_Q2xpbWJpbmdDbHViMjAyNw" },
+                    "disclosureAcknowledged": true }),
+            json!({ "recordId": "rn-4Tq8Zr2Lw9Ks6Pm1", "revision": 1, "recipientCount": 42 })
+        ),
+        // ─── network membership (`crate::networks`) ──────────────────
+        checked!(
+            s::networks::list::v0_2::Payload,
+            s::networks::list::v0_2::Response,
+            json!({ "state": "acknowledged", "limit": 50 }),
+            json!({ "items": [sample_network_membership()] })
+        ),
+        checked!(
+            s::networks::show::v0_2::Payload,
+            s::networks::show::v0_2::Response,
+            json!({ "network": "did:example:whn" }),
+            json!({ "membership": sample_network_membership() })
+        ),
+        checked!(
+            s::networks::preview::v0_1::Payload,
+            s::networks::preview::v0_1::Response,
+            json!({ "url": "https://whn.example.org", "network": "did:example:whn" }),
+            json!({ "network": "did:example:whn", "url": "https://whn.example.org",
+                    "name": "World Health Network", "owner": "WHN Foundation",
+                    "framework": { "iri": "https://whn.example.org/governance", "version": "1.0" },
+                    "roles": [{ "name": "admins", "required": true }],
+                    "listed": true, "entryState": "listed" })
+        ),
+        checked!(
+            s::networks::join::v0_2::Payload,
+            s::networks::join::v0_2::Response,
+            json!({ "url": "https://whn.example.org", "network": "did:example:whn",
+                    "groups": [{ "role": "admins", "groupId": "admins" }] }),
+            json!({ "membership": sample_network_membership() })
+        ),
+        checked!(
+            s::networks::repudiate::v0_2::Payload,
+            s::networks::repudiate::v0_2::Response,
+            json!({ "url": "https://whn.example.org", "network": "did:example:whn", "reason": "not ours" }),
+            json!({ "membership": sample_network_membership() })
+        ),
+        checked!(
+            s::networks::leave::v0_2::Payload,
+            s::networks::leave::v0_2::Response,
+            json!({ "network": "did:example:whn", "reason": "merged" }),
+            json!({ "membership": sample_network_membership() })
+        ),
+        checked!(
+            s::networks::groups::register::v0_2::Payload,
+            s::networks::groups::register::v0_2::Response,
+            json!({ "network": "did:example:whn", "role": "admins", "groupId": "admins" }),
+            json!({ "membership": sample_network_membership() })
+        ),
+        checked!(
+            s::networks::deliver::v0_1::Payload,
+            s::networks::deliver::v0_1::Response,
+            // The spec's own example.
+            json!({
+                "role": "admins",
+                "envelope": {
+                    "message": {
+                        "type": "VtnBroadcast",
+                        "id": "urn:uuid:00000000-0000-4000-8000-00000000b001",
+                        "origin": "did:example:whn",
+                        "role": "admins",
+                        "class": "notice",
+                        "subject": "Regional exercise",
+                        "body": "A coordination exercise runs on 12 November at 09:00 UTC.",
+                        "sentAt": "2026-11-03T09:59:00Z",
+                        "expiresAt": "2026-11-06T09:59:00Z",
+                        "proof": {
+                            "type": "DataIntegrityProof",
+                            "cryptosuite": "eddsa-jcs-2022",
+                            "proofPurpose": "assertionMethod",
+                            "verificationMethod": "did:example:whn#key-0",
+                            "proofValue": "z3abc"
+                        }
+                    },
+                    "hops": [
+                        {
+                            "type": "VtnRelayHop",
+                            "message": "urn:uuid:00000000-0000-4000-8000-00000000b001",
+                            "index": 0,
+                            "from": "did:example:whn",
+                            "to": "did:example:community-admins-group",
+                            "role": "admins",
+                            "at": "2026-11-03T09:59:01Z",
+                            "proof": {
+                                "type": "DataIntegrityProof",
+                                "cryptosuite": "eddsa-jcs-2022",
+                                "proofPurpose": "assertionMethod",
+                                "verificationMethod": "did:example:whn#key-0",
+                                "proofValue": "z3def"
+                            }
+                        }
+                    ]
+                }
+            }),
+            json!({ "status": "delivered" })
+        ),
+        checked!(
+            s::networks::evidence::v0_2::Payload,
+            s::networks::evidence::v0_2::Response,
+            json!({ "network": "did:example:whn" }),
+            json!({ "links": [{
+                "groupId": "admins", "groupDid": "did:example:community-admins",
+                "network": "did:example:whn", "role": "admins",
+                "registration": sample_network_membership()["groups"][0]["registration"],
+                "acceptance": sample_network_membership()["groups"][0]["acceptance"],
+            }] })
+        ),
+        // ─── the action list (`crate::admin_actions`) ────────────────
+        // `_shared/0.3` Actions: an approval, a cooling-off in the schema's own
+        // terms, and an operator's offline write (`offline-write/0.2`).
+        checked!(
+            s::admin::actions::list::v0_3::Payload,
+            s::admin::actions::list::v0_3::Response,
+            json!({ "view": "all", "limit": 25 }),
+            json!({
+                "actions": [sample_action(true), sample_cooling_off(true, "requester")],
+                "counts": { "waitingForMe": 1, "requestedByMe": 1 },
+                "nextCursor": "djF8YWxsfHwyNQ",
+                "ext": { "org.openvtc": {
+                    "operatorWritesUnacknowledged": [],
+                    "coolingOffAgainstMe": [],
+                }},
+            })
+        ),
+        checked!(
+            s::admin::actions::show::v0_3::Payload,
+            s::admin::actions::show::v0_3::Response,
+            json!({ "actionId": ACTION_ID }),
+            json!({ "action": sample_cooling_off(false, "subject") })
+        ),
+        checked!(
+            s::admin::actions::cancel::v0_3::Payload,
+            s::admin::actions::cancel::v0_3::Response,
+            json!({ "actionId": ACTION_ID, "reason": "raised against the wrong DID" }),
+            json!({ "action": sample_action(false) })
+        ),
+        checked!(
+            s::admin::actions::acknowledge::v0_3::Payload,
+            s::admin::actions::acknowledge::v0_3::Response,
+            json!({ "actionId": ACTION_ID }),
+            json!({ "action": sample_offline_write() })
+        ),
+        // ─── the console's live channel ──────────────────────────────
+        // The response is the first event of the stream it opens; the
+        // hints after it are `event/0.5` documents (`admin_events.rs`
+        // holds their shape against that schema).
+        checked!(
+            s::admin::events::subscribe::v0_6::Payload,
+            s::admin::events::subscribe::v0_6::Response,
+            json!({
+                "topics": ["actions", "acknowledgements", "joinRequests", "members",
+                           "singleAdminMode", "config", "rooms", "directory", "groups",
+                           "communityRooms"],
+                "resumeToken": "e1.AAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBB",
+            }),
+            json!({
+                "topics": ["actions", "members", "communityRooms"],
+                "heartbeatSeconds": 25,
+                "resumed": true,
+                "resumeToken": "e1.AAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBB",
+            })
+        ),
+        // ─── custom administrative roles ─────────────────────────────
+        // Responses rendered by the handler's own renderers.
+        checked!(
+            s::roles::define::v0_1::Payload,
+            s::roles::define::v0_1::Response,
+            json!({
+                "name": "events-team",
+                "description": "Runs the public pages and event invitations.",
+                "ceiling": [
+                    { "capability": "vtc.surface.admin" },
+                    { "capability": "git.repo.manage", "resource": "git-ns:github.com/acme" },
+                ],
+                "approveScope": [{ "capability": "vtc.surface.admin" }],
+                "replaces": false,
+                "reason": "delegating event operations",
+            }),
+            json!({
+                "role": crate::acl::roles::render(&sample_role()),
+                "ext": { "org.openvtc": { "affectedEntries": 0 } },
+            })
+        ),
+        checked!(
+            s::roles::list::v0_1::Payload,
+            s::roles::list::v0_1::Response,
+            json!({ "includeBuiltIn": true }),
+            json!({ "roles": crate::acl::AdminRole::BUILT_IN
+                .iter()
+                .map(crate::acl::roles::render_built_in)
+                .chain(std::iter::once(crate::acl::roles::render(&sample_role())))
+                .collect::<Vec<_>>() })
+        ),
+        checked!(
+            s::roles::show::v0_1::Payload,
+            s::roles::show::v0_1::Response,
+            json!({ "name": "events-team" }),
+            json!({ "role": crate::acl::roles::render(&sample_role()), "holders": 2 })
+        ),
+        checked!(
+            s::roles::delete::v0_1::Payload,
+            s::roles::delete::v0_1::Response,
+            json!({ "name": "events-team", "reason": "events moved elsewhere" }),
+            json!({ "deleted": "events-team" })
+        ),
+        // ─── the OpenID4VP verifier identities (`oid4vp_tasks`) ──────
+        checked!(
+            s::oid4vp::identities::list::v0_1::Payload,
+            s::oid4vp::identities::list::v0_1::Response,
+            json!({}),
+            json!({
+                "identities": [{
+                    "id": "eudi", "kind": "eudi",
+                    "clientId": "x509_hash:Uvo3HtuIxuhC92rShpgqcT3YXwrqRxWEviRiA0OZszk",
+                    "custody": "agent", "usable": true, "isDefault": true,
+                    "certificate": {
+                        "subject": "CN=Example community verifier",
+                        "issuer": "CN=Test Access CA",
+                        "notBefore": "2026-07-01T00:00:00Z",
+                        "notAfter": "2026-10-31T00:00:00Z",
+                        "chainLength": 1,
+                    },
+                    "attestations": [{
+                        "kind": "registrationCertificate",
+                        "expiresAt": "2027-01-01T00:00:00Z",
+                    }],
+                    "problems": [{
+                        "code": "certificateExpiresSoon", "severity": "warning",
+                        "detail": "the access certificate expires 2026-10-31",
+                    }],
+                    "installedAt": "2026-07-01T09:30:00Z",
+                }],
+                "defaultIdentity": null,
+                "problems": [],
+            })
+        ),
+        // ─── what rooms store and may store (`room_admin_tasks`) ─────
+        // The migration names its target, a paused one says why and when, and the host
+        // record's instants are RFC 3339 strings (0.3).
+        checked!(
+            s::rooms::get::v0_3::Payload,
+            s::rooms::get::v0_3::Response,
+            json!({ "roomId": "did:key:z6MkRoom" }),
+            json!({
+                "room": {
+                    "roomId": "did:key:z6MkRoom", "ownerDid": "did:key:zOwner",
+                    "visibility": "attributed", "retentionPolicy": "chained", "epoch": 1,
+                    "lifecycle": "live", "retentionDays": 30,
+                    "createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-10T10:00:00Z",
+                },
+                "storage": {
+                    "configId": "local",
+                    "earlierConfigs": [{ "configId": "old", "files": 1, "bytes": 10 }],
+                    "migration": crate::rooms::migration::progress_json(&sample_paused_migration()),
+                },
+                "limits": {
+                    "limits": {
+                        "filesEnabled": true,
+                        "room": { "maxFiles": 10000, "maxFileBytes": 104857600, "maxBytes": 5368709120u64 },
+                        "member": { "maxFiles": 2000, "maxFileBytes": 104857600, "maxBytes": 1073741824 },
+                    },
+                    "roomSource": "override", "memberSource": "default",
+                    "hostCeilingBytes": 1073741824,
+                },
+                "usage": {
+                    "room": { "files": 3, "bytes": 1800, "reservedBytes": 0, "reservedFiles": 0 },
+                    "orphans": { "files": 1, "bytes": 5, "oldestOrphanedAt": "2026-10-10T10:00:00+00:00" },
+                },
+                "largestBlobs": [{ "size": 900, "configId": "local", "createdAt": "2026-10-10T10:00:00+00:00" }],
+                "membersWithUsage": 1,
+            })
+        ),
+        checked!(
+            s::rooms::usage::v0_1::Payload,
+            s::rooms::usage::v0_1::Response,
+            json!({
+                "groupBy": "room",
+                "filter": { "from": "2026-09-15", "to": "2026-10-14" },
+                "sort": { "by": "bytes", "order": "desc" },
+                "limit": 10,
+            }),
+            json!({
+                "asOf": "2026-10-14T10:00:00+00:00", "from": "2026-09-15", "to": "2026-10-14",
+                "items": [{
+                    "roomId": "did:key:z6MkRoom", "storageConfig": "local",
+                    "files": 2, "bytes": 1500, "reservedBytes": 0,
+                    "uploads": 2, "downloads": 1, "egressBytes": 1000,
+                    "limits": { "maxFiles": 10000, "maxFileBytes": 104857600, "maxBytes": 5368709120u64 },
+                }],
+                "nextCursor": "vtc-rooms-usage:0011223344556677:10",
+            })
+        ),
+        checked!(
+            s::rooms::limits::set::v0_1::Payload,
+            s::rooms::limits::set::v0_1::Response,
+            json!({
+                "roomId": "did:key:z6MkRoom",
+                "target": { "kind": "member", "member": "did:key:zMember" },
+                "limits": { "maxFiles": 1 },
+                "reason": "tidy up first",
+            }),
+            json!({
+                "roomId": "did:key:z6MkRoom",
+                "target": { "kind": "member", "member": "did:key:zMember" },
+                "limits": {
+                    "limits": {
+                        "filesEnabled": true,
+                        "room": { "maxFiles": 10000, "maxFileBytes": 104857600, "maxBytes": 5368709120u64 },
+                        "member": { "maxFiles": 2000, "maxFileBytes": 104857600, "maxBytes": 1073741824 },
+                    },
+                    "roomSource": "default", "memberSource": "default",
+                    "hostCeilingBytes": 1073741824,
+                },
+                "targetLimits": { "maxFiles": 1, "maxFileBytes": 104857600 },
+                "usage": { "files": 2, "bytes": 200, "reservedBytes": 0, "reservedFiles": 0 },
+                "overLimit": true,
+            })
+        ),
+        // ─── rooms the community owns (`community_room_tasks`) ───────
+        // The community's VTA writes the label and description into the room as its
+        // profile — here it did not answer yet, so `pending`.
+        checked!(
+            s::rooms::community::create::v0_4::Payload,
+            s::rooms::community::create::v0_4::Response,
+            json!({
+                "label": "Board pack", "visibility": "attributed", "reason": "the board",
+                "description": "Papers for the board's meetings.", "tags": ["board"],
+            }),
+            json!({ "room": sample_community_room_v2(), "roomProfile": "pending" })
+        ),
+        checked!(
+            s::rooms::community::list::v0_3::Payload,
+            s::rooms::community::list::v0_3::Response,
+            json!({ "limit": 10, "tag": "board" }),
+            json!({
+                "items": [sample_community_room_v2()],
+                "nextCursor": "community-rooms:did:key:z6MkRoom",
+            })
+        ),
+        checked!(
+            s::rooms::community::get::v0_3::Payload,
+            s::rooms::community::get::v0_3::Response,
+            json!({ "roomId": "did:key:z6MkRoom" }),
+            json!({ "room": sample_community_room_v2() })
+        ),
+        checked!(
+            s::rooms::community::update::v0_3::Payload,
+            s::rooms::community::update::v0_3::Response,
+            json!({
+                "roomId": "did:key:z6MkRoom", "label": "Board pack — 2027",
+                "tags": [], "reason": "the 2027 cycle",
+            }),
+            json!({ "room": sample_community_room_v2(), "changed": true, "roomProfile": "written" })
+        ),
+        checked!(
+            s::rooms::community::members::add::v0_2::Payload,
+            s::rooms::community::members::add::v0_2::Response,
+            json!({
+                "roomId": "did:key:z6MkRoom", "member": "did:key:z6MkMember",
+                "actions": ["read", "write"], "validUntil": "2027-10-01T00:00:00Z",
+                "reason": "joins the board",
+            }),
+            json!({ "member": {
+                "member": "did:key:z6MkMember", "actions": ["read", "write"],
+                "validUntil": "2027-10-01T00:00:00Z", "state": "offered",
+                "offeredAt": "2026-10-14T10:00:00Z",
+            } })
+        ),
+        checked!(
+            s::rooms::community::members::remove::v0_2::Payload,
+            s::rooms::community::members::remove::v0_2::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "member": "did:key:z6MkMember", "reason": "left" }),
+            json!({
+                "member": {
+                    "member": "did:key:z6MkMember", "actions": ["read"],
+                    "validUntil": "2027-10-01T00:00:00Z", "state": "removed",
+                    "offeredAt": "2026-10-14T10:00:00Z", "admittedAt": "2026-10-14T11:00:00Z",
+                    "removedAt": "2026-11-02T09:00:00Z",
+                },
+                "revocation": { "sequence": 2,
+                    "digest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR" },
+                "revokedAt": "2026-11-02T09:00:00Z",
+                "epoch": 3,
+            })
+        ),
+        checked!(
+            s::rooms::community::members::list::v0_1::Payload,
+            s::rooms::community::members::list::v0_1::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "state": "admitted", "limit": 10 }),
+            json!({ "items": [{
+                "member": "did:key:z6MkMember", "actions": ["read"],
+                "validUntil": "2027-10-01T00:00:00Z", "state": "admitted",
+                "offeredAt": "2026-10-14T10:00:00Z", "admittedAt": "2026-10-14T11:00:00Z",
+            }] })
+        ),
+        // ─── a room's owner lifecycle (`rooms::community_lifecycle`) ───
+        checked!(
+            s::rooms::community::list::v0_4::Payload,
+            s::rooms::community::list::v0_4::Response,
+            json!({ "limit": 10, "states": ["archived", "removalScheduled"] }),
+            json!({ "items": [sample_community_room_v3(json!({
+                "state": "archived", "access": "readOnly",
+                "changedAt": "2026-11-02T10:00:02Z", "changedBy": "did:key:z6MkAdmin",
+            }))] })
+        ),
+        checked!(
+            s::rooms::community::get::v0_4::Payload,
+            s::rooms::community::get::v0_4::Response,
+            json!({ "roomId": "did:key:z6MkRoom" }),
+            json!({ "room": sample_community_room_v3(json!({
+                "state": "purging", "changedAt": "2026-11-02T10:00:02Z",
+                "changedBy": "did:key:z6MkAdmin", "purgeAt": "2026-11-02T10:00:02Z",
+                "purge": { "attempts": 1, "lastAttemptAt": "2026-11-02T10:00:03Z",
+                    "nextAttemptAt": "2026-11-02T10:00:33Z",
+                    "lastError": "1 of the room's files could not be deleted from storage yet" },
+            })) })
+        ),
+        checked!(
+            s::rooms::community::archive::v0_1::Payload,
+            s::rooms::community::archive::v0_1::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "access": "noAccess", "reason": "the cycle closed" }),
+            json!({
+                "room": sample_community_room_v3(json!({
+                    "state": "archived", "access": "noAccess",
+                    "changedAt": "2026-11-02T10:00:02Z", "changedBy": "did:key:z6MkAdmin",
+                })),
+                "changed": true, "withdrawnOffers": 1,
+                "revocation": { "sequence": 3,
+                    "digest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR" },
+                "revokedAt": "2026-11-02T10:00:01Z",
+            })
+        ),
+        checked!(
+            s::rooms::community::unarchive::v0_1::Payload,
+            s::rooms::community::unarchive::v0_1::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "reason": "reopened" }),
+            json!({
+                "room": sample_community_room_v3(json!({
+                    "state": "active", "changedAt": "2026-11-03T10:00:00Z",
+                    "changedBy": "did:key:z6MkAdmin", "restoring": 2,
+                })),
+                "changed": true,
+            })
+        ),
+        checked!(
+            s::rooms::community::remove::v0_1::Payload,
+            s::rooms::community::remove::v0_1::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "graceDays": 30, "reason": "no longer needed" }),
+            json!({ "room": sample_community_room_v3(json!({
+                "state": "removalScheduled", "access": "noAccess",
+                "changedAt": "2026-11-02T10:00:02Z", "changedBy": "did:key:z6MkAdmin",
+                "purgeAt": "2026-12-02T10:00:02Z",
+            })) })
+        ),
+        checked!(
+            s::rooms::community::removal::cancel::v0_1::Payload,
+            s::rooms::community::removal::cancel::v0_1::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "reason": "removed by mistake" }),
+            json!({ "room": sample_community_room_v3(json!({
+                "state": "archived", "access": "noAccess",
+                "changedAt": "2026-11-03T10:00:00Z", "changedBy": "did:key:z6MkAdmin",
+            })) })
+        ),
+        checked!(
+            s::rooms::community::members::list::v0_2::Payload,
+            s::rooms::community::members::list::v0_2::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "state": "suspended", "limit": 10 }),
+            json!({ "items": [{
+                "member": "did:key:z6MkMember", "actions": ["read"],
+                "validUntil": "2027-10-01T00:00:00Z", "state": "suspended",
+                "offeredAt": "2026-10-14T10:00:00Z", "admittedAt": "2026-10-14T11:00:00Z",
+                "suspendedAt": "2026-11-02T10:00:02Z",
+            }] })
+        ),
+        checked!(
+            s::rooms::memberships::list::v0_2::Payload,
+            s::rooms::memberships::list::v0_2::Response,
+            json!({ "limit": 10 }),
+            json!({ "items": [{
+                "roomId": "did:key:z6MkRoom", "host": "did:example:community",
+                "label": "Board pack", "visibility": "attributed", "actions": ["read"],
+                "validUntil": "2027-10-01T00:00:00Z", "state": "suspended",
+                "offeredAt": "2026-10-14T10:00:00Z", "admittedAt": "2026-10-14T11:00:00Z",
+                "suspendedAt": "2026-11-02T10:00:02Z",
+                "roomState": "removalScheduled", "roomAccess": "noAccess",
+                "purgeAt": "2026-12-02T10:00:02Z",
+            }] })
+        ),
+        // The offers, and on the first page the renewals of the admissions the
+        // member holds (`groups::bindings`), `renewsAt` (0.4).
+        checked!(
+            s::rooms::offers::list::v0_4::Payload,
+            s::rooms::offers::list::v0_4::Response,
+            json!({}),
+            json!({
+                "items": [{
+                    "roomId": "did:key:z6MkRoom", "host": "did:example:community",
+                    "label": "Board pack", "description": "Papers for the board's meetings.",
+                    "visibility": "attributed", "actions": ["read"],
+                    "validUntil": "2027-10-01T00:00:00Z", "offeredAt": "2026-10-14T10:00:00Z",
+                    "state": "open",
+                    "credentials": { "invitation": "{}", "membership": "{}", "authority": "{}" },
+                }],
+                "renewals": [{
+                    "roomId": "did:key:z6MkRoom", "host": "did:example:community",
+                    "label": "Board pack", "visibility": "attributed", "actions": ["read"],
+                    "validUntil": "2027-11-10T00:00:00Z", "renewsAt": "2026-11-10T00:00:00Z",
+                    "issuedAt": "2026-10-20T09:00:00Z",
+                    "credentials": { "membership": "{}", "authority": "{}" },
+                }],
+            })
+        ),
+        checked!(
+            s::rooms::memberships::list::v0_1::Payload,
+            s::rooms::memberships::list::v0_1::Response,
+            json!({ "limit": 10 }),
+            json!({ "items": [{
+                "roomId": "did:key:z6MkRoom", "host": "did:example:community",
+                "label": "Board pack", "visibility": "attributed", "actions": ["read"],
+                "validUntil": "2027-10-01T00:00:00Z", "state": "admitted",
+                "offeredAt": "2026-10-14T10:00:00Z", "admittedAt": "2026-10-14T11:00:00Z",
+                "repeatAcceptUntil": "2026-10-21T11:00:00Z",
+            }] })
+        ),
+        checked!(
+            s::rooms::offers::accept::v0_1::Payload,
+            s::rooms::offers::accept::v0_1::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "keyPackage": "AAEAAgADAAQ" }),
+            json!({ "roomId": "did:key:z6MkRoom", "state": "admitted", "epoch": 2, "welcome": "AAEAAgADAAQ" })
+        ),
+        // ─── storage configs (`storage_tasks`) ───────────────────────
+        checked!(
+            s::storage::configs::list::v0_2::Payload,
+            s::storage::configs::list::v0_2::Response,
+            json!({ "kind": "s3", "limit": 10 }),
+            json!({
+                "items": [{ "config": sample_storage_config_v2(), "facts": sample_storage_facts_v2() }],
+            })
+        ),
+        checked!(
+            s::storage::configs::get::v0_2::Payload,
+            s::storage::configs::get::v0_2::Response,
+            json!({ "configId": "eu-s3-instance" }),
+            json!({
+                "config": sample_storage_config_v2(),
+                "facts": {
+                    "rooms": 2, "files": 5, "bytes": 4096, "pendingDeleteBytes": 0,
+                    "credential": { "status": "ambient", "roomsHoldingCredentials": 1 },
+                    "health": {},
+                },
+                "assignedRooms": ["did:key:z6MkRoom"],
+                "assignedRoomsTruncated": false,
+            })
+        ),
+        checked!(
+            s::storage::configs::create::v0_3::Payload,
+            s::storage::configs::create::v0_3::Response,
+            json!({
+                "id": "eu-s3-instance",
+                "label": "EU — S3 (instance role)",
+                "settings": { "kind": "s3", "region": "eu-west-1", "bucket": "northwind-rooms-eu" },
+                "auth": { "mode": "ambient", "roleArn": "arn:aws:iam::123456789012:role/northwind-rooms-writer" },
+                "reason": "the community runs in the bucket's account",
+            }),
+            json!({ "config": sample_storage_config_v2() })
+        ),
+        checked!(
+            s::storage::configs::update::v0_3::Payload,
+            s::storage::configs::update::v0_3::Response,
+            json!({ "configId": "eu-s3-instance", "auth": { "mode": "sealed" }, "reason": "x" }),
+            json!({ "config": sample_storage_config_v2() })
+        ),
+        checked!(
+            s::storage::credentials::set::v0_3::Payload,
+            s::storage::credentials::set::v0_3::Response,
+            json!({
+                "configId": "r2-archive",
+                "sealed": format!("-----BEGIN VTA SEALED BUNDLE-----\n{}\n-----END VTA SEALED BUNDLE-----", "A".repeat(64)),
+                "digestMultibase": "zQmRq2ZwqJ3vWJrK1v8R8oPqWXhD4nVb1JmT9pV6uYh3aBc",
+                "reason": "evaluation only",
+            }),
+            json!({
+                "configId": "r2-archive",
+                "credentialState": {
+                    "status": "sealed",
+                    "fingerprint": "zQmT5NvUtoM5nWFfrQdVrFtvGfKFmG7AHE8P34isapyhCxX",
+                    "setAt": "2026-10-10T10:30:00Z",
+                },
+                "probeOk": true,
+            })
+        ),
+        checked!(
+            s::storage::credentials::recipient::v0_1::Payload,
+            s::storage::credentials::recipient::v0_1::Response,
+            json!({}),
+            json!({
+                "communityDid": "did:webs:vtc.example.com:EAbcAid",
+                "verificationMethod": "did:webs:vtc.example.com:EAbcAid#DKey",
+                "recipientKey": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+            })
+        ),
+        checked!(
+            s::storage::configs::retire::v0_3::Payload,
+            s::storage::configs::retire::v0_3::Response,
+            json!({ "configId": "local", "reason": "moving to object storage" }),
+            json!({ "configId": "local", "state": "draining", "blobsRemaining": 3 })
+        ),
+        checked!(
+            s::storage::configs::probe::v0_1::Payload,
+            s::storage::configs::probe::v0_1::Response,
+            json!({ "configId": "local" }),
+            json!({
+                "configId": "local",
+                "ok": false,
+                "probedAt": "2026-10-12T10:00:00Z",
+                "prefix": vti_common::blob_store::PROBE_PREFIX,
+                "steps": [
+                    { "step": "authenticate", "ok": true, "durationMs": 0 },
+                    { "step": "put", "ok": false, "durationMs": 3, "error": "permission denied" },
+                ],
+            })
+        ),
+        checked!(
+            s::rooms::storage::assign::v0_2::Payload,
+            s::rooms::storage::assign::v0_2::Response,
+            json!({ "roomId": "did:key:z6MkRoom", "configId": "eu", "reason": "EU residency" }),
+            json!({
+                "roomId": "did:key:z6MkRoom",
+                "configId": "eu",
+                "previousConfigId": "local",
+                "blobsOnEarlierConfigs": 2,
+            })
+        ),
+        checked!(
+            s::rooms::storage::migrate::v0_3::Payload,
+            s::rooms::storage::migrate::v0_3::Response,
+            json!({
+                "roomId": "did:key:z6MkRoom",
+                "maxBytesPerSecond": 1_048_576,
+                "reason": "retiring local",
+            }),
+            crate::rooms::migration::response_json(&sample_paused_migration())
+        ),
+        // ─── admin ───────────────────────────────────────────────────
+        checked!(
+            s::admin::bootstrap::v0_1::Payload,
+            s::admin::bootstrap::v0_1::Response,
+            // `BootstrapRequest` — install/ops/bootstrap.rs. Sent
+            // `setup_session_token` until it gained `rename_all`, so a
+            // conforming client's body failed as a missing required field —
+            // and `claim/finish` had been handing that client a
+            // `setupSessionToken` to send.
+            json!({ "setupSessionToken": "eyJhbGciOiJFZERTQSJ9.e30.sig" }),
+            json!({ "adminDid": OTHER_DID, "eventId": REQUEST_ID })
+        ),
+        checked!(
+            s::admin::invites::create::v0_2::Payload,
+            s::admin::invites::create::v0_2::Response,
+            // `CreateInviteRequest` — install/ops/invites.rs: a wallet
+            // invitation names `did`; a passkey invitation omits it (that
+            // shape is held by `single_admin_mode.rs`'s `assert_conforms`).
+            json!({ "did": OTHER_DID, "ttlSeconds": 3600, "label": "ops laptop invite" }),
+            // `CreateInviteResponse` — install/ops/invites.rs.
+            json!({
+                "jti": REQUEST_ID,
+                "kind": "wallet",
+                "installUrl": "https://vtc.example.org/admin/install?token=eyJ0.e30.s",
+                "claimCode": "K7QW-3M2X-9PLD",
+                "expiresAt": TS,
+                "aclEntryCreated": true,
+            })
+        ),
+        checked!(
+            s::admin::invites::list::v0_2::Payload,
+            s::admin::invites::list::v0_2::Response,
+            // The payload has no required member.
+            json!({}),
+            // `ListInvitesResponse` / `InviteSummary` — install/ops/invites.rs.
+            json!({
+                "invites": [
+                    { "jti": REQUEST_ID, "kind": "passkey", "status": "issued",
+                      "expiresAt": TS },
+                    { "jti": "8b7a6c5d-1e2f-4a3b-9c8d-7e6f5a4b3c2d", "kind": "wallet",
+                      "status": "consumed", "targetDid": DID, "consumedAt": TS },
+                ]
+            })
+        ),
+        checked!(
+            s::admin::invites::revoke::v0_1::Payload,
+            s::admin::invites::revoke::v0_1::Response,
+            // The REST route carries `jti` in the path and ignores the body,
+            // so the canonical payload is consumable as-is.
+            json!({ "jti": REQUEST_ID }),
+            // `RevokeInviteResponse` — install/ops/invites.rs.
+            json!({ "jti": REQUEST_ID })
+        ),
+        // ─── auth ────────────────────────────────────────────────────
+        checked!(
+            s::auth::admin_session::v0_2::Payload,
+            s::auth::admin_session::v0_2::Response,
+            json!({ "accessToken": "eyJhbGciOiJFZERTQSJ9.e30.sig" }),
+            // `AdminSessionResponse` — the handler returned 204 and nothing
+            // else until #1059. The cookies remain; the body is what makes
+            // the route usable by anything that is not a browser.
+            json!({ "sessionId": REQUEST_ID, "expiresAt": TS })
+        ),
+        checked!(
+            s::auth::recognise::challenge::v0_2::Payload,
+            s::auth::recognise::challenge::v0_2::Response,
+            json!({}),
+            // `RecogniseChallengeResponse` — recognition/recognise.rs. `expiresAt`
+            // is an RFC 3339 date-time from 0.2 (0.1 typed it Unix seconds).
+            json!({ "nonce": "b7c1e0a94f2d4e8ab5c36f01d9e27a3c", "expiresAt": TS })
+        ),
+        checked!(
+            s::auth::recognise::v0_3::Payload,
+            s::auth::recognise::v0_3::Response,
+            // `RecogniseRequest` — recognition/recognise.rs.
+            json!({ "presentation": { "type": ["VerifiablePresentation"], "nonce": "b7c1e0" } }),
+            // `RecogniseResponse` — recognition/recognise.rs.
+            json!({
+                "sessionId": "xc-6f2b1a7c-9d3e-4c58-b0a1-2e7d4f6a8b9c",
+                "data": {
+                    "accessToken": "eyJhbGciOiJFZERTQSJ9.e30.sig",
+                    "accessExpiresAt": TS,
+                    "foreignIssuerDid": "did:web:peer.example",
+                    "mappedRole": "member",
+                },
+            })
+        ),
+        // ─── backup ──────────────────────────────────────────────────
+        checked!(
+            s::backup::export::v0_1::Payload,
+            s::backup::export::v0_1::Response,
+            // What `handle_backup_export` (trust_tasks/mod.rs) parses.
+            json!({ "password": "correct-horse-battery-staple", "includeAudit": true }),
+            // `ExportResponse` (backup/ops.rs), what `export_inner` answers
+            // with — the envelope was returned bare until #1059.
+            json!({ "envelope": backup_envelope() })
+        ),
+        // ─── ceremonies ──────────────────────────────────────────────
+        checked!(
+            s::ceremonies::list::v0_1::Payload,
+            s::ceremonies::list::v0_1::Response,
+            json!({}),
+            // `CeremonyListResponse` — a top-level array until #1094
+            // (ceremony/listing.rs).
+            json!({ "ceremonies": [{
+                "purpose": "directory",
+                "pkg": "vtc.directory",
+                "nature": "read-only",
+                "label": "Directory",
+                "wired": "live",
+                "blurb": "A member views another member's record.",
+                "fields": [],
+                "factsTemplate": { "purpose": "directory" },
+            }] })
+        ),
+        // ─── community ───────────────────────────────────────────────
+        checked!(
+            s::community::profile::show::v0_1::Payload,
+            s::community::profile::show::v0_1::Response,
+            json!({}),
+            // `CommunityProfileResponse` — nested as of #1094, with
+            // `registryStatus` inside the profile where the canonical
+            // component defines it (community/ops/profile.rs).
+            {
+                let mut v = community_profile();
+                v.as_object_mut()
+                    .expect("object")
+                    .insert("registryStatus".into(), json!("active"));
+                json!({ "profile": v })
+            }
+        ),
+        checked!(
+            s::community::profile::update::v0_1::Payload,
+            s::community::profile::update::v0_1::Response,
+            // `CommunityProfileUpdate` — community/profile.rs:144.
+            json!({
+                "name": "Example Community",
+                "description": "A demo community.",
+                "logoUrl": "https://community.example/logo.png",
+                "publicUrl": "https://community.example",
+                "contactEmail": "ops@community.example",
+                "language": "en",
+                "relationshipIdentifierDefault": "pairwise",
+                "extensions": { "tier": "gold" },
+            }),
+            // `UpdateProfileResponse` — community/ops/profile.rs.
+            json!({ "profile": community_profile(), "fieldsChanged": ["name", "logoUrl"] })
+        ),
+        // ─── config ──────────────────────────────────────────────────
+        checked!(
+            s::config::did_hosting::list::v0_1::Payload,
+            s::config::did_hosting::list::v0_1::Response,
+            json!({}),
+            json!({ "servers": [{ "id": "hosting-eu", "did": "did:webvh:QmHost:hosting.example.com", "label": "EU hosting" }] })
+        ),
+        checked!(
+            s::config::export::v0_1::Payload,
+            s::config::export::v0_1::Response,
+            json!({}),
+            // `ExportResponse` / `ConfigExportDocument` —
+            // community/ops/config.rs / :460.
+            json!({
+                "document": {
+                    "schemaVersion": 1,
+                    "exportedAt": TS,
+                    "communityProfile": community_profile(),
+                    "configOverrides": { "log.level": "debug", "server.port": 8200 },
+                }
+            })
+        ),
+        checked!(
+            s::config::import::v0_1::Payload,
+            s::config::import::v0_1::Response,
+            // `ImportRequest` — community/ops/config.rs. The document is
+            // whatever `export` handed back, so it carries the same extra
+            // member.
+            json!({
+                "document": {
+                    "schemaVersion": 1,
+                    "exportedAt": TS,
+                    "communityProfile": community_profile(),
+                    "configOverrides": { "log.level": "warn" },
+                },
+                "confirm": true,
+            }),
+            // `ImportResponse` — community/ops/config.rs.
+            json!({
+                "status": "imported",
+                "profileChanges": [{ "key": "name", "oldValue": "Old", "newValue": "New" }],
+                "overrideChanges": [{ "key": "log.level", "newValue": "warn" }],
+                "pendingRestart": ["server.port"],
+                "rejected": [{ "key": "bogus.key", "reason": "unknown config key" }],
+            })
+        ),
+        // ─── directory ───────────────────────────────────────────────
+        checked!(
+            s::directory::query::v0_1::Payload,
+            s::directory::query::v0_1::Response,
+            // `subject` is the path segment and `fields` the query string
+            // (routes/directory.rs:65,93); both are consumable in the body.
+            json!({ "subject": DID, "fields": "did,role,joinedAt" }),
+            // Answered through the directory projection
+            // (`directory::read::query_by_did`), keyed by field.
+            json!({
+                "subject": DID,
+                "fields": { "did": DID, "role": "member", "joinedAt": "2026-08-23" },
+            })
+        ),
+        checked!(
+            s::directory::fields::list::v0_1::Payload,
+            s::directory::fields::list::v0_1::Response,
+            json!({ "includeRetired": true }),
+            json!({
+                "fields": [directory_field()],
+                "listingDefaults": { "defaultListing": "listed" },
+            })
+        ),
+        checked!(
+            s::directory::fields::define::v0_1::Payload,
+            s::directory::fields::define::v0_1::Response,
+            json!({
+                "field": {
+                    "key": "org.example.chapter", "label": "Chapter", "type": "enum",
+                    "source": "admin", "ceiling": "members", "defaultVisibility": "members",
+                    "facet": true, "order": 40,
+                    "constraints": { "options": [{ "value": "sydney", "label": "Sydney" }] },
+                },
+                "reason": "Members asked to find their chapter.",
+            }),
+            json!({ "field": directory_field() })
+        ),
+        checked!(
+            s::directory::fields::update::v0_1::Payload,
+            s::directory::fields::update::v0_1::Response,
+            json!({ "key": "bio", "ceiling": "members", "enabled": true, "reason": "narrow" }),
+            json!({ "field": directory_field() })
+        ),
+        checked!(
+            s::directory::fields::retire::v0_1::Payload,
+            s::directory::fields::retire::v0_1::Response,
+            json!({ "key": "org.example.chapter", "reason": "No longer collected." }),
+            json!({ "field": {
+                "key": "org.example.chapter", "label": "Chapter", "type": "text",
+                "source": "member", "base": false, "required": false, "ceiling": "members",
+                "defaultVisibility": "members", "searchable": false, "facet": false,
+                "order": 40, "state": "retired", "retiredAt": TS, "purgeAfter": TS,
+            }})
+        ),
+        checked!(
+            s::directory::card::show::v0_1::Payload,
+            s::directory::card::show::v0_1::Response,
+            json!({}),
+            json!({ "card": directory_card(), "missingRequired": ["displayName"] })
+        ),
+        checked!(
+            s::directory::card::update::v0_1::Payload,
+            s::directory::card::update::v0_1::Response,
+            json!({
+                "values": { "displayName": "Carol", "bio": null },
+                "visibility": { "displayName": "members", "pronouns": null },
+                "discoverability": { "listing": "findable", "search": "exactNickname", "external": false },
+                "introductions": "groups",
+                "groupAudience": null,
+                "expectedRevision": 3,
+            }),
+            json!({ "card": directory_card(), "missingRequired": [] })
+        ),
+        checked!(
+            s::directory::card::assert::v0_1::Payload,
+            s::directory::card::assert::v0_1::Response,
+            json!({
+                "entryId": DIRECTORY_ENTRY,
+                "values": { "org.example.chapter": "sydney" },
+                "reason": "Moved to the Sydney chapter.",
+            }),
+            json!({ "entryId": DIRECTORY_ENTRY, "written": ["org.example.chapter"], "revision": 5 })
+        ),
+        checked!(
+            s::directory::entries::list::v0_2::Payload,
+            s::directory::entries::list::v0_2::Response,
+            json!({
+                "query": "caro",
+                "filters": [{ "field": "org.example.chapter", "values": ["sydney"] }],
+                "limit": 25,
+            }),
+            json!({
+                "items": [{
+                    "entryId": DIRECTORY_ENTRY,
+                    "fields": { "displayName": "Carol", "role": "member" },
+                    "connected": true,
+                }],
+                "facets": [{ "field": "org.example.chapter", "values": [
+                    { "value": "sydney", "count": 12 },
+                    { "value": "berlin", "fewerThan": 5 },
+                ]}],
+            })
+        ),
+        checked!(
+            s::directory::entries::show::v0_1::Payload,
+            s::directory::entries::show::v0_1::Response,
+            json!({ "entryId": DIRECTORY_ENTRY }),
+            json!({ "entry": {
+                "entryId": DIRECTORY_ENTRY,
+                "fields": { "displayName": "Carol", "role": "member", "did": DID },
+            }})
+        ),
+        // ─── endorsement-types ───────────────────────────────────────
+        checked!(
+            s::endorsement_types::register::v0_1::Payload,
+            s::endorsement_types::register::v0_1::Response,
+            // `RegisterBody` — endorsement_types/ops.rs.
+            json!({
+                "typeUri": "https://skills.example.com/v1/rust",
+                "claimSchema": { "type": "object" },
+                "description": "Rust proficiency",
+            }),
+            // `RegisterResponse` — the row was returned bare until #1059.
+            json!({ "endorsementType": endorsement_type() })
+        ),
+        checked!(
+            s::endorsement_types::list::v0_2::Payload,
+            s::endorsement_types::list::v0_2::Response,
+            json!({ "cursor": "eyJsYXN0S2V5Ijoi", "limit": 50 }),
+            paginated(json!([endorsement_type()]))
+        ),
+        checked!(
+            s::endorsement_types::delete::v0_1::Payload,
+            s::endorsement_types::delete::v0_1::Response,
+            json!({ "typeUri": "https://skills.example.com/v1/rust" }),
+            // `DeleteResponse` — endorsement_types/ops.rs.
+            json!({ "typeUri": "https://skills.example.com/v1/rust" })
+        ),
+        // ─── endorsements ────────────────────────────────────────────
+        checked!(
+            s::endorsements::issue::v0_1::Payload,
+            s::endorsements::issue::v0_1::Response,
+            // `IssueBody` — endorsements/ops.rs, `typeUri` as of #1096.
+            json!({
+                "subjectDid": DID,
+                "typeUri": "https://skills.example.com/v1/rust",
+                "claim": { "level": "expert" },
+                "validitySeconds": 2_592_000_u64,
+            }),
+            // `issue` is the one route that holds the credential and the
+            // expiry it just computed; a read sends neither.
+            serde_json::to_value(crate::endorsements::ops::IssueResponse {
+                endorsement: endorsement_row(crate::endorsements::ops::CredentialReference {
+                    credential_id: VEC_ID.into(),
+                    issued_at: Some(TS.parse().expect("fixture timestamp")),
+                    expires_at: Some(TS.parse().expect("fixture timestamp")),
+                }),
+                credential: credential(),
+            })
+            .expect("IssueResponse serialises")
+        ),
+        checked!(
+            s::endorsements::list::v0_2::Payload,
+            s::endorsements::list::v0_2::Response,
+            json!({ "subjectDid": DID, "typeUri": "https://skills.example.com/v1/rust",
+                    "includeRevoked": true, "cursor": "eyJsYXN0S2V5Ijoi", "limit": 50 }),
+            paginated(json!([endorsement()]))
+        ),
+        checked!(
+            s::endorsements::show::v0_1::Payload,
+            s::endorsements::show::v0_1::Response,
+            json!({ "endorsementId": "11111111-1111-4111-8111-111111111111" }),
+            json!({ "endorsement": endorsement() })
+        ),
+        checked!(
+            s::endorsements::revoke::v0_1::Payload,
+            s::endorsements::revoke::v0_1::Response,
+            json!({ "endorsementId": "11111111-1111-4111-8111-111111111111",
+                    "reason": "issued in error" }),
+            // Serialised from the **real** `RevokeResponse`, not hand-written.
+            //
+            // This entry sat in the drift table describing a `{id}` response
+            // that #1082 had already replaced, because its hand-written
+            // fixture was never updated with the handler. The witness proves
+            // the *fixture* diverges, not the handler, so a stale fixture
+            // keeps a fixed route in the table forever and the count
+            // over-reports. Building the fixture from the type the handler
+            // actually returns closes that gap for this row: change the
+            // struct and this fixture changes with it.
+            serde_json::to_value(crate::endorsements::ops::RevokeResponse {
+                endorsement_id: "11111111-1111-4111-8111-111111111111".into(),
+                revocation: crate::endorsements::ops::RevocationDetail {
+                    credential_id: "urn:uuid:22222222-2222-4222-8222-222222222222".into(),
+                    revoked_at: "2026-08-23T09:00:00Z".into(),
+                },
+                status_list_index: 7,
+            })
+            .expect("RevokeResponse serialises")
+        ),
+        // ─── install ─────────────────────────────────────────────────
+        // The passkey install (`install::ops::{claim_start,claim_finish}`,
+        // which build the start response from the generated type).
+        checked!(
+            s::install::claim::passkey::start::v0_1::Payload,
+            s::install::claim::passkey::start::v0_1::Response,
+            json!({ "installToken": "eyJhbGciOiJFZERTQSJ9.e30.sig",
+                    "claimSecret": "K7QW-3M2X-9PLD" }),
+            json!({
+                "registrationId": REQUEST_ID,
+                "options": { "publicKey": {} },
+                "assertionOptions": { "publicKey": {} },
+            })
+        ),
+        checked!(
+            s::install::claim::passkey::finish::v0_1::Payload,
+            s::install::claim::passkey::finish::v0_1::Response,
+            // `ClaimFinishRequest` — install/ops/mod.rs.
+            json!({
+                "installToken": "eyJhbGciOiJFZERTQSJ9.e30.sig",
+                "registrationId": REQUEST_ID,
+                "webauthnResponse": { "id": "AX6nVQ8s", "type": "public-key" },
+                "webauthnAssertion": { "id": "AX6nVQ8s", "type": "public-key" },
+            }),
+            // Built from the generated type by `install_tasks`.
+            json!({
+                "adminDid": "did:key:zDnaerDaTF5BXEavCrfRZEk316dpbLsfPDZ3WJ5hRTPFU2169",
+                "setupSessionToken": "eyJhbGciOiJFZERTQSJ9.e30.sig",
+            })
+        ),
+        // 0.3 — a claim under an existing DID, with a step-up approver
+        // (`step_up_approver::claim_{start,finish}_v0_3`, which build their
+        // bodies from the generated types).
+        checked!(
+            s::install::claim::start::v0_3::Payload,
+            s::install::claim::start::v0_3::Response,
+            json!({ "token": "eyJhbGciOiJFZERTQSJ9.e30.sig", "claimCode": "K7QW3M2X9P" }),
+            json!({
+                "claimId": "clm_1f2e3d4c5b6a79880a1b2c3d4e5f6a7b",
+                "adminDid": OTHER_DID,
+                "challenge": "Q2xhaW1DaGFsbGVuZ2VOb25jZTQ1Njc4OTA",
+                "audience": DID,
+                "expiresAt": TS,
+            })
+        ),
+        checked!(
+            s::install::claim::finish::v0_3::Payload,
+            s::install::claim::finish::v0_3::Response,
+            json!({
+                "claimId": "clm_1f2e3d4c5b6a79880a1b2c3d4e5f6a7b",
+                "approverDid": "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH",
+                "label": "Browser plugin",
+                "statement": { "id": "urn:uuid:3a6c1e0b-9d2f-4b7a-8c15-2e4f6a8b0c01" },
+            }),
+            // Built from the generated type by `install_tasks`.
+            json!({ "adminDid": OTHER_DID, "setupSessionToken": "eyJhbGciOiJFZERTQSJ9.e30.sig" })
+        ),
+        // ─── invitations ─────────────────────────────────────────────
+        checked!(
+            s::invitations::issue::v0_1::Payload,
+            s::invitations::issue::v0_1::Response,
+            // `IssueInvitationBody` — join/invitations.rs.
+            json!({ "subjectDid": DID, "validityDays": 14, "role": "moderator" }),
+            // `IssueInvitationResponse` — join/invitations.rs.
+            json!({ "subjectDid": DID, "validUntil": TS, "vic": credential() })
+        ),
+        checked!(
+            s::invitations::list::v0_1::Payload,
+            s::invitations::list::v0_1::Response,
+            json!({}),
+            // `InvitationListResponse` / `InvitationListItem` —
+            // join/invitations.rs / :225.
+            json!({
+                "invitations": [{
+                    "id": "urn:uuid:22222222-2222-4222-8222-222222222222",
+                    "subjectDid": DID,
+                    "role": "moderator",
+                    "issuedBy": OTHER_DID,
+                    "issuedAt": TS,
+                    "validUntil": TS,
+                    "revokedAt": TS,
+                }]
+            })
+        ),
+        checked!(
+            s::invitations::revoke::v0_1::Payload,
+            s::invitations::revoke::v0_1::Response,
+            json!({ "id": "urn:uuid:22222222-2222-4222-8222-222222222222" }),
+            // `RevokeResponse` — join/invitations.rs.
+            json!({ "id": "urn:uuid:22222222-2222-4222-8222-222222222222",
+                    "revokedAt": TS, "newlyRevoked": true })
+        ),
+        checked!(
+            s::invitations::deliver::v0_1::Payload,
+            s::invitations::deliver::v0_1::Response,
+            // `deliver` takes and returns the generated types themselves
+            // (join/invitations.rs); the response is the `offer` channel's.
+            json!({ "id": "urn:uuid:22222222-2222-4222-8222-222222222222", "channel": "offer" }),
+            json!({
+                "id": "urn:uuid:22222222-2222-4222-8222-222222222222",
+                "channel": "offer",
+                "offer": {
+                    "credential_issuer": DID,
+                    "credential_configuration_ids": ["VIC"],
+                    "grants": { "urn:ietf:params:oauth:grant-type:pre-authorized_code":
+                                { "pre-authorized_code": "pac_0123" } },
+                },
+                "expiresAt": TS,
+            })
+        ),
+        // ─── join-requests ───────────────────────────────────────────
+        checked!(
+            s::join_requests::list::v0_2::Payload,
+            s::join_requests::list::v0_2::Response,
+            json!({ "status": "pending", "cursor": "eyJsYXN0S2V5Ijoi", "limit": 25 }),
+            paginated(json!([join_request()]))
+        ),
+        checked!(
+            s::join_requests::show::v0_1::Payload,
+            s::join_requests::show::v0_1::Response,
+            json!({ "id": REQUEST_ID }),
+            json!({ "request": join_request() })
+        ),
+        checked!(
+            s::join_requests::decide::v0_1::Payload,
+            s::join_requests::decide::v0_1::Response,
+            // `DecideBody` — join/ops/decide.rs; `id` is the
+            // path segment and is consumable in the body.
+            json!({ "id": REQUEST_ID, "decision": "approved", "reason": "verified out of band" }),
+            // `DecideResponse` — join/ops/decide.rs. The
+            // approve arm populates both credentials; the reject arm omits
+            // them and DOES conform, which is exactly why the witness has to
+            // carry the approve arm.
+            json!({ "requestId": REQUEST_ID, "status": "approved",
+                    "vmc": credential(), "roleVac": credential() })
+        ),
+        checked!(
+            s::join_requests::submit::v0_3::Payload,
+            s::join_requests::submit::v0_3::Response,
+            // From the SDK producer type, with `extensions` left at its
+            // `Default` — the shape a minimal client actually sends — naming
+            // the criterion it applies under.
+            to_v(jr::JoinRequestSubmitBody {
+                vp: json!({ "type": ["VerifiablePresentation"] }),
+                criterion: Some("zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw".into()),
+                registry_consent: true,
+                extensions: Value::Null,
+                attributes: Vec::new(),
+            }),
+            // The ceremony verdict envelope
+            // (docs/05-design-notes/vtc-ceremony-protocol.md §3), from the
+            // SDK type the dispatcher returns (trust_tasks/mod.rs:218).
+            to_v(jr::VerdictResponse::refer(
+                uuid(),
+                "admin-review",
+                "queued for an admin decision (approve/reject)",
+            ))
+        ),
+        checked!(
+            s::join_requests::supplement::v0_1::Payload,
+            s::join_requests::supplement::v0_1::Response,
+            // `vp` is the only required member; the id-less form is what an
+            // applicant who lost their submit response has.
+            json!({ "vp": { "type": ["VerifiablePresentation"] } }),
+            // Projected through the SDK type the handler actually returns
+            // (trust_tasks/mod.rs, `outcome_to_verdict` → `verdict_response`)
+            // — the same one `submit` returns, which is the point: a
+            // supplement's response IS a submission's response. `requestMore`
+            // is the arm worth witnessing, because the community is entitled
+            // to still not be satisfied by the new evidence.
+            to_v(jr::VerdictResponse {
+                request_id: uuid(),
+                verdict: jr::Verdict {
+                    effect: jr::VerdictEffect::RequestMore,
+                    with: jr::VerdictWith {
+                        needs: vec!["agreed:code-of-conduct".into()],
+                        presentation_definition: Some(json!({
+                            "id": "pd-1",
+                            "input_descriptors": []
+                        })),
+                        ..Default::default()
+                    },
+                },
+            })
+        ),
+        checked!(
+            s::join_requests::withdraw::v0_1::Payload,
+            s::join_requests::withdraw::v0_1::Response,
+            // Both members are optional — the id-less form is the common case
+            // (trust_tasks/mod.rs:1159) — so the witness carries the populated
+            // one, which is the only shape with anything to check.
+            json!({ "requestId": REQUEST_ID, "reason": "joining a different community instead" }),
+            // Projected through the same generated builder the handler returns
+            // through (trust_tasks/mod.rs:1186), not transcribed.
+            to_v({
+                let r: s::join_requests::withdraw::v0_1::Response =
+                    s::join_requests::withdraw::v0_1::Response::builder()
+                        .request_id(REQUEST_ID.to_string())
+                        .status(s::join_requests::withdraw::v0_1::ResponseStatus::Withdrawn)
+                        .try_into()
+                        .expect("the withdraw response satisfies its own schema");
+                r
+            })
+        ),
+        checked!(
+            s::join_requests::wallet_session::start::v0_1::Payload,
+            s::join_requests::wallet_session::start::v0_1::Response,
+            json!({
+                "criterion": "zQmaf3wtkysZWg8vCzdetBwzjiHACZz8JAxTVr4W66chiXV",
+                "requestId": REQUEST_ID,
+                "clientIdPrefix": "decentralized_identifier"
+            }),
+            // The members `wallet_session_tasks::handle_start` sets through the
+            // generated builder.
+            json!({
+                "sessionId": "q7Xw2LmN9pRt4VbK8sYc3Hd6aBcDeFgH",
+                "walletUri": "swiyu-verify://?client_id=decentralized_identifier%3Adid%3Awebvh%3AQm%3Averifier.example&request_uri=https%3A%2F%2Fcommunity.example%2Fv1%2Foid4vp%2Frequest%2Fq7Xw2LmN9pRt4VbK8sYc3Hd6aBcDeFgH",
+                "clientId": "decentralized_identifier:did:webvh:Qm:verifier.example",
+                "dcqlQuery": { "credentials": [{
+                    "id": "residence",
+                    "format": "dc+sd-jwt",
+                    "meta": { "vct_values": ["https://example.org/credentials/residence-permit"] }
+                }]},
+                "expiresAt": TS
+            })
+        ),
+        checked!(
+            s::join_requests::wallet_session::status::v0_1::Payload,
+            s::join_requests::wallet_session::status::v0_1::Response,
+            json!({ "sessionId": "q7Xw2LmN9pRt4VbK8sYc3Hd6aBcDeFgH" }),
+            // A presented session, with every member the handler can set.
+            json!({
+                "sessionId": "q7Xw2LmN9pRt4VbK8sYc3Hd6aBcDeFgH",
+                "state": "presented",
+                "expiresAt": TS,
+                "requestId": REQUEST_ID,
+                "evidence": {
+                    "satisfied": true,
+                    "holder": "did:key:zDnaerDaTF5BXEavCrfRZEk316dpbLsfPDZ3WJ5hRTPFU2169",
+                    "credentials": [{
+                        "credentialQueryId": "residence",
+                        "format": "dc+sd-jwt",
+                        "issuer": OTHER_DID,
+                        "vct": "https://example.org/credentials/residence-permit"
+                    }],
+                    "heldUntil": TS
+                }
+            })
+        ),
+        checked!(
+            s::join_requests::status::v0_1::Payload,
+            s::join_requests::status::v0_1::Response,
+            // The id-less poll: `requestId` is `Option` and omitted
+            // (vta-sdk/src/protocols/join_requests.rs:164), asking for an
+            // approved request's credentials again (tf#709). The response
+            // members that ask adds are witnessed apart, in
+            // `status_credential_delivery_speaks_its_published_schema`, since
+            // this table holds one witness per URI.
+            to_v(jr::JoinRequestStatusBody {
+                request_id: None,
+                resend_credentials: true,
+            }),
+            // The rejected projection — the only one that carries the three
+            // members #1058 added (join/ops/status.rs).
+            to_v(jr::JoinRequestStatusResponseBody {
+                request_id: uuid(),
+                status: "rejected".into(),
+                needs: vec![],
+                presentation_definition: None,
+                code: Some(jr::ADMIN_REJECT_CODE.into()),
+                reason: Some("insufficient evidence".into()),
+                decided_at: Some(
+                    chrono::DateTime::parse_from_rfc3339(TS)
+                        .expect("fixture ts")
+                        .with_timezone(&chrono::Utc),
+                ),
+                credentials_delivered: None,
+                credential_resend: None,
+                retry_after: None,
+            })
+        ),
+        // ─── members ─────────────────────────────────────────────────
+        checked!(
+            s::members::admin_remove::v0_1::Payload,
+            s::members::admin_remove::v0_1::Response,
+            // `RemoveBody` — members/ops/remove.rs; `did` is the path
+            // segment and is consumable in the body.
+            json!({ "did": DID, "disposition": "purge", "reason": "ToS violation" }),
+            // `RemoveResponse` — members/ops/remove.rs.
+            json!({ "did": DID, "disposition": "purge", "removed": true })
+        ),
+        checked!(
+            s::members::list::v0_2::Payload,
+            s::members::list::v0_2::Response,
+            json!({ "role": "member", "cursor": "eyJsYXN0S2V5Ijoi", "limit": 50 }),
+            paginated(json!([member_response()]))
+        ),
+        checked!(
+            s::members::show::v0_1::Payload,
+            s::members::show::v0_1::Response,
+            json!({ "did": DID }),
+            json!({ "member": member_response() })
+        ),
+        checked!(
+            s::members::credentials::v0_1::Payload,
+            s::members::credentials::v0_1::Response,
+            // The payload names the member; over REST it rides the path
+            // segment of `GET /v1/members/{did}/credentials`.
+            json!({ "did": DID }),
+            // Projected through the handler's own `credentials_response` from a
+            // row built by the real issuance and receipt methods — every
+            // optional document present, so the witness covers the widest
+            // shape the route sends.
+            member_credentials_response()
+        ),
+        checked!(
+            s::members::admit::v0_1::Payload,
+            s::members::admit::v0_1::Response,
+            json!({
+                "subject": DID,
+                "role": "moderator",
+                "label": "Ada",
+                "reason": "the founding moderator"
+            }),
+            // Built by the handler's own projection from a completed admission.
+            to_v(
+                crate::trust_tasks::admission_tasks::admit_response(admitted(Some("Ada")))
+                    .expect("a completed admission projects")
+            )
+        ),
+        checked!(
+            s::members::role::set::v0_1::Payload,
+            s::members::role::set::v0_1::Response,
+            json!({
+                "subject": DID,
+                "fromRole": "member",
+                "toRole": "moderator",
+                "reason": "runs the events programme"
+            }),
+            // The handler's own projection of a completed move.
+            crate::trust_tasks::member_role_tasks::role_set_response(
+                &role_set_entry(),
+                &crate::acl::VtcRole::Member,
+                &crate::acl::VtcRole::Moderator,
+                true,
+                Some("policyAllowed"),
+                Some(json!({ "type": ["VerifiableCredential"] })),
+            )
+            .expect("a completed move projects")
+        ),
+        checked!(
+            s::members::make_membership::v0_1::Payload,
+            s::members::make_membership::v0_1::Response,
+            json!({ "subject": DID, "reason": "the founder is a member too" }),
+            to_v(
+                crate::trust_tasks::admission_tasks::make_response(admitted(None))
+                    .expect("a completed admission projects")
+            )
+        ),
+        checked!(
+            s::members::update::v0_1::Payload,
+            s::members::update::v0_1::Response,
+            // `UpdateMemberRequest` — members/ops/update.rs.
+            json!({ "did": DID, "role": "moderator", "label": "Ada Lovelace",
+                    "publishConsent": true, "departurePreference": "historical",
+                    "extensions": { "org": "acme" } }),
+            json!({ "member": member_response() })
+        ),
+        checked!(
+            s::members::purge::v0_1::Payload,
+            s::members::purge::v0_1::Response,
+            json!({ "did": DID }),
+            json!({ "did": DID, "disposition": "purge", "removed": true })
+        ),
+        checked!(
+            s::members::removed::v0_1::Payload,
+            s::members::removed::v0_1::Response,
+            json!({}),
+            // `RemovedMembersResponse` — a top-level array until #1059.
+            json!({ "removed": [
+                { "did": DID, "removedAt": TS, "statusListIndex": 77, "status": "removed" }
+            ] })
+        ),
+        checked!(
+            s::members::renew::v0_1::Payload,
+            s::members::renew::v0_1::Response,
+            json!({}),
+            // `RenewResponse` — members/ops/renew.rs.
+            json!({ "did": DID, "vmc": credential(), "roleVac": credential(),
+                    "personhood": true, "personhoodChanged": false })
+        ),
+        checked!(
+            s::members::rotate_challenge::v0_1::Payload,
+            s::members::rotate_challenge::v0_1::Response,
+            // `ChallengeBody` — members/ops/rotate.rs.
+            json!({ "reason": "deviceLoss" }),
+            // `ChallengeResponse` — members/ops/rotate.rs.
+            json!({
+                "rotationId": REQUEST_ID,
+                "expiresAt": TS,
+                "signingPayloadHex": "7674632d6469642d726f746174696f6e2f763100",
+                "canonicalTemplate": { "rotationId": REQUEST_ID, "oldDid": DID },
+            })
+        ),
+        checked!(
+            s::members::rotate::v0_1::Payload,
+            s::members::rotate::v0_1::Response,
+            // `FinishBody` — members/ops/rotate.rs.
+            json!({ "rotationId": REQUEST_ID, "oldDid": DID, "newDid": OTHER_DID,
+                    "oldSignature": "9a3f", "newSignature": "1c7b" }),
+            // `FinishResponse` — members/ops/rotate.rs.
+            json!({ "newDid": OTHER_DID, "method": "did:key",
+                    "vmc": credential(), "roleVac": credential() })
+        ),
+        checked!(
+            s::members::self_remove::v0_1::Payload,
+            s::members::self_remove::v0_1::Response,
+            // The document form's body (vta-sdk). The REST route's
+            // `RemoveBody` also accepts a `reason`, which it then ignores on
+            // self-remove (members/ops/remove.rs) — unspecced, but
+            // unreachable in any body a conforming client sends.
+            to_v(jr::SelfRemoveBody {
+                disposition: Some("tombstone".into())
+            }),
+            to_v(jr::SelfRemoveReceiptBody {
+                did: DID.into(),
+                disposition: "tombstone".into(),
+                removed: true,
+            })
+        ),
+        checked!(
+            s::members::solicit_vmc::v0_1::Payload,
+            s::members::solicit_vmc::v0_1::Response,
+            // `RequestVmcBody` — members/ops/request_vmc.rs; the DID is
+            // the path segment.
+            json!({ "memberDid": DID, "reason": "annual audit" }),
+            // `RequestVmcResponse` — members/ops/request_vmc.rs.
+            json!({ "memberDid": DID, "requested": true, "threadId": REQUEST_ID })
+        ),
+        checked!(
+            s::members::personhood::challenge::v0_1::Payload,
+            s::members::personhood::challenge::v0_1::Response,
+            json!({ "did": DID }),
+            // `ChallengeResponse` — members/ops/personhood.rs.
+            // The `ext` member carries the spoken match code. The
+            // response schema is `additionalProperties: false`, so this
+            // witness is what proves the code found a conformant home
+            // rather than a new top-level field.
+            json!({ "challengeId": REQUEST_ID, "expiresAt": TS,
+                    "ext": { crate::members::match_code::MATCH_CODE_EXT_KEY: "7F4K-2QX9" } })
+        ),
+        checked!(
+            s::members::personhood::assert::v0_2::Payload,
+            s::members::personhood::assert::v0_2::Response,
+            // The payload the spine's assert handler reads.
+            json!({ "did": DID, "presentation": { "type": ["VerifiablePresentation"] } }),
+            // `AssertResponse` — members/ops/personhood.rs.
+            //
+            // This note used to explain that the DELETE on the same mount
+            // answered under *this* URI with `personhood: false`, and called
+            // the collapse a shared-mount workaround rather than a defect of
+            // this task. That was honest and it was also the problem: the
+            // witness carried the POST, so nothing here ever saw the DELETE,
+            // and a client was told the wrong task for the document it got.
+            // The response-conformance layer saw it on real traffic. #1108
+            // gives each verb its own task; `revoke` is witnessed below.
+            json!({ "did": DID, "personhood": true,
+                    "vmc": credential(), "roleVac": credential() })
+        ),
+        checked!(
+            s::members::personhood::revoke::v0_1::Payload,
+            s::members::personhood::revoke::v0_1::Response,
+            json!({ "did": DID }),
+            // `RevokeResponse` — members/ops/personhood.rs. `vmc` and
+            // `roleVac` are `skip_serializing_if`, so a revoke that re-mints
+            // nothing sends neither; the component makes both optional and
+            // pins `personhood` to `const false`.
+            json!({ "did": DID, "personhood": false })
+        ),
+        checked!(
+            s::members::vmc::v0_1::Payload,
+            s::members::vmc::v0_1::Response,
+            to_v(mem::MemberVmcBody {
+                vc: credential(),
+                request_id: Some(REQUEST_ID.into()),
+            }),
+            to_v(mem::MemberVmcReceiptBody {
+                member_did: DID.into(),
+                vmc_id: "urn:uuid:2f9c1d4e-7a3b-4c5d-8e6f-1a2b3c4d5e6f".into(),
+                status: "stored".into(),
+                request_id: Some(REQUEST_ID.into()),
+            })
+        ),
+        // ─── policies ────────────────────────────────────────────────
+        checked!(
+            s::policies::test::v0_1::Payload,
+            s::policies::test::v0_1::Response,
+            // `TestBody` — policy/ops/admin.rs; `id` is the path
+            // segment and is consumable in the body.
+            json!({ "id": REQUEST_ID, "query": "data.vtc.directory.decision",
+                    "input": { "purpose": "directory" } }),
+            // `TestResponse` — policy/ops/admin.rs.
+            json!({ "id": REQUEST_ID, "purpose": "directory", "sha256": "3b9f0a1c8d2e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3",
+                    "result": { "result": [] } })
+        ),
+        // ─── recognition ─────────────────────────────────────────────
+        checked!(
+            s::recognition::check::v0_1::Payload,
+            s::recognition::check::v0_1::Response,
+            json!({ "did": "did:web:other.example" }),
+            // `RecognitionCheck` — recognition/admin.rs.
+            json!({ "did": "did:web:other.example", "recognised": false,
+                    "registryConfigured": true, "error": "registry unreachable" })
+        ),
+        // ─── registry ────────────────────────────────────────────────
+        checked!(
+            s::registry::diagnostics::v0_1::Payload,
+            s::registry::diagnostics::v0_1::Response,
+            json!({}),
+            // `DiagnosticsResponse` — routes/health.rs:73, camelCase as of #1093.
+            json!({
+                "registryStatus": "active",
+                "queueDepth": 3,
+                "rtbfBatchedCount": 1,
+                "failedCount": 0,
+                "oldestPendingAgeSeconds": 42,
+                "lastSuccessAt": TS,
+                "syncerEnabled": true,
+                "syncerRunning": true,
+                "syncerRestarts": 0,
+                "messagingStatus": "connected",
+                "transports": [{ "protocol": "rest", "advertised": true, "serviceable": true }],
+            })
+        ),
+        // The reconciler's operator surface. These fixtures are transcribed
+        // from what `registry/admin.rs` actually builds, and every
+        // field an operator acts on is present: the member DID in the clear,
+        // the registry's verbatim error, and the attempt count that separates
+        // "answered and refused" from "never answered".
+        checked!(
+            s::registry::sync_jobs::list::v0_2::Payload,
+            s::registry::sync_jobs::list::v0_2::Response,
+            json!({ "state": "failed", "limit": 50 }),
+            // `job_wire` — registry/admin.rs. A failed row carries no
+            // `nextAttemptAt`: it has no schedule, and claiming one would be
+            // the response asserting something untrue.
+            json!({
+                "items": [{
+                    "jobId": "07c6c189-8272-4761-96e9-0ef869380665",
+                    "kind": "publishMember",
+                    "memberDid": "did:web:member.example",
+                    "state": "failed",
+                    "attempts": 1,
+                    "lastError": "registry rejected registry/record/put: unsupportedType",
+                    "createdAt": TS,
+                    "lastAttemptedAt": TS,
+                    "purgeDueAt": TS,
+                }],
+            })
+        ),
+        // `sync_jobs_retry`: a pending job brought forward says so, and an
+        // RTBF-batched one is `held`. Both halves are always present,
+        // including when one is empty: "requeued nothing" and "declined
+        // nothing" are distinct answers and a consumer must not have to
+        // infer either from absence.
+        checked!(
+            s::registry::sync_jobs::retry::v0_2::Payload,
+            s::registry::sync_jobs::retry::v0_2::Response,
+            json!({ "allWaiting": true }),
+            json!({
+                "requeued": [{
+                    "jobId": "07c6c189-8272-4761-96e9-0ef869380665",
+                    "memberDid": "did:web:member.example",
+                    "from": "pending",
+                }],
+                "skipped": [{
+                    "jobId": "1f2e3d4c-5b6a-4798-8765-43210fedcba9",
+                    "reason": "held",
+                }],
+            })
+        ),
+        checked!(
+            s::registry::sync_jobs::discard::v0_1::Payload,
+            s::registry::sync_jobs::discard::v0_1::Response,
+            json!({ "jobId": "07c6c189-8272-4761-96e9-0ef869380665" }),
+            json!({
+                "jobId": "07c6c189-8272-4761-96e9-0ef869380665",
+                "memberDid": "did:web:member.example",
+            })
+        ),
+        checked!(
+            s::registry::records::list::v0_2::Payload,
+            s::registry::records::list::v0_2::Response,
+            json!({ "source": "registry", "limit": 50 }),
+            // `source` is echoed, so a consumer never infers which view it
+            // received from the request it believes it sent.
+            json!({
+                "source": "registry",
+                "items": [{
+                    "entityId": "did:web:member.example",
+                    "authorityId": "did:web:community.example",
+                    "action": "recognise",
+                    "resource": "trust-graph",
+                    "recordType": "recognition",
+                    "recognized": true,
+                }],
+            })
+        ),
+        // ─── relationships ───────────────────────────────────────────
+        checked!(
+            s::relationships::list::v0_3::Payload,
+            s::relationships::list::v0_3::Response,
+            json!({ "did": DID, "cursor": "eyJsYXN0S2V5Ijoi", "limit": 50 }),
+            // This fixture said `vrcSha256` — the `0.1` member — while the
+            // service had already moved to a multibase digest. The table
+            // called the task conformant on that basis for as long as both
+            // were wrong together, which is what a hand-written fixture buys
+            // you. `0.2` (trustoverip/dtgwg-trust-tasks-tf#266) publishes the
+            // multibase form the service sends.
+            paginated(json!([{
+                "id": REQUEST_ID,
+                "issuerDid": DID,
+                "subjectDid": OTHER_DID,
+                "vrcJsonld": credential(),
+                "vrcDigestMultibase": "zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw",
+                "createdAt": TS,
+            }]))
+        ),
+        checked!(
+            s::relationships::graph::v0_2::Payload,
+            s::relationships::graph::v0_2::Response,
+            json!({}),
+            // Serialised from the real graph types. The hand-written version
+            // described `0.1`'s flat edge — one row per credential — which
+            // the service has never emitted: it groups halves by endpoint
+            // pair and says whether the edge is reciprocated. Two wrongs
+            // agreeing is what let this read as conformant.
+            serde_json::to_value(crate::relationships::ops::RelationshipsGraph {
+                nodes: vec![
+                    crate::relationships::ops::GraphNode { did: DID.into() },
+                    crate::relationships::ops::GraphNode {
+                        did: OTHER_DID.into()
+                    },
+                ],
+                edges: vec![crate::relationships::ops::GraphEdge {
+                    endpoints: vec![DID.into(), OTHER_DID.into()],
+                    halves: vec![crate::relationships::ops::GraphHalf {
+                        id: REQUEST_ID.into(),
+                        issuer_did: DID.into(),
+                        subject_did: OTHER_DID.into(),
+                        created_at: TS.into(),
+                        persona_did: None,
+                    }],
+                    complete: false,
+                }],
+            })
+            .expect("RelationshipsGraph serialises")
+        ),
+        checked!(
+            s::relationships::publish::v0_2::Payload,
+            s::relationships::publish::v0_2::Response,
+            // `PublishBody` — the task payload, carried inside a Trust Task
+            // document since #1084. The witness validates payloads, so the
+            // envelope is not represented here: it is the transport this
+            // payload rides in, and the framework validates it separately.
+            json!({
+                "vrc": credential(),
+                "pop": {
+                    "type": "VrcPublishAuthorization",
+                    "documentId": REQUEST_ID,
+                    "vrcDigestMultibase": "zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw",
+                    "proof": { "type": "DataIntegrityProof" },
+                },
+            }),
+            // `PublishResponse`. The response conforms — moving to 0.2 was
+            // what fixed it, since 0.1 asked for a bare-hex `vrcSha256` this
+            // service no longer computes.
+            json!({ "id": REQUEST_ID, "issuerDid": DID, "subjectDid": OTHER_DID,
+                    "vrcDigestMultibase": "zQmbGXRT3v1RmfWkQ7Y3Z5Uj9pKq2NcXhLd8sVtA4eB6nMw" })
+        ),
+        checked!(
+            s::relationships::revoke::v0_2::Payload,
+            s::relationships::revoke::v0_2::Response,
+            // The pairwise route: a `VrcRevokeAuthorization` bound to this
+            // document and to the edge, same shape as `publish/0.2`'s `pop`
+            // above with `relationship` in place of `vrcDigestMultibase`.
+            json!({
+                "id": REQUEST_ID,
+                "pop": {
+                    "type": "VrcRevokeAuthorization",
+                    "documentId": REQUEST_ID,
+                    "relationship": REQUEST_ID,
+                    "proof": { "type": "DataIntegrityProof" },
+                },
+            }),
+            json!({ "id": REQUEST_ID })
+        ),
+        // ─── website ─────────────────────────────────────────────────
+        checked!(
+            s::website::files::list::v0_3::Payload,
+            s::website::files::list::v0_3::Response,
+            json!({ "cursor": "assets/logo.png", "limit": 50 }),
+            // Serialised from the real `ListResponse` / `FileEntry`, per the
+            // `endorsements/revoke` note below — a hand-written fixture is
+            // what let that row describe a shape the handler had stopped
+            // sending.
+            serde_json::to_value(crate::website::ops::files::ListResponse {
+                items: vec![crate::website::ops::files::FileEntry {
+                    path: "index.html".into(),
+                    size: 2048,
+                    etag: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                    updated_at: DateTime::from_timestamp(1_755_946_800, 0)
+                        .expect("fixture timestamp"),
+                }],
+                next_cursor: Some("styles/main.css".into()),
+            })
+            .expect("ListResponse serialises")
+        ),
+        checked!(
+            s::website::files::delete::v0_1::Payload,
+            s::website::files::delete::v0_1::Response,
+            json!({ "path": "assets/old-logo.png" }),
+            // `DeleteResponse` — 200 with zero bytes until #1059.
+            json!({ "path": "assets/old-logo.png", "deleted": true })
+        ),
+        checked!(
+            s::website::generations::list::v0_1::Payload,
+            s::website::generations::list::v0_1::Response,
+            json!({}),
+            // Serialised from the real `GenerationsResponse` / `GenerationRow`.
+            serde_json::to_value(crate::website::ops::generations::GenerationsResponse {
+                generations: vec![crate::website::ops::generations::GenerationRow {
+                    generation: "1".into(),
+                    current: false,
+                    deployed_at: TS.parse().expect("fixture timestamp"),
+                    size_bytes: 1_048_576,
+                }],
+            })
+            .expect("GenerationsResponse serialises")
+        ),
+        checked!(
+            s::website::rollback::v0_1::Payload,
+            s::website::rollback::v0_1::Response,
+            // The generation is a path segment, typed `u32` there and
+            // `string` in the spec — a separate, unfixed mismatch.
+            json!({ "generation": "1" }),
+            // `RollbackResponse` — 200 with zero bytes until #1059, which
+            // discarded a `noop` it had already computed.
+            json!({ "generation": "1", "current": true, "noop": false })
+        ),
+        // `trust_tasks::website_tasks`: the chunked upload, deploy and ranged
+        // reads. Each handler builds its answer with `json!`, so these are the
+        // members it writes; `deploy` answers with `DeployResponse` itself.
+        checked!(
+            s::website::upload::begin::v0_1::Payload,
+            s::website::upload::begin::v0_1::Response,
+            json!({
+                "target": { "kind": "file", "path": "/index.html", "ifMatch": SITE_ETAG },
+                "expectedSha256": SITE_ETAG,
+                "expectedSizeBytes": 1024,
+                "chunks": {
+                    "chunkSize": 262_144,
+                    "chunkCount": 1,
+                    "chunkDigests": ["zQmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"],
+                },
+            }),
+            json!({ "uploadId": REQUEST_ID, "expiresAt": TS })
+        ),
+        checked!(
+            s::website::upload::chunk::v0_1::Payload,
+            s::website::upload::chunk::v0_1::Response,
+            json!({
+                "uploadId": REQUEST_ID,
+                "index": 0,
+                "digestMultibase": "zQmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+                "data": "PGh0bWw-PC9odG1sPg",
+            }),
+            json!({
+                "uploadId": REQUEST_ID,
+                "index": 0,
+                "stored": true,
+                "remainingCount": 0,
+                "expiresAt": TS,
+            })
+        ),
+        checked!(
+            s::website::upload::commit::v0_1::Payload,
+            s::website::upload::commit::v0_1::Response,
+            json!({ "uploadId": REQUEST_ID }),
+            json!({
+                "uploadId": REQUEST_ID,
+                "target": { "kind": "file", "path": "/index.html", "ifMatch": SITE_ETAG },
+                "sha256": SITE_ETAG,
+                "sizeBytes": 1024,
+                "file": { "path": "/index.html", "etag": SITE_ETAG, "sizeBytes": 1024 },
+            })
+        ),
+        checked!(
+            s::website::upload::abort::v0_1::Payload,
+            s::website::upload::abort::v0_1::Response,
+            json!({ "uploadId": REQUEST_ID }),
+            json!({ "uploadId": REQUEST_ID, "aborted": true })
+        ),
+        checked!(
+            s::website::deploy::v0_1::Payload,
+            s::website::deploy::v0_1::Response,
+            json!({ "uploadId": REQUEST_ID }),
+            to_v(crate::website::ops::deploy::DeployResponse {
+                deploy_mode: "managed".into(),
+                bundle_sha256: SITE_ETAG.into(),
+                bundle_size_bytes: 4096,
+                target_generation: 3,
+                pruned_generations: 1,
+            })
+        ),
+        checked!(
+            s::website::files::show::v0_1::Payload,
+            s::website::files::show::v0_1::Response,
+            json!({ "path": "/index.html", "offset": 0, "length": 1024, "ifMatch": SITE_ETAG }),
+            json!({
+                "path": "/index.html",
+                "etag": SITE_ETAG,
+                "sizeBytes": 13,
+                "contentType": "text/html",
+                "offset": 0,
+                "data": "PGh0bWw-PC9odG1sPg",
+                "complete": true,
+            })
+        ),
+        // ─── join manifest 0.4 and peer identity vetting ─────────────
+        //
+        // Every one of these handlers speaks the generated types. The
+        // responses are built the way the handlers build them — through the
+        // generated builders, or the manifest read itself — so a response the
+        // service could not produce cannot stand in for one it does.
+        checked!(
+            s::join_requests::manifest::v0_4::Payload,
+            s::join_requests::manifest::v0_4::Response,
+            json!({}),
+            to_v(
+                // With the directory's disclosure statement the way
+                // `directory::disclosure` generates it from the base schema.
+                crate::join::ops::manifest::response(
+                    COMMUNITY_DID.into(),
+                    vec![crate::schemas::accepts::AcceptsCriterion {
+                        id: "kernel-developer".into(),
+                        admission: crate::schemas::accepts::Admission::Review,
+                        query: Some(dcql_query()),
+                        credential_issuers: Some(
+                            crate::schemas::accepts::CredentialIssuers::Community,
+                        ),
+                        invitation_required: true,
+                        position: 1,
+                        description: Some("Two vetters, one in person".into()),
+                        hidden_vetting: None,
+                        vetting: Some(
+                            serde_json::from_value(json!({
+                                "version": "0.1",
+                                "statementType":
+                                    vta_sdk::protocols::vetting::VETTED_PREDICATE,
+                                "minStatements": 2,
+                                "minByMethod": { "inPerson": 1 },
+                                "acceptedMethods": ["inPerson", "video"],
+                                "eligibleVetters": { "role": "vetter" },
+                                "independence": { "requireConsistentIdentityCommitment": true }
+                            }))
+                            .expect("vetting requirements"),
+                        ),
+                        created_at: chrono::Utc::now(),
+                        created_by_did: DID.into(),
+                    }],
+                    Some(
+                        serde_json::from_value(
+                            json!({ "displayName": "Kernel", "accentColor": "#1a2b3c" }),
+                        )
+                        .expect("branding"),
+                    ),
+                    vec![
+                        serde_json::from_value(json!({
+                            "type": "name.display", "required": true,
+                            "purpose": "So other members know what to call you"
+                        }))
+                        .expect("requested attribute"),
+                    ],
+                    base_disclosure(),
+                )
+                .expect("the manifest projects the criterion"),
+            )
+        ),
+        checked!(
+            s::directory::disclosure::v0_1::Payload,
+            s::directory::disclosure::v0_1::Response,
+            json!({}),
+            json!({ "communityDid": COMMUNITY_DID, "disclosure": base_disclosure() })
+        ),
+        checked!(
+            s::directory::card::present::v0_1::Payload,
+            s::directory::card::present::v0_1::Response,
+            json!({
+                "fields": ["org.example.registration"],
+                "presentation": "eyJhbGciOiJFZERTQSJ9.e30.c2ln~WyJzYWx0IiwicmVnIiwiUkVHLTEiXQ~eyJhbGciOiJFZERTQSIsInR5cCI6ImtiK2p3dCJ9.e30.c2ln",
+            }),
+            json!({
+                "verified": {
+                    "org.example.registration": {
+                        "value": "REG-48213",
+                        "issuer": "did:example:registry",
+                        "credentialType": "ProfessionalRegistration",
+                        "verifiedAt": "2026-10-19T09:00:01Z",
+                        "validUntil": "2027-06-30T00:00:00Z",
+                    }
+                },
+                "revision": 6,
+            })
+        ),
+        checked!(
+            s::groups::create::v0_1::Payload,
+            s::groups::create::v0_1::Response,
+            json!({
+                "name": "Identity WG",
+                "kind": "static",
+                "joinPolicy": "request",
+                "visibility": "members",
+                "showMembers": "groupMembers",
+                "reason": "the working group starts",
+            }),
+            json!({ "group": group_wire() })
+        ),
+        checked!(
+            s::groups::update::v0_1::Payload,
+            s::groups::update::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "showMembers": "admins" }),
+            json!({ "group": group_wire() })
+        ),
+        checked!(
+            s::groups::delete::v0_1::Payload,
+            s::groups::delete::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "reason": "wound up" }),
+            json!({
+                "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA",
+                "state": "deleted",
+                "membersRemoved": 0,
+                "bindingsRemoved": 0,
+            })
+        ),
+        checked!(
+            s::groups::list::v0_2::Payload,
+            s::groups::list::v0_2::Response,
+            json!({ "joinable": true, "limit": 50 }),
+            json!({ "items": [{ "group": group_wire(), "myMembership": "none" }] })
+        ),
+        checked!(
+            s::groups::show::v0_1::Payload,
+            s::groups::show::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA" }),
+            json!({ "group": group_wire(), "myMembership": "member" })
+        ),
+        checked!(
+            s::groups::members::add::v0_1::Payload,
+            s::groups::members::add::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY }),
+            json!({ "member": { "entryId": DIRECTORY_ENTRY, "source": "added", "since": "2026-10-19T09:00:00Z", "state": "active", "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "credentialValidUntil": "2026-11-18T09:00:00Z" }, "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d" })
+        ),
+        checked!(
+            s::groups::members::remove::v0_1::Payload,
+            s::groups::members::remove::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY }),
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY, "state": "removed", "credentialValidUntil": "2026-11-18T09:00:00Z" })
+        ),
+        checked!(
+            s::groups::members::list::v0_2::Payload,
+            s::groups::members::list::v0_2::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "limit": 50 }),
+            json!({ "items": [{ "entryId": DIRECTORY_ENTRY, "source": "added", "since": "2026-10-19T09:00:00Z", "state": "active", "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "credentialValidUntil": "2026-11-18T09:00:00Z" }] })
+        ),
+        checked!(
+            s::groups::join::v0_1::Payload,
+            s::groups::join::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "message": "I work on identity." }),
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "outcome": "requested", "request": { "requestId": "greq_W5k2N8xRb3Qz7TpLAAAAAA", "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY, "message": "I work on identity.", "createdAt": "2026-10-19T09:00:00Z", "state": "pending" }, "credentialId": null })
+        ),
+        checked!(
+            s::groups::leave::v0_1::Payload,
+            s::groups::leave::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA" }),
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "state": "left", "credentialValidUntil": "2026-11-18T09:00:00Z" })
+        ),
+        checked!(
+            s::boards::create::v0_1::Payload,
+            s::boards::create::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"title": "Trust Week Unconference", "description": "Propose a session for Friday. The sessions with the most support fill the twelve slots.", "audience": {"kind": "members"}, "proposals": {"opensAt": "2026-11-02T00:00:00Z", "closesAt": "2026-11-10T00:00:00Z"}, "voting": {"opensAt": "2026-11-09T00:00:00Z", "closesAt": "2026-11-12T09:00:00Z"}, "topics": ["Identity", "Governance", "Voting"], "formats": ["Discussion", "Talk", "Workshop", "Demo"], "maxIdeasPerMember": 3, "selectionRule": "The twelve sessions the most members would attend.", "timetable": [{"slotId": "a-0900", "label": "Room A", "startsAt": "2026-11-13T01:00:00Z", "endsAt": "2026-11-13T02:00:00Z"}], "template": {"questions": [{"key": "attend", "type": "choice", "text": "Would you attend this session?", "options": [{"key": "yes", "label": "Yes, I'd attend"}, {"key": "no", "label": "Not for me"}], "minSelections": 1, "maxSelections": 1, "optional": false}], "secrecy": "open", "revote": "replace", "board": {"visibility": "public", "auditors": []}, "ballotBox": "did:example:ballot-box", "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"board": {"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "title": "Trust Week Unconference", "description": "Propose a session for Friday. The sessions with the most support fill the twelve slots.", "status": "open", "audience": {"kind": "members"}, "proposals": {"opensAt": "2026-11-02T00:00:00Z", "closesAt": "2026-11-10T00:00:00Z"}, "voting": {"opensAt": "2026-11-09T00:00:00Z", "closesAt": "2026-11-12T09:00:00Z"}, "topics": ["Identity", "Governance", "Voting"], "formats": ["Discussion", "Talk", "Workshop", "Demo"], "maxIdeasPerMember": 3, "selectionRule": "The twelve sessions the most members would attend.", "timetable": [{"slotId": "a-0900", "label": "Room A", "startsAt": "2026-11-13T01:00:00Z", "endsAt": "2026-11-13T02:00:00Z"}], "template": {"questions": [{"key": "attend", "type": "choice", "text": "Would you attend this session?", "options": [{"key": "yes", "label": "Yes, I'd attend"}, {"key": "no", "label": "Not for me"}], "minSelections": 1, "maxSelections": 1, "optional": false}], "secrecy": "open", "revote": "replace", "board": {"visibility": "public", "auditors": []}, "ballotBox": "did:example:ballot-box", "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}, "createdAt": "2026-11-01T03:00:00Z", "facilitator": true, "ideaCounts": {}}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::update::v0_1::Payload,
+            s::boards::update::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "status": "closed"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"board": {"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "title": "Trust Week Unconference", "description": "Propose a session for Friday. The sessions with the most support fill the twelve slots.", "status": "closed", "audience": {"kind": "members"}, "proposals": {"opensAt": "2026-11-02T00:00:00Z", "closesAt": "2026-11-10T00:00:00Z"}, "voting": {"opensAt": "2026-11-09T00:00:00Z", "closesAt": "2026-11-12T09:00:00Z"}, "topics": ["Identity", "Governance", "Voting"], "formats": ["Discussion", "Talk", "Workshop", "Demo"], "maxIdeasPerMember": 3, "selectionRule": "The twelve sessions the most members would attend.", "timetable": [{"slotId": "a-0900", "label": "Room A", "startsAt": "2026-11-13T01:00:00Z", "endsAt": "2026-11-13T02:00:00Z"}], "template": {"questions": [{"key": "attend", "type": "choice", "text": "Would you attend this session?", "options": [{"key": "yes", "label": "Yes, I'd attend"}, {"key": "no", "label": "Not for me"}], "minSelections": 1, "maxSelections": 1, "optional": false}], "secrecy": "open", "revote": "replace", "board": {"visibility": "public", "auditors": []}, "ballotBox": "did:example:ballot-box", "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}, "createdAt": "2026-11-01T03:00:00Z", "facilitator": true, "ideaCounts": {"proposed": 2, "open": 4, "selected": 0, "notSelected": 0, "declined": 0, "merged": 0, "withdrawn": 0}}}"#).unwrap()
+        ),
+        #[cfg(feature = "voting")]
+        checked!(
+            s::elections::tombstones::show::v0_1::Payload,
+            s::elections::tombstones::show::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "board.brd_Uc7N2qLm4Rt8Vx1Z.ida_Pk3Wq9Ls2Dn6Hy4B"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "board.brd_Uc7N2qLm4Rt8Vx1Z.ida_Pk3Wq9Ls2Dn6Hy4B", "manifestDigest": "uEiDexampleManifestDigestNotReal000000000000000", "ballotBox": "did:example:ballot-box", "checkpoints": [], "deletedAt": "2026-11-20T09:00:01Z", "removeAt": "2027-11-20T09:00:01Z"}"#).unwrap()
+        ),
+        checked!(
+            s::boards::delete::v0_1::Payload,
+            s::boards::delete::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "reason": "Trust Week is over."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "ideasRemoved": 18, "notesRemoved": 42, "electionsRemoved": 14, "tombstones": {"kept": 14, "removeAt": "2027-11-20T09:00:01Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::facilitators::add::v0_1::Payload,
+            s::boards::facilitators::add::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "entryId": "dir_Q7m2K9xVb4Tz8LpR", "reason": "Carol convenes the security track."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "facilitators": ["dir_Q7m2K9xVb4Tz8LpR"]}"#).unwrap()
+        ),
+        checked!(
+            s::boards::facilitators::remove::v0_1::Payload,
+            s::boards::facilitators::remove::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "entryId": "dir_Q7m2K9xVb4Tz8LpR"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "facilitators": []}"#).unwrap()
+        ),
+        checked!(
+            s::boards::facilitators::list::v0_1::Payload,
+            s::boards::facilitators::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "facilitators": [{"entryId": "dir_Q7m2K9xVb4Tz8LpR", "appointedAt": "2026-11-01T10:00:00Z", "appointedBy": "dir_K3n8P2xWc5Rz9MqT"}, {"entryId": "dir_T4v9L3xZd6Sq2NpW", "appointedAt": "2026-11-02T14:30:00Z", "reviewEndsAt": "2026-11-12T14:30:00Z"}]}"#).unwrap()
+        ),
+        // Member badges (VTI-BDG-*): each task's own request and response examples.
+        checked!(
+            s::badges::awards::list::v0_1::Payload,
+            s::badges::awards::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "state": "offered", "limit": 50}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"items": [{"award": {"awardId": "awd_K3mT9pQx2Lw8Rv5N", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_SamNguyen0000000", "givenBy": "dir_Pr1yaNatarajan00", "note": "For the Saturday joinery workshop.", "state": "offered", "offeredAt": "2026-11-05T18:00:00Z", "expiresAt": "2026-12-05T18:00:00Z"}, "hidden": false, "fields": {"displayName": "Sam N."}}]}"#).unwrap()
+        ),
+        checked!(
+            s::badges::awards::offer::v0_1::Payload,
+            s::badges::awards::offer::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "to": ["dir_NoorElSayed00000", "dir_LenaWirth0000000"], "note": "Resin pour workshop, 25 October 2026"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"awards": [{"awardId": "awd_Qz7TpLW5k2N8xRb3", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_NoorElSayed00000", "givenBy": "dir_Pr1yaNatarajan00", "note": "Resin pour workshop, 25 October 2026", "state": "offered", "offeredAt": "2026-11-06T18:00:01Z", "expiresAt": "2026-12-06T18:00:01Z"}], "skipped": [{"entryId": "dir_LenaWirth0000000", "reason": "alreadyOffered"}]}"#).unwrap()
+        ),
+        checked!(
+            s::badges::claims::create::v0_1::Payload,
+            s::badges::claims::create::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "label": "Saturday joinery workshop", "validUntil": "2026-11-08T18:00:00Z", "limit": 40}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"claim": {"claimId": "bcl_T4nQ8mLw2Rx9Kv5Z", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "label": "Saturday joinery workshop", "validUntil": "2026-11-08T18:00:00Z", "limit": 40, "claims": 0, "state": "active", "createdAt": "2026-11-08T09:00:01Z", "createdBy": "dir_Pr1yaNatarajan00"}, "code": "Qm7xV2kR9pLw4Nt8Hs3Fz6Bd1Yc5Je0Ua"}"#).unwrap()
+        ),
+        checked!(
+            s::badges::claims::list::v0_1::Payload,
+            s::badges::claims::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "limit": 50}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"items": [{"claimId": "bcl_T4nQ8mLw2Rx9Kv5Z", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "label": "Saturday joinery workshop", "validUntil": "2026-11-08T18:00:00Z", "limit": 40, "claims": 17, "state": "active", "createdAt": "2026-11-08T09:00:01Z", "createdBy": "dir_Pr1yaNatarajan00"}]}"#).unwrap()
+        ),
+        checked!(
+            s::badges::claims::withdraw::v0_1::Payload,
+            s::badges::claims::withdraw::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"claimId": "bcl_T4nQ8mLw2Rx9Kv5Z"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"claim": {"claimId": "bcl_T4nQ8mLw2Rx9Kv5Z", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "label": "Saturday joinery workshop", "validUntil": "2026-11-08T18:00:00Z", "limit": 40, "claims": 17, "state": "withdrawn", "createdAt": "2026-11-08T09:00:01Z", "createdBy": "dir_Pr1yaNatarajan00"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::claims::redeem::v0_1::Payload,
+            s::badges::claims::redeem::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"code": "Qm7xV2kR9pLw4Nt8Hs3Fz6Bd1Yc5Je0Ua"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_C7mT9pQx2Lw8Rv5N", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_SamNguyen0000000", "givenBy": "dir_Pr1yaNatarajan00", "state": "accepted", "offeredAt": "2026-11-08T11:30:00Z", "decidedAt": "2026-11-08T11:30:00Z", "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-000000000901"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::awards::share::v0_1::Payload,
+            s::badges::awards::share::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"awardId": "awd_K3mT9pQx2Lw8Rv5N"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_K3mT9pQx2Lw8Rv5N", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_Pr1yaNatarajan00", "givenBy": "dir_BenOkafor0000000", "note": "For the Saturday joinery workshop.", "state": "accepted", "offeredAt": "2026-11-05T18:00:00Z", "decidedAt": "2026-11-05T19:12:40Z", "credentialId": "urn:uuid:9f1b2c3d-4e5f-4a6b-8c7d-000000000777", "shared": {"verificationUrl": "https://harbourside.example/badges/shared/Qm7xV2kR9pLw4Nt8Hs3Fz6Bd1Yc5Je0Ua", "bakedImageUrl": "https://harbourside.example/badges/shared/Qm7xV2kR9pLw4Nt8Hs3Fz6Bd1Yc5Je0Ua/image.png", "since": "2026-11-06T12:00:01Z"}}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::awards::unshare::v0_1::Payload,
+            s::badges::awards::unshare::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"awardId": "awd_K3mT9pQx2Lw8Rv5N"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_K3mT9pQx2Lw8Rv5N", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_Pr1yaNatarajan00", "givenBy": "dir_BenOkafor0000000", "note": "For the Saturday joinery workshop.", "state": "accepted", "offeredAt": "2026-11-05T18:00:00Z", "decidedAt": "2026-11-05T19:12:40Z", "credentialId": "urn:uuid:9f1b2c3d-4e5f-4a6b-8c7d-000000000777"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::awards::revoke::v0_1::Payload,
+            s::badges::awards::revoke::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"awardId": "awd_K3mT9pQx2Lw8Rv5N", "reason": "The workshop was cancelled; nobody hosted it."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_K3mT9pQx2Lw8Rv5N", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_SamNguyen0000000", "givenBy": "dir_Pr1yaNatarajan00", "note": "For the Saturday joinery workshop.", "state": "revoked", "offeredAt": "2026-11-05T18:00:00Z", "decidedAt": "2026-11-06T12:00:01Z", "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::awards::withdraw::v0_1::Payload,
+            s::badges::awards::withdraw::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"awardId": "awd_K3mT9pQx2Lw8Rv5N", "reason": "Offered to the wrong Sam; the host was Sam Ortiz."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_K3mT9pQx2Lw8Rv5N", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_SamNguyen0000000", "givenBy": "dir_Pr1yaNatarajan00", "note": "For the Saturday joinery workshop.", "state": "withdrawn", "offeredAt": "2026-11-05T18:00:00Z", "decidedAt": "2026-11-06T11:00:01Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::create::v0_1::Payload,
+            s::badges::create::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "holdersVisibleTo": "members", "owners": ["dir_Pr1yaNatarajan00", "dir_BenOkafor0000000"], "reason": "Workshops are the heart of the community; the hosts should wear it."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "holderCount": 0, "createdAt": "2026-11-06T09:00:02Z", "createdBy": "dir_AnnaReyes0000000"}, "group": {"groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "groupDid": "did:webvh:QmGroupScid:community.example:group-dids:grp_Hs7Qm2Lk9Tn4Bv1X", "name": "Workshop host", "kind": "static", "joinPolicy": "request", "visibility": "members", "showMembers": "members", "issuesCredentials": true, "carriesAuthority": false, "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "memberCount": 0, "managers": ["dir_Pr1yaNatarajan00", "dir_BenOkafor0000000"], "credentialAuthorityValidUntil": "2027-11-06T09:00:01Z", "createdAt": "2026-11-06T09:00:02Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::holders::list::v0_1::Payload,
+            s::badges::holders::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "limit": 50}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"total": 2, "items": [{"entryId": "dir_BenOkafor0000000", "count": 3, "since": "2026-03-14T19:30:00Z", "latestAt": "2026-10-31T20:10:00Z", "fields": {"displayName": "Ben", "avatar": {"sha256": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b", "mediaType": "image/webp", "size": 18342}}}, {"entryId": "dir_SamNguyen0000000", "count": 1, "since": "2026-09-02T17:45:00Z", "latestAt": "2026-09-02T17:45:00Z"}]}"#).unwrap()
+        ),
+        checked!(
+            s::badges::images::get::v0_1::Payload,
+            s::badges::images::get::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "data": "iVBORw0KGgoAAAANSUhEUgAABAAAAAQA"}"#).unwrap()
+        ),
+        checked!(
+            s::badges::images::upload::v0_1::Payload,
+            s::badges::images::upload::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"mediaType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/webp", "size": 18342}, "expiresAt": "2026-11-07T08:55:01Z"}"#).unwrap()
+        ),
+        checked!(
+            s::badges::kudos::give::v0_1::Payload,
+            s::badges::kudos::give::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_Kd0sCl4mpWh1sp3r", "to": "dir_B3nOk4f0rRq9Wz2X", "note": "Found the long sash clamps behind the bandsaw. Saved the glue-up."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_K3m8Qp2Vt7Xz4Ln9", "badgeId": "bdg_Kd0sCl4mpWh1sp3r", "entryId": "dir_B3nOk4f0rRq9Wz2X", "givenBy": "dir_Tm4sV3g4K9xQ2bLp", "note": "Found the long sash clamps behind the bandsaw. Saved the glue-up.", "state": "offered", "offeredAt": "2026-11-06T10:30:01Z", "expiresAt": "2026-12-06T10:30:01Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::kudos::list::v0_1::Payload,
+            s::badges::kudos::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"direction": "received", "limit": 20}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"items": [{"award": {"awardId": "awd_K3m8Qp2Vt7Xz4Ln9", "badgeId": "bdg_Kd0sCl4mpWh1sp3r", "entryId": "dir_B3nOk4f0rRq9Wz2X", "givenBy": "dir_Tm4sV3g4K9xQ2bLp", "note": "Found the long sash clamps behind the bandsaw. Saved the glue-up.", "state": "offered", "offeredAt": "2026-11-06T10:30:01Z", "expiresAt": "2026-12-06T10:30:01Z"}, "badge": {"badgeId": "bdg_Kd0sCl4mpWh1sp3r", "kind": "kudos", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/png", "size": 24576}, "repeatable": true, "listed": true, "state": "active", "createdAt": "2026-10-02T09:05:00Z", "createdBy": "dir_Pr1yaN4t7Rj2Qw8K"}, "counterpart": {"displayName": "Tom\u00e1s"}}, {"award": {"awardId": "awd_P9r4Wn6Yc2Hs8Vq1", "badgeId": "bdg_Kd0sCl4mpWh1sp3r", "entryId": "dir_B3nOk4f0rRq9Wz2X", "givenBy": "dir_Pr1yaN4t7Rj2Qw8K", "state": "accepted", "offeredAt": "2026-10-28T19:00:00Z", "decidedAt": "2026-10-28T21:12:00Z"}, "badge": {"badgeId": "bdg_Kd0sCl4mpWh1sp3r", "kind": "kudos", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/png", "size": 24576}, "repeatable": true, "listed": true, "state": "active", "createdAt": "2026-10-02T09:05:00Z", "createdBy": "dir_Pr1yaN4t7Rj2Qw8K"}, "counterpart": {"displayName": "Priya"}}]}"#).unwrap()
+        ),
+        checked!(
+            s::badges::list::v0_1::Payload,
+            s::badges::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"kind": "community", "limit": 50}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"items": [{"badge": {"badgeId": "bdg_Nf2Rk7Lp9Xs3Qw5T", "kind": "community", "name": "One year aboard", "description": "A year in the community.", "criteria": "Twelve months of membership. Given by the community itself.", "image": {"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "mediaType": "image/png", "size": 52200}, "repeatable": false, "requestable": false, "listed": true, "shareableOutside": false, "groupId": "grp_Lk8Tn2Vx4Rm9Qs7H", "state": "active", "holderCount": 213, "createdAt": "2026-03-01T08:00:00Z"}, "myCount": 1, "myState": "holder"}, {"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "holderCount": 12, "createdAt": "2026-11-06T09:00:02Z"}, "myCount": 0, "myState": "requested"}]}"#).unwrap()
+        ),
+        checked!(
+            s::badges::mine::accept::v0_1::Payload,
+            s::badges::mine::accept::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"awardId": "awd_Qz7TpLW5k2N8xRb3"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_Qz7TpLW5k2N8xRb3", "badgeId": "bdg_W5k2N8xRb3Qz7TpL", "entryId": "dir_NoorElSayed00000", "givenBy": "dir_Pr1yaNatarajan00", "note": "Resin pour workshop, 25 October 2026", "state": "accepted", "offeredAt": "2026-11-06T18:00:01Z", "decidedAt": "2026-11-06T19:10:02Z", "credentialId": "urn:uuid:9c1d2e3f-4a5b-4c6d-8e7f-000000000777"}, "badge": {"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "holderCount": 10, "createdAt": "2026-11-06T09:00:02Z"}, "count": 1, "since": "2026-11-06T19:10:02Z", "latestAt": "2026-11-06T19:10:02Z", "pinned": false, "hidden": false, "position": 7, "credentialId": "urn:uuid:9c1d2e3f-4a5b-4c6d-8e7f-000000000777", "credentialValidUntil": "2028-11-06T19:10:02Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::mine::arrange::v0_1::Payload,
+            s::badges::mine::arrange::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"order": ["bdg_Kd0sCl4mpWh1sp3r", "bdg_W5k2N8xRb3Qz7TpL"], "pinned": ["bdg_Kd0sCl4mpWh1sp3r", "bdg_W5k2N8xRb3Qz7TpL"]}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badges": [{"badge": {"badgeId": "bdg_Kd0sCl4mpWh1sp3r", "kind": "kudos", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/png", "size": 24576}, "repeatable": true, "listed": true, "state": "active", "createdAt": "2026-10-02T09:05:00Z", "createdBy": "dir_Pr1yaN4t7Rj2Qw8K"}, "count": 3, "since": "2026-10-03T12:00:00Z", "latestAt": "2026-11-01T16:20:00Z", "pinned": true, "hidden": false, "position": 0}, {"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "createdAt": "2026-09-01T09:00:02Z"}, "count": 2, "since": "2026-09-14T18:00:00Z", "latestAt": "2026-10-19T18:30:00Z", "pinned": true, "hidden": false, "position": 1, "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "credentialValidUntil": "2028-10-19T18:30:00Z"}], "visibility": "members"}"#).unwrap()
+        ),
+        checked!(
+            s::badges::mine::decline::v0_1::Payload,
+            s::badges::mine::decline::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"awardId": "awd_H7q2Lm9Xc4Vt1Bz8"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"award": {"awardId": "awd_H7q2Lm9Xc4Vt1Bz8", "badgeId": "bdg_Yr1Ab0ardTn2Qx7V", "entryId": "dir_Tm4sV3g4K9xQ2bLp", "givenBy": "dir_B3nOk4f0rRq9Wz2X", "note": "A year of Saturdays. Thank you.", "state": "declined", "offeredAt": "2026-11-05T20:00:00Z", "decidedAt": "2026-11-06T10:05:01Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::mine::hide::v0_1::Payload,
+            s::badges::mine::hide::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_Kd0sCl4mpWh1sp3r"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badge": {"badge": {"badgeId": "bdg_Kd0sCl4mpWh1sp3r", "kind": "kudos", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/png", "size": 24576}, "repeatable": true, "listed": true, "state": "active", "createdAt": "2026-10-02T09:05:00Z", "createdBy": "dir_Pr1yaN4t7Rj2Qw8K"}, "count": 3, "since": "2026-10-03T12:00:00Z", "latestAt": "2026-11-01T16:20:00Z", "pinned": false, "hidden": true, "position": 1}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::mine::list::v0_1::Payload,
+            s::badges::mine::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badges": [{"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "createdAt": "2026-09-01T09:00:02Z"}, "count": 2, "since": "2026-09-14T18:00:00Z", "latestAt": "2026-10-19T18:30:00Z", "pinned": true, "hidden": false, "position": 0, "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "credentialValidUntil": "2028-10-19T18:30:00Z"}, {"badge": {"badgeId": "bdg_Kd0sCl4mpWh1sp3r", "kind": "kudos", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/png", "size": 24576}, "repeatable": true, "listed": true, "state": "active", "createdAt": "2026-10-02T09:05:00Z", "createdBy": "dir_Pr1yaN4t7Rj2Qw8K"}, "count": 3, "since": "2026-10-03T12:00:00Z", "latestAt": "2026-11-01T16:20:00Z", "pinned": false, "hidden": true, "position": 1}], "offers": [{"award": {"awardId": "awd_H7q2Lm9Xc4Vt1Bz8", "badgeId": "bdg_Yr1Ab0ardTn2Qx7V", "entryId": "dir_Tm4sV3g4K9xQ2bLp", "givenBy": "dir_B3nOk4f0rRq9Wz2X", "note": "A year of Saturdays. Thank you.", "state": "offered", "offeredAt": "2026-11-05T20:00:00Z", "expiresAt": "2026-12-05T20:00:00Z"}, "badge": {"badgeId": "bdg_Yr1Ab0ardTn2Qx7V", "kind": "community", "name": "One year aboard", "description": "A year in the community.", "image": {"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "mediaType": "image/png", "size": 30720}, "repeatable": false, "listed": true, "groupId": "grp_Yr1Ab0ardGr0upX2", "state": "active", "createdAt": "2026-09-01T09:10:00Z"}, "givenBy": {"displayName": "Ben"}}], "visibility": "members", "kudosTotal": 0}"#).unwrap()
+        ),
+        checked!(
+            s::badges::mine::show::v0_1::Payload,
+            s::badges::mine::show::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_Kd0sCl4mpWh1sp3r"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badge": {"badge": {"badgeId": "bdg_Kd0sCl4mpWh1sp3r", "kind": "kudos", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/png", "size": 24576}, "repeatable": true, "listed": true, "state": "active", "createdAt": "2026-10-02T09:05:00Z", "createdBy": "dir_Pr1yaN4t7Rj2Qw8K"}, "count": 3, "since": "2026-10-03T12:00:00Z", "latestAt": "2026-11-01T16:20:00Z", "pinned": false, "hidden": false, "position": 1}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::promote::v0_1::Payload,
+            s::badges::promote::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_Kd3mR9vXs2Wq8LpN", "requestable": false, "shareableOutside": false, "holdersVisibleTo": "members", "owners": ["dir_Pr1yaNatarajan00", "dir_TomasVrba0000000"], "reason": "Given four hundred times this year; the community should stand behind it."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badge": {"badgeId": "bdg_Kd3mR9vXs2Wq8LpN", "kind": "community", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/png", "size": 48120}, "repeatable": true, "requestable": false, "listed": true, "shareableOutside": false, "groupId": "grp_Qm4Vx8Tk2Rn7Hs1L", "state": "active", "holderCount": 0, "createdAt": "2026-11-06T09:05:02Z", "createdBy": "dir_TomasVrba0000000", "updatedAt": "2026-11-06T09:40:03Z"}, "group": {"groupId": "grp_Qm4Vx8Tk2Rn7Hs1L", "groupDid": "did:webvh:QmGroupScid:community.example:group-dids:grp_Qm4Vx8Tk2Rn7Hs1L", "name": "Clamp whisperer", "kind": "static", "joinPolicy": "closed", "visibility": "members", "showMembers": "members", "issuesCredentials": true, "carriesAuthority": false, "badgeId": "bdg_Kd3mR9vXs2Wq8LpN", "memberCount": 0, "managers": ["dir_Pr1yaNatarajan00", "dir_TomasVrba0000000"], "credentialAuthorityValidUntil": "2027-11-06T09:40:02Z", "createdAt": "2026-11-06T09:40:03Z"}, "holdersOffered": 37}"#).unwrap()
+        ),
+        checked!(
+            s::badges::retire::v0_1::Payload,
+            s::badges::retire::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "reason": "The workshop programme ended with the season."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": false, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "retired", "holderCount": 12, "createdAt": "2026-11-06T09:00:02Z", "createdBy": "dir_AnnaReyes0000000", "retiredAt": "2026-11-06T09:30:03Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::settings::show::v0_1::Payload,
+            s::badges::settings::show::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"settings": {"enabled": true, "kudosMakers": {"policy": "roles", "roles": ["steward"], "groups": ["grp_Hs7Qm2Lk9Tn4Bv1X"]}, "limits": {"kudosPerGiverPerDay": 10, "sameGiverSameMember": "day", "minTenureDays": 7, "kudosBadgesPerMakerPerMonth": 5, "maxPinned": 2}, "showKudosTotals": true, "automaticBadges": true, "membersMayRequest": true, "credentialValidDays": 730, "updatedAt": "2026-11-01T10:00:00Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::settings::update::v0_1::Payload,
+            s::badges::settings::update::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"settings": {"enabled": true, "kudosMakers": {"policy": "roles", "roles": ["steward"], "groups": ["grp_Hs7Qm2Lk9Tn4Bv1X"]}, "limits": {"kudosPerGiverPerDay": 10, "sameGiverSameMember": "day", "minTenureDays": 7, "kudosBadgesPerMakerPerMonth": 5, "maxPinned": 2}, "showKudosTotals": true, "automaticBadges": true, "membersMayRequest": true, "credentialValidDays": 730}, "reason": "Stewards and the welcome team asked to make their own thank-you badges."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"settings": {"enabled": true, "kudosMakers": {"policy": "roles", "roles": ["steward"], "groups": ["grp_Hs7Qm2Lk9Tn4Bv1X"]}, "limits": {"kudosPerGiverPerDay": 10, "sameGiverSameMember": "day", "minTenureDays": 7, "kudosBadgesPerMakerPerMonth": 5, "maxPinned": 2}, "showKudosTotals": true, "automaticBadges": true, "membersMayRequest": true, "credentialValidDays": 730, "updatedAt": "2026-11-06T09:10:02Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::show::v0_1::Payload,
+            s::badges::show::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "holderCount": 12, "createdAt": "2026-11-06T09:00:02Z"}, "myCount": 0, "myState": "requested", "owners": ["dir_Pr1yaNatarajan00", "dir_BenOkafor0000000"], "credentialRegime": "outside"}"#).unwrap()
+        ),
+        checked!(
+            s::badges::update::v0_1::Payload,
+            s::badges::update::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "criteria": "Hosted a workshop on the community calendar this year. A badge owner gives it after the session.", "requestable": false, "holdersVisibleTo": "groupMembers", "reason": "Owners give it after each session now; nobody needs to ask."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted a workshop on the community calendar this year. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": false, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "holderCount": 12, "createdAt": "2026-11-06T09:00:02Z", "createdBy": "dir_AnnaReyes0000000", "updatedAt": "2026-11-06T09:20:01Z"}}"#).unwrap()
+        ),
+        checked!(
+            s::badges::wall::show::v0_1::Payload,
+            s::badges::wall::show::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"entryId": "dir_BenOkafor0000000"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"visibility": "members", "kudosTotal": 14, "entries": [{"badge": {"badgeId": "bdg_W5k2N8xRb3Qz7TpL", "kind": "community", "name": "Workshop host", "description": "Ran a workshop for the community.", "criteria": "Hosted any workshop on the community calendar. A badge owner gives it after the session.", "image": {"sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "mediaType": "image/png", "size": 61440}, "repeatable": true, "requestable": true, "listed": true, "shareableOutside": true, "groupId": "grp_Hs7Qm2Lk9Tn4Bv1X", "state": "active", "holderCount": 2, "createdAt": "2026-03-01T09:00:02Z", "createdBy": "dir_AnnaReyes0000000"}, "count": 3, "since": "2026-03-14T19:30:00Z", "latestAt": "2026-10-31T20:10:00Z", "pinned": true}, {"badge": {"badgeId": "bdg_Kd8sPq2Vn4Xm7Rt1", "kind": "kudos", "name": "Clamp whisperer", "description": "Found the good clamps when nobody else could.", "image": {"sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "mediaType": "image/webp", "size": 18342}, "repeatable": true, "listed": true, "state": "active", "createdAt": "2026-11-06T09:05:01Z", "createdBy": "dir_TomasVega0000000"}, "count": 5, "since": "2026-11-06T12:00:00Z", "latestAt": "2026-11-06T14:30:00Z", "pinned": false}]}"#).unwrap()
+        ),
+        checked!(
+            s::boards::list::v0_1::Payload,
+            s::boards::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"status": "open"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"boards": [{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "title": "Trust Week Unconference", "description": "Propose a session for Friday. The sessions with the most support fill the twelve slots.", "status": "open", "audience": {"kind": "members"}, "proposals": {"opensAt": "2026-11-02T00:00:00Z", "closesAt": "2026-11-10T00:00:00Z"}, "voting": {"opensAt": "2026-11-09T00:00:00Z", "closesAt": "2026-11-12T09:00:00Z"}, "topics": ["Identity", "Governance", "Voting"], "formats": ["Discussion", "Talk", "Workshop", "Demo"], "maxIdeasPerMember": 3, "selectionRule": "The twelve sessions the most members would attend.", "timetable": [{"slotId": "a-0900", "label": "Room A", "startsAt": "2026-11-13T01:00:00Z", "endsAt": "2026-11-13T02:00:00Z"}], "template": {"questions": [{"key": "attend", "type": "choice", "text": "Would you attend this session?", "options": [{"key": "yes", "label": "Yes, I'd attend"}, {"key": "no", "label": "Not for me"}], "minSelections": 1, "maxSelections": 1, "optional": false}], "secrecy": "open", "revote": "replace", "board": {"visibility": "public", "auditors": []}, "ballotBox": "did:example:ballot-box", "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}, "createdAt": "2026-11-01T03:00:00Z", "facilitator": false, "ideaCounts": {"proposed": 2, "open": 4, "selected": 0, "notSelected": 0, "declined": 0, "merged": 0, "withdrawn": 0}}]}"#).unwrap()
+        ),
+        checked!(
+            s::boards::show::v0_1::Payload,
+            s::boards::show::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "state": ["open"]}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"board": {"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "title": "Trust Week Unconference", "description": "Propose a session for Friday. The sessions with the most support fill the twelve slots.", "status": "open", "audience": {"kind": "members"}, "proposals": {"opensAt": "2026-11-02T00:00:00Z", "closesAt": "2026-11-10T00:00:00Z"}, "voting": {"opensAt": "2026-11-09T00:00:00Z", "closesAt": "2026-11-12T09:00:00Z"}, "topics": ["Identity", "Governance", "Voting"], "formats": ["Discussion", "Talk", "Workshop", "Demo"], "maxIdeasPerMember": 3, "selectionRule": "The twelve sessions the most members would attend.", "timetable": [{"slotId": "a-0900", "label": "Room A", "startsAt": "2026-11-13T01:00:00Z", "endsAt": "2026-11-13T02:00:00Z"}], "template": {"questions": [{"key": "attend", "type": "choice", "text": "Would you attend this session?", "options": [{"key": "yes", "label": "Yes, I'd attend"}, {"key": "no", "label": "Not for me"}], "minSelections": 1, "maxSelections": 1, "optional": false}], "secrecy": "open", "revote": "replace", "board": {"visibility": "public", "auditors": []}, "ballotBox": "did:example:ballot-box", "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}, "createdAt": "2026-11-01T03:00:00Z", "facilitator": false, "ideaCounts": {"proposed": 2, "open": 4, "selected": 0, "notSelected": 0, "declined": 0, "merged": 0, "withdrawn": 0}}, "ideas": [{"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "state": "open", "title": "Accessible wallet sign-in", "description": "The on-screen number, screen readers, and people who can't scan a code. List the barriers and pick three to fix.", "format": "Discussion", "topic": "Identity", "proposer": {"entryId": "dir_Rb8Nc3Kq7Wz2Lp5D", "name": "Elif Polat"}, "proposedAt": "2026-11-04T02:10:00Z", "noteCount": 2, "election": {"electionId": "board.brd_Uc7N2qLm4Rt8Vx1Z.ida_Pk3Wq9Ls2Dn6Hy4B", "state": "voting", "ballotsOnBoard": 38, "boardHeadIssuedAt": "2026-11-10T04:00:00Z"}}]}"#).unwrap()
+        ),
+        checked!(
+            s::boards::ideas::propose::v0_1::Payload,
+            s::boards::ideas::propose::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "title": "Accessible wallet sign-in", "description": "The on-screen number, screen readers, and people who can't scan a code. List the barriers and pick three to fix.", "format": "Discussion", "topic": "Identity"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"idea": {"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "state": "proposed", "title": "Accessible wallet sign-in", "description": "The on-screen number, screen readers, and people who can't scan a code. List the barriers and pick three to fix.", "format": "Discussion", "topic": "Identity", "proposer": {"entryId": "dir_Rb8Nc3Kq7Wz2Lp5D", "name": "Elif Polat", "you": true}, "proposedAt": "2026-11-04T02:10:00Z", "noteCount": 0}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::ideas::update::v0_1::Payload,
+            s::boards::ideas::update::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "title": "Wallet sign-in for everyone"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"idea": {"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "state": "proposed", "title": "Wallet sign-in for everyone", "description": "The on-screen number, screen readers, and people who can't scan a code. List the barriers and pick three to fix.", "format": "Discussion", "topic": "Identity", "proposer": {"entryId": "dir_Rb8Nc3Kq7Wz2Lp5D", "name": "Elif Polat", "you": true}, "proposedAt": "2026-11-04T02:10:00Z", "noteCount": 0}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::ideas::withdraw::v0_1::Payload,
+            s::boards::ideas::withdraw::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"idea": {"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "state": "withdrawn", "title": "Accessible wallet sign-in", "description": "The on-screen number, screen readers, and people who can't scan a code. List the barriers and pick three to fix.", "format": "Discussion", "topic": "Identity", "proposer": {"entryId": "dir_Rb8Nc3Kq7Wz2Lp5D", "name": "Elif Polat", "you": true}, "proposedAt": "2026-11-04T02:10:00Z", "noteCount": 0}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::ideas::decide::v0_1::Payload,
+            s::boards::ideas::decide::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "decision": "accept"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"idea": {"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "state": "open", "title": "Accessible wallet sign-in", "description": "The on-screen number, screen readers, and people who can't scan a code. List the barriers and pick three to fix.", "format": "Discussion", "topic": "Identity", "proposer": {"entryId": "dir_Rb8Nc3Kq7Wz2Lp5D", "name": "Elif Polat"}, "proposedAt": "2026-11-04T02:10:00Z", "noteCount": 2, "election": {"electionId": "board.brd_Uc7N2qLm4Rt8Vx1Z.ida_Pk3Wq9Ls2Dn6Hy4B", "state": "registration"}}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::ideas::select::v0_1::Payload,
+            s::boards::ideas::select::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "decision": "selected", "slotId": "a-0900"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"idea": {"ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "state": "selected", "title": "Accessible wallet sign-in", "description": "The on-screen number, screen readers, and people who can't scan a code. List the barriers and pick three to fix.", "format": "Discussion", "topic": "Identity", "proposer": {"entryId": "dir_Rb8Nc3Kq7Wz2Lp5D", "name": "Elif Polat"}, "proposedAt": "2026-11-04T02:10:00Z", "noteCount": 2, "election": {"electionId": "board.brd_Uc7N2qLm4Rt8Vx1Z.ida_Pk3Wq9Ls2Dn6Hy4B", "state": "tallied", "certified": false, "result": {"electionId": "board.brd_Uc7N2qLm4Rt8Vx1Z.ida_Pk3Wq9Ls2Dn6Hy4B", "manifestDigest": "uEiDexampleDigestNotReal0000000000000000000000", "ballotsCounted": 92, "questions": [{"question": "attend", "abstained": 0, "choice": {"yes": 65, "no": 27}}], "head": {"electionId": "board.brd_Uc7N2qLm4Rt8Vx1Z.ida_Pk3Wq9Ls2Dn6Hy4B", "treeSize": 97, "rootHash": "uEiBexampleRootNotReal00000000000000000000000", "issuedAt": "2026-11-12T09:05:00Z"}}}, "decision": {"decidedAt": "2026-11-12T10:00:00Z", "slotId": "a-0900"}}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::notes::add::v0_1::Payload,
+            s::boards::notes::add::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "text": "Happy to co-host the screen-reader half."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"note": {"noteId": "bnt_Xa4Fh7Ty2Gp9Lm6C", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "author": {"entryId": "dir_Hm2Vt6Xs9Qe4Jn1F", "name": "Tomás Brandt", "you": true}, "text": "Happy to co-host the screen-reader half.", "createdAt": "2026-11-04T05:00:00Z", "state": "visible"}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::notes::list::v0_1::Payload,
+            s::boards::notes::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"notes": [{"noteId": "bnt_Xa4Fh7Ty2Gp9Lm6C", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "author": {"entryId": "dir_Hm2Vt6Xs9Qe4Jn1F", "name": "Tomás Brandt"}, "text": "Happy to co-host the screen-reader half.", "createdAt": "2026-11-04T05:00:00Z", "state": "visible"}]}"#).unwrap()
+        ),
+        checked!(
+            s::boards::notes::withdraw::v0_1::Payload,
+            s::boards::notes::withdraw::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"noteId": "bnt_Xa4Fh7Ty2Gp9Lm6C"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"note": {"noteId": "bnt_Xa4Fh7Ty2Gp9Lm6C", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "author": {"entryId": "dir_Hm2Vt6Xs9Qe4Jn1F", "name": "Tomás Brandt", "you": true}, "text": "Happy to co-host the screen-reader half.", "createdAt": "2026-11-04T05:00:00Z", "state": "withdrawn"}}"#).unwrap()
+        ),
+        checked!(
+            s::boards::notes::hide::v0_1::Payload,
+            s::boards::notes::hide::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"noteId": "bnt_Xa4Fh7Ty2Gp9Lm6C", "action": "hide", "reason": "Off topic for this board."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"note": {"noteId": "bnt_Xa4Fh7Ty2Gp9Lm6C", "boardId": "brd_Uc7N2qLm4Rt8Vx1Z", "ideaId": "ida_Pk3Wq9Ls2Dn6Hy4B", "author": {"entryId": "dir_Hm2Vt6Xs9Qe4Jn1F", "name": "Tomás Brandt"}, "text": "Happy to co-host the screen-reader half.", "createdAt": "2026-11-04T05:00:00Z", "state": "hidden", "hiddenReason": "Off topic for this board."}}"#).unwrap()
+        ),
+        checked!(
+            s::groups::requests::list::v0_2::Payload,
+            s::groups::requests::list::v0_2::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "state": "pending" }),
+            json!({ "items": [{ "request": { "requestId": "greq_W5k2N8xRb3Qz7TpLAAAAAA", "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY, "message": "I work on identity.", "createdAt": "2026-10-19T09:00:00Z", "state": "pending" } }] })
+        ),
+        checked!(
+            s::groups::requests::decide::v0_1::Payload,
+            s::groups::requests::decide::v0_1::Response,
+            json!({ "requestId": "greq_W5k2N8xRb3Qz7TpLAAAAAA", "decision": "approve" }),
+            json!({ "request": { "requestId": "greq_W5k2N8xRb3Qz7TpLAAAAAA", "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY, "message": "I work on identity.", "createdAt": "2026-10-19T09:00:00Z", "state": "pending" }, "member": { "entryId": DIRECTORY_ENTRY, "source": "added", "since": "2026-10-19T09:00:00Z", "state": "active", "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "credentialValidUntil": "2026-11-18T09:00:00Z" }, "credentialId": "urn:uuid:5a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d" })
+        ),
+        checked!(
+            s::groups::managers::add::v0_1::Payload,
+            s::groups::managers::add::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY, "reason": "she convenes it" }),
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "managers": [DIRECTORY_ENTRY] })
+        ),
+        checked!(
+            s::groups::managers::remove::v0_1::Payload,
+            s::groups::managers::remove::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "entryId": DIRECTORY_ENTRY }),
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA", "managers": [] })
+        ),
+        // A group's room bindings (`groups::bindings`); the response is the
+        // stored binding's own `wire()`.
+        checked!(
+            s::groups::bindings::add::v0_1::Payload,
+            s::groups::bindings::add::v0_1::Response,
+            json!({
+                "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA",
+                "binding": { "kind": "room", "roomId": "did:key:z6MkRoom", "actions": ["read"], "validFor": "P30D" },
+                "reason": "The working group's room.",
+            }),
+            json!({ "binding": sample_binding().wire() })
+        ),
+        checked!(
+            s::groups::bindings::list::v0_1::Payload,
+            s::groups::bindings::list::v0_1::Response,
+            json!({ "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA" }),
+            json!({ "items": [sample_binding().wire()] })
+        ),
+        checked!(
+            s::groups::bindings::remove::v0_1::Payload,
+            s::groups::bindings::remove::v0_1::Response,
+            json!({
+                "groupId": "grp_W5k2N8xRb3Qz7TpLAAAAAA",
+                "bindingId": "gb_P2k8W5qYc6Vd1MsKAAAAAA",
+                "reason": "The room moved.",
+            }),
+            json!({ "bindingId": "gb_P2k8W5qYc6Vd1MsKAAAAAA", "state": "removing" })
+        ),
+        checked!(
+            s::directory::notes::append::v0_1::Payload,
+            s::directory::notes::append::v0_1::Response,
+            json!({ "entryId": DIRECTORY_ENTRY, "text": "Spoke at the June meetup.", "followUp": "2026-11-01" }),
+            json!({ "note": admin_note().wire() })
+        ),
+        checked!(
+            s::directory::notes::list::v0_2::Payload,
+            s::directory::notes::list::v0_2::Response,
+            json!({ "entryId": DIRECTORY_ENTRY, "limit": 20 }),
+            json!({ "items": [admin_note().wire()] })
+        ),
+        checked!(
+            s::directory::notes::export::v0_1::Payload,
+            s::directory::notes::export::v0_1::Response,
+            json!({ "entryId": DIRECTORY_ENTRY, "reason": "The member asked for the data held about them." }),
+            json!({
+                "entryId": DIRECTORY_ENTRY,
+                "notes": [admin_note().wire_whole()],
+                "exportedAt": "2026-10-19T09:00:00Z",
+            })
+        ),
+        checked!(
+            s::directory::export::v0_2::Payload,
+            s::directory::export::v0_2::Response,
+            json!({ "format": "jscontact", "reason": "Annual archive.", "limit": 200 }),
+            json!({
+                "items": [{
+                    "@type": "Card",
+                    "version": "1.0",
+                    "uid": format!("{}{DIRECTORY_ENTRY}", crate::directory::external::UID_PREFIX),
+                    "name": { "full": "Carol Example" },
+                    "role": "member",
+                }],
+                "exportedAt": "2026-10-19T09:00:00Z",
+            })
+        ),
+        checked!(
+            s::directory::images::upload::v0_1::Payload,
+            s::directory::images::upload::v0_1::Response,
+            json!({ "mediaType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" }),
+            json!({ "image": stored_picture(), "expiresAt": "2026-10-20T09:00:01Z" })
+        ),
+        checked!(
+            s::directory::images::get::v0_1::Payload,
+            s::directory::images::get::v0_1::Response,
+            json!({
+                "entryId": DIRECTORY_ENTRY,
+                "field": "avatar",
+                "sha256": stored_picture()["sha256"],
+            }),
+            json!({ "image": stored_picture(), "data": "_9j_4AAQSkZJRgABAQAAAQABAAD" })
+        ),
+        checked!(
+            s::directory::card::publish::v0_1::Payload,
+            s::directory::card::publish::v0_1::Response,
+            json!({ "card": published_card(), "expectedRevision": 7 }),
+            json!({ "externalCard": {
+                "state": "published",
+                "cardDigest": crate::directory::external::card_digest(&published_card()).unwrap(),
+                "publishedAt": "2026-10-19T09:10:02Z",
+            }})
+        ),
+        checked!(
+            s::directory::card::public::v0_1::Payload,
+            s::directory::card::public::v0_1::Response,
+            json!({
+                "entryId": DIRECTORY_ENTRY,
+                "cardDigest": crate::directory::external::card_digest(&published_card()).unwrap(),
+            }),
+            json!({
+                "card": published_card(),
+                "cardDigest": crate::directory::external::card_digest(&published_card()).unwrap(),
+                "publishedAt": "2026-10-19T09:10:02Z",
+            })
+        ),
+        checked!(
+            s::vetting::revoke_statement::v0_1::Payload,
+            s::vetting::revoke_statement::v0_1::Response,
+            json!({
+                "statementId": format!("urn:uuid:{REQUEST_ID}"),
+                "statementDigestMultibase": "zQmYimQAvAKzznkjph8xTTpuLhf21jAiUPMy7qdBp7qsU7Z",
+                "reason": "newInformation",
+            }),
+            to_v(
+                s::vetting::revoke_statement::v0_1::Response::try_from(
+                    s::vetting::revoke_statement::v0_1::Response::builder()
+                        .recorded_at(TS.parse::<DateTime<chrono::Utc>>().unwrap()),
+                )
+                .expect("revoke-statement response")
+            )
+        ),
+        checked!(
+            s::vetting::vetters::grant::v0_1::Payload,
+            s::vetting::vetters::grant::v0_1::Response,
+            json!({ "memberDid": OTHER_DID, "validitySeconds": 31_536_000 }),
+            to_v(
+                s::vetting::vetters::grant::v0_1::Response::try_from(
+                    s::vetting::vetters::grant::v0_1::Response::builder()
+                        .endorsement_id(REQUEST_ID)
+                        .credential_id(format!("urn:uuid:{REQUEST_ID}"))
+                        .valid_from(TS.parse::<DateTime<chrono::Utc>>().unwrap())
+                        .valid_until(
+                            "2027-08-23T00:00:00Z"
+                                .parse::<DateTime<chrono::Utc>>()
+                                .unwrap()
+                        ),
+                )
+                .expect("grant response")
+            )
+        ),
+        checked!(
+            s::vetting::vetters::profile::v0_1::Payload,
+            s::vetting::vetters::profile::v0_1::Response,
+            json!({
+                "listed": true,
+                "displayName": "Carol M.",
+                "languages": ["en", "de-AT"],
+                "location": { "country": "AT", "city": "Vienna" },
+                "methods": ["inPerson", "video"],
+                "acceptsDocumentation": ["passport", "none"],
+                "events": [{ "name": "Kernel Maintainers Meetup",
+                             "startDate": "2026-10-05", "endDate": "2026-10-07" }],
+            }),
+            to_v(
+                s::vetting::vetters::profile::v0_1::Response::try_from(
+                    s::vetting::vetters::profile::v0_1::Response::builder()
+                        .listed(true)
+                        .updated_at(TS.parse::<DateTime<chrono::Utc>>().unwrap()),
+                )
+                .expect("profile response")
+            )
+        ),
+        checked!(
+            s::vetting::vetters::show::v0_1::Payload,
+            s::vetting::vetters::show::v0_1::Response,
+            json!({ "vetterDid": OTHER_DID }),
+            to_v(
+                s::vetting::vetters::show::v0_1::Response::try_from(
+                    s::vetting::vetters::show::v0_1::Response::builder()
+                        .vetter_did(
+                            s::vetting::vetters::show::v0_1::ResponseVetterDid::try_from(OTHER_DID)
+                                .expect("vetter did")
+                        )
+                        .status(s::vetting::vetters::show::v0_1::GrantStatus::Live)
+                        .grant_id(Some(
+                            s::vetting::vetters::show::v0_1::ResponseGrantId::try_from(
+                                "3f1b0c1e-9d2a-4a7f-9a1e-2b6c5d4e3f21"
+                            )
+                            .expect("grant id")
+                        ))
+                        .valid_until(Some(TS.parse::<DateTime<chrono::Utc>>().unwrap()))
+                        .listed(Some(true)),
+                )
+                .expect("show response")
+            )
+        ),
+        checked!(
+            s::vetting::vetters::list::v0_1::Payload,
+            s::vetting::vetters::list::v0_1::Response,
+            json!({ "language": "de", "eventFrom": "2026-10-01", "limit": 10 }),
+            to_v(
+                s::vetting::vetters::list::v0_1::Response::try_from(
+                    s::vetting::vetters::list::v0_1::Response::builder()
+                        .vetters(vec![
+                            serde_json::from_value::<s::vetting::vetters::list::v0_1::ListedVetter>(
+                                json!({
+                                    "vetterDid": OTHER_DID,
+                                    "displayName": "Carol M.",
+                                    "languages": ["en", "de-AT"],
+                                    "methods": ["inPerson"],
+                                    "acceptsDocumentation": ["passport"],
+                                    "events": [],
+                                    "grantValidUntil": TS,
+                                    "updatedAt": TS,
+                                }),
+                            )
+                            .expect("listed vetter"),
+                        ])
+                        .next_cursor(Some(
+                            s::vetting::vetters::list::v0_1::ResponseNextCursor::try_from(
+                                "b2Zmc2V0OjEw"
+                            )
+                            .expect("cursor"),
+                        )),
+                )
+                .expect("list response")
+            )
+        ),
+        checked!(
+            s::vetting::vetters::resend::v0_2::Payload,
+            s::vetting::vetters::resend::v0_2::Response,
+            // The administrator's route: `memberDid` names whose grant to
+            // resend, instead of the sender's own (an empty payload).
+            json!({ "memberDid": OTHER_DID }),
+            to_v(
+                s::vetting::vetters::resend::v0_2::Response::try_from(
+                    s::vetting::vetters::resend::v0_2::Response::builder()
+                        .credential_id(format!("urn:uuid:{REQUEST_ID}"))
+                        .valid_until(TS.parse::<DateTime<chrono::Utc>>().unwrap()),
+                )
+                .expect("resend response")
+            )
+        ),
+        // ─── b2 admin surfaces (trust_tasks::surface_tasks) ──────────
+        //
+        // Each response is the envelope `surface_tasks` builds around the
+        // value its handler reads or writes, and that value is built from its
+        // real type (or round-tripped through it) rather than typed out.
+        checked!(
+            s::community::branding::show::v0_1::Payload,
+            s::community::branding::show::v0_1::Response,
+            json!({}),
+            json!({ "branding": branding() })
+        ),
+        checked!(
+            s::community::branding::update::v0_1::Payload,
+            s::community::branding::update::v0_1::Response,
+            json!({ "branding": branding() }),
+            json!({ "branding": branding() })
+        ),
+        checked!(
+            s::community::theme::show::v0_1::Payload,
+            s::community::theme::show::v0_1::Response,
+            json!({}),
+            json!({ "stylesheet": ":root { --brand: #0a7f5c; }", "updatedAt": TS })
+        ),
+        checked!(
+            s::community::theme::update::v0_1::Payload,
+            s::community::theme::update::v0_1::Response,
+            json!({ "stylesheet": ":root { --brand: #0a7f5c; }", "dryRun": true }),
+            json!({ "stylesheet": ":root { --brand: #0a7f5c; }", "stored": false })
+        ),
+        // The handlers build both answers as the generated types; these pin
+        // the request shapes each side sends. Removal (`remove: true`,
+        // `logo: null`) is exercised end to end by `tests/it/community_logo.rs`.
+        checked!(
+            s::community::logo::update::v0_1::Payload,
+            s::community::logo::update::v0_1::Response,
+            json!({ "image": { "mediaType": "image/png", "data": "iVBORw0KGgo" } }),
+            json!({
+                "logo": {
+                    "sha256": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+                    "mediaType": "image/png",
+                    "size": 18342,
+                    "width": 512,
+                    "height": 256,
+                    "url": "https://community.example/v1/community/logo",
+                },
+                "stored": true,
+                "updatedAt": TS,
+            })
+        ),
+        checked!(
+            s::community::logo::show::v0_1::Payload,
+            s::community::logo::show::v0_1::Response,
+            json!({ "includeData": true }),
+            json!({
+                "logo": {
+                    "sha256": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+                    "mediaType": "image/png",
+                    "size": 18342,
+                    "width": 512,
+                    "height": 256,
+                },
+                "data": "iVBORw0KGgo",
+                "updatedAt": TS,
+            })
+        ),
+        checked!(
+            s::community::requested_attributes::show::v0_1::Payload,
+            s::community::requested_attributes::show::v0_1::Response,
+            json!({}),
+            json!({ "requestedAttributes": requested_attributes() })
+        ),
+        checked!(
+            s::community::requested_attributes::update::v0_1::Payload,
+            s::community::requested_attributes::update::v0_1::Response,
+            json!({ "requestedAttributes": requested_attributes() }),
+            json!({ "requestedAttributes": requested_attributes() })
+        ),
+        checked!(
+            s::community::join_discovery::show::v0_1::Payload,
+            s::community::join_discovery::show::v0_1::Response,
+            json!({}),
+            json!({ "joinDiscovery": join_discovery() })
+        ),
+        checked!(
+            s::community::join_discovery::update::v0_1::Payload,
+            s::community::join_discovery::update::v0_1::Response,
+            json!({ "joinDiscovery": join_discovery() }),
+            json!({ "joinDiscovery": join_discovery() })
+        ),
+        checked!(
+            s::schemas::register::v0_1::Payload,
+            s::schemas::register::v0_1::Response,
+            json!({
+                "typeUri": SCHEMA_TYPE,
+                "dtgType": "MembershipCredential",
+                "credentialSchema": { "type": "object" },
+                "kind": "accepts",
+                "description": "Membership evidence",
+            }),
+            json!({ "schema": schema_entry() })
+        ),
+        checked!(
+            s::schemas::list::v0_1::Payload,
+            s::schemas::list::v0_1::Response,
+            json!({ "kind": "accepts", "cursor": "o0", "limit": 50 }),
+            json!({
+                "items": [to_v(crate::trust_tasks::surface_tasks::SchemaSummary {
+                    type_uri: SCHEMA_TYPE.into(),
+                    dtg_type: Some("MembershipCredential".into()),
+                    kind: crate::schemas::SchemaKind::Accepts,
+                    description: Some("Membership evidence".into()),
+                    has_credential_schema: true,
+                    created_at: TS.parse().expect("fixture timestamp"),
+                    created_by_did: OTHER_DID.into(),
+                })],
+                "nextCursor": "o1",
+            })
+        ),
+        checked!(
+            s::schemas::show::v0_1::Payload,
+            s::schemas::show::v0_1::Response,
+            json!({ "typeUri": SCHEMA_TYPE }),
+            json!({ "schema": schema_entry() })
+        ),
+        checked!(
+            s::schemas::delete::v0_1::Payload,
+            s::schemas::delete::v0_1::Response,
+            json!({ "typeUri": SCHEMA_TYPE }),
+            json!({ "typeUri": SCHEMA_TYPE })
+        ),
+        checked!(
+            s::schemas::accepts::register::v0_2::Payload,
+            s::schemas::accepts::register::v0_2::Response,
+            json!({
+                "id": "membership",
+                "admission": "automatic",
+                "query": dcql_query(),
+                "credentialIssuers": "recognised",
+                "description": "A membership credential",
+            }),
+            json!({ "criterion": accepts_criterion() })
+        ),
+        checked!(
+            s::schemas::accepts::list::v0_2::Payload,
+            s::schemas::accepts::list::v0_2::Response,
+            json!({ "cursor": "o0", "limit": 50 }),
+            json!({ "items": [accepts_criterion()] })
+        ),
+        checked!(
+            s::schemas::accepts::show::v0_2::Payload,
+            s::schemas::accepts::show::v0_2::Response,
+            json!({ "id": "membership" }),
+            json!({ "criterion": accepts_criterion() })
+        ),
+        checked!(
+            s::schemas::accepts::delete::v0_1::Payload,
+            s::schemas::accepts::delete::v0_1::Response,
+            json!({ "id": "membership" }),
+            json!({ "id": "membership" })
+        ),
+        checked!(
+            s::vetting::vetters::grants::list::v0_1::Payload,
+            s::vetting::vetters::grants::list::v0_1::Response,
+            json!({ "cursor": "o0", "limit": 50 }),
+            json!({
+                "items": [to_v(vta_sdk::protocols::vetting::VetterGrantRow {
+                    endorsement_id: "11111111-1111-4111-8111-111111111111".into(),
+                    member_did: DID.into(),
+                    credential_id: VEC_ID.into(),
+                    valid_from: TS.parse().expect("fixture timestamp"),
+                    valid_until: Some(TS.parse().expect("fixture timestamp")),
+                    revoked: false,
+                    revoked_at: None,
+                    live: true,
+                    origin: vta_sdk::protocols::vetting::GrantOrigin::Manual,
+                    profile: None,
+                })],
+            })
+        ),
+        checked!(
+            s::vetting::auto_grant::show::v0_1::Payload,
+            s::vetting::auto_grant::show::v0_1::Response,
+            json!({}),
+            json!({ "autoGrant": auto_grant_status() })
+        ),
+        checked!(
+            s::vetting::auto_grant::update::v0_1::Payload,
+            s::vetting::auto_grant::update::v0_1::Response,
+            to_v(vta_sdk::protocols::vetting::AutoGrantConfig {
+                enabled: true,
+                sweep_minutes: Some(60),
+                validity_seconds: Some(31_536_000),
+            }),
+            json!({ "autoGrant": auto_grant_status() })
+        ),
+        checked!(
+            s::vetting::revocations::list::v0_1::Payload,
+            s::vetting::revocations::list::v0_1::Response,
+            json!({ "reviewState": "needsReview", "cursor": "o0", "limit": 50 }),
+            json!({
+                "items": [to_v(crate::vetting::ops::VettingRevocationRow {
+                    issuer: OTHER_DID.into(),
+                    statement_id: VEC_ID.into(),
+                    statement_digest_multibase: "zQmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG".into(),
+                    reason: Some("mistake".into()),
+                    recorded_at: TS.parse().expect("fixture timestamp"),
+                    review_state: crate::vetting::ops::RevocationReviewState::NeedsReview,
+                    affected_join_requests: vec![uuid()],
+                    affected_members: vec![DID.into()],
+                })],
+            })
+        ),
+        checked!(
+            s::relationships::suspend::v0_2::Payload,
+            s::relationships::suspend::v0_2::Response,
+            json!({ "id": REQUEST_ID, "reason": "under review" }),
+            to_v(crate::relationships::ops::LifecycleResponse {
+                id: uuid(),
+                state: crate::relationships::InForce::Suspended {
+                    since: TS.parse().expect("fixture timestamp"),
+                },
+            })
+        ),
+        checked!(
+            s::relationships::restore::v0_2::Payload,
+            s::relationships::restore::v0_2::Response,
+            json!({ "id": REQUEST_ID }),
+            to_v(crate::relationships::ops::LifecycleResponse {
+                id: uuid(),
+                state: crate::relationships::InForce::Yes,
+            })
+        ),
+        checked!(
+            s::join_requests::vetting::show::v0_1::Payload,
+            s::join_requests::vetting::show::v0_1::Response,
+            json!({ "id": REQUEST_ID }),
+            {
+                use crate::join::ops::read as r;
+                to_v(r::JoinRequestVettingResponse {
+                    request_id: uuid(),
+                    vetting: Some(r::JoinRequestVetting {
+                        criterion_id: "membership".into(),
+                        requirements_digest: "zQmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+                            .into(),
+                        applicant_digest_matches: true,
+                        statements: vec![r::JoinRequestVettingStatement {
+                            id: Some(VEC_ID.into()),
+                            issuer: Some(OTHER_DID.into()),
+                            verified: true,
+                            eligible: true,
+                            revoked: false,
+                            withdrawn_now: false,
+                            method: Some("inPerson".into()),
+                            declared_relationship: Some("communityColleague".into()),
+                            counted: true,
+                            failures: vec![],
+                        }],
+                        distinct_counted_vetters: 1,
+                        by_method: [("inPerson".to_string(), 1)].into_iter().collect(),
+                        commitments_consistent: true,
+                        independence_ok: true,
+                        invitation_required: false,
+                        satisfied: true,
+                        needs: vec![],
+                        recorded_at: TS.parse().expect("fixture timestamp"),
+                    }),
+                })
+            }
+        ),
+        checked!(
+            s::join_requests::query::v0_1::Payload,
+            s::join_requests::query::v0_1::Response,
+            // `SendQueryRequest` (join/ops/present.rs) is read, never
+            // written, so it has no `Serialize` to build this from.
+            json!({ "holderDid": DID, "criterionId": "membership" }),
+            to_v(crate::join::ops::present::SendQueryResponse {
+                thread_id: REQUEST_ID.into(),
+                holder_did: DID.into(),
+                query: vta_sdk::protocols::credential_exchange::QueryBody {
+                    dcql_query: affinidi_openid4vp::DcqlQuery::from_json(&dcql_query())
+                        .expect("fixture DCQL parses"),
+                    nonce: "b7c1e0a94f2d4e8ab5c36f01d9e27a3c".into(),
+                    purpose: "Show that you are a member of Example Community".into(),
+                    oid4vp_session: None,
+                },
+                delivered: true,
+            })
+        ),
+        checked!(
+            s::rooms::list::v0_2::Payload,
+            s::rooms::list::v0_2::Response,
+            json!({ "lifecycle": "live", "cursor": "o0", "limit": 50 }),
+            json!({
+                "items": [to_v(crate::routes::rooms::HostedRoom {
+                    room_id: "room-1".into(),
+                    owner_did: DID.into(),
+                    visibility: "attributed".into(),
+                    retention_policy: "chained".into(),
+                    epoch: 3,
+                    lifecycle: "live".into(),
+                    epoch_expires_at: Some("2026-08-25T00:00:00Z".into()),
+                    retention_days: 30,
+                    mirror_of: None,
+                    created_at: "2026-08-17T20:53:20Z".into(),
+                    updated_at: "2026-08-23T15:46:40Z".into(),
+                })],
+            })
+        ),
+    ];
+    #[cfg(feature = "vetting-pcs")]
+    table.extend(pcs_witnesses());
+    #[cfg(feature = "voting")]
+    table.extend(election_witnesses());
+    table
+}
+
+/// Community elections (`vtc/elections/*`), witnessed only where they are bound: each the
+/// specification's own example request and response. `create/0.4` and `show/0.3` carry the
+/// same example with a `textReleaseThreshold` of 3, which their voting/_shared/0.3 manifest
+/// admits and 0.2's refuses (VTI-VOT-065).
+#[cfg(feature = "voting")]
+#[allow(deprecated)] // create/0.3 and show/0.2: still served, and witnessed
+fn election_witnesses() -> Vec<Conformance> {
+    use vti_specs::vtc as s;
+    vec![
+        checked!(
+            s::elections::create::v0_3::Payload,
+            s::elections::create::v0_3::Response,
+            serde_json::from_str::<Value>(r#"{"manifest": {"electionId": "board-2026", "community": "did:webvh:QmCommunity:community.example", "title": "Board election 2026", "questions": [{"key": "chair", "type": "choice", "text": "Who should chair the board?", "options": [{"key": "alice", "label": "Alice"}, {"key": "bob", "label": "Bob"}], "minSelections": 1, "maxSelections": 1, "optional": true}], "secrecy": "open", "roll": {"rule": "members"}, "registrationOpensAt": "2026-11-01T00:00:00Z", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "revote": "replace", "board": {"visibility": "public", "auditors": ["did:web:audit.example"]}, "ballotBox": "did:web:ballots.example", "binding": true, "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "state": "registered", "actionId": "act_Vb3k9Qm2Lp7xR4tZ"}"#).unwrap()
+        ),
+        checked!(
+            s::elections::create::v0_4::Payload,
+            s::elections::create::v0_4::Response,
+            serde_json::from_str::<Value>(r#"{"manifest": {"electionId": "board-2026", "community": "did:webvh:QmCommunity:community.example", "title": "Board election 2026", "questions": [{"key": "chair", "type": "choice", "text": "Who should chair the board?", "options": [{"key": "alice", "label": "Alice"}, {"key": "bob", "label": "Bob"}], "minSelections": 1, "maxSelections": 1, "optional": true}], "secrecy": "open", "roll": {"rule": "members"}, "registrationOpensAt": "2026-11-01T00:00:00Z", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "revote": "replace", "board": {"visibility": "public", "auditors": ["did:web:audit.example"]}, "ballotBox": "did:web:ballots.example", "binding": true, "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 3}}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "state": "registered", "actionId": "act_Vb3k9Qm2Lp7xR4tZ"}"#).unwrap()
+        ),
+        checked!(
+            s::elections::list::v0_3::Payload,
+            s::elections::list::v0_3::Response,
+            serde_json::from_str::<Value>(r#"{"state": "voting", "limit": 20}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"elections": [{"electionId": "board-2026", "title": "Board election 2026", "state": "voting", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "binding": true, "ticketHeld": true}]}"#).unwrap()
+        ),
+        checked!(
+            s::elections::show::v0_2::Payload,
+            s::elections::show::v0_2::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"manifest": {"electionId": "board-2026", "community": "did:webvh:QmCommunity:community.example", "title": "Board election 2026", "questions": [{"key": "chair", "type": "choice", "text": "Who should chair the board?", "options": [{"key": "alice", "label": "Alice"}, {"key": "bob", "label": "Bob"}], "minSelections": 1, "maxSelections": 1, "optional": true}], "secrecy": "open", "roll": {"rule": "members"}, "registrationOpensAt": "2026-11-01T00:00:00Z", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "revote": "replace", "board": {"visibility": "public", "auditors": ["did:web:audit.example"]}, "ballotBox": "did:web:ballots.example", "binding": true, "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}, "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "state": "registration", "parameters": {"suite": "ps-ddh-bls12381", "votingKey": "z3Xef1JY2x1s2vY6yKWfLu8Ap2vKuoZGwaQLZ2tjq8QkEZbGeZyaNgtznZ8B7N1yf14"}, "disclosure": {"ballotBox": "did:web:ballots.example", "ballotBoxOperator": "Ballots Example Ltd", "sameOperator": false, "boardVisibility": "public", "auditors": ["did:web:audit.example"], "revote": "replace", "coercionResistance": false}, "checkpoints": [{"head": {"electionId": "board-2026", "treeSize": 0, "rootHash": "zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n", "issuedAt": "2026-11-01T00:00:05Z"}, "document": {"id": "urn:uuid:92a3b4c5-d6e7-4f80-a9ba-2b3c4d5e6f70", "type": "https://trusttasks.org/spec/voting/board/head/0.1#response", "issuer": "did:web:ballots.example", "recipient": "did:webvh:QmCommunity:community.example", "issuedAt": "2026-11-01T00:00:05Z", "threadId": "urn:uuid:a3b4c5d6-e7f8-4091-bacb-3c4d5e6f7081", "payload": {"head": {"electionId": "board-2026", "treeSize": 0, "rootHash": "zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n", "issuedAt": "2026-11-01T00:00:05Z"}}, "proof": {"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:web:ballots.example#key-1", "created": "2026-11-01T00:00:05Z", "proofPurpose": "assertionMethod", "proofValue": "z5BallotBoxHeadProofValue"}}}]}"#).unwrap()
+        ),
+        checked!(
+            s::elections::show::v0_3::Payload,
+            s::elections::show::v0_3::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026"}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"manifest": {"electionId": "board-2026", "community": "did:webvh:QmCommunity:community.example", "title": "Board election 2026", "questions": [{"key": "chair", "type": "choice", "text": "Who should chair the board?", "options": [{"key": "alice", "label": "Alice"}, {"key": "bob", "label": "Bob"}], "minSelections": 1, "maxSelections": 1, "optional": true}], "secrecy": "open", "roll": {"rule": "members"}, "registrationOpensAt": "2026-11-01T00:00:00Z", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "revote": "replace", "board": {"visibility": "public", "auditors": ["did:web:audit.example"]}, "ballotBox": "did:web:ballots.example", "binding": true, "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 3}, "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "state": "registration", "parameters": {"suite": "ps-ddh-bls12381", "votingKey": "z3Xef1JY2x1s2vY6yKWfLu8Ap2vKuoZGwaQLZ2tjq8QkEZbGeZyaNgtznZ8B7N1yf14"}, "disclosure": {"ballotBox": "did:web:ballots.example", "ballotBoxOperator": "Ballots Example Ltd", "sameOperator": false, "boardVisibility": "public", "auditors": ["did:web:audit.example"], "revote": "replace", "coercionResistance": false}, "checkpoints": [{"head": {"electionId": "board-2026", "treeSize": 0, "rootHash": "zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n", "issuedAt": "2026-11-01T00:00:05Z"}, "document": {"id": "urn:uuid:92a3b4c5-d6e7-4f80-a9ba-2b3c4d5e6f70", "type": "https://trusttasks.org/spec/voting/board/head/0.1#response", "issuer": "did:web:ballots.example", "recipient": "did:webvh:QmCommunity:community.example", "issuedAt": "2026-11-01T00:00:05Z", "threadId": "urn:uuid:a3b4c5d6-e7f8-4091-bacb-3c4d5e6f7081", "payload": {"head": {"electionId": "board-2026", "treeSize": 0, "rootHash": "zQmdfTbBqBPQ7VNxZEYEj14VmRuZBkqFbiwReogJgS1zR1n", "issuedAt": "2026-11-01T00:00:05Z"}}, "proof": {"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:web:ballots.example#key-1", "created": "2026-11-01T00:00:05Z", "proofPurpose": "assertionMethod", "proofValue": "z5BallotBoxHeadProofValue"}}}]}"#).unwrap()
+        ),
+        checked!(
+            s::elections::close::v0_1::Payload,
+            s::elections::close::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "motion-17", "reason": "Every one of the 12 eligible members has voted."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "motion-17", "state": "closed"}"#).unwrap()
+        ),
+        checked!(
+            s::elections::cancel::v0_1::Payload,
+            s::elections::cancel::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "reason": "The candidate list omitted a nominee; the election will be created again."}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "state": "cancelled"}"#).unwrap()
+        ),
+        checked!(
+            s::elections::certify::v0_1::Payload,
+            s::elections::certify::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "auditAttestations": [{"@context": ["https://www.w3.org/ns/credentials/v2"], "type": ["VerifiableCredential"], "issuer": "did:web:audit.example", "validFrom": "2026-11-15T18:00:00Z", "credentialSubject": {"electionId": "board-2026", "community": "did:webvh:QmCommunity:community.example", "treeSize": 84, "rootHash": "zQmPXME1oRtoT627YKaDPDQ3PwA8tdP9rWuAAweLzqSwAWT"}}]}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "result": {"electionId": "board-2026", "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "ballotsCounted": 80, "questions": [{"question": "chair", "abstained": 2, "choice": {"alice": 41, "bob": 37}}], "head": {"electionId": "board-2026", "treeSize": 84, "rootHash": "zQmPXME1oRtoT627YKaDPDQ3PwA8tdP9rWuAAweLzqSwAWT", "issuedAt": "2026-11-15T00:00:03Z"}}, "head": {"electionId": "board-2026", "treeSize": 84, "rootHash": "zQmPXME1oRtoT627YKaDPDQ3PwA8tdP9rWuAAweLzqSwAWT", "issuedAt": "2026-11-15T00:00:03Z"}, "certifiedAt": "2026-11-16T09:00:19Z", "auditAttestations": [{"@context": ["https://www.w3.org/ns/credentials/v2"], "type": ["VerifiableCredential"], "issuer": "did:web:audit.example", "validFrom": "2026-11-15T18:00:00Z", "credentialSubject": {"electionId": "board-2026", "community": "did:webvh:QmCommunity:community.example", "treeSize": 84, "rootHash": "zQmPXME1oRtoT627YKaDPDQ3PwA8tdP9rWuAAweLzqSwAWT"}}]}"#).unwrap()
+        ),
+        checked!(
+            s::elections::ballot_boxes::list::v0_1::Payload,
+            s::elections::ballot_boxes::list::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"ballotBoxes": [{"did": "did:webvh:QmBallots:votes.example.net", "operator": "Ballots Example Ltd", "sameOperator": false}, {"did": "did:webvh:QmOwnBox:votes.community.example", "operator": "Community Example Hosting", "sameOperator": true}]}"#).unwrap()
+        ),
+        checked!(
+            s::elections::tickets::issue::v0_1::Payload,
+            s::elections::tickets::issue::v0_1::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "request": {"label": "voter/board-2026", "id": "z5jokfsiZx1sk1mJyQnBnR519B9mcQhw9a8LrF9VQdAjExwoLzcdVdZ2aXaH14a3mdF", "request": {"encoding": "z6P4jNSt4qHKYhSBGSWgr6VcQGMsjmfYGUBdYWNtS7xbpGsTuiY1PDfoce4yTApuqUm", "proof": "zSzFTCny3qaXpSHTsTE877ffQfSuF9T5zo53iuZkwx9NbLYSq3GeLZpRda286SBhqwJg"}}}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "board-2026", "label": "voter/board-2026", "preCredential": "z3Xef1JY2x1s2vY6yKWfLu8Ap2vKuoZGwaQLZ2tjq8QkEZbGeZyaNgtznZ8B7N1yf14"}"#).unwrap()
+        ),
+        checked!(
+            s::elections::create::v0_5::Payload,
+            s::elections::create::v0_5::Response,
+            serde_json::from_str::<Value>(r#"{"manifest": {"electionId": "eng-offsite-2026", "community": "did:webvh:QmCommunity:community.example", "title": "Engineering offsite 2026", "questions": [{"key": "venue", "type": "choice", "text": "Where should we meet?", "options": [{"key": "lisbon"}, {"key": "berlin"}], "minSelections": 1, "maxSelections": 1, "optional": true}], "secrecy": "open", "roll": {"rule": "credential", "memberOf": "did:webvh:QmGroupEng:community.example:groups:g7"}, "registrationOpensAt": "2026-11-01T00:00:00Z", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "revote": "replace", "board": {"visibility": "public", "auditors": ["did:web:audit.example"]}, "ballotBox": "did:web:ballots.example", "binding": false, "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "eng-offsite-2026", "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "state": "registered"}"#).unwrap()
+        ),
+        checked!(
+            s::elections::list::v0_5::Payload,
+            s::elections::list::v0_5::Response,
+            serde_json::from_str::<Value>(r#"{"state": "voting", "limit": 20}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"elections": [{"electionId": "eng-offsite-2026", "title": "Engineering offsite 2026", "state": "voting", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "binding": false, "ticketHeld": false}]}"#).unwrap()
+        ),
+        checked!(
+            s::elections::show::v0_6::Payload,
+            s::elections::show::v0_6::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "eng-offsite-2026", "presentation": {"@context": ["https://www.w3.org/ns/credentials/v2"], "type": ["VerifiablePresentation"], "holder": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", "nonce": "urn:uuid:9e0f1a2b-3c4d-45e6-8f70-8192a3b4c5d6", "domain": "did:webvh:QmCommunity:community.example", "verifiableCredential": [{"@context": ["https://www.w3.org/ns/credentials/v2"], "type": ["VerifiableCredential", "MembershipCredential"], "issuer": "did:webvh:QmGroupEng:community.example:groups:g7", "validFrom": "2026-10-25T00:00:00Z", "validUntil": "2026-11-24T00:00:00Z", "credentialSubject": {"id": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"}, "proof": {"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "proofValue": "z5vExampleCredentialProof"}}], "proof": {"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK#z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", "proofPurpose": "authentication", "proofValue": "z2pExamplePresentationProof"}}}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"manifest": {"electionId": "eng-offsite-2026", "community": "did:webvh:QmCommunity:community.example", "title": "Engineering offsite 2026", "questions": [{"key": "venue", "type": "choice", "text": "Where should we meet?", "options": [{"key": "lisbon"}, {"key": "berlin"}], "minSelections": 1, "maxSelections": 1, "optional": true}], "secrecy": "open", "roll": {"rule": "credential", "memberOf": "did:webvh:QmGroupEng:community.example:groups:g7"}, "registrationOpensAt": "2026-11-01T00:00:00Z", "votingOpensAt": "2026-11-08T00:00:00Z", "votingClosesAt": "2026-11-15T00:00:00Z", "revote": "replace", "board": {"visibility": "public", "auditors": ["did:web:audit.example"]}, "ballotBox": "did:web:ballots.example", "binding": false, "allowEarlyClose": false, "resultsBeforeClose": false, "textReleaseThreshold": 10}, "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "state": "registration", "parameters": {"suite": "ps-ddh-bls12381", "votingKey": "z3Xef1JY2x1s2vY6yKWfLu8Ap2vKuoZGwaQLZ2tjq8QkEZbGeZyaNgtznZ8B7N1yf14"}, "disclosure": {"ballotBox": "did:web:ballots.example", "ballotBoxOperator": "Ballots Example Ltd", "sameOperator": false, "boardVisibility": "public", "auditors": ["did:web:audit.example"], "revote": "replace", "coercionResistance": false, "rollCredential": {"memberOf": "did:webvh:QmGroupEng:community.example:groups:g7", "memberOfKind": "communityGroup", "memberOfName": "Engineering", "presenterDisclosed": true}}, "checkpoints": []}"#).unwrap()
+        ),
+        checked!(
+            s::elections::tickets::issue::v0_3::Payload,
+            s::elections::tickets::issue::v0_3::Response,
+            serde_json::from_str::<Value>(r#"{"electionId": "eng-offsite-2026", "manifestDigest": "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR", "request": {"label": "voter/eng-offsite-2026", "id": "z5jokfsiZx1sk1mJyQnBnR519B9mcQhw9a8LrF9VQdAjExwoLzcdVdZ2aXaH14a3mdF", "request": {"encoding": "z6P4jNSt4qHKYhSBGSWgr6VcQGMsjmfYGUBdYWNtS7xbpGsTuiY1PDfoce4yTApuqUm", "proof": "zSzFTCny3qaXpSHTsTE877ffQfSuF9T5zo53iuZkwx9NbLYSq3GeLZpRda286SBhqwJg"}}, "presentation": {"@context": ["https://www.w3.org/ns/credentials/v2"], "type": ["VerifiablePresentation"], "holder": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", "nonce": "urn:uuid:9e0f1a2b-3c4d-45e6-8f70-8192a3b4c5d6", "domain": "did:webvh:QmCommunity:community.example", "verifiableCredential": [{"@context": ["https://www.w3.org/ns/credentials/v2"], "type": ["VerifiableCredential", "MembershipCredential"], "issuer": "did:webvh:QmGroupEng:community.example:groups:g7", "validFrom": "2026-10-25T00:00:00Z", "validUntil": "2026-11-24T00:00:00Z", "credentialSubject": {"id": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"}, "proof": {"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "proofValue": "z5vExampleCredentialProof"}}], "proof": {"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK#z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", "proofPurpose": "authentication", "proofValue": "z2pExamplePresentationProof"}}}"#).unwrap(),
+            serde_json::from_str::<Value>(r#"{"electionId": "eng-offsite-2026", "label": "voter/eng-offsite-2026", "preCredential": "z3Xef1JY2x1s2vY6yKWfLu8Ap2vKuoZGwaQLZ2tjq8QkEZbGeZyaNgtznZ8B7N1yf14"}"#).unwrap()
+        ),
+    ]
+}
+
+/// Hidden vetting's four exchanges (`zkp-pcs`), witnessed only where they are bound.
+///
+/// Built directly from the generated types (`trust-tasks-rs` 0.22+): the same ones
+/// `vetting::pcs_tasks`'s handlers use. The multibase values are placeholders of the right
+/// alphabet; whether the library's real encoding of a root request and a token batch meets
+/// these schemas is asserted against live output in `vetting::pcs_issue`'s enrolment test,
+/// where one exists.
+#[cfg(feature = "vetting-pcs")]
+fn pcs_witnesses() -> Vec<Conformance> {
+    use vti_specs::vtc as s;
+
+    /// Finish a generated builder into its `#[non_exhaustive]` type. Fixture data, so a
+    /// validation failure (a placeholder that stopped matching the specification's own pattern)
+    /// panics rather than threading a `Result` through every witness below.
+    fn finish<B, T: TryFrom<B>>(builder: B) -> T
+    where
+        T::Error: std::fmt::Display,
+    {
+        T::try_from(builder).unwrap_or_else(|e| panic!("fixture builds: {e}"))
+    }
+
+    const MB: &str = "z3yZe7d4yBMmB6ifs9NAJ3Z6z1pkcvXq5j3HLMdjU8uK";
+    let date = |d: &str| d.parse::<chrono::NaiveDate>().expect("fixture date");
+    let window = || {
+        finish::<_, s::vetting::vetters::event_mode::v0_1::Window>(
+            s::vetting::vetters::event_mode::v0_1::Window::builder()
+                .start_date(date("2026-10-05"))
+                .end_date(date("2026-10-07")),
+        )
+    };
+    vec![
+        checked!(
+            s::vetting::vetters::pcs_root::v0_1::Payload,
+            s::vetting::vetters::pcs_root::v0_1::Response,
+            to_v(finish::<_, s::vetting::vetters::pcs_root::v0_1::Payload>(
+                s::vetting::vetters::pcs_root::v0_1::Payload::builder()
+                    .label("vetter/2026-09")
+                    .id(MB)
+                    .request(finish::<
+                        _,
+                        s::vetting::vetters::pcs_root::v0_1::PayloadRequest,
+                    >(
+                        s::vetting::vetters::pcs_root::v0_1::PayloadRequest::builder()
+                            .encoding(finish::<
+                                _,
+                                s::vetting::vetters::pcs_root::v0_1::PayloadRequestEncoding,
+                            >(MB.to_string()))
+                            .t0(finish::<
+                                _,
+                                s::vetting::vetters::pcs_root::v0_1::PayloadRequestT0,
+                            >(MB.to_string()))
+                            .proof(finish::<
+                                _,
+                                s::vetting::vetters::pcs_root::v0_1::PayloadRequestProof,
+                            >(MB.to_string())),
+                    ))
+            )),
+            to_v(finish::<_, s::vetting::vetters::pcs_root::v0_1::Response>(
+                s::vetting::vetters::pcs_root::v0_1::Response::builder()
+                    .label("vetter/2026-09")
+                    .pre_credential(MB)
+            ))
+        ),
+        checked!(
+            s::vetting::vetters::pcs_tokens::v0_1::Payload,
+            s::vetting::vetters::pcs_tokens::v0_1::Response,
+            to_v(finish::<_, s::vetting::vetters::pcs_tokens::v0_1::Payload>(
+                s::vetting::vetters::pcs_tokens::v0_1::Payload::builder()
+                    .label("vetting-token/2026-09")
+                    .tick(3u64)
+                    .requests(vec![finish::<
+                        _,
+                        s::vetting::vetters::pcs_tokens::v0_1::PayloadRequestsItem,
+                    >(
+                        s::vetting::vetters::pcs_tokens::v0_1::PayloadRequestsItem::builder()
+                            .commitment(MB.to_string())
+                            .opening_proof(MB.to_string()),
+                    )])
+            )),
+            to_v(
+                finish::<_, s::vetting::vetters::pcs_tokens::v0_1::Response>(
+                    s::vetting::vetters::pcs_tokens::v0_1::Response::builder()
+                        .label("vetting-token/2026-09")
+                        .tick(3u64)
+                        .pre_credentials(vec![finish::<
+                            _,
+                            s::vetting::vetters::pcs_tokens::v0_1::ResponsePreCredentialsItem,
+                        >(MB.to_string())])
+                )
+            )
+        ),
+        checked!(
+            s::vetting::vetters::event_mode::v0_1::Payload,
+            s::vetting::vetters::event_mode::v0_1::Response,
+            to_v(finish::<_, s::vetting::vetters::event_mode::v0_1::Payload>(
+                s::vetting::vetters::event_mode::v0_1::Payload::builder()
+                    .event_id("devcon-2026")
+                    .tier("desk")
+                    .window(window())
+            )),
+            to_v(
+                finish::<_, s::vetting::vetters::event_mode::v0_1::Response>(
+                    s::vetting::vetters::event_mode::v0_1::Response::builder()
+                        .event_id("devcon-2026")
+                        .state("approved")
+                        .tier("desk")
+                        .window(window())
+                        .group_size(4u64)
+                        .group_floor(3i64)
+                        .label(Some(finish::<
+                            _,
+                            s::vetting::vetters::event_mode::v0_1::ResponseLabel,
+                        >(
+                            "vetting-token/devcon-2026/desk".to_string()
+                        )))
+                        .drip_per_tick(std::num::NonZeroU64::new(5))
+                        .closes_after(Some(date("2026-10-08")))
+                )
+            )
+        ),
+        checked!(
+            s::vetting::pcs_challenge::v0_1::Payload,
+            s::vetting::pcs_challenge::v0_1::Response,
+            to_v(finish::<_, s::vetting::pcs_challenge::v0_1::Payload>(
+                s::vetting::pcs_challenge::v0_1::Payload::builder()
+            )),
+            to_v(finish::<_, s::vetting::pcs_challenge::v0_1::Response>(
+                s::vetting::pcs_challenge::v0_1::Response::builder()
+                    .challenge("0123456789abcdef0123456789abcdef")
+                    .expires_at(TS.parse::<DateTime<chrono::Utc>>().unwrap())
+            ))
+        ),
+        // The community's own admin verb: turn hidden vetting on (or rotate its
+        // parameters) for a criterion. Plain JSON fixtures rather than the generated
+        // builder — the response nests `PublishedConfig`/`StoredConfig`, and this is
+        // exactly the shape `vetting::hidden::publish_hidden_vetting_core`
+        // builds, so the fixture doubles as a check that shape still matches.
+        checked!(
+            s::vetting::hidden::publish::v0_1::Payload,
+            s::vetting::hidden::publish::v0_1::Response,
+            json!({
+                "criterionId": "vetting-hidden-pilot",
+                "dripPerTick": 3,
+                "tickLength": "P1D",
+                "events": [],
+                "livePeriods": ["2026-09"],
+                "liveTokenLabels": ["token/2026-09"],
+            }),
+            json!({
+                "criterionId": "vetting-hidden-pilot",
+                "requirementsDigest": "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+                "published": {
+                    "suite": "pcs-bls12-381-g1",
+                    "helperKey": MB,
+                    "tokenKey": MB,
+                    "tokenLabels": ["token/2026-09"],
+                    "vetterLabels": ["vetter/2026-09"],
+                    "dripPerTick": 3,
+                    "tickLength": "P1D",
+                    "events": [],
+                },
+                "stored": {
+                    "suite": "pcs-bls12-381-g1",
+                    "hvk": MB,
+                    "tvk": MB,
+                    "livePeriods": ["2026-09"],
+                    "liveTokenLabels": ["token/2026-09"],
+                    "dripPerTick": 3,
+                    "tickLength": "P1D",
+                    "events": [],
+                },
+            })
+        ),
+        // Turning it off again: what `withdraw_hidden_vetting_core` answers.
+        checked!(
+            s::vetting::hidden::withdraw::v0_1::Payload,
+            s::vetting::hidden::withdraw::v0_1::Response,
+            json!({ "criterionId": "vetting-hidden-pilot" }),
+            json!({
+                "criterionId": "vetting-hidden-pilot",
+                "withdrawn": true,
+                "requirementsDigest": "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+            })
+        ),
+        // A member's own binding, with a reset waiting on a live label: what
+        // `pcs_tasks::handle_binding_show` builds from the enrolment record.
+        checked!(
+            s::vetting::vetters::pcs_binding::show::v0_1::Payload,
+            s::vetting::vetters::pcs_binding::show::v0_1::Response,
+            json!({}),
+            json!({
+                "bound": true,
+                "id": MB,
+                "enrolledLabels": ["vetter/2026-09", "vetter/2026-10"],
+                "reset": {
+                    "resetAt": "2026-11-02T14:20:00Z",
+                    "waitingOn": ["vetter/2026-10"],
+                    "open": false,
+                },
+            })
+        ),
+        // An administrator's reset: `pcs_tasks::handle_binding_reset`'s answer.
+        checked!(
+            s::vetting::vetters::pcs_binding::reset::v0_1::Payload,
+            s::vetting::vetters::pcs_binding::reset::v0_1::Response,
+            json!({
+                "memberDid": "did:key:z6MkVetter",
+                "reason": "Rebuilt their VTA; the old key cannot be recovered.",
+            }),
+            json!({
+                "memberDid": "did:key:z6MkVetter",
+                "resetAt": "2026-11-02T14:20:00Z",
+                "waitingOn": ["vetter/2026-10"],
+                "open": false,
+            })
+        ),
+        // The stored configuration and its counts: the shape
+        // `show_hidden_vetting_core` builds, an approved event included.
+        checked!(
+            s::vetting::hidden::show::v0_1::Payload,
+            s::vetting::hidden::show::v0_1::Response,
+            json!({ "criterionId": "vetting-hidden-pilot" }),
+            json!({
+                "criterionId": "vetting-hidden-pilot",
+                "enabled": true,
+                "requirementsDigest": "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+                "stored": {
+                    "suite": "pcs-bls12-381-g1",
+                    "hvk": MB,
+                    "tvk": MB,
+                    "livePeriods": ["2026-09"],
+                    "liveTokenLabels": ["token/2026-09", "token/event/summit-2026"],
+                    "dripPerTick": 3,
+                    "tickLength": "P3D",
+                    "events": [{
+                        "eventId": "summit-2026",
+                        "startDate": "2026-09-01",
+                        "endDate": "2026-09-03",
+                        "graceDays": 14,
+                        "groupFloor": 3,
+                        "tiers": [{ "name": "desk", "dripPerTick": 10 }],
+                        "approvedBy": "did:key:z6MkAdmin",
+                    }],
+                },
+                "published": {
+                    "suite": "pcs-bls12-381-g1",
+                    "helperKey": MB,
+                    "tokenKey": MB,
+                    "tokenLabels": ["token/2026-09", "token/event/summit-2026"],
+                    "vetterLabels": ["vetter/2026-09"],
+                    "dripPerTick": 3,
+                    "tickLength": "P3D",
+                    "events": [{
+                        "eventId": "summit-2026",
+                        "startDate": "2026-09-01",
+                        "endDate": "2026-09-03",
+                        "groupFloor": 3,
+                        "tiers": [{ "name": "desk", "dripPerTick": 10 }],
+                    }],
+                },
+                "enrolledVetters": { "vetter/2026-09": 4 },
+                "eventStatus": [{
+                    "eventId": "summit-2026",
+                    "groupFloor": 3,
+                    "groupSize": 1,
+                    "approved": true,
+                    "live": false,
+                }],
+            })
+        ),
+    ]
+}
+
+// ─── The sweep ───────────────────────────────────────────────────────────
+
+/// Coverage: the witness table and the derived census agree exactly, in both
+/// directions. A stream that binds a new published `spec/vtc/*` URI lands
+/// here first — that is the point.
+#[test]
+fn every_bound_published_uri_has_a_witness() {
+    let expected = resolved_uris();
+    assert!(
+        !expected.is_empty(),
+        "the census found no bound, published spec/vtc/ URIs at all — the \
+         scan is broken, not the code"
+    );
+
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+    for c in table() {
+        assert!(
+            covered.insert(c.witness().uri.to_owned()),
+            "duplicate witness entry for {} — one entry per URI",
+            c.witness().uri
+        );
+    }
+
+    let missing: Vec<_> = expected.difference(&covered).cloned().collect();
+    let template: String = missing
+        .iter()
+        .map(|uri| {
+            format!(
+                "    checked!(\n        /* the generated Payload type for {uri} */,\n        \
+                 /* the generated Response type */,\n        json!({{ /* a schema-valid \
+                 request */ }}),\n        json!({{ /* a schema-valid response, or {{}} if \
+                 fire-and-forget */ }}),\n    ),\n"
+            )
+        })
+        .collect::<String>();
+    assert!(
+        missing.is_empty(),
+        "these bound URIs are published in the registry but have no \
+         conformance witness:\n  {}\n\nAdd a `checked!` entry (request + \
+         response built from the wire types the handler actually emits), or \
+         — only for a real, understood non-conformance — a `drift!` entry \
+         with a reason.\n\nReady-to-fill template for each (the URI is read off the Payload \
+         type, never typed by hand):\n{template}",
+        missing.join("\n  ")
+    );
+
+    let stale: Vec<_> = covered.difference(&expected).cloned().collect();
+    assert!(
+        stale.is_empty(),
+        "these witnesses cover URIs that are no longer both bound and \
+         published:\n  {}\n\nRemove them, or fix the spec module they name.",
+        stale.join("\n  ")
+    );
+}
+
+/// The delivery members a status poll answers with on an approved request
+/// (tf#709) speak the published schema: `credentialsDelivered`,
+/// `credentialResend` in its camelCase spelling, and `retryAfter`. The witness
+/// table carries one response per URI, and status's is the rejected
+/// projection, so these are checked here.
+#[test]
+fn status_credential_delivery_speaks_its_published_schema() {
+    use vta_sdk::protocols::join_requests as jr;
+    type R = vti_specs::vtc::join_requests::status::v0_1::Response;
+    for resend in [
+        jr::CredentialResend::Queued,
+        jr::CredentialResend::NotNeeded,
+        jr::CredentialResend::RateLimited,
+    ] {
+        let v = to_v(jr::JoinRequestStatusResponseBody {
+            request_id: uuid(),
+            status: "approved".into(),
+            needs: vec![],
+            presentation_definition: None,
+            code: None,
+            reason: None,
+            decided_at: None,
+            credentials_delivered: Some(resend == jr::CredentialResend::NotNeeded),
+            credential_resend: Some(resend),
+            retry_after: (resend == jr::CredentialResend::RateLimited).then(|| {
+                DateTime::parse_from_rfc3339(TS)
+                    .expect("fixture ts")
+                    .with_timezone(&chrono::Utc)
+            }),
+        });
+        parses::<R>(v.clone()).unwrap_or_else(|e| panic!("{resend:?}: {e}\n{v:#}"));
+        validates::<R>(&v).unwrap_or_else(|e| panic!("{resend:?}: {e}\n{v:#}"));
+    }
+}
+
+/// Correctness: every conforming witness's request parses as the generated
+/// `Payload` and validates against its schema, and its response likewise
+/// against `Response` — and the check has teeth: a drifted (unknown-member)
+/// form of each MUST be rejected, so a witness cannot pass vacuously against
+/// a schema that accepts anything.
+#[test]
+fn every_witnessed_task_speaks_its_published_schema() {
+    for c in table() {
+        let Conformance::Checked(w) = &c else {
+            continue;
+        };
+        let uri = w.uri;
+
+        (w.parse_request)(w.request.clone())
+            .unwrap_or_else(|e| panic!("{uri}: request is not canonical: {e}\n{:#}", w.request));
+        (w.validate_request)(&w.request).unwrap_or_else(|e| {
+            panic!(
+                "{uri}: request fails its own payload schema: {e}\n{:#}",
+                w.request
+            )
+        });
+        (w.parse_response)(w.response.clone())
+            .unwrap_or_else(|e| panic!("{uri}: response is not canonical: {e}\n{:#}", w.response));
+        (w.validate_response)(&w.response).unwrap_or_else(|e| {
+            panic!(
+                "{uri}: response fails its own response schema: {e}\n{:#}",
+                w.response
+            )
+        });
+
+        assert_drifted_form_is_rejected(w);
+    }
+}
+
+/// The teeth: an unknown member must be rejected on both sides.
+///
+/// The generated types carry `deny_unknown_fields` wherever the spec is
+/// `additionalProperties: false`, which is every published `vtc/*` task
+/// today. A URI for which this stops holding needs review, not a silent pass.
+fn assert_drifted_form_is_rejected(w: &Witness) {
+    let uri = w.uri;
+    for (side, value, parse, validate) in [
+        ("request", &w.request, w.parse_request, w.validate_request),
+        (
+            "response",
+            &w.response,
+            w.parse_response,
+            w.validate_response,
+        ),
+    ] {
+        let mut drifted = value.clone();
+        drifted
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("{uri}: {side} witness must be a JSON object"))
+            .insert("__conformance_sweep_drift".into(), json!(true));
+        assert!(
+            parse(drifted.clone()).is_err() || validate(&drifted).is_err(),
+            "{uri}: the generated {side} type AND its schema both accepted an \
+             unknown member — this witness can pass vacuously and proves \
+             nothing"
+        );
+    }
+}
+
+/// Debt: every `KnownDrift` entry must still diverge, on the side it names,
+/// and must still conform on the side it does not.
+///
+/// A prose-only debt note is unfalsifiable — it cannot tell you the drift was
+/// fixed upstream, and it cannot tell you it was mis-diagnosed. This makes
+/// both visible: fix the divergence and this test fails asking you to promote
+/// the entry to `checked!`.
+#[test]
+fn known_drift_entries_still_diverge_where_they_say_they_do() {
+    let mut recorded: Vec<String> = Vec::new();
+
+    for c in table() {
+        let Conformance::KnownDrift {
+            reason,
+            side,
+            witness: w,
+        } = &c
+        else {
+            continue;
+        };
+        let uri = w.uri;
+        assert!(
+            !reason.trim().is_empty(),
+            "{uri}: KnownDrift entries must state the drift"
+        );
+
+        let request_ok = (w.parse_request)(w.request.clone()).is_ok()
+            && (w.validate_request)(&w.request).is_ok();
+        let response_ok = (w.parse_response)(w.response.clone()).is_ok()
+            && (w.validate_response)(&w.response).is_ok();
+
+        assert_eq!(
+            request_ok,
+            !side.request_diverges(),
+            "{uri}: the recorded drift says the request {}, but it actually \
+             {}. Re-diagnose the entry — a debt note that describes the wrong \
+             half is worse than none.\n{:#}",
+            if side.request_diverges() {
+                "diverges"
+            } else {
+                "conforms"
+            },
+            if request_ok { "conforms" } else { "diverges" },
+            w.request
+        );
+        assert_eq!(
+            response_ok,
+            !side.response_diverges(),
+            "{uri}: the recorded drift says the response {}, but it actually \
+             {}. If it was fixed (here or upstream), promote this entry to \
+             `checked!` and drop the KNOWN_DRIFT count by one.\n{:#}",
+            if side.response_diverges() {
+                "diverges"
+            } else {
+                "conforms"
+            },
+            if response_ok { "conforms" } else { "diverges" },
+            w.response
+        );
+
+        recorded.push(format!("{uri}: {reason}"));
+    }
+
+    // Debt is visible in the test output every run, not buried in a table.
+    for line in &recorded {
+        eprintln!("KNOWN DRIFT (follow-up issue required): {line}");
+    }
+
+    assert_eq!(
+        recorded.len(),
+        KNOWN_DRIFT_COUNT,
+        "the known-drift count changed. If it went DOWN, a divergence was \
+         closed — lower KNOWN_DRIFT_COUNT. If it went UP, a task was bound \
+         that does not speak its published schema; that is the thing this \
+         sweep exists to stop, and raising the number is the wrong fix unless \
+         the divergence is understood and written down."
+    );
+}

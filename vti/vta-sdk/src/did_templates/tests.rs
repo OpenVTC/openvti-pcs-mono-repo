@@ -1,0 +1,2630 @@
+//! End-to-end tests for template parsing, validation, and rendering.
+
+use serde_json::{Value, json};
+
+use super::*;
+
+fn base_doc() -> Value {
+    json!({
+        "id": "{DID}",
+        "verificationMethod": [{
+            "id": "{DID}#key-1",
+            "publicKeyMultibase": "{SIGNING_KEY_MB}"
+        }]
+    })
+}
+
+fn base_template(extra: Value) -> Value {
+    let mut v = json!({
+        "schemaVersion": 1,
+        "name": "test-template",
+        "kind": "custom",
+        "requiredVars": [],
+        "optionalVars": {},
+        "document": base_doc()
+    });
+    let obj = v.as_object_mut().unwrap();
+    for (k, val) in extra.as_object().unwrap() {
+        obj.insert(k.clone(), val.clone());
+    }
+    v
+}
+
+fn ambient_vars() -> TemplateVars {
+    let mut v = TemplateVars::new();
+    v.insert_string("DID", "did:webvh:abc:example.com");
+    v.insert_string("SIGNING_KEY_MB", "z6MkSigning");
+    v
+}
+
+// ─── validation ──────────────────────────────────────────────────────
+
+#[test]
+fn rejects_unsupported_schema_version() {
+    let raw = base_template(json!({ "schemaVersion": 99 }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(matches!(
+        err,
+        TemplateError::UnsupportedSchema { found: 99, .. }
+    ));
+}
+
+#[test]
+fn rejects_bad_name() {
+    let raw = base_template(json!({ "name": "Has Space" }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(matches!(err, TemplateError::Invalid(_)));
+}
+
+#[test]
+fn rejects_document_without_did_placeholder() {
+    let raw = base_template(json!({
+        "document": { "id": "did:example:fixed" }
+    }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(
+        matches!(&err, TemplateError::Invalid(msg) if msg.contains("{DID}")),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn rejects_reserved_name_in_required_vars() {
+    let raw = base_template(json!({ "requiredVars": ["DID"] }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(matches!(err, TemplateError::ReservedVar(v) if v == "DID"));
+}
+
+#[test]
+fn rejects_reserved_name_in_optional_vars() {
+    let raw = base_template(json!({
+        "optionalVars": { "NOW": "x" }
+    }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(matches!(err, TemplateError::ReservedVar(v) if v == "NOW"));
+}
+
+#[test]
+fn rejects_variable_in_both_lists() {
+    let raw = base_template(json!({
+        "requiredVars": ["URL"],
+        "optionalVars": { "URL": "x" },
+        "document": {
+            "id": "{DID}",
+            "url": "{URL}"
+        }
+    }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(
+        matches!(&err, TemplateError::Invalid(m) if m.contains("both")),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn rejects_undeclared_placeholder() {
+    let raw = base_template(json!({
+        "document": {
+            "id": "{DID}",
+            "mystery": "{NOT_DECLARED}"
+        }
+    }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(
+        matches!(&err, TemplateError::Invalid(m) if m.contains("NOT_DECLARED")),
+        "got: {err}"
+    );
+}
+
+// ─── render ──────────────────────────────────────────────────────────
+
+#[test]
+fn renders_embedded_string_placeholder() {
+    let raw = base_template(json!({
+        "requiredVars": ["URL"],
+        "document": {
+            "id": "{DID}",
+            "uri": "prefix-{URL}-suffix"
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("URL", "https://m.example.com");
+
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(out["uri"], "prefix-https://m.example.com-suffix");
+    assert_eq!(out["id"], "did:webvh:abc:example.com");
+}
+
+#[test]
+fn whole_string_token_substitutes_native_type() {
+    let raw = base_template(json!({
+        "optionalVars": {
+            "ROUTING_KEYS": ["did:key:fallback"]
+        },
+        "document": {
+            "id": "{DID}",
+            "routingKeys": "{ROUTING_KEYS}",
+            "accept": "{ACCEPT}"
+        },
+        "requiredVars": ["ACCEPT"]
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+
+    let mut vars = ambient_vars();
+    vars.insert("ACCEPT", json!(["didcomm/v2", "didcomm/v1"]));
+    vars.insert("ROUTING_KEYS", json!(["did:key:z6Mk1", "did:key:z6Mk2"]));
+
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(
+        out["routingKeys"],
+        json!(["did:key:z6Mk1", "did:key:z6Mk2"])
+    );
+    assert_eq!(out["accept"], json!(["didcomm/v2", "didcomm/v1"]));
+}
+
+#[test]
+fn optional_var_default_used_when_caller_omits() {
+    let raw = base_template(json!({
+        "optionalVars": {
+            "HOSTING_PATH": "/default-path"
+        },
+        "document": {
+            "id": "{DID}",
+            "path": "{HOSTING_PATH}"
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    let out = tpl.render(&ambient_vars()).unwrap();
+    assert_eq!(out["path"], "/default-path");
+}
+
+#[test]
+fn caller_vars_override_optional_defaults() {
+    let raw = base_template(json!({
+        "optionalVars": {
+            "HOSTING_PATH": "/default-path"
+        },
+        "document": {
+            "id": "{DID}",
+            "path": "{HOSTING_PATH}"
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("HOSTING_PATH", "/custom");
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(out["path"], "/custom");
+}
+
+#[test]
+fn missing_required_var_errors_with_name() {
+    let raw = base_template(json!({
+        "requiredVars": ["URL"],
+        "document": {
+            "id": "{DID}",
+            "uri": "{URL}"
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    let err = tpl.render(&ambient_vars()).unwrap_err();
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("URL")),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn ambient_var_missing_surfaces_as_unresolved() {
+    let raw = base_template(json!({
+        "document": {
+            "id": "{DID}",
+            "vtaDid": "{VTA_DID}"
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    // Provide DID + SIGNING_KEY_MB but NOT VTA_DID (both are reserved ambient).
+    let err = tpl.render(&ambient_vars()).unwrap_err();
+    assert!(
+        matches!(&err, TemplateError::Unresolved(m) if m.contains("VTA_DID")),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn lowercase_braces_are_not_placeholders() {
+    let raw = base_template(json!({
+        "document": {
+            "id": "{DID}",
+            "note": "literal {lowercase} stays"
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    let out = tpl.render(&ambient_vars()).unwrap();
+    assert_eq!(out["note"], "literal {lowercase} stays");
+}
+
+#[test]
+fn placeholders_in_nested_arrays_and_objects() {
+    let raw = base_template(json!({
+        "requiredVars": ["URL"],
+        "document": {
+            "id": "{DID}",
+            "service": [
+                {
+                    "id": "{DID}#svc",
+                    "serviceEndpoint": { "uri": "{URL}" }
+                }
+            ]
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("URL", "https://svc.example.com");
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(out["service"][0]["id"], "did:webvh:abc:example.com#svc");
+    assert_eq!(
+        out["service"][0]["serviceEndpoint"]["uri"],
+        "https://svc.example.com"
+    );
+}
+
+#[test]
+fn null_array_elements_are_pruned() {
+    // Optional array members are expressed as whole-string tokens whose
+    // `optionalVars` default is `null`. When the caller omits them the
+    // element resolves to `null` and is dropped, leaving a clean array —
+    // never a literal `null` member (invalid in DID-doc key arrays).
+    let raw = base_template(json!({
+        "optionalVars": { "EXTRA_KEY": null },
+        "document": {
+            "id": "{DID}",
+            "authentication": ["{DID}#key-0", "{EXTRA_KEY}"]
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+
+    // Omitted -> pruned.
+    let out = tpl.render(&ambient_vars()).unwrap();
+    assert_eq!(
+        out["authentication"],
+        json!(["did:webvh:abc:example.com#key-0"])
+    );
+
+    // Supplied -> retained. (A supplied value is not recursively
+    // re-substituted, so it must already carry the resolved DID.)
+    let mut vars = ambient_vars();
+    vars.insert_string("EXTRA_KEY", "did:webvh:abc:example.com#key-2");
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(
+        out["authentication"],
+        json!([
+            "did:webvh:abc:example.com#key-0",
+            "did:webvh:abc:example.com#key-2"
+        ])
+    );
+}
+
+#[test]
+fn provided_token_may_pass_through_as_sentinel() {
+    // A caller supplying `DID = "{DID}"` means "leave this literal alone for
+    // a downstream library to resolve" — render must not flag it.
+    let raw = base_template(json!({
+        "document": {
+            "id": "{DID}",
+            "verificationMethod": [{
+                "id": "{DID}#key-1",
+                "publicKeyMultibase": "{SIGNING_KEY_MB}"
+            }]
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "{DID}");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkReal");
+
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(out["id"], "{DID}");
+    assert_eq!(out["verificationMethod"][0]["id"], "{DID}#key-1");
+    assert_eq!(
+        out["verificationMethod"][0]["publicKeyMultibase"],
+        "z6MkReal"
+    );
+}
+
+#[test]
+fn utf8_strings_survive_substitution() {
+    let raw = base_template(json!({
+        "requiredVars": ["LABEL"],
+        "document": {
+            "id": "{DID}",
+            "label": "café-{LABEL}-résumé"
+        }
+    }));
+    let tpl = DidTemplate::from_json(raw).unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("LABEL", "naïve");
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(out["label"], "café-naïve-résumé");
+}
+
+// ─── built-ins ───────────────────────────────────────────────────────
+
+#[test]
+fn didcomm_mediator_builtin_renders_end_to_end() {
+    let tpl = load_embedded("didcomm-mediator").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:mediator:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "https://mediator.example.com");
+    vars.insert_string("WS_URL", "wss://mediator.example.com/ws");
+
+    let doc = tpl.render(&vars).unwrap();
+    assert_eq!(doc["id"], "did:webvh:mediator:example.com");
+
+    // No P-256 vars supplied -> the optional P-256 slots default to `null`
+    // and are pruned: only the Ed25519 + X25519 pair survives, and the
+    // verification-relationship arrays each carry a single key reference.
+    let vms = doc["verificationMethod"].as_array().unwrap();
+    assert_eq!(vms.len(), 2);
+    assert_eq!(vms[0]["id"], "did:webvh:mediator:example.com#key-0");
+    assert_eq!(vms[1]["id"], "did:webvh:mediator:example.com#key-1");
+    assert_eq!(
+        doc["authentication"],
+        json!(["did:webvh:mediator:example.com#key-0"])
+    );
+    assert_eq!(
+        doc["assertionMethod"],
+        json!(["did:webvh:mediator:example.com#key-0"])
+    );
+    assert_eq!(
+        doc["keyAgreement"],
+        json!(["did:webvh:mediator:example.com#key-1"])
+    );
+
+    let services = doc["service"].as_array().unwrap();
+    // No `SERVICE_TSP` supplied -> the optional `#tsp` slot defaults to `null`
+    // and is pruned. A DIDComm-only mediator advertises only DIDComm + auth;
+    // TSP is opt-in (see `..._renders_tsp_service_when_supplied`).
+    assert_eq!(services.len(), 2);
+    assert!(
+        !services
+            .iter()
+            .any(|s| s["type"] == "TSPTransport" || s["type"] == json!(["TSPTransport"])),
+        "TSP must be absent unless SERVICE_TSP is supplied"
+    );
+
+    // DIDComm service: id `#service`, type as a single-element array,
+    // serviceEndpoint as an array of two endpoint objects (HTTP first,
+    // WSS second). Each endpoint carries the same accept/routingKeys.
+    assert_eq!(services[0]["id"], "did:webvh:mediator:example.com#service");
+    assert_eq!(services[0]["type"], json!(["DIDCommMessaging"]));
+    let endpoints = services[0]["serviceEndpoint"].as_array().unwrap();
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0]["uri"], "https://mediator.example.com");
+    assert_eq!(endpoints[0]["accept"], json!(["didcomm/v2"]));
+    assert_eq!(endpoints[0]["routingKeys"], json!([]));
+    assert_eq!(endpoints[1]["uri"], "wss://mediator.example.com/ws");
+    assert_eq!(endpoints[1]["accept"], json!(["didcomm/v2"]));
+    assert_eq!(endpoints[1]["routingKeys"], json!([]));
+
+    // Authentication service: id `#auth`, type as a single-element array,
+    // serviceEndpoint as a plain string at `<URL>/authenticate`.
+    assert_eq!(services[1]["id"], "did:webvh:mediator:example.com#auth");
+    assert_eq!(services[1]["type"], json!(["Authentication"]));
+    assert_eq!(
+        services[1]["serviceEndpoint"],
+        "https://mediator.example.com/authenticate"
+    );
+}
+
+#[test]
+fn didcomm_mediator_builtin_renders_tsp_service_when_supplied() {
+    // Opt-in TSP: the caller supplies `SERVICE_TSP` as the fully-resolved
+    // service object (whole-string native-type substitution). Supplied values
+    // are not recursively re-substituted, so — like the P-256 VM slots — they
+    // carry the resolved DID here rather than the `{DID}` sentinel the local
+    // generator would pass in production (which the did-method layer resolves
+    // after SCID computation).
+    let tpl = load_embedded("didcomm-mediator").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:mediator:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "https://mediator.example.com");
+    vars.insert_string("WS_URL", "wss://mediator.example.com/ws");
+    vars.insert(
+        "SERVICE_TSP",
+        json!({
+            "id": "did:webvh:mediator:example.com#tsp",
+            "type": "TSPTransport",
+            "serviceEndpoint": "https://mediator.example.com"
+        }),
+    );
+
+    let doc = tpl.render(&vars).unwrap();
+    let services = doc["service"].as_array().unwrap();
+    // TSP first (canonical preference order), then DIDComm, then auth.
+    assert_eq!(services.len(), 3);
+    assert_eq!(services[0]["id"], "did:webvh:mediator:example.com#tsp");
+    assert_eq!(services[0]["type"], "TSPTransport");
+    assert_eq!(
+        services[0]["serviceEndpoint"],
+        "https://mediator.example.com"
+    );
+    assert_eq!(services[1]["type"], json!(["DIDCommMessaging"]));
+    assert_eq!(services[2]["type"], json!(["Authentication"]));
+}
+
+#[test]
+fn didcomm_mediator_builtin_renders_p256_slots_when_supplied() {
+    // Opt-in P-256: the caller supplies the optional verification-method
+    // objects (whole-string native-type substitution) plus the
+    // relationship references. The document then carries 4 verification
+    // methods and two-entry authentication/assertionMethod/keyAgreement
+    // arrays — exactly what a P-256-capable counterparty needs. (Supplied
+    // values are not recursively re-substituted, so they carry the resolved
+    // DID rather than the `{DID}` sentinel the local generator would pass.)
+    let tpl = load_embedded("didcomm-mediator").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:mediator:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "https://mediator.example.com");
+    vars.insert_string("WS_URL", "wss://mediator.example.com/ws");
+    vars.insert(
+        "VM_P256_SIGNING",
+        json!({
+            "id": "did:webvh:mediator:example.com#key-2",
+            "type": "Multikey",
+            "controller": "did:webvh:mediator:example.com",
+            "publicKeyMultibase": "zDnaP256Sign"
+        }),
+    );
+    vars.insert(
+        "VM_P256_KA",
+        json!({
+            "id": "did:webvh:mediator:example.com#key-3",
+            "type": "Multikey",
+            "controller": "did:webvh:mediator:example.com",
+            "publicKeyMultibase": "zDnaP256Ka"
+        }),
+    );
+    vars.insert_string("AUTH_P256", "did:webvh:mediator:example.com#key-2");
+    vars.insert_string("ASSERTION_P256", "did:webvh:mediator:example.com#key-2");
+    vars.insert_string("KEYAGREEMENT_P256", "did:webvh:mediator:example.com#key-3");
+
+    let doc = tpl.render(&vars).unwrap();
+
+    let vms = doc["verificationMethod"].as_array().unwrap();
+    assert_eq!(vms.len(), 4);
+    assert_eq!(vms[2]["id"], "did:webvh:mediator:example.com#key-2");
+    assert_eq!(vms[2]["type"], "Multikey");
+    assert_eq!(vms[2]["controller"], "did:webvh:mediator:example.com");
+    assert_eq!(vms[2]["publicKeyMultibase"], "zDnaP256Sign");
+    assert_eq!(vms[3]["id"], "did:webvh:mediator:example.com#key-3");
+    assert_eq!(vms[3]["publicKeyMultibase"], "zDnaP256Ka");
+
+    assert_eq!(
+        doc["authentication"],
+        json!([
+            "did:webvh:mediator:example.com#key-0",
+            "did:webvh:mediator:example.com#key-2"
+        ])
+    );
+    assert_eq!(
+        doc["assertionMethod"],
+        json!([
+            "did:webvh:mediator:example.com#key-0",
+            "did:webvh:mediator:example.com#key-2"
+        ])
+    );
+    assert_eq!(
+        doc["keyAgreement"],
+        json!([
+            "did:webvh:mediator:example.com#key-1",
+            "did:webvh:mediator:example.com#key-3"
+        ])
+    );
+}
+
+#[test]
+fn ws_url_is_derived_from_url_when_omitted() {
+    // The renderer auto-derives WS_URL from URL by swapping the
+    // scheme and appending `/ws` so `vta setup` and similar one-URL
+    // flows can render the mediator template without a separate
+    // `--var WS_URL=...`. Mirrors the deployed convention
+    // (`/mediator/v1` over HTTP, `/mediator/v1/ws` over WSS).
+    let tpl = load_embedded("didcomm-mediator").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:mediator:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "https://mediator.example.com/mediator/v1");
+    // WS_URL deliberately omitted.
+
+    let doc = tpl.render(&vars).expect("render with derived WS_URL");
+    // No SERVICE_TSP -> DIDComm is the first service entry.
+    let endpoints = doc["service"][0]["serviceEndpoint"].as_array().unwrap();
+    assert_eq!(
+        endpoints[0]["uri"],
+        "https://mediator.example.com/mediator/v1"
+    );
+    assert_eq!(
+        endpoints[1]["uri"],
+        "wss://mediator.example.com/mediator/v1/ws"
+    );
+}
+
+#[test]
+fn ws_url_derivation_handles_plain_http_and_trailing_slash() {
+    // Trailing slash on URL must not produce a double slash in the
+    // derived WS_URL: `http://host/` → `ws://host/ws`, not
+    // `ws://host//ws`.
+    let tpl = load_embedded("didcomm-mediator").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:mediator:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "http://mediator.local/");
+
+    let doc = tpl.render(&vars).expect("render with derived ws://");
+    // No SERVICE_TSP -> DIDComm is the first service entry.
+    let endpoints = doc["service"][0]["serviceEndpoint"].as_array().unwrap();
+    assert_eq!(endpoints[1]["uri"], "ws://mediator.local/ws");
+}
+
+#[test]
+fn explicit_ws_url_overrides_derivation() {
+    // A caller supplying both URL and WS_URL gets exactly what they
+    // asked for — derivation must not clobber an explicit value (e.g.
+    // an operator who terminates WS at a different host).
+    let tpl = load_embedded("didcomm-mediator").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:mediator:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "https://mediator.example.com");
+    vars.insert_string("WS_URL", "wss://ws-gateway.example.net/mediator/ws");
+
+    let doc = tpl.render(&vars).unwrap();
+    // No SERVICE_TSP -> DIDComm is the first service entry.
+    let endpoints = doc["service"][0]["serviceEndpoint"].as_array().unwrap();
+    assert_eq!(endpoints[0]["uri"], "https://mediator.example.com");
+    assert_eq!(
+        endpoints[1]["uri"],
+        "wss://ws-gateway.example.net/mediator/ws"
+    );
+}
+
+#[test]
+fn ws_url_not_derived_for_non_http_scheme() {
+    // A URL with neither http:// nor https:// can't be safely converted
+    // — surface the missing-var error instead of fabricating something.
+    let tpl = load_embedded("didcomm-mediator").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:mediator:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "didcomm://routed-only");
+
+    let err = tpl
+        .render(&vars)
+        .expect_err("render should fail with missing WS_URL");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("WS_URL"),
+        "expected WS_URL in error, got: {msg}"
+    );
+}
+
+#[test]
+fn vta_admin_builtin_renders_end_to_end() {
+    // The vta-admin template is a did:key shape — no required vars beyond
+    // the ambient {DID} + {SIGNING_KEY_MB} the renderer / VTA always
+    // supplies. No service endpoints, no key-agreement VM (X25519 is
+    // derived on demand from the Ed25519 pub by did:key resolvers).
+    let tpl = load_embedded("vta-admin").unwrap();
+    assert_eq!(tpl.kind, "admin");
+    assert!(tpl.required_vars.is_empty());
+    assert!(tpl.optional_vars.is_empty());
+
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:key:z6MkAdminPub");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkAdminPub");
+
+    let doc = tpl.render(&vars).unwrap();
+    assert_eq!(doc["id"], "did:key:z6MkAdminPub");
+    assert_eq!(
+        doc["verificationMethod"][0]["id"],
+        "did:key:z6MkAdminPub#z6MkAdminPub"
+    );
+    assert_eq!(
+        doc["verificationMethod"][0]["publicKeyMultibase"],
+        "z6MkAdminPub"
+    );
+    assert!(doc.get("service").is_none(), "admin DID has no service");
+}
+
+#[test]
+fn did_host_http_builtin_renders_end_to_end() {
+    let tpl = load_embedded("did-host-http").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:host:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSign");
+    vars.insert_string("KA_KEY_MB", "z6LSKa");
+    vars.insert_string("URL", "https://host.example.com");
+
+    let doc = tpl.render(&vars).unwrap();
+    assert_eq!(doc["service"][0]["type"], "WebVHHosting");
+    assert_eq!(
+        doc["service"][0]["serviceEndpoint"]["uri"],
+        "https://host.example.com"
+    );
+    // The endpoint carries the origin and nothing else. `hostingPath`
+    // used to sit beside it, always at this template's own default —
+    // no caller ever set HOSTING_PATH and no server ever read it back —
+    // until a consumer mistook it for the REST base and 404'd (#759).
+    assert!(
+        doc["service"][0]["serviceEndpoint"]
+            .get("hostingPath")
+            .is_none(),
+        "hostingPath must not be emitted: {}",
+        doc["service"][0]["serviceEndpoint"]
+    );
+}
+
+// ─── did-host-didcomm built-in ──────────────────────────────────────
+//
+// The rendered-fixture comparison is a shape regression guard: if the
+// template is edited (a field renamed, a key added, an array flattened
+// to an object) this test fails and the author has to update the
+// fixture deliberately. That's the point — downstream services build
+// against this shape.
+
+const DID_HOST_DIDCOMM_RENDERED_FIXTURE: &str =
+    include_str!("../../tests/fixtures/did-host-didcomm.rendered.json");
+
+fn did_host_didcomm_fixture_vars() -> TemplateVars {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmTEST:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkTESTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSTESTka");
+    vars.insert_string(
+        "MEDIATOR_DID",
+        "did:webvh:QmMED:mediator.example.com:mediator",
+    );
+    vars
+}
+
+#[test]
+fn did_host_didcomm_builtin_loads_and_validates() {
+    let tpl = load_embedded("did-host-didcomm").expect("load_embedded");
+    assert_eq!(tpl.name, "did-host-didcomm");
+    assert_eq!(tpl.kind, "did-host-didcomm");
+    assert_eq!(tpl.methods, vec!["webvh"]);
+    assert_eq!(tpl.required_vars, vec!["MEDIATOR_DID"]);
+    tpl.validate().expect("validate after load");
+}
+
+#[test]
+fn did_host_didcomm_builtin_renders_exact_document_shape() {
+    let tpl = load_embedded("did-host-didcomm").unwrap();
+    let out = tpl.render(&did_host_didcomm_fixture_vars()).unwrap();
+    let expected: Value =
+        serde_json::from_str(DID_HOST_DIDCOMM_RENDERED_FIXTURE).expect("fixture parses as JSON");
+    assert_eq!(
+        out, expected,
+        "rendered document diverged from fixture — if intentional, update tests/fixtures/did-host-didcomm.rendered.json"
+    );
+}
+
+#[test]
+fn did_host_didcomm_builtin_accept_is_native_array_not_string() {
+    // The whole-string-placeholder contract: `"accept": "{ACCEPT}"` must
+    // substitute to the JSON array from the var, not render the literal
+    // string "[\"didcomm/v2\"]". Downstream DIDComm libraries parse the
+    // accept list as an array; a stringified version breaks them silently.
+    let tpl = load_embedded("did-host-didcomm").unwrap();
+    let doc = tpl.render(&did_host_didcomm_fixture_vars()).unwrap();
+    // The DIDComm entry is at [1] (the `#tsp` TSP entry sorts first); its
+    // first serviceEndpoint object carries the `accept` array.
+    let endpoint = &doc["service"][1]["serviceEndpoint"][0];
+    let accept = &endpoint["accept"];
+    assert!(
+        accept.is_array(),
+        "accept must be a JSON array, got {accept:?}"
+    );
+    assert_eq!(*accept, json!(["didcomm/v2"]));
+}
+
+#[test]
+fn did_host_didcomm_builtin_has_exactly_one_entry_per_transport() {
+    // Two transports advertised: TSP (`#tsp`, preferred) then DIDComm
+    // (`#vta-didcomm`), both pointing at the same mediator DID (D8 — one
+    // dual-protocol mediator). Older mediator setups emitted an unnamed
+    // duplicate DIDCommMessaging service; lock exactly one entry per type
+    // so the template never regresses into that.
+    let tpl = load_embedded("did-host-didcomm").unwrap();
+    let doc = tpl.render(&did_host_didcomm_fixture_vars()).unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    assert_eq!(
+        services.len(),
+        2,
+        "expected exactly two service entries (tsp + didcomm), got {}: {:?}",
+        services.len(),
+        services
+    );
+    // TSP first (canonical order): plain-string mediator-DID endpoint.
+    assert_eq!(services[0]["id"], "did:webvh:QmTEST:example.com#tsp");
+    assert_eq!(services[0]["type"], "TSPTransport");
+    assert_eq!(
+        services[0]["serviceEndpoint"],
+        "did:webvh:QmMED:mediator.example.com:mediator"
+    );
+    // DIDComm second, same mediator.
+    assert_eq!(
+        services[1]["id"],
+        "did:webvh:QmTEST:example.com#vta-didcomm"
+    );
+    assert_eq!(services[1]["type"], "DIDCommMessaging");
+}
+
+#[test]
+fn did_host_didcomm_builtin_context_is_did_v1_plus_cid_v1() {
+    // Spec: exactly these two contexts, in this order. No multikey or
+    // didcomm contexts (unlike didcomm-mediator which carries them).
+    let tpl = load_embedded("did-host-didcomm").unwrap();
+    let doc = tpl.render(&did_host_didcomm_fixture_vars()).unwrap();
+    assert_eq!(
+        doc["@context"],
+        json!([
+            "https://www.w3.org/ns/did/v1",
+            "https://www.w3.org/ns/cid/v1"
+        ])
+    );
+}
+
+#[test]
+fn did_host_didcomm_builtin_missing_mediator_did_errors() {
+    let tpl = load_embedded("did-host-didcomm").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmTEST:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkTESTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSTESTka");
+    // MEDIATOR_DID deliberately omitted.
+
+    let err = tpl
+        .render(&vars)
+        .expect_err("missing MEDIATOR_DID must error");
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("MEDIATOR_DID")),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn did_host_didcomm_builtin_rejects_unknown_placeholder_in_template() {
+    // Sanity-check that validate() (which ran implicitly on load) rejects
+    // any future edit that adds an undeclared `{TOKEN}` to the document.
+    // Mirrors the strictness of the other built-ins.
+    //
+    // We construct a copy of the template with an injected stray token and
+    // confirm `from_json` refuses it — this guards the author against
+    // accidentally adding a new placeholder without declaring it in
+    // required/optional vars.
+    let tpl = load_embedded("did-host-didcomm").unwrap();
+    let mut doc = tpl.document.clone();
+    // Inject into the DIDComm entry at [1] (whose serviceEndpoint is an
+    // array of objects); [0] is now the `#tsp` entry with a plain-string
+    // endpoint that can't take a nested key.
+    doc["service"][1]["serviceEndpoint"][0]["extra"] =
+        Value::String("{UNDECLARED_TOKEN}".to_string());
+
+    let raw = serde_json::json!({
+        "schemaVersion": tpl.schema_version,
+        "name": tpl.name,
+        "kind": tpl.kind,
+        "description": tpl.description,
+        "methods": tpl.methods,
+        "requiredVars": tpl.required_vars,
+        "optionalVars": tpl.optional_vars,
+        "defaults": tpl.defaults,
+        "document": doc,
+    });
+    let err = DidTemplate::from_json(raw).expect_err("undeclared token must be rejected");
+    assert!(
+        matches!(&err, TemplateError::Invalid(m) if m.contains("UNDECLARED_TOKEN")),
+        "got: {err}"
+    );
+}
+
+// ─── vtc-host built-in ───────────────────────────────────────────────
+
+#[test]
+fn vtc_host_rest_path_is_overridable_and_can_be_emptied() {
+    // A deployment that serves the API somewhere other than `/v1` — or at the
+    // root — must be able to say so, the same way `STATUS_LIST_PATH` already
+    // allows. The default exists because `/v1` is what `vtc-service` serves,
+    // not because the path is fixed.
+    let tpl = load_embedded("vtc-host").unwrap();
+
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+    vars.insert_string("REST_PATH", "/api/v2");
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(
+        out["service"][0]["serviceEndpoint"],
+        "https://vtc.example.com/api/v2"
+    );
+
+    // Empty means the root, and must not leave a trailing slash behind — the
+    // template's own rule about `URL` is what keeps this clean.
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+    vars.insert_string("REST_PATH", "");
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(
+        out["service"][0]["serviceEndpoint"],
+        "https://vtc.example.com"
+    );
+}
+
+#[test]
+fn vtc_host_renders_with_minimal_vars() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+
+    let out = tpl.render(&vars).unwrap();
+
+    assert_eq!(out["id"], "did:webvh:abc:example.com");
+    assert_eq!(
+        out["verificationMethod"][0]["id"],
+        "did:webvh:abc:example.com#key-0"
+    );
+    assert_eq!(
+        out["verificationMethod"][0]["publicKeyMultibase"],
+        "z6MkSigning"
+    );
+    assert_eq!(
+        out["verificationMethod"][1]["id"],
+        "did:webvh:abc:example.com#key-1"
+    );
+    assert_eq!(
+        out["verificationMethod"][1]["publicKeyMultibase"],
+        "z6LSKeyAgreement"
+    );
+    assert_eq!(out["assertionMethod"][0], "did:webvh:abc:example.com#key-0");
+    assert_eq!(out["authentication"][0], "did:webvh:abc:example.com#key-0");
+    assert_eq!(out["keyAgreement"][0], "did:webvh:abc:example.com#key-1");
+
+    // Two services, each at URL + its default path.
+    assert_eq!(
+        out["service"][0]["id"],
+        "did:webvh:abc:example.com#vtc-rest"
+    );
+    assert_eq!(out["service"][0]["type"], "VTCRest");
+    // `/v1`, not the bare URL. The bare form is what a VTC advertised until
+    // Keyring's VTI-15: `vtc-service` serves its API under `/v1`, so every
+    // request a client derived from the document answered 405. Nothing in
+    // this workspace reads this entry — it exists for third parties — so a
+    // wrong value is invisible here and costs only the integrator.
+    assert_eq!(
+        out["service"][0]["serviceEndpoint"],
+        "https://vtc.example.com/v1"
+    );
+    assert_eq!(
+        out["service"][1]["id"],
+        "did:webvh:abc:example.com#vtc-status-list"
+    );
+    assert_eq!(out["service"][1]["type"], "VTCStatusList");
+    assert_eq!(
+        out["service"][1]["serviceEndpoint"],
+        "https://vtc.example.com/v1/status-lists",
+    );
+    // The optional `SERVICE_TRUST_REGISTRY` slot defaults to
+    // `null` and is pruned, so a community with no registry is unchanged.
+    assert_eq!(out["service"][2]["type"], "TrustTaskHTTPS");
+    assert_eq!(
+        out["service"][2]["serviceEndpoint"], "https://vtc.example.com/v1",
+        "the Trust-Task base (binding 0.2 §6): clients POST to <base>/trust-tasks, \
+         which is the /v1/trust-tasks vtc-service serves"
+    );
+    // The workspace's own reader takes it as the REST/Trust-Task base.
+    assert_eq!(
+        crate::protocol::matching::ServiceCapabilities::from_did_document(&out)
+            .endpoint(crate::protocol::matching::Protocol::Rest),
+        Some("https://vtc.example.com/v1")
+    );
+    assert_eq!(out["service"][3]["type"], "SignInPortal");
+    assert_eq!(
+        out["service"][3]["serviceEndpoint"],
+        "https://vtc.example.com/members/"
+    );
+    // Exactly four: the optional `SERVICE_TRUST_REGISTRY` slot defaults to
+    // `null` and is pruned, so a community with no registry is unchanged.
+    assert_eq!(out["service"].as_array().unwrap().len(), 4);
+}
+
+/// A community that names its registry gets a third entry: a `TrustRegistry`
+/// referral whose `uri` is the registry's DID.
+#[test]
+fn vtc_host_advertises_a_trust_registry_referral_when_given_one() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+    vars.insert(
+        TRUST_REGISTRY_SERVICE_VAR,
+        referral_service("did:webvh:xyz:registry.example.com").unwrap(),
+    );
+
+    let out = tpl.render(&vars).unwrap();
+
+    let services = out["service"].as_array().unwrap();
+    assert_eq!(services.len(), 5, "appended, not replacing");
+    // Appended last, so the two pinned entries keep their indices.
+    assert_eq!(services[0]["type"], "VTCRest");
+    assert_eq!(services[1]["type"], "VTCStatusList");
+
+    let referral = &services[4];
+    assert_eq!(referral["type"], TRUST_REGISTRY_SERVICE_TYPE);
+    assert_eq!(
+        referral["serviceEndpoint"]["uri"], "did:webvh:xyz:registry.example.com",
+        "a referral names the registry by DID, never by URL"
+    );
+    assert_eq!(referral["serviceEndpoint"]["profile"], TRQP_PROFILE_URI);
+
+    // Caller-supplied variable values are not re-substituted by the renderer,
+    // so `{DID}` survives here rather than resolving to the ambient `DID`.
+    // That is deliberate: on the real mint path `DID` is itself the `{DID}`
+    // sentinel and `didwebvh-rs` resolves every leaf string once the SCID is
+    // known, so the entry lands with the community's own DID either way.
+    assert_eq!(referral["id"], "{DID}#trust-registry");
+}
+
+/// The registry a community trusts is not knowable at template-authoring
+/// time and many communities have none, so the entry has to be omissible —
+/// the null-pruning slot is what makes one template serve both shapes.
+#[test]
+fn vtc_host_omits_the_referral_when_no_registry_is_named() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+
+    let out = tpl.render(&vars).unwrap();
+
+    let services = out["service"].as_array().unwrap();
+    assert_eq!(services.len(), 4);
+    assert!(
+        !services
+            .iter()
+            .any(|s| s["type"] == TRUST_REGISTRY_SERVICE_TYPE),
+        "no literal null and no half-built entry may survive"
+    );
+}
+
+// ─── vtc-host messaging transports ───────────────────────────────────
+
+const MEDIATOR: &str = "did:webvh:QmTS3:webvh.example.com:mediator";
+
+/// The shape §12 Phase A asks for: both transports advertised, both naming the
+/// same mediator, ahead of REST in the array.
+///
+/// Order is not cosmetic — CLAUDE.md §3.3 encodes transport preference as array
+/// order (TSP > DIDComm > REST), so a DID-Core resolver walking `service` picks
+/// the highest-preference transport first. Rendering REST ahead of the
+/// messaging entries would quietly demote them for every conforming client.
+#[test]
+fn vtc_host_advertises_both_transports_in_canonical_order() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+    vars.insert(TSP_SERVICE_VAR, tsp_service(MEDIATOR).unwrap());
+    vars.insert(DIDCOMM_SERVICE_VAR, didcomm_service(MEDIATOR).unwrap());
+
+    let out = tpl.render(&vars).unwrap();
+    let services = out["service"].as_array().unwrap();
+
+    assert_eq!(
+        services.len(),
+        6,
+        "tsp + didcomm + rest + status-list + trust-tasks + sign-in portal"
+    );
+    assert_eq!(
+        services
+            .iter()
+            .map(|s| s["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "TSPTransport",
+            "DIDCommMessaging",
+            "VTCRest",
+            "VTCStatusList",
+            "TrustTaskHTTPS",
+            "SignInPortal"
+        ],
+    );
+
+    // Both messaging entries carry the *same* mediator DID (§14 Q2) — one
+    // dual-protocol mediator advertised twice, never two endpoints.
+    assert_eq!(services[0]["serviceEndpoint"], MEDIATOR);
+    assert_eq!(services[1]["serviceEndpoint"], MEDIATOR);
+    assert_eq!(services[0]["id"], "{DID}#tsp");
+    assert_eq!(services[1]["id"], "{DID}#didcomm");
+}
+
+/// DIDComm alone — the shape for a community whose mediator does not route
+/// TSP. The TSP slot prunes, leaving no null and no half-built entry.
+#[test]
+fn vtc_host_advertises_didcomm_alone_when_tsp_is_not_selected() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+    vars.insert(DIDCOMM_SERVICE_VAR, didcomm_service(MEDIATOR).unwrap());
+
+    let out = tpl.render(&vars).unwrap();
+    let services = out["service"].as_array().unwrap();
+
+    assert_eq!(services.len(), 5);
+    assert_eq!(services[0]["type"], "DIDCommMessaging");
+    assert!(
+        !services.iter().any(|s| s["type"] == "TSPTransport"),
+        "the unselected TSP slot must prune entirely: {services:#?}"
+    );
+}
+
+/// The pre-existing shape has to keep rendering unchanged: a community that
+/// skips messaging advertises REST + status-list and nothing else. This is the
+/// regression guard for every VTC provisioned before transports were
+/// selectable.
+#[test]
+fn vtc_host_advertises_no_messaging_when_neither_transport_is_selected() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+
+    let out = tpl.render(&vars).unwrap();
+    let services = out["service"].as_array().unwrap();
+
+    assert_eq!(services.len(), 4);
+    assert_eq!(services[0]["type"], "VTCRest");
+    assert_eq!(services[1]["type"], "VTCStatusList");
+    assert!(
+        !services.iter().any(|s| s.is_null()),
+        "a pruned slot must vanish, not render as null: {services:#?}"
+    );
+}
+
+/// Transports and the registry referral prune independently — three optional
+/// slots in one array, and selecting some must not disturb the others.
+#[test]
+fn transport_and_registry_slots_prune_independently() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+    vars.insert(TSP_SERVICE_VAR, tsp_service(MEDIATOR).unwrap());
+    vars.insert(
+        TRUST_REGISTRY_SERVICE_VAR,
+        referral_service("did:webvh:xyz:registry.example.com").unwrap(),
+    );
+
+    let out = tpl.render(&vars).unwrap();
+    let types: Vec<&str> = out["service"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "TSPTransport",
+            "VTCRest",
+            "VTCStatusList",
+            "TrustTaskHTTPS",
+            "SignInPortal",
+            TRUST_REGISTRY_SERVICE_TYPE
+        ],
+    );
+}
+
+#[test]
+fn vtc_host_status_list_path_override() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    vars.insert_string("URL", "https://vtc.example.com");
+    vars.insert_string("STATUS_LIST_PATH", "/custom/status");
+
+    let out = tpl.render(&vars).unwrap();
+    assert_eq!(
+        out["service"][1]["serviceEndpoint"],
+        "https://vtc.example.com/custom/status",
+    );
+}
+
+#[test]
+fn vtc_host_requires_url() {
+    let tpl = load_embedded("vtc-host").unwrap();
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqSigning");
+    // URL deliberately omitted.
+
+    let err = tpl.render(&vars).expect_err("URL is required");
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("URL")),
+        "got: {err}"
+    );
+}
+
+// ─── ai-agent built-in ───────────────────────────────────────────────
+//
+// The VTA-minted personal-AI-agent identity (open-claw / nano-claw /
+// hermes). Same DIDComm-via-mediator shape as did-host-didcomm but with
+// kind `ai-agent`, so a consumer-side device/register can recognise it.
+
+fn ai_agent_fixture_vars() -> TemplateVars {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmAGENT:example.com:agents:nano-claw");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkAGENTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSAGENTka");
+    vars.insert_string(
+        "MEDIATOR_DID",
+        "did:webvh:QmMED:mediator.example.com:mediator",
+    );
+    vars
+}
+
+#[test]
+fn ai_agent_builtin_loads_and_validates() {
+    let tpl = load_embedded("ai-agent").expect("load_embedded");
+    assert_eq!(tpl.name, "ai-agent");
+    assert_eq!(tpl.kind, "ai-agent");
+    assert_eq!(tpl.methods, vec!["webvh", "web"]);
+    assert_eq!(tpl.required_vars, vec!["MEDIATOR_DID"]);
+    tpl.validate().expect("validate after load");
+}
+
+#[test]
+fn ai_agent_builtin_has_key_agreement_for_authcrypt() {
+    // The agent receives authcrypt + sealed-transfer, so the rendered
+    // document must expose a keyAgreement method (key-1), not just a
+    // signing key. Guards against a future edit dropping it.
+    let tpl = load_embedded("ai-agent").unwrap();
+    let doc = tpl.render(&ai_agent_fixture_vars()).unwrap();
+    assert_eq!(
+        doc["keyAgreement"],
+        json!(["did:webvh:QmAGENT:example.com:agents:nano-claw#key-1"])
+    );
+    assert_eq!(
+        doc["authentication"],
+        json!(["did:webvh:QmAGENT:example.com:agents:nano-claw#key-0"])
+    );
+}
+
+#[test]
+fn ai_agent_builtin_advertises_tsp_then_didcomm_via_mediator() {
+    let tpl = load_embedded("ai-agent").unwrap();
+    let doc = tpl.render(&ai_agent_fixture_vars()).unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    assert_eq!(
+        services.len(),
+        2,
+        "expected two service entries (tsp + didcomm): {services:?}"
+    );
+    // TSP first (canonical preference): plain-string mediator-DID endpoint —
+    // inbound TSP routes through the same mediator as DIDComm (D8).
+    assert_eq!(services[0]["type"], "TSPTransport");
+    assert_eq!(
+        services[0]["serviceEndpoint"],
+        "did:webvh:QmMED:mediator.example.com:mediator"
+    );
+    // DIDComm second, through the same mediator.
+    assert_eq!(services[1]["type"], "DIDCommMessaging");
+    assert_eq!(
+        services[1]["serviceEndpoint"][0]["uri"], "did:webvh:QmMED:mediator.example.com:mediator",
+        "inbound traffic must route through the operator's mediator"
+    );
+    // Whole-string-placeholder contract: accept substitutes to an array.
+    assert!(services[1]["serviceEndpoint"][0]["accept"].is_array());
+}
+
+#[test]
+fn ai_agent_builtin_missing_mediator_did_errors() {
+    let tpl = load_embedded("ai-agent").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmAGENT:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkAGENTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSAGENTka");
+    // MEDIATOR_DID deliberately omitted.
+
+    let err = tpl
+        .render(&vars)
+        .expect_err("missing MEDIATOR_DID must error");
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("MEDIATOR_DID")),
+        "got: {err}"
+    );
+}
+
+// ─── push-gateway built-in ────────────────────────────────────────────
+//
+// The push wake-up gateway (`vti-push-gateway`): signing + key-agreement
+// methods and a DIDCommMessaging service, plus an optional TSPTransport
+// service naming the same mediator DID — same null-pruning `SERVICE_TSP`
+// slot as `vtc-host`, since the gateway now serves Trust Tasks over TSP,
+// DIDComm, and HTTPS and everything in this stack is transport-agnostic.
+
+fn push_gateway_fixture_vars() -> TemplateVars {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmGW:push.example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkGWsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSGWka");
+    vars.insert_string("URL", "https://push.example.com");
+    vars
+}
+
+#[test]
+fn push_gateway_builtin_loads_and_validates() {
+    let tpl = load_embedded("push-gateway").expect("load_embedded");
+    assert_eq!(tpl.name, "push-gateway");
+    assert_eq!(tpl.kind, "push-gateway");
+    assert_eq!(tpl.methods, vec!["webvh", "web"]);
+    assert_eq!(tpl.required_vars, vec!["URL"]);
+    tpl.validate().expect("validate after load");
+}
+
+/// The pre-existing shape has to keep rendering unchanged: a gateway minted
+/// without a mediator advertises DIDComm alone. Regression guard for every
+/// push gateway provisioned before TSP was selectable.
+#[test]
+fn push_gateway_advertises_didcomm_alone_when_no_mediator_is_supplied() {
+    let tpl = load_embedded("push-gateway").unwrap();
+    let doc = tpl.render(&push_gateway_fixture_vars()).unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    assert_eq!(
+        services.len(),
+        1,
+        "expected only the DIDComm entry: {services:?}"
+    );
+    assert_eq!(services[0]["type"], json!(["DIDCommMessaging"]));
+    assert!(
+        !services.iter().any(|s| s.is_null()),
+        "the unselected TSP slot must prune entirely, not render as null: {services:#?}"
+    );
+}
+
+/// Opt-in TSP: the caller supplies `SERVICE_TSP` as the fully-resolved entry
+/// (built by `vta_sdk::did_templates::tsp_service`), and both transports are
+/// advertised, TSP first (canonical order), both naming the same mediator —
+/// one dual-protocol mediator, advertised twice under two service types.
+#[test]
+fn push_gateway_advertises_both_transports_when_mediator_is_supplied() {
+    let tpl = load_embedded("push-gateway").unwrap();
+    let mut vars = push_gateway_fixture_vars();
+    vars.insert(TSP_SERVICE_VAR, tsp_service(MEDIATOR).unwrap());
+
+    let doc = tpl.render(&vars).unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    assert_eq!(services.len(), 2, "tsp + didcomm: {services:?}");
+    assert_eq!(services[0]["type"], "TSPTransport");
+    assert_eq!(services[0]["serviceEndpoint"], MEDIATOR);
+    assert_eq!(services[0]["id"], "{DID}#tsp");
+    assert_eq!(services[1]["type"], json!(["DIDCommMessaging"]));
+}
+
+#[test]
+fn push_gateway_builtin_missing_url_errors() {
+    let tpl = load_embedded("push-gateway").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmGW:push.example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkGWsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSGWka");
+    // URL deliberately omitted.
+
+    let err = tpl.render(&vars).expect_err("URL is required");
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("URL")),
+        "got: {err}"
+    );
+}
+
+// ─── did-host-http-tsp built-in ──────────────────────────────────────
+//
+// TSP-only sibling of did-host-http-didcomm: advertises WebVHHosting +
+// TSPTransport but NO DIDCommMessaging, for nodes that speak TSP over the
+// mediator and publish DID logs over HTTP.
+
+fn did_host_http_tsp_fixture_vars() -> TemplateVars {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmTEST:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkTESTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSTESTka");
+    vars.insert_string("URL", "https://host.example.com");
+    vars.insert_string(
+        "MEDIATOR_DID",
+        "did:webvh:QmMED:mediator.example.com:mediator",
+    );
+    vars
+}
+
+#[test]
+fn did_host_http_tsp_builtin_loads_and_validates() {
+    let tpl = load_embedded("did-host-http-tsp").expect("load_embedded");
+    assert_eq!(tpl.name, "did-host-http-tsp");
+    assert_eq!(tpl.kind, "did-host-http-tsp");
+    assert_eq!(tpl.methods, vec!["webvh", "web"]);
+    assert_eq!(tpl.required_vars, vec!["URL", "MEDIATOR_DID"]);
+    tpl.validate().expect("validate after load");
+}
+
+#[test]
+fn did_host_http_tsp_advertises_hosting_trust_tasks_sign_in_portal_then_tsp_only() {
+    let tpl = load_embedded("did-host-http-tsp").unwrap();
+    let doc = tpl.render(&did_host_http_tsp_fixture_vars()).unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    assert_eq!(
+        services.len(),
+        4,
+        "expected hosting + trust-tasks + sign-in-portal + tsp, got {}: {services:?}",
+        services.len()
+    );
+    // Where DID *documents* are served.
+    assert_eq!(services[0]["type"], "WebVHHosting");
+    assert!(
+        services[0]["serviceEndpoint"].get("hostingPath").is_none(),
+        "hostingPath must not be emitted (#759): {}",
+        services[0]["serviceEndpoint"]
+    );
+
+    // Where Trust Tasks are accepted — a different claim from the one above,
+    // and the reason this entry exists at all. Without it a consumer either
+    // cannot find the endpoint or, as this VTA did, posts to `WebVHHosting`
+    // and relies on the same host happening to serve both.
+    assert_eq!(services[1]["type"], "TrustTaskHTTPS");
+    assert_eq!(
+        services[1]["serviceEndpoint"], "https://host.example.com/api",
+        "the Trust-Task base is the control plane's `/api`, not the hosting origin: \
+         binding 0.2 §6 makes the advertised endpoint the base and the request \
+         `<base>/trust-tasks`"
+    );
+
+    assert_eq!(services[2]["type"], "SignInPortal");
+    assert_eq!(
+        services[2]["serviceEndpoint"],
+        "https://host.example.com/login"
+    );
+
+    assert_eq!(services[3]["id"], "did:webvh:QmTEST:example.com#tsp");
+    assert_eq!(services[3]["type"], "TSPTransport");
+    assert_eq!(
+        services[3]["serviceEndpoint"],
+        "did:webvh:QmMED:mediator.example.com:mediator"
+    );
+    assert!(
+        !services
+            .iter()
+            .any(|s| s["type"] == "DIDCommMessaging" || s["type"] == json!(["DIDCommMessaging"])),
+        "did-host-http-tsp must not advertise DIDComm"
+    );
+}
+
+/// The endpoint a Trust-Task consumer resolves to, through the real matcher
+/// rather than by reading the array. This is the property the template exists
+/// to give: `ServiceCapabilities` must pick the binding entry, not the hosting
+/// one it sits beside.
+#[test]
+fn a_rendered_did_host_resolves_to_its_trust_task_base() {
+    use crate::protocol::matching::{Protocol, ServiceCapabilities};
+    for name in [
+        "did-host-http",
+        "did-host-http-tsp",
+        "did-host-http-didcomm",
+    ] {
+        let tpl = load_embedded(name).unwrap();
+        let mut vars = did_host_http_tsp_fixture_vars();
+        vars.insert_string("ACCEPT", "didcomm/v2");
+        let doc = tpl.render(&vars).unwrap();
+        let caps = ServiceCapabilities::from_did_document(&doc);
+        assert_eq!(
+            caps.endpoint(Protocol::Rest),
+            Some("https://host.example.com/api"),
+            "`{name}` did not resolve to its Trust-Task base",
+        );
+    }
+}
+
+// ─── SignInPortal on the did-host-http* built-ins ────────────────────
+//
+// Wallet sign-in with a trigger link (contract C4 / C9) needs the node's
+// document to list `SignInPortal` on the origin of its console login page.
+// DID hosting publishes `<origin>/login` for itself; a node minted from one of
+// these templates lacked it, and wallets refused its sign-in links with
+// "This code can't be used" (webvh.storm.ws).
+
+const DID_HOST_HTTP_TEMPLATES: [&str; 3] = [
+    "did-host-http",
+    "did-host-http-tsp",
+    "did-host-http-didcomm",
+];
+
+fn sign_in_portal_entries(doc: &Value) -> Vec<&Value> {
+    doc["service"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["type"] == "SignInPortal")
+        .collect()
+}
+
+#[test]
+fn every_did_host_http_template_advertises_its_login_page_as_sign_in_portal() {
+    for name in DID_HOST_HTTP_TEMPLATES {
+        let tpl = load_embedded(name).unwrap();
+        let mut vars = did_host_http_tsp_fixture_vars();
+        vars.insert_string("URL", "https://webvh.storm.ws");
+        let doc = tpl.render(&vars).unwrap();
+        let portals = sign_in_portal_entries(&doc);
+        assert_eq!(portals.len(), 1, "`{name}`: {doc}");
+        assert_eq!(
+            *portals[0],
+            json!({
+                "id": "did:webvh:QmTEST:example.com#sign-in-portal",
+                "type": "SignInPortal",
+                "serviceEndpoint": "https://webvh.storm.ws/login",
+            }),
+            "`{name}` must publish exactly what DID hosting publishes for itself"
+        );
+    }
+}
+
+#[test]
+fn the_sign_in_portal_is_on_the_url_origin_not_its_path() {
+    let tpl = load_embedded("did-host-http").unwrap();
+    let mut vars = did_host_http_tsp_fixture_vars();
+    vars.insert_string("URL", "https://host.example.com:8443/hosting");
+    let doc = tpl.render(&vars).unwrap();
+    assert_eq!(
+        sign_in_portal_entries(&doc)[0]["serviceEndpoint"],
+        "https://host.example.com:8443/login"
+    );
+}
+
+#[test]
+fn the_sign_in_portal_keeps_the_did_sentinel_for_the_webvh_library() {
+    // The VTA renders with `DID = "{DID}"` and `didwebvh-rs` substitutes the
+    // final DID after SCID computation.
+    let tpl = load_embedded("did-host-http").unwrap();
+    let mut vars = did_host_http_tsp_fixture_vars();
+    vars.insert_string("DID", "{DID}");
+    let doc = tpl.render(&vars).unwrap();
+    assert_eq!(
+        sign_in_portal_entries(&doc)[0]["id"],
+        "{DID}#sign-in-portal"
+    );
+}
+
+#[test]
+fn a_plain_http_url_gets_no_sign_in_portal() {
+    for name in DID_HOST_HTTP_TEMPLATES {
+        let tpl = load_embedded(name).unwrap();
+        let mut vars = did_host_http_tsp_fixture_vars();
+        vars.insert_string("URL", "http://localhost:8530");
+        let doc = tpl.render(&vars).unwrap();
+        assert!(
+            sign_in_portal_entries(&doc).is_empty(),
+            "`{name}` advertised a plain-http sign-in portal: {doc}"
+        );
+        // Everything else still renders.
+        assert_eq!(doc["service"][0]["type"], "WebVHHosting");
+        assert_eq!(doc["service"][1]["type"], "TrustTaskHTTPS");
+    }
+}
+
+#[test]
+fn a_caller_may_omit_or_override_the_sign_in_portal() {
+    let tpl = load_embedded("did-host-http").unwrap();
+
+    let mut vars = did_host_http_tsp_fixture_vars();
+    vars.insert(SIGN_IN_PORTAL_SERVICE_VAR, Value::Null);
+    let doc = tpl.render(&vars).unwrap();
+    assert!(sign_in_portal_entries(&doc).is_empty(), "{doc}");
+
+    let mut vars = did_host_http_tsp_fixture_vars();
+    let custom = sign_in_portal_service("{DID}", "https://console.example.com").unwrap();
+    vars.insert(SIGN_IN_PORTAL_SERVICE_VAR, custom.clone());
+    let doc = tpl.render(&vars).unwrap();
+    assert_eq!(sign_in_portal_entries(&doc), vec![&custom]);
+}
+
+#[test]
+fn templates_without_a_login_page_get_no_sign_in_portal() {
+    // Witness / watcher / mediator nodes serve no `/login`; deriving the
+    // entry is opt-in by declaring the variable, which they do not.
+    for name in BUILTIN_NAMES {
+        if DID_HOST_HTTP_TEMPLATES.contains(name) || *name == "vtc-host" {
+            continue;
+        }
+        let tpl = load_embedded(name).unwrap();
+        assert!(
+            !tpl.optional_vars.contains_key(SIGN_IN_PORTAL_SERVICE_VAR),
+            "`{name}` declares {SIGN_IN_PORTAL_SERVICE_VAR}"
+        );
+    }
+    let mut vars = did_host_didcomm_fixture_vars();
+    vars.insert_string("URL", "https://host.example.com");
+    let doc = load_embedded("did-host-didcomm")
+        .unwrap()
+        .render(&vars)
+        .unwrap();
+    assert!(sign_in_portal_entries(&doc).is_empty(), "{doc}");
+}
+
+#[test]
+fn did_host_http_tsp_missing_mediator_did_errors() {
+    let tpl = load_embedded("did-host-http-tsp").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmTEST:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkTESTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSTESTka");
+    vars.insert_string("URL", "https://host.example.com");
+    // MEDIATOR_DID deliberately omitted.
+
+    let err = tpl
+        .render(&vars)
+        .expect_err("missing MEDIATOR_DID must error");
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("MEDIATOR_DID")),
+        "got: {err}"
+    );
+}
+
+// ─── did-host-tsp built-in ───────────────────────────────────────────
+//
+// TSP-only sibling of did-host-didcomm: a single TSPTransport service,
+// no HTTP and no DIDComm. The rendered-fixture comparison is a shape
+// regression guard — downstream services build against this exact shape.
+
+const DID_HOST_TSP_RENDERED_FIXTURE: &str =
+    include_str!("../../tests/fixtures/did-host-tsp.rendered.json");
+
+fn did_host_tsp_fixture_vars() -> TemplateVars {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmTEST:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkTESTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSTESTka");
+    vars.insert_string(
+        "MEDIATOR_DID",
+        "did:webvh:QmMED:mediator.example.com:mediator",
+    );
+    vars
+}
+
+#[test]
+fn did_host_tsp_builtin_loads_and_validates() {
+    let tpl = load_embedded("did-host-tsp").expect("load_embedded");
+    assert_eq!(tpl.name, "did-host-tsp");
+    assert_eq!(tpl.kind, "did-host-tsp");
+    assert_eq!(tpl.methods, vec!["webvh"]);
+    assert_eq!(tpl.required_vars, vec!["MEDIATOR_DID"]);
+    tpl.validate().expect("validate after load");
+}
+
+#[test]
+fn did_host_tsp_builtin_renders_exact_document_shape() {
+    let tpl = load_embedded("did-host-tsp").unwrap();
+    let out = tpl.render(&did_host_tsp_fixture_vars()).unwrap();
+    let expected: Value =
+        serde_json::from_str(DID_HOST_TSP_RENDERED_FIXTURE).expect("fixture parses as JSON");
+    assert_eq!(
+        out, expected,
+        "rendered document diverged from fixture — if intentional, update tests/fixtures/did-host-tsp.rendered.json"
+    );
+}
+
+#[test]
+fn did_host_tsp_builtin_advertises_single_tsp_transport() {
+    // Exactly one service: TSP via the mediator. No HTTP, no DIDComm.
+    let tpl = load_embedded("did-host-tsp").unwrap();
+    let doc = tpl.render(&did_host_tsp_fixture_vars()).unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    assert_eq!(
+        services.len(),
+        1,
+        "expected exactly one service entry (tsp), got {}: {services:?}",
+        services.len()
+    );
+    assert_eq!(services[0]["id"], "did:webvh:QmTEST:example.com#tsp");
+    assert_eq!(services[0]["type"], "TSPTransport");
+    assert_eq!(
+        services[0]["serviceEndpoint"],
+        "did:webvh:QmMED:mediator.example.com:mediator"
+    );
+    assert!(
+        !services
+            .iter()
+            .any(|s| s["type"] == "DIDCommMessaging" || s["type"] == "WebVHHosting"),
+        "did-host-tsp must advertise neither DIDComm nor HTTP hosting"
+    );
+}
+
+#[test]
+fn did_host_tsp_builtin_context_is_did_v1_plus_cid_v1() {
+    let tpl = load_embedded("did-host-tsp").unwrap();
+    let doc = tpl.render(&did_host_tsp_fixture_vars()).unwrap();
+    assert_eq!(
+        doc["@context"],
+        json!([
+            "https://www.w3.org/ns/did/v1",
+            "https://www.w3.org/ns/cid/v1"
+        ])
+    );
+}
+
+#[test]
+fn did_host_tsp_builtin_missing_mediator_did_errors() {
+    let tpl = load_embedded("did-host-tsp").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmTEST:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkTESTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSTESTka");
+    // MEDIATOR_DID deliberately omitted.
+
+    let err = tpl
+        .render(&vars)
+        .expect_err("missing MEDIATOR_DID must error");
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("MEDIATOR_DID")),
+        "got: {err}"
+    );
+}
+
+// ── schemaVersion 2: the `keys` block ────────────────────────────────────────
+
+/// **The compatibility guarantee.** A v1 built-in must keep the exact key pair
+/// it has always had.
+///
+/// `key_slots()` is what makes a v1 and a v2 template one code path, and it can
+/// only do that if a v1 template's implicit answer is right. If this ever
+/// drifts, every existing DID document starts being minted with different keys
+/// than the template says — and nothing else in the suite would notice, because
+/// a v1 template does not mention algorithms at all.
+///
+/// `vtc-host` is v2 (it declares a post-quantum signing slot), so it is checked
+/// against what it declares rather than against the v1 default. Listing it by
+/// name rather than skipping every v2 template keeps this test honest: a
+/// built-in that quietly moved to v2 would otherwise stop being checked at all.
+#[test]
+fn every_builtin_still_declares_the_historical_key_pair() {
+    /// Built-ins that have deliberately moved past the implicit pair.
+    const V2_BUILTINS: &[&str] = &["vtc-host"];
+
+    for name in BUILTIN_NAMES {
+        let tpl = builtin::load_embedded(name).expect("builtin loads");
+        let slots = tpl.key_slots();
+
+        // A foreign-protocol identity, shaped by someone else's profile rather
+        // than by this stack's historical pair: the Swiss Profile Anchor
+        // forbids keyAgreement and publicKeyMultibase, so the swiyu verifier
+        // keeps its Ed25519 update key out of the document and publishes one
+        // P-256 key as a JWK. Pinned here so it cannot drift back toward the
+        // pair, and so the pair's check below stays exact for everything else.
+        if *name == "swiyu-verifier" {
+            assert_eq!(tpl.schema_version, 2);
+            assert_eq!(slots[SLOT_SIGNING].algorithms, vec!["ed25519".to_string()]);
+            assert!(
+                !slots[SLOT_SIGNING].publish,
+                "the update key stays out of the document"
+            );
+            assert!(
+                !slots.contains_key(SLOT_KA),
+                "the profile forbids keyAgreement"
+            );
+            assert_eq!(slots["verifier"].algorithms, vec!["p256".to_string()]);
+            continue;
+        }
+
+        // `vtc-host` less its post-quantum slot: v2 because it is derived from
+        // `vtc-host`, and declaring exactly the historical pair.
+        if *name == "vtc-host-classical" {
+            assert_eq!(tpl.schema_version, 2);
+            assert_eq!(
+                slots.keys().map(String::as_str).collect::<Vec<_>>(),
+                [SLOT_KA, SLOT_SIGNING]
+            );
+            assert_eq!(slots[SLOT_SIGNING].algorithms, vec!["ed25519".to_string()]);
+            assert_eq!(slots[SLOT_KA].algorithms, vec!["x25519".to_string()]);
+            continue;
+        }
+
+        if V2_BUILTINS.contains(name) {
+            assert_eq!(
+                tpl.schema_version, 2,
+                "{name} is listed as a v2 built-in but declares schemaVersion {}",
+                tpl.schema_version
+            );
+            // The two historical slots must survive unchanged even here. The
+            // post-quantum key is an *addition*: `#key-0` still signs the
+            // did:webvh log (didwebvh 1.0 mandates eddsa-jcs-2022 there) and
+            // the VTC still derives its install-token, audit and storage keys
+            // from that Ed25519 seed.
+            assert_eq!(
+                slots[SLOT_SIGNING].algorithms,
+                vec!["ed25519".to_string()],
+                "{name}: the primary signing key must stay Ed25519 — it signs the DID log"
+            );
+            assert_eq!(
+                slots[SLOT_KA].algorithms,
+                vec!["x25519".to_string()],
+                "{name}: the key-agreement key is X25519"
+            );
+            assert!(
+                slots.len() > 2,
+                "{name} is listed as v2 but declares only the historical pair — either the \
+                 extra slot was dropped or it should not be in V2_BUILTINS"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            tpl.schema_version, 1,
+            "{name} moved to schemaVersion {} — add it to V2_BUILTINS and state what it \
+             declares, rather than letting it fall out of this check",
+            tpl.schema_version
+        );
+        assert_eq!(
+            slots.len(),
+            2,
+            "{name}: a v1 template means exactly the signing + key-agreement pair"
+        );
+        assert_eq!(
+            slots[SLOT_SIGNING].algorithms,
+            vec!["ed25519".to_string()],
+            "{name}: the v1 signing key is Ed25519"
+        );
+        assert_eq!(
+            slots[SLOT_KA].algorithms,
+            vec!["x25519".to_string()],
+            "{name}: the v1 key-agreement key is X25519"
+        );
+    }
+}
+
+/// The slot-to-placeholder rule reproduces the two names v1 already uses,
+/// rather than special-casing them.
+#[test]
+fn the_v1_placeholders_fall_out_of_the_slot_naming_rule() {
+    assert_eq!(DidTemplate::slot_var(SLOT_SIGNING), "SIGNING_KEY_MB");
+    assert_eq!(DidTemplate::slot_var(SLOT_KA), "KA_KEY_MB");
+    // And both are already reserved, so a template cannot declare them as vars.
+    assert!(RESERVED_VARS.contains(&"SIGNING_KEY_MB"));
+    assert!(RESERVED_VARS.contains(&"KA_KEY_MB"));
+}
+
+/// A document publishing exactly the slots a v2 fixture declares.
+///
+/// Built from the slot names rather than hardcoded, because validation now
+/// refuses a declared-but-unpublished slot — and a fixture that quietly went
+/// out of step with that rule would make these tests fail for a reason that
+/// has nothing to do with what they assert.
+fn doc_publishing(slots: &Value) -> Value {
+    let vms: Vec<Value> = slots
+        .as_object()
+        .expect("slots is an object")
+        .keys()
+        .map(|slot| {
+            let var = DidTemplate::slot_var(slot);
+            json!({
+                "id": format!("{{DID}}#{slot}"),
+                "type": "Multikey",
+                "controller": "{DID}",
+                "publicKeyMultibase": format!("{{{var}}}"),
+            })
+        })
+        .collect();
+    json!({ "id": "{DID}", "verificationMethod": vms })
+}
+
+fn v2_template(keys: Value) -> Value {
+    json!({
+        "schemaVersion": 2,
+        "name": "pq-admin",
+        "kind": "admin",
+        "document": doc_publishing(&keys),
+        "keys": keys,
+    })
+}
+
+/// A declared slot the document never publishes is refused.
+///
+/// The failure it prevents is the quiet one: the template announces a
+/// post-quantum key, the VTA mints it, the document does not publish it — so
+/// every verifier still sees only the classical key while the deployment
+/// believes it has migrated. (It also burns a derivation path forever.)
+#[test]
+fn a_declared_slot_the_document_never_publishes_is_refused() {
+    let err = DidTemplate::from_json(json!({
+        "schemaVersion": 2,
+        "name": "pq-admin",
+        "kind": "admin",
+        "keys": {
+            "signing": { "purpose": "signing", "algorithms": ["mldsa44"] },
+            "ka": { "purpose": "keyAgreement", "algorithms": ["x25519"] },
+        },
+        // Publishes the signing key only.
+        "document": {
+            "id": "{DID}",
+            "verificationMethod": [{
+                "id": "{DID}#key-1",
+                "publicKeyMultibase": "{SIGNING_KEY_MB}",
+            }],
+        },
+    }))
+    .expect_err("a slot that is minted and never published is refused");
+    assert!(
+        err.to_string().contains("never published"),
+        "the error must say the key would be minted and not published: {err}"
+    );
+}
+
+/// The converse: a slot placeholder the document uses but no slot declares.
+#[test]
+fn an_undeclared_slot_placeholder_is_refused() {
+    let err = DidTemplate::from_json(json!({
+        "schemaVersion": 2,
+        "name": "pq-admin",
+        "kind": "admin",
+        "keys": { "signing": { "purpose": "signing", "algorithms": ["ed25519"] } },
+        "document": {
+            "id": "{DID}",
+            "verificationMethod": [
+                { "id": "{DID}#s", "publicKeyMultibase": "{SIGNING_KEY_MB}" },
+                { "id": "{DID}#k", "publicKeyMultibase": "{KA_KEY_MB}" },
+            ],
+        },
+    }))
+    .expect_err("an undeclared slot placeholder is refused");
+    assert!(err.to_string().contains("no key slot"), "got: {err}");
+}
+
+/// A post-quantum signing slot with a classical fallback — the shape a fleet
+/// mid-migration needs from one template.
+#[test]
+fn a_pqc_first_slot_with_a_fallback_parses() {
+    let tpl = DidTemplate::from_json(v2_template(json!({
+        "signing": { "purpose": "signing", "algorithms": ["mldsa44", "ed25519"] },
+        "ka": { "purpose": "keyAgreement", "algorithms": ["x25519"] },
+    })))
+    .expect("a v2 template with a PQC-first signing slot is valid");
+
+    assert_eq!(
+        tpl.key_slots()[SLOT_SIGNING].algorithms,
+        vec!["mldsa44".to_string(), "ed25519".to_string()],
+        "preference order is the declared order, highest first"
+    );
+}
+
+/// The `keys` block is refused on a v1 template rather than silently ignored.
+///
+/// Ignoring it is the dangerous reading: a template that asks for ML-DSA and
+/// gets Ed25519 without complaint is a deployment that believes it is
+/// post-quantum and is not.
+#[test]
+fn a_keys_block_on_a_v1_template_is_refused() {
+    let mut raw = v2_template(json!({
+        "signing": { "purpose": "signing", "algorithms": ["mldsa44"] },
+    }));
+    raw["schemaVersion"] = json!(1);
+
+    let err = DidTemplate::from_json(raw).expect_err("v1 cannot carry a keys block");
+    assert!(
+        err.to_string().contains("schemaVersion"),
+        "the error must name the version, since that is the fix: {err}"
+    );
+}
+
+/// An empty algorithm list is refused rather than read as "anything".
+#[test]
+fn a_slot_naming_no_algorithm_is_refused() {
+    let err = DidTemplate::from_json(v2_template(json!({
+        "signing": { "purpose": "signing", "algorithms": [] },
+    })))
+    .expect_err("an empty preference list is not a preference");
+    assert!(
+        err.to_string().contains("no algorithms"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A signing slot cannot name X25519, and a key-agreement slot cannot name a
+/// signing algorithm.
+///
+/// Caught at validation because the alternative is a DID document that looks
+/// well-formed and whose `keyAgreement` entry nothing can actually use.
+#[test]
+fn a_slot_cannot_name_an_algorithm_that_cannot_serve_its_purpose() {
+    let err = DidTemplate::from_json(v2_template(json!({
+        "signing": { "purpose": "signing", "algorithms": ["x25519"] },
+    })))
+    .expect_err("X25519 cannot sign");
+    assert!(err.to_string().contains("cannot serve"), "got: {err}");
+
+    let err = DidTemplate::from_json(v2_template(json!({
+        "ka": { "purpose": "keyAgreement", "algorithms": ["mldsa44"] },
+    })))
+    .expect_err("ML-DSA cannot agree a key");
+    assert!(err.to_string().contains("cannot serve"), "got: {err}");
+}
+
+/// An algorithm this build does not know is named, not ignored.
+#[test]
+fn an_unknown_algorithm_is_named() {
+    let err = DidTemplate::from_json(v2_template(json!({
+        "signing": { "purpose": "signing", "algorithms": ["falcon512"] },
+    })))
+    .expect_err("an unknown algorithm is refused");
+    assert!(
+        err.to_string().contains("falcon512"),
+        "the error must name the algorithm so the author can fix it: {err}"
+    );
+}
+
+// ── schemaVersion 2: a key slot beyond the historical pair ───────────────────
+//
+// `slot_var`'s `{SLOT}_KEY_MB` rule was mechanical in one direction only. A
+// template could *declare* a third slot, but the placeholder that slot's rule
+// produces was rejected as undeclared — and the workaround for that rejection
+// published a literal string as a verification method. These pin both halves.
+
+/// A template with a third key slot: post-quantum signing alongside the
+/// classical pair, which is the shape a hybrid-credential issuer needs.
+fn three_slot_template(optional_vars: Value) -> Value {
+    json!({
+        "schemaVersion": 2,
+        "name": "three-slot",
+        "kind": "vtc-host",
+        "requiredVars": [],
+        "optionalVars": optional_vars,
+        "keys": {
+            "signing": { "purpose": "signing",      "algorithms": ["ed25519"] },
+            "ka":      { "purpose": "keyAgreement", "algorithms": ["x25519"] },
+            "pq-signing": { "purpose": "signing",   "algorithms": ["mldsa44"] }
+        },
+        "document": {
+            "id": "{DID}",
+            "verificationMethod": [
+                { "id": "{DID}#key-0", "type": "Multikey", "controller": "{DID}",
+                  "publicKeyMultibase": "{SIGNING_KEY_MB}" },
+                { "id": "{DID}#key-1", "type": "Multikey", "controller": "{DID}",
+                  "publicKeyMultibase": "{KA_KEY_MB}" },
+                { "id": "{DID}#key-2", "type": "Multikey", "controller": "{DID}",
+                  "publicKeyMultibase": "{PQ_SIGNING_KEY_MB}" }
+            ],
+            "assertionMethod": ["{DID}#key-0", "{DID}#key-2"],
+            "keyAgreement": ["{DID}#key-1"]
+        }
+    })
+}
+
+/// The first half: a third slot is expressible at all.
+///
+/// Its placeholder is ambient, like `{DID}` — the minting flow supplies it from
+/// the key it minted, so an author has nothing to declare and no way to know
+/// the value. Before `slot_vars()` fed `check_placeholders_declared`, this
+/// failed with "undeclared placeholder(s) { PQ_SIGNING_KEY_MB }", which is how
+/// a v2 template could declare a post-quantum slot and never be loadable.
+#[test]
+fn a_third_key_slot_needs_no_placeholder_declaration() {
+    let tpl = DidTemplate::from_json(three_slot_template(json!({})))
+        .expect("a declared slot's placeholder is ambient");
+
+    assert_eq!(tpl.key_slots().len(), 3);
+    assert!(
+        tpl.slot_vars().contains("PQ_SIGNING_KEY_MB"),
+        "the slot's ambient name follows `slot_var`, got {:?}",
+        tpl.slot_vars()
+    );
+}
+
+/// The second half, and the defect that mattered: the obvious way round the
+/// rejection above was to declare `PQ_SIGNING_KEY_MB` in `optionalVars`. That
+/// passed validation **and rendered** — publishing the author's default string
+/// as a `publicKeyMultibase` inside `assertionMethod`, into a `did:webvh` log
+/// that is written once and cannot be re-signed.
+///
+/// A key minted and never published is what `check_key_slots` refuses. This is
+/// the converse: a key published and never minted.
+#[test]
+fn a_key_slot_placeholder_cannot_be_given_a_default() {
+    let err = DidTemplate::from_json(three_slot_template(
+        json!({ "PQ_SIGNING_KEY_MB": "PLACEHOLDER-NEVER-SUBSTITUTED" }),
+    ))
+    .expect_err("a slot's placeholder must not be declarable");
+
+    let TemplateError::Invalid(msg) = &err else {
+        panic!("expected Invalid, got {err:?}");
+    };
+    assert!(
+        msg.contains("pq-signing") && msg.contains("optionalVars"),
+        "the error must name the slot and where it was declared: {msg}"
+    );
+}
+
+/// `requiredVars` is the same hole with a different lid — the caller supplies
+/// the value instead of the author, but it still shadows the minted key.
+#[test]
+fn a_key_slot_placeholder_cannot_be_a_required_var() {
+    let mut raw = three_slot_template(json!({}));
+    raw.as_object_mut()
+        .unwrap()
+        .insert("requiredVars".into(), json!(["PQ_SIGNING_KEY_MB"]));
+
+    let err = DidTemplate::from_json(raw).expect_err("a slot's placeholder must not be declarable");
+    let TemplateError::Invalid(msg) = &err else {
+        panic!("expected Invalid, got {err:?}");
+    };
+    assert!(
+        msg.contains("pq-signing") && msg.contains("requiredVars"),
+        "the error must name the slot and where it was declared: {msg}"
+    );
+}
+
+/// With the default route closed, a slot the minting flow has not yet learned
+/// to supply fails **loudly at render** rather than publishing something.
+///
+/// This is the state between this change and the one that wires derivation to
+/// the `keys` block: a third slot is expressible, and a VTA that cannot yet
+/// mint for it refuses to render rather than emitting a document with a hole
+/// in it. `Unresolved` naming the placeholder is the whole safety property.
+#[test]
+fn an_unsupplied_slot_key_is_unresolved_not_defaulted() {
+    let tpl = DidTemplate::from_json(three_slot_template(json!({}))).unwrap();
+
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:abc:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSigning");
+    vars.insert_string("KA_KEY_MB", "z6LSka");
+    // PQ_SIGNING_KEY_MB deliberately absent — what the VTA does today.
+
+    let err = tpl
+        .render(&vars)
+        .expect_err("an unminted slot must not render");
+    assert!(
+        matches!(&err, TemplateError::Unresolved(names) if names.contains("PQ_SIGNING_KEY_MB")),
+        "expected Unresolved naming the slot placeholder, got {err:?}"
+    );
+}
+
+/// And the positive case: supplied, it renders as the key.
+#[test]
+fn a_supplied_slot_key_renders_into_its_verification_method() {
+    let tpl = DidTemplate::from_json(three_slot_template(json!({}))).unwrap();
+
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:abc:example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkSigning");
+    vars.insert_string("KA_KEY_MB", "z6LSka");
+    vars.insert_string("PQ_SIGNING_KEY_MB", "zPqMlDsa44Public");
+
+    let doc = tpl.render(&vars).expect("renders");
+    assert_eq!(
+        doc["verificationMethod"][2]["publicKeyMultibase"],
+        "zPqMlDsa44Public"
+    );
+    // Published where a hybrid issuer needs it: a second assertion method, so
+    // a credential can carry a proof from each key.
+    assert_eq!(doc["assertionMethod"][1], "did:webvh:abc:example.com#key-2");
+}
+
+/// A v1 template's two slot names are in `RESERVED_VARS`, so they are refused
+/// by `check_reserved_vars` — which runs first — with the error it always gave.
+/// Pinning it so the new check cannot quietly take over that case and change
+/// the error type every v1 author sees.
+#[test]
+fn a_v1_slot_var_is_still_refused_as_reserved() {
+    let raw = base_template(json!({ "optionalVars": { "SIGNING_KEY_MB": "z6Mk" } }));
+    let err = DidTemplate::from_json(raw).unwrap_err();
+    assert!(
+        matches!(&err, TemplateError::ReservedVar(v) if v == "SIGNING_KEY_MB"),
+        "expected ReservedVar, got {err:?}"
+    );
+}
+
+/// A slot-shaped placeholder with no slot behind it must be told to declare a
+/// **slot**. The generic "add them to requiredVars or optionalVars" advice
+/// points at exactly what `check_slot_vars_not_declared` refuses — and at what,
+/// before that check existed, published the author's literal as a verification
+/// method. An error that recommends the defect is worse than no error.
+#[test]
+fn a_slot_shaped_placeholder_with_no_slot_is_told_to_declare_a_slot() {
+    let err = DidTemplate::from_json(json!({
+        "schemaVersion": 2,
+        "name": "no-such-slot",
+        "kind": "custom",
+        "keys": { "signing": { "purpose": "signing", "algorithms": ["ed25519"] } },
+        "document": {
+            "id": "{DID}",
+            "verificationMethod": [
+                { "id": "{DID}#key-0", "publicKeyMultibase": "{SIGNING_KEY_MB}" },
+                { "id": "{DID}#key-2", "publicKeyMultibase": "{PQ_SIGNING_KEY_MB}" },
+            ],
+        },
+    }))
+    .expect_err("a slot-shaped placeholder with no slot is refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no key slot 'pq-signing' is declared"),
+        "must name the missing slot: {msg}"
+    );
+    assert!(
+        msg.contains("not in requiredVars or optionalVars"),
+        "must steer away from declaring it as a variable: {msg}"
+    );
+}
+
+/// A v2 template whose `verifier` slot is published as a JWK, with the
+/// update key (`signing`) given as `signing_slot`.
+fn jwk_template(signing_slot: Value, document: Value) -> Result<DidTemplate, TemplateError> {
+    DidTemplate::from_json(json!({
+        "schemaVersion": 2,
+        "name": "jwk-test",
+        "kind": "oid4vp-verifier",
+        "keys": {
+            "signing": signing_slot,
+            "verifier": { "purpose": "signing", "algorithms": ["p256"] },
+        },
+        "document": document,
+    }))
+}
+
+fn jwk_document() -> Value {
+    json!({
+        "id": "{DID}",
+        "verificationMethod": [{
+            "id": "{DID}#verifier-key-1",
+            "type": "JsonWebKey2020",
+            "controller": "{DID}",
+            "publicKeyJwk": "{VERIFIER_KEY_JWK}",
+        }],
+        "authentication": ["{DID}#verifier-key-1"],
+    })
+}
+
+/// `{SLOT}_KEY_JWK` publishes a slot as well as `{SLOT}_KEY_MB` does, and it
+/// renders as the JWK object itself — a whole-string placeholder replaced by a
+/// JSON value, not a string.
+#[test]
+fn a_slot_published_as_a_jwk_renders_the_object() {
+    let tpl = jwk_template(
+        json!({ "purpose": "signing", "algorithms": ["ed25519"], "publish": false }),
+        jwk_document(),
+    )
+    .expect("a JWK-published slot and an unpublished update key validate");
+    let jwk = json!({ "kty": "EC", "crv": "P-256", "x": "AA", "y": "BB" });
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:Qm:example.com");
+    vars.insert("VERIFIER_KEY_JWK", jwk.clone());
+    let doc = tpl.render(&vars).expect("render");
+    assert_eq!(doc["verificationMethod"][0]["publicKeyJwk"], jwk);
+}
+
+/// Only the `did:webvh` update key may stay out of the document; and an
+/// unpublished slot that the document uses anyway is refused rather than
+/// silently published.
+#[test]
+fn publish_false_is_for_the_update_key_alone_and_means_it() {
+    // The signing slot published after all.
+    let mut doc = jwk_document();
+    doc["verificationMethod"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "{DID}#update",
+            "publicKeyJwk": "{SIGNING_KEY_JWK}",
+        }));
+    let err = jwk_template(
+        json!({ "purpose": "signing", "algorithms": ["ed25519"], "publish": false }),
+        doc,
+    )
+    .expect_err("an unpublished slot the document publishes");
+    assert!(err.to_string().contains("publish: false"), "{err}");
+
+    // Any other slot unpublished.
+    let err = DidTemplate::from_json(json!({
+        "schemaVersion": 2,
+        "name": "jwk-test",
+        "kind": "custom",
+        "keys": {
+            "signing": { "purpose": "signing", "algorithms": ["ed25519"] },
+            "verifier": { "purpose": "signing", "algorithms": ["p256"], "publish": false },
+        },
+        "document": {
+            "id": "{DID}",
+            "verificationMethod": [{ "id": "{DID}#k", "publicKeyMultibase": "{SIGNING_KEY_MB}" }],
+        },
+    }))
+    .expect_err("only the update key may go unpublished");
+    assert!(err.to_string().contains("only the"), "{err}");
+
+    // And the default stays: the update key is published unless told otherwise.
+    let err = jwk_template(
+        json!({ "purpose": "signing", "algorithms": ["ed25519"] }),
+        jwk_document(),
+    )
+    .expect_err("a published-by-default update key the document never carries");
+    assert!(err.to_string().contains("never published"), "{err}");
+}
+
+/// A `_KEY_JWK` placeholder for a slot nobody declared is refused, as its
+/// `_KEY_MB` twin is, and declaring it as a variable is refused too.
+#[test]
+fn an_undeclared_or_shadowed_jwk_placeholder_is_refused() {
+    let err = DidTemplate::from_json(json!({
+        "schemaVersion": 2,
+        "name": "jwk-test",
+        "kind": "custom",
+        "keys": { "signing": { "purpose": "signing", "algorithms": ["ed25519"] } },
+        "document": {
+            "id": "{DID}",
+            "verificationMethod": [
+                { "id": "{DID}#k", "publicKeyMultibase": "{SIGNING_KEY_MB}" },
+                { "id": "{DID}#v", "publicKeyJwk": "{VERIFIER_KEY_JWK}" },
+            ],
+        },
+    }))
+    .expect_err("no `verifier` slot is declared");
+    assert!(err.to_string().contains("verifier"), "{err}");
+
+    let err = DidTemplate::from_json(json!({
+        "schemaVersion": 2,
+        "name": "jwk-test",
+        "kind": "custom",
+        "optionalVars": { "VERIFIER_KEY_JWK": { "kty": "EC" } },
+        "keys": {
+            "signing": { "purpose": "signing", "algorithms": ["ed25519"], "publish": false },
+            "verifier": { "purpose": "signing", "algorithms": ["p256"] },
+        },
+        "document": jwk_document(),
+    }))
+    .expect_err("a slot's JWK placeholder declared as a variable");
+    assert!(err.to_string().contains("optionalVars"), "{err}");
+}
+
+// ─── dtg-witness built-in ──────────────────────────────────────────────
+//
+// A `vti-witness` identity — the witness of `witness/session/0.2`, named
+// `dtg-witness` so it cannot be confused with the did:webvh log witness
+// (`did-host-didcomm`, which `did-templates init witness` still resolves to).
+// Design: docs/05-design-notes/witness-host-service.md §3.1. One Ed25519 key that both authenticates and asserts (it answers
+// Trust Tasks and signs the VWCs it issues), one X25519 key-agreement key,
+// and TSP + DIDComm through a mediator — and no HTTP endpoint of any kind.
+
+const WITNESS_RENDERED_FIXTURE: &str =
+    include_str!("../../tests/fixtures/dtg-witness.rendered.json");
+const WITNESS_DID: &str = "did:webvh:QmWIT:witness.example.net:w1";
+const WITNESS_MEDIATOR: &str = "did:webvh:QmMED:mediator.example.org:mediator";
+
+fn witness_fixture_vars() -> TemplateVars {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", WITNESS_DID);
+    vars.insert_string("SIGNING_KEY_MB", "z6MkWITsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSWITka");
+    vars.insert_string("MEDIATOR_DID", WITNESS_MEDIATOR);
+    vars
+}
+
+#[test]
+fn dtg_witness_builtin_loads_and_validates() {
+    let tpl = load_embedded("dtg-witness").expect("load_embedded");
+    assert_eq!(tpl.name, "dtg-witness");
+    assert_eq!(
+        tpl.kind, "dtg-witness",
+        "the integration kind is `dtg-witness`"
+    );
+    assert_eq!(tpl.methods, vec!["webvh"]);
+    assert_eq!(tpl.required_vars, vec!["MEDIATOR_DID"]);
+    tpl.validate().expect("validate after load");
+}
+
+#[test]
+fn dtg_witness_builtin_renders_exact_document_shape() {
+    let tpl = load_embedded("dtg-witness").unwrap();
+    let out = tpl.render(&witness_fixture_vars()).unwrap();
+    let expected: Value =
+        serde_json::from_str(WITNESS_RENDERED_FIXTURE).expect("fixture parses as JSON");
+    assert_eq!(
+        out, expected,
+        "rendered document diverged from fixture — if intentional, update tests/fixtures/dtg-witness.rendered.json"
+    );
+}
+
+/// The services, matched by `type` (never by `#id`, which is a label): TSP
+/// first, then DIDComm, both at the mediator — and nothing a client could
+/// reach over HTTP. A witness has no HTTPS door in v1 (design note §3.1, §5
+/// item 2), so a `VTARest` entry would advertise a transport this service
+/// cannot serve.
+#[test]
+fn dtg_witness_builtin_advertises_tsp_and_didcomm_at_the_mediator_and_no_rest() {
+    let doc = load_embedded("dtg-witness")
+        .unwrap()
+        .render(&witness_fixture_vars())
+        .unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    let types: Vec<&str> = services
+        .iter()
+        .map(|s| s["type"].as_str().expect("a single type string"))
+        .collect();
+    assert_eq!(types, ["TSPTransport", "DIDCommMessaging"]);
+
+    let tsp = &services[0];
+    assert_eq!(tsp["serviceEndpoint"], WITNESS_MEDIATOR);
+    assert_eq!(tsp["id"], format!("{WITNESS_DID}#tsp"));
+    let didcomm = &services[1];
+    assert_eq!(didcomm["serviceEndpoint"][0]["uri"], WITNESS_MEDIATOR);
+    assert_eq!(
+        didcomm["serviceEndpoint"][0]["accept"],
+        json!(["didcomm/v2"])
+    );
+    assert_eq!(didcomm["id"], format!("{WITNESS_DID}#didcomm"));
+
+    for forbidden in [
+        "VTARest",
+        "VTCRest",
+        "TrustTaskHTTPS",
+        "WebVHHosting",
+        "SignInPortal",
+    ] {
+        assert!(
+            !types.contains(&forbidden),
+            "a witness advertises no {forbidden}: {services:#?}"
+        );
+    }
+}
+
+/// `#key-0` (Ed25519) answers Trust Tasks and signs the VWC, so it sits under
+/// both `authentication` and `assertionMethod`; `#key-1` (X25519) is key
+/// agreement only and never signs.
+#[test]
+fn dtg_witness_builtin_puts_the_keys_in_the_right_relationships() {
+    let doc = load_embedded("dtg-witness")
+        .unwrap()
+        .render(&witness_fixture_vars())
+        .unwrap();
+    let signing = format!("{WITNESS_DID}#key-0");
+    let ka = format!("{WITNESS_DID}#key-1");
+    assert_eq!(doc["authentication"], json!([signing]));
+    assert_eq!(doc["assertionMethod"], json!([signing]));
+    assert_eq!(doc["keyAgreement"], json!([ka]));
+    assert_eq!(
+        doc["verificationMethod"][0]["publicKeyMultibase"],
+        "z6MkWITsigning"
+    );
+    assert_eq!(
+        doc["verificationMethod"][1]["publicKeyMultibase"],
+        "z6LSWITka"
+    );
+
+    // The historical pair, nothing more: Ed25519 signs, X25519 agrees.
+    let slots = load_embedded("dtg-witness").unwrap().key_slots();
+    assert_eq!(slots.len(), 2, "{slots:?}");
+    assert_eq!(slots[SLOT_SIGNING].algorithms, vec!["ed25519".to_string()]);
+    assert_eq!(slots[SLOT_KA].algorithms, vec!["x25519".to_string()]);
+}
+
+#[test]
+fn dtg_witness_builtin_missing_mediator_did_errors() {
+    let tpl = load_embedded("dtg-witness").unwrap();
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", WITNESS_DID);
+    vars.insert_string("SIGNING_KEY_MB", "z6MkWITsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSWITka");
+    // MEDIATOR_DID deliberately omitted.
+    let err = tpl
+        .render(&vars)
+        .expect_err("missing MEDIATOR_DID must error");
+    assert!(
+        matches!(&err, TemplateError::MissingVars(m) if m.contains("MEDIATOR_DID")),
+        "got: {err}"
+    );
+}
+
+// ─── ballot-box built-in ───────────────────────────────────────────────
+//
+// A `vti-voting-service` identity: the witness's shape (one Ed25519 key that
+// authenticates and asserts — it answers Trust Tasks and signs receipts and
+// board heads — and one X25519 key-agreement key, TSP + DIDComm through a
+// mediator) plus a `TrustTaskHTTPS` door, because a cast from a one-time key
+// MUST be accepted over a binding whose sender holds no session (VTI-VOT-004).
+
+const BALLOT_BOX_DID: &str = "did:webvh:QmBBX:votes.example.net:b1";
+const BALLOT_BOX_MEDIATOR: &str = "did:webvh:QmMED:mediator.example.org:mediator";
+const BALLOT_BOX_HTTPS: &str = "https://votes.example.net";
+
+fn ballot_box_vars() -> TemplateVars {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", BALLOT_BOX_DID);
+    vars.insert_string("SIGNING_KEY_MB", "z6MkBBXsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSBBXka");
+    vars.insert_string("MEDIATOR_DID", BALLOT_BOX_MEDIATOR);
+    vars.insert_string("HTTPS_URL", BALLOT_BOX_HTTPS);
+    vars
+}
+
+#[test]
+fn ballot_box_builtin_loads_and_requires_its_mediator_and_https_door() {
+    let tpl = load_embedded("ballot-box").expect("load_embedded");
+    assert_eq!(tpl.kind, "ballot-box");
+    assert_eq!(tpl.methods, vec!["webvh"]);
+    assert_eq!(tpl.required_vars, vec!["MEDIATOR_DID", "HTTPS_URL"]);
+    tpl.validate().expect("validate after load");
+}
+
+/// TSP, then DIDComm, both at the mediator, then the sessionless cast door —
+/// matched by `type`, never by `#id`.
+#[test]
+fn ballot_box_builtin_advertises_tsp_didcomm_and_the_cast_door() {
+    let doc = load_embedded("ballot-box")
+        .unwrap()
+        .render(&ballot_box_vars())
+        .unwrap();
+    let services = doc["service"].as_array().expect("service is array");
+    let types: Vec<&str> = services
+        .iter()
+        .map(|s| s["type"].as_str().expect("a single type string"))
+        .collect();
+    assert_eq!(
+        types,
+        ["TSPTransport", "DIDCommMessaging", "TrustTaskHTTPS"]
+    );
+    assert_eq!(services[0]["serviceEndpoint"], BALLOT_BOX_MEDIATOR);
+    assert_eq!(
+        services[1]["serviceEndpoint"][0]["uri"],
+        BALLOT_BOX_MEDIATOR
+    );
+    assert_eq!(services[2]["serviceEndpoint"], BALLOT_BOX_HTTPS);
+
+    let signing = format!("{BALLOT_BOX_DID}#key-0");
+    assert_eq!(doc["authentication"], json!([signing]));
+    assert_eq!(doc["assertionMethod"], json!([signing]));
+    assert_eq!(
+        doc["keyAgreement"],
+        json!([format!("{BALLOT_BOX_DID}#key-1")])
+    );
+}
+
+/// A room host advertises its `rooms/*` surface as `TrustTaskHTTPS` at `URL` — the
+/// HTTPS binding's own service type, which every Trust Task client reads — and never
+/// `VTARest`: a room host is not a VTA, and a client looking for the binding's type
+/// (the wallet's console) found none and refused to register rooms with it.
+#[test]
+fn room_host_builtin_advertises_trust_task_https_not_vta_rest() {
+    let mut vars = TemplateVars::new();
+    vars.insert_string("DID", "did:webvh:QmHost:rooms.example.com");
+    vars.insert_string("SIGNING_KEY_MB", "z6MkHOSTsigning");
+    vars.insert_string("KA_KEY_MB", "z6LSHOSTka");
+    vars.insert_string("WEBVH_SERVER", "prod");
+    vars.insert_string("URL", "https://rooms.example.com");
+    vars.insert_string("MEDIATOR_DID", "did:webvh:QmMediator:mediator.example.com");
+    let doc = load_embedded("room-host").unwrap().render(&vars).unwrap();
+    let rest: Vec<&Value> = doc["service"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["serviceEndpoint"] == "https://rooms.example.com")
+        .collect();
+    assert_eq!(rest.len(), 1, "{doc:#}");
+    assert_eq!(rest[0]["type"], "TrustTaskHTTPS");
+}
+
+// ─── trust-registry built-in ─────────────────────────────────────────
+
+/// The four entries a trust registry's own runtime builder emits, in the
+/// shape it emits them. `{DID}` is the sentinel `didwebvh-rs` resolves after
+/// the SCID is known, as it is for every caller-supplied entry.
+fn trust_registry_entries() -> [(&'static str, Value); 4] {
+    [
+        (DIDCOMM_SERVICE_VAR, didcomm_service(MEDIATOR).unwrap()),
+        (
+            "SERVICE_REST",
+            json!({
+                "id": "{DID}#rest",
+                "type": "TRQPRest",
+                "serviceEndpoint": "https://registry.example.com",
+            }),
+        ),
+        (
+            TRUST_REGISTRY_SERVICE_VAR,
+            json!({
+                "id": "{DID}#trust-registry",
+                "type": TRUST_REGISTRY_SERVICE_TYPE,
+                "serviceEndpoint": {
+                    "uri": "https://registry.example.com",
+                    "profile": TRQP_PROFILE_URI,
+                },
+            }),
+        ),
+        (TSP_SERVICE_VAR, tsp_service(MEDIATOR).unwrap()),
+    ]
+}
+
+#[test]
+fn trust_registry_renders_every_transport_it_is_given() {
+    let tpl = load_embedded("trust-registry").unwrap();
+    assert_eq!(tpl.name, "trust-registry");
+    let mut vars = ambient_vars();
+    vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+    for (var, entry) in trust_registry_entries() {
+        vars.insert(var, entry);
+    }
+
+    let out = tpl.render(&vars).unwrap();
+
+    assert_eq!(out["authentication"][0], "did:webvh:abc:example.com#key-0");
+    assert_eq!(out["assertionMethod"][0], "did:webvh:abc:example.com#key-0");
+    assert_eq!(out["keyAgreement"][0], "did:webvh:abc:example.com#key-1");
+    let types: Vec<&str> = out["service"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "DIDCommMessaging",
+            "TRQPRest",
+            TRUST_REGISTRY_SERVICE_TYPE,
+            "TSPTransport"
+        ]
+    );
+    // An endpoint, not a referral: in the registry's own document the
+    // `TrustRegistry` uri is its TRQP URL.
+    assert_eq!(
+        out["service"][2]["serviceEndpoint"]["uri"],
+        "https://registry.example.com"
+    );
+}
+
+/// A registry advertises only what it serves, so each slot has to be
+/// omissible on its own: a REST-only registry has no mediator to name, and a
+/// DIDComm-only one has no public URL.
+#[test]
+fn trust_registry_prunes_every_transport_it_is_not_given() {
+    let tpl = load_embedded("trust-registry").unwrap();
+    for (kept, entry) in trust_registry_entries() {
+        let mut vars = ambient_vars();
+        vars.insert_string("KA_KEY_MB", "z6LSKeyAgreement");
+        let expected_type = entry["type"].clone();
+        vars.insert(kept, entry);
+
+        let out = tpl.render(&vars).unwrap();
+
+        let services = out["service"].as_array().unwrap();
+        assert_eq!(services.len(), 1, "only {kept} was supplied");
+        assert_eq!(services[0]["type"], expected_type);
+    }
+}

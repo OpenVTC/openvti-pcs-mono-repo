@@ -1,0 +1,174 @@
+# Deleting a DID: what goes with it
+
+**Status:** classification + census, blockers, revocation and the
+authorization cascade shipped. Preview/confirm and the remaining cascades are
+follow-ups — see *Not done yet*.
+
+## The problem
+
+`dids delete` removed the daemon-side DID, the local `webvh` record and log,
+and the DID's key records. Nothing else. ACL entries, issued credentials,
+sessions, contexts and per-DID state were left behind.
+
+That is the same defect class as the VTC's ACL-revoke orphan (#1194, #1196),
+one level up: **a surface owning part of a multi-part identity and knowing
+nothing about the rest.** The VTC learned it the expensive way — an
+`acl/revoke` aimed at a member left a live member row with no authorization and
+credentials that still verified for anyone holding them, and the members-list
+reader called the result "genuine out-of-band corruption" while the writer
+produced it on request.
+
+## Deleting a DID is four relationships, not one
+
+Treating them alike gets one wrong in a way nobody notices until it matters.
+
+| Relationship | Verb | Examples |
+|---|---|---|
+| The DID **owns** it | Cascade | keys, the webvh log, resolution cache |
+| It **names the DID as a subject of authorization** | Cascade | ACL entry, sessions, passkey VMs, consent, vault |
+| It **depends on the DID to function** | Blocks | a context acting as this DID, an advertised service, a policy or approver set naming it |
+| The VTA **issued** it | Revoke | issued credentials |
+
+The fourth is the one that cannot be "cleaned up" and the one most likely to be
+got wrong, because it looks the most like a cascade. Third parties hold copies
+of what the VTA issued. Deleting our record does not invalidate theirs — it
+destroys the only means of revoking them, leaving every copy in the wild valid
+forever. It is precisely the residue left on the VTC.
+
+## Decisions
+
+Three, settled deliberately:
+
+1. **A deletion revokes what it cannot destroy.** Credentials the VTA issued to
+   the DID are revoked, not deleted.
+2. **A dependency refuses the deletion, and says what to unpick.** Not a
+   cascade — cascading silently breaks a context. The refusal names the
+   corrective command, per the workspace's "operator errors should suggest the
+   fix" convention.
+3. **No `--force`.** Same call as `would_violate_last_service`, for the same
+   reason: the escape hatch is what gets used at 2am.
+
+## Ordering
+
+Revocation runs **first**, before any deletion, remote or local.
+
+If anything later fails, the credentials are already dead and the DID still
+exists — recoverable by re-running. The other order leaves live credentials for
+a DID nobody can revoke through any more. When a partial failure is possible,
+the surviving state should be the *over*-restrictive one.
+
+The preflight is read-only, so a refusal leaves the VTA exactly as it found it.
+
+## Why a census rather than a list in a function
+
+The failure mode is not getting today's answers wrong. It is a keyspace added
+next quarter that nobody classifies, whose rows then quietly outlive the DID
+they belong to — which is how the original gap happened.
+
+`vta_keyspaces::did_delete_effect` classifies every keyspace, and a census test
+fails when one is unclassified. `Unrelated` is a fine answer; it just has to be
+a *chosen* one. This rides the same rail as the existing backup-partition
+census, and turns "we forgot" from an orphan found months later in a log into a
+red test.
+
+A label is a claim about the code. `Cascade`, `Blocks` and `Revoke` are held
+to the cascade's own list of what it reaches (`DID_DELETE_REACHES` beside
+`delete_did_webvh_with`) by `did_delete_labels_match_the_cascade`. A keyspace
+whose rows should go with the DID, or should stop the deletion, but which the
+cascade does not reach yet is labelled `Orphaned`, with the intended effect in
+the comment beside it. Until that test existed, most of the census said
+`Cascade` for keyspaces nothing cleared.
+
+Two classifications are pinned explicitly because they are the ones a future
+change is most likely to get wrong:
+
+- `issued_credentials` is **never** `Cascade`.
+- `audit` is **never** cascaded — the record that a DID was deleted is the one
+  thing that must survive deleting it.
+
+## Preview and confirm
+
+Deletion is irreversible and now also *revokes* — credentials in other people's
+wallets stop being good, and no undo puts them back. So the operator sees the
+plan first.
+
+`plan_did_deletion` is read-only and returns the same plan the deletion acts
+on. One function, both callers: a preview computed separately would agree with
+the deletion only as long as somebody kept the two agreeing, and a preview that
+under-reports is worse than none, because it is a promise the operator acted
+on.
+
+Credentials are listed **by id**, not counted. Someone deciding whether to
+proceed is deciding about *those* credentials, and "3 will be revoked" cannot be
+checked against what they expected — which is the only question a confirmation
+prompt actually asks.
+
+`--force` skips the *prompt*. It does not skip the blockers: those are refused
+inside the operation regardless, and still have no override. The two are
+different things and the flag name is the obvious place to confuse them, so it
+says so.
+
+A plan that touches nothing beyond the DID's own records does not prompt at
+all. The ceremony is for consequences, not for deletions.
+
+## The copy on the hosting server
+
+The local record holds the only credentials that can delete a hosted DID's
+published log. Dropping the record without reaching the host leaves a log that
+keeps resolving and that nobody can update or remove any more. VTI R2.1
+(Remote-First) says the remote effect comes first, so:
+
+- **Server no longer registered → refused.** `get_server` returning nothing used
+  to skip the host delete silently: the record went, the log stayed live, and
+  nothing reported it. The deletion now refuses before touching anything
+  (including revocation), with the corrective sequence: `servers add --id <id>
+  --did <server-did>`, then retry. The refusal is a `Conflict`, the same typed
+  error as every other blocker, on REST, DIDComm and TSP alike.
+- **Serverless → unaffected.** There is no host copy.
+- **Server registered but the host delete fails → partial success, reported.**
+  The `webvh/dids/delete/1.0` response defines `daemonCleanupError` for exactly
+  this, and says a consumer MUST surface it. `pnm` used to discard it (the SDK's
+  `delete_did_webvh` returns `()`); it now calls
+  `delete_did_webvh_with_outcome` and prints it.
+
+`--local-only` (offline `vta did-mgmt dids delete` only) is the explicit opt-in
+for a host that is gone for good, where `servers add` cannot succeed because the
+server DID no longer resolves. It is not the `--force` decision 3 rules out: it
+acknowledges one specific leftover, it is refused for a registered or serverless
+DID (where it would orphan a deletable copy, or mean nothing), and the result
+still says the host copy remains.
+
+It is offline-only because the request payload is generated from the
+specification with `additionalProperties: false`. An online opt-in needs a
+`localOnly` member on `vta/webvh/dids/delete` in `dtgwg-trust-tasks-tf` first,
+then a `trust-tasks-rs` bump.
+
+## A caller that cannot cascade cannot delete
+
+`WebvhDeps::delete_cascade` is `None` on the paths that only read or publish.
+That does not mean "skip the cascade" — `delete_did_webvh` refuses. Half a
+deletion is the failure this exists to prevent, so it is not something a
+construction site can opt into by omission.
+
+## Not done yet
+
+- **Preview/confirm on the *online* path.** The offline `vta did-mgmt dids
+  delete` now shows the plan and prompts (see below). The Trust Task surface
+  cannot yet: there is no published `webvh/dids/preview-delete` URI, and a new
+  Trust Task family cannot be dispatched until its schema lands in
+  `trustoverip/dtgwg-trust-tasks-tf` and `trust-tasks-rs` bumps.
+  `vta/contexts/preview-delete/1.0` is the precedent to copy, and a spec PR is
+  the prerequisite — not something to work around by inventing a URI.
+- **The remaining cascades and blockers.** Every keyspace labelled `Orphaned`
+  in `did_delete_effect`: the material of imported / internal keys, outbox,
+  trust-task pushes, TSP relationships, passkey VMs, consent, task consent,
+  vault, app state, memory, room groups and invitations, PCS engine, witness
+  sessions, notifications, persona bindings and contacts (should cascade); and
+  `service_state` / `service_prev_config`, `policy`, `consent_approvers` and
+  `external_accounts` (should block — only the context and self-DID checks are
+  implemented). A *context* deletion purges most of the cascade set for the
+  whole context (`vta_keyspaces::context_delete_effect`); a lone DID deletion
+  does not.
+- **Resumability (R2.1).** The daemon delete still happens before local cleanup
+  with no idempotency key, so a failure between them leaves the daemon-side
+  orphan the code already warns about.

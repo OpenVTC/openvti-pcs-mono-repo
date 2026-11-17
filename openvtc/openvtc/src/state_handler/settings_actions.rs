@@ -1,0 +1,1795 @@
+//! Settings action handlers for the TUI.
+
+use crate::state_handler::background_dispatch::{self, DispatchDomain, DispatchOutcome, InFlight};
+use crate::state_handler::main_page::status::Status;
+#[allow(unused_imports)]
+use crate::state_handler::state::PublishState;
+use anyhow::Result;
+#[cfg(feature = "openpgp-card")]
+use openvtc_core::config::ConfigProtectionType;
+use openvtc_core::{config::Config, logs::LogFamily};
+use secrecy::{ExposeSecret, SecretString};
+use tracing::info;
+
+/// Update the friendly name.
+///
+/// R11: mutates + logs only; persistence is the caller's responsibility (the
+/// loop marks the config dirty for a coalesced save via `Persist::SaveAndSync`).
+/// This is a routine, non-durability-critical setting (no key re-derivation),
+/// so coalescing is safe — the Exit force-flush guarantees it is persisted.
+pub fn update_friendly_name(config: &mut Config, name: &str) {
+    config.public.friendly_name = name.to_string();
+    config.private.logs.insert(
+        LogFamily::Config,
+        format!("Friendly name changed to '{}'", name),
+    );
+    info!(name = %name, "friendly name updated");
+}
+
+// There is deliberately no `update_mediator_did`. A persona's mediator is chosen
+// when the persona is minted and published in its DID document, so the Settings
+// row is read-only (see `settings_panel::MEDIATOR_ROW`). The `OPENVTC_MEDIATOR_DID`
+// override in `env_overrides.rs` is not a write path: it exists only in
+// `dev-overrides` builds and calls `Config::set_active_mediator_did_runtime`,
+// which never touches the persisted account record.
+
+// There is likewise no `update_org_did`, and no "Org DID" row: no protocol,
+// trust check or message consults one, and a reference CLI has no business
+// asserting an organisation on anyone's behalf. An existing config's `org_did`
+// key rides in `Account::extra`, carried untouched.
+
+/// Set a passphrase to encrypt the config in the keyring.
+///
+/// R12: the Argon2id unlock-key derivation (~0.5–1 s of pure CPU) runs on a
+/// `spawn_blocking` thread via `UnlockKey::derive_blocking` so it does not peg
+/// the async event-loop / render task. The key is derived under a fresh random
+/// salt (#566), which the save writes beside the ciphertext. The subsequent
+/// force-flush ([`SaveScheduler::flush`]) does not run Argon2 (it AES-encrypts with the already-derived
+/// key), so this is the only KDF on this path.
+pub async fn set_passphrase(
+    config: &mut Config,
+    save: &mut SaveScheduler,
+    passphrase: &SecretString,
+) -> Result<()> {
+    use openvtc_core::config::{ConfigProtectionType, UnlockKey, validate_passphrase};
+
+    validate_passphrase(passphrase.expose_secret())?;
+    let key = UnlockKey::derive_blocking(passphrase.clone()).await?;
+    config.unlock_code = Some(key);
+    config.public.protection = ConfigProtectionType::Encrypted;
+    config.private.logs.insert(
+        LogFamily::Config,
+        "Profile protection changed to an unlock code".to_string(),
+    );
+    save.flush(config).await?;
+    info!("config protection set to passphrase encrypted");
+    Ok(())
+}
+
+/// Remove passphrase protection, reverting to keyring-only.
+///
+/// Force-flushes through [`SaveScheduler::flush`]: the protection change must
+/// be on disk before success is reported.
+pub async fn remove_passphrase(config: &mut Config, save: &mut SaveScheduler) -> Result<()> {
+    use openvtc_core::config::ConfigProtectionType;
+
+    config.unlock_code = None;
+    config.public.protection = ConfigProtectionType::Plaintext;
+    config.private.logs.insert(
+        LogFamily::Config,
+        "Config protection changed to keyring only (no additional encryption)".to_string(),
+    );
+    save.flush(config).await?;
+    info!("config protection reverted to keyring only");
+    Ok(())
+}
+
+/// Validate a file path for export/import operations.
+fn validate_file_path(path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        anyhow::bail!("File path cannot be empty");
+    }
+    if path.contains("..") {
+        anyhow::bail!("Path traversal (..) is not allowed");
+    }
+    Ok(())
+}
+
+/// Export the config to a file, encrypted with the given passphrase.
+///
+/// R12: `Config::export` now derives its Argon2 export key off the runtime
+/// (`spawn_blocking`), so this awaits it instead of blocking the loop.
+pub async fn export_config(config: &Config, path: &str, passphrase: SecretString) -> Result<()> {
+    validate_file_path(path)?;
+    config.export(passphrase, path).await?;
+    info!(path = %path, "config exported");
+    Ok(())
+}
+
+/// Validate an import file, then direct the operator to the real restore flow.
+///
+/// Importing into a *running* profile would require swapping the live config
+/// and reconnecting messaging, so it is intentionally not performed from the
+/// Settings panel. The supported restore path lives in the setup wizard:
+/// run `openvtc setup` and choose "Import" / "Restore Backup".
+pub fn import_config(path: &str, _passphrase: &SecretString) -> Result<String> {
+    validate_file_path(path)?;
+    // Validate the file exists
+    if !std::path::Path::new(path).exists() {
+        anyhow::bail!("File not found: {}", path);
+    }
+    Ok(format!(
+        "Import from {} is not supported here — run `openvtc setup` and choose \
+         Import / Restore Backup to restore an exported config.",
+        path
+    ))
+}
+
+// ============================================================
+// State-handler dispatch wrappers
+// ============================================================
+
+use crate::state_handler::{
+    actions::SettingsAction,
+    dispatch_util,
+    main_page::content::SettingsMode,
+    save_coalesce::SaveScheduler,
+    state::{self, State},
+};
+use crate::ui::pages::main::components::settings_panel as rows;
+use tokio::sync::{mpsc::UnboundedSender, watch};
+
+fn handle_select(state: &mut State, index: usize) {
+    #[cfg(feature = "openpgp-card")]
+    if let SettingsMode::TokenManagement { selected_index } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *selected_index = index;
+    } else {
+        state.main_page.content_panel.settings.selected_index = index;
+    }
+    #[cfg(not(feature = "openpgp-card"))]
+    {
+        state.main_page.content_panel.settings.selected_index = index;
+    }
+}
+
+fn handle_start_edit(state: &mut State) {
+    state.main_page.content_panel.settings.form_problem = None;
+    let idx = state.main_page.content_panel.settings.selected_index;
+    let s = &state.main_page.content_panel.settings;
+    state.main_page.content_panel.settings.mode = match idx {
+        rows::FRIENDLY_NAME_ROW => SettingsMode::EditFriendlyName {
+            input: s.friendly_name.clone(),
+        },
+        // `MEDIATOR_ROW` is deliberately absent: the mediator is read-only, so
+        // Enter on it falls through to `View` like any other unedittable row.
+        rows::EXPORT_ROW => SettingsMode::ExportConfig {
+            path_input: "openvtc-export.enc".to_string(),
+            passphrase_len: 0,
+            confirm_len: 0,
+            active_field: 0,
+        },
+        rows::IMPORT_ROW => SettingsMode::ImportConfig {
+            path_input: "openvtc-export.enc".to_string(),
+            passphrase_len: 0,
+            active_field: 0,
+        },
+        _ => SettingsMode::View,
+    };
+}
+
+fn handle_field_update(state: &mut State, value: String) {
+    if let SettingsMode::EditFriendlyName { input } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *input = value;
+    }
+}
+
+fn handle_form_field_update(state: &mut State, field: usize, value: String) {
+    match &mut state.main_page.content_panel.settings.mode {
+        SettingsMode::ExportConfig { path_input, .. }
+        | SettingsMode::ImportConfig { path_input, .. }
+            if field == 0 =>
+        {
+            *path_input = value;
+        }
+        _ => {}
+    }
+}
+
+fn handle_passphrase_len(state: &mut State, len: usize) {
+    state.main_page.content_panel.settings.form_problem = None;
+    match &mut state.main_page.content_panel.settings.mode {
+        SettingsMode::ExportConfig { passphrase_len, .. }
+        | SettingsMode::ImportConfig { passphrase_len, .. } => {
+            *passphrase_len = len;
+        }
+        _ => {}
+    }
+}
+
+fn handle_export_confirm_len(state: &mut State, len: usize) {
+    state.main_page.content_panel.settings.form_problem = None;
+    if let SettingsMode::ExportConfig { confirm_len, .. } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *confirm_len = len;
+    }
+}
+
+/// Export cycles path → passphrase → confirm; import has no confirm field.
+fn handle_form_tab_switch(state: &mut State) {
+    state.main_page.content_panel.settings.form_problem = None;
+    match &mut state.main_page.content_panel.settings.mode {
+        SettingsMode::ExportConfig { active_field, .. } => {
+            *active_field = (*active_field + 1) % 3;
+        }
+        SettingsMode::ImportConfig { active_field, .. } => {
+            *active_field = if *active_field == 0 { 1 } else { 0 };
+        }
+        _ => {}
+    }
+}
+
+fn handle_protection_option_select(state: &mut State, option: usize) {
+    if let SettingsMode::ChangeProtection {
+        selected_option, ..
+    } = &mut state.main_page.content_panel.settings.mode
+    {
+        *selected_option = option;
+    }
+}
+
+fn handle_protection_start_input(state: &mut State) {
+    if let SettingsMode::ChangeProtection { active_field, .. } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *active_field = 1;
+    }
+}
+
+fn handle_protection_passphrase_len(state: &mut State, len: usize) {
+    state.main_page.content_panel.settings.form_problem = None;
+    if let SettingsMode::ChangeProtection { passphrase_len, .. } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *passphrase_len = len;
+    }
+}
+
+fn handle_protection_confirm_len(state: &mut State, len: usize) {
+    state.main_page.content_panel.settings.form_problem = None;
+    if let SettingsMode::ChangeProtection { confirm_len, .. } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *confirm_len = len;
+    }
+}
+
+fn handle_protection_tab_switch(state: &mut State, next_field: usize) {
+    if let SettingsMode::ChangeProtection { active_field, .. } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *active_field = next_field;
+    }
+}
+
+/// Commit the in-progress settings edit.
+///
+/// R11: the per-setting save is coalesced (`Persist::SaveAndSync` marks the
+/// config dirty rather than saving inline).
+///
+/// No row here can decline to apply, and none triggers a mediator reconnect.
+/// The mediator DID would be the exception on both counts: it is a
+/// *per-persona* field, so on a profile with no persona a write would vanish
+/// while the panel said "Setting saved" over a field that read back empty, and
+/// it would ask for a reconnect with nothing new to dial — leaving the header on
+/// "Connecting…" under a success message. So that row is read-only
+/// (`MEDIATOR_ROW` never opens an edit mode).
+fn handle_submit_edit(
+    config: &mut Box<Config>,
+    state: &mut State,
+    save: &mut SaveScheduler,
+    value: &str,
+) {
+    let idx = state.main_page.content_panel.settings.selected_index;
+    let setting_name = match idx {
+        rows::FRIENDLY_NAME_ROW => {
+            update_friendly_name(config, value);
+            "Friendly name"
+        }
+        _ => "Setting",
+    };
+    state.main_page.content_panel.settings.mode = SettingsMode::View;
+
+    dispatch_util::save_and_sync(
+        &mut state.main_page,
+        config,
+        save,
+        dispatch_util::Persist::SaveAndSync(
+            crate::state_handler::main_page::Panels::FROM_FRIENDLY_NAME,
+        ),
+        |mp| &mut mp.content_panel.settings.status_message,
+        "Setting saved",
+        dispatch_util::SyncLog::Plain(format!("{} updated", setting_name)),
+    );
+}
+
+async fn handle_export_config_action(
+    config: &mut Box<Config>,
+    state: &mut State,
+    state_tx: &watch::Sender<std::sync::Arc<State>>,
+    save: &mut SaveScheduler,
+    path: &str,
+    passphrase: SecretString,
+) {
+    // R12: surface a "deriving" status *before* the blocking Argon2 derive so
+    // the user sees progress while the key is computed off the runtime. Push it
+    // to the render task now — `export_config` then awaits a `spawn_blocking`
+    // derive, during which the loop is parked here but the render task keeps
+    // drawing this status (the runtime is not pegged by the KDF).
+    state.main_page.content_panel.settings.status_message =
+        Some(Status::progress("Deriving encryption key…".to_string()));
+    let _ = state_tx.publish(state);
+
+    match export_config(config, path, passphrase).await {
+        Ok(()) => {
+            config
+                .private
+                .logs
+                .insert(LogFamily::Config, format!("Config exported to {}", path));
+            // R11 force-flush: export is durability-critical (the exported file
+            // must reflect persisted state and the export-log entry must hit
+            // disk now). The flush is awaited before the handler returns — a
+            // deliberate force-flush point, not the coalesced hot path — and a
+            // successful one also clears any pending coalesced dirty state.
+            if let Err(e) = save.flush(config).await {
+                state
+                    .main_page
+                    .log_error("Failed to persist export-log entry", &e);
+            }
+            state.main_page.content_panel.settings.mode = SettingsMode::View;
+            dispatch_util::save_and_sync(
+                &mut state.main_page,
+                config,
+                save,
+                dispatch_util::Persist::None,
+                |mp| &mut mp.content_panel.settings.status_message,
+                format!("Config exported to {}", path),
+                dispatch_util::SyncLog::Plain(format!("Config exported to {}", path)),
+            );
+        }
+        Err(e) => {
+            state.main_page.content_panel.settings.status_message =
+                Some(Status::error(format!("Export failed: {e:#}")));
+            state.main_page.log_error("Config export failed", &e);
+        }
+    }
+}
+
+async fn handle_import_config_action(
+    config: &mut Box<Config>,
+    state: &mut State,
+    save: &mut SaveScheduler,
+    path: &str,
+    passphrase: &SecretString,
+) {
+    match import_config(path, passphrase) {
+        Ok(msg) => {
+            config
+                .private
+                .logs
+                .insert(LogFamily::Config, format!("Config imported from {}", path));
+            // Force-flush the import-log entry (see export handler).
+            if let Err(e) = save.flush(config).await {
+                state
+                    .main_page
+                    .log_error("Failed to persist import-log entry", &e);
+            }
+            state.main_page.content_panel.settings.mode = SettingsMode::View;
+            dispatch_util::save_and_sync(
+                &mut state.main_page,
+                config,
+                save,
+                dispatch_util::Persist::None,
+                |mp| &mut mp.content_panel.settings.status_message,
+                msg.clone(),
+                dispatch_util::SyncLog::Plain(msg),
+            );
+        }
+        Err(e) => {
+            state.main_page.content_panel.settings.status_message =
+                Some(Status::error(format!("Import failed: {e:#}")));
+            state.main_page.log_error("Config import failed", &e);
+        }
+    }
+}
+
+fn handle_change_protection(state: &mut State) {
+    state.main_page.content_panel.settings.form_problem = None;
+    state.main_page.content_panel.settings.mode = SettingsMode::ChangeProtection {
+        selected_option: 0,
+        passphrase_len: 0,
+        confirm_len: 0,
+        active_field: 0,
+    };
+}
+
+async fn handle_set_passphrase(
+    config: &mut Box<Config>,
+    state: &mut State,
+    state_tx: &watch::Sender<std::sync::Arc<State>>,
+    save: &mut SaveScheduler,
+    profile: &str,
+    passphrase: &SecretString,
+) {
+    // R12: surface a "deriving" status *before* the blocking Argon2 derive so
+    // the user sees progress while the unlock key is computed off the runtime.
+    // Push it to the render task now; `set_passphrase` then awaits a
+    // `spawn_blocking` derive, during which the render task keeps drawing.
+    state.main_page.content_panel.settings.status_message =
+        Some(Status::progress("Deriving encryption key…".to_string()));
+    let _ = state_tx.publish(state);
+
+    // R11 force-flush: a protection change re-derives the unlock key and rewrites
+    // the secured config; it MUST be persisted before reporting success (the
+    // keyring entry now requires the new passphrase to decrypt). `set_passphrase`
+    // force-flushes and awaits it — a deliberate force-flush point, which also
+    // drops any pending coalesced dirty mark. (R12 moves its Argon2 derivation
+    // off the runtime.)
+    match set_passphrase(config, save, passphrase).await {
+        Ok(()) => {
+            state.main_page.content_panel.settings.mode = SettingsMode::View;
+            dispatch_util::save_and_sync(
+                &mut state.main_page,
+                config,
+                save,
+                dispatch_util::Persist::SyncOnly(crate::state_handler::main_page::Panels::SETTINGS),
+                |mp| &mut mp.content_panel.settings.status_message,
+                "Unlock code protection enabled",
+                dispatch_util::SyncLog::Plain("Unlock code protection enabled".to_string()),
+            );
+            // Setting a passphrase can move the secret to durable storage (the
+            // file store only accepts an encrypted blob), so the volatile
+            // warning may have just become untrue. Re-probe rather than leave a
+            // stale warning telling the user to do what they just did.
+            state.main_page.refresh_storage_warning(profile);
+        }
+        Err(e) => {
+            dispatch_util::record_error(
+                &mut state.main_page,
+                |mp| &mut mp.content_panel.settings.status_message,
+                "Failed to set the unlock code",
+                &e,
+            );
+        }
+    }
+}
+
+async fn handle_remove_passphrase(
+    config: &mut Box<Config>,
+    state: &mut State,
+    save: &mut SaveScheduler,
+    profile: &str,
+) {
+    // R11 force-flush: same rationale as `handle_set_passphrase` — a protection
+    // change must be on disk before reporting success. `remove_passphrase`
+    // force-flushes and awaits it.
+    match remove_passphrase(config, save).await {
+        Ok(()) => {
+            state.main_page.content_panel.settings.mode = SettingsMode::View;
+            dispatch_util::save_and_sync(
+                &mut state.main_page,
+                config,
+                save,
+                dispatch_util::Persist::SyncOnly(crate::state_handler::main_page::Panels::SETTINGS),
+                |mp| &mut mp.content_panel.settings.status_message,
+                "Protection reverted to keyring only",
+                dispatch_util::SyncLog::Plain("Protection reverted to keyring only".to_string()),
+            );
+            // The mirror of the set-passphrase case: dropping protection can
+            // push the secret back to a volatile store, and the user should be
+            // told that is what just happened.
+            state.main_page.refresh_storage_warning(profile);
+            if let Some(warning) = state
+                .main_page
+                .content_panel
+                .settings
+                .storage_warning
+                .clone()
+            {
+                state.main_page.log(format!("WARNING: {warning}"));
+            }
+        }
+        Err(e) => {
+            dispatch_util::record_error(
+                &mut state.main_page,
+                |mp| &mut mp.content_panel.settings.status_message,
+                "Failed to remove the unlock code",
+                &e,
+            );
+        }
+    }
+}
+
+fn handle_wipe_start(state: &mut State) {
+    state.main_page.content_panel.settings.mode = SettingsMode::WipeConfirm {
+        confirm_input: String::new(),
+    };
+}
+
+fn handle_wipe_input(state: &mut State, value: String) {
+    if let SettingsMode::WipeConfirm { confirm_input } =
+        &mut state.main_page.content_panel.settings.mode
+    {
+        *confirm_input = value;
+    }
+}
+
+const WIPE_CONFIRM_TOKEN: &str = "WIPE";
+
+fn handle_wipe_confirm(state: &mut State, config: &Config, profile: &str) -> bool {
+    let typed = match &state.main_page.content_panel.settings.mode {
+        SettingsMode::WipeConfirm { confirm_input } => confirm_input.trim().to_string(),
+        _ => return false,
+    };
+    if !typed.eq_ignore_ascii_case(WIPE_CONFIRM_TOKEN) {
+        state.main_page.content_panel.settings.status_message = Some(Status::warning(format!(
+            "Type {WIPE_CONFIRM_TOKEN} (exactly) to confirm — wipe cancelled."
+        )));
+        state.main_page.content_panel.settings.mode = SettingsMode::View;
+        return false;
+    }
+
+    wipe_signing_identities(state, config);
+
+    match openvtc_core::config::public_config::PublicConfig::delete_profile(profile) {
+        Ok(summary) => {
+            if let Some(path) = &summary.removed_config_file {
+                state
+                    .main_page
+                    .log(format!("Removed openvtc config: {path}"));
+            }
+            if summary.removed_keyring_entry {
+                state.main_page.log("Removed openvtc keyring entry");
+            }
+            for w in &summary.warnings {
+                state.main_page.log(format!("openvtc wipe: {w}"));
+            }
+        }
+        Err(e) => {
+            state
+                .main_page
+                .log_error("Failed to wipe openvtc profile", &e);
+            state.main_page.content_panel.settings.status_message =
+                Some(Status::error(format!("Wipe failed: {e:#}")));
+            return false;
+        }
+    }
+
+    state.main_page.log("Profile wiped — exiting.");
+    true
+}
+
+/// Detect the did-git-sign install for the persona shown in Settings, off the
+/// loop: the read is two small files, but on a slow or network home directory
+/// that is the stall, and the settings panel is synced on every change it shows. The
+/// answer arrives as [`DispatchOutcome::DidGitSign`] and is stored by
+/// [`apply_did_git_sign`].
+///
+/// Call it at startup, and whenever the install may have changed. When a
+/// detection is already running this one is queued
+/// ([`SettingsState::did_git_sign_wanted`]) and started by the next
+/// [`maybe_refresh_did_git_sign`], so the answer reflects the latest change.
+///
+/// [`SettingsState::did_git_sign_wanted`]: crate::state_handler::main_page::content::SettingsState::did_git_sign_wanted
+pub(crate) fn refresh_did_git_sign(
+    state: &mut State,
+    in_flight: &mut InFlight,
+    dispatch_tx: &UnboundedSender<DispatchOutcome>,
+) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let persona_did = settings.persona_did.clone();
+    // No persona (a zero-persona account, or before the first sync): nothing
+    // can be configured for it, and there is nothing to read.
+    if persona_did.is_empty() {
+        settings.did_git_sign = None;
+        settings.did_git_sign_for = Some(persona_did);
+        settings.did_git_sign_wanted = false;
+        return;
+    }
+    let job = DidGitSignJob { persona_did };
+    let started = background_dispatch::dispatch(job, in_flight, dispatch_tx, |_| {
+        settings.did_git_sign_wanted = true;
+    });
+    if started {
+        settings.did_git_sign_wanted = false;
+    }
+}
+
+/// One did-git-sign detection for `persona_did`, by
+/// [`detect_did_git_sign_off_loop`].
+struct DidGitSignJob {
+    persona_did: String,
+}
+
+impl background_dispatch::Job for DidGitSignJob {
+    fn domain(&self) -> DispatchDomain {
+        DispatchDomain::DidGitSign
+    }
+
+    async fn execute(self) -> DispatchOutcome {
+        let info = detect_did_git_sign_off_loop(self.persona_did.clone()).await;
+        DispatchOutcome::DidGitSign {
+            persona_did: self.persona_did,
+            info,
+        }
+    }
+}
+
+/// A mediator change or manual reconnect: replace the persona listener with
+/// `listener` and wait for it to connect. The listener is built on the loop
+/// (it reads secrets from the TDK, no network); only the connect runs here.
+pub(crate) struct MediatorReconnectJob {
+    pub(crate) service: openvtc_core::didcomm::Messaging,
+    pub(crate) listener_id: String,
+    pub(crate) listener: openvtc_core::didcomm::ListenerSpec,
+}
+
+impl background_dispatch::Job for MediatorReconnectJob {
+    fn domain(&self) -> DispatchDomain {
+        DispatchDomain::Mediator
+    }
+
+    async fn execute(self) -> DispatchOutcome {
+        DispatchOutcome::MediatorReconnect(
+            openvtc_core::didcomm::reconnect_persona_listener_io(
+                &self.service,
+                self.listener_id,
+                self.listener,
+            )
+            .await,
+        )
+    }
+}
+
+/// [`detect_did_git_sign_info`](crate::state_handler::main_page::detect_did_git_sign_info)
+/// on a blocking thread. A detection that panics reads as "not set up".
+pub(crate) async fn detect_did_git_sign_off_loop(
+    persona_did: String,
+) -> Option<crate::state_handler::main_page::content::DidGitSignInfo> {
+    crate::state_handler::repos_workspace::blocking(move || {
+        crate::state_handler::main_page::detect_did_git_sign_info(&persona_did)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Whether the did-git-sign info should be read again, and note what is on
+/// screen: due when it was never read for the current persona (startup, a
+/// persona switch), when a refresh was asked for, or when Help / Status or
+/// Settings has just been opened. Cheap — no I/O — so it can run on every pass
+/// of the loop.
+fn did_git_sign_refresh_due(state: &mut State) -> bool {
+    let viewing = matches!(
+        state.main_page.menu_panel.selected_menu,
+        crate::state_handler::main_page::menu::MainMenu::Help
+            | crate::state_handler::main_page::menu::MainMenu::Settings
+    );
+    let settings = &mut state.main_page.content_panel.settings;
+    let opened = viewing && !settings.did_git_sign_viewing;
+    settings.did_git_sign_viewing = viewing;
+    opened
+        || settings.did_git_sign_wanted
+        || settings.did_git_sign_for.as_deref() != Some(settings.persona_did.as_str())
+}
+
+/// [`refresh_did_git_sign`] when one is due (see [`did_git_sign_refresh_due`]).
+/// Meant for the loop: after an action or on a tick. Starts nothing while a
+/// detection is running.
+pub(crate) fn maybe_refresh_did_git_sign(
+    state: &mut State,
+    in_flight: &mut InFlight,
+    dispatch_tx: &UnboundedSender<DispatchOutcome>,
+) {
+    if did_git_sign_refresh_due(state) && !in_flight.is_busy(DispatchDomain::DidGitSign) {
+        refresh_did_git_sign(state, in_flight, dispatch_tx);
+    }
+}
+
+/// Store a finished detection — unless the persona changed while it ran, in
+/// which case it describes a persona no longer shown and is dropped; the
+/// current persona is still unread, so the next check refreshes it.
+pub(crate) fn apply_did_git_sign(
+    state: &mut State,
+    persona_did: String,
+    info: Option<crate::state_handler::main_page::content::DidGitSignInfo>,
+) {
+    let settings = &mut state.main_page.content_panel.settings;
+    if settings.persona_did == persona_did {
+        settings.did_git_sign = info;
+        settings.did_git_sign_for = Some(persona_did);
+    }
+}
+
+/// The did-git-sign identities this profile's personas sign with: each
+/// persona's assertion method, and the default identity the settings panel
+/// detected (an install from before per-persona profiles).
+fn signing_identities(state: &State, config: &Config) -> Vec<String> {
+    let mut ids: Vec<String> = config
+        .identities
+        .values()
+        .filter_map(|id| {
+            id.document()
+                .assertion_method
+                .first()
+                .map(|vm| vm.get_id().to_string())
+        })
+        .collect();
+    if let Some(info) = &state.main_page.content_panel.settings.did_git_sign {
+        ids.push(info.did_key_id.clone());
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Remove did-git-sign's identity for every persona this profile holds, so no
+/// credential is left signing for a profile that no longer exists.
+///
+/// Local only: a wipe has no VTA session, and the VTA account outlives the
+/// profile (it can be rebuilt from). Each credential openvtc granted is named
+/// in the log with the command that revokes it, rather than silently left
+/// able to export its persona's key.
+fn wipe_signing_identities(state: &mut State, config: &Config) {
+    let own = match &config.key_backend {
+        openvtc_core::config::KeyBackend::Vta { credential_did, .. } => credential_did.clone(),
+        _ => String::new(),
+    };
+    for did_key_id in signing_identities(state, config) {
+        let had = openvtc_core::git_signing::identity_status(&did_key_id);
+        if !had.any() {
+            continue;
+        }
+        match openvtc_core::git_signing::remove_identity(&did_key_id) {
+            Ok(removed) => {
+                state
+                    .main_page
+                    .log(format!("Removed did-git-sign identity {did_key_id}"));
+                if let Some(cred) = removed.credential_did.filter(|c| *c != own) {
+                    state.main_page.log(format!(
+                        "did-git-sign's credential {cred} is still granted at the VTA — revoke \
+                         it with: pnm acl delete {cred}"
+                    ));
+                }
+                for w in &removed.warnings {
+                    state.main_page.log(format!("did-git-sign uninstall: {w}"));
+                }
+            }
+            Err(e) => state
+                .main_page
+                .log_error("did-git-sign uninstall failed", &e),
+        }
+    }
+}
+
+#[cfg(feature = "openpgp-card")]
+fn handle_token_management(state: &mut State) {
+    state.main_page.content_panel.settings.mode =
+        SettingsMode::TokenManagement { selected_index: 0 };
+    match openvtc_core::openpgp_card::get_cards() {
+        Ok(cards) => {
+            state.main_page.content_panel.settings.token.detected_count = cards.len();
+            state
+                .main_page
+                .content_panel
+                .settings
+                .token
+                .messages
+                .clear();
+        }
+        Err(e) => {
+            state.main_page.content_panel.settings.token.detected_count = 0;
+            state.main_page.content_panel.settings.token.messages =
+                vec![format!("Error detecting tokens: {e}")];
+        }
+    }
+}
+
+#[cfg(feature = "openpgp-card")]
+fn handle_token_detect(state: &mut State) {
+    match openvtc_core::openpgp_card::get_cards() {
+        Ok(cards) => {
+            state.main_page.content_panel.settings.token.detected_count = cards.len();
+            state.main_page.content_panel.settings.token.messages =
+                vec![format!("{} token(s) detected", cards.len())];
+        }
+        Err(e) => {
+            state.main_page.content_panel.settings.token.detected_count = 0;
+            state.main_page.content_panel.settings.token.messages = vec![format!("Error: {e}")];
+        }
+    }
+}
+
+#[cfg(feature = "openpgp-card")]
+use crate::ui::pages::main::components::settings_panel::TOKEN_RESET_CONFIRM_TOKEN;
+
+/// A connected card, as `openvtc_core::openpgp_card::get_cards` hands it out.
+#[cfg(feature = "openpgp-card")]
+type SharedCard = std::sync::Arc<tokio::sync::Mutex<openpgp_card::Card<openpgp_card::state::Open>>>;
+
+/// The one connected card, by identity. A reset is offered only when exactly
+/// one card is present, so the card erased is never a guess between several.
+#[cfg(feature = "openpgp-card")]
+fn single_card() -> Result<(SharedCard, String, String), String> {
+    let cards = openvtc_core::openpgp_card::get_cards().map_err(|e| format!("Error: {e}"))?;
+    match cards.as_slice() {
+        [] => Err("No tokens detected. Insert a token first.".to_string()),
+        [card] => {
+            let (ident, manufacturer) = openvtc_core::openpgp_card::card_identity(card)
+                .map_err(|e| format!("Error: {e}"))?;
+            Ok((card.clone(), ident, manufacturer))
+        }
+        _ => Err(format!(
+            "{} tokens are connected. Remove all but the one to reset, then try again.",
+            cards.len()
+        )),
+    }
+}
+
+#[cfg(feature = "openpgp-card")]
+fn handle_token_reset_start(state: &mut State, config: &Config) {
+    let settings = &mut state.main_page.content_panel.settings;
+    settings.token.reset_completed = false;
+    match single_card() {
+        Ok((_, ident, manufacturer)) => {
+            let protects_profile = matches!(
+                &config.public.protection,
+                ConfigProtectionType::Token(id) if *id == ident
+            );
+            settings.token.messages.clear();
+            settings.mode = SettingsMode::TokenResetConfirm {
+                ident,
+                manufacturer,
+                protects_profile,
+                confirm_input: String::new(),
+            };
+        }
+        Err(why) => settings.token.messages = vec![why],
+    }
+}
+
+#[cfg(feature = "openpgp-card")]
+fn handle_token_factory_reset(state: &mut State) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let SettingsMode::TokenResetConfirm {
+        ident,
+        confirm_input,
+        ..
+    } = &settings.mode
+    else {
+        return;
+    };
+    let confirmed = confirm_input.trim() == TOKEN_RESET_CONFIRM_TOKEN;
+    let ident = ident.clone();
+    settings.mode = SettingsMode::TokenManagement { selected_index: 1 };
+    if !confirmed {
+        settings.token.messages = vec![format!(
+            "Type {TOKEN_RESET_CONFIRM_TOKEN} (exactly) to confirm — reset cancelled."
+        )];
+        return;
+    }
+    // The card is looked up again: the one confirmed must still be the only
+    // one connected, or nothing is erased.
+    let card = match single_card() {
+        Ok((card, now, _)) if now == ident => card,
+        Ok(_) => {
+            settings.token.messages =
+                vec!["The connected token changed — nothing was reset.".to_string()];
+            return;
+        }
+        Err(why) => {
+            settings.token.messages = vec![why];
+            return;
+        }
+    };
+    match openvtc_core::openpgp_card::factory_reset(card) {
+        Ok(()) => {
+            settings.token.messages = vec![format!("Token {ident} was factory reset.")];
+            settings.token.reset_completed = true;
+        }
+        Err(e) => {
+            settings.token.messages = vec![format!("Factory reset failed: {e}")];
+        }
+    }
+}
+
+#[cfg(feature = "openpgp-card")]
+fn handle_token_back(state: &mut State) {
+    state.main_page.content_panel.settings.mode = SettingsMode::View;
+    state
+        .main_page
+        .content_panel
+        .settings
+        .token
+        .messages
+        .clear();
+    state.main_page.content_panel.settings.token.reset_completed = false;
+}
+
+/// Set the synchronous "reconnecting" state — the immediate, non-blocking part
+/// of a mediator reconnect. The slow `wait_connected` I/O is performed by a
+/// background task spawned by the runtime loop (R13); its completion drives the
+/// final `Connected`/`Failed` state via
+/// [`crate::state_handler::background_dispatch::apply_outcome`]. The strings here
+/// match the pre-R13 inline path so the activity log is unchanged.
+fn begin_reconnect_status(state: &mut State) {
+    state.connection.status = state::MediatorStatus::Connecting;
+    state.connection.messaging_active = false;
+    state.main_page.log("Reconnecting to mediator...");
+}
+
+// ============================================================
+// Themes
+// ============================================================
+
+use crate::state_handler::main_page::content::ThemeRow;
+use crate::theme::{
+    self, Theme,
+    catalog::{self, Roots},
+    terminal,
+};
+
+fn theme_rows(roots: &Roots) -> Vec<ThemeRow> {
+    catalog::list(roots)
+        .into_iter()
+        .map(|entry| ThemeRow {
+            source: entry.source.label().to_string(),
+            id: entry.id,
+            name: entry.name,
+        })
+        .collect()
+}
+
+/// Open the picker on the theme in use.
+fn handle_theme_open(state: &mut State, roots: &Roots) {
+    let rows = theme_rows(roots);
+    let (original, _) = theme::active_theme();
+    let selected = rows.iter().position(|r| r.id == original).unwrap_or(0);
+    let settings = &mut state.main_page.content_panel.settings;
+    settings.status_message = None;
+    settings.mode = SettingsMode::ThemePicker {
+        rows,
+        selected,
+        original,
+    };
+}
+
+/// Highlight row `index` and preview its theme.
+fn handle_theme_select(state: &mut State, roots: &Roots, index: usize) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let SettingsMode::ThemePicker { rows, selected, .. } = &mut settings.mode else {
+        return;
+    };
+    let Some(row) = rows.get(index) else {
+        return;
+    };
+    *selected = index;
+    settings.status_message = match catalog::load(roots, &row.id) {
+        Ok(theme) => {
+            theme::set_active(&theme);
+            None
+        }
+        Err(e) => Some(Status::error(format!("Could not load {}: {e}", row.name))),
+    };
+}
+
+/// Keep the highlighted theme, and remember it.
+fn handle_theme_apply(state: &mut State, roots: &Roots) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let SettingsMode::ThemePicker { rows, selected, .. } = &settings.mode else {
+        return;
+    };
+    let Some(id) = rows.get(*selected).map(|r| r.id.clone()) else {
+        return;
+    };
+    let kept = catalog::load(roots, &id).and_then(|theme| {
+        catalog::remember(roots, &theme.id)?;
+        Ok(theme)
+    });
+    match kept {
+        Ok(theme) => {
+            theme::set_active(&theme);
+            settings.mode = SettingsMode::View;
+            let shown = theme::display_name(&theme.id, &theme.name);
+            let mut message = format!("Theme set to {shown}.");
+            let (mode, learned) = terminal::mode();
+            if theme.id == catalog::AUTO_ID && learned != terminal::Source::Asked {
+                // The terminal can only be asked before the TUI starts.
+                message.push_str(&format!(
+                    " OpenVTC asks your terminal for its background when it starts; \
+                     until then, Auto takes it to be {}.",
+                    mode.as_str()
+                ));
+            }
+            settings.status_message = Some(Status::success(message));
+            state.main_page.log(format!("Theme set to {shown}"));
+        }
+        Err(e) => {
+            settings.status_message = Some(Status::error(format!("Could not use that theme: {e}")))
+        }
+    }
+}
+
+/// Put back the theme that was in use, and close the picker.
+fn handle_theme_cancel(state: &mut State, roots: &Roots) {
+    let settings = &mut state.main_page.content_panel.settings;
+    if let SettingsMode::ThemePicker { original, .. } = &settings.mode {
+        let theme = catalog::load(roots, original).unwrap_or_else(|_| Theme::default_theme());
+        theme::set_active(&theme);
+    }
+    settings.mode = SettingsMode::View;
+}
+
+/// Copy the highlighted theme into the person's themes, and highlight the copy.
+fn handle_theme_copy(state: &mut State, roots: &Roots) {
+    let settings = &mut state.main_page.content_panel.settings;
+    let SettingsMode::ThemePicker { rows, selected, .. } = &settings.mode else {
+        return;
+    };
+    let Some(id) = rows.get(*selected).map(|r| r.id.clone()) else {
+        return;
+    };
+    let copied = catalog::load(roots, &id).and_then(|mut theme| {
+        theme.name = format!("{} (mine)", theme.name);
+        catalog::install(roots, &theme)
+    });
+    match copied {
+        Ok((copy_id, path)) => {
+            reload_rows(state, roots, &copy_id);
+            state.main_page.content_panel.settings.status_message = Some(Status::success(format!(
+                "Copied to {} — edit it, then press r here to see your changes.",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            settings.status_message = Some(Status::error(format!("Could not copy that theme: {e}")))
+        }
+    }
+}
+
+/// Re-read the themes, keeping `keep` highlighted when it is still there.
+fn reload_rows(state: &mut State, roots: &Roots, keep: &str) {
+    let rows = theme_rows(roots);
+    let index = rows.iter().position(|r| r.id == keep).unwrap_or(0);
+    if let SettingsMode::ThemePicker {
+        rows: current,
+        selected,
+        ..
+    } = &mut state.main_page.content_panel.settings.mode
+    {
+        *current = rows;
+        *selected = index;
+    }
+    handle_theme_select(state, roots, index);
+}
+
+/// Re-read the themes, so edits to a theme file show.
+fn handle_theme_reload(state: &mut State, roots: &Roots) {
+    let SettingsMode::ThemePicker { rows, selected, .. } =
+        &state.main_page.content_panel.settings.mode
+    else {
+        return;
+    };
+    let keep = rows
+        .get(*selected)
+        .map(|r| r.id.clone())
+        .unwrap_or_default();
+    reload_rows(state, roots, &keep);
+    let settings = &mut state.main_page.content_panel.settings;
+    if settings.status_message.is_none() {
+        settings.status_message = Some(Status::success("Themes reloaded.".to_string()));
+    }
+}
+
+/// Outcome of dispatching a `SettingsAction`.
+///
+/// The TUI loop ignores `Continue`, breaks out with `UserInt` when the operator
+/// wipes the profile (the binary can no longer authenticate after a wipe), and
+/// on `ReconnectMediator` spawns a background mediator reconnect (R13) — the slow
+/// `wait_connected` wait runs off the select loop so the UI stays responsive.
+pub(crate) enum SettingsOutcome {
+    Continue,
+    ExitUserInt,
+    /// A mediator change or manual reconnect was requested. The loop builds the
+    /// listener config and spawns the I/O; `begin_reconnect_status` has already
+    /// set the synchronous "Connecting" state.
+    ReconnectMediator,
+}
+
+/// Dispatch a single `SettingsAction`. Returns `ExitUserInt` if the
+/// operator confirmed a profile wipe — caller is responsible for
+/// driving the terminator afterwards.
+pub(crate) async fn dispatch(
+    action: SettingsAction,
+    config: &mut Box<Config>,
+    state: &mut State,
+    state_tx: &watch::Sender<std::sync::Arc<State>>,
+    save: &mut SaveScheduler,
+    profile: &str,
+) -> SettingsOutcome {
+    match action {
+        SettingsAction::Select(index) => handle_select(state, index),
+        SettingsAction::StartEdit => handle_start_edit(state),
+        SettingsAction::CancelEdit => {
+            state.main_page.content_panel.settings.mode = SettingsMode::View;
+        }
+        SettingsAction::FieldUpdate(value) => handle_field_update(state, value),
+        SettingsAction::FormFieldUpdate { field, value } => {
+            handle_form_field_update(state, field, value)
+        }
+        SettingsAction::FormTabSwitch => handle_form_tab_switch(state),
+        SettingsAction::ProtectionOptionSelect(option) => {
+            handle_protection_option_select(state, option)
+        }
+        SettingsAction::ProtectionStartInput => handle_protection_start_input(state),
+        SettingsAction::ProtectionPassphraseLen(len) => {
+            handle_protection_passphrase_len(state, len)
+        }
+        SettingsAction::ProtectionConfirmLen(len) => handle_protection_confirm_len(state, len),
+        SettingsAction::ProtectionTabSwitch(next_field) => {
+            handle_protection_tab_switch(state, next_field)
+        }
+        SettingsAction::PassphraseLen(len) => handle_passphrase_len(state, len),
+        SettingsAction::ExportConfirmLen(len) => handle_export_confirm_len(state, len),
+        SettingsAction::FormProblem(why) => {
+            state.main_page.content_panel.settings.form_problem = Some(why);
+        }
+        // No editable setting changes the mediator, so committing one
+        // never implies a reconnect. `SettingsAction::ReconnectMediator` is the
+        // remaining (explicit, operator-driven) way to ask for one.
+        SettingsAction::SubmitEdit { value } => handle_submit_edit(config, state, save, &value),
+        SettingsAction::ExportConfig { path, passphrase } => {
+            handle_export_config_action(config, state, state_tx, save, &path, passphrase).await
+        }
+        SettingsAction::ImportConfig { path, passphrase } => {
+            handle_import_config_action(config, state, save, &path, &passphrase).await
+        }
+        SettingsAction::ChangeProtection => handle_change_protection(state),
+        SettingsAction::SetPassphrase { passphrase } => {
+            handle_set_passphrase(config, state, state_tx, save, profile, &passphrase).await
+        }
+        SettingsAction::RemovePassphrase => {
+            handle_remove_passphrase(config, state, save, profile).await
+        }
+        #[cfg(feature = "openpgp-card")]
+        SettingsAction::TokenManagement => handle_token_management(state),
+        #[cfg(feature = "openpgp-card")]
+        SettingsAction::TokenDetect => handle_token_detect(state),
+        #[cfg(feature = "openpgp-card")]
+        SettingsAction::TokenFactoryResetStart => handle_token_reset_start(state, config),
+        #[cfg(feature = "openpgp-card")]
+        SettingsAction::TokenFactoryResetInput(value) => {
+            if let SettingsMode::TokenResetConfirm { confirm_input, .. } =
+                &mut state.main_page.content_panel.settings.mode
+            {
+                *confirm_input = value;
+            }
+        }
+        #[cfg(feature = "openpgp-card")]
+        SettingsAction::TokenFactoryReset => handle_token_factory_reset(state),
+        #[cfg(feature = "openpgp-card")]
+        SettingsAction::TokenBack => handle_token_back(state),
+        SettingsAction::ClipboardCopied(msg) => {
+            state.main_page.content_panel.settings.status_message = Some(msg.clone());
+            state.main_page.log(msg.text);
+        }
+        SettingsAction::WipeProfileStart => handle_wipe_start(state),
+        SettingsAction::WipeProfileInput(value) => handle_wipe_input(state, value),
+        SettingsAction::WipeProfileConfirm => {
+            if handle_wipe_confirm(state, config, profile) {
+                return SettingsOutcome::ExitUserInt;
+            }
+        }
+        SettingsAction::ReconnectMediator => {
+            begin_reconnect_status(state);
+            return SettingsOutcome::ReconnectMediator;
+        }
+        // The theme choice is kept per-profile (`tui-{profile}.toml`), so these
+        // read/write against the running profile rather than the shared default.
+        SettingsAction::ThemeOpen => {
+            handle_theme_open(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeSelect(index) => {
+            handle_theme_select(state, &Roots::from_env_for_profile(profile), index);
+        }
+        SettingsAction::ThemeApply => {
+            handle_theme_apply(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeCancel => {
+            handle_theme_cancel(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeCopy => {
+            handle_theme_copy(state, &Roots::from_env_for_profile(profile))
+        }
+        SettingsAction::ThemeReload => {
+            handle_theme_reload(state, &Roots::from_env_for_profile(profile))
+        }
+    }
+    SettingsOutcome::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_sign_info(did_key_id: &str) -> crate::state_handler::main_page::content::DidGitSignInfo {
+        crate::state_handler::main_page::content::DidGitSignInfo {
+            did_key_id: did_key_id.into(),
+            ssh_public_key: String::new(),
+            config_path: String::new(),
+        }
+    }
+
+    /// A detection that finished after the persona changed is dropped, so one
+    /// persona's signing key is never shown as another's; a sync for another
+    /// persona hides what was detected for the last one.
+    #[test]
+    fn did_git_sign_info_is_only_shown_for_the_persona_it_was_read_for() {
+        let mut state = State::default();
+        state.main_page.content_panel.settings.persona_did = "did:example:b".into();
+
+        apply_did_git_sign(
+            &mut state,
+            "did:example:a".into(),
+            Some(git_sign_info("did:example:a#key-0")),
+        );
+        let settings = &state.main_page.content_panel.settings;
+        assert!(settings.did_git_sign.is_none());
+        assert_eq!(settings.did_git_sign_for, None);
+
+        apply_did_git_sign(
+            &mut state,
+            "did:example:b".into(),
+            Some(git_sign_info("did:example:b#key-0")),
+        );
+        let settings = &state.main_page.content_panel.settings;
+        assert!(settings.did_git_sign.is_some());
+        assert_eq!(settings.did_git_sign_for.as_deref(), Some("did:example:b"));
+
+        // A sync for a persona the info was not read for hides it.
+        let config = crate::state_handler::dispatch_util::test_config();
+        state.main_page.sync_from_config(&config);
+        let settings = &state.main_page.content_panel.settings;
+        if config.persona_did() != "did:example:b" {
+            assert!(settings.did_git_sign.is_none());
+        }
+    }
+
+    /// When a refresh is due: never read for this persona, asked for, or Help /
+    /// Settings just opened — and not again while it stays open.
+    #[test]
+    fn did_git_sign_refresh_is_due_on_switch_request_and_open() {
+        use crate::state_handler::main_page::menu::MainMenu;
+        let mut state = State::default();
+        state.main_page.content_panel.settings.persona_did = "did:example:a".into();
+        assert!(did_git_sign_refresh_due(&mut state), "never read");
+
+        apply_did_git_sign(&mut state, "did:example:a".into(), None);
+        assert!(
+            !did_git_sign_refresh_due(&mut state),
+            "read, nothing changed"
+        );
+
+        state.main_page.content_panel.settings.did_git_sign_wanted = true;
+        assert!(did_git_sign_refresh_due(&mut state), "asked for");
+        state.main_page.content_panel.settings.did_git_sign_wanted = false;
+
+        state.main_page.menu_panel.selected_menu = MainMenu::Help;
+        assert!(did_git_sign_refresh_due(&mut state), "Help opened");
+        assert!(!did_git_sign_refresh_due(&mut state), "still open");
+        state.main_page.menu_panel.selected_menu = MainMenu::Settings;
+        assert!(!did_git_sign_refresh_due(&mut state), "Help to Settings");
+        state.main_page.menu_panel.selected_menu = MainMenu::Logs;
+        assert!(!did_git_sign_refresh_due(&mut state), "closed");
+        state.main_page.menu_panel.selected_menu = MainMenu::Settings;
+        assert!(did_git_sign_refresh_due(&mut state), "Settings reopened");
+
+        state.main_page.content_panel.settings.persona_did = "did:example:b".into();
+        assert!(did_git_sign_refresh_due(&mut state), "persona switched");
+    }
+
+    /// A refresh runs off the loop and comes back as an outcome for the persona
+    /// it was started for; one asked for while it runs is queued, not dropped.
+    #[tokio::test]
+    async fn did_git_sign_refresh_runs_as_a_dispatch_and_queues_a_second() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut in_flight = InFlight::default();
+        let mut state = State::default();
+        state.main_page.content_panel.settings.persona_did = "did:example:none".into();
+
+        maybe_refresh_did_git_sign(&mut state, &mut in_flight, &tx);
+        assert!(in_flight.is_busy(DispatchDomain::DidGitSign));
+        refresh_did_git_sign(&mut state, &mut in_flight, &tx);
+        assert!(state.main_page.content_panel.settings.did_git_sign_wanted);
+
+        let outcome = rx.recv().await.expect("the detection reports");
+        assert_eq!(outcome.domain(), DispatchDomain::DidGitSign);
+        let DispatchOutcome::DidGitSign { persona_did, .. } = &outcome else {
+            panic!("a did-git-sign outcome");
+        };
+        assert_eq!(persona_did, "did:example:none");
+        let mut config = crate::state_handler::dispatch_util::test_config();
+        let mut save = crate::state_handler::save_coalesce::SaveScheduler::new("test");
+        background_dispatch::apply_outcome(
+            &mut state,
+            &mut config,
+            &mut save,
+            &mut in_flight,
+            &mut openvtc_core::pending_replies::PendingReplies::default(),
+            outcome,
+        );
+        assert!(!in_flight.is_busy(DispatchDomain::DidGitSign));
+        assert_eq!(
+            state
+                .main_page
+                .content_panel
+                .settings
+                .did_git_sign_for
+                .as_deref(),
+            Some("did:example:none")
+        );
+
+        // The queued one starts on the next check.
+        maybe_refresh_did_git_sign(&mut state, &mut in_flight, &tx);
+        assert!(in_flight.is_busy(DispatchDomain::DidGitSign));
+        assert!(!state.main_page.content_panel.settings.did_git_sign_wanted);
+        assert!(rx.recv().await.is_some());
+
+        // No persona: answered without a read.
+        let mut in_flight = InFlight::default();
+        state.main_page.content_panel.settings.persona_did.clear();
+        refresh_did_git_sign(&mut state, &mut in_flight, &tx);
+        assert!(!in_flight.is_busy(DispatchDomain::DidGitSign));
+        assert_eq!(
+            state
+                .main_page
+                .content_panel
+                .settings
+                .did_git_sign_for
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    /// The picker previews as it moves, keeps what Enter chose, and puts back
+    /// what was in use when cancelled. One test, because the active theme is
+    /// process-wide.
+    #[test]
+    fn the_theme_picker_previews_keeps_and_cancels() {
+        let base = std::env::temp_dir().join(format!("openvtc-picker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let roots = Roots {
+            config: Some(base.join("config")),
+            home: Some(base.join("home")),
+            system_omarchy: None,
+            profile: "default".to_string(),
+        };
+        theme::set_active(&Theme::default_theme());
+        let mut state = State::default();
+
+        handle_theme_open(&mut state, &roots);
+        let SettingsMode::ThemePicker { rows, selected, .. } =
+            &state.main_page.content_panel.settings.mode
+        else {
+            panic!("the picker opens");
+        };
+        assert_eq!(rows[*selected].id, "openvtc", "on the theme in use");
+        let nord = rows.iter().position(|r| r.id == "nord").unwrap();
+
+        handle_theme_select(&mut state, &roots, nord);
+        assert_eq!(theme::active_theme().0, "nord", "moving previews");
+        handle_theme_cancel(&mut state, &roots);
+        assert_eq!(theme::active_theme().0, "openvtc", "cancel puts it back");
+        assert!(
+            !roots.settings_file().unwrap().exists(),
+            "and remembers nothing"
+        );
+
+        handle_theme_open(&mut state, &roots);
+        handle_theme_select(&mut state, &roots, nord);
+        handle_theme_copy(&mut state, &roots);
+        let SettingsMode::ThemePicker { rows, selected, .. } =
+            &state.main_page.content_panel.settings.mode
+        else {
+            panic!("still picking");
+        };
+        assert_eq!(
+            rows[*selected].id, "user/nord-mine",
+            "the copy is highlighted"
+        );
+        handle_theme_apply(&mut state, &roots);
+        assert!(matches!(
+            state.main_page.content_panel.settings.mode,
+            SettingsMode::View
+        ));
+        assert_eq!(catalog::choice(&roots).theme, "user/nord-mine");
+        assert_eq!(theme::active_theme().1, "Nord (mine)");
+
+        // Auto is listed first, and kept by its own id.
+        handle_theme_open(&mut state, &roots);
+        let SettingsMode::ThemePicker { rows, .. } = &state.main_page.content_panel.settings.mode
+        else {
+            panic!("the picker opens again");
+        };
+        assert_eq!(rows[0].id, catalog::AUTO_ID);
+        handle_theme_select(&mut state, &roots, 0);
+        assert_eq!(theme::active_theme().0, catalog::AUTO_ID, "auto previews");
+        handle_theme_apply(&mut state, &roots);
+        assert_eq!(catalog::choice(&roots).theme, catalog::AUTO_ID);
+        let message = state
+            .main_page
+            .content_panel
+            .settings
+            .status_message
+            .clone();
+        assert!(message.is_some_and(|m| m.text.starts_with("Theme set to Auto — ")));
+
+        theme::set_active(&Theme::default_theme());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_empty() {
+        assert!(validate_file_path("").is_err());
+        assert!(validate_file_path("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_traversal() {
+        assert!(validate_file_path("../../etc/passwd").is_err());
+        assert!(validate_file_path("foo/../bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_file_path_accepts_normal() {
+        assert!(validate_file_path("export.enc").is_ok());
+        assert!(validate_file_path("/home/user/backup.enc").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_accepts_dot_slash() {
+        assert!(validate_file_path("./local-file.dat").is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_hidden_traversal() {
+        assert!(validate_file_path("/tmp/safe/../../../etc/shadow").is_err());
+    }
+
+    /// Pressing Enter on the Mediator DID row must not open an edit mode at
+    /// all: on a profile with no persona the write would vanish while the panel
+    /// said "Setting saved" over a field that read back empty.
+    #[test]
+    fn mediator_row_does_not_open_an_edit_mode() {
+        let mut state = State::default();
+        state.main_page.content_panel.settings.mediator_did = "did:webvh:example:mediator".into();
+        state.main_page.content_panel.settings.selected_index = rows::MEDIATOR_ROW;
+
+        handle_start_edit(&mut state);
+
+        assert!(
+            matches!(settings(&state), SettingsMode::View),
+            "the mediator row is read-only, so Enter stays in View"
+        );
+    }
+
+    /// A committed edit never implies a mediator reconnect — nothing editable
+    /// can move the mediator, so a reconnect (which would hang on
+    /// "Connecting…") has no trigger.
+    #[tokio::test]
+    async fn submitting_an_edit_never_asks_for_a_reconnect() {
+        let mut config = Box::new(crate::state_handler::dispatch_util::test_config());
+        let mut state = State::default();
+        let mut save = crate::state_handler::save_coalesce::SaveScheduler::new("test");
+        let (state_tx, _rx) = watch::channel(std::sync::Arc::new(State::default()));
+
+        for idx in [
+            rows::FRIENDLY_NAME_ROW,
+            rows::MEDIATOR_ROW,
+            rows::PERSONA_ROW,
+        ] {
+            state.main_page.content_panel.settings.selected_index = idx;
+            let outcome = dispatch(
+                SettingsAction::SubmitEdit {
+                    value: "value".to_string(),
+                },
+                &mut config,
+                &mut state,
+                &state_tx,
+                &mut save,
+                "test",
+            )
+            .await;
+            assert!(
+                matches!(outcome, SettingsOutcome::Continue),
+                "row {idx} must not request a mediator reconnect"
+            );
+        }
+        assert_eq!(config.mediator_did(), "", "and no row wrote a mediator DID");
+    }
+
+    /// The other half: an editable row still reports success and keeps the
+    /// existing coalesced-save behaviour, so removing the mediator edit has not
+    /// disturbed the ordinary path.
+    #[test]
+    fn friendly_name_edit_still_reports_a_save() {
+        let mut config = Box::new(crate::state_handler::dispatch_util::test_config());
+        let mut state = State::default();
+        let mut save = crate::state_handler::save_coalesce::SaveScheduler::new("test");
+        state.main_page.content_panel.settings.selected_index = rows::FRIENDLY_NAME_ROW;
+
+        handle_submit_edit(&mut config, &mut state, &mut save, "Alice");
+
+        assert_eq!(
+            state
+                .main_page
+                .content_panel
+                .settings
+                .status_message
+                .as_ref()
+                .map(|s| s.text.as_str()),
+            Some("Setting saved")
+        );
+        assert_eq!(config.public.friendly_name, "Alice");
+    }
+
+    // ----------------------------------------------------------------
+    // Table tests for the pure mode-transition handlers. Each is a pure
+    // function of `&mut State`; the tables drive the handler from a starting
+    // `State` and assert on the resulting settings-panel mode. Mirrors the
+    // table-test style in `ui/pages/setup_flow/navigation.rs`.
+    // ----------------------------------------------------------------
+
+    fn settings(state: &State) -> &super::SettingsMode {
+        &state.main_page.content_panel.settings.mode
+    }
+
+    /// A constructor for a representative `SettingsMode`, used by the tables to
+    /// seed a starting mode / check a target discriminant.
+    type ModeFn = fn() -> SettingsMode;
+
+    /// `handle_start_edit` maps the selected setting index to the matching edit
+    /// mode, seeding the input from the current value; unknown indices fall back
+    /// to `View`. Table-driven over (selected_index, expected mode discriminant).
+    #[test]
+    fn start_edit_maps_index_to_mode() {
+        // Closures returning a representative mode for the discriminant check.
+        let cases: &[(usize, ModeFn)] = &[
+            (rows::FRIENDLY_NAME_ROW, || SettingsMode::EditFriendlyName {
+                input: String::new(),
+            }),
+            // The read-only Mediator DID falls through to `View` like any
+            // other unedittable row.
+            (rows::MEDIATOR_ROW, || SettingsMode::View),
+            (rows::EXPORT_ROW, || SettingsMode::ExportConfig {
+                path_input: String::new(),
+                passphrase_len: 0,
+                confirm_len: 0,
+                active_field: 0,
+            }),
+            (rows::IMPORT_ROW, || SettingsMode::ImportConfig {
+                path_input: String::new(),
+                passphrase_len: 0,
+                active_field: 0,
+            }),
+            (rows::PERSONA_ROW, || SettingsMode::View),
+            (rows::PROTECTION_ROW, || SettingsMode::View),
+            (99, || SettingsMode::View),
+        ];
+        for (idx, expected) in cases {
+            let mut state = State::default();
+            state.main_page.content_panel.settings.friendly_name = "Alice".to_string();
+            state.main_page.content_panel.settings.mediator_did = "did:med".to_string();
+            state.main_page.content_panel.settings.selected_index = *idx;
+            handle_start_edit(&mut state);
+            assert_eq!(
+                std::mem::discriminant(settings(&state)),
+                std::mem::discriminant(&expected()),
+                "start_edit index {idx}"
+            );
+        }
+        // The edit modes seed `input` from the current value.
+        let mut state = State::default();
+        state.main_page.content_panel.settings.friendly_name = "Alice".to_string();
+        state.main_page.content_panel.settings.selected_index = rows::FRIENDLY_NAME_ROW;
+        handle_start_edit(&mut state);
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::EditFriendlyName { input } if input == "Alice"
+        ));
+    }
+
+    /// `handle_field_update` writes the single-line input for the one remaining
+    /// edit mode and is a no-op elsewhere.
+    #[test]
+    fn field_update_writes_edit_input() {
+        let mut state = State::default();
+        state.main_page.content_panel.settings.mode = SettingsMode::EditFriendlyName {
+            input: String::new(),
+        };
+        handle_field_update(&mut state, "new-value".to_string());
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::EditFriendlyName { input } if input == "new-value"
+        ));
+        // No-op in View.
+        let mut state = State::default();
+        handle_field_update(&mut state, "ignored".to_string());
+        assert!(matches!(settings(&state), SettingsMode::View));
+    }
+
+    /// `handle_change_protection` enters the `ChangeProtection` form zeroed, and
+    /// the protection sub-field handlers then mutate exactly their field.
+    #[test]
+    fn change_protection_form_field_transitions() {
+        let mut state = State::default();
+        handle_change_protection(&mut state);
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::ChangeProtection {
+                selected_option: 0,
+                passphrase_len: 0,
+                confirm_len: 0,
+                active_field: 0,
+            }
+        ));
+
+        handle_protection_option_select(&mut state, 1);
+        handle_protection_passphrase_len(&mut state, 7);
+        handle_protection_confirm_len(&mut state, 9);
+        handle_protection_tab_switch(&mut state, 2);
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::ChangeProtection {
+                selected_option: 1,
+                passphrase_len: 7,
+                confirm_len: 9,
+                active_field: 2,
+            }
+        ));
+
+        // `handle_protection_start_input` forces the active field to the
+        // passphrase (1).
+        let mut state = State::default();
+        handle_change_protection(&mut state);
+        handle_protection_start_input(&mut state);
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::ChangeProtection {
+                active_field: 1,
+                ..
+            }
+        ));
+    }
+
+    /// `handle_form_tab_switch` toggles the export/import form active field
+    /// between 0 and 1; `handle_form_field_update`/`handle_passphrase_len`
+    /// populate the path/passphrase-length.
+    #[test]
+    fn export_import_form_field_transitions() {
+        for make in [
+            (|| SettingsMode::ExportConfig {
+                path_input: String::new(),
+                passphrase_len: 0,
+                confirm_len: 0,
+                active_field: 0,
+            }) as ModeFn,
+            || SettingsMode::ImportConfig {
+                path_input: String::new(),
+                passphrase_len: 0,
+                active_field: 0,
+            },
+        ] {
+            let mut state = State::default();
+            state.main_page.content_panel.settings.mode = make();
+            handle_form_field_update(&mut state, 0, "backup.enc".to_string());
+            handle_passphrase_len(&mut state, 4);
+            handle_form_tab_switch(&mut state); // 0 -> 1
+            let (path, plen, field) = match settings(&state) {
+                SettingsMode::ExportConfig {
+                    path_input,
+                    passphrase_len,
+                    active_field,
+                    ..
+                }
+                | SettingsMode::ImportConfig {
+                    path_input,
+                    passphrase_len,
+                    active_field,
+                } => (path_input.clone(), *passphrase_len, *active_field),
+                other => panic!("unexpected mode {other:?}"),
+            };
+            assert_eq!(path, "backup.enc");
+            assert_eq!(plen, 4);
+            assert_eq!(field, 1, "tab switch toggled 0 -> 1");
+            if matches!(settings(&state), SettingsMode::ExportConfig { .. }) {
+                handle_form_tab_switch(&mut state); // 1 -> 2 (confirm)
+                assert!(matches!(
+                    settings(&state),
+                    SettingsMode::ExportConfig {
+                        active_field: 2,
+                        ..
+                    }
+                ));
+            }
+            handle_form_tab_switch(&mut state); // back to 0
+            let field = match settings(&state) {
+                SettingsMode::ExportConfig { active_field, .. }
+                | SettingsMode::ImportConfig { active_field, .. } => *active_field,
+                other => panic!("unexpected mode {other:?}"),
+            };
+            assert_eq!(field, 0, "tab switch toggled 1 -> 0");
+        }
+    }
+
+    /// A wipe covers the identity the settings panel detected, once, beside
+    /// every persona's.
+    #[test]
+    fn a_wipe_covers_the_detected_signing_identity_once() {
+        let config = crate::state_handler::dispatch_util::test_config();
+        let mut state = State::default();
+        let persona_keys = signing_identities(&state, &config);
+        assert!(persona_keys.is_empty() || persona_keys.iter().all(|k| k.contains('#')));
+        state.main_page.content_panel.settings.did_git_sign =
+            Some(crate::state_handler::main_page::content::DidGitSignInfo {
+                did_key_id: "did:webvh:legacy#key-0".into(),
+                ssh_public_key: String::new(),
+                config_path: String::new(),
+            });
+        let all = signing_identities(&state, &config);
+        assert_eq!(
+            all.iter()
+                .filter(|k| *k == "did:webvh:legacy#key-0")
+                .count(),
+            1
+        );
+        assert_eq!(all.len(), persona_keys.len() + 1);
+    }
+
+    /// `handle_wipe_start` enters `WipeConfirm` (empty input) and
+    /// `handle_wipe_input` records the typed confirmation token.
+    #[test]
+    fn wipe_start_and_input_transitions() {
+        let mut state = State::default();
+        handle_wipe_start(&mut state);
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::WipeConfirm { confirm_input } if confirm_input.is_empty()
+        ));
+        handle_wipe_input(&mut state, "WIPE".to_string());
+        assert!(matches!(
+            settings(&state),
+            SettingsMode::WipeConfirm { confirm_input } if confirm_input == "WIPE"
+        ));
+
+        // `handle_wipe_input` is a no-op outside WipeConfirm.
+        let mut state = State::default();
+        handle_wipe_input(&mut state, "WIPE".to_string());
+        assert!(matches!(settings(&state), SettingsMode::View));
+    }
+
+    /// `handle_select` updates the selected index in `View`.
+    #[test]
+    fn select_updates_index() {
+        let mut state = State::default();
+        handle_select(&mut state, rows::PROTECTION_ROW);
+        assert_eq!(
+            state.main_page.content_panel.settings.selected_index,
+            rows::PROTECTION_ROW
+        );
+    }
+}

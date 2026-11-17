@@ -1,0 +1,970 @@
+//! Shared TDK profile construction for DIDComm services.
+//!
+//! Resolves the server's DID document to discover the correct verification-method
+//! key IDs, then builds a `TDKProfile` with the correct secrets. This is used by
+//! the `affinidi-messaging-didcomm-service` framework to establish mediator
+//! connections.
+
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_tdk_common::profiles::TDKProfile;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+use super::error::AppError;
+use super::identity::ServiceIdentity;
+
+/// Resolve the mediator DID from a peer's DID document.
+///
+/// Looks for a `DIDCommMessaging` service endpoint in the peer's DID document
+/// and extracts the mediator DID URI from it. This follows the DIDComm v2
+/// convention where the `serviceEndpoint.uri` of a `DIDCommMessaging` service
+/// points to the mediator that relays messages for the peer.
+///
+/// Returns `None` if the DID cannot be resolved or has no `DIDCommMessaging` service.
+pub async fn resolve_mediator_did(
+    peer_did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<String> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for mediator discovery: {e}");
+                return None;
+            }
+        },
+    };
+
+    let doc = match resolver.resolve(peer_did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {peer_did} for mediator discovery: {e}");
+            return None;
+        }
+    };
+
+    // Find the DIDCommMessaging service endpoint URI. `get_uri()` leaves
+    // JSON quoting on Map-shaped endpoints, so trim it.
+    let mediator = doc
+        .service
+        .iter()
+        .find(|s| s.type_.iter().any(|t| t == "DIDCommMessaging"))
+        .and_then(|s| s.service_endpoint.get_uri())
+        .map(|uri| uri.trim_matches('"').to_string())?;
+
+    info!(peer = peer_did, mediator = %mediator, "discovered mediator from DID document");
+    Some(mediator)
+}
+
+/// A transport a peer's DID document advertises for reaching it.
+///
+/// The `did-hosting` workspace treats **TSP as preferred over DIDComm,
+/// and DIDComm as preferred over HTTPS** when a peer advertises more than
+/// one — matching the canonical service order the VTA webvh templates
+/// render (`#tsp`, then `#vta-didcomm`, then `#trust-tasks`). The outbound
+/// send path ([`crate::server`] / the trust-task sender) uses
+/// [`resolve_transport`] to pick the binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTransport {
+    /// Trust Spanning Protocol (`TSPTransport` service).
+    Tsp,
+    /// DIDComm v2 (`DIDCommMessaging` service).
+    Didcomm,
+    /// The HTTPS Trust-Task binding (`TrustTaskHTTPS` service). Unlike
+    /// `Tsp`/`Didcomm`, this carries no mediator — the peer *is* the
+    /// endpoint, so [`resolve_transport`]'s paired `String` is the request
+    /// base URL rather than a mediator VID.
+    Https,
+}
+
+/// A transport a message was **observed** travelling on, as opposed to
+/// [`PeerTransport`], which records what a DID document *advertises*.
+///
+/// The distinction is the whole point of persisting this. A peer that
+/// advertises `TSPTransport` may still be talked to over DIDComm — because the
+/// TSP send failed and fell back, or because it registered before it advertised
+/// anything. Reporting the advertised transport as though it were the one in
+/// use would quietly lie to the operator.
+///
+/// `Https` exists because the trust-task core is transport-agnostic and the
+/// same documents can arrive over `POST /api/trust-tasks`. No registered
+/// service instance uses it today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObservedTransport {
+    Tsp,
+    Didcomm,
+    Https,
+}
+
+impl ObservedTransport {
+    /// Map a [`trust_tasks_rs::TransportHandler::binding_uri`] to the transport
+    /// it identifies.
+    ///
+    /// Matched against the binding crates' own exported constants rather than
+    /// by substring, so a new binding shows up as `None` — an honest "we don't
+    /// know" — instead of being silently mis-attributed.
+    pub fn from_binding_uri(binding_uri: &str) -> Option<Self> {
+        match binding_uri {
+            crate::server::trust_tasks::transport::TSP_BINDING_URI => Some(Self::Tsp),
+            trust_tasks_didcomm::BINDING_URI => Some(Self::Didcomm),
+            trust_tasks_https::BINDING_URI => Some(Self::Https),
+            _ => None,
+        }
+    }
+}
+
+impl From<PeerTransport> for ObservedTransport {
+    fn from(t: PeerTransport) -> Self {
+        match t {
+            PeerTransport::Tsp => Self::Tsp,
+            PeerTransport::Didcomm => Self::Didcomm,
+            PeerTransport::Https => Self::Https,
+        }
+    }
+}
+
+/// Resolve every service `type` a peer's DID document advertises.
+///
+/// The network-facing counterpart to
+/// [`crate::did::service_types_from_doc`], which reads a document we
+/// already hold. Used to populate the registry's per-instance badge cache:
+/// the registry stores only a DID string, so the document has to be fetched.
+///
+/// Skips the `#whois` / `#files` services a conforming did:webvh resolver
+/// synthesises into every document — see
+/// [`crate::did::is_implicit_webvh_service`]. They appear on 100% of resolved
+/// webvh DIDs, are absent from the stored `did.jsonl`, and carry no operator
+/// intent; reporting them would put a permanent, meaningless `Other` badge on
+/// every server while the DID list (which reads the log) showed none.
+///
+/// Returns `None` when the DID cannot be resolved — distinct from
+/// `Some(vec![])`, which means it resolved and advertises no services.
+/// Callers cache the distinction; see `ServiceInstance::advertised_services`.
+pub async fn resolve_service_types(
+    peer_did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<Vec<String>> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for service discovery: {e}");
+                return None;
+            }
+        },
+    };
+
+    let doc = match resolver.resolve(peer_did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {peer_did} for service discovery: {e}");
+            return None;
+        }
+    };
+
+    // Flatten the resolved document's typed `service` array. Mirrors
+    // `did::service_types_from_doc`'s contract — document order, deduped,
+    // implicit services skipped — but over the resolver's `Service` type
+    // rather than raw JSON.
+    let mut out: Vec<String> = Vec::new();
+    for svc in &doc.service {
+        let implicit = svc
+            .id
+            .as_ref()
+            .is_some_and(|id| crate::did::is_implicit_webvh_service(id.as_str()));
+        if implicit {
+            continue;
+        }
+        for t in &svc.type_ {
+            if !t.is_empty() && !out.iter().any(|seen| seen == t) {
+                out.push(t.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Resolve a peer's preferred transport and its mediator endpoint from
+/// the peer's DID document.
+///
+/// Scans for a `TSPTransport` service **first**, falling back to
+/// `DIDCommMessaging`, falling back to `TrustTaskHTTPS`. Returns
+/// `(transport, endpoint)` — a mediator VID for `Tsp`/`Didcomm`, the
+/// request base URL for `Https` — or `None` if the DID cannot be resolved
+/// or advertises none of the three.
+///
+/// This is the single canonical "which transport for this peer" reader —
+/// when a DID has a `TSPTransport` service we prefer it over `DIDComm`,
+/// and prefer `DIDComm` over `TrustTaskHTTPS` — the concrete realisation
+/// of "TSP > DIDComm > HTTPS".
+///
+/// A `TrustTaskHTTPS` endpoint is used only when it passes the peer endpoint
+/// egress policy (`crate::http::vet_peer_endpoint`): `https`, and a host that
+/// is a public name or a globally routable address — not loopback, a private
+/// or link-local range, or a special-use name such as `localhost`. The
+/// endpoint comes from the peer's own document, so this node must not send
+/// wherever it says. A document naming any other endpoint is treated as
+/// silent on this transport. What the name resolves to is checked again
+/// when the send connects.
+pub async fn resolve_transport(
+    peer_did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<(PeerTransport, String)> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for transport discovery: {e}");
+                return None;
+            }
+        },
+    };
+
+    let doc = match resolver.resolve(peer_did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {peer_did} for transport discovery: {e}");
+            return None;
+        }
+    };
+
+    // Scan for a service of `type_name` and return its endpoint URI as a
+    // plain string. Handles both endpoint shapes the webvh templates
+    // emit: DIDComm's array-of-objects (`[{ "uri": ... }]`) and TSP's
+    // bare-string (`"did:webvh:mediator..."`) `serviceEndpoint`.
+    let find_uri = |type_name: &str| {
+        doc.service
+            .iter()
+            .find(|s| s.type_.iter().any(|t| t == type_name))
+            .and_then(|s| s.service_endpoint.get_uri())
+            .map(|uri| uri.trim_matches('"').to_string())
+    };
+
+    if let Some(tsp) = find_uri("TSPTransport") {
+        info!(peer = peer_did, mediator = %tsp, "peer advertises TSPTransport — preferring TSP");
+        return Some((PeerTransport::Tsp, tsp));
+    }
+    if let Some(didcomm) = find_uri("DIDCommMessaging") {
+        info!(peer = peer_did, mediator = %didcomm, "peer advertises DIDCommMessaging — using DIDComm");
+        return Some((PeerTransport::Didcomm, didcomm));
+    }
+    if let Some(https) = find_uri("TrustTaskHTTPS") {
+        match crate::http::vet_peer_endpoint(&https) {
+            Ok(_) => {
+                info!(peer = peer_did, endpoint = %https, "peer advertises TrustTaskHTTPS — using HTTPS");
+                return Some((PeerTransport::Https, https));
+            }
+            // Every send to this peer re-reads its document, so warn once per
+            // peer and keep the repeats at debug.
+            Err(e) if first_refusal(peer_did) => warn!(
+                peer = peer_did,
+                endpoint = %https,
+                reason = %e,
+                "peer advertises TrustTaskHTTPS at an endpoint outside the outbound policy \
+                 (https to a public host) — not routing trust tasks there"
+            ),
+            Err(e) => debug!(
+                peer = peer_did,
+                endpoint = %https,
+                reason = %e,
+                "peer's TrustTaskHTTPS endpoint is still outside the outbound policy"
+            ),
+        }
+    }
+    None
+}
+
+/// Most peers [`first_refusal`] remembers. Past it, every refusal is logged at
+/// debug: the log cannot be flooded by a stream of distinct peers either.
+const REFUSAL_WARNINGS_CAPACITY: usize = 1024;
+
+/// Whether this is the first time `peer_did`'s advertised HTTPS endpoint has
+/// been refused in this process (and so worth a warning).
+fn first_refusal(peer_did: &str) -> bool {
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut warned = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    let warned = warned.get_or_insert_with(Default::default);
+    if warned.contains(peer_did) || warned.len() >= REFUSAL_WARNINGS_CAPACITY {
+        return false;
+    }
+    warned.insert(peer_did.to_string());
+    true
+}
+
+/// The node's locally-configured messaging fallback, applied when a peer's
+/// DID document advertises no `TSPTransport`/`DIDCommMessaging` service.
+///
+/// This is the compatibility bridge for the "DID document is authoritative"
+/// model: before transports were published in documents, control↔server
+/// links worked because both ends shared a mediator and messages were sent
+/// over DIDComm regardless of what the document said. That behaviour is
+/// preserved here — a node with a mediator configured keeps reaching
+/// doc-silent peers over its own mediator — while a node with no mediator
+/// (which could never have spoken DIDComm) yields no binding and the caller
+/// treats the peer as unroutable, rather than silently attempting a DIDComm
+/// send that cannot route.
+///
+/// This fallback is deliberately DIDComm/TSP-only, not HTTPS: a shared
+/// mediator is a real compatibility bridge two nodes could always have
+/// spoken over, but there is no equivalent "shared HTTPS endpoint" a
+/// document-silent peer could be guessed to answer at. A peer only gets
+/// [`PeerTransport::Https`] by advertising `TrustTaskHTTPS` itself
+/// ([`resolve_transport`]).
+///
+/// `binding` is the node's *own* mediator VID plus the transport it prefers
+/// (TSP when `features.tsp`, else DIDComm). It is `None` on HTTP-only nodes.
+#[derive(Debug, Clone, Default)]
+pub struct TransportFallback {
+    /// The node's configured `(preferred transport, mediator VID)`, or `None`
+    /// when the node has no mediator configured.
+    pub binding: Option<(PeerTransport, String)>,
+}
+
+impl TransportFallback {
+    /// Build from a node's configured mediator and transport preference.
+    ///
+    /// `prefer_tsp` should track `features.tsp`; when the node advertises both
+    /// transports it prefers TSP, matching [`resolve_transport`]'s document
+    /// ordering. Returns an empty fallback (no binding) when `mediator_did` is
+    /// `None`, so HTTP-only nodes yield no binding at all.
+    pub fn from_config(mediator_did: Option<&str>, prefer_tsp: bool) -> Self {
+        let binding = mediator_did.map(|m| {
+            let t = if prefer_tsp {
+                PeerTransport::Tsp
+            } else {
+                PeerTransport::Didcomm
+            };
+            (t, m.to_string())
+        });
+        Self { binding }
+    }
+}
+
+/// Decide how to reach `peer_did` with a trust task, applying the
+/// **DID-document-authoritative** precedence:
+///
+/// 1. **DID document** — a `TSPTransport` (preferred), `DIDCommMessaging`, or
+///    `TrustTaskHTTPS` service, in that order, is the authoritative statement
+///    of how to reach the peer.
+/// 2. **Config fallback** — if the document advertises none of the three, use
+///    the local node's configured mediator ([`TransportFallback`]). Preserves
+///    existing shared-mediator deployments whose documents predate published
+///    transports.
+/// 3. **Fail** — `None` when the peer advertises no messaging service and the
+///    node has no configured mediator. The caller treats this as an unroutable
+///    peer rather than blindly attempting a send that cannot succeed.
+///
+/// The return shape matches [`resolve_transport`] — `(transport, mediator VID)`
+/// — so it drops into the existing send paths unchanged; the only addition is
+/// the config tier between the document and failure. The document is resolved
+/// once; the config tier still applies when the document fails to resolve
+/// entirely (the shared-mediator case).
+pub async fn resolve_send_binding(
+    peer_did: &str,
+    fallback: &TransportFallback,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<(PeerTransport, String)> {
+    decide_binding(
+        peer_did,
+        resolve_transport(peer_did, did_resolver).await,
+        fallback,
+    )
+}
+
+/// The pure precedence ladder behind [`resolve_send_binding`], split out so
+/// the ordering can be tested without a live DID resolver. `from_doc` is what
+/// the peer's document advertised (via [`resolve_transport`]), or `None` when
+/// it advertised no messaging service or failed to resolve.
+fn decide_binding(
+    peer_did: &str,
+    from_doc: Option<(PeerTransport, String)>,
+    fallback: &TransportFallback,
+) -> Option<(PeerTransport, String)> {
+    // 1. DID document — authoritative.
+    if let Some((transport, mediator)) = from_doc {
+        info!(peer = peer_did, ?transport, mediator = %mediator, "send-binding: using document-advertised transport");
+        return Some((transport, mediator));
+    }
+
+    // 2. Config fallback — the node's own configured mediator.
+    if let Some((transport, mediator)) = &fallback.binding {
+        info!(
+            peer = peer_did,
+            ?transport,
+            mediator = %mediator,
+            "send-binding: document silent — using configured mediator fallback"
+        );
+        return Some((*transport, mediator.clone()));
+    }
+
+    // 3. Fail — unroutable.
+    warn!(
+        peer = peer_did,
+        "send-binding: peer advertises no messaging service and no mediator is \
+         configured — cannot route (peer is unreachable for trust-task push)"
+    );
+    None
+}
+
+/// The messaging transports a DID document advertises, as a [`ProtocolSet`](crate::server::identity::ProtocolSet).
+///
+/// Resolves `did` and maps its services: a `TSPTransport` service ⇒ `tsp`, a
+/// `DIDCommMessaging` service ⇒ `didcomm`. Returns `None` when the document
+/// can't be resolved — the caller decides how to degrade.
+pub async fn advertised_protocols(
+    did: &str,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<crate::server::identity::ProtocolSet> {
+    let owned;
+    let resolver = match did_resolver {
+        Some(r) => r,
+        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+            Ok(r) => {
+                owned = r;
+                &owned
+            }
+            Err(e) => {
+                warn!("failed to create DID resolver for advertised-transport check: {e}");
+                return None;
+            }
+        },
+    };
+    let doc = match resolver.resolve(did).await {
+        Ok(response) => response.doc,
+        Err(e) => {
+            warn!("failed to resolve {did} for advertised-transport check: {e}");
+            return None;
+        }
+    };
+    let advertises = |type_name: &str| {
+        doc.service
+            .iter()
+            .any(|s| s.type_.iter().any(|t| t == type_name))
+    };
+    Some(crate::server::identity::ProtocolSet {
+        didcomm: advertises("DIDCommMessaging"),
+        tsp: advertises("TSPTransport"),
+    })
+}
+
+/// Reconcile a node's config-derived listener protocols with what its own DID
+/// document advertises, returning the set the listener must carry.
+///
+/// The DID document is **authoritative for reachability**: peers route to a
+/// node over exactly the transport services its document advertises, so the
+/// listener has to accept every one of them. Otherwise inbound frames on an
+/// advertised-but-unhandled transport are silently dropped *and acked* — the
+/// mediator considers them delivered and the sender never learns otherwise,
+/// which is how a `features.tsp = false` node whose DID advertises
+/// `TSPTransport` loses every control→server push without an error.
+///
+/// This unions `config` (which also carries the rotation grace window across
+/// live generations) with `advertised`, and logs when the document advertises
+/// a transport the config left off — the "which must agree" invariant
+/// (`identity::IdentityGeneration`), now enforced and visible. When
+/// `advertised` is `None` (document unresolvable) the config set is returned
+/// unchanged, with a warning that the two can no longer be cross-checked.
+pub fn reconcile_listener_protocols(
+    config: crate::server::identity::ProtocolSet,
+    advertised: Option<crate::server::identity::ProtocolSet>,
+    did: &str,
+) -> crate::server::identity::ProtocolSet {
+    let Some(advertised) = advertised else {
+        warn!(
+            did = %did,
+            "could not resolve own DID document — deriving listener transports from config \
+             only; if the published DID advertises a transport this node has disabled, peers' \
+             messages on it will be dropped"
+        );
+        return config;
+    };
+    if advertised.tsp && !config.tsp {
+        warn!(
+            did = %did,
+            "DID document advertises TSPTransport but features.tsp is off — enabling the TSP \
+             listener to match the document (set features.tsp = true to silence this)"
+        );
+    }
+    if advertised.didcomm && !config.didcomm {
+        warn!(
+            did = %did,
+            "DID document advertises DIDCommMessaging but features.didcomm is off — enabling \
+             the DIDComm listener to match the document"
+        );
+    }
+    config.union(advertised)
+}
+
+/// Build the main listener a node runs for its *own* DID.
+///
+/// The one function every node (server, control, witness, watcher) uses both at
+/// boot and when it rebuilds the listener after an identity change, so the two
+/// cannot drift. A rebuild that skipped any of these steps would come back
+/// different from the listener the node booted with:
+///
+/// - the profile carries every live generation's key material
+///   ([`build_tdk_profile_for_identity`]);
+/// - the transports are the live generations' union **reconciled against what
+///   our own DID document advertises** ([`reconcile_listener_protocols`]) —
+///   otherwise frames on an advertised transport the listener does not carry
+///   are dropped and acked;
+/// - with TSP on, the listener persists its TSP relationships in `store`, so a
+///   rebuild does not forget every peer.
+///
+/// Returns the listener and the transports it carries. The caller starts the
+/// service with its TSP handler *always* installed (`start_with_tsp`), not only
+/// when `transports.tsp` is set: the listener's `protocols` gate TSP dispatch,
+/// and the service keeps one handler for its lifetime, so only a service that
+/// has one can pick up TSP when [`rebuild_own_listener`] turns it on later.
+pub async fn build_own_listener(
+    listener_id: &str,
+    identity: &ServiceIdentity,
+    mediator_did: &str,
+    store: &crate::server::store::Store,
+) -> Result<
+    (
+        affinidi_messaging_didcomm_service::ListenerConfig,
+        crate::server::identity::ProtocolSet,
+    ),
+    AppError,
+> {
+    let profile = build_tdk_profile_for_identity(listener_id, identity, Some(mediator_did)).await?;
+    let advertised = advertised_protocols(&identity.did, Some(&identity.did_resolver)).await;
+    let transports = reconcile_listener_protocols(identity.protocols(), advertised, &identity.did);
+    let listener = own_listener_config(listener_id, profile, transports, store)?;
+    Ok((listener, transports))
+}
+
+/// Rebuild a running node's own listener against its current live identity.
+///
+/// Necessary after any identity change because the framework re-seeds its
+/// secrets resolver from `ListenerConfig.profile.secrets()` on every reconnect —
+/// a secret that is not in the profile vector vanishes the moment the socket
+/// drops. The new listener comes from [`build_own_listener`], exactly as at
+/// boot.
+///
+/// Remove-then-add, not add-then-remove: the mediator allows exactly one
+/// connection per DID, and the framework rejects a second listener for a DID it
+/// already holds. There is a brief window with no listener; inbound messages
+/// queue at the mediator and are delivered on reconnect.
+///
+/// Returns the transports the rebuilt listener carries.
+pub async fn rebuild_own_listener(
+    svc: &affinidi_messaging_didcomm_service::DIDCommService,
+    listener_id: &str,
+    identity: &ServiceIdentity,
+    mediator_did: &str,
+    store: &crate::server::store::Store,
+) -> Result<crate::server::identity::ProtocolSet, AppError> {
+    let (listener, transports) =
+        build_own_listener(listener_id, identity, mediator_did, store).await?;
+
+    if let Err(e) = svc.remove_listener(listener_id).await {
+        warn!("failed to remove the old listener: {e}");
+    }
+    svc.add_listener(listener)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to restart the DIDComm listener: {e}")))?;
+
+    info!(
+        didcomm = transports.didcomm,
+        tsp = transports.tsp,
+        "DIDComm listener rebuilt on the new identity"
+    );
+    Ok(transports)
+}
+
+/// The listener config [`build_own_listener`] assembles, once the profile and
+/// the reconciled transports are known. Split out so the shape is testable
+/// without resolving a DID.
+fn own_listener_config(
+    listener_id: &str,
+    profile: TDKProfile,
+    transports: crate::server::identity::ProtocolSet,
+    store: &crate::server::store::Store,
+) -> Result<affinidi_messaging_didcomm_service::ListenerConfig, AppError> {
+    use affinidi_messaging_didcomm_service::{
+        ListenerConfig, Protocols, RestartPolicy, RetryConfig,
+    };
+
+    // "Neither flag set but a mediator is configured" defaults to DIDComm-only
+    // for back-compat.
+    let protocols = match (transports.didcomm, transports.tsp) {
+        (true, true) => Protocols::BOTH,
+        (false, true) => Protocols::TSP_ONLY,
+        _ => Protocols::DIDCOMM_ONLY,
+    };
+    let mut listener = ListenerConfig {
+        id: listener_id.into(),
+        profile,
+        restart_policy: RestartPolicy::Always {
+            backoff: RetryConfig::default(),
+        },
+        auto_delete: true,
+        protocols,
+        ..Default::default()
+    };
+    // Persist this listener's TSP relationships (Rev 3 §7.2.2) across restarts
+    // and rebuilds. The default store is in-memory, so without this every
+    // peer's relationship is forgotten and its application traffic silently
+    // dropped until a re-handshake. See docs/tsp-transport.md.
+    if transports.tsp {
+        listener.relationship_store =
+            Some(crate::server::tsp_relationship_store::build_relationship_store(store)?);
+    }
+    Ok(listener)
+}
+
+/// Wait until a DID resolves, retrying with exponential backoff.
+///
+/// Used at DIDComm startup to block until the mediator DID document is
+/// reachable. This avoids the situation where the listener spins up against
+/// an unreachable mediator and the SDK reports the cryptic "No Mediator is
+/// configured for this Profile" error after silently dropping the underlying
+/// network failure.
+///
+/// Returns `Ok(())` on first successful resolution, or `Err` if the shutdown
+/// token is cancelled while waiting.
+///
+/// Backoff: 2s, 4s, 8s, … capped at 60s.
+pub async fn wait_for_did_resolution(
+    did: &str,
+    label: &str,
+    did_resolver: &DIDCacheClient,
+    shutdown: &CancellationToken,
+) -> Result<(), AppError> {
+    const INITIAL_BACKOFF_SECS: u64 = 2;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
+    let mut backoff_secs = INITIAL_BACKOFF_SECS;
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+        match did_resolver.resolve(did).await {
+            Ok(_) => {
+                if attempt == 1 {
+                    info!(did, label, "DID resolved");
+                } else {
+                    info!(did, label, attempt, "DID resolved after retries");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    did,
+                    label,
+                    attempt,
+                    error = %e,
+                    "DID not yet resolvable — retrying in {backoff_secs}s"
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+            _ = shutdown.cancelled() => {
+                return Err(AppError::Internal(format!(
+                    "shutdown signalled while waiting for {label} DID {did} to resolve"
+                )));
+            }
+        }
+
+        backoff_secs = (backoff_secs.saturating_mul(2)).min(MAX_BACKOFF_SECS);
+    }
+}
+
+/// Build a `TDKProfile` from an already-loaded [`ServiceIdentity`].
+///
+/// Differs from `build_tdk_profile` in two ways that matter.
+///
+/// The kids are **not** re-resolved — they come from the identity's generation
+/// records. That is what keeps the listener's profile and the secrets resolver
+/// keyed on the same fragments; resolving them independently in two places is
+/// exactly how they came to disagree.
+///
+/// The profile carries the key material of **every live generation**, not just
+/// the current one. Since inbound decryption matches the JWE recipient `kid`
+/// against the secrets resolver rather than against our DID document, a message
+/// encrypted to a retired key-agreement key still decrypts for as long as its
+/// generation is live. This vector is also the only durable source of that
+/// truth: the framework re-seeds its resolver from `profile.secrets()` on every
+/// reconnect.
+pub async fn build_tdk_profile_for_identity(
+    alias: &str,
+    identity: &ServiceIdentity,
+    peer_did: Option<&str>,
+) -> Result<TDKProfile, AppError> {
+    let mediator_did = discover_mediator(peer_did, Some(&identity.did_resolver)).await;
+
+    Ok(TDKProfile::new(
+        alias,
+        &identity.did,
+        mediator_did.as_deref(),
+        identity.secrets(),
+    ))
+}
+
+/// Discover the actual mediator DID from a peer's DID document.
+///
+/// Only follows one level: if the discovered endpoint is a DID, use it; if it
+/// is a URL (i.e. the peer *is* the mediator), use the peer DID directly.
+async fn discover_mediator(
+    peer_did: Option<&str>,
+    did_resolver: Option<&DIDCacheClient>,
+) -> Option<String> {
+    let peer = peer_did?;
+
+    match resolve_mediator_did(peer, did_resolver).await {
+        Some(mediator) if mediator.starts_with("did:") => Some(mediator),
+        Some(_url) => {
+            info!("peer {peer} is a mediator (endpoint is a URL) — using it directly");
+            Some(peer.to_string())
+        }
+        None => {
+            warn!(
+                "could not discover mediator from {peer} — \
+                 falling back to using it directly as mediator"
+            );
+            Some(peer.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PEER: &str = "did:webvh:Qm:peer.example";
+    const DOC_MED: &str = "did:web:mediator.doc.example";
+    const CFG_MED: &str = "did:web:mediator.config.example";
+
+    fn cfg(mediator: Option<&str>, prefer_tsp: bool) -> TransportFallback {
+        TransportFallback::from_config(mediator, prefer_tsp)
+    }
+
+    /// TSP > DIDComm > HTTPS: `resolve_transport` never has to run against a
+    /// live resolver here — [`decide_binding`]/`ObservedTransport` only need
+    /// the *shape* to be right — but the HTTPS binding itself is exercised via
+    /// `find_uri`'s equivalent in `resolve_transport`'s doc tests below where
+    /// a resolver is available. This covers the `PeerTransport::Https` arm of
+    /// the precedence ladder that HTTPS shares with TSP/DIDComm: document
+    /// wins over config, and HTTPS carries the endpoint URL as its "mediator"
+    /// slot.
+    #[test]
+    fn https_binding_from_document_wins_over_config_like_the_others() {
+        let https = decide_binding(
+            PEER,
+            Some((PeerTransport::Https, "https://peer.example/api".into())),
+            &cfg(Some(CFG_MED), true),
+        );
+        assert_eq!(
+            https,
+            Some((PeerTransport::Https, "https://peer.example/api".into()))
+        );
+    }
+
+    /// A `did:peer` whose only service is `TrustTaskHTTPS` at `endpoint`.
+    fn https_only_peer(endpoint: &str) -> String {
+        use affinidi_tdk::dids::{DID, KeyType, PeerKeyRole, PeerService, PeerServiceEndpoint};
+        let (did, _) = DID::generate_did_peer_with_services(
+            vec![(PeerKeyRole::Verification, KeyType::Ed25519)],
+            Some(vec![PeerService {
+                type_: "TrustTaskHTTPS".into(),
+                endpoint: PeerServiceEndpoint::Uri(endpoint.to_string()),
+                id: Some("#trust-tasks".into()),
+            }]),
+        )
+        .expect("generate did:peer");
+        did
+    }
+
+    /// The `TrustTaskHTTPS` endpoint comes from the peer's own document, so
+    /// one on loopback, a private or link-local range, or a special-use name
+    /// is treated as not advertised (and falls through to the configured
+    /// mediator, or to no route); a public `https` one is used.
+    #[tokio::test]
+    async fn a_peer_advertised_https_endpoint_must_be_public() {
+        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("resolver");
+
+        let public = https_only_peer("https://edge.example.com/api");
+        assert_eq!(
+            resolve_transport(&public, Some(&resolver)).await,
+            Some((PeerTransport::Https, "https://edge.example.com/api".into()))
+        );
+
+        for endpoint in [
+            "http://127.0.0.1:8534/api",
+            "https://127.0.0.1:8534/api",
+            "https://10.0.0.5/api",
+            "https://192.168.0.2/api",
+            "https://169.254.169.254/latest",
+            "https://localhost/api",
+            "http://edge.example.com/api",
+        ] {
+            let peer = https_only_peer(endpoint);
+            assert_eq!(
+                resolve_transport(&peer, Some(&resolver)).await,
+                None,
+                "{endpoint} must not be routed to"
+            );
+            assert_eq!(
+                resolve_send_binding(&peer, &cfg(None, false), Some(&resolver)).await,
+                None,
+                "{endpoint}: no route without a configured mediator"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_endpoint_warns_once_per_peer() {
+        assert!(first_refusal("did:example:refusal-once"));
+        assert!(!first_refusal("did:example:refusal-once"));
+        assert!(first_refusal("did:example:refusal-other"));
+    }
+
+    #[test]
+    fn https_observed_transport_round_trips() {
+        assert_eq!(
+            ObservedTransport::from(PeerTransport::Https),
+            ObservedTransport::Https
+        );
+    }
+
+    #[test]
+    fn tier1_document_transport_wins_over_config() {
+        // The document advertises a transport and config also has a mediator:
+        // the document is authoritative and its binding wins.
+        let tsp = decide_binding(
+            PEER,
+            Some((PeerTransport::Tsp, DOC_MED.into())),
+            &cfg(Some(CFG_MED), false),
+        );
+        assert_eq!(tsp, Some((PeerTransport::Tsp, DOC_MED.into())));
+
+        let didcomm = decide_binding(
+            PEER,
+            Some((PeerTransport::Didcomm, DOC_MED.into())),
+            &cfg(Some(CFG_MED), true),
+        );
+        assert_eq!(didcomm, Some((PeerTransport::Didcomm, DOC_MED.into())));
+    }
+
+    #[test]
+    fn tier2_config_fallback_used_when_document_silent() {
+        // Document advertises no messaging service; the configured mediator
+        // is used — this is the compatibility bridge for pre-transport DIDs.
+        // `prefer_tsp` picks the binding.
+        let tsp = decide_binding(PEER, None, &cfg(Some(CFG_MED), true));
+        assert_eq!(tsp, Some((PeerTransport::Tsp, CFG_MED.into())));
+
+        let didcomm = decide_binding(PEER, None, &cfg(Some(CFG_MED), false));
+        assert_eq!(didcomm, Some((PeerTransport::Didcomm, CFG_MED.into())));
+    }
+
+    #[test]
+    fn tier3_none_when_nothing_routes() {
+        // No document messaging service and no configured mediator: unroutable.
+        // The caller must not blindly attempt a send (the old blind-DIDComm
+        // behaviour this replaces).
+        let got = decide_binding(PEER, None, &cfg(None, false));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn from_config_empty_without_mediator() {
+        assert!(TransportFallback::from_config(None, true).binding.is_none());
+        let f = TransportFallback::from_config(Some(CFG_MED), true);
+        assert_eq!(f.binding, Some((PeerTransport::Tsp, CFG_MED.to_string())));
+        let f = TransportFallback::from_config(Some(CFG_MED), false);
+        assert_eq!(
+            f.binding,
+            Some((PeerTransport::Didcomm, CFG_MED.to_string()))
+        );
+    }
+
+    fn pset(didcomm: bool, tsp: bool) -> crate::server::identity::ProtocolSet {
+        crate::server::identity::ProtocolSet { didcomm, tsp }
+    }
+
+    #[test]
+    fn reconcile_enables_advertised_transport_config_left_off() {
+        // The bug: config is DIDComm-only but the DID advertises both, so the
+        // listener must carry TSP too or silently drop (and ack) inbound TSP.
+        let got = reconcile_listener_protocols(pset(true, false), Some(pset(true, true)), "did:x");
+        assert_eq!(got, pset(true, true));
+    }
+
+    #[test]
+    fn reconcile_keeps_config_transports_not_advertised() {
+        // Config runs both (e.g. a retiring generation's grace window); the
+        // document advertises only DIDComm. The union still carries TSP — don't
+        // drop a transport peers may still deliver on.
+        let got = reconcile_listener_protocols(pset(true, true), Some(pset(true, false)), "did:x");
+        assert_eq!(got, pset(true, true));
+    }
+
+    #[test]
+    fn reconcile_falls_back_to_config_when_document_unresolvable() {
+        let cfg = pset(true, false);
+        assert_eq!(reconcile_listener_protocols(cfg, None, "did:x"), cfg);
+    }
+
+    /// The listener boot and every identity rebuild share: the reconciled
+    /// transports map onto the framework's protocols, and a TSP listener always
+    /// carries the persistent relationship store (a rebuild that dropped it
+    /// would forget every TSP peer).
+    #[cfg(feature = "store-fjall")]
+    #[cfg(feature = "store-fjall")]
+    #[tokio::test]
+    async fn own_listener_config_carries_the_transports_and_tsp_relationship_store() {
+        use affinidi_messaging_didcomm_service::Protocols;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = crate::server::store::Store::open(&crate::server::config::StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        })
+        .await
+        .expect("open store");
+        let profile = || TDKProfile::new("node", "did:example:node", Some(CFG_MED), vec![]);
+
+        for (transports, protocols, persists) in [
+            (pset(true, true), Protocols::BOTH, true),
+            (pset(false, true), Protocols::TSP_ONLY, true),
+            (pset(true, false), Protocols::DIDCOMM_ONLY, false),
+            (pset(false, false), Protocols::DIDCOMM_ONLY, false),
+        ] {
+            let listener =
+                own_listener_config("node", profile(), transports, &store).expect("listener");
+            assert_eq!(listener.id, "node");
+            assert_eq!(listener.protocols, protocols, "{transports:?}");
+            assert_eq!(
+                listener.relationship_store.is_some(),
+                persists,
+                "{transports:?}: a TSP listener must persist its relationships"
+            );
+        }
+    }
+}

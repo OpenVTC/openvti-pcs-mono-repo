@@ -1,0 +1,2456 @@
+use ipnetwork::IpNetwork;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use vti_common::error::AppError;
+
+// Re-export shared config types
+pub use vti_common::config::{
+    AppStateConfig, AuditConfig, AuthConfig, LogConfig, LogFormat, MessagingConfig, StoreConfig,
+    VaultConfig,
+};
+// The `[secrets]` config shape + its seed-store backends live in the shared
+// `vti-secrets` crate (issue #501). Re-exported here so `AppConfig.secrets`
+// and every `crate::config::SecretsConfig` reference are unchanged.
+pub use vti_secrets::{SecretBackend, SecretsConfig};
+
+/// Typed, allowlisted tenant-config overlay for un-baked TEE (`BAKE_CONFIG=false`)
+/// deployments. See `docs/05-design-notes/tenant-config-allowlist.md`.
+pub mod tenant_overlay;
+pub use tenant_overlay::{
+    TenantCollectionOverlay, TenantConfigOverlay, TenantKmsOverlay, TenantMessagingOverlay,
+    TenantOverlayError,
+};
+
+/// The notifications this VTA holds for its principal (`notifications/*`,
+/// VTI-NTF-030 – 033, VTI-NTF-052): the acceptance policy this VTA states, and how
+/// long a lapsed or withdrawn notification is kept.
+///
+/// The stated policy (VTI-NTF-030): a notification is held only when the party
+/// that delivered it — the originator, or for a relay the last relayer
+/// (VTI-NTF-031) — is a party the principal holds a relationship with: an issuer
+/// of a membership credential held in the context, a party of a relationship
+/// credential held there, a party holding an ACL entry at this VTA, or a DID in
+/// [`accept_from`](Self::accept_from). Every other verified notification is
+/// declined, and answered with the same receipt (VTI-NTF-023).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct NotificationsConfig {
+    /// DIDs the principal has chosen to accept notifications from, beside the
+    /// relationships the policy counts on its own.
+    #[serde(default)]
+    pub accept_from: Vec<String>,
+    /// Accept a verified notification from any party. The principal's choice
+    /// "otherwise" of VTI-NTF-030; off by default.
+    #[serde(default)]
+    pub accept_any: bool,
+    /// Days a notification is kept after it lapsed (its `validUntil` passed) or
+    /// was withdrawn, before it is discarded (VTI-NTF-052; default 30). A
+    /// notification with no `validUntil` lapses only by withdrawal.
+    #[serde(default = "default_notifications_retain_lapsed_days")]
+    pub retain_lapsed_days: u32,
+}
+
+fn default_notifications_retain_lapsed_days() -> u32 {
+    30
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            accept_from: Vec::new(),
+            accept_any: false,
+            retain_lapsed_days: default_notifications_retain_lapsed_days(),
+        }
+    }
+}
+
+/// **Collection** of the principal's identifiers (`vta/collection/*`,
+/// VTI-NTF-080 – 098): the VTA holding the one mediator connection of each
+/// persona DID whose keys it holds and that no client has claimed.
+///
+/// Whether the VTA collects by default is **not** set here: it is a stored
+/// setting of each trust context, enabled unless a party with administrative
+/// authority over the context disables it with
+/// `vta/collection/settings/set/0.1` (VTI-NTF-094, VTI-NTF-095). The one switch
+/// the operator keeps is [`suspend`](Self::suspend), which can only stop
+/// collection (VTI-NTF-098).
+///
+/// The retired `collect_by_default` key (VTI-NTF-093, withdrawn) is no longer
+/// read: [`AppConfig::validate`] warns that it is ignored, whatever its value.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct CollectionConfig {
+    /// The operator's suspension of collection by default (VTI-NTF-098):
+    /// while `true` the VTA collects for no unclaimed persona DID in any
+    /// context, whatever each context's setting says, and changes no context's
+    /// setting. It can only stop collection — there is no operator key that
+    /// enables it for a context whose setting disables it. Read at boot;
+    /// engaging or lifting it is audited at the boot that applies it. Default
+    /// `false`.
+    #[serde(default)]
+    pub suspend: bool,
+    /// The most identifiers the VTA collects for at once (VTI-NTF-088; default
+    /// 64). One beyond it is listed as collected by nobody, reason `limit`.
+    #[serde(default = "default_collection_max_identifiers")]
+    pub max_identifiers: usize,
+    /// The longest claim the VTA grants, in seconds (VTI-NTF-082; default and
+    /// ceiling thirty days).
+    #[serde(default = "default_collection_max_claim_secs")]
+    pub max_claim_secs: u64,
+    /// The claim granted when a client asks for no duration (default 24 hours,
+    /// the length VTI-NTF-083 asks clients to request).
+    #[serde(default = "default_collection_default_claim_secs")]
+    pub default_claim_secs: u64,
+    /// The VTA's clock-skew tolerance in seconds (default 60): it resumes
+    /// collecting for an identifier no earlier than a claim's end plus this,
+    /// unless the claimant released it (VTI-NTF-084).
+    #[serde(default = "default_collection_clock_skew_secs")]
+    pub clock_skew_secs: u64,
+    /// Identifiers the VTA never collects for, beside the ones it already
+    /// excludes (its own DID, any DID holding an ACL entry, and the identities
+    /// provision-integration minted for another party). For an integration
+    /// provisioned before this setting existed, whose holder collects for it.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// The configuration key VTI-NTF-093's operator setting was read from. It is
+/// retired: [`AppConfig::validate`] names it in a warning of its own, and it
+/// has no effect whatever its value.
+pub const RETIRED_COLLECT_BY_DEFAULT_KEY: &str = "collection.collect_by_default";
+
+/// Thirty days: the ceiling VTI-NTF-082 puts on the maximum a VTA states.
+pub const COLLECTION_MAX_CLAIM_SECS_CEILING: u64 = 30 * 24 * 3600;
+
+fn default_collection_max_identifiers() -> usize {
+    64
+}
+
+fn default_collection_max_claim_secs() -> u64 {
+    COLLECTION_MAX_CLAIM_SECS_CEILING
+}
+
+fn default_collection_default_claim_secs() -> u64 {
+    24 * 3600
+}
+
+fn default_collection_clock_skew_secs() -> u64 {
+    60
+}
+
+impl Default for CollectionConfig {
+    fn default() -> Self {
+        Self {
+            suspend: false,
+            max_identifiers: default_collection_max_identifiers(),
+            max_claim_secs: default_collection_max_claim_secs(),
+            default_claim_secs: default_collection_default_claim_secs(),
+            clock_skew_secs: default_collection_clock_skew_secs(),
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl CollectionConfig {
+    /// The maximum claim the VTA states: the configured value, held to between
+    /// one minute and thirty days.
+    #[must_use]
+    pub fn stated_max_claim_secs(&self) -> u64 {
+        self.max_claim_secs
+            .clamp(60, COLLECTION_MAX_CLAIM_SECS_CEILING)
+    }
+}
+
+/// Being the principal's **witnessed party** (`vta/witness/{open,present,accept}`):
+/// the VTA's side of a `witness/session` whose documents the client carries.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct WitnessPartyConfig {
+    /// Seconds a session record lives after `vta/witness/open` (default 600, 60–3600).
+    ///
+    /// `vta/_shared/0.6/CONVENTIONS.md` §3 item 4: minutes, near the witness's own
+    /// session lifetime — a witness session is opened for one occasion, and a
+    /// record that outlived the witness's side would only ever answer
+    /// `sessionUnknown` later than it should.
+    #[serde(default = "default_witness_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+fn default_witness_session_ttl_secs() -> u64 {
+    600
+}
+
+impl Default for WitnessPartyConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_secs: default_witness_session_ttl_secs(),
+        }
+    }
+}
+
+impl WitnessPartyConfig {
+    fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !(60..=3600).contains(&self.session_ttl_secs) {
+            errors.push(format!(
+                "witness.session_ttl_secs = {} is outside 60–3600: a witness session is \
+                 opened for one occasion, and its record should expire in minutes",
+                self.session_ttl_secs
+            ));
+        }
+        errors
+    }
+}
+
+/// Policy Decision Point configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[non_exhaustive]
+pub struct PolicyConfig {
+    /// When true, every dispatched Trust Task is evaluated by the PDP before its
+    /// handler runs, and a non-`allow` decision rejects the task. **Default
+    /// false** — enforcement is opt-in so a deployment turns it on deliberately,
+    /// after authoring policies. The boot-installed baseline allows current
+    /// flows, so enabling this changes nothing until an operator adds a
+    /// restrictive, higher-priority policy (expand-before-contract).
+    #[serde(default)]
+    pub enforcement: bool,
+    /// Named approver sets a policy's `requireConsent` references by name; each
+    /// maps to the DIDs permitted to approve a task's execution. Empty by
+    /// default — a `requireConsent` naming an unknown or empty set can never be
+    /// satisfied (fail-closed), so operators define sets before using them.
+    ///
+    /// **Seed, not source of truth.** Approver sets now live on the declarative
+    /// approvals row in the policy keyspace, editable at runtime with
+    /// `pnm approvals approvers`. What is here is copied into that row the first
+    /// time the VTA boots without one, so an IaC-provisioned or freshly-restored
+    /// VTA comes up already configured. After that the row wins and this is
+    /// inert: re-reading it every boot would silently undo runtime edits on the
+    /// next restart, which is the trap the old reconcile-every-boot consent
+    /// policy had.
+    #[serde(default)]
+    pub approver_sets: std::collections::HashMap<String, Vec<String>>,
+    /// Declarative approval rules — which tasks require re-authentication or
+    /// consent before they run.
+    ///
+    /// Same seed-once semantics as [`PolicyConfig::approver_sets`]: this is the
+    /// bring-up path for a VTA with no declarative row yet, not a second place
+    /// the rules live. Read them back (and change them) with `pnm approvals`.
+    #[serde(default)]
+    pub approvals: Vec<vta_sdk::approvals::ApprovalRule>,
+    /// Refuse any task for which this build knows no payload schema.
+    ///
+    /// Payload validation always runs where a schema *is* known — that is not
+    /// optional and has no switch. This governs the other case: 62 of the tasks
+    /// this VTA dispatches have no published spec yet, and refusing them outright
+    /// would break them.
+    ///
+    /// So the default is to validate what we can, warn about what we cannot, and
+    /// proceed. An operator who would rather fail closed sets this — and should
+    /// understand what they are choosing: "no schema" currently means "no spec has
+    /// been written", not "this task is suspicious".
+    ///
+    /// **Default false.** It is a stopgap, and the honest fix is to write the
+    /// missing specs.
+    #[serde(default)]
+    pub require_payload_schema: bool,
+    /// Retired: `[[policy.require_consent]]`.
+    ///
+    /// Present only to **refuse** a config that still declares it. It was the
+    /// third way to tell a VTA an operation needs a human — alongside the
+    /// `[auth.step_up]` floors and [`Self::approvals`] — and it behaved
+    /// differently from both: reconciled from the file on every boot, so it
+    /// silently reverted anything an operator changed at runtime.
+    ///
+    /// [`Self::approvals`] replaces it and is seeded once, then owned by
+    /// `pnm approvals` — which is the difference that matters. A rule you can
+    /// change at runtime and read back is a rule you can diagnose.
+    ///
+    /// Absent (the only accepted state) deserializes to `()` via `default`.
+    #[serde(
+        default,
+        deserialize_with = "refuse_retired_require_consent",
+        skip_serializing
+    )]
+    pub require_consent: (),
+}
+
+/// Reject `tee.embed_in_did` with what replaced it. Reaching this function is
+/// the error: `#[serde(default)]` covers the key's absence.
+#[cfg(feature = "tee")]
+fn refuse_retired_embed_in_did<'de, D>(_: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(RETIRED_EMBED_IN_DID))
+}
+
+#[cfg(feature = "tee")]
+const RETIRED_EMBED_IN_DID: &str = "`tee.embed_in_did` has been retired. It added a `TeeAttestation` \
+     service to the VTA's DID document pointing at the REST route `/attestation/report`, which \
+     no longer exists: attestation is the `vta/attestation/{status,report,config-report}` Trust \
+     Tasks, reached over the transports the DID document already advertises, and a verifier \
+     learns a VTA is attested from `vta/attestation/status` or `trust-task-discovery`. Delete \
+     the key (or unset VTA_TEE_EMBED_IN_DID).";
+
+/// Reject `[[policy.require_consent]]` with the migration the operator needs.
+///
+/// Only ever called when the key is present — `#[serde(default)]` covers its
+/// absence — so reaching this function *is* the error.
+fn refuse_retired_require_consent<'de, D>(_: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "`[[policy.require_consent]]` has been retired. It was a third, separate \
+         way to say \"this task needs a human\", reconciled from the file on \
+         every boot — so it silently reverted anything changed at runtime. \
+         Declare the same requirements under `[policy.approvals]` (seeded once, \
+         then owned by `pnm approvals require <task-uri> --consent --set \
+         <approver-set>`), and delete this section. A VTA upgraded with the old \
+         section still present drops the rule it synthesized on first boot, so \
+         leaving it in place would enforce nothing regardless.",
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppConfig {
+    pub vta_did: Option<String>,
+    #[serde(alias = "community_name")]
+    pub vta_name: Option<String>,
+    pub public_url: Option<String>,
+    /// WebSocket URL of a remote DID resolver (network mode).
+    /// When set, the VTA uses the remote resolver instead of resolving locally.
+    /// Format: `ws://host:port/did/v1/ws`
+    /// In TEE mode, this points to the affinidi-did-resolver-cache-server
+    /// sidecar on the parent, bridged via vsock.
+    #[serde(default)]
+    pub resolver_url: Option<String>,
+    /// The DID-document cache (`[did_cache]`): how long a mutable DID's
+    /// document is trusted before it is resolved again. Bounded — see
+    /// [`vti_common::config::DidCacheConfig`].
+    #[serde(default)]
+    pub did_cache: vti_common::config::DidCacheConfig,
+    #[serde(default = "default_server_config")]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+    #[serde(default = "default_store_config")]
+    pub store: StoreConfig,
+    /// Optional Fjall memory tuning (`[fjall]`) — the block cache, write
+    /// buffer and journal-size caps that keep the store's memory use
+    /// inside a pod's Kubernetes limit. Every field defaults to `None`
+    /// (fjall's own defaults, unchanged). See
+    /// [`vti_common::config::FjallTuning`].
+    #[serde(default)]
+    pub fjall: vti_common::config::FjallTuning,
+    pub messaging: Option<MessagingConfig>,
+    /// Startup readiness gate + reconnect policy for the mediator DIDComm
+    /// connection: wait until the VTA's own DID resolves over the network before
+    /// initiating the outbound mediator handshake, then keep the connection up.
+    /// See `docs/02-vta/mediator-connection.md`.
+    #[serde(default)]
+    pub mediator_readiness: MediatorReadinessConfig,
+    #[serde(default)]
+    pub services: ServicesConfig,
+    /// How the DIDs this VTA creates are presented (`[dids]`): as `did:webvh`
+    /// or as their `did:scid:vh:1` DID, and whether a new log lists its
+    /// did:scid alias (VTI-VTA-034, VTI-VTA-035). A create request, or the VTC
+    /// it is made for, overrides both (VTI-VTA-036).
+    #[serde(default)]
+    pub dids: DidsConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
+    /// Vault lifecycle tuning (soft-delete grace window). Shared by the
+    /// password vault and the credential store.
+    #[serde(default)]
+    pub vault: VaultConfig,
+    /// Application-state store tuning (tombstone retention).
+    #[serde(default)]
+    pub app_state: AppStateConfig,
+    /// Policy Decision Point settings (enforcement toggle).
+    #[serde(default)]
+    pub policy: PolicyConfig,
+    /// The witnessed-party tasks (`vta/witness/*`): session lifetime and which
+    /// witnesses read a member presentation.
+    #[serde(default)]
+    pub witness: WitnessPartyConfig,
+    /// The notifications this VTA holds for its principal: its stated acceptance
+    /// policy and retention (VTI-NTF-030, VTI-NTF-052).
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+    /// Collection for the principal's identifiers (VTI-NTF-080 – 093): the
+    /// operator's "collection by default" setting, off unless enabled.
+    #[serde(default)]
+    pub collection: CollectionConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+    /// Verifier DIDs the holder **auto-consents** to when answering a
+    /// `credential-exchange/query` (`present_or_defer`'s `ConsentPolicy`). Any
+    /// verifier not listed **defers** to an out-of-band approval. Default empty
+    /// (defer everything) — a safe default; operators trust specific verifiers.
+    #[serde(default)]
+    pub trusted_presentation_verifiers: Vec<String>,
+    /// The VTA-managed holder identity (a registered derived `subject_did`) the
+    /// VTA **auto-accepts** offered credentials for: when set, an inbound
+    /// `credential-exchange/offer` is answered with a `request` binding the new
+    /// credential to this DID. Default unset — the VTA does **not** accept
+    /// unsolicited offers (a safe default; opt in by naming the holder identity).
+    #[serde(default)]
+    pub credential_holder_did: Option<String>,
+    #[cfg(feature = "tee")]
+    #[serde(default)]
+    pub tee: TeeConfig,
+    /// Non-TEE hardened configuration: derive the storage-encryption key and JWT signing
+    /// key from the master seed at boot, keeping both secrets out of
+    /// `config.toml`. See `hardened.rs` for details.
+    #[serde(default)]
+    pub hardened: HardenedConfig,
+    #[serde(skip)]
+    pub config_path: PathBuf,
+    /// Dotted paths of keys present in the parsed `config.toml` that no
+    /// field of `AppConfig` claims — typos, removed/renamed settings, or
+    /// keys meant for a different section. Collected by `load()` (via
+    /// `serde_ignored`) and surfaced as advisory warnings in `validate()`.
+    /// `#[serde(skip)]` so it never round-trips through the file itself.
+    /// We *warn* rather than reject (no `deny_unknown_fields`): an existing
+    /// deployment may legitimately carry a legacy/extra key, and a config
+    /// that boots fine today must keep booting (P0.9b).
+    #[serde(skip)]
+    pub unknown_keys: Vec<String>,
+    /// SHA-384 of the **effective** config, captured once after any runtime
+    /// tenant overlay is applied (un-baked/fleet mode). This is what the boot
+    /// attestation anchor and `POST /attestation/config-report` commit to — so
+    /// the attested digest reflects the tenant's real `key_arn` / mediator /
+    /// anchor / `public_url`, not the baked placeholder file. `None` until
+    /// [`AppConfig::compute_config_attestation_digest`] populates it (e.g. a
+    /// non-TEE build never sets it). `#[serde(skip)]` — never in the file.
+    #[serde(skip)]
+    pub effective_config_digest: Option<Vec<u8>>,
+    /// The canonical, secret-free JSON bytes the [`effective_config_digest`] is
+    /// the SHA-384 of — i.e. the exact input to the hash. Captured alongside the
+    /// digest at boot so `POST /attestation/config-report` can return it verbatim
+    /// to a verifier, who hashes it to reproduce (and thus authenticate) the
+    /// signed `user_data` WITHOUT re-deriving it from base+overlay (which cannot
+    /// reproduce the enclave-generated `vta_did`). `#[serde(skip)]` — never in
+    /// the file, and never inside the view of itself.
+    ///
+    /// [`effective_config_digest`]: Self::effective_config_digest
+    #[serde(skip)]
+    pub effective_config_view: Option<Vec<u8>>,
+}
+
+/// How the mediator self-readiness gate behaves when it times out.
+/// See [`MediatorReadinessConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessTimeoutPolicy {
+    /// Skip DIDComm startup this boot. `/health` stays live so the LB can turn
+    /// the target healthy; a later restart reconnects. Default.
+    #[default]
+    Skip,
+    /// Connect to the mediator anyway (best-effort), accepting that the
+    /// handshake may be rejected because the mediator can't resolve us yet.
+    Proceed,
+    /// Treat a DID that won't resolve as fatal and shut the process down.
+    Fail,
+}
+
+/// Startup readiness gate for the mediator DIDComm connection.
+///
+/// On cold start a VTA can initiate its outbound mediator handshake before its
+/// own DID document is resolvable — the DID host hasn't published it, or the
+/// load-balancer target fronting it isn't healthy yet. The mediator
+/// authenticates the VTA by resolving that DID itself, so it can't get the key
+/// to decrypt the authcrypt handshake and rejects it, producing a burst of 403s.
+///
+/// This gate makes the VTA wait until its own DID **fully resolves over the
+/// network** — through the configured resolver, so it exercises the same path
+/// the mediator takes — before connecting. Only network-resolved methods
+/// (`did:webvh`, `did:web`) are gated; a `did:key` VTA resolves from its own
+/// identifier with no network fetch and skips the wait.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct MediatorReadinessConfig {
+    /// Enable the gate. Default `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Base (initial) seconds between probe attempts. The actual wait uses
+    /// capped exponential backoff with full jitter — attempt `n` sleeps a
+    /// random duration in `[0, min(backoff_cap_secs, retry_secs * 2^n)]` — so a
+    /// fleet of VTAs coming up together doesn't probe in lock-step. Default 5.
+    #[serde(default = "default_readiness_retry_secs")]
+    pub retry_secs: u64,
+    /// Upper bound on the per-attempt backoff interval (the "cap" in the
+    /// exponential-backoff-with-jitter scheme). The jittered wait never exceeds
+    /// this. Default 30.
+    #[serde(default = "default_readiness_backoff_cap_secs")]
+    pub backoff_cap_secs: u64,
+    /// Maximum seconds the gate waits before applying `on_timeout`. The wait is
+    /// cancellable: a shutdown signal abandons it immediately rather than
+    /// holding the process open for the remainder. Default 300.
+    #[serde(default = "default_readiness_max_wait_secs")]
+    pub max_wait_secs: u64,
+    /// What to do when the gate times out. Default `skip`.
+    #[serde(default)]
+    pub on_timeout: ReadinessTimeoutPolicy,
+    /// Persistent reconnect supervisor. After the self-readiness gate passes,
+    /// the mediator connect can still fail — most commonly because the
+    /// mediator's *own* resolver holds a negative-cache entry for the VTA host
+    /// and can't fetch our DID document to complete the authcrypt handshake
+    /// (a `NetworkError{status_code:None}` → 403). That clears itself once the
+    /// mediator's negative cache expires, so rather than give up until the next
+    /// restart, keep retrying with capped exponential backoff + full jitter.
+    /// Each attempt first re-confirms the VTA can resolve its own DID, so the
+    /// mediator is never touched while the VTA is unresolvable. A successful
+    /// confirmation is trusted for 300 s rather than re-fetched per attempt
+    /// (see `vta_service::messaging::readiness::SELF_RESOLUTION_FRESH_FOR`); a
+    /// failed one is always re-checked.
+    ///
+    /// This also covers an *established* session whose inbound loop ends: the
+    /// supervisor tears the session down and reconnects, instead of leaving the
+    /// VTA silently deaf until an operator restarts it. Setting this `false`
+    /// restores the legacy single-shot behaviour (one attempt, then nothing
+    /// until the next restart). Default `true`.
+    #[serde(default = "default_true")]
+    pub reconnect: bool,
+    /// Upper bound on the reconnect backoff interval (seconds) — the "cap" for
+    /// the persistent-reconnect scheme. The jittered retry wait never exceeds
+    /// this. Larger than `backoff_cap_secs` (the gate's cap) because the
+    /// reconnect horizon must comfortably outlast a resolver negative-cache TTL,
+    /// which can be many minutes. Default 60.
+    #[serde(default = "default_reconnect_backoff_cap_secs")]
+    pub reconnect_backoff_cap_secs: u64,
+    /// Give up reconnecting after this many seconds of *continuous* failure.
+    /// `0` = never give up (retry forever at the capped, jittered interval).
+    /// A bounded retry rate is safe to run indefinitely and lets the VTA
+    /// self-heal without any operator restart.
+    ///
+    /// The clock is measured from the start of the current run of failures, not
+    /// from process start, and resets after any session that stayed up long
+    /// enough to count as healthy — so a VTA that ran for a week and then
+    /// dropped gets the full budget rather than one it exhausted days ago.
+    /// Default 0.
+    #[serde(default)]
+    pub reconnect_max_elapsed_secs: u64,
+}
+
+fn default_readiness_retry_secs() -> u64 {
+    5
+}
+
+fn default_reconnect_backoff_cap_secs() -> u64 {
+    60
+}
+
+fn default_readiness_backoff_cap_secs() -> u64 {
+    30
+}
+
+fn default_readiness_max_wait_secs() -> u64 {
+    300
+}
+
+impl Default for MediatorReadinessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retry_secs: default_readiness_retry_secs(),
+            backoff_cap_secs: default_readiness_backoff_cap_secs(),
+            max_wait_secs: default_readiness_max_wait_secs(),
+            on_timeout: ReadinessTimeoutPolicy::Skip,
+            reconnect: true,
+            reconnect_backoff_cap_secs: default_reconnect_backoff_cap_secs(),
+            reconnect_max_elapsed_secs: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServicesConfig {
+    #[serde(default = "default_true")]
+    pub rest: bool,
+    #[serde(default = "default_true")]
+    pub didcomm: bool,
+    /// WebAuthn-RP service — the dedicated `/auth/portal` +
+    /// `/auth/passkey-login/*` + `/did/verification-methods/passkey/*`
+    /// surface. Distinct from `rest` so an operator can run a
+    /// REST-less, browser-facing-only VTA (e.g. one that only
+    /// publishes WebAuthn flows for end-users plus DIDComm for
+    /// programmatic peers). Defaults to `false` because legacy
+    /// installs don't have this surface enabled; new installs that
+    /// want browser-side passkey login flip this on explicitly.
+    #[serde(default)]
+    pub webauthn: bool,
+    /// Trust Spanning Protocol transport. Additive and `false` by
+    /// default while TSP rolls out gated — DIDComm stays the default
+    /// transport. When enabled, the VTA advertises a `#tsp`
+    /// `TSPTransport` service (pointing at the same mediator as
+    /// DIDComm). See `docs/05-design-notes/tsp-enablement.md`.
+    #[serde(default)]
+    pub tsp: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `[dids]` — how the DIDs this VTA creates are presented.
+///
+/// Every new DID is a `did:webvh` log (VTI-KEY-165). These choose the identity
+/// it is given out as and whether its first entry lists the did:scid alias. A
+/// create request states its own, and a VTC states the community's in its
+/// requests; this is what applies when neither does (VTI-VTA-036).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DidsConfig {
+    /// `webvh` (the default) or `scid` (VTI-VTA-034).
+    #[serde(default)]
+    pub default_did_method: vta_sdk::did_scid::DidMethod,
+    /// Whether a new `did:webvh` log lists its `did:scid:vh:1` DID URL in
+    /// `alsoKnownAs`, linking the two forms as one subject (VTI-KEY-164,
+    /// VTI-KEY-166, VTI-VTA-035). Default `true`. A DID presented as did:scid
+    /// always lists it, whatever this says.
+    #[serde(default = "default_true")]
+    pub scid_also_known_as: bool,
+    /// Whether this VTA creates `did:webs` persona, relationship and
+    /// integration DIDs. Default `false`: the integration is alpha
+    /// (`docs/05-design-notes/did-webs-in-the-vta.md`). Off stops creation
+    /// only; a `did:webs` this VTA already holds keeps working, so turning it
+    /// off never strands one.
+    #[serde(default)]
+    pub webs_enabled: bool,
+    /// Whether `vta/webs/dids/create/0.2` creates a `did:webs` **service** DID
+    /// — the durable identity of a node or a service, at key assurance level 1.
+    /// Default `false`: a service `did:webs` is optional and alpha, peers that
+    /// have not declared `did:webs` resolution may not verify one, and the
+    /// specification has it enabled separately from `webs_enabled`
+    /// (`vta/webs/_shared/0.2` CONVENTIONS.md §1.1). Needs `webs_enabled` as
+    /// well; off refuses only new ones (`serviceDidNotPermitted`), never a
+    /// service DID already created.
+    #[serde(default)]
+    pub webs_service_dids: bool,
+}
+
+impl Default for DidsConfig {
+    fn default() -> Self {
+        Self {
+            default_did_method: vta_sdk::did_scid::DidMethod::default(),
+            scid_also_known_as: true,
+            webs_enabled: false,
+            webs_service_dids: false,
+        }
+    }
+}
+
+impl Default for ServicesConfig {
+    fn default() -> Self {
+        Self {
+            rest: true,
+            didcomm: true,
+            webauthn: false,
+            tsp: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct ServerConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    /// Origins permitted to make cross-origin requests against the
+    /// VTA's REST surface. Empty (default) disables the CORS layer
+    /// entirely — a fresh-install VTA refuses cross-origin requests
+    /// the way the legacy behaviour did. Production deployments
+    /// typically leave this empty (programmatic clients send the
+    /// bearer token directly and don't need browser-side CORS); the
+    /// demo at `examples/vta-auth-demo/` sets it to
+    /// `["http://localhost:8000"]` so an operator can drive the
+    /// auth flow from a browser running on a different localhost
+    /// port.
+    ///
+    /// Each entry is matched exactly against the request's `Origin`
+    /// header. Wildcards are not accepted — bearer credentials must
+    /// not flow to arbitrary origins.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "vti_common::rate_limit::deserialize_trusted_proxy_cidrs"
+    )]
+    pub trust_xff_cidrs: Vec<IpNetwork>,
+    /// Token replenishment interval for the **auth** rate limiter, in
+    /// **seconds per token** — not requests per second. One new token every
+    /// `rate_limit_interval_secs`, so *lower is more permissive*. Default: 5.
+    ///
+    /// The auth limiter covers the unauthenticated endpoints that do real
+    /// crypto on caller input: auth challenge / authenticate / refresh,
+    /// passkey login, `/bootstrap/request`, the TEE attestation reports — and,
+    /// as a separate bucket at the same quota, the token-gated
+    /// `/backup/blob/*` branch. The public DID-log routes are *not* on it; see
+    /// `did_log_rate_limit_interval_secs`.
+    ///
+    /// With the default `rate_limit_burst = 10`: 10 rapid requests, then one
+    /// every 5 s. Local dev that fires a bootstrap flow in a burst wants
+    /// `rate_limit_interval_secs = 1` and a larger `rate_limit_burst`.
+    ///
+    /// Zero is clamped to 1 at router build (`routes::rate_limit`); the
+    /// limiter cannot be turned off from config.
+    #[serde(default = "default_rate_limit_interval_secs")]
+    pub rate_limit_interval_secs: u64,
+    /// Burst capacity for the auth rate limiter — how many requests can
+    /// arrive back-to-back before throttling starts. Default: 10. Zero is
+    /// clamped to 1.
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+    /// Token replenishment interval for the **DID-log** rate limiter, in
+    /// **seconds per token** — not requests per second. One new token every
+    /// `did_log_rate_limit_interval_secs`, so *lower is more permissive*.
+    /// Default: 1.
+    ///
+    /// The DID-log limiter covers the public, unauthenticated `did.jsonl`
+    /// routes (`/.well-known/did.jsonl`, the canonical pathful
+    /// `/<path>/did.jsonl` catch-all, `/did/{did}/log`, and under TEE
+    /// `/attestation/did-log`). It is a separate per-IP bucket from the auth
+    /// limiter because resolving the VTA's DID is the first step of every
+    /// client command, the mediator and the VTA's own readiness gate fetch the
+    /// log too, and serving it is a cheap store read with no crypto — sharing
+    /// the auth budget made a few CLI commands in a row return 429.
+    ///
+    /// With the default `did_log_rate_limit_burst = 60`: 60 rapid fetches,
+    /// then one per second. Zero is clamped to 1.
+    #[serde(default = "default_did_log_rate_limit_interval_secs")]
+    pub did_log_rate_limit_interval_secs: u64,
+    /// Burst capacity for the DID-log rate limiter — how many `did.jsonl`
+    /// fetches can arrive back-to-back from one client IP before throttling
+    /// starts. Default: 60. Zero is clamped to 1.
+    #[serde(default = "default_did_log_rate_limit_burst")]
+    pub did_log_rate_limit_burst: u32,
+    /// Per-appliance budget for **authenticated** Trust Tasks, in
+    /// **operations per second** (unlike the per-IP intervals above, this one
+    /// is a rate). Absent (the default) means no appliance budget: the work is
+    /// bounded only by each client's share and the unauthenticated budget,
+    /// whose right sum depends on the hardware, so sizing it is the
+    /// operator's.
+    ///
+    /// One token bucket for the whole VTA, shared by REST, DIDComm and TSP, so
+    /// the sum of every client's work is bounded; each client's share is
+    /// `operation_rate_limit_per_subject_per_sec` (VTI-TRN-029). A task is
+    /// charged its weight (`trust_tasks::operation_budget`): most cost 1, a
+    /// vault release 2, a DID create or delete 10. Work past the budget is
+    /// refused before it runs — `429` with `x-rate-limit-source: vta` over
+    /// REST, a retryable `unavailable` over DIDComm and TSP — so an overloaded
+    /// appliance sheds load instead of failing health checks and restarting.
+    ///
+    /// Not a runtime `config/patch` key: a TEE VTA would lose a patch on its
+    /// next restart. Set it in the config, or in the tenant overlay's `server`
+    /// block, which the parent delivers on every boot. Must be at least 1.
+    #[serde(default)]
+    pub operation_rate_limit_per_sec: Option<u32>,
+    /// Burst for `operation_rate_limit_per_sec`: how many operations' worth can
+    /// arrive back-to-back before the rate applies. Absent means one second's
+    /// worth. Raised to the heaviest task's weight if lower, so every task can
+    /// be served on an idle appliance. Ignored without a rate.
+    #[serde(default)]
+    pub operation_rate_limit_burst: Option<u32>,
+    /// Per-client share of the operation budget, in operations per second:
+    /// how much one client with standing (a session, or an ACL entry) may use,
+    /// keyed by its DID, so it cannot take what the others need (VTI-TRN-029).
+    /// Charged before the appliance budget. Absent means
+    /// [`DEFAULT_OPERATION_RATE_LIMIT_PER_SUBJECT_PER_SEC`]: VTI-TRN-029 is a
+    /// MUST, so there is no unbounded setting, and a VTA that is never sized
+    /// still bounds each client (read it through
+    /// [`ServerConfig::operation_per_subject_per_sec`]). The burst is one
+    /// second's worth, never below 10. Must be at least 1.
+    #[serde(default)]
+    pub operation_rate_limit_per_subject_per_sec: Option<u32>,
+    /// Budget for DIDComm / TSP senders without standing — the login steps,
+    /// public tasks, credential-exchange counterparties, approvers — in
+    /// operations per second, all together and apart from the clients' budget,
+    /// so strangers cannot spend it (VTI-TRN-029). Anonymous REST requests are
+    /// bounded per IP instead. Absent means
+    /// [`DEFAULT_OPERATION_RATE_LIMIT_UNAUTHENTICATED_PER_SEC`], for the reason
+    /// the per-client share gives (read it through
+    /// [`ServerConfig::operation_unauthenticated_per_sec`]). Must be at least 1.
+    #[serde(default)]
+    pub operation_rate_limit_unauthenticated_per_sec: Option<u32>,
+    /// Retired: `trust_xff`. Present only to **refuse** a config that still
+    /// declares it — replaced by `trust_xff_cidrs`, an explicit trusted-proxy
+    /// CIDR allowlist. Absent (the only accepted state) deserializes to `()`
+    /// via `default`.
+    #[serde(
+        default,
+        deserialize_with = "refuse_retired_trust_xff",
+        skip_serializing
+    )]
+    pub trust_xff: (),
+}
+
+/// Reject `trust_xff` with the migration the operator needs.
+///
+/// Only ever called when the key is present — `#[serde(default)]` covers its
+/// absence — so reaching this function *is* the error.
+fn refuse_retired_trust_xff<'de, D>(_: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "`trust_xff` has been retired. Replace it with `trust_xff_cidrs = [\"<cidr>\", ...]` \
+         — the addresses of the reverse proxies actually in front of this VTA. A `true` \
+         config silently keying the rate limiter on the socket peer after this change \
+         collapses every client behind that proxy into one shared bucket.",
+    ))
+}
+
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_port() -> u16 {
+    8100
+}
+
+fn default_rate_limit_interval_secs() -> u64 {
+    5
+}
+
+fn default_rate_limit_burst() -> u32 {
+    10
+}
+
+fn default_did_log_rate_limit_interval_secs() -> u64 {
+    1
+}
+
+fn default_did_log_rate_limit_burst() -> u32 {
+    60
+}
+
+fn default_server_config() -> ServerConfig {
+    ServerConfig::default()
+}
+
+fn default_store_config() -> StoreConfig {
+    StoreConfig {
+        data_dir: PathBuf::from("data/vta"),
+    }
+}
+
+/// The per-client operation budget a VTA applies when
+/// `[server] operation_rate_limit_per_subject_per_sec` is absent (VTI-TRN-029).
+/// Generous on purpose: it stops one runaway client, not ordinary heavy use; an
+/// operator sizing an appliance sets a tighter one.
+pub const DEFAULT_OPERATION_RATE_LIMIT_PER_SUBJECT_PER_SEC: u32 = 100;
+
+/// The budget for DIDComm / TSP senders without standing when
+/// `[server] operation_rate_limit_unauthenticated_per_sec` is absent
+/// (VTI-TRN-029). Room for logins, approvers and public tasks, not a flood.
+pub const DEFAULT_OPERATION_RATE_LIMIT_UNAUTHENTICATED_PER_SEC: u32 = 50;
+
+impl ServerConfig {
+    /// Each client's share of the operation budget, in operations per second:
+    /// the configured value, or the default. Never unbounded (VTI-TRN-029).
+    pub fn operation_per_subject_per_sec(&self) -> u32 {
+        self.operation_rate_limit_per_subject_per_sec
+            .unwrap_or(DEFAULT_OPERATION_RATE_LIMIT_PER_SUBJECT_PER_SEC)
+    }
+
+    /// The budget for DIDComm / TSP senders without standing, in operations
+    /// per second: the configured value, or the default. Never unbounded
+    /// (VTI-TRN-029).
+    pub fn operation_unauthenticated_per_sec(&self) -> u32 {
+        self.operation_rate_limit_unauthenticated_per_sec
+            .unwrap_or(DEFAULT_OPERATION_RATE_LIMIT_UNAUTHENTICATED_PER_SEC)
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            cors_origins: Vec::new(),
+            trust_xff_cidrs: Vec::new(),
+            rate_limit_interval_secs: default_rate_limit_interval_secs(),
+            rate_limit_burst: default_rate_limit_burst(),
+            did_log_rate_limit_interval_secs: default_did_log_rate_limit_interval_secs(),
+            did_log_rate_limit_burst: default_did_log_rate_limit_burst(),
+            operation_rate_limit_per_sec: None,
+            operation_rate_limit_burst: None,
+            operation_rate_limit_per_subject_per_sec: None,
+            operation_rate_limit_unauthenticated_per_sec: None,
+            trust_xff: (),
+        }
+    }
+}
+
+/// TEE attestation configuration.
+#[cfg(feature = "tee")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TeeConfig {
+    /// Enforcement mode: required, optional, disabled, simulated.
+    #[serde(default)]
+    pub mode: TeeMode,
+    /// Retired: `tee.embed_in_did`.
+    ///
+    /// Present only to **refuse** a config that still sets it. It added a
+    /// `TeeAttestation` service to the VTA's DID document pointing at the REST
+    /// route `/attestation/report`, which is gone: attestation is the
+    /// `vta/attestation/*` Trust Tasks, reached over the transports the
+    /// document already advertises. Ignoring the key would leave an operator
+    /// believing the document still says something it no longer does.
+    ///
+    /// Absent (the only accepted state) deserializes to `()` via `default`.
+    #[serde(
+        default,
+        deserialize_with = "refuse_retired_embed_in_did",
+        skip_serializing
+    )]
+    pub embed_in_did: (),
+    /// Attestation report cache TTL in seconds (generation is expensive).
+    #[serde(default = "default_attestation_cache_ttl")]
+    pub attestation_cache_ttl: u64,
+    /// KMS-based secret bootstrap configuration (for Nitro Enclaves).
+    #[serde(default)]
+    pub kms: Option<TeeKmsConfig>,
+    /// Storage encryption salt (change to invalidate all stored data).
+    /// WARNING: Changing this value invalidates all encrypted storage.
+    #[serde(default = "default_storage_key_salt")]
+    pub storage_key_salt: String,
+    /// Restrict which DID methods are accepted for ACL entries and authentication.
+    /// When set, only DIDs matching these prefixes are allowed (e.g., `["did:key", "did:webvh"]`).
+    /// When `None`, all DID methods are accepted (less secure with parent-side resolver).
+    #[serde(default)]
+    pub allowed_did_methods: Option<Vec<String>>,
+    /// AWS account IDs this image's tenant overlay may hand a `tee.kms.key_arn`
+    /// from (un-baked fleet mode — see `crate::tenant_overlay` and
+    /// `docs/05-design-notes/tenant-config-allowlist.md` §3.5).
+    ///
+    /// Baked, PCR0-committed — the parent cannot extend this list at runtime.
+    /// **Empty means "no tenant overlay `key_arn` accepted"** (fail closed, not
+    /// "allow all"). Irrelevant for `BAKE_CONFIG=true`/self-host builds, which
+    /// never accept an overlay.
+    #[serde(default)]
+    pub allowed_kms_accounts: Vec<String>,
+    /// Ed25519 `did:key` that alone may claim first-boot admin via Mode B
+    /// (`POST /bootstrap/request`). Authorizes the claimant only — it is never
+    /// an admin identity. Unset means no Mode B claim is accepted. Baked
+    /// (self-host, PCR0-committed) or delivered by the tenant overlay (fleet,
+    /// parent-supplied); either way it is in the attested config digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_claim_did: Option<String>,
+}
+
+/// KMS configuration for TEE secret bootstrap.
+#[cfg(feature = "tee")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct TeeKmsConfig {
+    /// AWS region for KMS calls.
+    pub region: String,
+    /// KMS key ARN used to encrypt/decrypt VTA secrets.
+    pub key_arn: String,
+    /// Template for auto-generating a did:webvh identity on first boot.
+    ///
+    /// Use `{SCID}` as a placeholder for the self-certifying identifier:
+    ///   `did:webvh:{SCID}:example.com:vta`
+    ///
+    /// On first boot, the VTA derives keys from the bootstrapped seed,
+    /// creates the DID, and persists it in the encrypted store.
+    ///
+    /// Ignored if `vta_did` is already set in config or the store.
+    #[serde(default)]
+    pub vta_did_template: Option<String>,
+    /// Mint a key-role `did:webs` as this VTA's identity on first boot instead
+    /// of a `did:webvh` (alpha; VTI-KEY-001, design note did-webs-in-the-vta
+    /// §4, S8). The enclave derives the identity from its bootstrapped seed —
+    /// the same create `vta setup`'s `create_webs` runs — records it
+    /// unpublished, and registers it at its host on its own authority before
+    /// messaging starts. Needs `[dids] webs_enabled = true` and an enclave
+    /// built with the `webs` feature; exclusive with `vta_did_template`.
+    ///
+    /// Absent (the default) leaves first boot as it was. Ignored, like the
+    /// template, once the store holds an identity or config sets `vta_did`.
+    /// Not overlay-settable: a fleet tenant overlay cannot ask for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vta_did_webs: Option<TeeWebsIdentityConfig>,
+    /// Context ID used for the auto-bootstrapped admin (default: "default").
+    ///
+    /// On first boot, the VTA auto-creates this context and grants the
+    /// admin_did super-admin access.
+    #[serde(default = "default_admin_context_id")]
+    pub admin_context_id: String,
+    /// DID to grant super-admin access on first boot.
+    ///
+    /// The operator generates a `did:key` locally (e.g., via `pnm setup`),
+    /// sets it here before building the EIF, and connects to the VTA using
+    /// the corresponding private key after boot. The private key never
+    /// touches the TEE or the parent instance.
+    ///
+    /// If not set, the VTA auto-generates a random `did:key` and stores
+    /// the credential in the bootstrap keyspace (retrievable via REST).
+    #[serde(default)]
+    pub admin_did: Option<String>,
+    /// Allow falling back to non-attested KMS calls when the attested path
+    /// fails on real Nitro hardware (`/dev/nsm` present).
+    ///
+    /// **Default: false.** On production hardware a failure to use the
+    /// Nitro `Recipient` parameter must be terminal — otherwise a transient
+    /// NSM hiccup silently downgrades to an IAM-only KMS call, bypassing
+    /// the key policy's PCR conditions (PCR0/PCR8). The fallback path stays
+    /// available for simulated mode (no `/dev/nsm`), which uses the direct
+    /// KMS call regardless of this flag.
+    ///
+    /// Set to `true` only as a break-glass measure during incident response,
+    /// understanding that decrypts will then only require the enclave's IAM
+    /// role, not an attested PCR match.
+    #[serde(default)]
+    pub allow_unattested_fallback: bool,
+    /// Allow initializing the JWT key fingerprint when none is stored.
+    ///
+    /// **Default: false.** A missing fingerprint on a subsequent boot is
+    /// suspicious — the only legitimate cause is first boot after upgrading
+    /// from a pre-fingerprint VTA version. Left unguarded, an attacker with
+    /// write access to the bootstrap keyspace (parent-host / vsock proxy
+    /// compromise) could delete the fingerprint and then substitute a
+    /// rogue key that the enclave would accept as canonical on the next
+    /// restart.
+    ///
+    /// Operators migrating from a pre-fingerprint VTA: set `true`, boot
+    /// once to store the fingerprint, then set back to `false`.
+    #[serde(default)]
+    pub allow_fingerprint_init: bool,
+    /// Allow auto-clearing existing bootstrap ciphertexts after a KMS decrypt
+    /// failure on a subsequent boot.
+    ///
+    /// **Default: false.** Every KMS failure class, including ACCESS_DENIED
+    /// from a wrong or tampered image whose PCRs do not match, preserves the
+    /// VTA's identity and refuses to start. Set to `true` only when you have
+    /// diagnosed the cause and explicitly intend to reset the VTA to a fresh
+    /// first-boot state.
+    ///
+    /// Necessary but not sufficient. A transient class (KMS_INTERNAL,
+    /// NETWORK) means KMS never answered, so the ciphertexts have not been
+    /// *shown* to be undecryptable — the reset is refused even with this
+    /// flag, because destroying a recoverable identity on "no answer" would
+    /// be the same denial of service by another route.
+    ///
+    /// This is also **not a full reset**: the seed it discards is what every
+    /// other keyspace is encrypted under, and those rows will not decrypt
+    /// under the new one. It only produces a bootable VTA on a store holding
+    /// nothing but the bootstrap rows; otherwise wipe the data volume
+    /// instead. See `deploy/nitro/README.md`.
+    #[serde(default)]
+    pub allow_kms_reinit: bool,
+    /// Allow establishing the TEE integrity-manifest baseline when none is
+    /// stored (P0.2a anti-rollback anchor).
+    ///
+    /// **Default: false.** The integrity manifest is the MAC'd snapshot of the
+    /// rollback-protected singletons (carve-out sentinel, ACL root, JWT
+    /// fingerprint, key counters). A missing manifest on a configured VTA is
+    /// indistinguishable from a parent-deleted one, so the enclave refuses to
+    /// boot rather than silently baseline whatever (possibly rolled-back) state
+    /// the parent presents.
+    ///
+    /// Operators on first boot, or migrating from a pre-manifest VTA: set
+    /// `true`, boot once to establish the baseline, then set back to `false`.
+    /// Mirrors [`Self::allow_fingerprint_init`].
+    #[serde(default)]
+    pub allow_anchor_init: bool,
+    /// External anti-rollback counter (P0.2b). When set, the integrity manifest
+    /// version is pinned to a DynamoDB single-item counter the parent can't roll
+    /// back, upgrading detection from "deletion / inconsistent tamper" (P0.2a)
+    /// to "consistent storage rollback". Absent → manifest-only (P0.2a).
+    #[serde(default)]
+    pub anchor: Option<TeeAnchorConfig>,
+    /// Break-glass: boot even when the external anchor counter can't be reached
+    /// or disagrees with the local manifest (P0.2b).
+    ///
+    /// **Default: false.** If the parent denies egress to the counter the
+    /// enclave fails closed (a DoS, not an integrity breach). Setting this true
+    /// lets it boot manifest-only when the counter is unreachable, or re-anchor
+    /// the counter to the MAC-trusted local manifest when they diverge — for
+    /// incident recovery only. Safe to leave as a config flag because the parent
+    /// cannot flip it at runtime: a baked config commits it to PCR0, and an
+    /// un-baked (fleet) config cannot carry it — the typed tenant overlay
+    /// (`tenant_overlay`, `deny_unknown_fields`) has no `allow_*` field, so there
+    /// is no channel for the parent to set it.
+    #[serde(default)]
+    pub allow_unanchored: bool,
+}
+
+/// The `did:webs` a TEE VTA mints as its identity on first boot
+/// ([`TeeKmsConfig::vta_did_webs`]): the same inputs as `vta setup`'s
+/// `vta_did` kind `create_webs`. The DID is
+/// `did:webs:{domain}[:{path}]:{AID}`.
+#[cfg(feature = "tee")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct TeeWebsIdentityConfig {
+    /// The did-hosting server's DID (`did:webvh:…`). Its operator must allow
+    /// self-registration on `domain` (`[[hosting.webs_self_register]]`). The
+    /// enclave's egress must reach its Trust-Task HTTPS endpoint.
+    pub server_did: String,
+    /// The domain the host serves the DID on, e.g. `did.example.com`
+    /// (`host:port` for a non-default port).
+    pub domain: String,
+    /// Slot path before the AID, `/`-separated (`nodes`); absent puts it at
+    /// the top of the domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The id the VTA registers the server under. Default `vta-host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+}
+
+/// External anti-rollback anchor configuration (P0.2b counter + P0.2c writer).
+#[cfg(feature = "tee")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct TeeAnchorConfig {
+    /// DynamoDB table holding the single-item monotonic version counter (one
+    /// item per VTA DID). The region is reused from [`TeeKmsConfig::region`].
+    pub table_name: String,
+    /// KMS-attestation-gated writer credential (P0.2c — root-on-parent
+    /// resistance). Base64 of the `vta-anchor-writer` IAM credentials
+    /// (`{"access_key_id","secret_access_key"}`) sealed under the PCR-gated KMS
+    /// key ([`TeeKmsConfig::key_arn`]): only the genuine enclave image can
+    /// `kms:Decrypt` it, so a root-on-parent attacker — who holds the
+    /// *instance-role* credentials but cannot produce a valid attestation —
+    /// cannot obtain the only principal allowed to write the counter (the
+    /// instance role is explicitly denied on the table; see the operator
+    /// runbook). Unset → P0.2b: the counter is written with the instance role
+    /// (resists storage/backup rollback, **not** root-on-parent).
+    #[serde(default)]
+    pub writer_credential_ciphertext: Option<String>,
+}
+
+// KMS ciphertexts (seed, JWT key, fingerprint) are stored as K/V entries
+// in the "bootstrap" keyspace — no file paths needed.
+
+#[cfg(feature = "tee")]
+fn default_admin_context_id() -> String {
+    "default".to_string()
+}
+
+#[cfg(feature = "tee")]
+fn default_attestation_cache_ttl() -> u64 {
+    300
+}
+
+#[cfg(feature = "tee")]
+fn default_storage_key_salt() -> String {
+    "vta-tee-storage-v1".to_string()
+}
+
+/// Fallback salt for configs that predate per-VTA salt generation.
+///
+/// **Do not change this value.** It is not a "default" in the sense of a
+/// recommended setting — it is the compatibility constant that keeps any VTA
+/// whose `config.toml` omits `storage_key_salt` able to re-derive its own
+/// storage key. Changing it makes those deployments unable to read their store.
+///
+/// New installs do not use it: `vta setup` mints a random per-VTA salt
+/// (`hardened_bootstrap::generate_storage_key_salt`) and writes it into
+/// `config.toml`.
+fn default_hardened_storage_key_salt() -> String {
+    "vta-storage-v1".to_string()
+}
+
+/// Non-TEE hardened configuration: derive storage-encryption and JWT signing keys from
+/// the master seed, so neither secret lives in `config.toml` or on disk.
+///
+/// This PoC mirrors the key-derivation that `vta-enclave` performs inside the
+/// Nitro enclave (see `tee::kms_bootstrap`), without requiring KMS or an
+/// enclave. The seed must reside in a real secret-store backend — the
+/// plaintext file fallback (`PlaintextSeedStore`) defeats the protection.
+///
+/// Enable in `config.toml`:
+/// ```toml
+/// [hardened]
+/// enabled = true
+/// storage_key_salt = "my-unique-per-vta-salt"
+/// ```
+///
+/// **Enabling on an existing VTA is handled automatically.** The first boot
+/// after setting this flag converts the existing plaintext rows to the
+/// encrypted format before anything reads them
+/// (`hardened_bootstrap::migrate_store_to_encrypted`). The pass is idempotent
+/// and crash-safe, so it costs one prefix scan per keyspace on later boots and
+/// an interrupted run is finished by the next one.
+///
+/// It has to be automatic: the store's decrypt path is deliberately
+/// fail-closed with no plaintext fallback, so a VTA that started reading an
+/// unconverted store would fail on every pre-existing row — including its own
+/// ACL entries. Take a backup first regardless; the conversion rewrites every
+/// row in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardenedConfig {
+    /// When `true`, enables hardened non-TEE configuration:
+    /// - All 23 fjall keyspaces are encrypted with AES-256-GCM (`VAE1` format,
+    ///   same as TEE mode). The storage-encryption key is derived from the
+    ///   master seed via HKDF.
+    /// - The JWT signing key is generated randomly on first boot, AES-GCM
+    ///   sealed under the storage key, and stored in the `bootstrap` keyspace.
+    ///   It is injected into memory only — `[auth] jwt_signing_key` in
+    ///   `config.toml` is absent and ignored.
+    ///
+    /// Default `false` (standard non-TEE behaviour — plaintext fjall, JWT key
+    /// in `config.toml`).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Salt for the HKDF storage-key derivation.
+    ///
+    /// **Changing this invalidates all encrypted data.** Set it once at
+    /// initial setup and treat it as permanent. Ignored when
+    /// `enabled = false`.
+    #[serde(default = "default_hardened_storage_key_salt")]
+    pub storage_key_salt: String,
+}
+
+impl Default for HardenedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            storage_key_salt: default_hardened_storage_key_salt(),
+        }
+    }
+}
+
+#[cfg(feature = "tee")]
+impl Default for TeeConfig {
+    fn default() -> Self {
+        Self {
+            mode: TeeMode::default(),
+            embed_in_did: (),
+            attestation_cache_ttl: default_attestation_cache_ttl(),
+            kms: None,
+            storage_key_salt: default_storage_key_salt(),
+            allowed_did_methods: None,
+            allowed_kms_accounts: Vec::new(),
+            bootstrap_claim_did: None,
+        }
+    }
+}
+
+/// TEE enforcement mode.
+#[cfg(feature = "tee")]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TeeMode {
+    /// TEE hardware required — VTA refuses to start without it.
+    Required,
+    /// TEE used if available, continues without it.
+    #[default]
+    Optional,
+    /// Simulated TEE for development/testing (NOT for production).
+    Simulated,
+}
+
+impl AppConfig {
+    /// Compute the SHA-384 digest of the **effective** config for attestation.
+    ///
+    /// Serializes a canonical, secret-free view of this config (RFC 8785
+    /// canonical JSON: members sorted, so the same configuration is the same
+    /// bytes in every process) and hashes it. Call once **after all effective-config
+    /// mutations** for this boot (tenant overlay applied, KMS-injected JWT signing
+    /// key, DID reconciliation/generation, webvh backfill, admin bootstrap), then
+    /// store the result in [`Self::effective_config_digest`]; both the boot
+    /// attestation anchor and `POST /attestation/config-report` read that stored
+    /// value so they commit to the same digest. Capturing after secret injection
+    /// is safe because the secret fields are removed from the canonical view
+    /// before serialization (below).
+    ///
+    /// Secret and non-reproducible fields are cleared before hashing:
+    /// `auth.jwt_signing_key` and the `[secrets]` seed are zeroed, and the
+    /// `#[serde(skip)]` fields (`config_path`, `unknown_keys`, this digest, the
+    /// view) never serialize.
+    ///
+    /// A verifier does **not** re-derive this digest from base+overlay — after
+    /// in-enclave `vta_did` generation/restoration the effective config differs
+    /// from base+overlay, so that would never match. Instead the endpoint returns
+    /// the captured canonical view (see [`compute_config_attestation_view`]) and
+    /// the verifier hashes the decoded `configView` to reproduce this digest.
+    ///
+    /// [`compute_config_attestation_view`]: Self::compute_config_attestation_view
+    pub fn compute_config_attestation_digest(&self) -> Result<Vec<u8>, AppError> {
+        use sha2::{Digest, Sha384};
+        Ok(Sha384::digest(self.compute_config_attestation_view()?).to_vec())
+    }
+
+    /// Build the canonical, secret-free JSON **bytes** that
+    /// [`compute_config_attestation_digest`] hashes.
+    ///
+    /// Returned verbatim by `POST /attestation/config-report` (base64) so a
+    /// consumer can authenticate the config without depending on this crate or
+    /// re-deriving the enclave-generated `vta_did`: hashing these bytes must equal
+    /// the signed `user_data`, after which the consumer may inspect the (now
+    /// authenticated) view — in particular that `tee.kms.key_arn` is its own key.
+    ///
+    /// ## Disclosure: this view is served to UNAUTHENTICATED callers
+    ///
+    /// `POST /attestation/config-report` has no auth gate by construction — the
+    /// verifier calls it *before* onboarding, so there is no credential to
+    /// present. Everything left in this view is therefore public to anyone who
+    /// can reach the VTA (rate-limited only), including `tee.kms.admin_did`, the
+    /// full `allow_*` break-glass posture, `tee.kms.anchor.table_name`,
+    /// `tee.storage_key_salt`, `resolver_url`, `store.data_dir`,
+    /// `credential_holder_did`, and `trusted_presentation_verifiers`.
+    ///
+    /// That is a deliberate trade, not an oversight. Those fields are precisely
+    /// what makes the attestation worth anything — a verifier that cannot see
+    /// the `allow_*` flags or the anchor table cannot tell an enclave with
+    /// break-glass off from one with it on — and each is either public by nature
+    /// (DIDs, URLs), useless without AWS credentials (the anchor table name), or
+    /// documented as not-secret (`storage_key_salt`, an HKDF salt over a
+    /// per-VTA high-entropy seed; see `hardened_bootstrap::generate_storage_key_salt`).
+    /// Narrowing the view weakens the gate; it does not harden it.
+    ///
+    /// What must never appear here is key material. Two fields are stripped
+    /// below for that reason, and **any new secret-bearing config field must be
+    /// added to that list** and to
+    /// `config_attestation_view_strips_secrets_and_capture_fields`.
+    ///
+    /// [`compute_config_attestation_digest`]: Self::compute_config_attestation_digest
+    pub fn compute_config_attestation_view(&self) -> Result<Vec<u8>, AppError> {
+        let mut view = self.clone();
+        view.auth.jwt_signing_key = None;
+        view.secrets = SecretsConfig::default();
+        view.effective_config_digest = None;
+        view.effective_config_view = None;
+        // RFC 8785 canonical JSON, not `serde_json::to_vec`: the config holds
+        // maps (`policy.approver_sets` is a `HashMap`) whose iteration order is
+        // seeded per process, so serializing them as they iterate gave one
+        // configuration a different view and digest in every process.
+        serde_json_canonicalizer::to_vec(&view).map_err(|e| {
+            AppError::Internal(format!("config attestation view serialization failed: {e}"))
+        })
+    }
+
+    /// Capture the effective-config attestation snapshot into
+    /// [`effective_config_digest`] + [`effective_config_view`] in one shot.
+    ///
+    /// Call once at boot, after the tenant overlay is applied and the DID is
+    /// reconciled/generated, so both the boot anchor and the pull endpoint commit
+    /// to the same bytes.
+    ///
+    /// [`effective_config_digest`]: Self::effective_config_digest
+    /// [`effective_config_view`]: Self::effective_config_view
+    pub fn capture_effective_config_attestation(&mut self) -> Result<(), AppError> {
+        use sha2::{Digest, Sha384};
+        let view = self.compute_config_attestation_view()?;
+        self.effective_config_digest = Some(Sha384::digest(&view).to_vec());
+        self.effective_config_view = Some(view);
+        Ok(())
+    }
+
+    /// The configuration a soft restart's next generation runs with.
+    ///
+    /// **Attested** (an [`effective_config_digest`] was captured): the running
+    /// configuration, unchanged — the file is not an input. The boot
+    /// attestation covers what this process runs, and the runtime operations
+    /// that persist configuration (`services {kind} {enable,update,disable}`,
+    /// `config/patch`) apply every change to the running copy as well as to
+    /// the file, so the file holds nothing a restart needs. Reading it would
+    /// let an edit no attestation covered take effect; comparing it would fail
+    /// every restart on drift that is not an edit at all (a fleet enclave's
+    /// file is the baked base, without the tenant overlay applied in memory).
+    /// The digest and view are cleared; the restart orchestrator captures them
+    /// again after it applies the runtime service flags.
+    ///
+    /// **Otherwise**: re-read [`config_path`], so an operator's edit takes
+    /// effect, carrying forward the values boot injects and never persists.
+    /// **The carry-forward list below is the contract.** A new boot-time
+    /// mutation of `AppConfig` — the hardened `auth.jwt_signing_key`, a
+    /// generated `vta_did`, anything a future bootstrap derives — must be
+    /// added here, or a soft restart silently drops it and the next generation
+    /// comes up without an identity it had a moment earlier.
+    ///
+    /// [`config_path`]: Self::config_path
+    /// [`effective_config_digest`]: Self::effective_config_digest
+    pub fn reload_for_restart(&self) -> Result<Self, AppError> {
+        if self.effective_config_digest.is_some() {
+            let mut next = self.clone();
+            next.effective_config_digest = None;
+            next.effective_config_view = None;
+            return Ok(next);
+        }
+
+        let mut reloaded = Self::load(Some(self.config_path.clone()))?;
+
+        // Hardened boot injects the signing key outside TOML; a persisted
+        // value must not replace that boot-only key. Otherwise preserve the
+        // prior fallback when TOML omits it.
+        if self.hardened.enabled || reloaded.auth.jwt_signing_key.is_none() {
+            reloaded.auth.jwt_signing_key = self.auth.jwt_signing_key.clone();
+        }
+        if reloaded.vta_did.is_none() {
+            reloaded.vta_did = self.vta_did.clone();
+        }
+
+        Ok(reloaded)
+    }
+
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self, AppError> {
+        let path = config_path
+            .or_else(|| std::env::var("VTA_CONFIG_PATH").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("config.toml"));
+
+        if !path.exists() {
+            return Err(AppError::Config(format!(
+                "configuration file not found: {}",
+                path.display()
+            )));
+        }
+
+        let contents = std::fs::read_to_string(&path).map_err(AppError::Io)?;
+
+        // Deserialize through `serde_ignored` so we can *record* every key the
+        // schema doesn't recognise (typo'd / legacy / mis-sectioned) instead of
+        // silently dropping it. We don't reject — `validate()` warns. (P0.9b)
+        let de = toml::Deserializer::parse(&contents)
+            .map_err(|e| AppError::Config(format!("failed to parse {}: {e}", path.display())))?;
+        let mut unknown_keys: Vec<String> = Vec::new();
+        let mut config: AppConfig = serde_ignored::deserialize(de, |key_path| {
+            unknown_keys.push(key_path.to_string());
+        })
+        .map_err(|e| AppError::Config(format!("failed to parse {}: {e}", path.display())))?;
+
+        config.config_path = path.clone();
+        config.unknown_keys = unknown_keys;
+
+        // =====================================================================
+        // SECURITY: When KMS bootstrap is configured (TEE mode), the config
+        // baked into the EIF is authoritative. ALL env var overrides are blocked
+        // except VTA_LOG_LEVEL and VTA_LOG_FORMAT (operational, no security impact).
+        //
+        // This prevents an attacker with server access from overriding identity
+        // (VTA_DID), endpoints (VTA_PUBLIC_URL, VTA_MESSAGING_*), secrets
+        // (VTA_SECRETS_*, VTA_AUTH_JWT_SIGNING_KEY), or security settings
+        // (VTA_TEE_MODE) via environment variables.
+        //
+        // In Nitro Enclaves, env var injection is already blocked by the enclave
+        // model (no --env flag on nitro-cli run-enclave). This gate provides
+        // defense in depth for non-Nitro TEE deployments (e.g., SEV-SNP).
+        // =====================================================================
+        #[cfg(feature = "tee")]
+        let kms_locked = config.tee.kms.is_some();
+        #[cfg(not(feature = "tee"))]
+        let kms_locked = false;
+
+        if kms_locked {
+            // In KMS mode, only allow log settings
+            if let Ok(level) = std::env::var("VTA_LOG_LEVEL") {
+                config.log.level = level;
+            }
+            if let Ok(format) = std::env::var("VTA_LOG_FORMAT") {
+                config.log.format = match format.to_lowercase().as_str() {
+                    "json" => LogFormat::Json,
+                    "text" => LogFormat::Text,
+                    other => {
+                        return Err(AppError::Config(format!(
+                            "invalid VTA_LOG_FORMAT '{other}', expected 'text' or 'json'"
+                        )));
+                    }
+                };
+            }
+
+            // Log warnings for any env vars that would have been applied
+            let blocked_vars = [
+                "VTA_DID",
+                "VTA_SERVER_HOST",
+                "VTA_SERVER_PORT",
+                "VTA_PUBLIC_URL",
+                "VTA_STORE_DATA_DIR",
+                "VTA_DIDS_DEFAULT_DID_METHOD",
+                "VTA_DIDS_SCID_ALSO_KNOWN_AS",
+                "VTA_DIDS_WEBS_ENABLED",
+                "VTA_MESSAGING_MEDIATOR_URL",
+                "VTA_MESSAGING_MEDIATOR_DID",
+                "VTA_SECRETS_SEED",
+                "VTA_SECRETS_AWS_SECRET_NAME",
+                "VTA_SECRETS_AWS_REGION",
+                "VTA_SECRETS_GCP_PROJECT",
+                "VTA_SECRETS_GCP_SECRET_NAME",
+                "VTA_SECRETS_AZURE_VAULT_URL",
+                "VTA_SECRETS_AZURE_SECRET_NAME",
+                "VTA_SECRETS_KEYRING_SERVICE",
+                "VTA_SECRETS_K8S_SECRET_NAME",
+                "VTA_SECRETS_K8S_NAMESPACE",
+                "VTA_SECRETS_K8S_SECRET_KEY",
+                "VTA_AUTH_ACCESS_EXPIRY",
+                "VTA_AUTH_REFRESH_EXPIRY",
+                "VTA_AUTH_CHALLENGE_TTL",
+                "VTA_AUTH_SESSION_CLEANUP_INTERVAL",
+                "VTA_AUTH_JWT_SIGNING_KEY",
+                "VTA_TEE_MODE",
+                "VTA_TEE_EMBED_IN_DID",
+                "VTA_TEE_ATTESTATION_CACHE_TTL",
+                "STORAGE_FJALL_BLOCK_CACHE",
+                "STORAGE_FJALL_WRITE_BUFFER",
+                "STORAGE_FJALL_MAX_JOURNAL",
+            ];
+            for var in &blocked_vars {
+                if std::env::var(var).is_ok() {
+                    tracing::warn!(
+                        "SECURITY: {var} env var ignored — config is locked when KMS bootstrap is active"
+                    );
+                }
+            }
+        } else {
+            // Non-KMS mode: apply all env var overrides (existing behavior)
+            Self::apply_env_overrides(&mut config)?;
+        }
+
+        Ok(config)
+    }
+
+    /// Apply environment variable overrides to the config.
+    ///
+    /// Only called in non-KMS mode. When KMS bootstrap is active,
+    /// the baked-in config is authoritative and env overrides are blocked.
+    fn apply_env_overrides(config: &mut AppConfig) -> Result<(), AppError> {
+        if let Ok(vta_did) = std::env::var("VTA_DID") {
+            config.vta_did = Some(vta_did);
+        }
+        if let Ok(host) = std::env::var("VTA_SERVER_HOST") {
+            config.server.host = host;
+        }
+        if let Ok(port) = std::env::var("VTA_SERVER_PORT") {
+            config.server.port = port
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid VTA_SERVER_PORT: {e}")))?;
+        }
+        if let Ok(level) = std::env::var("VTA_LOG_LEVEL") {
+            config.log.level = level;
+        }
+        if let Ok(format) = std::env::var("VTA_LOG_FORMAT") {
+            config.log.format = match format.to_lowercase().as_str() {
+                "json" => LogFormat::Json,
+                "text" => LogFormat::Text,
+                other => {
+                    return Err(AppError::Config(format!(
+                        "invalid VTA_LOG_FORMAT '{other}', expected 'text' or 'json'"
+                    )));
+                }
+            };
+        }
+        if let Ok(public_url) = std::env::var("VTA_PUBLIC_URL") {
+            config.public_url = Some(public_url);
+        }
+        if let Ok(data_dir) = std::env::var("VTA_STORE_DATA_DIR") {
+            config.store.data_dir = PathBuf::from(data_dir);
+        }
+        if let Ok(method) = std::env::var("VTA_DIDS_DEFAULT_DID_METHOD") {
+            config.dids.default_did_method = method.parse().map_err(|e| {
+                AppError::Config(format!("invalid VTA_DIDS_DEFAULT_DID_METHOD: {e}"))
+            })?;
+        }
+        if let Ok(alias) = std::env::var("VTA_DIDS_SCID_ALSO_KNOWN_AS") {
+            config.dids.scid_also_known_as = match alias.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                other => {
+                    return Err(AppError::Config(format!(
+                        "invalid VTA_DIDS_SCID_ALSO_KNOWN_AS '{other}', expected 'true' or 'false'"
+                    )));
+                }
+            };
+        }
+        if let Ok(enabled) = std::env::var("VTA_DIDS_WEBS_ENABLED") {
+            config.dids.webs_enabled = match enabled.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                other => {
+                    return Err(AppError::Config(format!(
+                        "invalid VTA_DIDS_WEBS_ENABLED '{other}', expected 'true' or 'false'"
+                    )));
+                }
+            };
+        }
+        if let Ok(enabled) = std::env::var("VTA_DIDS_WEBS_SERVICE_DIDS") {
+            config.dids.webs_service_dids = match enabled.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                other => {
+                    return Err(AppError::Config(format!(
+                        "invalid VTA_DIDS_WEBS_SERVICE_DIDS '{other}', expected 'true' or 'false'"
+                    )));
+                }
+            };
+        }
+        // Fjall memory settings (STORAGE_FJALL_BLOCK_CACHE / _WRITE_BUFFER /
+        // _MAX_JOURNAL) — shared, unprefixed names; see
+        // `vti_common::config::apply_fjall_env_overrides`.
+        vti_common::config::apply_fjall_env_overrides(&mut config.fjall)
+            .map_err(AppError::Config)?;
+
+        // Messaging
+        match (
+            std::env::var("VTA_MESSAGING_MEDIATOR_URL"),
+            std::env::var("VTA_MESSAGING_MEDIATOR_DID"),
+        ) {
+            (Ok(url), Ok(did)) => {
+                config.messaging = Some(MessagingConfig {
+                    mediator_url: url,
+                    mediator_did: did,
+                    mediator_host: None,
+                    setup_acl: false,
+                    drain_inbox_on_start: false,
+                });
+            }
+            (Ok(url), Err(_)) => {
+                let messaging = config.messaging.get_or_insert(MessagingConfig {
+                    mediator_url: String::new(),
+                    mediator_did: String::new(),
+                    mediator_host: None,
+                    setup_acl: false,
+                    drain_inbox_on_start: false,
+                });
+                messaging.mediator_url = url;
+            }
+            (Err(_), Ok(did)) => {
+                let messaging = config.messaging.get_or_insert(MessagingConfig {
+                    mediator_url: String::new(),
+                    mediator_did: String::new(),
+                    mediator_host: None,
+                    setup_acl: false,
+                    drain_inbox_on_start: false,
+                });
+                messaging.mediator_did = did;
+            }
+            (Err(_), Err(_)) => {}
+        }
+
+        // Secrets
+        if let Ok(seed) = std::env::var("VTA_SECRETS_SEED") {
+            config.secrets.seed = Some(seed);
+        }
+        if let Ok(name) = std::env::var("VTA_SECRETS_AWS_SECRET_NAME") {
+            config.secrets.aws_secret_name = Some(name);
+        }
+        if let Ok(region) = std::env::var("VTA_SECRETS_AWS_REGION") {
+            config.secrets.aws_region = Some(region);
+        }
+        if let Ok(project) = std::env::var("VTA_SECRETS_GCP_PROJECT") {
+            config.secrets.gcp_project = Some(project);
+        }
+        if let Ok(name) = std::env::var("VTA_SECRETS_GCP_SECRET_NAME") {
+            config.secrets.gcp_secret_name = Some(name);
+        }
+        if let Ok(url) = std::env::var("VTA_SECRETS_AZURE_VAULT_URL") {
+            config.secrets.azure_vault_url = Some(url);
+        }
+        if let Ok(name) = std::env::var("VTA_SECRETS_AZURE_SECRET_NAME") {
+            config.secrets.azure_secret_name = Some(name);
+        }
+        if let Ok(service) = std::env::var("VTA_SECRETS_KEYRING_SERVICE") {
+            config.secrets.keyring_service = service;
+        }
+
+        // Vault. K8s deployments commonly inject these via Secret /
+        // ConfigMap so envs override file-config. `VAULT_ADDR` /
+        // `VAULT_NAMESPACE` / `VAULT_TOKEN` are the canonical names
+        // Vault itself uses; we accept those alongside the
+        // VTA_SECRETS_* prefix for symmetry.
+        if let Ok(addr) =
+            std::env::var("VAULT_ADDR").or_else(|_| std::env::var("VTA_SECRETS_VAULT_ADDR"))
+        {
+            config.secrets.vault_addr = Some(addr);
+        }
+        if let Ok(ns) = std::env::var("VAULT_NAMESPACE")
+            .or_else(|_| std::env::var("VTA_SECRETS_VAULT_NAMESPACE"))
+        {
+            config.secrets.vault_namespace = Some(ns);
+        }
+        if let Ok(path) = std::env::var("VTA_SECRETS_VAULT_SECRET_PATH") {
+            config.secrets.vault_secret_path = Some(path);
+        }
+        if let Ok(key) = std::env::var("VTA_SECRETS_VAULT_SECRET_KEY") {
+            config.secrets.vault_secret_key = key;
+        }
+        if let Ok(mount) = std::env::var("VTA_SECRETS_VAULT_KV_MOUNT") {
+            config.secrets.vault_kv_mount = mount;
+        }
+        if let Ok(method) = std::env::var("VTA_SECRETS_VAULT_AUTH_METHOD") {
+            config.secrets.vault_auth_method = method;
+        }
+        if let Ok(role) = std::env::var("VTA_SECRETS_VAULT_K8S_ROLE") {
+            config.secrets.vault_k8s_role = Some(role);
+        }
+        if let Ok(mount) = std::env::var("VTA_SECRETS_VAULT_K8S_MOUNT") {
+            config.secrets.vault_k8s_mount = mount;
+        }
+        if let Ok(jwt) = std::env::var("VTA_SECRETS_VAULT_K8S_JWT_PATH") {
+            config.secrets.vault_k8s_jwt_path = jwt;
+        }
+        if let Ok(token) = std::env::var("VAULT_TOKEN") {
+            config.secrets.vault_token = Some(token);
+        }
+        if let Ok(rid) = std::env::var("VTA_SECRETS_VAULT_APPROLE_ROLE_ID") {
+            config.secrets.vault_approle_role_id = Some(rid);
+        }
+        if let Ok(sid) = std::env::var("VTA_SECRETS_VAULT_APPROLE_SECRET_ID") {
+            config.secrets.vault_approle_secret_id = Some(sid);
+        }
+        if let Ok(mount) = std::env::var("VTA_SECRETS_VAULT_APPROLE_MOUNT") {
+            config.secrets.vault_approle_mount = mount;
+        }
+        if let Ok(skip) = std::env::var("VAULT_SKIP_VERIFY")
+            .or_else(|_| std::env::var("VTA_SECRETS_VAULT_SKIP_VERIFY"))
+        {
+            config.secrets.vault_skip_verify =
+                matches!(skip.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+
+        // Kubernetes Secret backend. K8s deployments commonly inject the
+        // namespace from the pod's own metadata via the Downward API, so an
+        // env override is the natural way to set it.
+        if let Ok(name) = std::env::var("VTA_SECRETS_K8S_SECRET_NAME") {
+            config.secrets.k8s_secret_name = Some(name);
+        }
+        if let Ok(ns) = std::env::var("VTA_SECRETS_K8S_NAMESPACE") {
+            config.secrets.k8s_namespace = Some(ns);
+        }
+        if let Ok(key) = std::env::var("VTA_SECRETS_K8S_SECRET_KEY") {
+            config.secrets.k8s_secret_key = key;
+        }
+
+        // Auth
+        if let Ok(expiry) = std::env::var("VTA_AUTH_ACCESS_EXPIRY") {
+            config.auth.access_token_expiry = expiry
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid VTA_AUTH_ACCESS_EXPIRY: {e}")))?;
+        }
+        if let Ok(expiry) = std::env::var("VTA_AUTH_REFRESH_EXPIRY") {
+            config.auth.refresh_token_expiry = expiry
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid VTA_AUTH_REFRESH_EXPIRY: {e}")))?;
+        }
+        if let Ok(ttl) = std::env::var("VTA_AUTH_CHALLENGE_TTL") {
+            config.auth.challenge_ttl = ttl
+                .parse()
+                .map_err(|e| AppError::Config(format!("invalid VTA_AUTH_CHALLENGE_TTL: {e}")))?;
+        }
+        if let Ok(interval) = std::env::var("VTA_AUTH_SESSION_CLEANUP_INTERVAL") {
+            config.auth.session_cleanup_interval = interval.parse().map_err(|e| {
+                AppError::Config(format!("invalid VTA_AUTH_SESSION_CLEANUP_INTERVAL: {e}"))
+            })?;
+        }
+        if let Ok(key) = std::env::var("VTA_AUTH_JWT_SIGNING_KEY") {
+            config.auth.jwt_signing_key = Some(key);
+        }
+
+        // Audit
+        if let Ok(val) = std::env::var("VTA_AUDIT_RETENTION_DAYS")
+            && let Ok(days) = val.parse::<u32>()
+        {
+            config.audit.retention_days = days;
+        }
+
+        // TEE (non-KMS mode — all overrides allowed)
+        #[cfg(feature = "tee")]
+        {
+            if let Ok(mode) = std::env::var("VTA_TEE_MODE") {
+                config.tee.mode = match mode.to_lowercase().as_str() {
+                    "required" => TeeMode::Required,
+                    "optional" => TeeMode::Optional,
+                    "simulated" => TeeMode::Simulated,
+                    "disabled" => {
+                        tracing::warn!(
+                            "VTA_TEE_MODE=disabled is deprecated — use 'optional' instead"
+                        );
+                        TeeMode::Optional
+                    }
+                    other => {
+                        return Err(AppError::Config(format!(
+                            "invalid VTA_TEE_MODE '{other}', expected 'required', 'optional', or 'simulated'"
+                        )));
+                    }
+                };
+            }
+            if std::env::var_os("VTA_TEE_EMBED_IN_DID").is_some() {
+                return Err(AppError::Config(RETIRED_EMBED_IN_DID.into()));
+            }
+            if let Ok(val) = std::env::var("VTA_TEE_ATTESTATION_CACHE_TTL") {
+                config.tee.attestation_cache_ttl = val.parse().map_err(|e| {
+                    AppError::Config(format!("invalid VTA_TEE_ATTESTATION_CACHE_TTL: {e}"))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate the loaded runtime config, called at daemon boot
+    /// (`server::run`). Catches misconfigurations that would otherwise
+    /// produce a half-started or misbehaving service — the setup wizard
+    /// validates its *inputs*, but a hand-edited `config.toml` never went
+    /// through that gate.
+    ///
+    /// Conservative by design: it hard-errors only on values that are
+    /// unambiguously broken (a present-but-empty URL, a zero retention
+    /// window the sweeper can't honour) and *warns* — never blocks — on
+    /// cross-field advisories that a working deployment might legitimately
+    /// have, so it can't reject a config that boots fine today.
+    pub fn validate(&self) -> Result<(), AppError> {
+        // Advisory (non-blocking): keys the schema doesn't recognise. Emitted
+        // here rather than in `load()` because `load()` runs before the tracing
+        // subscriber is installed, so a warn there would be dropped. A typo'd
+        // key means the operator's intended setting silently took its default —
+        // worth flagging, but never a reason to refuse a config that otherwise
+        // boots (P0.9b — softer than `deny_unknown_fields`).
+        for key in &self.unknown_keys {
+            if key == RETIRED_COLLECT_BY_DEFAULT_KEY {
+                tracing::warn!(
+                    "`[collection] collect_by_default` in {} is retired and ignored, whatever \
+                     its value (VTI-NTF-093 is withdrawn). Collection by default is now a \
+                     setting of each trust context, on unless a context administrator turns it \
+                     off (`pnm collection disable --context <id>`, VTI-NTF-094 – 095). To stop \
+                     collection on this whole VTA, set `[collection] suspend = true` \
+                     (VTI-NTF-098). Remove the key to silence this warning.",
+                    self.config_path.display()
+                );
+                continue;
+            }
+            tracing::warn!(
+                "unknown configuration key `{key}` in {} — ignored. Check for a typo, \
+                 a removed/renamed setting, or a key placed in the wrong [section].",
+                self.config_path.display()
+            );
+        }
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // A present-but-empty URL is always a mistake (the operator set the
+        // key and left it blank); an *absent* key is fine (the default /
+        // serverless path).
+        if self
+            .public_url
+            .as_deref()
+            .is_some_and(|u| u.trim().is_empty())
+        {
+            errors.push(
+                "public_url is set to an empty string — remove the key for a \
+                 serverless VTA, or give it a value (e.g. https://vta.example.com)"
+                    .into(),
+            );
+        }
+        if self
+            .resolver_url
+            .as_deref()
+            .is_some_and(|u| u.trim().is_empty())
+        {
+            errors.push(
+                "resolver_url is set to an empty string — remove the key to resolve \
+                 DIDs locally, or give it a ws:// or wss:// URL"
+                    .into(),
+            );
+        }
+        errors.extend(self.did_cache.validation_errors());
+        errors.extend(self.witness.validation_errors());
+        // An operation budget of 0 would starve the VTA or, read as "no
+        // budget", fail open (VTI-TRN-029). Omitting the key takes the default.
+        for (key, value) in [
+            (
+                "operation_rate_limit_per_sec",
+                self.server.operation_rate_limit_per_sec,
+            ),
+            (
+                "operation_rate_limit_burst",
+                self.server.operation_rate_limit_burst,
+            ),
+            (
+                "operation_rate_limit_per_subject_per_sec",
+                self.server.operation_rate_limit_per_subject_per_sec,
+            ),
+            (
+                "operation_rate_limit_unauthenticated_per_sec",
+                self.server.operation_rate_limit_unauthenticated_per_sec,
+            ),
+        ] {
+            if value == Some(0) {
+                errors.push(format!(
+                    "[server] {key} = 0 — remove the key for the default, or set 1 or more \
+                     (operations per second)"
+                ));
+            }
+        }
+        // retention_days = 0 would silently disable audit retention; the
+        // sweeper assumes a positive window. (Mirrors the setup-time rule.)
+        if self.audit.retention_days == 0 {
+            errors.push("audit.retention_days must be > 0 (default is 28)".into());
+        }
+        // Whether baked or overlay-delivered: a malformed claim DID would
+        // otherwise surface only at the one-shot Mode-B claim.
+        #[cfg(feature = "tee")]
+        if let Some(did) = self.tee.bootstrap_claim_did.as_deref()
+            && affinidi_crypto::did_key::did_key_to_ed25519_pub(did).is_err()
+        {
+            errors.push(format!(
+                "tee.bootstrap_claim_did is not an Ed25519 did:key: {did} — use the DID \
+                 printed by `pnm bootstrap claim-did create`"
+            ));
+        }
+
+        if !errors.is_empty() {
+            return Err(AppError::Config(format!(
+                "invalid configuration in {}:\n  - {}",
+                self.config_path.display(),
+                errors.join("\n  - ")
+            )));
+        }
+
+        // Advisory (non-blocking): a REST-advertising VTA with no public_url
+        // publishes a DID document with no reachable REST endpoint. We don't
+        // hard-fail — a dev VTA legitimately runs REST without publishing —
+        // but the operator should see it.
+        if self.services.rest && self.public_url.is_none() {
+            tracing::warn!(
+                "services.rest = true but public_url is unset — the VTA DID document \
+                 will advertise no reachable REST endpoint"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Serialise this configuration for a **runtime** write-back to
+    /// [`config_path`] — a service enable, a `config/patch`, a retention
+    /// change — keeping `[auth] jwt_signing_key` exactly as the file has it.
+    ///
+    /// The in-memory key is not always the file's. Hardened and KMS boots
+    /// inject one that must never reach disk ([`HardenedConfig::enabled`]),
+    /// and `VTA_AUTH_JWT_SIGNING_KEY` overrides whatever the file holds.
+    /// Serialising the whole running config, as every runtime writer did,
+    /// wrote that key into `config.toml`. No runtime operation changes the
+    /// key, so the file's own value is always the right one to keep; one
+    /// that does (setup, a restore onto a plain VTA) uses [`Self::save`].
+    ///
+    /// A file that does not parse is refused rather than overwritten.
+    ///
+    /// [`config_path`]: Self::config_path
+    pub fn to_runtime_toml(&self) -> Result<String, AppError> {
+        let on_disk = match std::fs::read_to_string(&self.config_path) {
+            Ok(contents) => contents
+                .parse::<toml::Table>()
+                .map_err(|e| {
+                    AppError::Config(format!(
+                        "{} does not parse; not overwriting it: {e}",
+                        self.config_path.display()
+                    ))
+                })?
+                .get("auth")
+                .and_then(|auth| auth.get("jwt_signing_key"))
+                .and_then(|key| key.as_str())
+                .map(str::to_owned),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(AppError::Io(e)),
+        };
+        let mut persisted = self.clone();
+        persisted.auth.jwt_signing_key = on_disk;
+        toml::to_string_pretty(&persisted)
+            .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))
+    }
+
+    pub fn save(&self) -> Result<(), AppError> {
+        let contents = toml::to_string_pretty(self)
+            .map_err(|e| AppError::Config(format!("failed to serialize config: {e}")))?;
+        std::fs::write(&self.config_path, contents).map_err(AppError::Io)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    /// Parse a (possibly empty) TOML snippet into an `AppConfig`. An empty
+    /// document is valid — every field defaults (Options to None, server /
+    /// store / audit to their default fns).
+    fn cfg(toml_str: &str) -> AppConfig {
+        toml::from_str::<AppConfig>(toml_str).expect("parse test config")
+    }
+
+    #[test]
+    fn default_config_validates() {
+        cfg("")
+            .validate()
+            .expect("a fully-defaulted config must validate");
+    }
+
+    #[test]
+    fn retired_trust_xff_key_is_refused() {
+        let err = toml::from_str::<AppConfig>("[server]\ntrust_xff = true\n")
+            .expect_err("retired trust_xff key must be rejected");
+        assert!(format!("{err}").contains("trust_xff_cidrs"), "{err}");
+    }
+
+    /// `tee.embed_in_did` is refused, not ignored: the `TeeAttestation` service
+    /// it added pointed at a REST route that no longer exists, and an operator
+    /// who kept the key would believe the DID document still said something.
+    #[cfg(feature = "tee")]
+    #[test]
+    fn retired_embed_in_did_is_refused() {
+        let err = toml::from_str::<AppConfig>("[tee]\nembed_in_did = true\n")
+            .expect_err("retired embed_in_did key must be rejected");
+        assert!(format!("{err}").contains("vta/attestation"), "{err}");
+        // Absent is the one accepted state.
+        cfg("[tee]\nmode = \"simulated\"\n");
+    }
+
+    /// A baked claim DID is checked at boot like an overlay-delivered one, so
+    /// a typo fails startup rather than the one-shot Mode-B claim.
+    #[cfg(feature = "tee")]
+    #[test]
+    fn a_malformed_bootstrap_claim_did_is_rejected() {
+        let err = cfg("[tee]\nbootstrap_claim_did = \"did:web:example.com\"\n")
+            .validate()
+            .expect_err("a non-did:key claim DID must be rejected");
+        assert!(
+            format!("{err:?}").contains("bootstrap_claim_did"),
+            "{err:?}"
+        );
+        cfg("[tee]\nbootstrap_claim_did = \"did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK\"\n")
+            .validate()
+            .expect("an Ed25519 did:key is accepted");
+    }
+
+    #[test]
+    fn trust_xff_cidrs_still_parses() {
+        let config = cfg("[server]\ntrust_xff_cidrs = [\"127.0.0.1/32\"]\n");
+        assert_eq!(config.server.trust_xff_cidrs.len(), 1);
+    }
+
+    /// A range trusting every peer would let any client name its own
+    /// rate-limit bucket.
+    #[test]
+    fn a_catch_all_trust_xff_range_is_refused() {
+        for cidr in ["0.0.0.0/0", "::/0"] {
+            let err =
+                toml::from_str::<AppConfig>(&format!("[server]\ntrust_xff_cidrs = [\"{cidr}\"]\n"))
+                    .expect_err("a catch-all range must be refused");
+            assert!(err.to_string().contains("covers every address"), "{err}");
+        }
+    }
+
+    /// A zero budget would starve the VTA or, read as "no budget", fail open
+    /// (VTI-TRN-029).
+    #[test]
+    fn a_zero_operation_budget_is_rejected() {
+        for key in [
+            "operation_rate_limit_per_sec",
+            "operation_rate_limit_burst",
+            "operation_rate_limit_per_subject_per_sec",
+            "operation_rate_limit_unauthenticated_per_sec",
+        ] {
+            let err = cfg(&format!("[server]\n{key} = 0\n"))
+                .validate()
+                .expect_err("a zero budget must be rejected");
+            assert!(format!("{err:?}").contains(key), "{err:?}");
+        }
+        cfg("[server]\noperation_rate_limit_per_sec = 1\n")
+            .validate()
+            .expect("a budget of 1 is accepted");
+    }
+
+    /// VTI-TRN-029 is a MUST: an absent per-client or unauthenticated budget
+    /// takes the default, never "unbounded"; an absent appliance budget is off.
+    #[test]
+    fn absent_operation_budgets_take_the_defaults() {
+        let config = cfg("");
+        assert_eq!(
+            config.server.operation_per_subject_per_sec(),
+            DEFAULT_OPERATION_RATE_LIMIT_PER_SUBJECT_PER_SEC
+        );
+        assert_eq!(
+            config.server.operation_unauthenticated_per_sec(),
+            DEFAULT_OPERATION_RATE_LIMIT_UNAUTHENTICATED_PER_SEC
+        );
+        assert_eq!(config.server.operation_rate_limit_per_sec, None);
+        let config = cfg("[server]\noperation_rate_limit_per_subject_per_sec = 7\n\
+             operation_rate_limit_unauthenticated_per_sec = 3\n");
+        assert_eq!(config.server.operation_per_subject_per_sec(), 7);
+        assert_eq!(config.server.operation_unauthenticated_per_sec(), 3);
+    }
+
+    #[test]
+    fn zero_retention_days_is_rejected() {
+        let err = cfg("[audit]\nretention_days = 0\n")
+            .validate()
+            .expect_err("retention_days = 0 must be rejected");
+        assert!(format!("{err:?}").contains("retention_days"), "{err:?}");
+    }
+
+    #[test]
+    fn present_but_empty_public_url_is_rejected() {
+        let err = cfg("public_url = \"\"\n")
+            .validate()
+            .expect_err("empty public_url must be rejected");
+        assert!(format!("{err:?}").contains("public_url"), "{err:?}");
+    }
+
+    #[test]
+    fn present_but_empty_resolver_url_is_rejected() {
+        let err = cfg("resolver_url = \"   \"\n")
+            .validate()
+            .expect_err("whitespace-only resolver_url must be rejected");
+        assert!(format!("{err:?}").contains("resolver_url"), "{err:?}");
+    }
+
+    /// The DID-document cache TTL bounds how long a revoked key keeps
+    /// verifying; a value past the bound is refused, not honoured.
+    #[test]
+    fn a_did_cache_ttl_past_the_bound_is_rejected() {
+        assert_eq!(
+            cfg("").did_cache.ttl_secs,
+            vti_common::config::DID_CACHE_TTL_DEFAULT_SECS
+        );
+        let err = cfg("[did_cache]\nttl_secs = 3600\n")
+            .validate()
+            .expect_err("a one-hour DID cache must be rejected");
+        assert!(format!("{err:?}").contains("did_cache.ttl_secs"), "{err:?}");
+        cfg("[did_cache]\nttl_secs = 30\n")
+            .validate()
+            .expect("a shorter TTL is fine");
+    }
+
+    #[test]
+    fn rest_without_public_url_only_warns_does_not_fail() {
+        // services.rest defaults to true and public_url is absent — this is
+        // an advisory (a dev VTA legitimately runs REST without publishing),
+        // so validate must NOT hard-fail.
+        cfg("")
+            .validate()
+            .expect("rest-without-public_url is advisory, not an error");
+    }
+
+    #[test]
+    fn config_attestation_view_strips_secrets_and_capture_fields() {
+        let mut config = cfg("[auth]\njwt_signing_key = \"jwt-secret-sentinel\"\n\
+             [secrets]\nseed = \"seed-secret-sentinel\"\n");
+        config.effective_config_digest = Some(vec![0x11; 48]);
+        config.effective_config_view = Some(b"prior-view-sentinel".to_vec());
+
+        let bytes = config
+            .compute_config_attestation_view()
+            .expect("attestation view serializes");
+        let text = std::str::from_utf8(&bytes).expect("JSON is UTF-8");
+        assert!(!text.contains("jwt-secret-sentinel"));
+        assert!(!text.contains("seed-secret-sentinel"));
+        assert!(!text.contains("prior-view-sentinel"));
+
+        let view: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON view");
+        assert_eq!(
+            view.pointer("/auth/jwt_signing_key"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            view.pointer("/secrets/seed"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(view.get("effective_config_digest").is_none());
+        assert!(view.get("effective_config_view").is_none());
+    }
+
+    /// The view is the same bytes for the same configuration in any process.
+    ///
+    /// `policy.approver_sets` is a `HashMap`, whose iteration order is seeded
+    /// per map, so serializing it as it iterates gave two processes with one
+    /// configuration two different views and digests. Each parse below builds
+    /// its map with a fresh seed, and the sets are written in different orders.
+    #[test]
+    fn config_attestation_view_is_the_same_bytes_for_the_same_config() {
+        let sets: Vec<String> = (0..8)
+            .map(|i| format!("set-{i} = [\"did:key:z{i}a\", \"did:key:z{i}b\"]"))
+            .collect();
+        let views: Vec<(Vec<u8>, Vec<u8>)> = (0..6)
+            .map(|rotate| {
+                let mut ordered = sets.clone();
+                ordered.rotate_left(rotate);
+                let config = cfg(&format!("[policy.approver_sets]\n{}\n", ordered.join("\n")));
+                (
+                    config.compute_config_attestation_view().expect("view"),
+                    config.compute_config_attestation_digest().expect("digest"),
+                )
+            })
+            .collect();
+        for (view, digest) in &views[1..] {
+            assert_eq!(view, &views[0].0, "the view differs between equal configs");
+            assert_eq!(digest, &views[0].1);
+        }
+    }
+
+    /// Write `contents` to a `config.toml` in a fresh tempdir and run it
+    /// through the real `AppConfig::load` path (the only path that populates
+    /// `unknown_keys` — `toml::from_str` doesn't). Returns the loaded config;
+    /// the `TempDir` is returned too so the file outlives the call.
+    fn load(contents: &str) -> (AppConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, contents).expect("write config");
+        let config = AppConfig::load(Some(path)).expect("load config");
+        (config, dir)
+    }
+
+    /// The hardened / KMS boot writes the JWT signing key into memory only
+    /// (`main.rs`, `vta-enclave/src/main.rs`). A soft restart that re-read the
+    /// file would drop it and bring the next generation up with no ability to
+    /// issue tokens — every authenticated request 401s.
+    #[test]
+    fn reload_for_restart_carries_forward_the_injected_jwt_key() {
+        let (mut config, _dir) = load("vta_did = \"did:key:z6MkTest\"\n");
+        assert!(config.auth.jwt_signing_key.is_none());
+        config.auth.jwt_signing_key = Some("injected-at-boot".into());
+
+        let reloaded = config.reload_for_restart().expect("reload");
+        assert_eq!(
+            reloaded.auth.jwt_signing_key.as_deref(),
+            Some("injected-at-boot")
+        );
+    }
+
+    /// `tee::did_autogen` can mint the DID at boot without writing it back.
+    #[test]
+    fn reload_for_restart_carries_forward_an_injected_vta_did() {
+        let (mut config, _dir) = load("");
+        assert!(config.vta_did.is_none());
+        config.vta_did = Some("did:key:z6MkGenerated".into());
+
+        let reloaded = config.reload_for_restart().expect("reload");
+        assert_eq!(reloaded.vta_did.as_deref(), Some("did:key:z6MkGenerated"));
+    }
+
+    /// A value the operator has since written into the file wins over the
+    /// in-memory copy — carry-forward fills a gap, it does not pin.
+    #[test]
+    fn reload_for_restart_prefers_the_file_over_the_carried_value() {
+        let (mut config, _dir) = load("vta_did = \"did:key:z6MkFromFile\"\n");
+        config.vta_did = Some("did:key:z6MkInMemory".into());
+
+        let reloaded = config.reload_for_restart().expect("reload");
+        assert_eq!(reloaded.vta_did.as_deref(), Some("did:key:z6MkFromFile"));
+    }
+
+    /// The point of the reload: an edit made since boot takes effect.
+    #[test]
+    fn reload_for_restart_picks_up_an_edited_file() {
+        let (config, dir) = load("vta_did = \"did:key:z6MkTest\"\n");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "vta_did = \"did:key:z6MkTest\"\n\
+             [messaging]\nmediator_did = \"did:web:new.example\"\nmediator_url = \"https://new.example\"\n",
+        )
+        .expect("rewrite config");
+
+        let reloaded = config.reload_for_restart().expect("reload");
+        assert_eq!(
+            reloaded.messaging.expect("messaging").mediator_did,
+            "did:web:new.example"
+        );
+    }
+
+    /// An attested generation restarts with what it runs: the runtime change
+    /// (applied in memory by the service operation) and the boot-only values
+    /// survive, and the digest is left for the orchestrator to recapture.
+    #[test]
+    fn attested_reload_keeps_the_running_configuration() {
+        let (mut config, _dir) = load("vta_did = \"did:key:z6MkTest\"\n");
+        config.auth.jwt_signing_key = Some("boot-injected-jwt".into());
+        config
+            .capture_effective_config_attestation()
+            .expect("capture");
+        config.messaging = Some(MessagingConfig {
+            mediator_did: "did:web:new.example".into(),
+            mediator_url: "https://new.example".into(),
+            mediator_host: None,
+            setup_acl: false,
+            drain_inbox_on_start: false,
+        });
+
+        let reloaded = config.reload_for_restart().expect("reload");
+        assert_eq!(reloaded.vta_did.as_deref(), Some("did:key:z6MkTest"));
+        assert_eq!(
+            reloaded.auth.jwt_signing_key.as_deref(),
+            Some("boot-injected-jwt")
+        );
+        assert_eq!(
+            reloaded.messaging.expect("messaging").mediator_did,
+            "did:web:new.example"
+        );
+        assert_eq!(reloaded.effective_config_digest, None);
+        assert_eq!(reloaded.effective_config_view, None);
+    }
+
+    /// The file is not an input to an attested restart, so an edit to it —
+    /// or a file that is merely the baked base without the overlay — neither
+    /// takes effect nor fails the restart.
+    #[test]
+    fn attested_reload_ignores_the_file() {
+        let (mut config, dir) = load("vta_did = \"did:key:z6MkTest\"\n");
+        config
+            .capture_effective_config_attestation()
+            .expect("capture");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "vta_did = \"did:key:z6MkTest\"\npublic_url = \"https://changed.example\"\n",
+        )
+        .expect("rewrite config");
+
+        let reloaded = config.reload_for_restart().expect("reload");
+        assert_eq!(reloaded.public_url, None);
+    }
+
+    /// A broken edit must surface as an error so the caller keeps the running
+    /// configuration, rather than half-applying or killing a live VTA.
+    #[test]
+    fn reload_for_restart_errors_on_a_malformed_file() {
+        let (config, dir) = load("vta_did = \"did:key:z6MkTest\"\n");
+        std::fs::write(dir.path().join("config.toml"), "this is not = = toml")
+            .expect("rewrite config");
+
+        assert!(config.reload_for_restart().is_err());
+    }
+
+    /// A hardened / KMS boot injects the JWT key into memory only. A runtime
+    /// write-back (service enable, `config/patch`) must not carry it to disk.
+    #[test]
+    fn runtime_toml_never_writes_an_injected_jwt_key() {
+        let (mut config, _dir) = load("[hardened]\nenabled = true\n");
+        config.auth.jwt_signing_key = Some("injected-at-boot".into());
+        config.vta_name = Some("patched".into());
+
+        let written = config.to_runtime_toml().expect("serialise");
+        assert!(!written.contains("injected-at-boot"), "{written}");
+        assert!(
+            written.contains("patched"),
+            "the runtime change itself is written"
+        );
+    }
+
+    /// `VTA_AUTH_JWT_SIGNING_KEY` overrides the file in memory; the file keeps
+    /// the key it had.
+    #[test]
+    fn runtime_toml_keeps_the_files_own_jwt_key() {
+        let (mut config, _dir) = load("[auth]\njwt_signing_key = \"from-file\"\n");
+        config.auth.jwt_signing_key = Some("from-env".into());
+
+        let written = config.to_runtime_toml().expect("serialise");
+        assert!(written.contains("from-file"), "{written}");
+        assert!(!written.contains("from-env"), "{written}");
+    }
+
+    #[test]
+    fn runtime_toml_refuses_to_overwrite_a_file_that_does_not_parse() {
+        let (config, dir) = load("");
+        std::fs::write(dir.path().join("config.toml"), "this is not = = toml").expect("write");
+        assert!(config.to_runtime_toml().is_err());
+    }
+
+    /// VTI-NTF-093 is withdrawn: its key still loads (a deployed config keeps
+    /// booting) and is recorded as the retired key, which `validate` names in
+    /// its own warning; it sets nothing. `suspend` (VTI-NTF-098) is off unless
+    /// set.
+    #[test]
+    fn vti_ntf_098_the_retired_collect_by_default_key_loads_and_sets_nothing() {
+        for value in ["true", "false"] {
+            let (config, _dir) = load(&format!("[collection]\ncollect_by_default = {value}\n"));
+            assert!(
+                config
+                    .unknown_keys
+                    .iter()
+                    .any(|k| k == RETIRED_COLLECT_BY_DEFAULT_KEY),
+                "{:?}",
+                config.unknown_keys
+            );
+            assert!(!config.collection.suspend, "the retired key never suspends");
+            config
+                .validate()
+                .expect("a retired key is a warning, not an error");
+        }
+        let (config, _dir) = load("[collection]\nsuspend = true\n");
+        assert!(config.collection.suspend);
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+        let (config, _dir) = load("");
+        assert!(
+            !config.collection.suspend,
+            "not suspended unless the operator suspends"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_collected_not_rejected() {
+        // A typo'd top-level key and a typo inside a nested table. `load`
+        // must succeed (no rejection) and record both as dotted paths.
+        let (config, _dir) = load(
+            "vta_naem = \"oops\"\n\
+             [secrets]\nkyring_service = \"vta-2\"\n",
+        );
+        assert!(
+            config.unknown_keys.iter().any(|k| k == "vta_naem"),
+            "top-level typo should be flagged: {:?}",
+            config.unknown_keys
+        );
+        assert!(
+            config
+                .unknown_keys
+                .iter()
+                .any(|k| k == "secrets.kyring_service"),
+            "nested typo should be flagged with a dotted path: {:?}",
+            config.unknown_keys
+        );
+        // Advisory only — a config with unknown keys still validates.
+        config
+            .validate()
+            .expect("unknown keys are advisory, not a hard error");
+    }
+
+    #[test]
+    fn rate_limit_keys_default_and_parse() {
+        // Absent keys take the documented defaults: auth 5 s/token burst 10,
+        // DID log 1 s/token burst 60.
+        let server = cfg("").server;
+        assert_eq!(server.rate_limit_interval_secs, 5);
+        assert_eq!(server.rate_limit_burst, 10);
+        assert_eq!(server.did_log_rate_limit_interval_secs, 1);
+        assert_eq!(server.did_log_rate_limit_burst, 60);
+
+        // Each key is read independently of the others.
+        let (config, _dir) = load(
+            "[server]\nrate_limit_interval_secs = 2\nrate_limit_burst = 20\n\
+             did_log_rate_limit_interval_secs = 3\ndid_log_rate_limit_burst = 200\n",
+        );
+        assert!(
+            config.unknown_keys.is_empty(),
+            "rate-limit keys must be known: {:?}",
+            config.unknown_keys
+        );
+        assert_eq!(config.server.rate_limit_interval_secs, 2);
+        assert_eq!(config.server.rate_limit_burst, 20);
+        assert_eq!(config.server.did_log_rate_limit_interval_secs, 3);
+        assert_eq!(config.server.did_log_rate_limit_burst, 200);
+    }
+
+    #[test]
+    fn known_keys_and_aliases_are_not_flagged() {
+        // `community_name` is a serde alias for `vta_name`; a real nested
+        // key must not be reported. Nothing should land in `unknown_keys`.
+        let (config, _dir) = load(
+            "community_name = \"acme\"\n\
+             [server]\nport = 9000\n",
+        );
+        assert!(
+            config.unknown_keys.is_empty(),
+            "known keys + aliases must not be flagged: {:?}",
+            config.unknown_keys
+        );
+        assert_eq!(config.vta_name.as_deref(), Some("acme"));
+        assert_eq!(config.server.port, 9000);
+    }
+}

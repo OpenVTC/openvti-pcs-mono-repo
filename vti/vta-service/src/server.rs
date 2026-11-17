@@ -1,0 +1,4771 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use affinidi_tdk::common::TDKSharedState;
+use affinidi_tdk::common::config::TDKConfig;
+use affinidi_tdk::messaging::ATM;
+use affinidi_tdk::messaging::config::ATMConfig;
+use affinidi_tdk::secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
+use vti_common::slip10::ExtendedSigningKey;
+
+use crate::auth::AuthState;
+use crate::auth::jwt::JwtKeys;
+use crate::auth::session::cleanup_expired_sessions;
+use crate::config::{AppConfig, AuthConfig};
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+use crate::didcomm_bridge::DIDCommBridge;
+use crate::error::AppError;
+use crate::keys::KeyRecord;
+use crate::keys::derivation::Bip32Extension;
+use crate::keys::seed_store::SeedStore;
+use crate::keys::seeds::load_seed_bytes;
+#[cfg(feature = "rest")]
+use crate::routes;
+use crate::store::{KeyspaceHandle, Store};
+use tokio::sync::{RwLock, watch};
+use tokio_util::sync::CancellationToken;
+#[cfg(feature = "rest")]
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
+use tracing::{debug, error, info, warn};
+
+// D2 P2a: the reliable-messaging delivery layer replaces the
+// `affinidi-messaging-didcomm-service` framework. `MessagingService` (built in
+// `messaging::service`) drives inbound + outbound over a `DidCommTransport`.
+// The mediator ACL is keyed on the VTA DID, so it authorises whichever
+// protocol rides the socket — either transport wires it on connect.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+use vta_sdk::acl_setup;
+
+/// TEE context passed by the caller (main.rs or vta-enclave).
+/// None when running outside a TEE.
+///
+/// When the `tee` feature is not compiled in, this is a unit struct
+/// that is never constructed — callers pass `None::<TeeContext>`.
+#[derive(Clone)]
+#[cfg(feature = "tee")]
+pub struct TeeContext {
+    pub state: crate::tee::TeeState,
+    pub mnemonic_guard: Option<Arc<crate::tee::mnemonic_guard::MnemonicExportGuard>>,
+}
+
+/// Stub type when TEE is not compiled in. Never constructed.
+#[derive(Clone)]
+#[cfg(not(feature = "tee"))]
+pub struct TeeContext(());
+
+/// Maximum time to wait for a transport to finish sending a restart-triggering
+/// reply before the safety backstop starts the restart anyway.
+///
+/// This matches the current TSP reply-send budget: 10 seconds for peer
+/// mediator lookup plus 20 seconds for rate-limit retries. Keep this value in
+/// sync if either transport budget changes; the Rust const evaluator cannot
+/// currently add `Duration` constants here (rust-lang/rust#143874).
+const RESTART_BACKSTOP: Duration = Duration::from_secs(30);
+
+/// Coordinates a restart request with the reply that caused it.
+///
+/// One owner per step. A handler only marks its outcome
+/// (`TrustTaskOutcome::with_restart`); the dispatch spine
+/// (`dispatch_trust_task_core`) arms the gate for every transport alike; and
+/// the transport holds a [`RestartOnDrop`] across its send, so the restart
+/// fires once the reply is out — on every path out of the send, failed or not.
+/// The backstop covers an outcome no transport ever sends (a consent replay, a
+/// send that hangs), so a successful mutation cannot leave the service enabled
+/// but inactive forever.
+pub struct RestartGate {
+    tx: watch::Sender<bool>,
+    pending: AtomicBool,
+    fired: AtomicBool,
+    backstop_cancel: CancellationToken,
+}
+
+impl RestartGate {
+    pub(crate) fn new(tx: watch::Sender<bool>) -> Self {
+        Self {
+            tx,
+            pending: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            backstop_cancel: CancellationToken::new(),
+        }
+    }
+
+    /// Request a restart and arm the delayed safety backstop. Called by the
+    /// dispatch spine only; a transport releases the request with
+    /// [`Self::fire_on_drop`].
+    pub(crate) fn request(self: &Arc<Self>) {
+        self.request_with_delay(RESTART_BACKSTOP);
+    }
+
+    /// A guard that fires the restart when dropped. A transport takes one
+    /// before sending a restart-carrying reply and keeps it until the send is
+    /// finished, so no early return can strand the restart on the backstop.
+    pub(crate) fn fire_on_drop(self: &Arc<Self>) -> RestartOnDrop {
+        RestartOnDrop(Arc::clone(self))
+    }
+
+    fn request_with_delay(self: &Arc<Self>, delay: Duration) {
+        if self.fired.load(Ordering::Acquire) || self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let gate = Arc::clone(self);
+        let cancellation = self.backstop_cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => gate.fire(),
+                _ = cancellation.cancelled() => {}
+            }
+        });
+    }
+
+    /// Fire the restart exactly once.
+    fn fire(&self) {
+        if !self.fired.swap(true, Ordering::AcqRel) {
+            self.backstop_cancel.cancel();
+            let _ = self.tx.send(true);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) && !self.fired.load(Ordering::Acquire)
+    }
+}
+
+/// Fires its [`RestartGate`] when dropped — see [`RestartGate::fire_on_drop`].
+pub(crate) struct RestartOnDrop(Arc<RestartGate>);
+
+impl Drop for RestartOnDrop {
+    fn drop(&mut self) {
+        self.0.fire();
+    }
+}
+
+/// Shared handle graph for every route, task handler and sweeper.
+///
+/// **`#[non_exhaustive]` is load-bearing, not decoration.** This struct is 46
+/// public fields with no private field and no constructor guard, so before
+/// this attribute any crate could write an `AppState { .. }` literal — which
+/// made *adding a field* a source-breaking change under
+/// `constructible_struct_adds_field`. Twenty-nine commits have added at least
+/// one field to it; one added five.
+///
+/// That break was never reported, because `cargo semver-checks` cannot build
+/// this crate's baseline (its published dependency ranges resolve two
+/// `trust-tasks-rs` versions into one graph) and a crate whose baseline fails
+/// to build is silently not compared. Version numbers stayed correct anyway
+/// — at 0.x a break needs a minor bump and conventional commits already force
+/// one for `feat:`, which every field addition since release-plz happened to
+/// be. Both of those are coincidences: `refactor:`/`fix:`/`perf:`/`chore:`
+/// yield a patch and can add fields just as easily (c93c7b57 added five under
+/// `refactor:`), and the alignment disappears entirely at 1.0, where a break
+/// needs a major and `feat:` gives only a minor.
+///
+/// Marking it non-exhaustive closes the class permanently rather than relying
+/// on any of that holding. Construction inside this crate is unaffected —
+/// both sites (`build_state` below and `test_support`) are in-crate, and
+/// `vta_test_support::MockVta` is the supported entry point for consumers.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct AppState {
+    pub keys_ks: KeyspaceHandle,
+    pub sessions_ks: KeyspaceHandle,
+    pub acl_ks: KeyspaceHandle,
+    pub contexts_ks: KeyspaceHandle,
+    pub did_templates_ks: KeyspaceHandle,
+    /// The audit keyspace, for **reads and retention only** — the audit-list
+    /// query and `cleanup_expired_logs`. Writes go through [`Self::audit_sink`].
+    ///
+    /// The two are separate because an alternative sink may be write-only and
+    /// remote, and "delete rows older than N days" is not an operation an
+    /// append-only or anchored backend can offer — the immutability is the
+    /// point. Retention therefore stays a property of the local keyspace, which
+    /// is what the retention API is documented to govern.
+    pub audit_ks: KeyspaceHandle,
+    /// Pluggable audit sink — every audit *write* goes through this.
+    /// Default impl is the `audit` keyspace ([`KeyspaceAuditSink`]);
+    /// an append-only log, transparency log, or hash chain plugs in via the
+    /// `AuditSink` trait without any call site changing (#1031).
+    pub audit_sink: vta_audit::SharedAuditSink,
+    pub imported_ks: KeyspaceHandle,
+    /// Non-extractable internal signing keys. Separate from `imported_ks`
+    /// because that keyspace wraps under a seed-derived KEK; these must have
+    /// no path back to the mnemonic.
+    pub internal_ks: KeyspaceHandle,
+    /// Vault — third-party credentials the holder has stored on this VTA.
+    /// M1 reads only; upsert/delete/sync/release land in M2+. Encrypted at
+    /// rest like every other secret-bearing keyspace.
+    pub vault_ks: KeyspaceHandle,
+    /// Persistent runtime state for service enable/disable
+    /// (`operations::protocol::runtime_state`). Replaces the legacy
+    /// `[services]` block in `config.toml` as the source of truth for whether
+    /// REST / DIDComm are currently active.
+    pub service_state_ks: KeyspaceHandle,
+    /// Anti-replay log for sealed-bootstrap `bundle_id`s. One row per seal;
+    /// `PersistentNonceStore` refuses duplicates.
+    pub sealed_nonces_ks: KeyspaceHandle,
+    /// Idempotency records for keyed Trust Tasks (`trust_tasks::idempotency`).
+    /// One row per `(actor, idempotency-key)`, so a client's retry of a lost
+    /// reply converges on the first execution instead of producing a second
+    /// durable effect.
+    pub idempotency_ks: KeyspaceHandle,
+    /// The record of accepted Trust Task document identifiers (VTI-OPS-025 …
+    /// 027, SPEC §7.2 item 11), shared by every binding. Read through
+    /// [`Self::accepted_ids`].
+    pub accepted_ids_ks: KeyspaceHandle,
+    /// In-flight backup-bundle records for the descriptor-pattern
+    /// export/import slice (see
+    /// `docs/05-design-notes/backup-descriptor-pattern.md`). Holds
+    /// only the control-plane state — `.vtabak` bytes live on disk
+    /// under [`Self::backup_blob_dir`]. Encrypted at rest (records
+    /// include hashed bearer tokens; nothing useful leaks if the
+    /// keyspace is read, but encrypting it keeps storage-layer
+    /// invariants uniform across slices).
+    pub backup_bundles_ks: KeyspaceHandle,
+    /// Filesystem directory under which `.vtabak` byte blobs are
+    /// staged for in-flight backup bundles. Created lazily at first
+    /// `initiate-*` call. Permissions: 0700 (owner-only). Each
+    /// blob is at `{backup_blob_dir}/{bundle_id}.vtabak` with mode
+    /// 0600. The sweeper deletes both the file and the record
+    /// when a bundle ages out.
+    pub backup_blob_dir: std::path::PathBuf,
+    #[cfg(feature = "webvh")]
+    pub webvh_ks: KeyspaceHandle,
+    /// `did:webs` DID records (`crate::webs_store`). Opened in every build, so
+    /// a build without the `webs` feature still purges and backs them up.
+    pub webs_ks: KeyspaceHandle,
+    /// IACA roots this VTA accepts as ISO 18013-5 mdoc issuers, parsed once at
+    /// boot from `[vault] mdoc_iaca_trust_anchors`.
+    ///
+    /// Empty unless configured, and the resolver fails closed on empty — mdoc
+    /// is the one credential format whose issuer is not a resolvable DID, so
+    /// there is no safe default to fall back to.
+    pub mdoc_trust: Arc<vta_vault::mdoc_trust::IacaTrustAnchors>,
+    /// In-flight WebAuthn registration state for the
+    /// passkey-as-verificationMethod enrolment ceremony. Holds
+    /// `PasskeyRegistration` keyed by ceremony id; consumed (taken)
+    /// at finish.
+    #[cfg(feature = "webvh")]
+    pub passkey_vms_ks: KeyspaceHandle,
+    /// Inbound-messaging consent store (grants + pending requests).
+    pub consent_ks: KeyspaceHandle,
+    /// Per-(platform, context) approver bindings for consent routing.
+    pub consent_approvers_ks: KeyspaceHandle,
+    /// VTA-issued credentials minted via `vta/credentials/issue/0.1` and
+    /// revoked via `vta/credentials/revoke/0.1`. Keyed `cred:<id>`; revoke is a
+    /// tombstone (`revokedAt`), not a delete.
+    pub issued_credentials_ks: KeyspaceHandle,
+    /// Per-context key/value store for AI-agent memory (`vta/memory/{put,list,
+    /// delete}/0.1`). Entries keyed `mem:<contextId>:<key>`; gated on context
+    /// access. Durable user data.
+    pub memory_ks: KeyspaceHandle,
+    /// External accounts (`external/accounts/*`): settings, bindings, state.
+    pub external_accounts_ks: KeyspaceHandle,
+    /// Their wrapped secrets — excluded from backup.
+    pub external_secrets_ks: KeyspaceHandle,
+    /// Per-binding issuance rate for `external/credentials/issue`.
+    pub external_rate: Arc<vta_external::rate::BindingRateLimiter>,
+    /// The operation budgets Trust Tasks are charged against on every
+    /// transport — appliance, per client, unauthenticated
+    /// (`trust_tasks::operation_budget`, VTI-TRN-029). Built from `[server]`
+    /// with the state, so a soft restart picks up a change.
+    pub operation_budget: Arc<crate::trust_tasks::operation_budget::OperationBudget>,
+    /// The hidden-vetting PCS engine (`vta/pcs/*`): vetter and applicant
+    /// engines, their secret state wrapped under the seed-derived KEK.
+    pub pcs_engine_ks: KeyspaceHandle,
+    /// Witnessed sessions in flight (`vta/witness/*`), one record per session —
+    /// see [`crate::keyspaces::WITNESS_SESSIONS`].
+    pub witness_sessions_ks: KeyspaceHandle,
+    /// The notifications held for the principal (`vta/notifications/*`) — see
+    /// [`crate::keyspaces::NOTIFICATIONS`].
+    pub notifications_ks: KeyspaceHandle,
+    /// Collection claims, conflicts and the setting's last applied value — see
+    /// [`crate::keyspaces::COLLECTION`].
+    pub collection_ks: KeyspaceHandle,
+    /// Who collects for each persona DID: the handle the `vta/collection/*`
+    /// handlers and the collector share (`operations::collection`).
+    pub collection: Arc<crate::operations::collection::CollectionControl>,
+    /// The watches armed for the principal's clients (`rooms/keys/watch/0.1`) and the
+    /// connections receiving at their addresses — see
+    /// [`crate::keyspaces::ROOM_KEY_WATCHES`].
+    pub room_key_watches: Arc<crate::operations::room_key_watch::RoomKeyWatches>,
+    /// A member's MLS group for each room they belong to. Group secrets — see
+    /// [`crate::keyspaces::ROOM_GROUPS`].
+    pub room_groups_ks: KeyspaceHandle,
+    /// Invitations already spent joining a room.
+    pub room_invitations_ks: KeyspaceHandle,
+    /// Versioned, namespaced application state (`vta/app-state/*`) — the third
+    /// store, beside the vault and agent memory, for JSON an application owns
+    /// and the VTA does not interpret. Records keyed
+    /// `app:<contextId>:<namespace>:<key>`, with a `appv:` version index and an
+    /// `appc:` per-namespace write counter alongside; gated on context access.
+    /// Durable user data an account's recoverability depends on.
+    pub app_state_ks: KeyspaceHandle,
+    /// The holder's persona store. Encrypted at rest like the vault: these are
+    /// the person's own identity attributes, not application data.
+    pub persona_ks: KeyspaceHandle,
+    /// Per-agent key for the persona correlation index's keyed hash.
+    ///
+    /// Derived beside the at-rest key and never leaving the agent, which is
+    /// what makes the blinded index blinded: the store can answer "does this
+    /// value appear elsewhere" without holding a plaintext index of the
+    /// holder's personal data.
+    pub persona_correlation_key: [u8; 32],
+    /// One lock per `(contextId, namespace)`, serialising the read-modify-write
+    /// sequences the application-state store needs and that the store layer
+    /// cannot make atomic on its own (it serialises individual operations, not
+    /// sequences of them). See `operations::app_state` for why this is sound
+    /// for a single-writer VTA and what it does not cover.
+    pub app_state_locks: crate::operations::app_state::NamespaceLocks,
+    /// The same, for agent memory (`operations::memory`), which keeps its items
+    /// in the application-state layout inside the memory keyspace. A map of its
+    /// own, because the keyspaces differ: an application namespace called
+    /// `memory` and the memory store must not share a lock or a counter.
+    pub memory_locks: crate::operations::app_state::NamespaceLocks,
+    /// Rego policy modules for the Policy Decision Point (`policy/*`). One
+    /// [`crate::policy::PolicyModule`] per id; the active set is every enabled
+    /// row, priority-ordered. A migration-safe baseline is boot-installed if
+    /// empty. Durable operator security config.
+    pub policy_ks: KeyspaceHandle,
+    /// The compiled active policy set, kept until `policy_ks` is written again
+    /// (#2623) — the PDP no longer parses and compiles every module per task.
+    pub policy_cache: Arc<crate::policy::PolicyCache>,
+    /// Task-execution consent: pending approvals + granted consents the PDP's
+    /// `requireConsent` disposition uses. Distinct from `consent_ks` (messaging).
+    pub task_consent_ks: KeyspaceHandle,
+    /// Persisted drain set for the protocol-management feature
+    /// (`docs/05-design-notes/didcomm-protocol-management.md`).
+    /// Keyed by mediator DID; replayed at boot.
+    #[cfg(feature = "webvh")]
+    pub drains_ks: KeyspaceHandle,
+    /// Per-kind previous-config snapshot store for fail-forward
+    /// rollback (spec §3.5a). Populated alongside `drains_ks`.
+    #[cfg(feature = "webvh")]
+    pub snapshot_ks: KeyspaceHandle,
+    /// In-process registry of active + draining mediator listeners.
+    /// Owns the per-listener bounded outbound buffer and the
+    /// active/drain state machine.
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    pub mediator_registry: Arc<crate::messaging::registry::MediatorListenerRegistry>,
+    /// Per-mediator TTL sweeper. Arms a `tokio::time::sleep_until`
+    /// task per drain entry; on expiry, calls
+    /// `record_expiries_persisted` and signals upstream listener
+    /// teardown via the teardown channel.
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    pub drain_sweeper: Arc<crate::messaging::drain_sweeper::DrainSweeper>,
+    /// Pluggable telemetry sink for mediator-attribution events.
+    /// Default impl is the in-memory ring buffer; alternative
+    /// backends plug in via the `TelemetrySink` trait.
+    pub telemetry: vti_common::telemetry::SharedTelemetrySink,
+    pub wrapping_cache: crate::keys::wrapping::WrappingKeyCache,
+    pub config: Arc<RwLock<AppConfig>>,
+    pub seed_store: Arc<dyn SeedStore>,
+    /// The store every keyspace handle above is opened from, and the at-rest
+    /// key they are sealed under. A backup reads *every* keyspace — including
+    /// ones no request path holds a handle to — and a restore is staged into
+    /// the unencrypted `bootstrap` keyspace; see [`Self::backup_target`].
+    pub store: Store,
+    pub storage_encryption_key: Option<[u8; 32]>,
+    pub did_resolver: Option<DIDCacheClient>,
+    /// Live status-list resolver for the present path: when set, the holder
+    /// **re-resolves** a credential's revocation status at present time rather
+    /// than trusting the stored tag (§14.5). `None` falls back to the stored
+    /// status (the pre-live behaviour).
+    pub status_list_resolver: Option<Arc<dyn crate::vault::status::StatusListResolver>>,
+    pub secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    /// Verification-method id for the VTA's signing key (e.g.
+    /// `{did}#key-0`). Populated by `init_auth`. Needed by the
+    /// live mediator-handshake prover to fetch the corresponding
+    /// secret out of [`Self::secrets_resolver`].
+    ///
+    /// **Not feature-gated**, unlike its key-agreement sibling below, because
+    /// the Trust-Task spine signs every success response with it and
+    /// conformance must not depend on which transports were compiled in. A
+    /// `--no-default-features --features rest` build answers the same
+    /// specifications as a full one, and those specifications require a proof
+    /// on the response (SPEC §7.3 item 7).
+    pub signing_vm_id: Option<String>,
+    /// Verification-method id for the VTA's key-agreement key
+    /// (e.g. `{did}#key-1`). Populated by `init_auth`.
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    pub ka_vm_id: Option<String>,
+    /// Outbound seam over the mediator socket. Present for either transport —
+    /// the service it holds multiplexes DIDComm and TSP.
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    pub didcomm_bridge: Arc<DIDCommBridge>,
+
+    /// Learn-from-inbound TSP reachability: which device DIDs were last seen
+    /// sending over TSP, so device-push can prefer TSP over DIDComm for them.
+    /// Populated by the inbound TSP dispatcher from the proven `sender_vid`.
+    #[cfg(feature = "tsp")]
+    pub tsp_reach: Arc<crate::messaging::tsp_reach::TspReachability>,
+    /// Trust Task pushes in flight or recently finished
+    /// (`crate::messaging::push`). Encrypted at rest.
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    pub trust_task_pushes_ks: KeyspaceHandle,
+    /// The delivery layer's outbox, read by the push sweep for evidence.
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    pub outbox_ks: KeyspaceHandle,
+    /// What each push site handed to `crate::messaging::push` (unit tests).
+    #[cfg(all(test, any(feature = "didcomm", feature = "tsp")))]
+    pub push_log: crate::messaging::push::PushLog,
+
+    /// Waiters for replies to Trust Tasks this agent sent.
+    ///
+    /// Read by the dispatch spine before a document is treated as a request —
+    /// see `trust_tasks::pending_replies`. Deliberately **not** feature-gated:
+    /// correlation is a property of the document layer, so the spine consults it
+    /// on every transport. TSP is only the first that needed it.
+    pub pending_replies: crate::trust_tasks::pending_replies::PendingReplies,
+    /// D6 single-flight recovery of §7.2.2 TSP relationships on the outbound send
+    /// path: concurrent sends to one peer coalesce onto one re-invite, and a
+    /// genuinely-down peer is capped rather than invite-flooded. Shared across
+    /// every server-initiated send — they all funnel through
+    /// [`TspTransport::send_to`](crate::messaging::tsp_transport::TspTransport::send_to).
+    /// Design note `tsp-relationship-recovery.md`, D6.
+    #[cfg(feature = "tsp")]
+    pub tsp_recovery: Arc<affinidi_messaging_sdk::RecoveryCoordinator>,
+    /// The durable TSP relationship store, over the (encrypted) `relationships`
+    /// keyspace, for what the ATM's trait object cannot do: stamp a pair's
+    /// last-active time on a successful round trip and read it back (D5), which
+    /// the outbound path uses to re-invite a peer idle long enough to have lost
+    /// its half, and the startup sweep uses to evict. The ATM holds its own
+    /// instance over the same keyspace; neither caches, so they agree.
+    #[cfg(feature = "tsp")]
+    pub tsp_relationships: Arc<crate::messaging::tsp_relationship_store::VtaRelationshipStore>,
+    /// Peers an idle-relationship re-invite is in flight to, so concurrent
+    /// sends produce one invite. Deliberately not `tsp_recovery`: a proactive
+    /// re-invite is not a recovery, and counting it as one would falsify the D8
+    /// recovery metrics.
+    #[cfg(feature = "tsp")]
+    pub tsp_idle_reinvites: crate::operations::outbound::IdleReinvites,
+    pub jwt_keys: Option<Arc<JwtKeys>>,
+    pub atm: Option<ATM>,
+    pub tee: Option<TeeContext>,
+    /// Coordinates a reply-safe soft restart for this generation.
+    pub restart_gate: Arc<RestartGate>,
+    /// Which peer endpoints an outbound Trust-Task REST send may dial
+    /// ([`vta_sdk::http::guard_peer_endpoint`]). The process policy at startup
+    /// (`VTA_ALLOW_PRIVATE_ENDPOINTS`); a test harness whose stand-in peers
+    /// listen on loopback states its own.
+    pub endpoint_policy: vta_sdk::http::EndpointPolicy,
+    /// Prometheus metrics handle for rendering `/metrics` endpoint.
+    #[cfg(feature = "rest")]
+    pub metrics_handle: Option<crate::metrics::PrometheusHandle>,
+}
+
+impl AppState {
+    /// What a backup or a restore needs from this VTA.
+    pub fn backup_access(&self) -> crate::restore::BackupAccess<'_> {
+        crate::restore::BackupAccess {
+            store: &self.store,
+            storage_key: self.storage_encryption_key,
+            in_enclave: self.tee.is_some(),
+            seed_store: self.seed_store.as_ref(),
+            config: &self.config,
+        }
+    }
+
+    /// The accepted-document-id record over [`Self::accepted_ids_ks`]: the one
+    /// every binding claims a document's `id` in before executing it.
+    pub fn accepted_ids(&self) -> vti_trust_task_server::StoreAcceptedIds {
+        vti_trust_task_server::StoreAcceptedIds::new(self.accepted_ids_ks.clone())
+    }
+
+    /// The resolver Trust Task Data-Integrity proofs are verified with.
+    ///
+    /// Carries the configured DID cache, so a proof by any DID that names a key
+    /// — `did:webvh:<scid>:example.com:glenn#key-0` as much as a `did:key` —
+    /// resolves. With no cache configured this degrades to `did:key` only,
+    /// which is what a deployment with no outbound DID resolution gets.
+    pub fn trust_task_vm_resolver(&self) -> vti_common::auth::TrustTaskVmResolver {
+        vti_common::auth::TrustTaskVmResolver::from_optional(self.did_resolver.clone())
+    }
+
+    /// The one transport every TSP operation goes through, or `None` when this
+    /// node has no live mediator session.
+    ///
+    /// Sending, sealing and unsealing all need the same ATM + mediator-bearing
+    /// profile, and getting that pair from anywhere else is how this VTA came to
+    /// answer over TSP while being unable to initiate. See
+    /// [`TspTransport`](crate::messaging::tsp_transport::TspTransport) for the
+    /// invariant and for what a mediator-less profile actually does.
+    #[cfg(feature = "tsp")]
+    pub fn tsp_transport(&self) -> Option<crate::messaging::tsp_transport::TspTransport> {
+        crate::messaging::tsp_transport::TspTransport::from_app_state(self)
+    }
+}
+
+impl AuthState for AppState {
+    fn jwt_keys(&self) -> Option<&Arc<JwtKeys>> {
+        self.jwt_keys.as_ref()
+    }
+    fn sessions_ks(&self) -> &KeyspaceHandle {
+        &self.sessions_ks
+    }
+}
+
+/// Run-path-specific shared components injected into [`build_app_state`].
+///
+/// The full server path (`run()`) builds these *before* the `AppState` because
+/// it needs them for drain replay and the teardown-channel consumer, and they
+/// must be the live wiring rather than the inert defaults. Non-axum front-ends
+/// (Lambda, offline CLI) pass [`AppStateParts::default`] and `build_app_state`
+/// fills in self-contained defaults: a fresh telemetry ring buffer + registry,
+/// a drain sweeper whose teardown signals go nowhere, a placeholder DIDComm
+/// bridge, and no metrics handle.
+///
+/// Injecting these (rather than letting `run()` assemble its own `AppState`
+/// literal) keeps `build_app_state` the single `AppState` constructor — one
+/// config `RwLock`, one `init_auth` — so the REST
+/// and DIDComm transports can't diverge (P1.1).
+/// **`#[non_exhaustive]` for the same reason [`AppState`] carries it** (#1024),
+/// and the gap that motivated adding it here was found the same way: a field
+/// addition landing as a source-breaking change nobody had labelled.
+///
+/// Every field is public with no private field and no constructor guard, so
+/// before this attribute any crate could write an `AppStateParts { .. }`
+/// literal — including the functional-update form — which made *adding a
+/// field* break them under `constructible_struct_adds_field`. That is not
+/// hypothetical: #1049 added `audit_sink` and #1051 nearly added
+/// `app_state_locks` before the break was noticed and routed around.
+///
+/// Construction inside this crate is unaffected. Outside it, `Default` plus
+/// field assignment replaces the literal:
+///
+/// ```ignore
+/// let mut parts = AppStateParts::default();
+/// parts.audit_sink = Some(sink);
+/// ```
+///
+/// which is what this crate's own integration tests now do — they are separate
+/// crates, so they were the first thing the attribute broke, and they are a
+/// fair proxy for what a consumer has to change.
+#[derive(Default)]
+#[non_exhaustive]
+pub struct AppStateParts {
+    /// Telemetry sink shared with the mediator registry. `None` → fresh ring buffer.
+    pub telemetry: Option<vti_common::telemetry::SharedTelemetrySink>,
+    /// Audit sink. `None` → the `audit` keyspace, i.e. what the VTA has always
+    /// done. An operator wiring tamper-evidence supplies one here — typically a
+    /// `FanOutAuditSink` keeping the keyspace so the query API goes on working.
+    pub audit_sink: Option<vta_audit::SharedAuditSink>,
+    /// Live mediator listener registry. `None` → fresh registry over `telemetry`.
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    pub mediator_registry: Option<Arc<crate::messaging::registry::MediatorListenerRegistry>>,
+    /// Drain sweeper wired to a real teardown channel. `None` → dead-channel no-op sweeper.
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    pub drain_sweeper: Option<Arc<crate::messaging::drain_sweeper::DrainSweeper>>,
+    /// Outbound mediator bridge. `None` → placeholder (no live service).
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    pub didcomm_bridge: Option<Arc<DIDCommBridge>>,
+    /// Peer endpoint policy for outbound sends. `None` →
+    /// [`vta_sdk::http::EndpointPolicy::process_default`].
+    pub endpoint_policy: Option<vta_sdk::http::EndpointPolicy>,
+    /// Prometheus handle for `/metrics`. `None` → no metrics rendering.
+    #[cfg(feature = "rest")]
+    pub metrics_handle: Option<crate::metrics::PrometheusHandle>,
+}
+
+/// Build the shared application state from config, store, and TEE context.
+///
+/// This is the **single** `AppState` constructor. The server path (`run()`)
+/// injects its live shared components via `parts` and then derives the
+/// DIDComm-transport `VtaState` from the returned `AppState` (so both
+/// transports share the same Arcs); non-axum front-ends (e.g., Lambda handlers)
+/// pass `AppStateParts::default()` and manage their own request loop.
+pub async fn build_app_state(
+    config: AppConfig,
+    store: &Store,
+    seed_store: Arc<dyn SeedStore>,
+    storage_encryption_key: Option<[u8; 32]>,
+    tee_context: Option<TeeContext>,
+    restart_tx: watch::Sender<bool>,
+    parts: AppStateParts,
+) -> Result<AppState, AppError> {
+    // Parse the configured IACA roots once, here, so a malformed certificate
+    // fails the boot rather than surfacing as a puzzling rejection on the first
+    // mdoc that arrives. Empty is legal and means "this VTA accepts no mdoc
+    // issuers" — the resolver fails closed on it.
+    let mdoc_trust = Arc::new(vta_vault::mdoc_trust::IacaTrustAnchors::from_pem(
+        &config.vault.mdoc_iaca_trust_anchors,
+    )?);
+
+    let apply_encryption = |ks: KeyspaceHandle| -> KeyspaceHandle {
+        if let Some(key) = storage_encryption_key {
+            ks.with_encryption(key)
+        } else {
+            ks
+        }
+    };
+
+    let restart_gate = Arc::new(RestartGate::new(restart_tx));
+
+    let keys_ks = apply_encryption(store.keyspace(crate::keyspaces::KEYS)?);
+    let sessions_ks = apply_encryption(store.keyspace(crate::keyspaces::SESSIONS)?);
+    let acl_ks = apply_encryption(store.keyspace(crate::keyspaces::ACL)?);
+    let contexts_ks = apply_encryption(store.keyspace(crate::keyspaces::CONTEXTS)?);
+    let did_templates_ks = apply_encryption(store.keyspace(crate::keyspaces::DID_TEMPLATES)?);
+    let audit_ks = apply_encryption(store.keyspace(crate::keyspaces::AUDIT)?);
+    let audit_key_ks = apply_encryption(store.keyspace(crate::keyspaces::AUDIT_KEY)?);
+    let imported_ks = apply_encryption(store.keyspace(crate::keyspaces::IMPORTED_SECRETS)?);
+    let internal_ks = apply_encryption(store.keyspace(crate::keyspaces::INTERNAL_KEYS)?);
+    let vault_ks = apply_encryption(store.keyspace(crate::keyspaces::VAULT)?);
+    // Persistent runtime state for service enable/disable. Encrypted because
+    // a couple of bool records are cheap and the keyspace may grow.
+    let service_state_ks = apply_encryption(store.keyspace(crate::keyspaces::SERVICE_STATE)?);
+    // Sealed-transfer anti-replay store. Bundle_ids are not secret and the
+    // row is a one-byte sentinel, so the keyspace is intentionally
+    // unencrypted — saves a decrypt hop on every request.
+    let sealed_nonces_ks = apply_encryption(store.keyspace(crate::keyspaces::SEALED_NONCES)?);
+    // Trust-Task idempotency records. Encrypted like every other keyspace that
+    // may hold response bodies — a `Keyed` record carries the original response
+    // verbatim, which is caller data even when it is not secret material.
+    let idempotency_ks = apply_encryption(store.keyspace(crate::keyspaces::IDEMPOTENCY)?);
+    // The accepted-document-id record. Encrypted for the same reason: a row
+    // carries the first execution's response.
+    let accepted_ids_ks = apply_encryption(store.keyspace(crate::keyspaces::ACCEPTED_IDS)?);
+    let backup_bundles_ks = apply_encryption(store.keyspace(crate::keyspaces::BACKUP_BUNDLES)?);
+    // Stage `.vtabak` blobs under `{data_dir}/backups`. Created lazily
+    // by the op layer at first `initiate-*` call (so a VTA that never
+    // does backups doesn't get an empty directory). See
+    // `docs/05-design-notes/backup-descriptor-pattern.md` §"State
+    // machine" for the file-system layout.
+    let backup_blob_dir = config.store.data_dir.join("backups");
+    #[cfg(feature = "webvh")]
+    let webvh_ks = apply_encryption(store.keyspace(crate::keyspaces::WEBVH)?);
+    let webs_ks = apply_encryption(store.keyspace(crate::keyspaces::WEBS)?);
+    #[cfg(feature = "webvh")]
+    let passkey_vms_ks = apply_encryption(store.keyspace(crate::keyspaces::PASSKEY_VMS)?);
+    let consent_ks = apply_encryption(store.keyspace(crate::keyspaces::CONSENT)?);
+    let consent_approvers_ks =
+        apply_encryption(store.keyspace(crate::keyspaces::CONSENT_APPROVERS)?);
+    let issued_credentials_ks =
+        apply_encryption(store.keyspace(crate::keyspaces::ISSUED_CREDENTIALS)?);
+    let memory_ks = apply_encryption(store.keyspace(crate::keyspaces::MEMORY)?);
+    let external_accounts_ks =
+        apply_encryption(store.keyspace(crate::keyspaces::EXTERNAL_ACCOUNTS)?);
+    // Provider secrets, wrapped under the seed-derived KEK on top of the
+    // keyspace's own at-rest encryption.
+    let external_secrets_ks = apply_encryption(store.keyspace(crate::keyspaces::EXTERNAL_SECRETS)?);
+    // PCS engine state: wrapped under the seed-derived KEK, like the provider
+    // secrets above, on top of the keyspace's own at-rest encryption.
+    let pcs_engine_ks = apply_encryption(store.keyspace(crate::keyspaces::PCS_ENGINE)?);
+    // Witnessed sessions: a session record holds the session document, which names
+    // both relationship DIDs — encrypted at rest like the rest of the vault's state.
+    let witness_sessions_ks = apply_encryption(store.keyspace(crate::keyspaces::WITNESS_SESSIONS)?);
+    // Held notifications: each names who the principal belongs to, so it is
+    // encrypted at rest like the vault.
+    let notifications_ks = apply_encryption(store.keyspace(crate::keyspaces::NOTIFICATIONS)?);
+    let collection_ks = apply_encryption(store.keyspace(crate::keyspaces::COLLECTION)?);
+    // Watches: each record holds its address's private keys.
+    let room_key_watches_ks = apply_encryption(store.keyspace(crate::keyspaces::ROOM_KEY_WATCHES)?);
+    // Encrypted alongside the key store where a TEE deployment provides a storage key: a
+    // group snapshot decrypts every record its room holds, which is the same class of
+    // material as a derived key and deserves the same treatment.
+    let room_groups_ks = apply_encryption(store.keyspace(crate::keyspaces::ROOM_GROUPS)?);
+    let room_invitations_ks = apply_encryption(store.keyspace(crate::keyspaces::ROOM_INVITATIONS)?);
+    let app_state_ks = apply_encryption(store.keyspace(crate::keyspaces::APP_STATE)?);
+    let persona_ks = apply_encryption(store.keyspace(crate::keyspaces::PERSONA)?);
+    // Domain-separated from the at-rest key so that compromise of one does not
+    // hand over the other.
+    let persona_correlation_key = crate::restore::persona_correlation_key(storage_encryption_key);
+    let policy_ks = apply_encryption(store.keyspace(crate::keyspaces::POLICY)?);
+    let task_consent_ks = apply_encryption(store.keyspace(crate::keyspaces::TASK_CONSENT)?);
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    let trust_task_pushes_ks =
+        apply_encryption(store.keyspace(crate::keyspaces::TRUST_TASK_PUSHES)?);
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    let outbox_ks = apply_encryption(store.keyspace(crate::keyspaces::OUTBOX)?);
+    #[cfg(feature = "webvh")]
+    let drains_ks = apply_encryption(store.keyspace(crate::keyspaces::DRAINS)?);
+    #[cfg(feature = "webvh")]
+    let snapshot_ks =
+        apply_encryption(store.keyspace(crate::operations::protocol::snapshot::KEYSPACE_NAME)?);
+
+    // Finish any key rotation a crash interrupted between its log write and its
+    // promotion — before the VTA loads its own keys, which a rotation of its own
+    // DID may have replaced. A failure here must not become a boot loop: the
+    // staging records are inert and the next boot retries.
+    #[cfg(feature = "webvh")]
+    match crate::operations::did_webvh::recover_staged_rotations(&keys_ks, &webvh_ks).await {
+        Ok(report) if report == Default::default() => {}
+        Ok(report) => warn!(?report, "recovered interrupted did:webvh key rotations"),
+        Err(e) => warn!(error = %e, "could not recover interrupted did:webvh key rotations"),
+    }
+
+    // A staged did:webs rotation is finished by publishing it again, which
+    // needs its host: the next write to the DID does that before anything
+    // else (vta/webs/dids, CONVENTIONS §6). Say which are waiting.
+    #[cfg(feature = "webs")]
+    match crate::operations::did_webs::staged_webs_rotations(&webs_ks).await {
+        Ok(dids) if dids.is_empty() => {}
+        Ok(dids) => warn!(
+            ?dids,
+            "did:webs rotations are staged and not yet published; each completes on its \
+             next update, rotation or deletion"
+        ),
+        Err(e) => warn!(error = %e, "could not read staged did:webs rotations"),
+    }
+
+    let auth = init_auth(
+        &config,
+        &*seed_store,
+        &keys_ks,
+        #[cfg(feature = "webvh")]
+        Some(&webvh_ks),
+        #[cfg(not(feature = "webvh"))]
+        None,
+        Some(&webs_ks),
+    )
+    .await;
+
+    // Every entry states its purposes before anything is served (VTI-ACL-101):
+    // an entry written before they existed is rewritten with `any`, the
+    // authority it already held. A row that cannot be rewritten still reads as
+    // `any`, so a failure here is logged rather than fatal.
+    match vti_common::acl::state_purposes_on_every_entry(&acl_ks).await {
+        Ok(0) => {}
+        Ok(n) => info!(
+            rewritten = n,
+            "ACL entries now state purposes: any (VTI-ACL-101)"
+        ),
+        Err(e) => warn!(error = %e, "ACL entries not rewritten with their purposes"),
+    }
+
+    // The did:scid identities this VTA authorises resolve by their bare DID,
+    // and refuse a log older than one verified before, from the first request
+    // after a restart (VTI-KEY-162).
+    if let Some(resolver) = auth.did_resolver.as_ref() {
+        match vti_common::scid_floors::seed(&acl_ks, resolver).await {
+            Ok(0) => {}
+            Ok(n) => info!(seeded = n, "did:scid floors seeded from the store"),
+            Err(e) => warn!(error = %e, "did:scid floors not seeded"),
+        }
+    }
+
+    // Telemetry sink: reuse the run-path's live sink when injected, else a
+    // fresh ring buffer for non-axum front-ends.
+    let telemetry: vti_common::telemetry::SharedTelemetrySink = parts
+        .telemetry
+        .unwrap_or_else(|| Arc::new(vti_common::telemetry::RingBufferTelemetry::new()));
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    let mediator_registry = parts.mediator_registry.unwrap_or_else(|| {
+        Arc::new(crate::messaging::registry::MediatorListenerRegistry::new(
+            Arc::clone(&telemetry),
+        ))
+    });
+    // The full `run()` path injects a sweeper whose teardown receiver is
+    // consumed by a real task that calls `DIDCommService::remove_listener`.
+    // Non-axum front-ends (e.g. Lambda) that don't run a teardown consumer get
+    // a sweeper whose channel sender goes nowhere, so signals become no-ops.
+    #[cfg(all(feature = "webvh", feature = "didcomm"))]
+    let drain_sweeper = parts.drain_sweeper.unwrap_or_else(|| {
+        let (tx, _rx) = crate::messaging::drain_sweeper::teardown_channel(
+            crate::messaging::drain_sweeper::DEFAULT_TEARDOWN_CHANNEL_CAPACITY,
+        );
+        Arc::new(crate::messaging::drain_sweeper::DrainSweeper::new(
+            Arc::clone(&mediator_registry),
+            drains_ks.clone(),
+            tx,
+        ))
+    });
+
+    // Default sink = the audit keyspace, i.e. unchanged behaviour. A caller
+    // that supplied its own keeps the keyspace handle too (`audit_ks` above),
+    // because reads and retention deliberately do not route through the sink.
+    let audit_sink: vta_audit::SharedAuditSink = parts
+        .audit_sink
+        .unwrap_or_else(|| vta_audit::shared_chained_sink(audit_ks.clone(), audit_key_ks.clone()));
+
+    let state = AppState {
+        keys_ks,
+        sessions_ks,
+        acl_ks,
+        contexts_ks,
+        did_templates_ks,
+        audit_ks,
+        audit_sink,
+        imported_ks,
+        internal_ks,
+        vault_ks,
+        service_state_ks,
+        sealed_nonces_ks,
+        idempotency_ks,
+        accepted_ids_ks,
+        backup_bundles_ks,
+        backup_blob_dir,
+        #[cfg(feature = "webvh")]
+        webvh_ks,
+        webs_ks,
+        #[cfg(feature = "webvh")]
+        passkey_vms_ks,
+        consent_ks,
+        consent_approvers_ks,
+        issued_credentials_ks,
+        memory_ks,
+        external_accounts_ks,
+        external_secrets_ks,
+        external_rate: Arc::new(vta_external::rate::BindingRateLimiter::new()),
+        operation_budget: Arc::new(
+            crate::trust_tasks::operation_budget::OperationBudget::from_config(&config.server),
+        ),
+        pcs_engine_ks,
+        witness_sessions_ks,
+        notifications_ks,
+        collection_ks,
+        collection: Arc::new(crate::operations::collection::CollectionControl::new(
+            config.collection.suspend,
+        )),
+        room_key_watches: Arc::new(crate::operations::room_key_watch::RoomKeyWatches::new(
+            room_key_watches_ks,
+        )),
+        room_groups_ks,
+        room_invitations_ks,
+        app_state_ks,
+        persona_ks,
+        persona_correlation_key,
+        app_state_locks: crate::operations::app_state::NamespaceLocks::default(),
+        memory_locks: crate::operations::app_state::NamespaceLocks::default(),
+        policy_ks,
+        policy_cache: Arc::new(crate::policy::PolicyCache::new()),
+        task_consent_ks,
+        #[cfg(feature = "webvh")]
+        drains_ks,
+        #[cfg(feature = "webvh")]
+        snapshot_ks,
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        mediator_registry,
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        drain_sweeper,
+        telemetry,
+        wrapping_cache: crate::keys::wrapping::WrappingKeyCache::new(),
+        mdoc_trust,
+        config: Arc::new(RwLock::new(config)),
+        seed_store,
+        store: store.clone(),
+        storage_encryption_key,
+        did_resolver: auth.did_resolver.clone(),
+        status_list_resolver: crate::vault::status::default_status_resolver(auth.did_resolver),
+        secrets_resolver: auth.secrets_resolver,
+        signing_vm_id: auth.signing_vm_id,
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        ka_vm_id: auth.ka_vm_id,
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        didcomm_bridge: parts
+            .didcomm_bridge
+            .unwrap_or_else(|| Arc::new(DIDCommBridge::placeholder())),
+        #[cfg(feature = "tsp")]
+        tsp_reach: Arc::new(crate::messaging::tsp_reach::TspReachability::new()),
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        trust_task_pushes_ks,
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        outbox_ks,
+        #[cfg(all(test, any(feature = "didcomm", feature = "tsp")))]
+        push_log: Default::default(),
+        pending_replies: crate::trust_tasks::pending_replies::PendingReplies::new(),
+        #[cfg(feature = "tsp")]
+        tsp_recovery: Arc::new(affinidi_messaging_sdk::RecoveryCoordinator::new(
+            affinidi_messaging_sdk::BackoffPolicy::default(),
+        )),
+        #[cfg(feature = "tsp")]
+        tsp_relationships: vti_common::relationship_store::build_relationship_store(
+            apply_encryption(store.keyspace(crate::keyspaces::RELATIONSHIPS)?),
+        ),
+        #[cfg(feature = "tsp")]
+        tsp_idle_reinvites: Default::default(),
+        jwt_keys: auth.jwt_keys,
+        atm: auth.atm,
+        tee: tee_context,
+        restart_gate,
+        endpoint_policy: parts
+            .endpoint_policy
+            .unwrap_or_else(vta_sdk::http::EndpointPolicy::process_default),
+        #[cfg(feature = "rest")]
+        metrics_handle: parts.metrics_handle,
+    };
+    #[cfg(any(feature = "didcomm", feature = "tsp"))]
+    if let (Some(resolver), Some(vm_id)) = (&state.secrets_resolver, &state.signing_vm_id) {
+        state
+            .didcomm_bridge
+            .set_document_signer(resolver.clone(), vm_id.clone());
+    }
+    Ok(state)
+}
+
+/// Whether this build can **receive** TSP. One definition, so the startup check
+/// and `enable_tsp` cannot disagree about it. It lives here rather than beside
+/// `enable_tsp` because `operations::protocol` is compiled only under `webvh`,
+/// and the startup check has to run in every build, including those built
+/// without `tsp`.
+pub(crate) const TSP_BUILT: bool = cfg!(feature = "tsp");
+
+/// Why a `services.tsp = true` setting cannot be honoured by a build, if it
+/// cannot (Keyring VTI-34). Pure, and parameterised on the build, so both
+/// answers are testable from one build — `cfg!` alone would only ever exercise
+/// whichever branch the test binary was compiled with.
+pub(crate) fn tsp_configured_but_unbuilt(configured: bool, built: bool) -> Option<&'static str> {
+    (configured && !built).then_some(
+        "services.tsp is true, but this VTA was built without the `tsp` feature, so it \
+         cannot receive TSP. Rebuild with `--features tsp`, or set `services.tsp = false` \
+         (and `pnm services tsp disable` if `#tsp` was already published).",
+    )
+}
+
+/// Whether any transport will actually serve: REST, DIDComm or TSP, each built
+/// and enabled. TSP counts on its own (#937): its receive rides the mediator
+/// socket the connect supervisor opens for `services.didcomm || services.tsp`,
+/// so a TSP-only VTA is a complete one. `tsp_configured_but_unbuilt` has
+/// already refused a TSP setting the build cannot honour, but the `TSP_BUILT`
+/// AND keeps this answer right on its own.
+pub(crate) fn any_transport_enabled(services: &vta_config::ServicesConfig) -> bool {
+    cfg!(feature = "rest") && services.rest
+        || cfg!(feature = "didcomm") && services.didcomm
+        || TSP_BUILT && services.tsp
+}
+
+// `config` is only mutated when the `webvh` feature is on (mirror of
+// runtime-state into the in-memory `config.services`). Allow the lint
+// in other feature combos so `cargo check -D warnings` stays clean.
+#[cfg_attr(not(feature = "webvh"), allow(unused_mut))]
+pub async fn run(
+    mut config: AppConfig,
+    store: Store,
+    seed_store: Arc<dyn SeedStore>,
+    storage_encryption_key: Option<[u8; 32]>,
+    tee_context: Option<TeeContext>,
+    allow_degraded: bool,
+    // Recovery: when set (via `--flush-queues`), purge BOTH this DID's mediator
+    // inbox and its outbound (sender) queue before going live. The outbound
+    // purge is the piece the config-driven `drain_inbox_on_start` can't do — a
+    // message loop can fill the sender queue at the mediator (`limits.queue.
+    // sender`) so no new sends get through until it's cleared.
+    // Consumed by the DIDComm outbox/inbox drain below; a REST-only build has
+    // no queues to flush but keeps the parameter so callers are unconditional.
+    #[cfg_attr(not(feature = "didcomm"), allow(unused_variables))] flush_queues: bool,
+) -> Result<(), AppError> {
+    // Fail fast on a broken config rather than booting a half-started
+    // service that passes a port-liveness check but can't function (P0.9).
+    config.validate()?;
+
+    // Refuse to boot on a store an older build left half-imported (P0.5). That
+    // import rewrote the live store in place behind this sentinel. Imports now
+    // stage the restore and apply it at boot — the stage is its own crash marker
+    // (`vta_support::restore_stage`) — but a store written by the old path must
+    // still not be served.
+    {
+        let keys_ks_boot = {
+            let ks = store.keyspace(crate::keyspaces::KEYS)?;
+            match storage_encryption_key {
+                Some(key) => ks.with_encryption(key),
+                None => ks,
+            }
+        };
+        if keys_ks_boot
+            .get_raw(crate::operations::backup::IMPORT_IN_PROGRESS_KEY)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::Internal(
+                "a previous backup import did not complete — the store is in a \
+                 half-imported, inconsistent state. Re-run the import to restore a \
+                 consistent snapshot before starting the VTA."
+                    .into(),
+            ));
+        }
+    }
+
+    // Open the runtime-state keyspace once up front so the boot decisions
+    // below can read it (and the migration can seed it from the legacy
+    // `[services]` block on first boot post-upgrade). Same encryption policy
+    // as the rest of the keyspaces.
+    let boot_service_state_ks = {
+        let ks = store.keyspace(crate::keyspaces::SERVICE_STATE)?;
+        match storage_encryption_key {
+            Some(key) => ks.with_encryption(key),
+            None => ks,
+        }
+    };
+    // Runtime-state-to-fjall migration + read-back lives in
+    // `operations::protocol`, which is `#[cfg(feature = "webvh")]`-
+    // gated (the protocol-management surface that owns service
+    // toggles only exists in webvh builds). Without webvh the
+    // boot path falls back to reading `config.services.*` directly
+    // from `config.toml` — the legacy behaviour, still useful for
+    // headless / secrets-only builds in the CI feature-combos
+    // matrix.
+    #[cfg(feature = "webvh")]
+    {
+        crate::operations::protocol::runtime_state::migrate_from_config(
+            &boot_service_state_ks,
+            &config,
+        )
+        .await?;
+
+        // Runtime state in fjall is authoritative; mirror it into the in-memory
+        // `config.services` so the existing readers across the codebase keep
+        // working unchanged. The on-disk `config.toml` [services] block is now
+        // legacy (consumed only by the first-boot migration above).
+        config.services.rest =
+            crate::operations::protocol::runtime_state::is_rest_enabled(&boot_service_state_ks)
+                .await?;
+        config.services.didcomm =
+            crate::operations::protocol::runtime_state::is_didcomm_enabled(&boot_service_state_ks)
+                .await?;
+        // TSP too: `pnm services tsp {enable,disable}` writes only the runtime
+        // state, so without this a restart forgot it, and a TSP-only VTA was
+        // judged by whatever `config.toml` last said.
+        config.services.tsp =
+            crate::operations::protocol::runtime_state::is_tsp_enabled(&boot_service_state_ks)
+                .await?;
+    }
+    #[cfg(not(feature = "webvh"))]
+    {
+        let _ = &boot_service_state_ks;
+    }
+
+    // Reconcile the retired-seed archive (P0.7b): migrate any legacy plaintext
+    // archive to ciphertext under the active seed, and repair any archive left
+    // under a predecessor's KEK by an interrupted rotation. Idempotent and a
+    // no-op for a never-rotated VTA (the overwhelmingly common case). Runs once
+    // per process, before the restart loop. Failure is non-fatal — log and
+    // continue (a stale/legacy archive is still readable via the load path).
+    {
+        let keys_ks_boot = {
+            let ks = store.keyspace(crate::keyspaces::KEYS)?;
+            match storage_encryption_key {
+                Some(key) => ks.with_encryption(key),
+                None => ks,
+            }
+        };
+        match crate::keys::seeds::reconcile_archive(&keys_ks_boot, &*seed_store).await {
+            Ok(0) => {}
+            Ok(n) => info!(rewritten = n, "seed archive reconciled at boot"),
+            Err(e) => warn!(error = %e, "seed archive reconcile failed — continuing"),
+        }
+    }
+
+    // TEE anti-rollback anchor (P0.2). Verify the MAC'd integrity manifest
+    // (Layer 0, P0.2a) plus the external monotonic counter (P0.2b) against the
+    // live store, install the runtime sealer, and fail closed on a covered
+    // singleton deleted / replayed / rolled back. Gated on a KMS storage key
+    // (i.e. a real TEE); a `None` key is the non-TEE path with no
+    // untrusted-parent threat. Security-critical, so a failure aborts the boot.
+    #[cfg(feature = "tee")]
+    if let Some(storage_key) = storage_encryption_key
+        && let Some(kms) = config.tee.kms.as_ref()
+    {
+        let enc = |name: &str| -> Result<KeyspaceHandle, AppError> {
+            Ok(store.keyspace(name)?.with_encryption(storage_key))
+        };
+        // Build the external counter when configured. It is keyed by the VTA
+        // DID; without an identity there is nothing to key on, so fall back to
+        // manifest-only (P0.2a) with a warning.
+        let anchor = crate::restore::build_anchor_counter(kms, config.vta_did.as_deref()).await?;
+        // A restore applied at this boot replaced the store the manifest
+        // describes, and left an instruction (in the encrypted `keys` keyspace,
+        // so the parent cannot forge one) to re-baseline it — bound to the
+        // anti-rollback version the restore reserved when it was committed.
+        let restore_target = vta_backup::BackupTarget {
+            store: &store,
+            storage_key: Some(storage_key),
+            environment: vta_sdk::protocols::backup_management::types::BackupEnvironment::Tee,
+        };
+        if let Some(marker) = vta_backup::restore::read_rebaseline_marker(&restore_target).await? {
+            let reserved = match &marker.anchor {
+                Some(binding) if Some(binding.did.as_str()) == config.vta_did.as_deref() => {
+                    Some(binding.version)
+                }
+                Some(binding) => {
+                    return Err(AppError::Internal(format!(
+                        "restore {} reserved the anti-rollback counter of {}, but this enclave                          runs as {} — refusing to re-baseline",
+                        marker.restore_id,
+                        binding.did,
+                        config.vta_did.as_deref().unwrap_or("no DID")
+                    )));
+                }
+                None => None,
+            };
+            let version = vti_common::integrity::rebaseline_after_restore(
+                vti_common::integrity::derive_mac_key(&storage_key),
+                enc("keys")?,
+                store.keyspace(crate::keyspaces::BOOTSTRAP)?,
+                enc("acl")?,
+                enc("contexts")?,
+                anchor.clone(),
+                reserved,
+            )
+            .await?;
+            vta_backup::restore::clear_rebaseline_marker(&restore_target).await?;
+            info!(
+                restore_id = %marker.restore_id,
+                version,
+                "integrity manifest re-baselined over the restored store"
+            );
+        }
+        let outcome = vti_common::integrity::boot_verify_and_install(
+            vti_common::integrity::derive_mac_key(&storage_key),
+            enc("keys")?,
+            store.keyspace(crate::keyspaces::BOOTSTRAP)?, // unencrypted, KMS-protected
+            enc("acl")?,
+            enc("contexts")?,
+            anchor,
+            kms.allow_anchor_init,
+            kms.allow_unanchored,
+        )
+        .await?;
+        info!(?outcome, "TEE anti-rollback anchor checked");
+    }
+
+    // Determine which services will actually start (feature flag AND
+    // persisted runtime state, the latter set by `pnm services {kind}
+    // {enable,disable}`).
+    let rest_enabled = cfg!(feature = "rest") && config.services.rest;
+
+    // `services.tsp` gets no silent `cfg!` AND like `rest_enabled` above, on
+    // purpose. REST and DIDComm default to `true`, so a reduced build
+    // (`--no-default-features --features rest`, which CI runs) depends on the
+    // AND quietly dropping a transport it was never built with. `services.tsp`
+    // defaults to `false` in a config, so `tsp = true` is always written on
+    // purpose — by an operator, or by setup on a build that has the feature —
+    // and on a build without it the setting was accepted and did nothing, while
+    // anything that had published `#tsp` sent peers into a transport no one
+    // was listening on (Keyring VTI-34). Refusing to start is the only honest
+    // answer to a setting the build cannot honour.
+    if let Some(reason) = tsp_configured_but_unbuilt(config.services.tsp, TSP_BUILT) {
+        return Err(AppError::Config(reason.into()));
+    }
+
+    if !any_transport_enabled(&config.services) {
+        return Err(AppError::Config(
+            "no services enabled — enable at least one of REST, DIDComm or TSP \
+             (compile-time feature flags + `pnm services {kind} enable`)"
+                .into(),
+        ));
+    }
+
+    // Decide where REST listens before anything binds (VTA_REST_VSOCK_PORT,
+    // set by the Nitro entrypoint). A malformed or unservable setting refuses
+    // the boot: falling back to TCP would leave an enclave with no reachable
+    // API and no error, since nothing forwards to its loopback port.
+    //
+    // Either listener binds once here and persists across soft restarts: each
+    // REST thread generation gets a clone. Rebinding per generation would race
+    // the previous thread, which `/vta/restart` does not join, for the port
+    // (EADDRINUSE would end the process). The REST thread reports back whether
+    // it could adopt its clone before the boot goes on.
+    #[cfg(feature = "rest")]
+    let std_listener = if rest_enabled {
+        let raw = std::env::var_os(REST_VSOCK_PORT_ENV).map(|v| v.to_string_lossy().into_owned());
+        match rest_ingress_mode(raw.as_deref()).map_err(AppError::Config)? {
+            RestIngressMode::Tcp => {
+                let addr = format!("{}:{}", config.server.host, config.server.port);
+                let listener = std::net::TcpListener::bind(&addr).map_err(AppError::Io)?;
+                listener.set_nonblocking(true).map_err(AppError::Io)?;
+                info!("server listening addr={addr}");
+                Some(RestListener::Tcp(listener))
+            }
+            #[cfg(feature = "vsock-store")]
+            RestIngressMode::Vsock(port) => {
+                let listener =
+                    vsock::VsockListener::bind_with_cid_port(vsock::VMADDR_CID_ANY, port).map_err(
+                        |e| {
+                            AppError::Config(format!(
+                                "REST vsock listener on port {port} could not be opened: {e}"
+                            ))
+                        },
+                    )?;
+                info!(
+                    port,
+                    parent_cid = vti_common::store::vsock::PARENT_CID,
+                    "REST listening on vsock, parent only; no TCP listener is opened"
+                );
+                Some(RestListener::Vsock(listener))
+            }
+        }
+    } else {
+        None
+    };
+
+    // Install the Prometheus recorder once per process (persists across
+    // soft restarts, same as the TCP listener above). The global recorder
+    // can only be set once — installing it inside the restart loop panics
+    // the REST thread on the second iteration with FailedToSetGlobalRecorder.
+    // The handle is cloned into each iteration's AppState below.
+    #[cfg(feature = "rest")]
+    let metrics_handle = if rest_enabled {
+        Some(crate::metrics::install())
+    } else {
+        None
+    };
+
+    // ── Restart loop ──────────────────────────────────────────────
+    // Each iteration starts all service threads, waits for shutdown
+    // or restart signal, tears everything down, then either exits
+    // or loops back to re-initialize with updated state.
+    loop {
+        // The pre-loop guard above cannot re-run — the listener and the metrics
+        // recorder are bound once per process — so a reload that leaves nothing
+        // enabled is reported rather than fatal. Killing a VTA that is already
+        // serving, over an edited file, is the worse failure.
+        if !any_transport_enabled(&config.services) {
+            warn!(
+                "no services enabled — this VTA is running with no transport; \
+                 enable one with `pnm services {{kind}} enable`"
+            );
+        }
+
+        // Keyspace handles `run()` needs directly: the storage-thread inputs
+        // (un-gated, so the storage thread compiles in every feature combo) and
+        // the drain set (webvh — needed for boot replay + the sweeper, which
+        // are built before `AppState` exists). Every other keyspace is opened
+        // by `build_app_state`, the single `AppState` constructor (P1.1).
+        let apply_encryption = |ks: KeyspaceHandle| -> KeyspaceHandle {
+            match storage_encryption_key {
+                Some(key) => ks.with_encryption(key),
+                None => ks,
+            }
+        };
+        let sessions_ks = apply_encryption(store.keyspace(crate::keyspaces::SESSIONS)?);
+        let acl_ks = apply_encryption(store.keyspace(crate::keyspaces::ACL)?);
+        let audit_ks = apply_encryption(store.keyspace(crate::keyspaces::AUDIT)?);
+        let audit_key_ks = apply_encryption(store.keyspace(crate::keyspaces::AUDIT_KEY)?);
+        let consent_ks = apply_encryption(store.keyspace(crate::keyspaces::CONSENT)?);
+        let idempotency_ks = apply_encryption(store.keyspace(crate::keyspaces::IDEMPOTENCY)?);
+        let task_consent_ks = apply_encryption(store.keyspace(crate::keyspaces::TASK_CONSENT)?);
+        let vault_ks = apply_encryption(store.keyspace(crate::keyspaces::VAULT)?);
+        let backup_bundles_ks = apply_encryption(store.keyspace(crate::keyspaces::BACKUP_BUNDLES)?);
+        let backup_blob_dir = config.store.data_dir.join("backups");
+        // Read by the DIDComm drain machinery only; a TSP-only build has no
+        // drain window, so it never opens the keyspace.
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        let drains_ks = apply_encryption(store.keyspace(crate::keyspaces::DRAINS)?);
+
+        // Pluggable telemetry sink + multi-mediator listener registry.
+        // The registry holds active/drain state and the per-mediator
+        // bounded outbound buffer; spec
+        // `docs/05-design-notes/didcomm-protocol-management.md`.
+        let telemetry: vti_common::telemetry::SharedTelemetrySink =
+            Arc::new(vti_common::telemetry::RingBufferTelemetry::new());
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        let mediator_registry = Arc::new(
+            crate::messaging::registry::MediatorListenerRegistry::new(Arc::clone(&telemetry)),
+        );
+        // Drain sweeper: TTL-keyed `tokio::time::sleep_until` per
+        // drain entry. On expiry, the sweeper signals the
+        // teardown channel; the consumer task spawned below
+        // translates each signal into a
+        // `DIDCommService::remove_listener` call.
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        let (teardown_tx, teardown_rx) = crate::messaging::drain_sweeper::teardown_channel(
+            crate::messaging::drain_sweeper::DEFAULT_TEARDOWN_CHANNEL_CAPACITY,
+        );
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        let drain_sweeper = Arc::new(crate::messaging::drain_sweeper::DrainSweeper::new(
+            Arc::clone(&mediator_registry),
+            drains_ks.clone(),
+            teardown_tx,
+        ));
+        // Boot replay: load any drains persisted from a previous
+        // run, drop already-expired entries, register the live
+        // ones with the registry, and arm the sweeper for each.
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        match mediator_registry.replay_drains(&drains_ks).await {
+            Ok(live) => {
+                if !live.is_empty() {
+                    info!(count = live.len(), "drain set replayed from keyspace");
+                }
+                drain_sweeper.arm_all(&live).await;
+            }
+            Err(e) => {
+                warn!(error = %e, "drain replay failed — starting with empty drain set");
+            }
+        }
+
+        // Shutdown + restart coordination
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (restart_tx, mut restart_rx) = watch::channel(false);
+
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        let didcomm_shutdown = CancellationToken::new();
+
+        // Spawn signal handler. First signal triggers cooperative shutdown;
+        // a second signal forces an immediate exit so an operator can always
+        // bail out if cleanup hangs (e.g., a mediator handshake that won't
+        // complete before its timeout fires).
+        tokio::spawn({
+            let shutdown_tx = shutdown_tx.clone();
+            #[cfg(any(feature = "didcomm", feature = "tsp"))]
+            let didcomm_shutdown = didcomm_shutdown.clone();
+            async move {
+                shutdown_signal().await;
+                info!("shutting down — press Ctrl-C again to force exit");
+                let _ = shutdown_tx.send(true);
+                #[cfg(any(feature = "didcomm", feature = "tsp"))]
+                didcomm_shutdown.cancel();
+
+                shutdown_signal().await;
+                eprintln!("\nForcing exit.");
+                std::process::exit(130);
+            }
+        });
+
+        // Gather storage thread inputs
+        let storage_store = store.clone();
+        let storage_sessions_ks = sessions_ks.clone();
+        let storage_audit_ks = audit_ks.clone();
+        // Built once here and handed to *both* the storage thread and
+        // `AppStateParts` below, so the sweepers and the request path share one
+        // sink object rather than two that merely happen to agree today.
+        let audit_sink: vta_audit::SharedAuditSink =
+            vta_audit::shared_chained_sink(audit_ks.clone(), audit_key_ks.clone());
+        let storage_audit_sink = Arc::clone(&audit_sink);
+        let storage_acl_ks = acl_ks.clone();
+        let storage_consent_ks = consent_ks.clone();
+        let storage_idempotency_ks = idempotency_ks.clone();
+        let storage_accepted_ids_ks =
+            apply_encryption(store.keyspace(crate::keyspaces::ACCEPTED_IDS)?);
+        let storage_task_consent_ks = task_consent_ks.clone();
+        let storage_vault_ks = vault_ks.clone();
+        let storage_witness_sessions_ks =
+            apply_encryption(store.keyspace(crate::keyspaces::WITNESS_SESSIONS)?);
+        let storage_notifications_ks =
+            apply_encryption(store.keyspace(crate::keyspaces::NOTIFICATIONS)?);
+        let storage_notifications_retain_days = config.notifications.retain_lapsed_days;
+        let storage_room_groups_ks =
+            apply_encryption(store.keyspace(crate::keyspaces::ROOM_GROUPS)?);
+        let storage_pcs_engine_ks = apply_encryption(store.keyspace(crate::keyspaces::PCS_ENGINE)?);
+        let storage_app_state_ks = apply_encryption(store.keyspace(crate::keyspaces::APP_STATE)?);
+        let storage_app_state_retention_days = config.app_state.tombstone_retention_days;
+        let storage_backup_bundles_ks = backup_bundles_ks.clone();
+        let storage_backup_blob_dir = backup_blob_dir.clone();
+        let storage_audit_config = config.audit.clone();
+        let storage_auth_config = config.auth.clone();
+
+        // Shared DIDComm bridge for outbound request-response messaging.
+        // The service reference is set after DIDCommService::start().
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        let didcomm_bridge: Arc<DIDCommBridge> = Arc::new(DIDCommBridge::new("vta-main"));
+
+        // Build the shared `AppState` once, via the single constructor
+        // (`build_app_state`), injecting the live shared components `run()`
+        // built above (telemetry sink, mediator registry, drain sweeper, the
+        // real DIDComm bridge, the metrics handle). Both the REST front-end and
+        // the DIDComm → trust-task dispatch bridge clone from this one owned
+        // copy. `AppState` is `Clone`. (P1.1)
+        #[cfg(any(feature = "rest", feature = "didcomm"))]
+        let app_state = {
+            let parts = AppStateParts {
+                telemetry: Some(Arc::clone(&telemetry)),
+                // The same sink the storage thread's sweepers hold, so an
+                // operator-installed backend covers unattended removals too.
+                audit_sink: Some(Arc::clone(&audit_sink)),
+                #[cfg(all(feature = "webvh", feature = "didcomm"))]
+                mediator_registry: Some(Arc::clone(&mediator_registry)),
+                #[cfg(all(feature = "webvh", feature = "didcomm"))]
+                drain_sweeper: Some(Arc::clone(&drain_sweeper)),
+                #[cfg(any(feature = "didcomm", feature = "tsp"))]
+                didcomm_bridge: Some(didcomm_bridge.clone()),
+                endpoint_policy: None,
+                #[cfg(feature = "rest")]
+                metrics_handle: metrics_handle.clone(), // installed once, before the loop
+            };
+            build_app_state(
+                config.clone(),
+                &store,
+                seed_store.clone(),
+                storage_encryption_key,
+                tee_context.clone(),
+                restart_tx.clone(),
+                parts,
+            )
+            .await?
+        };
+
+        // A did:webs VTA minted by setup is published here, at its first boot:
+        // registered at its host on its own authority, before messaging starts
+        // and its readiness gate waits for the DID to resolve.
+        #[cfg(feature = "webs")]
+        publish_own_webs_identity(&app_state).await;
+
+        // Agent memory written by `vta/memory/*/0.1` before the store was
+        // versioned (#2115) moves into the versioned layout before anything is
+        // served, so both versions read one store from the first request.
+        // Idempotent, and one empty prefix scan once nothing is left to move —
+        // which also covers a restore carrying rows from an older VTA.
+        match crate::operations::memory::migrate_legacy(
+            &app_state.memory_ks,
+            &app_state.memory_locks,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => info!(
+                moved = n,
+                "agent memory: moved 0.1 rows into the versioned store"
+            ),
+            Err(e) => {
+                warn!(error = %e, "agent memory: could not finish moving 0.1 rows; retried next boot")
+            }
+        }
+
+        // VTI-VTA-051: a restore is recorded in the audit trail — by the first
+        // boot with a sink, since the trail is part of what the restore replaced.
+        // Retried on every boot until it lands.
+        #[cfg(any(feature = "rest", feature = "didcomm"))]
+        if let Err(e) = crate::restore::audit_restore_once(&app_state).await {
+            warn!(error = %e, "could not record the applied restore in the audit trail yet");
+        }
+
+        // Key custody scan: report every derived key record whose path its
+        // context does not own (a record planted through the pre-FTL-29904
+        // `keys/create`, or carried in by a restore). Reports only. It never
+        // revokes, and the use-time check already makes such a record
+        // unusable. Spawned so the boot never waits on a keyspace walk.
+        {
+            let keys_ks = app_state.keys_ks.clone();
+            let contexts_ks = app_state.contexts_ks.clone();
+            let audit_sink = Arc::clone(&app_state.audit_sink);
+            tokio::spawn(async move {
+                match crate::operations::key_custody::scan_key_custody(
+                    &keys_ks,
+                    &contexts_ks,
+                    &audit_sink,
+                )
+                .await
+                {
+                    Ok(r) if r.violations.is_empty() => {
+                        info!(checked = r.checked, "key custody scan: no violations")
+                    }
+                    Ok(r) => tracing::error!(
+                        security_alert = true,
+                        checked = r.checked,
+                        violations = r.violations.len(),
+                        "key custody scan found key records whose derivation path \
+                         their context does not own; see the `key.custody_violation` \
+                         audit rows. They are refused at use, but review and revoke them"
+                    ),
+                    Err(e) => warn!(error = %e, "key custody scan failed"),
+                }
+            });
+        }
+
+        // The did:scid version floors of every ACL subject, persisted as the
+        // resolver learns them so a restart does not reset what it refuses
+        // (VTI-KEY-162).
+        if let Some(resolver) = app_state.did_resolver.clone() {
+            crate::scid_floors::spawn(app_state.acl_ks.clone(), resolver, shutdown_rx.clone());
+        }
+
+        // A room's revocation list that a registration left `pending` at its host is
+        // delivered again by one sweeper, its single retry owner (`rooms/owner/register/0.2`
+        // item 4). Off the startup path, and ended with everything else at shutdown.
+        {
+            let state = app_state.clone();
+            let mut stop = shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = stop.changed() => {}
+                    _ = crate::trust_tasks::room_list_delivery::redelivery_loop(state) => {}
+                }
+            });
+        }
+
+        // The tombstone sweeper takes a namespace's lock to reap it, so it must
+        // hold the *same* map the request path writes through. Cloned from the
+        // built `AppState` rather than injected through `AppStateParts`: adding
+        // a public field to that struct is a semver break (it is not
+        // `#[non_exhaustive]`, unlike `AppState`), and the storage thread is
+        // spawned after `build_app_state` anyway, so there is nothing to inject.
+        let storage_app_state_locks = app_state.app_state_locks.clone();
+        let storage_memory_ks = app_state.memory_ks.clone();
+        let storage_memory_locks = app_state.memory_locks.clone();
+        // The persona store the request path uses, so the expiry sweep writes
+        // through the same keyspace (and at-rest encryption) and blinds with
+        // the same correlation key.
+        let storage_persona = vta_persona::PersonaStore::new(
+            app_state.persona_ks.clone(),
+            app_state.persona_correlation_key,
+        );
+        // The wrapping-key cache reaper is a run()-path concern (build_app_state
+        // just constructs the cache); arm it on the live state.
+        #[cfg(any(feature = "rest", feature = "didcomm"))]
+        app_state.wrapping_cache.clone().spawn_reaper();
+
+        // Policy bootstrap reads `app_state.policy_ks`, and `app_state` itself
+        // only exists when a serving surface does — `build_app_state` is what
+        // constructs the policy keyspace. Carry the same gate as the binding
+        // above, or a `--no-default-features` build names a value that was
+        // configured out.
+        #[cfg(any(feature = "rest", feature = "didcomm"))]
+        {
+            // Boot-install the migration-safe default PDP baseline if the operator
+            // has no policy yet. Idempotent; never clobbers an operator upload.
+            crate::policy::install_default_policy(
+                &app_state.policy_ks,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await?;
+
+            // Drop any `config:require-consent` row synthesized by a previous
+            // release. `[[policy.require_consent]]` is retired and the config
+            // loader now refuses it — but a VTA upgraded from a release that had
+            // the block would otherwise keep enforcing the row it last wrote,
+            // with nothing left that can explain or remove it. One-way and
+            // idempotent; it never writes.
+            crate::policy::remove_stale_config_consent_policy(&app_state.policy_ks).await?;
+
+            // Seed the declarative approvals row from config the first time we
+            // boot without one. Unlike the reconcile above, this runs ONCE: the
+            // rules are editable at runtime (`pnm approvals`), so re-reading the
+            // file every boot would silently revert an operator's change on the
+            // next restart.
+            {
+                let cfg = app_state.config.read().await;
+                crate::policy::seed_declarative_approvals(
+                    &app_state.policy_ks,
+                    &cfg.policy.approvals,
+                    &cfg.policy.approver_sets,
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await?;
+            }
+
+            // A rule naming a task version this VTA no longer serves would never
+            // match again, leaving the task it gated ungated: move it to the
+            // successor (`vta_policy::approvals::RETIRED_TASK_TYPES`). A move
+            // that cannot be made (rules for both versions) is reported loudly
+            // rather than stopping the VTA, which would leave the operator no
+            // online way to fix the rules.
+            match vta_policy::approvals::migrate_retired_task_types(
+                &app_state.policy_ks,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            {
+                Ok(moved) => {
+                    for (old, new) in moved {
+                        tracing::warn!(
+                            from = %old,
+                            to = %new,
+                            "approval rule moved from a retired task version to its successor"
+                        );
+                    }
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    security_alert = true,
+                    "approval rules name a retired task version and could not be moved; the \
+                     task they gate runs ungated until the rules are edited"
+                ),
+            }
+
+            // Enforcement is opt-in and stays off by default (flipping it would
+            // turn every written-but-unintended policy into a gate on upgrade).
+            // The cost is that a rule written with `pnm approvals` is stored,
+            // listed and explained, then silently ignored — so say so at boot
+            // (Keyring KR-22). Advisory only: a failure to read the rows must
+            // not stop the VTA starting. The flag is copied out so the config
+            // lock is not held across the keyspace read.
+            let enforcement = app_state.config.read().await.policy.enforcement;
+            if !enforcement {
+                warn_if_policies_unenforced(&app_state.policy_ks).await;
+            }
+        }
+
+        // Fail-closed on missing identity (P0.9b). `init_auth` (inside
+        // build_app_state) yields `jwt_keys: Some` only when the VTA has a
+        // complete, usable signing identity: a configured `vta_did`, its key
+        // records + seed present, and a decodable JWT signing key. With any of
+        // those missing the VTA still *boots* but every authenticated endpoint
+        // returns 401 — a service that looks "up" to a liveness probe while
+        // being inert. Refuse to start unless the operator explicitly opted
+        // into a degraded boot (e.g. to inspect or finish provisioning a
+        // half-set-up instance). TEE front-ends pass `allow_degraded = true`:
+        // their identity is established by KMS autogen / admin-bootstrap earlier
+        // in enclave boot, and a degraded first boot there is an existing,
+        // documented state.
+        #[cfg(any(feature = "rest", feature = "didcomm"))]
+        if app_state.jwt_keys.is_none() && !allow_degraded {
+            return Err(AppError::Config(missing_identity_message(&config)));
+        }
+
+        // Whether a usable signing identity is present — drives session cleanup
+        // in the storage thread (and the TEE warn below). Defined in every
+        // feature combo so the un-gated storage thread compiles; a build with
+        // neither transport returns at the "no services enabled" guard above
+        // before this is read.
+        #[cfg(any(feature = "rest", feature = "didcomm"))]
+        let has_auth = app_state.jwt_keys.is_some();
+        #[cfg(not(any(feature = "rest", feature = "didcomm")))]
+        let has_auth = false;
+
+        // In TEE required mode, warn if auth isn't initialized.
+        #[cfg(feature = "tee")]
+        if config.tee.mode == crate::config::TeeMode::Required && !has_auth {
+            warn!(
+                "TEE mode is 'required' but authentication is not initialized \
+                 (vta_did not configured). The VTA will start but authenticated \
+                 endpoints will return 401."
+            );
+        }
+
+        // Spawn REST thread (conditional)
+        #[cfg(feature = "rest")]
+        let rest_handle = if let Some(ref listener_ref) = std_listener {
+            let listener = listener_ref.try_clone().map_err(AppError::Io)?;
+            let state = app_state.clone();
+            let mut rest_shutdown_rx = shutdown_rx.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let handle = std::thread::Builder::new()
+                .name("vta-rest".into())
+                .spawn(move || run_rest_thread(listener, state, &mut rest_shutdown_rx, ready_tx))
+                .map_err(|e| AppError::Internal(format!("failed to spawn REST thread: {e}")))?;
+            // A listener that cannot be served fails the boot, not a thread.
+            // On a soft restart this generation has already started work, so
+            // it is stopped the way a normal shutdown stops it before the
+            // error is returned.
+            let failure = match ready_rx.await {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(AppError::Config(e)),
+                Err(_) => Some(AppError::Internal(
+                    "REST thread exited before its listener was ready".into(),
+                )),
+            };
+            if let Some(err) = failure {
+                let _ = shutdown_tx.send(true);
+                #[cfg(any(feature = "didcomm", feature = "tsp"))]
+                didcomm_shutdown.cancel();
+                match tokio::task::spawn_blocking(move || handle.join()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_panic)) => error!("REST thread panicked"),
+                    Err(e) => error!("failed to join REST thread: {e}"),
+                }
+                // What the storage thread does on shutdown; it has not started.
+                if let Err(e) = store.persist().await {
+                    error!("failed to persist store on shutdown: {e}");
+                }
+                return Err(err);
+            }
+            Some(handle)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "rest"))]
+        let rest_handle: Option<std::thread::JoinHandle<()>> = None;
+
+        // Start the delivery-layer messaging service (conditional).
+        //
+        // D2 P2a: the `MessagingService` over a `DidCommTransport` (built in
+        // `messaging::service::build_messaging`) replaces the framework
+        // `DIDCommService`. On success it is published into the outbound
+        // `DIDCommBridge` (so REST + DIDComm handlers can send) and drives the
+        // protocol-routed inbound loop; the `Arc<MessagingService>` handle is
+        // retained for drain teardown. `DidCommTransport::inbound()` multiplexes
+        // BOTH DIDComm and TSP frames off the one mediator socket (one socket
+        // per DID — a second would be evicted as `duplicate-channel`), so TSP
+        // receive is always on when compiled with `tsp`; `config.services.tsp`
+        // governs advertisement only.
+        //
+        // Self-readiness gate + persistent reconnect, both owned by the spawned
+        // `MessagingConnect` supervisor.
+        //
+        // The supervisor first runs the self-readiness gate: it waits until the
+        // VTA's own DID resolves over the network — the same operation the
+        // mediator performs to fetch our sender key — so the mediator can
+        // authenticate us instead of 403-storming on a cold start. It then
+        // connects, and keeps reconnecting: the classic initial failure is the
+        // mediator's *own* resolver still negative-caching the VTA host, which
+        // clears itself on its own timer, so the VTA self-heals with no operator
+        // restart. It also re-connects if an established session's inbound loop
+        // ends, rather than going silently deaf for the rest of the process.
+        //
+        // Everything — gate included — runs in the spawned task, never on the
+        // startup path. `run()` must reach the shutdown/restart select below for
+        // a SIGTERM to be honoured, so awaiting a gate here (up to
+        // `max_wait_secs`, default 300s) would hold the process open with no
+        // listener after the REST thread had already exited.
+        //
+        // The live `MessagingService` handle is published into
+        // `app_state.didcomm_bridge` on each successful connect; the
+        // drain-teardown consumer + status read it there.
+        //
+        // `on_timeout = "fail"` has to fail the *process*, and the gate no longer
+        // runs on this path, so it can't do that by returning `Err` from here.
+        // The supervisor sets this flag and signals shutdown; `run` converts it
+        // back into an `Err` after the threads are joined, so the exit status
+        // still says "failed" for a systemd `Restart=on-failure` or anything else
+        // that reads it.
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        let readiness_fatal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Either advertised transport needs the mediator socket: TSP receive
+        // arrives on it (ADR 0005 — one websocket per DID) and TSP send is an
+        // HTTP post through the same ATM. Gating this on DIDComm alone is what
+        // made a TSP-only VTA impossible — it would have advertised `#tsp` and
+        // never connected to anything.
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        if config.services.didcomm || config.services.tsp {
+            match (
+                &app_state.secrets_resolver,
+                &config.vta_did,
+                &config.messaging,
+            ) {
+                (Some(_), Some(vta_did), Some(messaging_config)) => {
+                    // Compute the outbox keyspace here (it needs `?`), then hand
+                    // the whole gate + connect + reconnect loop to the background
+                    // supervisor.
+                    let outbox_ks = apply_encryption(store.keyspace(crate::keyspaces::OUTBOX)?);
+                    let relationships_ks =
+                        apply_encryption(store.keyspace(crate::keyspaces::RELATIONSHIPS)?);
+                    // D8: counter the SDK gate increments on every §7.2.2 drop.
+                    // Created here so build_messaging can inject it into the ATM
+                    // and a startup task can sample it into telemetry.
+                    let relationship_drop_counter =
+                        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    // D6/D9: durable-store maintenance — enumerate surviving
+                    // relationships on boot, then periodically sweep idle ones.
+                    // D8: sample the drop counter into the telemetry sink.
+                    // Not in `build_messaging`, which re-runs on every mediator
+                    // reconnect and would leak a task per reconnect. Each is
+                    // scoped to this generation's shutdown token: spawning them
+                    // once per process instead would leave them holding the
+                    // first generation's `AppState` — and so a `DIDCommBridge`
+                    // no later generation ever publishes into.
+                    #[cfg(feature = "tsp")]
+                    {
+                        let token = didcomm_shutdown.clone();
+                        let relationships = app_state.tsp_relationships.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = token.cancelled() => {}
+                                _ = crate::messaging::tsp_relationship_store::maintenance_loop(
+                                    relationships,
+                                ) => {}
+                            }
+                        });
+                        let token = didcomm_shutdown.clone();
+                        let counter = relationship_drop_counter.clone();
+                        let telemetry = app_state.telemetry.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = token.cancelled() => {}
+                                _ = crate::messaging::tsp_relationship_store::drop_telemetry_loop(
+                                    counter, telemetry,
+                                ) => {}
+                            }
+                        });
+                    }
+                    // Durable Trust Task pushes, reading the current session
+                    // each pass.
+                    {
+                        let token = didcomm_shutdown.clone();
+                        let push_state = app_state.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = token.cancelled() => {}
+                                _ = crate::messaging::push::sweep_loop(push_state) => {}
+                            }
+                        });
+                    }
+                    let supervisor = MessagingConnect {
+                        app_state: app_state.clone(),
+                        vta_did: vta_did.clone(),
+                        messaging_config: messaging_config.clone(),
+                        readiness: config.mediator_readiness.clone(),
+                        resolver_url: config.resolver_url.clone(),
+                        outbox_ks,
+                        relationships_ks,
+                        relationship_drop_counter,
+                        flush_queues,
+                        shutdown: didcomm_shutdown.clone(),
+                        fatal_shutdown: shutdown_tx.clone(),
+                        fatal_flag: readiness_fatal.clone(),
+                    };
+                    tokio::spawn(supervisor.run());
+                }
+                _ => {
+                    info!("DIDComm not configured — service not started");
+                }
+            }
+        }
+
+        // The collector: the connections the VTA holds for the principal's
+        // persona DIDs (VTI-NTF-080 – 098). It runs whether or not the
+        // operator has suspended collection, so engaging or lifting the
+        // suspension is audited at this boot, and integrations provisioned
+        // before `provisioned:` records existed are recorded before anything is
+        // opened.
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        let collector_handle = tokio::spawn(crate::messaging::collector::run(
+            app_state.clone(),
+            didcomm_shutdown.clone(),
+        ));
+        // The room watches' addresses (`rooms/keys/watch/0.1`): one connection per watch
+        // held, and the sweep that forgets lapsed watches and those whose caller lost
+        // standing.
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        let watch_addresses_handle = tokio::spawn(crate::messaging::watch_addresses::run(
+            app_state.clone(),
+            didcomm_shutdown.clone(),
+        ));
+
+        // TSP inbound is no longer a standalone websocket. The delivery-layer
+        // `DidCommTransport` built above multiplexes TSP frames off its single
+        // mediator websocket (`Inbound.message.protocol` tags DIDComm vs TSP);
+        // the inbound loop routes each TSP frame to `messaging::tsp_inbound`.
+        // Opening a second socket here — as the earlier `run_tsp_inbound` loop
+        // did — made the mediator evict a connection as `duplicate-channel`,
+        // flapping the VTA. See `messaging::tsp_inbound`.
+
+        // Spawn the teardown channel consumer. The drain sweeper
+        // sends mediator DIDs over `teardown_rx` whenever a TTL
+        // fires; this task translates each signal into a
+        // `DIDCommService::remove_listener` call. If DIDComm
+        // isn't running, the loop still runs but every recv is a
+        // no-op — drains still get cleaned up at the registry +
+        // keyspace level by the sweeper.
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        let _teardown_handle = {
+            // Source the live `MessagingService` from the bridge at recv time
+            // rather than a captured handle: the connect now happens in the
+            // background `MessagingConnect` supervisor, so the service may not be
+            // published yet when this consumer is spawned (and it self-heals /
+            // (re)connects later). `messaging_handle()` returns the current
+            // handle once the supervisor's first successful connect sets it.
+            let teardown_app_state = app_state.clone();
+            let mut teardown_rx = teardown_rx;
+            let mut shutdown_rx_for_teardown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx_for_teardown.changed() => {
+                            if *shutdown_rx_for_teardown.borrow() {
+                                break;
+                            }
+                        }
+                        msg = teardown_rx.recv() => {
+                            match msg {
+                                None => break,
+                                Some(mediator_did) => {
+                                    // The drain window kept the OLD mediator's
+                                    // transport installed (still receiving inbound
+                                    // via the merged dispatcher) after promote; its
+                                    // fjall drain-entry TTL has now expired, so drop
+                                    // it from the delivery-layer service.
+                                    if let Some(svc) =
+                                        teardown_app_state.didcomm_bridge.messaging_handle()
+                                    {
+                                        svc.remove_transport(&mediator_did);
+                                        info!(
+                                            mediator = %mediator_did,
+                                            "drain teardown: transport removed"
+                                        );
+                                    } else {
+                                        debug!(
+                                            mediator = %mediator_did,
+                                            "drain teardown: DIDComm not connected, skipping remove_transport"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                debug!("teardown consumer task exiting");
+            })
+        };
+        #[cfg(not(all(feature = "webvh", feature = "didcomm")))]
+        let _teardown_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        // Storage thread always runs
+        let mut storage_shutdown_rx = shutdown_rx.clone();
+        let storage_handle = std::thread::Builder::new()
+            .name("vta-storage".into())
+            .spawn(move || {
+                run_storage_thread(
+                    storage_store,
+                    storage_sessions_ks,
+                    storage_audit_ks,
+                    storage_audit_sink,
+                    storage_acl_ks,
+                    storage_consent_ks,
+                    storage_idempotency_ks,
+                    storage_accepted_ids_ks,
+                    storage_task_consent_ks,
+                    storage_vault_ks,
+                    storage_witness_sessions_ks,
+                    storage_notifications_ks,
+                    storage_notifications_retain_days,
+                    storage_room_groups_ks,
+                    storage_pcs_engine_ks,
+                    storage_app_state_ks,
+                    storage_app_state_locks,
+                    storage_memory_ks,
+                    storage_memory_locks,
+                    storage_app_state_retention_days,
+                    storage_persona,
+                    storage_backup_bundles_ks,
+                    storage_backup_blob_dir,
+                    storage_audit_config,
+                    storage_auth_config,
+                    has_auth,
+                    &mut storage_shutdown_rx,
+                )
+            })
+            .map_err(|e| AppError::Internal(format!("failed to spawn storage thread: {e}")))?;
+
+        // ── Wait for shutdown or restart ──────────────────────────
+        let mut any_panic = false;
+        let is_restart;
+
+        if let Some(handle) = rest_handle {
+            // REST thread blocks — wait for it, or for restart signal
+            tokio::select! {
+                result = tokio::task::spawn_blocking(move || handle.join()) => {
+                    match result {
+                        Ok(Ok(())) => info!("REST thread stopped"),
+                        Ok(Err(_panic)) => { error!("REST thread panicked"); any_panic = true; }
+                        Err(e) => { error!("failed to join REST thread: {e}"); any_panic = true; }
+                    }
+                    is_restart = false;
+                }
+                _ = restart_rx.changed() => {
+                    info!("soft restart requested — shutting down services");
+                    let _ = shutdown_tx.send(true);
+                    is_restart = true;
+                }
+            }
+        } else {
+            // No REST thread — wait for shutdown or restart
+            tokio::select! {
+                _ = async {
+                    let mut wait_rx = shutdown_rx.clone();
+                    let _ = wait_rx.changed().await;
+                } => {
+                    is_restart = false;
+                }
+                _ = restart_rx.changed() => {
+                    info!("soft restart requested — shutting down services");
+                    let _ = shutdown_tx.send(true);
+                    is_restart = true;
+                }
+            }
+        }
+
+        // The collector's connections are closed before this generation ends,
+        // so a soft restart never opens a persona's socket while the last
+        // generation's is still up (one socket per DID).
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        {
+            didcomm_shutdown.cancel();
+            if tokio::time::timeout(std::time::Duration::from_secs(30), collector_handle)
+                .await
+                .is_err()
+            {
+                warn!("the collector did not close its connections within 30s");
+            }
+            if tokio::time::timeout(std::time::Duration::from_secs(30), watch_addresses_handle)
+                .await
+                .is_err()
+            {
+                warn!("the room watch addresses did not close their connections within 30s");
+            }
+        }
+
+        // Stop mediator messaging: cancel the inbound loop's shutdown token
+        // (also stops the `MessagingConnect` reconnect supervisor between
+        // attempts). The delivery-layer background tasks (dispatcher, transport
+        // forwarder, outbox drain loops) are detached — as in the VTC pilot —
+        // and wind down as their `Arc<MessagingService>`/transport handles drop.
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        {
+            didcomm_shutdown.cancel();
+            info!("mediator messaging stopped");
+        }
+
+        if any_panic {
+            let _ = shutdown_tx.send(true);
+        }
+
+        // Join storage last — guarantees all writes flushed before database closes
+        match storage_handle.join() {
+            Ok(()) => info!("storage thread stopped"),
+            Err(_panic) => {
+                error!("storage thread panicked");
+                any_panic = true;
+            }
+        }
+
+        if any_panic {
+            return Err(AppError::Internal("one or more threads panicked".into()));
+        }
+
+        // Surface a `fail`-policy readiness timeout as a non-zero exit, now that
+        // the threads are joined and the store is flushed.
+        #[cfg(any(feature = "didcomm", feature = "tsp"))]
+        if readiness_fatal.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AppError::Internal(
+                "mediator self-readiness gate timed out with on_timeout = \"fail\"".into(),
+            ));
+        }
+
+        if !is_restart {
+            info!("server shut down");
+            return Ok(());
+        }
+        if crate::restore::reboot_requested() {
+            // A committed restore: a soft restart would keep this process's
+            // storage key, which the restore may have changed. Return, and let
+            // the binary boot again from the top (`restore::reexec`).
+            info!("server stopped for a reboot to apply a committed restore");
+            return Ok(());
+        }
+
+        // ── Soft restart: reload config and re-derive keys ───────
+        info!("soft restart: re-initializing services");
+
+        // Read the config the generation actually ran with — the shared copy
+        // every runtime operation mutates, not `run()`'s local, which was
+        // cloned into `app_state` at boot and never sees those writes. Every
+        // failure path keeps the running configuration: an edited
+        // `config.toml` must not be able to kill a VTA that is already up.
+        match reload_config_for_restart(&app_state.config, &boot_service_state_ks).await {
+            Ok(reloaded) => config = reloaded,
+            Err(e) => {
+                warn!(error = %e, "soft restart kept the running configuration")
+            }
+        }
+    }
+}
+
+/// The configuration the next generation runs with, over the authoritative
+/// service enablement.
+///
+/// Takes the **shared** handle, not an `AppConfig`: `run()` holds a detached
+/// clone of the boot config, and a snapshot of it looks enough like the running
+/// configuration to pass for it. `services didcomm enable` persists the
+/// mediator to the shared copy, so a restart that read the local one brought
+/// the next generation up with DIDComm enabled and no mediator.
+///
+/// Enablement comes from fjall, not the file: `pnm services {kind}
+/// {enable,disable}` writes runtime state, and the `[services]` block is legacy
+/// (consumed only by the first-boot migration). Mirroring exactly the two
+/// services boot mirrors keeps the two paths from disagreeing about what a
+/// generation starts with.
+async fn reload_config_for_restart(
+    current: &Arc<RwLock<AppConfig>>,
+    #[cfg_attr(not(feature = "webvh"), allow(unused_variables))] service_state_ks: &KeyspaceHandle,
+) -> Result<AppConfig, AppError> {
+    let current = current.read().await.clone();
+
+    #[cfg_attr(not(feature = "webvh"), allow(unused_mut))]
+    let mut reloaded = current.reload_for_restart()?;
+
+    #[cfg(feature = "webvh")]
+    {
+        use crate::operations::protocol::runtime_state;
+        reloaded.services.rest = runtime_state::is_rest_enabled(service_state_ks).await?;
+        reloaded.services.didcomm = runtime_state::is_didcomm_enabled(service_state_ks).await?;
+        reloaded.services.tsp = runtime_state::is_tsp_enabled(service_state_ks).await?;
+    }
+
+    // Ask the generation being replaced, not the reload: the digest is
+    // `#[serde(skip)]` and `reload_for_restart` clears it, so the reload never
+    // has one. Asking it left every restarted generation unattested — and the
+    // generation after that, seeing no digest, reloading without the attested
+    // path at all.
+    if current.effective_config_digest.is_some() {
+        reloaded.capture_effective_config_attestation()?;
+    }
+
+    // Boot refuses to start on this; a restart cannot refuse without killing a
+    // running VTA, so reject the reload instead and keep what works.
+    if let Some(reason) = tsp_configured_but_unbuilt(reloaded.services.tsp, TSP_BUILT) {
+        return Err(AppError::Config(reason.into()));
+    }
+    reloaded.validate()?;
+    Ok(reloaded)
+}
+
+/// Storage thread: runs session cleanup loop and persists the store on shutdown.
+#[allow(clippy::too_many_arguments)]
+fn run_storage_thread(
+    store: Store,
+    sessions_ks: KeyspaceHandle,
+    // `audit_ks` for `cleanup_expired_logs` — retention prunes the keyspace.
+    // `audit_sink` for the sweepers' own audit rows: the *same* sink the
+    // request path uses, threaded in rather than rebuilt from `audit_ks`. A
+    // sweeper's `acl.expire` is exactly the kind of unattended removal an
+    // operator installs a tamper-evident backend to capture, and rebuilding one
+    // here would route it back to the keyspace whatever they configured.
+    audit_ks: KeyspaceHandle,
+    audit_sink: vta_audit::SharedAuditSink,
+    acl_ks: KeyspaceHandle,
+    consent_ks: KeyspaceHandle,
+    idempotency_ks: KeyspaceHandle,
+    accepted_ids_ks: KeyspaceHandle,
+    task_consent_ks: KeyspaceHandle,
+    vault_ks: KeyspaceHandle,
+    witness_sessions_ks: KeyspaceHandle,
+    notifications_ks: KeyspaceHandle,
+    notifications_retain_days: u32,
+    room_groups_ks: KeyspaceHandle,
+    pcs_engine_ks: KeyspaceHandle,
+    app_state_ks: KeyspaceHandle,
+    app_state_locks: crate::operations::app_state::NamespaceLocks,
+    memory_ks: KeyspaceHandle,
+    memory_locks: crate::operations::app_state::NamespaceLocks,
+    app_state_retention_days: u32,
+    persona: vta_persona::PersonaStore,
+    backup_bundles_ks_storage: KeyspaceHandle,
+    backup_blob_dir_storage: std::path::PathBuf,
+    audit_config: crate::config::AuditConfig,
+    auth_config: AuthConfig,
+    has_auth: bool,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build storage runtime");
+
+    rt.block_on(async {
+        info!("storage thread started");
+
+        if has_auth {
+            let interval = Duration::from_secs(auth_config.session_cleanup_interval);
+            let mut timer = tokio::time::interval(interval);
+            // First tick completes immediately; skip it so cleanup doesn't run at startup
+            timer.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        if let Err(e) = cleanup_expired_sessions(&sessions_ks, auth_config.challenge_ttl).await {
+                            warn!("session cleanup error: {e}");
+                        }
+                        // Also clean up expired audit logs
+                        let audit_retention = audit_config.retention_days;
+                        if let Err(e) = crate::audit::cleanup_expired_logs(&audit_ks, audit_retention).await {
+                            warn!("audit cleanup error: {e}");
+                        }
+                        // Prune expired AclEntry rows and PendingBootstrap rows.
+                        // `audit_ks` threaded in so each deletion produces
+                        // an `acl.expire` audit entry — without it, the
+                        // sweeper's removals leave no trail and operators
+                        // can't distinguish "entry was never created" from
+                        // "entry was created then expired and pruned".
+                        if let Err(e) =
+                            crate::acl_sweeper::sweep_expired(&acl_ks, &audit_sink).await
+                        {
+                            warn!("acl sweeper error: {e}");
+                        }
+                        // Prune expired pending consents (never answered) and
+                        // lapsed grants, so the consent keyspace can't grow
+                        // unbounded at inbound-message rate.
+                        if let Err(e) =
+                            crate::consent_sweeper::sweep_expired(&consent_ks, &audit_sink).await
+                        {
+                            warn!("consent sweeper error: {e}");
+                        }
+                        // Idempotency records are read-through-expiry, so a
+                        // missed pass costs space and nothing else — that is why
+                        // this one logs rather than propagating, and why it is
+                        // not audited (retry bookkeeping, not a security event).
+                        crate::idempotency_sweeper::sweep_expired_logged(&idempotency_ks).await;
+                        // The accepted-document-id record, the same way: a claim
+                        // treats an expired row as absent, so a missed pass costs
+                        // space only. Its rows live minutes, so one tick's worth
+                        // is the steady-state size.
+                        match vti_trust_task_server::accepted_store::sweep_expired(
+                            &accepted_ids_ks,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => debug!("accepted-id sweeper pruned {n} rows"),
+                            Ok(_) => {}
+                            Err(e) => warn!("accepted-id sweeper error: {e}"),
+                        }
+                        // Same for task-execution consent: an unanswered pending
+                        // would otherwise sit in the keyspace forever, since the
+                        // gate only expires one lazily when its digest is re-read.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        match crate::policy::consent::sweep_expired(&task_consent_ks, now).await {
+                            Ok(n) if n > 0 => debug!("task-consent sweeper pruned {n} rows"),
+                            Ok(_) => {}
+                            Err(e) => warn!("task-consent sweeper error: {e}"),
+                        }
+                        // Expire & retention-prune in-flight backup
+                        // bundles (descriptor-pattern slice). TTL
+                        // pass transitions stale non-terminal records
+                        // to Expired; retention pass deletes terminal
+                        // records older than the 24h audit window.
+                        if let Err(e) = crate::backup_bundle_sweeper::sweep_bundles(
+                            &backup_bundles_ks_storage,
+                            &backup_blob_dir_storage,
+                        )
+                        .await
+                        {
+                            warn!("backup bundle sweeper error: {e}");
+                        }
+                        // Reclaim deferred-presentation records that are
+                        // terminal or stale (P0.12). Without this the
+                        // `pending-present:` namespace grows unbounded at
+                        // DIDComm message rate — every untrusted-verifier
+                        // query writes one.
+                        match crate::operations::credential_exchange::pending::sweep(
+                            &vault_ks,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => {
+                                info!(reclaimed = n, "pending-present sweeper")
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("pending-present sweeper error: {e}"),
+                        }
+                        // End every persona binding whose `until` has passed, and
+                        // retire each face that leaves worn nowhere. Reads already
+                        // treat a lapsed binding as cleared; this makes it durable
+                        // and does the retiring (persona/binding/set, `until`).
+                        match persona.expire_bindings(chrono::Utc::now()).await {
+                            Ok(lapsed) if !lapsed.is_empty() => {
+                                for l in &lapsed {
+                                    let detail = format!(
+                                        "binding of persona {} in context {} to face {} ended at \
+                                         its until{}",
+                                        l.persona_did,
+                                        l.context_id,
+                                        l.profile_id,
+                                        if l.retired { "; the face, worn nowhere else, was retired" } else { "" },
+                                    );
+                                    if let Err(e) = crate::audit::record_with_detail(
+                                        &audit_sink,
+                                        "persona.binding.expire",
+                                        "system:sweeper",
+                                        Some(&l.persona_did),
+                                        "success",
+                                        None,
+                                        Some(&l.context_id),
+                                        Some(&detail),
+                                    )
+                                    .await
+                                    {
+                                        warn!("persona expiry audit error: {e}");
+                                    }
+                                }
+                                info!(ended = lapsed.len(), "persona binding expiry sweeper");
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("persona binding expiry sweeper error: {e}"),
+                        }
+                        // Hard-purge grace-expired vault + credential tombstones
+                        // (soft-deleted entries past their recovery window), so
+                        // the trash can't linger forever. Audits each purge.
+                        if let Err(e) =
+                            crate::vault_sweeper::sweep_expired(&vault_ks, &audit_sink).await
+                        {
+                            warn!("vault sweeper error: {e}");
+                        }
+                        // Delete witnessed-session records past their expiry
+                        // (`vta/_shared/0.6/CONVENTIONS.md` §3 item 4). Reads
+                        // already treat an expired record as unknown; this keeps
+                        // the keyspace from holding abandoned sessions — their
+                        // session documents name both relationship DIDs.
+                        match crate::operations::witness::sweep_expired(
+                            &witness_sessions_ks,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => debug!(removed = n, "witness session sweeper"),
+                            Ok(_) => {}
+                            Err(e) => warn!("witness session sweeper error: {e}"),
+                        }
+                        // Discard held notifications that lapsed or were withdrawn
+                        // longer ago than `[notifications] retain_lapsed_days`
+                        // (VTI-NTF-052).
+                        match crate::operations::notifications::sweep_lapsed(
+                            &notifications_ks,
+                            notifications_retain_days,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => debug!(removed = n, "notification sweeper"),
+                            Ok(_) => {}
+                            Err(e) => warn!("notification sweeper error: {e}"),
+                        }
+                        // Discard every retained admission past its 24 hours
+                        // (`rooms/owner/group/add/0.3` item 8). Reads already refuse
+                        // to serve one late; this takes its Welcome off the disk
+                        // when nobody asks again.
+                        match crate::operations::room_groups::sweep_retained_admissions(
+                            &room_groups_ks,
+                            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0),
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => debug!(removed = n, "retained admission sweeper"),
+                            Ok(_) => {}
+                            Err(e) => warn!("retained admission sweeper error: {e}"),
+                        }
+                        // Discard each voter's ticket once its election's voting
+                        // closes, and the rest of its record the retention later
+                        // (`voting/_shared/0.1` CONVENTIONS §5 item 3).
+                        match crate::operations::pcs_voter::sweep(
+                            &pcs_engine_ks,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => debug!(removed = n, "voter record sweeper"),
+                            Ok(_) => {}
+                            Err(e) => warn!("voter record sweeper error: {e}"),
+                        }
+                        // Reap application-state tombstones past their retention
+                        // window. This is what makes the window real rather than
+                        // advertised — and what makes `watermarkTooOld`
+                        // reachable, so a consumer resuming from a watermark
+                        // whose deletions have been discarded is told to rebuild
+                        // instead of being served a feed that silently omits
+                        // them.
+                        // `0` days disables reaping outright: tombstones are
+                        // kept forever, no watermark ever expires, and the
+                        // keyspace grows unbounded. That is a legitimate choice
+                        // for a deployment that would rather spend disk than
+                        // ever force a consumer to rebuild — so it is a skip
+                        // here rather than a zero cutoff, which would mean the
+                        // opposite and reap everything.
+                        if app_state_retention_days > 0 {
+                            match crate::operations::app_state::sweep_expired_tombstones(
+                                &app_state_ks,
+                                &app_state_locks,
+                                &audit_sink,
+                                u64::from(app_state_retention_days) * 24 * 60 * 60,
+                            )
+                            .await
+                            {
+                                Ok(n) if n > 0 => {
+                                    info!(reaped = n, "app-state tombstone sweeper")
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!("app-state tombstone sweeper error: {e}"),
+                            }
+                            // Agent memory's tombstones, on the same window: the
+                            // memory store is the same layout in its own
+                            // keyspace, and `vta/memory/list/0.2` reports this
+                            // retention to its change-feed callers.
+                            match crate::operations::app_state::sweep_expired_tombstones(
+                                &memory_ks,
+                                &memory_locks,
+                                &audit_sink,
+                                u64::from(app_state_retention_days) * 24 * 60 * 60,
+                            )
+                            .await
+                            {
+                                Ok(n) if n > 0 => {
+                                    info!(reaped = n, "agent-memory tombstone sweeper")
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!("agent-memory tombstone sweeper error: {e}"),
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        info!("storage thread shutting down");
+                        break;
+                    }
+                }
+            }
+        } else {
+            // No auth — just wait for shutdown
+            let _ = shutdown_rx.changed().await;
+            info!("storage thread shutting down");
+        }
+
+        // Persist store before closing
+        if let Err(e) = store.persist().await {
+            error!("failed to persist store on shutdown: {e}");
+        } else {
+            info!("store persisted");
+        }
+    });
+}
+
+/// Environment variable the Nitro entrypoint sets to make the VTA serve REST
+/// on vsock itself, instead of behind a per-connection `socat`.
+#[cfg(feature = "rest")]
+const REST_VSOCK_PORT_ENV: &str = "VTA_REST_VSOCK_PORT";
+
+/// Where the REST server listens, decided once at boot.
+#[cfg(feature = "rest")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestIngressMode {
+    Tcp,
+    #[cfg(feature = "vsock-store")]
+    Vsock(u32),
+}
+
+/// Read [`REST_VSOCK_PORT_ENV`] (`None` when unset). Fails closed: a value
+/// that is not a usable vsock port, or any value in a build that cannot serve
+/// vsock, is an error, never a silent fallback to TCP — in an enclave nothing
+/// forwards to the TCP port any more, so a fallback is an unreachable API.
+#[cfg(feature = "rest")]
+fn rest_ingress_mode(raw: Option<&str>) -> Result<RestIngressMode, String> {
+    let Some(raw) = raw else {
+        return Ok(RestIngressMode::Tcp);
+    };
+    #[cfg(feature = "vsock-store")]
+    {
+        match raw.parse::<u32>() {
+            // 0 and u32::MAX (VMADDR_PORT_ANY) are not ports a listener can be
+            // reached on.
+            Ok(port) if port != 0 && port != u32::MAX => Ok(RestIngressMode::Vsock(port)),
+            _ => Err(format!(
+                "{REST_VSOCK_PORT_ENV}={raw:?} is not a vsock port (1 to {}). Fix or \
+                 unset it; the VTA does not fall back to TCP, which nothing \
+                 forwards to in an enclave.",
+                u32::MAX - 1
+            )),
+        }
+    }
+    #[cfg(not(feature = "vsock-store"))]
+    {
+        Err(format!(
+            "{REST_VSOCK_PORT_ENV}={raw:?} is set, but this binary was built \
+             without vsock support (the `vsock-store` feature) and cannot serve \
+             REST on vsock. Use an enclave build, or unset it to serve on TCP."
+        ))
+    }
+}
+
+/// The REST listener, bound once at boot. Each REST thread generation (one
+/// per soft restart) gets a [`RestListener::try_clone`]: a second descriptor
+/// for the same listening socket, so a restart never rebinds the port.
+#[cfg(feature = "rest")]
+enum RestListener {
+    Tcp(std::net::TcpListener),
+    /// The blocking listener; the REST thread adopts its clone into its own
+    /// runtime ([`adopt_vsock_listener`]).
+    #[cfg(feature = "vsock-store")]
+    Vsock(vsock::VsockListener),
+}
+
+#[cfg(feature = "rest")]
+impl RestListener {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Tcp(l) => Ok(Self::Tcp(l.try_clone()?)),
+            #[cfg(feature = "vsock-store")]
+            Self::Vsock(l) => Ok(Self::Vsock(l.try_clone()?)),
+        }
+    }
+}
+
+/// A vsock listener for `axum::serve`, for enclave builds.
+///
+/// Accepts the parent only, and reports it as
+/// [`vti_common::rate_limit::VSOCK_PARENT_PEER`] (`0.0.0.3`) — an address no
+/// TCP connection can carry, which `trust_xff_cidrs` can then trust as exactly
+/// the parent's proxy. Through `socat` the peer was `127.0.0.1`, which
+/// anything inside the enclave could also be.
+///
+/// Built on the blocking `vsock` listener (bound once at boot, cloned per REST
+/// generation) wrapped in this runtime's [`AsyncFd`](tokio::io::unix::AsyncFd),
+/// rather than tokio-vsock's listener, whose only way to adopt an existing
+/// socket (`FromRawFd`) panics on failure.
+#[cfg(all(feature = "rest", feature = "vsock-store"))]
+struct VsockRestListener {
+    inner: tokio::io::unix::AsyncFd<vsock::VsockListener>,
+    backoff: AcceptBackoff,
+}
+
+#[cfg(all(feature = "rest", feature = "vsock-store"))]
+impl VsockRestListener {
+    /// Register this generation's clone of the boot listener with the calling
+    /// runtime. Fallible end to end, so a real OS error (EMFILE, a runtime
+    /// shutting down) reaches the boot through the REST thread's `ready`
+    /// channel instead of panicking the thread.
+    fn adopt(listener: vsock::VsockListener) -> std::io::Result<Self> {
+        listener.set_nonblocking(true)?;
+        // SAFETY: `VsockListener` owns its socket — the descriptor is open from
+        // `bind`/`try_clone` until the listener drops, and `as_raw_fd` always
+        // returns that one descriptor. Moving it in makes the `AsyncFd` its sole
+        // owner for as long as it is registered.
+        #[allow(unsafe_code)]
+        let inner = unsafe { tokio::io::unix::AsyncFd::register(listener) }
+            .map_err(|e| e.into_parts().1)?;
+        Ok(Self {
+            inner,
+            backoff: AcceptBackoff::default(),
+        })
+    }
+
+    async fn accept_one(&self) -> std::io::Result<(vsock::VsockStream, vsock::VsockAddr)> {
+        loop {
+            let mut guard = self.inner.readable().await?;
+            match guard.try_io(|inner| inner.get_ref().accept()) {
+                Ok(Ok(accepted)) => return Ok(accepted),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "rest", feature = "vsock-store"))]
+impl axum::serve::Listener for VsockRestListener {
+    type Io = tokio_vsock::VsockStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let error = match self.accept_one().await {
+                Ok((stream, peer)) if peer.cid() == vti_common::store::vsock::PARENT_CID => {
+                    match tokio_vsock::VsockStream::new(stream) {
+                        Ok(stream) => {
+                            if let Some(failures) = self.backoff.succeeded() {
+                                info!(failures, "REST vsock accept recovered");
+                            }
+                            return (stream, vti_common::rate_limit::VSOCK_PARENT_PEER);
+                        }
+                        Err(e) => e,
+                    }
+                }
+                Ok((stream, peer)) => {
+                    tracing::warn!(
+                        cid = peer.cid(),
+                        port = peer.port(),
+                        security_alert = true,
+                        "REST vsock connection from a peer other than the parent; dropped"
+                    );
+                    drop(stream);
+                    continue;
+                }
+                Err(e) => e,
+            };
+            let (delay, report) = self.backoff.failed(std::time::Instant::now());
+            match report {
+                Some(AcceptFailureReport::First) => {
+                    tracing::warn!(error = %error, "REST vsock accept failed; backing off")
+                }
+                Some(AcceptFailureReport::Since { failures }) => tracing::warn!(
+                    error = %error,
+                    failures,
+                    "REST vsock accept still failing"
+                ),
+                None => {}
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(vti_common::rate_limit::VSOCK_PARENT_PEER)
+    }
+}
+
+/// Backoff and log rate for failing `accept`s. A persistent error (EMFILE)
+/// retried every 10 ms with a warning each time is ~100 lines a second, which
+/// fills the enclave's log queue; this doubles the delay from 10 ms to 1 s,
+/// warns on the first failure, then at most one summary per
+/// [`AcceptBackoff::REPORT_EVERY`], and resets on the next success.
+#[cfg(all(feature = "rest", feature = "vsock-store"))]
+#[derive(Debug)]
+struct AcceptBackoff {
+    delay: std::time::Duration,
+    /// Failures since the last success.
+    failures: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+#[cfg(all(feature = "rest", feature = "vsock-store"))]
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptFailureReport {
+    /// The first failure since a success.
+    First,
+    /// A periodic summary: failures since the last success.
+    Since { failures: u64 },
+}
+
+#[cfg(all(feature = "rest", feature = "vsock-store"))]
+impl Default for AcceptBackoff {
+    fn default() -> Self {
+        Self {
+            delay: Self::MIN,
+            failures: 0,
+            last_report: None,
+        }
+    }
+}
+
+#[cfg(all(feature = "rest", feature = "vsock-store"))]
+impl AcceptBackoff {
+    const MIN: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(1);
+    const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Record a failure: how long to wait, and whether to log now.
+    fn failed(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (std::time::Duration, Option<AcceptFailureReport>) {
+        self.failures += 1;
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(Self::MAX);
+        let report = match self.last_report {
+            None => Some(AcceptFailureReport::First),
+            Some(at) if now.duration_since(at) >= Self::REPORT_EVERY => {
+                Some(AcceptFailureReport::Since {
+                    failures: self.failures,
+                })
+            }
+            Some(_) => None,
+        };
+        if report.is_some() {
+            self.last_report = Some(now);
+        }
+        (delay, report)
+    }
+
+    /// Record a success; the failure count it ends, if any.
+    fn succeeded(&mut self) -> Option<u64> {
+        let failures = std::mem::take(&mut self.failures);
+        self.delay = Self::MIN;
+        self.last_report = None;
+        (failures > 0).then_some(failures)
+    }
+}
+
+/// What the REST router trusts, and what to say about it at boot.
+#[cfg(feature = "rest")]
+#[derive(Debug, PartialEq, Eq)]
+struct XffTrust {
+    cidrs: Vec<ipnetwork::IpNetwork>,
+    /// Logged once at info: a legacy entry honoured for the parent.
+    note: Option<String>,
+    /// Logged at warn: a list that trusts proxies but cannot reach the parent.
+    warning: Option<String>,
+}
+
+/// `trust_xff_cidrs` as the REST router applies it.
+///
+/// Over TCP, exactly as configured. On vsock the parent arrives as
+/// `0.0.0.3`, so:
+///
+/// - **A trusted `127.0.0.1` also trusts the parent.** On vsock the VTA binds
+///   no TCP, so no peer is ever `127.0.0.1`; in a VTA config that entry can
+///   only ever have meant the socat hop from the parent. Honouring it keeps an
+///   upgraded config (`["127.0.0.1/32"]`) from collapsing every client into
+///   one rate-limit bucket. It is safe for the same reason trusting the parent
+///   is: a non-empty list implies the Rust `enclave-proxy`, which sets
+///   `X-Forwarded-For` itself, because `parent-proxy.sh` (a byte bridge)
+///   refuses to start whenever `trust_xff_cidrs` is set.
+/// - **A non-empty list naming neither** reads no header; that is warned.
+/// - **An empty list** trusts nothing, as a byte-bridging parent requires.
+#[cfg(feature = "rest")]
+fn effective_trust_xff_cidrs(configured: &[ipnetwork::IpNetwork], vsock: bool) -> XffTrust {
+    let parent = vti_common::rate_limit::VSOCK_PARENT_PEER.ip();
+    let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+    let has = |ip| configured.iter().any(|c| c.contains(ip));
+    let mut trust = XffTrust {
+        cidrs: configured.to_vec(),
+        note: None,
+        warning: None,
+    };
+    if !vsock || configured.is_empty() || has(parent) {
+        return trust;
+    }
+    if has(loopback) {
+        trust
+            .cidrs
+            .push(ipnetwork::IpNetwork::new(parent, 32).expect("a /32 is valid"));
+        trust.note = Some(
+            "[server] trust_xff_cidrs trusts 127.0.0.1, which on vsock can only mean \
+             the parent's proxy: trusting it as 0.0.0.3 (the parent over vsock). Add \
+             \"0.0.0.3/32\" to make that explicit"
+                .into(),
+        );
+    } else {
+        trust.warning = Some(format!(
+            "[server] trust_xff_cidrs = {:?} names neither 0.0.0.3/32 nor \
+             127.0.0.1/32. REST is served on vsock and the parent arrives as \
+             0.0.0.3, so X-Forwarded-For is never read and every client shares one \
+             rate-limit bucket. If the parent runs deploy/nitro/enclave-proxy, add \
+             \"0.0.0.3/32\"",
+            configured
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        ));
+    }
+    trust
+}
+
+/// A listener ready to serve, inside the REST thread's runtime./// A listener ready to serve, inside the REST thread's runtime.
+#[cfg(feature = "rest")]
+enum Serving {
+    Tcp(tokio::net::TcpListener),
+    #[cfg(feature = "vsock-store")]
+    Vsock(VsockRestListener),
+}
+
+/// REST thread: serves the Axum HTTP server.
+#[cfg(feature = "rest")]
+fn run_rest_thread(
+    listener: RestListener,
+    state: AppState,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    ready: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
+    // One worker per CPU when there is more than one. On a single thread the
+    // REST server can use at most one CPU however many the host has; with
+    // one CPU a current-thread runtime is cheaper (measured in an enclave).
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let mut builder = if cpus > 1 {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.worker_threads(cpus).thread_name("vta-rest-worker");
+        b
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let rt = match builder.enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ready.send(Err(format!("REST runtime could not be built: {e}")));
+            return;
+        }
+    };
+
+    rt.block_on(async {
+        info!("REST thread started");
+
+        // The Prometheus recorder is installed once per process (before the
+        // restart loop in `run`); `state.metrics_handle` already carries the
+        // handle. Installing here would panic on every soft restart.
+
+        // Adopt this generation's clone of the boot listener into the runtime
+        // first, and tell the boot whether it worked: a REST server that
+        // cannot listen fails the boot.
+        let serving = match listener {
+            RestListener::Tcp(std_listener) => {
+                tokio::net::TcpListener::from_std(std_listener).map(Serving::Tcp)
+            }
+            #[cfg(feature = "vsock-store")]
+            RestListener::Vsock(listener) => VsockRestListener::adopt(listener).map(Serving::Vsock),
+        };
+        let serving = match serving {
+            Ok(s) => {
+                let _ = ready.send(Ok(()));
+                s
+            }
+            Err(e) => {
+                let _ = ready.send(Err(format!("REST listener could not be opened: {e}")));
+                return;
+            }
+        };
+
+        // Snapshot the CORS origins for the router build. The config
+        // is reloadable, but a router rebuild requires a full
+        // service restart (which the operator triggers via
+        // /vta/restart after editing the file), so reading the
+        // current values here is correct.
+        //
+        // The rate-limit *quotas* are the exception: the limiters read them
+        // from the shared config on every request (`QuotaSource::Live`), so a
+        // runtime `config/patch` applies without a rebuild. `trust_xff_cidrs`
+        // picks the key extractor here and stays restart-only.
+        let (cors_origins, trust_xff_cidrs) = {
+            let cfg = state.config.read().await;
+            (
+                cfg.server.cors_origins.clone(),
+                cfg.server.trust_xff_cidrs.clone(),
+            )
+        };
+        #[cfg(feature = "vsock-store")]
+        let on_vsock = matches!(serving, Serving::Vsock(_));
+        #[cfg(not(feature = "vsock-store"))]
+        let on_vsock = false;
+        let trust = effective_trust_xff_cidrs(&trust_xff_cidrs, on_vsock);
+        if let Some(note) = &trust.note {
+            // Once per process, not once per soft restart.
+            static NOTED: std::sync::Once = std::sync::Once::new();
+            NOTED.call_once(|| info!("{note}"));
+        }
+        if let Some(warning) = &trust.warning {
+            warn!("{warning}");
+        }
+
+        let traced_routes = routes::router_with_cors(
+            &cors_origins,
+            &trust.cidrs,
+            routes::QuotaSource::Live(state.config.clone()),
+        )
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn(crate::metrics::track_metrics))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        );
+
+        // `/health` stays out of the trace + metrics layers (it's a
+        // high-frequency probe), but still needs the API's CORS policy
+        // so browser tools can run their cross-origin connectivity
+        // check against it.
+        let app =
+            traced_routes.merge(routes::health_router_with_cors(&cors_origins).with_state(state));
+
+        let shutdown_rx = shutdown_rx.clone();
+        let shutdown = async move {
+            let mut rx = shutdown_rx;
+            let _ = rx.changed().await;
+        };
+        let make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+        match serving {
+            Serving::Tcp(listener) => axum::serve(listener, make_service)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .expect("axum serve failed"),
+            // `tap_io` only to get axum's `Connected` impl for `L::Addr`.
+            #[cfg(feature = "vsock-store")]
+            Serving::Vsock(vsock) => axum::serve(
+                axum::serve::ListenerExt::tap_io(vsock, |_| {}),
+                make_service,
+            )
+            .with_graceful_shutdown(shutdown)
+            .await
+            .expect("axum serve failed"),
+        }
+
+        info!("REST thread shutting down");
+    });
+}
+
+/// Initialize DID resolver, secrets resolver, and JWT keys for authentication.
+///
+/// Returns `None` values if the VTA DID is not configured (server still starts
+/// so the setup wizard can be run first).
+/// Result of auth initialization, bundling all outputs including the
+/// verification-method IDs that were inserted into the secrets resolver.
+struct AuthInit {
+    did_resolver: Option<DIDCacheClient>,
+    secrets_resolver: Option<Arc<ThreadedSecretsResolver>>,
+    jwt_keys: Option<Arc<JwtKeys>>,
+    atm: Option<ATM>,
+    /// Signing verification method ID (e.g. `{did}#key-0` or `{did}#{ed_pub_mb}`).
+    /// Consumed only by the DIDComm secret-collection path; cfg-gated to
+    /// keep non-didcomm builds warning-free.
+    #[cfg_attr(not(feature = "didcomm"), allow(dead_code))]
+    signing_vm_id: Option<String>,
+    /// Key-agreement verification method ID (e.g. `{did}#key-1` or `{did}#{x_pub_mb}`).
+    #[cfg_attr(not(feature = "didcomm"), allow(dead_code))]
+    ka_vm_id: Option<String>,
+}
+
+impl AuthInit {
+    fn empty() -> Self {
+        Self {
+            did_resolver: None,
+            secrets_resolver: None,
+            jwt_keys: None,
+            atm: None,
+            signing_vm_id: None,
+            ka_vm_id: None,
+        }
+    }
+}
+
+/// Warn at boot when operator-written policy exists but `policy.enforcement`
+/// is off, so nothing consults it (Keyring KR-22).
+///
+/// Advisory only: a failure to read the policy rows is itself logged and the
+/// VTA carries on starting — this must never be the reason a VTA will not boot.
+#[cfg(any(feature = "rest", feature = "didcomm"))]
+async fn warn_if_policies_unenforced(policy_ks: &KeyspaceHandle) {
+    match vta_policy::unenforced_policies(policy_ks).await {
+        Ok(found) if found.is_empty() => {}
+        Ok(found) => tracing::warn!(
+            approval_rules = found.approval_rules,
+            operator_policies = ?found.operator_policies,
+            "{}",
+            unenforced_policies_message(&found)
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not check the policy keyspace for rules that enforcement would apply"
+        ),
+    }
+}
+
+/// The operator-facing text for [`warn_if_policies_unenforced`]: what is being
+/// ignored, and the exact change that turns it on.
+#[cfg(any(feature = "rest", feature = "didcomm"))]
+fn unenforced_policies_message(found: &vta_policy::UnenforcedPolicies) -> String {
+    let mut what = Vec::new();
+    if found.approval_rules > 0 {
+        what.push(format!(
+            "{} approval rule{} (`pnm approvals list`)",
+            found.approval_rules,
+            if found.approval_rules == 1 { "" } else { "s" }
+        ));
+    }
+    if !found.operator_policies.is_empty() {
+        what.push(format!(
+            "hand-authored polic{} {} (`pnm policy list`)",
+            if found.operator_policies.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            found.operator_policies.join(", ")
+        ));
+    }
+    format!(
+        "policy.enforcement is off, so {} {} stored but NOT enforced — every task runs on the \
+         caller's own authority. Enforcement is opt-in: set `enforcement = true` under \
+         `[policy]` in config.toml and restart the VTA to apply it. See \
+         docs/02-vta/approvals.md#enforcement.",
+        what.join(" and "),
+        if found.approval_rules + found.operator_policies.len() == 1 {
+            "is"
+        } else {
+            "are"
+        }
+    )
+}
+
+/// Build the operator-facing boot-refusal message for the missing-identity
+/// gate (P0.9b). Names the specific gap so the fix is obvious, and always
+/// points at the `--allow-degraded` escape hatch (mirrors CLAUDE.md's
+/// "operator errors should suggest the fix").
+fn missing_identity_message(config: &AppConfig) -> String {
+    let cause = if config.vta_did.is_none() {
+        "vta_did is not configured — this VTA has no identity. Run `vta setup` \
+         to provision one"
+            .to_string()
+    } else if config.auth.jwt_signing_key.is_none() {
+        "auth.jwt_signing_key is not configured — the VTA can't issue access \
+         tokens. Run `vta setup`, or restore the key to config.toml"
+            .to_string()
+    } else {
+        format!(
+            "vta_did is set ({}) but its signing identity could not be loaded — \
+             the VTA key records may be missing from the store or the seed \
+             backend may be unreachable. Check the store data_dir and the \
+             secrets backend",
+            config.vta_did.as_deref().unwrap_or_default()
+        )
+    };
+    format!(
+        "refusing to start: {cause}. A VTA without a usable signing identity \
+         boots but answers every authenticated request with 401. To start \
+         anyway (e.g. to inspect or finish provisioning a half-set-up \
+         instance), pass `--allow-degraded`."
+    )
+}
+
+async fn init_auth(
+    config: &AppConfig,
+    seed_store: &dyn SeedStore,
+    keys_ks: &KeyspaceHandle,
+    // Local `did.jsonl` source for the self-DID resolver preload (webvh only).
+    // Always present in the signature; the caller passes `None` when the
+    // `webvh` feature is off. Keeps the signature identical across feature sets.
+    webvh_ks: Option<&KeyspaceHandle>,
+    // The `did:webs` records this VTA holds, for an identity that is one:
+    // `None` when the `webs` feature is off.
+    webs_ks: Option<&KeyspaceHandle>,
+) -> AuthInit {
+    let vta_did = match &config.vta_did {
+        Some(did) => did.clone(),
+        None => {
+            warn!("vta_did not configured — auth endpoints will not work (run setup first)");
+            return AuthInit::empty();
+        }
+    };
+
+    // Which keys are which, read from this VTA's own document: by role, not by
+    // an assumed `#key-0` / `#key-1` (VTI-KEY-150). Records are named under the
+    // DID they were minted for — its own, or for a VTA presented as its did:scid
+    // the did:webvh log that verifies it — and the secrets below are registered
+    // under the identity's own (VTI-KEY-161).
+    let self_keys = crate::self_keys::self_keys(&vta_did, webvh_ks, webs_ks).await;
+
+    // Look up VTA key paths from stored key records
+    let (signing_path, ka_path, vta_seed_id) = match find_vta_key_paths(&self_keys, keys_ks).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            warn!(
+                "failed to find VTA key records: {e} — auth endpoints will not work (run setup first)"
+            );
+            return AuthInit::empty();
+        }
+    };
+
+    // Load seed for VTA keys (uses the seed generation from the key record)
+    let seed = match load_seed_bytes(keys_ks, seed_store, vta_seed_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("failed to load seed: {e} — auth endpoints will not work");
+            return AuthInit::empty();
+        }
+    };
+
+    let root = match ExtendedSigningKey::from_seed(&seed) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("failed to create BIP-32 root key: {e} — auth endpoints will not work");
+            return AuthInit::empty();
+        }
+    };
+
+    // 1. DID resolver (network mode if resolver_url is set, local mode otherwise)
+    //
+    // The cache TTL is explicit and bounded (`[did_cache]`, default 60 s, at
+    // most 300 s): it is how long a key revoked from a peer's document keeps
+    // verifying here. A proof that fails against a cached document re-resolves
+    // it once before it is refused (`vta_sdk::trust_task_proof`), so a
+    // rotation does not wait for the TTL.
+    let resolver_config = {
+        if let Some(ref url) = config.resolver_url {
+            // The remote keeps its own cache, which this node can neither read
+            // nor evict: a revoked key keeps verifying for up to our TTL plus
+            // the remote's (`DidCacheConfig::ttl_secs`).
+            info!(
+                url = %url,
+                "DID resolver using network mode (remote resolver); a revoked key may keep \
+                 verifying for did_cache.ttl_secs plus the remote resolver's own cache expiry"
+            );
+        } else {
+            info!("DID resolver using local mode");
+        }
+        info!(
+            ttl_secs = config.did_cache.ttl_secs,
+            capacity = config.did_cache.capacity,
+            "DID document cache bounds"
+        );
+        vta_sdk::resolver::build_verifier_did_cache_config(
+            config.resolver_url.as_deref(),
+            config.did_cache.ttl_secs,
+            config.did_cache.capacity,
+        )
+    };
+    let mut did_resolver = match DIDCacheClient::new(resolver_config).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("failed to create DID resolver: {e} — auth endpoints will not work");
+            return AuthInit::empty();
+        }
+    };
+
+    // 1.2. Preload the VTA's DID document into the resolver so that DIDComm consumers
+    // can resolve it without a network round-trip.
+    preload_self_did_document(&mut did_resolver, &vta_did, webvh_ks, webs_ks).await;
+
+    // 2. Secrets resolver with VTA's Ed25519 + X25519 secrets
+    let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
+
+    // Track verification-method IDs so DIDComm consumers use the right fragment.
+    let mut signing_vm_id: Option<String> = None;
+    let mut ka_vm_id: Option<String> = None;
+
+    if vta_did.starts_with("did:key:") {
+        // did:key uses fragment IDs like {did}#{ed_pub_mb} and {did}#{x_pub_mb},
+        // and the X25519 key is derived FROM the Ed25519 key (not independently).
+        // Use the SDK helper which handles both correctly.
+        let dp: vti_common::slip10::DerivationPath = match signing_path.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("invalid signing derivation path: {e}");
+                return AuthInit {
+                    did_resolver: Some(did_resolver),
+                    ..AuthInit::empty()
+                };
+            }
+        };
+        match root.derive(&dp) {
+            Ok(derived) => {
+                let seed_bytes: &[u8; 32] = derived.signing_key.as_bytes();
+                match vta_sdk::did_key::secrets_from_did_key(&vta_did, seed_bytes) {
+                    Ok(secrets) => {
+                        signing_vm_id = Some(secrets.signing.id.clone());
+                        ka_vm_id = Some(secrets.key_agreement.id.clone());
+                        info!(signing_id = %secrets.signing.id, ka_id = %secrets.key_agreement.id, "did:key secrets loaded");
+                        secrets_resolver.insert(secrets.signing).await;
+                        secrets_resolver.insert(secrets.key_agreement).await;
+                    }
+                    Err(e) => {
+                        warn!("failed to build did:key secrets: {e} — auth will not work");
+                        return AuthInit {
+                            did_resolver: Some(did_resolver),
+                            ..AuthInit::empty()
+                        };
+                    }
+                }
+            }
+            Err(e) => warn!("failed to derive VTA signing key: {e}"),
+        }
+    } else {
+        // did:webvh, did:webs and other methods: independently derived Ed25519
+        // + X25519 keys, under the ids this VTA's own document gives them.
+        let ka_path = match ka_path {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "VTA key-agreement record missing — auth endpoints will not work (run setup first)"
+                );
+                return AuthInit {
+                    did_resolver: Some(did_resolver),
+                    ..AuthInit::empty()
+                };
+            }
+        };
+
+        let Some(ka_key) = self_keys.key_agreement.clone() else {
+            warn!(
+                "this VTA's DID document lists no key-agreement key — auth endpoints will not \
+                 work"
+            );
+            return AuthInit {
+                did_resolver: Some(did_resolver),
+                ..AuthInit::empty()
+            };
+        };
+        // The authentication key: see `find_vta_key_paths`.
+        let signing_key = self_keys.authentication.clone();
+        signing_vm_id = Some(signing_key.vm_id.clone());
+        ka_vm_id = Some(ka_key.vm_id.clone());
+
+        // Load stored key records for validation
+        let stored_signing: Option<KeyRecord> = keys_ks
+            .get(crate::keys::store_key(&signing_key.record_id))
+            .await
+            .ok()
+            .flatten();
+        let stored_ka: Option<KeyRecord> = keys_ks
+            .get(crate::keys::store_key(&ka_key.record_id))
+            .await
+            .ok()
+            .flatten();
+
+        // Derive and insert VTA signing secret (Ed25519)
+        match root.derive_ed25519(&signing_path) {
+            Ok(signing_secret) => {
+                if let Some(ref record) = stored_signing {
+                    match signing_secret.get_public_keymultibase() {
+                        Ok(runtime_pub) if runtime_pub != record.public_key => {
+                            error!(
+                                key_id = %signing_key.vm_id,
+                                stored = %record.public_key,
+                                runtime = %runtime_pub,
+                                "SIGNING KEY MISMATCH: runtime-derived Ed25519 public key does not match \
+                                 the key stored in the key record (and published in the DID document). \
+                                 DIDComm message signing/verification will fail. \
+                                 This likely means the DID was created with different code or seed."
+                            );
+                        }
+                        Ok(runtime_pub) => {
+                            info!(key_id = %signing_key.vm_id, pub_key = %runtime_pub, "signing key validated");
+                        }
+                        Err(e) => warn!("could not extract signing public key for validation: {e}"),
+                    }
+                }
+                for id in self_secret_ids(&vta_did, signing_key.fragment()) {
+                    let mut secret = signing_secret.clone();
+                    secret.id = id;
+                    secrets_resolver.insert(secret).await;
+                }
+            }
+            Err(e) => warn!("failed to derive VTA signing key: {e}"),
+        }
+
+        // Derive and insert VTA key-agreement secret (X25519)
+        match root.derive_x25519(&ka_path) {
+            Ok(ka_secret) => {
+                if let Some(ref record) = stored_ka {
+                    match ka_secret.get_public_keymultibase() {
+                        Ok(runtime_pub) if runtime_pub != record.public_key => {
+                            error!(
+                                key_id = %ka_key.vm_id,
+                                stored = %record.public_key,
+                                runtime = %runtime_pub,
+                                "KEY-AGREEMENT KEY MISMATCH: runtime-derived X25519 public key does not match \
+                                 the key stored in the key record (and published in the DID document). \
+                                 DIDComm encryption/decryption will fail. Others will encrypt to the DID \
+                                 document key but this VTA holds a different private key. \
+                                 The DID document must be updated or the VTA identity must be regenerated."
+                            );
+                        }
+                        Ok(runtime_pub) => {
+                            info!(key_id = %ka_key.vm_id, pub_key = %runtime_pub, "key-agreement key validated");
+                        }
+                        Err(e) => warn!("could not extract KA public key for validation: {e}"),
+                    }
+                }
+                for id in self_secret_ids(&vta_did, ka_key.fragment()) {
+                    let mut secret = ka_secret.clone();
+                    secret.id = id;
+                    secrets_resolver.insert(secret).await;
+                }
+            }
+            Err(e) => warn!("failed to derive VTA key-agreement key: {e}"),
+        }
+    }
+
+    // 3. JWT signing key from config (random key, not BIP-32 derived)
+    let jwt_keys = match &config.auth.jwt_signing_key {
+        Some(b64) => match JwtKeys::from_base64_seed(b64, "VTA") {
+            Ok(k) => k,
+            Err(e) => {
+                warn!("failed to load JWT signing key: {e} — auth endpoints will not work");
+                return AuthInit {
+                    did_resolver: Some(did_resolver),
+                    secrets_resolver: Some(Arc::new(secrets_resolver)),
+                    signing_vm_id,
+                    ka_vm_id,
+                    ..AuthInit::empty()
+                };
+            }
+        },
+        None => {
+            warn!(
+                "auth.jwt_signing_key not configured — auth endpoints will not work (run setup first)"
+            );
+            return AuthInit {
+                did_resolver: Some(did_resolver),
+                secrets_resolver: Some(Arc::new(secrets_resolver)),
+                signing_vm_id,
+                ka_vm_id,
+                ..AuthInit::empty()
+            };
+        }
+    };
+
+    // 4. Build ATM for DIDComm message unpacking (used by auth endpoints)
+    let secrets_resolver = Arc::new(secrets_resolver);
+    let atm = {
+        let tdk_config = TDKConfig::builder()
+            .with_did_resolver(did_resolver.clone())
+            .with_secrets_resolver((*secrets_resolver).clone())
+            .with_load_environment(false)
+            .build();
+        match tdk_config {
+            Ok(cfg) => match TDKSharedState::new(cfg).await {
+                Ok(tdk) => {
+                    match ATM::new(ATMConfig::builder().build().unwrap(), Arc::new(tdk)).await {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            warn!("failed to create ATM for auth unpack: {e}");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to create TDK shared state: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("failed to build TDK config: {e}");
+                None
+            }
+        }
+    };
+
+    // No TSP profile is built here, and that absence is deliberate.
+    //
+    // There used to be one: `ATMProfile::new(atm, "VTA", vta_did, None)` — no
+    // mediator — on the reasoning that unpacking reads the decryption key from
+    // the ATM's secrets resolver and so needs no route. That reasoning is
+    // wrong, and wrong in a way nothing here could show. Every TSP entry point
+    // in the messaging SDK goes through `ATMProfile::dids()`, which *errors*
+    // without a mediator: `unpack_bytes` calls it to check the envelope's
+    // receiver, `pack` to name the sender, and `send_raw` also needs
+    // `get_mediator_rest_endpoint()`. So that profile could neither send nor
+    // unseal, and answered every attempt with `ConfigError("No Mediator is
+    // configured for this Profile")` before touching the network — which reads
+    // as an internal error rather than as missing wiring.
+    //
+    // The profile that works is the one `messaging::service::build_messaging`
+    // registers against the mediator, and it is published on the bridge. Read
+    // it via `AppState::tsp_transport`.
+
+    info!("auth initialized for DID {vta_did}");
+
+    AuthInit {
+        did_resolver: Some(did_resolver),
+        secrets_resolver: Some(secrets_resolver),
+        jwt_keys: Some(Arc::new(jwt_keys)),
+        atm,
+        signing_vm_id,
+        ka_vm_id,
+    }
+}
+
+/// Seed the resolver with this VTA's own `did:webvh` document so it can
+/// pack/unpack DIDComm messages without a network round-trip. `did:webvh`
+/// self-resolution normally needs HTTPS to the VTA's own public domain, which
+/// may be unreachable from inside the VTA's network (e.g. VPC-internal); the
+/// locally stored `did.jsonl` (WEBVH keyspace) is the authoritative source, so
+/// we seed the cache from it instead.
+///
+/// Scope: **`did:webvh` only** — the preload reads the local webvh log.
+/// `did:web` and other network-resolved methods have no local log to seed from,
+/// so they are left to normal resolver behaviour.
+///
+/// Staleness: this runs once at init, and the seeded resolver is now reused by
+/// the DIDComm listener path (so auth + listener share one cache view). Every
+/// runtime DID-log mutation — the did-webvh lifecycle (`create` / `update`) and
+/// all protocol `services {…}` ops, which funnel through `update_did_webvh` —
+/// reseeds this shared entry via `refresh_resolver_doc_from_log` right after the
+/// new log is persisted, so service-advertisement changes stay in sync in the
+/// VTA's in-process self-view.
+///
+/// Best-effort and fail-safe: if local state is missing or malformed we warn and
+/// keep the last-known-good cache entry (never evict, never poison), falling back
+/// to normal resolver behaviour where none exists.
+pub(crate) async fn preload_self_did_document(
+    did_resolver: &mut DIDCacheClient,
+    vta_did: &str,
+    webvh_ks: Option<&KeyspaceHandle>,
+    webs_ks: Option<&KeyspaceHandle>,
+) {
+    // A did:webs VTA: its document is derived from the key event log it
+    // stores, exactly as its host serves it (design note did-webs-in-the-vta
+    // §4, S6), so the VTA resolves itself before — and without — the host.
+    if vta_did.starts_with("did:webs:") {
+        match crate::self_keys::own_document(vta_did, webvh_ks, webs_ks).await {
+            Some(value) => match serde_json::from_value(value) {
+                Ok(doc) => {
+                    did_resolver.add_did_document(vta_did, doc).await;
+                    info!(did = %vta_did, "preloaded VTA DID into resolver cache from its key event log");
+                }
+                Err(e) => {
+                    warn!(did = %vta_did, error = %e, "failed to decode DID document for resolver preload");
+                }
+            },
+            None => warn!(did = %vta_did, "no local key event log found for resolver preload"),
+        }
+        return;
+    }
+    let _ = webs_ks;
+
+    #[cfg(not(feature = "webvh"))]
+    {
+        // Without the `webvh` feature there is no local webvh log to seed from;
+        // nothing to preload. Consume the params so the non-webvh build is
+        // warning-clean under `-D warnings`.
+        let _ = (&did_resolver, vta_did, webvh_ks);
+    }
+
+    #[cfg(feature = "webvh")]
+    {
+        let Some(webvh_ks) = webvh_ks else {
+            if vta_sdk::did_scid::is_durable(vta_did) {
+                warn!(
+                    did = %vta_did,
+                    "webvh keyspace not available; self DID preload skipped"
+                );
+            }
+            return;
+        };
+        // Every did:scid identity this VTA holds resolves here by its bare DID
+        // after a restart: its own document and its source, from the local log
+        // (VTI-KEY-161, VTI-KEY-162). A serverless one is reachable no other way.
+        match crate::webvh_store::list_scid_identities(webvh_ks).await {
+            Ok(identities) => {
+                for identity in identities {
+                    if let Ok(Some(log)) =
+                        crate::webvh_store::get_did_log(webvh_ks, &identity.webvh_did).await
+                    {
+                        crate::operations::did_webvh::refresh_resolver_doc_from_log(
+                            did_resolver,
+                            &identity.webvh_did,
+                            &log,
+                            "boot",
+                        )
+                        .await;
+                    }
+                    did_resolver.scid_sources().add_source(&identity.did_url());
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to list did:scid identities for resolver preload"),
+        }
+        if vta_sdk::did_scid::is_scid(vta_did) {
+            // Preloaded above, under its bare DID.
+            return;
+        }
+        if !vta_did.starts_with("did:webvh:") {
+            return;
+        }
+        let Some(did_log) = (match crate::webvh_store::get_did_log(webvh_ks, vta_did).await {
+            Ok(log) => log,
+            Err(e) => {
+                warn!(did = %vta_did, error = %e, "failed to read local did.jsonl for resolver preload");
+                return;
+            }
+        }) else {
+            warn!(did = %vta_did, "no local did.jsonl found for resolver preload");
+            return;
+        };
+
+        let doc_value = match crate::operations::protocol::document::current_document_from_log(
+            &did_log,
+        ) {
+            Ok(doc) => doc,
+            Err(e) => {
+                warn!(did = %vta_did, error = %e, "failed to parse local did.jsonl for resolver preload");
+                return;
+            }
+        };
+
+        let doc = match serde_json::from_value(doc_value) {
+            Ok(doc) => doc,
+            Err(e) => {
+                warn!(did = %vta_did, error = %e, "failed to decode DID document for resolver preload");
+                return;
+            }
+        };
+
+        did_resolver.add_did_document(vta_did, doc).await;
+        info!(did = %vta_did, "preloaded VTA DID into resolver cache from local did.jsonl");
+    }
+}
+
+/// Publish this VTA's own did:webs if setup left it unpublished
+/// (`operations::did_webs::publish_own_identity`). Over the host's Trust Task
+/// HTTPS endpoint, since no mediator session exists yet, signed by the key the
+/// DID's own key event log establishes. A failure is logged and boot goes on:
+/// the readiness gate then reports the DID unresolved, and the next boot
+/// tries again.
+#[cfg(feature = "webs")]
+async fn publish_own_webs_identity(state: &AppState) {
+    let Some(vta_did) = state.config.read().await.vta_did.clone() else {
+        return;
+    };
+    if !vta_did.starts_with("did:webs:") {
+        return;
+    }
+    let record = match crate::webs_store::get(&state.webs_ks, &vta_did).await {
+        Ok(Some(record)) if !record.published => record,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(did = %vta_did, error = %e, "could not read this VTA's did:webs record");
+            return;
+        }
+    };
+    let Some(resolver) = state.did_resolver.as_ref() else {
+        warn!(did = %vta_did, "no DID resolver; this VTA's did:webs cannot be published yet");
+        return;
+    };
+    let server = match crate::webvh_store::get_server(&state.webvh_ks, &record.server_id).await {
+        Ok(Some(server)) => server,
+        Ok(None) => {
+            error!(
+                did = %vta_did,
+                server_id = %record.server_id,
+                "this VTA's did:webs names a hosting server that is not registered; register it \
+                 (`pnm did-mgmt servers add`) and restart"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(did = %vta_did, error = %e, "could not read this VTA's hosting server");
+            return;
+        }
+    };
+    let deps = crate::operations::did_webvh::WebvhDeps::from_app_state(state, resolver);
+    let host = match crate::operations::did_webvh::host::host_client(&deps, &vta_did, &server).await
+    {
+        Ok(host) => host,
+        Err(e) => {
+            error!(did = %vta_did, error = %e, "cannot reach this VTA's did:webs host");
+            return;
+        }
+    };
+    match crate::operations::did_webs::publish_own_identity(&state.webs_ks, &vta_did, &host).await {
+        Ok(true) => info!(did = %vta_did, "published this VTA's did:webs at its host"),
+        Ok(false) => {}
+        Err(e) => error!(
+            did = %vta_did,
+            server = %server.did,
+            error = %e,
+            "could not publish this VTA's did:webs; the host must allow self-registration on \
+             its domain (`[[hosting.webs_self_register]]`). Retried at the next boot"
+        ),
+    }
+}
+
+/// The ids the VTA registers one of its own secrets under: the method id in its
+/// document — under the bare DID, for a did:scid (VTI-KEY-161) — and, where the
+/// configured DID carries a `src`, the same id with it, which is how this VTA
+/// names the key when it signs as that DID URL (VTI-KEY-163).
+fn self_secret_ids(vta_did: &str, fragment: &str) -> Vec<String> {
+    let bare = format!("{}#{fragment}", vta_sdk::did_scid::strip_src(vta_did));
+    let presented = format!("{vta_did}#{fragment}");
+    if presented == bare {
+        vec![bare]
+    } else {
+        vec![bare, presented]
+    }
+}
+
+/// Look up VTA signing and key-agreement derivation paths from stored key records.
+///
+/// `did:webvh` (and other methods with independently-derived X25519) stores
+/// records at both `#key-0` and `#key-1`. `did:key` stores only `#key-0`
+/// because its X25519 key is curve-converted from Ed25519 at runtime, not
+/// independently derived — there is no separate path to record.
+///
+/// Returns `(signing_path, ka_path, seed_id)` where `ka_path` is `None` for
+/// `did:key` and `seed_id` comes from the signing key record.
+async fn find_vta_key_paths(
+    self_keys: &crate::self_keys::SelfKeys,
+    keys_ks: &KeyspaceHandle,
+) -> Result<(String, Option<String>, Option<u32>), AppError> {
+    // The resident key is the one this VTA authenticates with — its requests,
+    // responses and DIDComm sender all carry `proofPurpose: authentication` —
+    // which is a key-role identity's `operational` key and a webvh VTA's
+    // `#key-0` (VTI-KEY-072). Attestation artefacts load their key per use.
+    let signing: KeyRecord = keys_ks
+        .get(crate::keys::store_key(&self_keys.authentication.record_id))
+        .await?
+        .ok_or_else(|| AppError::NotFound("VTA signing key not found".into()))?;
+    require_active(&signing)?;
+
+    let ka_path = if self_keys.authentication.vm_id.starts_with("did:key:") {
+        None
+    } else {
+        let ka_key_id = self_keys
+            .key_agreement
+            .as_ref()
+            .map(|k| k.record_id.clone())
+            .ok_or_else(|| AppError::NotFound("VTA key-agreement key not listed".into()))?;
+        let ka: KeyRecord = keys_ks
+            .get(crate::keys::store_key(&ka_key_id))
+            .await?
+            .ok_or_else(|| AppError::NotFound("VTA key-agreement key not found".into()))?;
+        require_active(&ka)?;
+        Some(ka.derivation_path)
+    };
+
+    debug!(signing_path = %signing.derivation_path, ka_path = ?ka_path, "VTA key paths resolved");
+    Ok((signing.derivation_path, ka_path, signing.seed_id))
+}
+
+/// The VTA loads only active records as its own identity: a revoked record
+/// (retired by a rotation, or revoked outright) or a rotation's inert staging
+/// record must never become the key it signs or decrypts with.
+fn require_active(record: &KeyRecord) -> Result<(), AppError> {
+    if record.status != vta_sdk::keys::KeyStatus::Active {
+        return Err(AppError::Forbidden(format!(
+            "VTA key `{}` is not active; refusing to load it",
+            record.key_id
+        )));
+    }
+    Ok(())
+}
+
+/// Decode a base64url-no-pad JWT signing key and construct `JwtKeys`.
+/// Mediator-connect supervisor: readiness gate, connect, and reconnect.
+///
+/// Owns the whole mediator lifecycle that used to run inline once during
+/// startup:
+///
+/// 1. **Self-readiness gate** — wait until the VTA's own DID resolves over the
+///    network, so the mediator (which authenticates us by resolving that DID)
+///    can actually fetch our sender key instead of 403-ing the handshake.
+/// 2. **Connect**, with capped exponential backoff + full jitter. The classic
+///    initial failure is the mediator's *own* resolver still negative-caching
+///    the VTA host: it clears on its own timer, so retrying self-heals with no
+///    operator restart where the previous one-shot connect needed one.
+/// 3. **Supervise the session** — the inbound loop is awaited here rather than
+///    detached, so when it ends the supervisor tears the session down and
+///    reconnects instead of leaving the VTA silently deaf for the rest of the
+///    process.
+///
+/// All of it runs in a spawned task: nothing here may block `server::run`, which
+/// has to reach its shutdown/restart select for a signal to be honoured.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+struct MessagingConnect {
+    app_state: AppState,
+    vta_did: String,
+    messaging_config: crate::config::MessagingConfig,
+    readiness: crate::config::MediatorReadinessConfig,
+    resolver_url: Option<String>,
+    outbox_ks: KeyspaceHandle,
+    relationships_ks: KeyspaceHandle,
+    relationship_drop_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    flush_queues: bool,
+    shutdown: CancellationToken,
+    /// Brings the whole process down when the readiness gate's `fail` policy
+    /// trips. The gate runs off the startup path (so a SIGTERM mid-gate is
+    /// honoured), which means it can no longer surface a fatal by returning
+    /// `Err` from `run` — it signals here instead.
+    fatal_shutdown: watch::Sender<bool>,
+    /// Set alongside `fatal_shutdown` so `run` can turn the same condition into
+    /// a non-zero exit status once the threads are joined.
+    fatal_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+impl MessagingConnect {
+    /// Gate, then run the connect/supervise/reconnect loop until shutdown, the
+    /// configured horizon, or a `reconnect = false` single-shot failure.
+    async fn run(self) {
+        // One probe for the life of the supervisor, shared by the gate and every
+        // reconnect: a pass it has just observed answers the next check instead
+        // of fetching our own `did.jsonl` again (see `SELF_RESOLUTION_FRESH_FOR`).
+        // It never consults the long-lived resolver, so the preloaded self-DID
+        // entry cannot stand in for a network resolution.
+        let mut probe = crate::messaging::readiness::SelfResolutionProbe::new(
+            &self.vta_did,
+            self.resolver_url.as_deref(),
+        );
+        match crate::messaging::readiness::run_gate_with_probe(
+            &self.readiness,
+            &mut probe,
+            &self.shutdown,
+        )
+        .await
+        {
+            Ok(crate::messaging::readiness::GateDecision::Proceed) => {}
+            Ok(crate::messaging::readiness::GateDecision::Skip) => {
+                info!(
+                    "DIDComm messaging not started this boot \
+                     (mediator self-readiness gate: skip)"
+                );
+                return;
+            }
+            Err(e) => {
+                error!("mediator self-readiness gate failed, shutting down: {e}");
+                self.fatal_flag
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.fatal_shutdown.send(true);
+                return;
+            }
+        }
+
+        // One-shot, *before* the first connect attempt and never repeated. Both
+        // of these delete queued messages at the mediator, so re-running them on
+        // every retry would keep destroying traffic that arrived between
+        // attempts.
+        self.run_startup_recovery().await;
+
+        self.supervise(&mut probe).await;
+    }
+
+    /// The connect → supervise-session → reconnect loop.
+    async fn supervise(&self, probe: &mut crate::messaging::readiness::SelfResolutionProbe) {
+        // The give-up / how-long-to-wait arithmetic lives in `ReconnectPolicy`
+        // so it is unit-testable without a mediator; this loop owns the effects.
+        let policy = crate::messaging::readiness::ReconnectPolicy::from_config(&self.readiness);
+        // `failing_for` is measured from the start of the current run of
+        // failures, not from process start — a VTA that ran healthily for a week
+        // and then dropped gets the full horizon to reconnect, rather than
+        // blowing a 1-hour budget it exhausted six days ago.
+        let mut window_started = tokio::time::Instant::now();
+        let mut attempt: u32 = 0;
+        // What the inbox watch may do about a receive leg that stops
+        // delivering: reconnect the socket, or end the session so this loop
+        // rebuilds it. Held here, across sessions, so a rebuilt session keeps
+        // the same backoff instead of being allowed to reconnect at once.
+        let reconnects = std::sync::Arc::new(vti_common::inbox::ReconnectGovernor::new(
+            vti_common::inbox::Escalation::EndSession,
+        ));
+
+        loop {
+            if self.shutdown.is_cancelled() {
+                return;
+            }
+
+            // Never touch the mediator unless the VTA can resolve its own DID
+            // over the network (the same path the mediator takes). A cold VTA
+            // that can't resolve itself would only storm the mediator with
+            // unresolvable-sender auth attempts. A success observed within
+            // `SELF_RESOLUTION_FRESH_FOR` answers without a fetch; a failure is
+            // never remembered, so an unresolvable VTA re-probes on every
+            // attempt, paced by the backoff below.
+            if probe.is_resolvable().await {
+                match self.connect_once().await {
+                    Ok(messaging) => {
+                        info!("DIDComm messaging started");
+                        let session_started = tokio::time::Instant::now();
+
+                        // Await the inbound loop rather than detaching it: its
+                        // return is the only signal that this session is over.
+                        crate::messaging::service::run_inbound_loop(
+                            messaging.clone(),
+                            self.app_state.clone(),
+                            self.vta_did.clone(),
+                            self.shutdown.clone(),
+                            reconnects.clone(),
+                        )
+                        .await;
+
+                        // Session over. Unpublish before tearing down so no
+                        // caller packs onto a socket we're about to stop, then
+                        // stop it — the mediator allows one socket per DID, so a
+                        // reconnect while the old socket still auto-reconnects
+                        // would have the two duel over the slot.
+                        self.app_state.didcomm_bridge.clear_messaging();
+                        messaging.atm.graceful_shutdown().await;
+
+                        if self.shutdown.is_cancelled() {
+                            return;
+                        }
+
+                        let lasted = session_started.elapsed();
+                        warn!(
+                            session_secs = lasted.as_secs(),
+                            "mediator session ended unexpectedly; reconnecting"
+                        );
+                        if policy.session_was_healthy(lasted) {
+                            attempt = 0;
+                            window_started = tokio::time::Instant::now();
+                        }
+                    }
+                    Err(e) => warn!("failed to start DIDComm messaging: {e}"),
+                }
+            } else {
+                warn!(
+                    vta_did = %self.vta_did,
+                    "VTA not yet self-resolvable over the network; deferring mediator connect"
+                );
+            }
+
+            // `None` = stop: either reconnect is disabled (legacy single-shot:
+            // give up until the next restart) or the horizon is exhausted.
+            let Some(sleep_for) = policy.next_backoff(attempt, window_started.elapsed()) else {
+                if self.readiness.reconnect {
+                    warn!(
+                        waited_secs = window_started.elapsed().as_secs(),
+                        "mediator reconnect gave up after the configured horizon; \
+                         a later restart will retry"
+                    );
+                }
+                return;
+            };
+            debug!(
+                attempt = attempt + 1,
+                ceiling_secs = policy.ceiling_for(attempt).as_secs_f64(),
+                sleep_secs = sleep_for.as_secs_f64(),
+                "mediator connection not established; backing off before retry \
+                 (exponential backoff + full jitter)"
+            );
+            tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    info!("shutdown during mediator reconnect backoff; stopping supervisor");
+                    return;
+                }
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
+    /// Best-effort, destructive queue recovery that runs **once** per process,
+    /// before the first connect attempt.
+    ///
+    /// Clearing this DID's mediator inbox stops a poison / undeliverable backlog
+    /// stalling the pickup handshake and wedging the (shared DIDComm+TSP)
+    /// socket. `--flush-queues` additionally clears the OUTBOUND (sender) queue:
+    /// a message loop can fill it, after which the mediator rejects every new
+    /// send until it drains, and the inbox drain cannot touch it.
+    async fn run_startup_recovery(&self) {
+        let messaging_config = &self.messaging_config;
+        let vta_did = self.vta_did.as_str();
+
+        if messaging_config.drain_inbox_on_start || self.flush_queues {
+            match self.app_state.atm.as_ref() {
+                Some(atm) => {
+                    let cleared =
+                        drain_mediator_inbox(atm, &messaging_config.mediator_did, vta_did).await;
+                    info!(
+                        count = cleared,
+                        mediator = %messaging_config.mediator_did,
+                        "cleared queued mediator inbox before going live"
+                    );
+                }
+                None => warn!("inbox drain requested but no ATM is available; skipping"),
+            }
+        }
+
+        if self.flush_queues {
+            match self.app_state.atm.as_ref() {
+                Some(atm) => {
+                    let cleared =
+                        flush_mediator_outbox(atm, &messaging_config.mediator_did, vta_did).await;
+                    info!(
+                        count = cleared,
+                        mediator = %messaging_config.mediator_did,
+                        "flush_queues: cleared outbound sender queue before going live"
+                    );
+                }
+                None => {
+                    warn!("--flush-queues set but no ATM is available; skipping outbox flush")
+                }
+            }
+        }
+    }
+
+    /// One connect attempt: build the messaging service and, on success, wire
+    /// the bridge/registry/ACL and hand the live session back to the caller,
+    /// which owns its inbound loop. Returns `Err` (to be retried) if the connect
+    /// fails; `build_messaging` tears its own socket down on every error path.
+    async fn connect_once(&self) -> Result<Arc<crate::messaging::service::VtaMessaging>, String> {
+        let app_state = &self.app_state;
+        let messaging_config = &self.messaging_config;
+        let vta_did = self.vta_did.as_str();
+
+        let sr = app_state
+            .secrets_resolver
+            .as_ref()
+            .ok_or_else(|| "no secrets resolver available".to_string())?;
+
+        // Collect secrets using the VM IDs from init_auth (correct for both
+        // did:key and did:webvh — avoids hardcoding #key-0/#key-1 fragments).
+        let mut secrets = Vec::new();
+        if let Some(ref signing_id) = app_state.signing_vm_id
+            && let Some(s) = sr.get_secret(signing_id).await
+        {
+            secrets.push(s);
+        }
+        if let Some(ref ka_id) = app_state.ka_vm_id
+            && let Some(s) = sr.get_secret(ka_id).await
+        {
+            secrets.push(s);
+        }
+
+        let messaging = Arc::new(
+            crate::messaging::service::build_messaging(
+                secrets,
+                vta_did,
+                &messaging_config.mediator_did,
+                self.outbox_ks.clone(),
+                app_state.trust_task_pushes_ks.clone(),
+                self.relationships_ks.clone(),
+                self.relationship_drop_counter.clone(),
+                app_state.did_resolver.as_ref(),
+                self.resolver_url.as_deref(),
+            )
+            .await?,
+        );
+
+        // Publish the outbound wiring so every REST/DIDComm component can send to
+        // a peer over this one connection (`DIDCommBridge` → `MessagingService`).
+        // Replaces any previous session's wiring on a reconnect.
+        app_state.didcomm_bridge.set_messaging(
+            messaging.service.clone(),
+            (*messaging.atm).clone(),
+            messaging.profile.clone(),
+            vta_did.to_string(),
+        );
+
+        // Register the config-loaded mediator in the listener registry so the
+        // delegated step-up push (buffered through the registry) can reach
+        // approvers on this mediator.
+        #[cfg(all(feature = "webvh", feature = "didcomm"))]
+        app_state
+            .mediator_registry
+            .record_activate(crate::messaging::registry::MediatorBinding {
+                mediator_did: messaging_config.mediator_did.clone(),
+                endpoint: messaging_config.mediator_url.clone(),
+            })
+            .await;
+
+        // Set the VTA's own allow-all ACL on the mediator (keyed on the VTA DID,
+        // so it authorises both DIDComm and TSP on the shared socket). Only when
+        // `setup_acl` is set (mediators in ExplicitAllow mode).
+        if messaging_config.setup_acl {
+            if let Some(atm) = app_state.atm.as_ref() {
+                acl_setup::set_client_acl_on_connection(
+                    atm,
+                    vta_did,
+                    messaging_config.mediator_did.as_str(),
+                    "vta-main",
+                    "vta",
+                )
+                .await;
+            } else {
+                warn!("setup_acl = true but no ATM available; skipping mediator ACL provisioning");
+            }
+        }
+
+        Ok(messaging)
+    }
+}
+
+/// Best-effort REST drain of this DID's mediator inbox, run at startup when
+/// `messaging.drain_inbox_on_start` is set.
+///
+/// The mediator allows one live-delivery websocket per DID, so an
+/// undeliverable/poison message queued for this DID can stall the pickup
+/// handshake and wedge the (shared DIDComm + TSP) listener indefinitely. REST
+/// auth + message-pickup keep working even when the websocket stalls, so this
+/// fetches the queued messages over REST and deletes them, clearing the wedge
+/// before the live listener starts. Each cleared message is logged; a batch that
+/// can't be fetched is logged loudly and stops the drain (so it can't spin).
+/// Returns how many were cleared. Never panics — a failure just skips the drain.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+async fn drain_mediator_inbox(atm: &ATM, mediator_did: &str, vta_did: &str) -> usize {
+    // A mediator-connected profile for REST pickup — added without live delivery
+    // (`false`), so this never opens the websocket that's the thing wedging.
+    let profile = match affinidi_tdk::messaging::profiles::ATMProfile::new(
+        atm,
+        Some("VTA-drain".to_string()),
+        vta_did.to_string(),
+        Some(mediator_did.to_string()),
+    )
+    .await
+    {
+        Ok(p) => match atm.profile_add(&p, false).await {
+            Ok(arc) => arc,
+            Err(e) => {
+                warn!(error = %e, "drain: could not register mediator profile; skipping drain");
+                return 0;
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "drain: could not build mediator profile; skipping drain");
+            return 0;
+        }
+    };
+
+    let mut cleared = 0usize;
+    // Bounded so a mediator that keeps re-queuing can never spin forever.
+    for _round in 0..200 {
+        let batch = match atm
+            .message_pickup()
+            .send_delivery_request(&profile, Some(20), true)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, cleared, "drain: delivery-request failed; stopping — a queued message may be un-fetchable, inspect the mediator");
+                break;
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let ids: Vec<String> = batch.iter().map(|(msg, _meta)| msg.id.clone()).collect();
+        for (msg, _meta) in &batch {
+            warn!(id = %msg.id, msg_type = %msg.typ, "drain: clearing queued mediator message");
+        }
+        match atm
+            .message_pickup()
+            .send_messages_received(&profile, &ids, true)
+            .await
+        {
+            Ok(_) => cleared += ids.len(),
+            Err(e) => {
+                warn!(error = %e, cleared, "drain: delete failed; stopping to avoid a loop");
+                break;
+            }
+        }
+    }
+    cleared
+}
+
+/// Clear this DID's OUTBOUND (sender) queue at the mediator — messages it sent
+/// that are still queued for delivery to recipients.
+///
+/// A message loop (e.g. a wedged consent/update retry) can pile these up until
+/// the mediator's per-sender cap (`limits.queue.sender`) trips and rejects every
+/// new send, wedging the VTA's outbound path. [`drain_mediator_inbox`] can't
+/// touch these — they live in the sender's outbox, not this DID's inbox — so
+/// this lists the outbox and deletes each message. The VTA is authorised to
+/// delete them because the mediator's owner check admits the message's `FROM`
+/// (sender), not only its `TO` (recipient). Best-effort; returns how many were
+/// cleared and never panics.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+async fn flush_mediator_outbox(atm: &ATM, mediator_did: &str, vta_did: &str) -> usize {
+    use affinidi_tdk::messaging::messages::{DeleteMessageRequest, Folder};
+
+    let profile = match affinidi_tdk::messaging::profiles::ATMProfile::new(
+        atm,
+        Some("VTA-flush-outbox".to_string()),
+        vta_did.to_string(),
+        Some(mediator_did.to_string()),
+    )
+    .await
+    {
+        Ok(p) => match atm.profile_add(&p, false).await {
+            Ok(arc) => arc,
+            Err(e) => {
+                warn!(error = %e, "flush outbox: could not register mediator profile; skipping");
+                return 0;
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, "flush outbox: could not build mediator profile; skipping");
+            return 0;
+        }
+    };
+
+    let list = match atm.list_messages(&profile, Folder::Outbox).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(error = %e, "flush outbox: could not list outbound queue; skipping");
+            return 0;
+        }
+    };
+    let ids: Vec<String> = list.iter().map(|m| m.msg_id.clone()).collect();
+    if ids.is_empty() {
+        return 0;
+    }
+
+    // The mediator caps a single delete request at 100 ids, so batch.
+    let mut cleared = 0usize;
+    for chunk in ids.chunks(100) {
+        match atm
+            .delete_messages_direct(
+                &profile,
+                &DeleteMessageRequest {
+                    message_ids: chunk.to_vec(),
+                },
+            )
+            .await
+        {
+            Ok(r) => cleared += r.success.len(),
+            Err(e) => {
+                warn!(error = %e, cleared, "flush outbox: delete batch failed; stopping");
+                break;
+            }
+        }
+    }
+    cleared
+}
+
+// The framework's `ListenerEvent`-based `spawn_event_logger` is gone with the
+// `DIDCommService`. Messaging connectivity is now read live (non-latched, R6.2)
+// off `MessagingService::status()` via `DIDCommBridge::messaging_status_str`.
+
+use vti_common::runtime::shutdown_signal;
+
+/// `VTA_REST_VSOCK_PORT` fails closed: it never falls back to TCP.
+#[cfg(all(test, feature = "rest"))]
+mod rest_ingress_tests {
+    use super::*;
+
+    #[test]
+    fn unset_serves_tcp() {
+        assert_eq!(rest_ingress_mode(None), Ok(RestIngressMode::Tcp));
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn a_port_serves_vsock() {
+        assert_eq!(
+            rest_ingress_mode(Some("5100")),
+            Ok(RestIngressMode::Vsock(5100))
+        );
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn a_malformed_port_refuses_the_boot_naming_it() {
+        for bad in [
+            "",
+            " 5100",
+            "5100 ",
+            "51OO",
+            "-1",
+            "0",
+            "4294967295",
+            "4294967296",
+        ] {
+            let err = rest_ingress_mode(Some(bad)).expect_err(bad);
+            assert!(
+                err.contains(&format!("{bad:?}")),
+                "error names the value: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "vsock-store")]
+    fn nets(list: &[&str]) -> Vec<ipnetwork::IpNetwork> {
+        list.iter().map(|n| n.parse().unwrap()).collect()
+    }
+
+    fn trusts(trust: &XffTrust, ip: &str) -> bool {
+        let ip: std::net::IpAddr = ip.parse().unwrap();
+        trust.cidrs.iter().any(|c| c.contains(ip))
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn a_legacy_loopback_list_trusts_the_parent_on_vsock() {
+        // An upgraded socat-era config must not collapse rate limiting.
+        let trust = effective_trust_xff_cidrs(&nets(&["127.0.0.1/32"]), true);
+        assert!(trusts(&trust, "0.0.0.3"));
+        let note = trust.note.as_deref().expect("says so once");
+        assert!(note.contains("\"0.0.0.3/32\""), "{note}");
+        assert_eq!(trust.warning, None);
+
+        // End to end: the parent's X-Forwarded-For names the client.
+        let mut req = axum::http::Request::builder()
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            vti_common::rate_limit::VSOCK_PARENT_PEER,
+        ));
+        let extractor = vti_common::rate_limit::TrustedProxyKeyExtractor::new(trust.cidrs).unwrap();
+        assert_eq!(
+            extractor.client_of(&req).unwrap().ip,
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn an_explicit_parent_is_trusted_without_comment() {
+        for list in [&["0.0.0.3/32"][..], &["127.0.0.1/32", "0.0.0.3/32"][..]] {
+            let trust = effective_trust_xff_cidrs(&nets(list), true);
+            assert!(trusts(&trust, "0.0.0.3"));
+            assert_eq!((trust.note, trust.warning), (None, None));
+        }
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn an_empty_list_trusts_nothing_and_is_not_warned() {
+        // How a byte-bridging parent (parent-proxy.sh) must be configured.
+        let trust = effective_trust_xff_cidrs(&[], true);
+        assert!(trust.cidrs.is_empty());
+        assert_eq!((trust.note, trust.warning), (None, None));
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn a_list_naming_neither_is_warned_and_not_widened() {
+        let trust = effective_trust_xff_cidrs(&nets(&["10.0.0.0/8"]), true);
+        assert!(!trusts(&trust, "0.0.0.3"));
+        let warning = trust.warning.expect("warned");
+        assert!(
+            warning.contains("\"0.0.0.3/32\"") && warning.contains("10.0.0.0/8"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn tcp_mode_is_unchanged() {
+        let configured: Vec<ipnetwork::IpNetwork> = vec!["127.0.0.1/32".parse().unwrap()];
+        let trust = effective_trust_xff_cidrs(&configured, false);
+        assert_eq!(trust.cidrs, configured);
+        assert!(!trusts(&trust, "0.0.0.3"));
+        assert_eq!((trust.note, trust.warning), (None, None));
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn accept_backoff_doubles_to_a_cap_and_resets() {
+        let mut b = AcceptBackoff::default();
+        let now = std::time::Instant::now();
+        let delays: Vec<u64> = (0..9).map(|_| b.failed(now).0.as_millis() as u64).collect();
+        assert_eq!(delays, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+        assert_eq!(b.succeeded(), Some(9));
+        assert_eq!(b.failed(now).0.as_millis(), 10, "reset after a success");
+        assert_eq!(b.succeeded(), Some(1));
+        assert_eq!(
+            b.succeeded(),
+            None,
+            "nothing to report after a clean accept"
+        );
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn accept_failures_are_reported_first_then_at_most_every_ten_seconds() {
+        let mut b = AcceptBackoff::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(b.failed(t0).1, Some(AcceptFailureReport::First));
+        for ms in [10, 500, 9_000] {
+            assert_eq!(b.failed(t0 + std::time::Duration::from_millis(ms)).1, None);
+        }
+        assert_eq!(
+            b.failed(t0 + std::time::Duration::from_secs(10)).1,
+            Some(AcceptFailureReport::Since { failures: 5 })
+        );
+        assert_eq!(b.failed(t0 + std::time::Duration::from_secs(11)).1, None);
+        b.succeeded();
+        assert_eq!(
+            b.failed(t0 + std::time::Duration::from_secs(12)).1,
+            Some(AcceptFailureReport::First),
+            "a new outage is reported at once"
+        );
+    }
+
+    #[cfg(feature = "vsock-store")]
+    #[test]
+    fn restart_generations_share_one_bound_listener() {
+        // `/vta/restart` starts a new REST thread without joining the old one,
+        // so each generation must clone the boot listener rather than rebind.
+        // The same shape for both kinds; TCP proves it portably: the original
+        // can be dropped (an old generation ending) and the clone still serves
+        // the same port.
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let boot = RestListener::Tcp(tcp);
+        let next = boot.try_clone().unwrap();
+        drop(boot);
+        let RestListener::Tcp(next) = next else {
+            unreachable!()
+        };
+        assert_eq!(next.local_addr().unwrap(), addr);
+        std::net::TcpStream::connect(addr).expect("the clone still accepts");
+        next.accept()
+            .expect("connection queued on the shared socket");
+
+        // Vsock where the host supports it (a Linux host with vsock loopback);
+        // elsewhere AF_VSOCK cannot bind and there is nothing to check.
+        // u32::MAX is VMADDR_PORT_ANY: any free port.
+        if let Ok(v) = vsock::VsockListener::bind_with_cid_port(vsock::VMADDR_CID_ANY, u32::MAX) {
+            let port = v.local_addr().unwrap().port();
+            let boot = RestListener::Vsock(v);
+            let RestListener::Vsock(next) = boot.try_clone().unwrap() else {
+                unreachable!()
+            };
+            drop(boot);
+            assert_eq!(
+                next.local_addr().unwrap().port(),
+                port,
+                "same socket, not a rebind"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "vsock-store"))]
+    #[test]
+    fn any_value_refuses_the_boot_without_vsock_support() {
+        let err = rest_ingress_mode(Some("5100")).expect_err("no vsock in this build");
+        assert!(err.contains("without vsock support"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::{KeyType, save_key_record};
+    use crate::store::Store;
+    #[cfg(feature = "webvh")]
+    use crate::webvh_store;
+    use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
+    use vti_common::config::StoreConfig;
+
+    fn temp_keys_ks() -> (Store, KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("store open");
+        let keys_ks = store
+            .keyspace(crate::keyspaces::KEYS)
+            .expect("keys keyspace");
+        (store, keys_ks, dir)
+    }
+
+    #[tokio::test]
+    async fn restart_gate_fires_only_once() {
+        let (tx, mut rx) = watch::channel(false);
+        let gate = Arc::new(RestartGate::new(tx));
+
+        gate.request();
+        gate.fire();
+        gate.fire();
+
+        rx.changed().await.expect("restart signal");
+        assert!(*rx.borrow());
+        assert!(!gate.is_pending());
+        assert!(gate.backstop_cancel.is_cancelled());
+    }
+
+    /// The transport's guard releases the restart on whatever path leaves the
+    /// send — the early returns included — not on the 30s backstop.
+    #[tokio::test]
+    async fn restart_on_drop_fires_when_the_send_scope_ends() {
+        let (tx, rx) = watch::channel(false);
+        let gate = Arc::new(RestartGate::new(tx));
+        gate.request();
+        {
+            let _restart = gate.fire_on_drop();
+            assert!(!*rx.borrow(), "nothing fires while the reply is in flight");
+        }
+        assert!(*rx.borrow());
+        assert!(gate.backstop_cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn restart_gate_backstop_fires_without_transport_release() {
+        let (tx, mut rx) = watch::channel(false);
+        let gate = Arc::new(RestartGate::new(tx));
+
+        gate.request_with_delay(Duration::from_millis(1));
+
+        tokio::time::timeout(Duration::from_secs(1), rx.changed())
+            .await
+            .expect("restart backstop did not fire")
+            .expect("restart signal channel closed");
+        assert!(*rx.borrow());
+    }
+
+    /// An attested generation's successor is attested too: the reload carries
+    /// no digest, so the orchestrator must ask the generation being replaced
+    /// whether to capture one. Otherwise `vta/attestation/config-report` goes
+    /// blank after the first restart, and the restart after that takes the
+    /// un-attested reload path.
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn soft_restart_recaptures_the_attestation_digest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("store open");
+        let service_state_ks = store
+            .keyspace(crate::keyspaces::SERVICE_STATE)
+            .expect("service state keyspace");
+        crate::operations::protocol::runtime_state::set_didcomm_enabled(&service_state_ks, false)
+            .await
+            .expect("didcomm off");
+
+        let mut current: AppConfig = toml::from_str("").expect("default config");
+        current
+            .capture_effective_config_attestation()
+            .expect("capture");
+
+        let next = reload_config_for_restart(&Arc::new(RwLock::new(current)), &service_state_ks)
+            .await
+            .expect("reload");
+        assert!(next.effective_config_digest.is_some());
+        assert!(next.effective_config_view.is_some());
+        let again = reload_config_for_restart(&Arc::new(RwLock::new(next)), &service_state_ks)
+            .await
+            .expect("second reload");
+        assert!(again.effective_config_digest.is_some());
+    }
+
+    /// The restart must read the config the generation ran with, not `run()`'s
+    /// detached boot clone: `services didcomm enable` persists the mediator to
+    /// the shared copy only, and a restart that missed it brought the next
+    /// generation up with DIDComm enabled and no mediator to connect to.
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn soft_restart_keeps_a_mediator_enabled_at_runtime() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("store open");
+        let service_state_ks = store
+            .keyspace(crate::keyspaces::SERVICE_STATE)
+            .expect("service state keyspace");
+        crate::operations::protocol::runtime_state::set_didcomm_enabled(&service_state_ks, true)
+            .await
+            .expect("didcomm on");
+
+        // Attested, so the reload takes the "running configuration" path and
+        // never consults the file — exactly where a stale snapshot is invisible.
+        let mut boot: AppConfig = toml::from_str("").expect("default config");
+        boot.capture_effective_config_attestation()
+            .expect("capture");
+        let shared = Arc::new(RwLock::new(boot));
+
+        // What `enable_didcomm` persists: the shared copy, not `run()`'s local.
+        shared.write().await.messaging = Some(vti_common::config::MessagingConfig {
+            mediator_did: "did:web:mediator.test".into(),
+            mediator_url: "wss://mediator.test/ws".into(),
+            mediator_host: None,
+            setup_acl: true,
+            drain_inbox_on_start: false,
+        });
+
+        let next = reload_config_for_restart(&shared, &service_state_ks)
+            .await
+            .expect("reload");
+
+        assert!(
+            next.services.didcomm,
+            "fjall is authoritative for enablement"
+        );
+        let messaging = next
+            .messaging
+            .expect("the next generation must keep the mediator enabled at runtime");
+        assert_eq!(messaging.mediator_did, "did:web:mediator.test");
+    }
+
+    #[cfg(feature = "webvh")]
+    fn temp_webvh_ks() -> (Store, KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("store open");
+        let webvh_ks = store
+            .keyspace(crate::keyspaces::WEBVH)
+            .expect("webvh keyspace");
+        (store, webvh_ks, dir)
+    }
+
+    /// `did:key` VTAs only store the Ed25519 signing record at `#key-0`;
+    /// the X25519 key-agreement secret is curve-converted from Ed25519 at
+    /// runtime, so a `#key-1` record is intentionally absent.
+    /// `find_vta_key_paths` must succeed without it.
+    #[tokio::test]
+    async fn find_vta_key_paths_returns_none_ka_for_did_key() {
+        let (_store, keys_ks, _dir) = temp_keys_ks();
+        let did = "did:key:z6MkTestKey";
+
+        save_key_record(
+            &keys_ks,
+            &format!("{did}#key-0"),
+            "m/44'/0'/0'",
+            KeyType::Ed25519,
+            "z6MkSigningPub",
+            "VTA signing key",
+            Some("vta"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        let (signing_path, ka_path, seed_id) = find_vta_key_paths(&test_self_keys(did), &keys_ks)
+            .await
+            .expect("paths");
+
+        assert_eq!(signing_path, "m/44'/0'/0'");
+        assert!(ka_path.is_none(), "did:key must not require #key-1 lookup");
+        assert_eq!(seed_id, Some(0));
+    }
+
+    /// `did:webvh` (and any non-`did:key` method) keeps the
+    /// independently-derived X25519 record at `#key-1`, and
+    /// `find_vta_key_paths` must surface it.
+    #[tokio::test]
+    async fn find_vta_key_paths_loads_ka_for_did_webvh() {
+        let (_store, keys_ks, _dir) = temp_keys_ks();
+        let did = "did:webvh:abc:example.com:vta";
+
+        save_key_record(
+            &keys_ks,
+            &format!("{did}#key-0"),
+            "m/44'/0'/0'",
+            KeyType::Ed25519,
+            "z6MkSigningPub",
+            "VTA signing key",
+            Some("vta"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+        save_key_record(
+            &keys_ks,
+            &format!("{did}#key-1"),
+            "m/44'/0'/1'",
+            KeyType::X25519,
+            "z6LSKaPub",
+            "VTA key-agreement key",
+            Some("vta"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        let (signing_path, ka_path, _seed_id) = find_vta_key_paths(&test_self_keys(did), &keys_ks)
+            .await
+            .expect("paths");
+
+        assert_eq!(signing_path, "m/44'/0'/0'");
+        assert_eq!(ka_path.as_deref(), Some("m/44'/0'/1'"));
+    }
+
+    /// A `did:webvh` setup that is missing its `#key-1` record is broken —
+    /// `find_vta_key_paths` must return `NotFound` rather than silently
+    /// degrading to a `None` ka_path. (The `did:key` short-circuit is
+    /// keyed off the DID prefix, not off record presence, so a missing
+    /// record for non-`did:key` is genuinely an error.)
+    #[tokio::test]
+    async fn find_vta_key_paths_errors_when_did_webvh_missing_ka() {
+        let (_store, keys_ks, _dir) = temp_keys_ks();
+        let did = "did:webvh:abc:example.com:vta";
+
+        save_key_record(
+            &keys_ks,
+            &format!("{did}#key-0"),
+            "m/44'/0'/0'",
+            KeyType::Ed25519,
+            "z6MkSigningPub",
+            "VTA signing key",
+            Some("vta"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        let result = find_vta_key_paths(&test_self_keys(did), &keys_ks).await;
+        assert!(
+            matches!(result, Err(AppError::NotFound(_))),
+            "expected NotFound for did:webvh missing #key-1, got {result:?}"
+        );
+    }
+
+    /// S6: a did:webs VTA resolves its own DID from the key event log it
+    /// stores, before and without its host.
+    #[cfg(feature = "webs")]
+    #[tokio::test]
+    async fn a_did_webs_vta_preloads_its_own_document_from_its_key_event_log() {
+        let ts = crate::test_support::open_test_store().await;
+        let (did, record) = crate::self_keys::tests::key_role_webs_record();
+        crate::webs_store::put(&ts.webs_ks, &record).await.unwrap();
+        let mut resolver = DIDCacheClient::new(
+            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        )
+        .await
+        .unwrap();
+        preload_self_did_document(&mut resolver, &did, None, Some(&ts.webs_ks)).await;
+        let resolved = resolver
+            .resolve(&did)
+            .await
+            .expect("resolves from the cache");
+        assert!(
+            resolved.cache_hit,
+            "served from the preload, not the network"
+        );
+        let doc = serde_json::to_value(&resolved.doc).unwrap();
+        assert!(doc.get("keyRoles").is_some(), "{doc}");
+    }
+
+    /// The keys a VTA whose own document is the `did:webvh` convention has.
+    fn test_self_keys(did: &str) -> crate::self_keys::SelfKeys {
+        if did.starts_with("did:key:") {
+            crate::self_keys::SelfKeys::did_key(did)
+        } else {
+            crate::self_keys::SelfKeys::from_ids(
+                did,
+                did,
+                &vta_sdk::node_keys::NodeKeyIds::conventional(did),
+            )
+        }
+    }
+
+    /// Build an `AppConfig` from a TOML snippet for the message tests.
+    fn cfg(toml_str: &str) -> AppConfig {
+        toml::from_str::<AppConfig>(toml_str).expect("parse test config")
+    }
+
+    /// P0.9b: the missing-identity refusal names the *specific* gap and always
+    /// points at the `--allow-degraded` escape hatch.
+    #[test]
+    fn missing_identity_message_names_absent_vta_did() {
+        let msg = missing_identity_message(&cfg(""));
+        assert!(msg.contains("vta_did is not configured"), "{msg}");
+        assert!(msg.contains("vta setup"), "{msg}");
+        assert!(msg.contains("--allow-degraded"), "{msg}");
+    }
+
+    #[test]
+    fn missing_identity_message_names_absent_jwt_key() {
+        // vta_did present, JWT signing key absent → the message must point at
+        // the JWT key, not the DID.
+        let msg = missing_identity_message(&cfg("vta_did = \"did:key:z6MkTest\"\n"));
+        assert!(msg.contains("auth.jwt_signing_key"), "{msg}");
+        assert!(!msg.contains("vta_did is not configured"), "{msg}");
+        assert!(msg.contains("--allow-degraded"), "{msg}");
+    }
+
+    #[test]
+    fn missing_identity_message_falls_back_to_key_material() {
+        // Both identity fields present but key material unloadable (the real
+        // gate reaches this arm when `init_auth` can't derive/find the keys).
+        let msg = missing_identity_message(&cfg(
+            "vta_did = \"did:key:z6MkTest\"\n[auth]\njwt_signing_key = \"AAAA\"\n",
+        ));
+        assert!(msg.contains("could not be loaded"), "{msg}");
+        assert!(msg.contains("did:key:z6MkTest"), "{msg}");
+        assert!(msg.contains("--allow-degraded"), "{msg}");
+    }
+
+    /// once we seed the resolver from local did.jsonl,
+    /// resolving the VTA DID is cache-only and does not
+    /// require network reachability to its own public domain.
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn preload_self_did_document_makes_vta_did_resolvable_from_cache() {
+        let (_store, webvh_ks, _dir) = temp_webvh_ks();
+        let did = "did:webvh:QmScid:vta.example.com:vta";
+
+        let log_line = serde_json::json!({
+            "versionId": "1-test",
+            "versionTime": "2026-05-06T00:00:00Z",
+            "parameters": {},
+            "state": {
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": did,
+            },
+        });
+        let log = serde_json::to_string(&log_line).expect("serialize log line");
+        webvh_store::store_did_log(&webvh_ks, did, &log)
+            .await
+            .expect("store did log");
+
+        let mut resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("resolver init");
+
+        preload_self_did_document(&mut resolver, did, Some(&webvh_ks), None).await;
+
+        let resolved = resolver.resolve(did).await.expect("resolve preloaded did");
+        assert!(
+            resolved.cache_hit,
+            "preloaded DID was not served from cache"
+        );
+
+        let expected_value = crate::operations::protocol::document::current_document_from_log(&log)
+            .expect("extract current DID document from did.jsonl");
+        let expected_doc =
+            serde_json::from_value(expected_value).expect("deserialize expected DID document");
+
+        assert_eq!(
+            resolved.doc, expected_doc,
+            "resolved DID document should match local did.jsonl current state"
+        );
+    }
+
+    /// Malformed local did.jsonl must be a safe no-op: preload logs a warning
+    /// and leaves resolver behavior unchanged (no poisoned cache entry).
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn preload_self_did_document_ignores_malformed_local_log() {
+        let (_store, webvh_ks, _dir) = temp_webvh_ks();
+        let did = "did:webvh:QmBadScid:vta.example.com:vta";
+
+        webvh_store::store_did_log(&webvh_ks, did, "not-json")
+            .await
+            .expect("store malformed did log");
+
+        let mut resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+            .await
+            .expect("resolver init");
+
+        preload_self_did_document(&mut resolver, did, Some(&webvh_ks), None).await;
+
+        let result = resolver.resolve(did).await;
+        assert!(
+            result.is_err(),
+            "malformed preload input should not seed resolver cache"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tsp_build_tests {
+    use super::{any_transport_enabled, tsp_configured_but_unbuilt};
+    use vta_config::ServicesConfig;
+
+    fn services(rest: bool, didcomm: bool, tsp: bool) -> ServicesConfig {
+        ServicesConfig {
+            rest,
+            didcomm,
+            webauthn: false,
+            tsp,
+        }
+    }
+
+    /// #937: a TSP-only VTA is a complete one, so boot must not refuse it as
+    /// having "no services enabled".
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn a_tsp_only_vta_has_a_transport() {
+        assert!(any_transport_enabled(&services(false, false, true)));
+    }
+
+    /// Nothing enabled is still refused, and WebAuthn alone is not a transport.
+    #[test]
+    fn nothing_enabled_has_no_transport() {
+        assert!(!any_transport_enabled(&services(false, false, false)));
+        let mut webauthn_only = services(false, false, false);
+        webauthn_only.webauthn = true;
+        assert!(!any_transport_enabled(&webauthn_only));
+    }
+
+    /// Keyring VTI-34: asked for and not built is the one combination refused.
+    #[test]
+    fn tsp_asked_for_but_not_built_is_refused() {
+        let reason = tsp_configured_but_unbuilt(true, false).expect("must refuse");
+        assert!(reason.contains("--features tsp"), "{reason}");
+        assert!(reason.contains("pnm services tsp disable"), "{reason}");
+    }
+
+    /// Every other combination starts. In particular a default build — no
+    /// `tsp` feature — with the default `services.tsp = false` must not be
+    /// touched, or every ordinary VTA would stop starting.
+    #[test]
+    fn every_other_combination_is_allowed() {
+        assert!(tsp_configured_but_unbuilt(false, false).is_none());
+        assert!(tsp_configured_but_unbuilt(false, true).is_none());
+        assert!(tsp_configured_but_unbuilt(true, true).is_none());
+    }
+}
+
+#[cfg(all(test, any(feature = "rest", feature = "didcomm")))]
+mod unenforced_policy_tests {
+    use super::unenforced_policies_message;
+    use crate::store::Store;
+    use vti_common::config::StoreConfig;
+
+    /// Keyring KR-22: a rule written while enforcement is off is stored and then
+    /// silently ignored. The boot warning must name what is being ignored and
+    /// the exact change that turns enforcement on.
+    #[tokio::test]
+    async fn kr22_warning_names_the_rules_and_how_to_enable_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .unwrap();
+        let ks = store.keyspace(vta_keyspaces::POLICY).unwrap();
+        let now = "2026-09-22T00:00:00Z";
+        vta_policy::install_default_policy(&ks, now).await.unwrap();
+        assert!(
+            vta_policy::unenforced_policies(&ks)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the boot-installed baseline alone must not trigger the warning"
+        );
+
+        vta_policy::seed_declarative_approvals(
+            &ks,
+            &[vta_sdk::approvals::ApprovalRule::reauth(
+                "https://trusttasks.org/spec/acl/grant/0.3",
+            )],
+            &Default::default(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let found = vta_policy::unenforced_policies(&ks).await.unwrap();
+        let msg = unenforced_policies_message(&found);
+        assert!(msg.contains("1 approval rule "), "{msg}");
+        assert!(msg.contains("NOT enforced"), "{msg}");
+        assert!(msg.contains("`enforcement = true`"), "{msg}");
+        assert!(msg.contains("[policy]"), "{msg}");
+        assert!(msg.contains("restart"), "{msg}");
+    }
+}

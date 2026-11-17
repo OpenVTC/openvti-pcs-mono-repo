@@ -1,0 +1,2089 @@
+//! Interactive setup wizard (`vta setup`).
+//!
+//! This module is **pure prompting**: it gathers operator answers into a
+//! [`WizardInputs`] and hands them to the shared engine
+//! ([`super::apply_inputs`]) — the same engine that drives
+//! `vta setup --from <file>`. All the *work* (store init, seed persistence,
+//! mediator + VTA DID minting, config write, summary) lives in `apply_inputs`,
+//! so the two setup paths cannot drift (P1.2).
+//!
+//! Prompts go through the [`Prompter`] seam rather than calling `dialoguer`
+//! directly. Production uses [`DialoguerPrompter`]; tests drive a scripted
+//! prompter, which is what lets the golden test assert that prompt-gathered
+//! inputs match the equivalent TOML byte-for-byte.
+//!
+//! Module-private by design: only [`run_setup_wizard`] is pub. Everything else
+//! is an implementation detail.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use bip39::Mnemonic;
+use dialoguer::{Confirm, Input, MultiSelect, Select};
+use serde_json::json;
+
+use crate::config::{
+    AuditConfig, HardenedConfig, LogConfig, LogFormat, ServerConfig, ServicesConfig,
+};
+
+use super::{
+    SetupUi, apply_inputs, derive_ws_url,
+    from_toml::{
+        ExistingDataDirPolicy, MessagingInput, SecretsBackendInput, VtaDidInput, WizardInputs,
+    },
+};
+
+type DynErr = Box<dyn std::error::Error>;
+
+// ---------------------------------------------------------------------------
+// Prompter seam
+// ---------------------------------------------------------------------------
+
+/// Abstraction over the handful of `dialoguer` prompt kinds the wizard uses.
+///
+/// The real implementation ([`DialoguerPrompter`]) drives a terminal; the test
+/// suite supplies a scripted implementation so the prompt-gathering code can
+/// run head-less. Keeping the seam this narrow (text / confirm / select /
+/// multiselect) is what makes the golden equivalence test possible.
+pub(crate) trait Prompter {
+    /// Free-text input. `default` is offered when the operator just presses
+    /// enter; `allow_empty` permits an empty answer; `validate`, when set,
+    /// rejects (and in the real impl re-prompts on) bad input.
+    fn text(
+        &self,
+        prompt: &str,
+        default: Option<&str>,
+        allow_empty: bool,
+        validate: Option<&dyn Fn(&str) -> Result<(), String>>,
+    ) -> Result<String, DynErr>;
+
+    /// Yes/no confirmation.
+    fn confirm(&self, prompt: &str, default: bool) -> Result<bool, DynErr>;
+
+    /// Single choice among `items`; returns the chosen index.
+    fn select(&self, prompt: &str, items: &[&str], default: usize) -> Result<usize, DynErr>;
+
+    /// Multiple choice; returns the chosen indices.
+    fn multiselect(
+        &self,
+        prompt: &str,
+        items: &[&str],
+        defaults: &[bool],
+    ) -> Result<Vec<usize>, DynErr>;
+}
+
+/// Terminal-backed [`Prompter`] using `dialoguer`.
+pub(crate) struct DialoguerPrompter;
+
+impl Prompter for DialoguerPrompter {
+    fn text(
+        &self,
+        prompt: &str,
+        default: Option<&str>,
+        allow_empty: bool,
+        validate: Option<&dyn Fn(&str) -> Result<(), String>>,
+    ) -> Result<String, DynErr> {
+        let mut input = Input::<String>::new().with_prompt(prompt);
+        if let Some(d) = default {
+            input = input.default(d.to_owned());
+        }
+        if allow_empty {
+            input = input.allow_empty(true);
+        }
+        let out = match validate {
+            Some(v) => input
+                .validate_with(move |s: &String| v(s.as_str()))
+                .interact_text()?,
+            None => input.interact_text()?,
+        };
+        Ok(out)
+    }
+
+    fn confirm(&self, prompt: &str, default: bool) -> Result<bool, DynErr> {
+        Ok(Confirm::new()
+            .with_prompt(prompt)
+            .default(default)
+            .interact()?)
+    }
+
+    fn select(&self, prompt: &str, items: &[&str], default: usize) -> Result<usize, DynErr> {
+        Ok(Select::new()
+            .with_prompt(prompt)
+            .items(items)
+            .default(default)
+            .interact()?)
+    }
+
+    fn multiselect(
+        &self,
+        prompt: &str,
+        items: &[&str],
+        defaults: &[bool],
+    ) -> Result<Vec<usize>, DynErr> {
+        Ok(MultiSelect::new()
+            .with_prompt(prompt)
+            .items(items)
+            .defaults(defaults)
+            .interact()?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SetupUi — the engine's callbacks, driven by the prompter
+// ---------------------------------------------------------------------------
+
+/// Interactive [`SetupUi`]: displays the mnemonic for confirmation and prompts
+/// for the `did.jsonl` save path. Both go through the same [`Prompter`] as the
+/// rest of the wizard so the whole flow is scriptable.
+struct InteractiveUi<'p> {
+    prompter: &'p dyn Prompter,
+}
+
+impl SetupUi for InteractiveUi<'_> {
+    fn confirm_mnemonic(&self, mnemonic: &Mnemonic) -> Result<(), DynErr> {
+        eprintln!();
+        eprintln!("\x1b[1;33m╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  WARNING: Write down your mnemonic phrase and store it   ║");
+        eprintln!("║  securely. It is the ONLY way to recover your keys.      ║");
+        eprintln!("╚══════════════════════════════════════════════════════════╝\x1b[0m");
+        eprintln!();
+        eprintln!("\x1b[1m{mnemonic}\x1b[0m");
+        eprintln!();
+
+        if self
+            .prompter
+            .confirm("I have saved my mnemonic phrase", false)?
+        {
+            Ok(())
+        } else {
+            Err("Setup cancelled — please save your mnemonic before proceeding.".into())
+        }
+    }
+
+    fn did_log_path(&self, label: &str, _default: &Path) -> Option<PathBuf> {
+        let default_file = format!("{label}-did.jsonl");
+        // A prompt failure here shouldn't abort an otherwise-finished setup;
+        // fall back to the canonical default the engine passed.
+        match self
+            .prompter
+            .text("Save DID log to file", Some(&default_file), false, None)
+        {
+            Ok(entered) => {
+                eprintln!();
+                eprintln!(
+                    "  \x1b[2mTo self-host this DID, upload {entered} to the DID URL.\x1b[0m"
+                );
+                Some(PathBuf::from(entered))
+            }
+            Err(_) => Some(_default.to_path_buf()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt helpers — each returns a piece of WizardInputs
+// ---------------------------------------------------------------------------
+
+/// Prompt whether to enable hardened configuration.
+///
+/// When enabled, a fresh random `storage_key_salt` is minted for this VTA and
+/// written to `config.toml`. The field is documented as a permanent per-VTA
+/// constant, so setup makes it one rather than leaving every install on the
+/// shared compatibility default. Operators who need a specific value still use
+/// `--from <toml>`.
+fn prompt_hardened(p: &dyn Prompter) -> Result<HardenedConfig, DynErr> {
+    let enabled = p.confirm(
+        "Enable hardened configuration? (encrypts the fjall store and seals the JWT signing key \
+          in the bootstrap keyspace — protects against direct disk access)",
+        false,
+    )?;
+
+    if !enabled {
+        return Ok(HardenedConfig::default());
+    }
+
+    eprintln!();
+    eprintln!("  \x1b[2mHardened configuration enabled.\x1b[0m");
+    eprintln!(
+        "  \x1b[2mA random storage_key_salt has been generated and written to config.toml.\x1b[0m"
+    );
+    eprintln!(
+        "  \x1b[2mBack up config.toml: changing or losing the salt makes the store \
+         unreadable.\x1b[0m"
+    );
+    eprintln!(
+        "  \x1b[2mTo supply your own storage_key_salt, run `vta setup --from <toml>` \
+         instead.\x1b[0m"
+    );
+    eprintln!();
+
+    Ok(HardenedConfig {
+        enabled: true,
+        storage_key_salt: crate::hardened_bootstrap::generate_storage_key_salt(),
+    })
+}
+
+/// Labels for the transport multiselect. Answers are mapped back onto
+/// flags **by label** ([`services_from_selection`]) rather than by
+/// position, because the option list varies with the compiled feature
+/// set — a positional mapping would quietly mean something different in
+/// a `--features tsp` build than in a default one.
+const REST_ITEM: &str = "REST API";
+const DIDCOMM_ITEM: &str = "DIDComm Messaging";
+const TSP_ITEM: &str = "TSP (Trust Spanning Protocol)";
+
+/// Which transports the operator chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ServiceSelection {
+    pub rest: bool,
+    pub didcomm: bool,
+    pub tsp: bool,
+}
+
+/// The transport options *this build* can offer.
+///
+/// TSP is listed only when the binary was compiled with `--features
+/// tsp`. Without it there is no TSP dispatcher (the inbound half lives
+/// behind that flag), so advertising a `#tsp` service would publish a
+/// transport this VTA cannot serve — and because TSP is *first* in the
+/// preference order, a peer that honours the DID document would pick it
+/// and fail rather than fall back to DIDComm. An option that can't be
+/// served isn't offered.
+fn service_items() -> Vec<&'static str> {
+    // `mut` is load-bearing only in a `tsp` build.
+    #[allow(unused_mut)]
+    let mut items = vec![REST_ITEM, DIDCOMM_ITEM];
+    #[cfg(feature = "tsp")]
+    items.push(TSP_ITEM);
+    items
+}
+
+/// Resolve the chosen indices into flags by matching labels, so the
+/// mapping is independent of how many options this build offered.
+fn services_from_selection(items: &[&str], selected: &[usize]) -> ServiceSelection {
+    let picked = |label: &str| {
+        items
+            .iter()
+            .position(|it| *it == label)
+            .is_some_and(|i| selected.contains(&i))
+    };
+    ServiceSelection {
+        rest: picked(REST_ITEM),
+        didcomm: picked(DIDCOMM_ITEM),
+        tsp: picked(TSP_ITEM),
+    }
+}
+
+/// The rules a transport selection must satisfy, as the text shown when
+/// it doesn't. `Ok(())` means the selection is usable.
+fn validate_services(sel: &ServiceSelection) -> Result<(), String> {
+    if !sel.rest && !sel.didcomm && !sel.tsp {
+        return Err("Please select at least one service.".into());
+    }
+    // TSP no longer implies DIDComm. Both transports ride the same mediator
+    // socket, and the mediator section below is now reached by either — so a
+    // TSP-only VTA is a VTA that connects to a mediator and speaks TSP on it,
+    // with no DIDComm dispatcher compiled or advertised. Whether that mediator
+    // *carries* TSP is the operator's call (nothing here can verify it), and
+    // skipping the mediator entirely degrades the same way it always has for
+    // DIDComm: the transport is enabled in config and no service entry is
+    // published, because there is no endpoint to name.
+    Ok(())
+}
+
+/// Whether TSP stays selected once the existing mediator it would ride has
+/// been checked (Keyring VTI-33), telling the operator what was found.
+///
+/// A mediator that does not carry TSP drops it from the selection, since
+/// advertising `#tsp` through it would send TSP-preferring peers nowhere —
+/// unless TSP was the only transport chosen, when there is nothing left to set
+/// up and the refusal `--from` gives is the answer. A mediator that could not
+/// be resolved keeps it, with a warning: setup runs offline too.
+fn keep_tsp_after_mediator_check(
+    did: &str,
+    verdict: &super::MediatorTsp,
+    another_transport: bool,
+) -> Result<bool, DynErr> {
+    match verdict {
+        super::MediatorTsp::Carried => {
+            eprintln!("  \x1b[2mMediator {did} advertises TSP.\x1b[0m");
+            Ok(true)
+        }
+        super::MediatorTsp::NotCarried if !another_transport => {
+            Err(super::from_toml::mediator_lacks_tsp(did).into())
+        }
+        super::MediatorTsp::NotCarried => {
+            eprintln!(
+                "  \x1b[33mMediator {did} advertises no TSPTransport service, so it does not \
+                 route TSP. TSP will not be advertised; add it later with `pnm services tsp \
+                 enable` once the mediator carries it.\x1b[0m"
+            );
+            Ok(false)
+        }
+        super::MediatorTsp::Unknown(why) => {
+            eprintln!(
+                "  \x1b[33mWarning: {why}. Could not confirm that mediator {did} carries TSP; \
+                 `#tsp` will be advertised through it regardless. If it does not route TSP, \
+                 run `pnm services tsp disable` once the VTA is up.\x1b[0m"
+            );
+            Ok(true)
+        }
+    }
+}
+
+/// Prompt which services to enable. At least one; anything else re-asks
+/// rather than proceeding.
+fn prompt_services(p: &dyn Prompter) -> Result<ServiceSelection, DynErr> {
+    let items = service_items();
+    // Everything this build offers is pre-ticked, TSP included: it is the
+    // preferred transport. Whether the mediator carries it is checked once the
+    // mediator is known — a minted one is minted with `#tsp`, and an existing
+    // one's DID document is read (Keyring VTI-33).
+    let defaults: Vec<bool> = vec![true; items.len()];
+    loop {
+        let selected = p.multiselect(
+            "Services to enable (select at least one)",
+            &items,
+            &defaults,
+        )?;
+        let selection = services_from_selection(&items, &selected);
+        if let Err(msg) = validate_services(&selection) {
+            eprintln!("\x1b[31m{msg}\x1b[0m");
+            continue;
+        }
+        if selection.tsp {
+            eprintln!();
+            eprintln!(
+                "  \x1b[2mTSP will be advertised as `#tsp` in the VTA DID document, \
+                 pointing at the same mediator as DIDComm.\x1b[0m"
+            );
+            eprintln!(
+                "  \x1b[2mAn existing mediator is checked for TSP once you name it; a mediator \
+                 created here is created with it.\x1b[0m"
+            );
+            eprintln!(
+                "  \x1b[2mThis is changeable later: `pnm services tsp enable` / \
+                 `disable`.\x1b[0m"
+            );
+            eprintln!();
+        }
+        return Ok(selection);
+    }
+}
+
+/// Prompt for the seed-store backend, returning the typed [`SecretsBackendInput`]
+/// the engine consumes. Only backends compiled into this build are offered.
+async fn configure_secrets(p: &dyn Prompter) -> Result<SecretsBackendInput, DynErr> {
+    let mut labels: Vec<&str> = Vec::new();
+    let mut tags: Vec<&str> = Vec::new();
+
+    #[cfg(feature = "aws-secrets")]
+    {
+        labels.push("AWS Secrets Manager");
+        tags.push("aws");
+    }
+    #[cfg(feature = "gcp-secrets")]
+    {
+        labels.push("GCP Secret Manager");
+        tags.push("gcp");
+    }
+    #[cfg(feature = "azure-secrets")]
+    {
+        labels.push("Azure Key Vault");
+        tags.push("azure");
+    }
+    #[cfg(feature = "vault-secrets")]
+    {
+        labels.push("HashiCorp Vault");
+        tags.push("vault");
+    }
+    #[cfg(feature = "k8s-secrets")]
+    {
+        labels.push("Kubernetes Secret");
+        tags.push("k8s");
+    }
+    #[cfg(feature = "config-seed")]
+    {
+        labels.push("Config file (hex-encoded seed in config.toml)");
+        tags.push("config");
+    }
+    #[cfg(feature = "keyring")]
+    {
+        labels.push("OS keyring");
+        tags.push("keyring");
+    }
+    labels.push("Encrypted file (passphrase, systemd-creds or TPM key)");
+    tags.push("encrypted-file");
+    labels.push("Plaintext file (NOT recommended)");
+    tags.push("plaintext");
+
+    // If only one backend is compiled, use it without prompting.
+    let choice = if labels.len() == 1 {
+        0
+    } else {
+        p.select("Seed storage backend", &labels, 0)?
+    };
+    let tag = tags[choice];
+
+    #[cfg(feature = "aws-secrets")]
+    if tag == "aws" {
+        return prompt_aws_secrets(p).await;
+    }
+    #[cfg(feature = "gcp-secrets")]
+    if tag == "gcp" {
+        return prompt_gcp_secrets(p).await;
+    }
+    #[cfg(feature = "azure-secrets")]
+    if tag == "azure" {
+        return prompt_azure_secrets(p);
+    }
+    #[cfg(feature = "vault-secrets")]
+    if tag == "vault" {
+        return prompt_vault_secrets(p);
+    }
+    #[cfg(feature = "k8s-secrets")]
+    if tag == "k8s" {
+        return prompt_k8s_secrets(p);
+    }
+    #[cfg(feature = "config-seed")]
+    if tag == "config" {
+        return Ok(SecretsBackendInput::ConfigSeed);
+    }
+    #[cfg(feature = "keyring")]
+    if tag == "keyring" {
+        let service = p.text(
+            "Keyring service name (use a unique name per VTA instance)",
+            Some("vta"),
+            false,
+            None,
+        )?;
+        return Ok(SecretsBackendInput::Keyring { service });
+    }
+    if tag == "encrypted-file" {
+        return prompt_encrypted_file_secrets(p);
+    }
+    if tag == "plaintext" {
+        eprintln!();
+        eprintln!("\x1b[1;33m╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  WARNING: Plaintext storage is NOT secure.               ║");
+        eprintln!("║  Seeds will be stored in a plaintext file on disk.       ║");
+        eprintln!("║  Use only for development or testing.                    ║");
+        eprintln!("╚══════════════════════════════════════════════════════════╝\x1b[0m");
+        eprintln!();
+        return Ok(SecretsBackendInput::Plaintext);
+    }
+
+    unreachable!("selected backend tag does not match any compiled feature")
+}
+
+/// The `encrypted_file` backend's key-encryption key source and location.
+/// The KEK has to be readable now: setup writes the seed with it.
+fn prompt_encrypted_file_secrets(p: &dyn Prompter) -> Result<SecretsBackendInput, DynErr> {
+    use vti_secrets::KekSource;
+
+    #[allow(unused_mut)]
+    let mut labels = vec![
+        "Passphrase in a file",
+        "Passphrase in a systemd credential",
+        "32-byte key in a systemd credential (systemd-creds)",
+    ];
+    #[cfg(all(feature = "tpm", target_os = "linux"))]
+    labels.push("Key sealed to this host's TPM 2.0");
+    let choice = p.select("Key-encryption key source", &labels, 0)?;
+    let credential = |prompt: &str| p.text(prompt, None, false, None);
+    let kek = match choice {
+        0 => KekSource::Passphrase {
+            file: Some(PathBuf::from(p.text(
+                "Passphrase file (readable by the VTA user only; never put the passphrase in config)",
+                None,
+                false,
+                None,
+            )?)),
+            credential: None,
+        },
+        1 => KekSource::Passphrase {
+            file: None,
+            credential: Some(credential(
+                "systemd credential name (LoadCredential=/LoadCredentialEncrypted=)",
+            )?),
+        },
+        2 => KekSource::SystemdCreds {
+            credential: credential("systemd credential name holding the key")?,
+        },
+        _ => {
+            let pcrs = p.text(
+                "Bind to SHA-256 PCRs (comma-separated, e.g. 7; empty for none)",
+                None,
+                true,
+                Some(&|s: &str| parse_pcr_list(s).map(|_| ())),
+            )?;
+            KekSource::Tpm {
+                pcrs: parse_pcr_list(&pcrs)?,
+                tcti: None,
+            }
+        }
+    };
+    let path = p.text(
+        "Encrypted file path (empty for <data_dir>/seed.enc)",
+        None,
+        true,
+        None,
+    )?;
+    Ok(SecretsBackendInput::EncryptedFile {
+        path: (!path.trim().is_empty()).then(|| PathBuf::from(path.trim())),
+        kek,
+    })
+}
+
+#[cfg_attr(not(all(feature = "tpm", target_os = "linux")), allow(dead_code))]
+fn parse_pcr_list(s: &str) -> Result<Vec<u8>, String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| match t.parse::<u8>() {
+            Ok(n) if n <= 23 => Ok(n),
+            _ => Err(format!("'{t}' is not a PCR index (0-23)")),
+        })
+        .collect()
+}
+
+#[cfg(feature = "aws-secrets")]
+async fn prompt_aws_secrets(p: &dyn Prompter) -> Result<SecretsBackendInput, DynErr> {
+    let region = p.text("AWS region (leave empty for SDK default)", None, true, None)?;
+    let region = if region.is_empty() {
+        None
+    } else {
+        Some(region)
+    };
+
+    let secret_name = pick_or_enter_secret(
+        p,
+        vti_secrets::discovery::list_aws_secrets(region.as_deref())
+            .await
+            .map_err(Into::into),
+    )
+    .await?;
+    Ok(SecretsBackendInput::Aws {
+        region,
+        secret_name,
+    })
+}
+
+#[cfg(feature = "gcp-secrets")]
+async fn prompt_gcp_secrets(p: &dyn Prompter) -> Result<SecretsBackendInput, DynErr> {
+    let project = p.text("GCP project ID", None, false, None)?;
+    let secret_name = pick_or_enter_secret(
+        p,
+        vti_secrets::discovery::list_gcp_secrets(&project)
+            .await
+            .map_err(Into::into),
+    )
+    .await?;
+    Ok(SecretsBackendInput::Gcp {
+        project,
+        secret_name,
+    })
+}
+
+/// Shared "pick from a listed set or type a new name" flow for the cloud
+/// secret-manager backends. A listing error degrades to a free-text prompt.
+#[cfg(any(feature = "aws-secrets", feature = "gcp-secrets"))]
+async fn pick_or_enter_secret(
+    p: &dyn Prompter,
+    listed: Result<Vec<String>, DynErr>,
+) -> Result<String, DynErr> {
+    match listed {
+        Ok(names) if !names.is_empty() => {
+            let mut items: Vec<String> = names;
+            items.push("Create new secret".into());
+            let item_refs: Vec<&str> = items.iter().map(String::as_str).collect();
+            let choice = p.select(
+                "Select an existing secret or create a new one",
+                &item_refs,
+                0,
+            )?;
+            if choice == items.len() - 1 {
+                p.text("Secret name", Some("vta-master-seed"), false, None)
+            } else {
+                Ok(items.swap_remove(choice))
+            }
+        }
+        Ok(_) => {
+            eprintln!("  No existing secrets found.");
+            p.text("Secret name", Some("vta-master-seed"), false, None)
+        }
+        Err(e) => {
+            eprintln!("  Warning: could not list secrets: {e}");
+            p.text("Secret name", Some("vta-master-seed"), false, None)
+        }
+    }
+}
+
+#[cfg(feature = "azure-secrets")]
+fn prompt_azure_secrets(p: &dyn Prompter) -> Result<SecretsBackendInput, DynErr> {
+    let vault_url = p.text(
+        "Azure Key Vault URL (e.g. https://my-vault.vault.azure.net)",
+        None,
+        false,
+        None,
+    )?;
+    let secret_name = p.text(
+        "Azure Key Vault secret name",
+        Some("vta-master-seed"),
+        false,
+        None,
+    )?;
+    Ok(SecretsBackendInput::Azure {
+        vault_url,
+        secret_name,
+    })
+}
+
+/// Prompt for HashiCorp Vault settings. Synchronous — actual Vault auth
+/// happens at first seed-store call.
+#[cfg(feature = "vault-secrets")]
+fn prompt_vault_secrets(p: &dyn Prompter) -> Result<SecretsBackendInput, DynErr> {
+    use super::from_toml::{
+        default_vault_approle_mount, default_vault_k8s_jwt_path, default_vault_k8s_mount,
+    };
+
+    let addr = p.text(
+        "Vault server URL (e.g. https://vault.example.com:8200)",
+        None,
+        false,
+        None,
+    )?;
+    let secret_path = p.text(
+        "KV v2 secret path (e.g. vta/master-seed)",
+        None,
+        false,
+        None,
+    )?;
+    let kv_mount = p.text("KV v2 mount path", Some("secret"), false, None)?;
+    let secret_key = p.text(
+        "Field name within the KV entry holding the hex seed",
+        Some("seed"),
+        false,
+        None,
+    )?;
+    let namespace = p.text(
+        "Vault Enterprise namespace (leave empty if not using)",
+        None,
+        true,
+        None,
+    )?;
+    let namespace = if namespace.is_empty() {
+        None
+    } else {
+        Some(namespace)
+    };
+
+    let auth_methods = ["kubernetes", "token", "approle"];
+    let auth_idx = p.select("Auth method", &auth_methods, 0)?;
+    let auth_method = auth_methods[auth_idx].to_string();
+
+    let mut k8s_role = None;
+    let mut token = None;
+    let mut approle_role_id = None;
+    let mut approle_secret_id = None;
+    match auth_method.as_str() {
+        "kubernetes" => {
+            k8s_role = Some(p.text("Kubernetes auth role name", None, false, None)?);
+        }
+        "token" => {
+            eprintln!(
+                "  \x1b[2mLeave empty to read from the VAULT_TOKEN env var at runtime.\x1b[0m"
+            );
+            let t = p.text("Vault token", None, true, None)?;
+            if !t.is_empty() {
+                token = Some(t);
+            }
+        }
+        "approle" => {
+            approle_role_id = Some(p.text("AppRole role_id", None, false, None)?);
+            approle_secret_id = Some(p.text("AppRole secret_id", None, false, None)?);
+        }
+        _ => unreachable!("auth_method came from a fixed list"),
+    }
+
+    Ok(SecretsBackendInput::Vault {
+        addr,
+        secret_path,
+        kv_mount,
+        secret_key,
+        namespace,
+        auth_method,
+        k8s_role,
+        k8s_mount: default_vault_k8s_mount(),
+        k8s_jwt_path: default_vault_k8s_jwt_path(),
+        token,
+        approle_role_id,
+        approle_secret_id,
+        approle_mount: default_vault_approle_mount(),
+        skip_verify: false,
+    })
+}
+
+/// Prompt for Kubernetes Secret backend settings. Synchronous — the actual
+/// cluster connection happens at first seed-store call.
+#[cfg(feature = "k8s-secrets")]
+fn prompt_k8s_secrets(p: &dyn Prompter) -> Result<SecretsBackendInput, DynErr> {
+    use super::from_toml::default_k8s_secret_key;
+
+    let secret_name = p.text(
+        "Kubernetes Secret name",
+        Some("vta-master-seed"),
+        false,
+        None,
+    )?;
+    let namespace = p.text(
+        "Namespace (leave empty to use the pod's ServiceAccount namespace)",
+        None,
+        true,
+        None,
+    )?;
+    let namespace = if namespace.is_empty() {
+        None
+    } else {
+        Some(namespace)
+    };
+    let secret_key = p.text(
+        "Key within the Secret's data map holding the hex seed",
+        Some("seed"),
+        false,
+        None,
+    )?;
+    let secret_key = if secret_key.is_empty() {
+        default_k8s_secret_key()
+    } else {
+        secret_key
+    };
+
+    Ok(SecretsBackendInput::Kubernetes {
+        secret_name,
+        namespace,
+        secret_key,
+    })
+}
+
+/// Prompt for the optional `mediator_host` override (TEE vsock-bridge SNI).
+fn prompt_optional_mediator_host(p: &dyn Prompter) -> Result<Option<String>, DynErr> {
+    let host = p.text(
+        "Mediator hostname for vsock-bridged TEE deployments (leave empty to skip)",
+        None,
+        true,
+        None,
+    )?;
+    Ok(if host.is_empty() { None } else { Some(host) })
+}
+
+/// Prompt for DIDComm messaging configuration, returning a [`MessagingInput`].
+async fn configure_messaging(p: &dyn Prompter) -> Result<MessagingInput, DynErr> {
+    let options = [
+        "Use an existing mediator DID",
+        "Create a new mediator DID (did:webvh)",
+        "Do not use DIDComm messaging",
+    ];
+    let choice = p.select("DIDComm messaging", &options, 0)?;
+
+    match choice {
+        0 => {
+            let did = p.text(
+                "Mediator DID",
+                None,
+                false,
+                Some(&|s: &str| {
+                    if s.starts_with("did:") {
+                        Ok(())
+                    } else {
+                        Err("DID must start with 'did:' (e.g. did:webvh:... or did:key:...)".into())
+                    }
+                }),
+            )?;
+            let mediator_host = prompt_optional_mediator_host(p)?;
+            let setup_acl = p.confirm(
+                "Automatically provision ACL on mediator after connecting? \
+(enable if mediator uses ExplicitAllow mode)",
+                false,
+            )?;
+            Ok(MessagingInput::Existing {
+                did,
+                mediator_host,
+                setup_acl,
+            })
+        }
+        1 => {
+            let context = p
+                .text(
+                    "Trust context for the mediator DID",
+                    Some("mediator"),
+                    false,
+                    None,
+                )?
+                .trim()
+                .to_string();
+            if context.is_empty() {
+                return Err("mediator context id cannot be empty".into());
+            }
+
+            let url = p.text("Mediator URL", None, false, None)?;
+            let ws_default = derive_ws_url(&url);
+            let ws_url = p.text("Mediator WebSocket URL", ws_default.as_deref(), false, None)?;
+
+            // Hosting URL for the mediator's `did.jsonl` — separate knob from
+            // the DIDComm endpoint above. Defaults to the DIDComm URL for the
+            // common case where both live on the same host; operators with
+            // split hosts (DIDComm at e.g. `mediator.example.com/mediator/v1`,
+            // DID document at `dids.example.com/mediator`) override here.
+            // The engine reads this as `webvh_url` and falls back to `url`
+            // when None — we always send Some so the operator's choice is
+            // captured explicitly.
+            let webvh_url = prompt_webvh_url(p, &context, Some(&url))?;
+
+            let mediator_host = prompt_optional_mediator_host(p)?;
+
+            // Optional ROUTING_KEYS escape hatch (mediator chains). The
+            // engine fills URL / WS_URL from the fields above; the other
+            // optional template vars (ACCEPT, WEBVH_SERVER) have correct
+            // defaults and are only reachable via `--from <toml>`.
+            let routing_raw = p.text(
+                "Upstream routing-key DIDs for this mediator (comma-separated, leave empty to skip)",
+                None,
+                true,
+                None,
+            )?;
+            let routing_keys: Vec<String> = routing_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let mut template_vars: HashMap<String, serde_json::Value> = HashMap::new();
+            if !routing_keys.is_empty() {
+                template_vars.insert("ROUTING_KEYS".into(), json!(routing_keys));
+            }
+
+            let setup_acl = p.confirm(
+                "Automatically provision ACL on mediator after connecting? \
+(enable if mediator uses ExplicitAllow mode)",
+                false,
+            )?;
+
+            Ok(MessagingInput::CreateMediator {
+                context,
+                url,
+                ws_url: Some(ws_url),
+                webvh_url: Some(webvh_url),
+                mediator_host,
+                template_vars,
+                setup_acl,
+                // Derived from the services chosen earlier: a mediator minted
+                // for this VTA serves what this VTA advertises. Overriding
+                // that (a shared mediator carrying more) is a `--from <toml>`
+                // affair — see `MessagingInput::CreateMediator::protocols`.
+                protocols: None,
+            })
+        }
+        _ => Ok(MessagingInput::Skip),
+    }
+}
+
+/// Prompt for the VTA's own DID, returning a [`VtaDidInput`]. The advanced
+/// webvh modes collect file paths / key ids only — the engine reads the files
+/// and mints the DID.
+fn create_vta_did(p: &dyn Prompter) -> Result<VtaDidInput, DynErr> {
+    let did_options = [
+        "Create a new did:webvh DID (recommended for production)",
+        "Create a new did:key (no external hosting; great for local dev)",
+        "Enter an existing DID",
+        "Skip (no VTA DID for now)",
+        "Create a new did:webs (alpha; on a did-hosting server, published at first boot)",
+    ];
+    let choice = p.select("VTA DID", &did_options, 0)?;
+
+    match choice {
+        0 => {
+            let url = prompt_webvh_url(p, "VTA", None)?;
+
+            let mode_options = [
+                "Simple — VTA creates keys and document (recommended)",
+                "Advanced — provide your own document, keys, or pre-signed log",
+            ];
+            let advanced = p.select("DID creation mode", &mode_options, 0)? == 1;
+
+            let (did_document_file, did_log_file, signing_key_id, ka_key_id) = if advanced {
+                let adv_options = [
+                    "Provide a DID Document template (VTA signs it)",
+                    "Import a pre-signed did.jsonl",
+                    "Use existing imported keys",
+                ];
+                match p.select("Advanced option", &adv_options, 0)? {
+                    0 => {
+                        let path = p.text("Path to DID Document JSON file", None, false, None)?;
+                        (Some(PathBuf::from(path)), None, None, None)
+                    }
+                    1 => {
+                        let path = p.text("Path to did.jsonl file", None, false, None)?;
+                        (None, Some(PathBuf::from(path)), None, None)
+                    }
+                    _ => {
+                        let signing = p.text("Signing key ID (Ed25519)", None, false, None)?;
+                        let ka = p.text(
+                            "Key-agreement key ID (X25519, leave empty to skip)",
+                            None,
+                            true,
+                            None,
+                        )?;
+                        let ka_id = if ka.is_empty() { None } else { Some(ka) };
+                        (None, None, Some(signing), ka_id)
+                    }
+                }
+            } else {
+                (None, None, None, None)
+            };
+
+            // Portability / pre-rotation are meaningless for a pre-signed log.
+            let (portable, pre_rotation_count) = if did_log_file.is_none() {
+                let portable = p.confirm(
+                    "Make this DID portable (can move to a different domain later)?",
+                    true,
+                )?;
+                eprintln!();
+                eprintln!(
+                    "  \x1b[2mPre-rotation protects against key compromise by publishing hashes"
+                );
+                eprintln!("  of future keys now. Recommended: 1-3 keys.\x1b[0m");
+                let pre_rotation_count = p
+                    .text(
+                        "Number of pre-rotation keys",
+                        Some("1"),
+                        false,
+                        Some(&|s: &str| {
+                            s.parse::<u32>()
+                                .map(|_| ())
+                                .map_err(|e| format!("must be a non-negative integer: {e}"))
+                        }),
+                    )?
+                    .parse()
+                    .expect("validated above");
+                (portable, pre_rotation_count)
+            } else {
+                (true, 0)
+            };
+
+            Ok(VtaDidInput::CreateWebvh {
+                url,
+                portable,
+                pre_rotation_count,
+                did_document_file,
+                did_log_file,
+                signing_key_id,
+                ka_key_id,
+            })
+        }
+        1 => Ok(VtaDidInput::CreateDidKey),
+        2 => {
+            let did = p.text("VTA DID", None, false, None)?;
+            Ok(VtaDidInput::Existing { did })
+        }
+        4 => {
+            eprintln!();
+            eprintln!(
+                "  \x1b[2mdid:webs is alpha. The host's operator must allow self-registration on\n  \
+                 the domain ([[hosting.webs_self_register]]).\x1b[0m"
+            );
+            let server_did = p.text("did-hosting server DID", None, false, None)?;
+            let domain = p.text("Domain the host serves it on", None, false, None)?;
+            let path = p.text(
+                "Slot path before the AID (e.g. nodes; empty for none)",
+                None,
+                true,
+                None,
+            )?;
+            Ok(VtaDidInput::CreateWebs {
+                server_did,
+                domain,
+                path: (!path.trim().is_empty()).then(|| path.trim().to_string()),
+                server_id: None,
+            })
+        }
+        _ => Ok(VtaDidInput::Skip),
+    }
+}
+
+/// How this VTA presents the DIDs it creates, its own included (VTI-VTA-034,
+/// VTI-VTA-035). Asked only when the wizard mints a did:webvh log; otherwise
+/// the defaults apply — did:webvh, with the did:scid alias listed.
+fn prompt_did_presentation(
+    p: &dyn Prompter,
+    vta_did: &VtaDidInput,
+) -> Result<crate::config::DidsConfig, DynErr> {
+    let mut dids = crate::config::DidsConfig::default();
+    // A did:webs VTA turns did:webs on: choosing it is the opt-in.
+    if matches!(vta_did, VtaDidInput::CreateWebs { .. }) {
+        dids.webs_enabled = true;
+        return Ok(dids);
+    }
+    if !matches!(vta_did, VtaDidInput::CreateWebvh { .. }) {
+        return Ok(dids);
+    }
+    eprintln!();
+    eprintln!(
+        "  \x1b[2mA did:webvh log can be presented as its did:scid:vh:1 DID, which the same\n  \
+         log verifies but which does not name its host, so it survives a move.\x1b[0m"
+    );
+    let options = [
+        "did:webvh (recommended; what every existing peer expects)",
+        "did:scid (portable identity, located by ?src=)",
+    ];
+    if p.select("Present this VTA's DIDs as", &options, 0)? == 1 {
+        dids.default_did_method = vta_sdk::did_scid::DidMethod::Scid;
+    } else {
+        dids.scid_also_known_as = p.confirm(
+            "List the did:scid alias in alsoKnownAs, so peers can also use that form?",
+            true,
+        )?;
+    }
+    Ok(dids)
+}
+
+/// Prompt for a webvh hosting URL, returning the raw string the engine parses.
+/// Re-prompts (via the validator) until the URL parses as an `http(s)://` URL.
+///
+/// `default` lets the caller offer a sensible default the operator can accept
+/// with Enter — used by the create-mediator path to pre-fill the DIDComm
+/// endpoint URL, so the common-case "DIDComm and DID hosting on the same host"
+/// stays one keystroke while operators with split hosts can override.
+fn prompt_webvh_url(
+    p: &dyn Prompter,
+    label: &str,
+    default: Option<&str>,
+) -> Result<String, DynErr> {
+    eprintln!();
+    eprintln!("  Enter the URL where the {label} DID document will be hosted.");
+    eprintln!("  Examples:");
+    eprintln!("    https://example.com                -> did:webvh:{{SCID}}:example.com");
+    eprintln!("    https://example.com/dids/vta       -> did:webvh:{{SCID}}:example.com:dids:vta");
+    eprintln!("    http://localhost:8000               -> did:webvh:{{SCID}}:localhost%3A8000");
+    eprintln!();
+
+    let url = p.text(
+        &format!("{label} DID URL"),
+        default.or(Some("http://localhost:8000/")),
+        false,
+        Some(&|s: &str| {
+            let parsed = url::Url::parse(s).map_err(|e| format!("invalid URL: {e}"))?;
+            didwebvh_rs::url::WebVHURL::parse_url(&parsed)
+                .map(|_| ())
+                .map_err(|e| format!("could not convert to a webvh DID: {e}"))
+        }),
+    )?;
+    Ok(url)
+}
+
+// ---------------------------------------------------------------------------
+// Gather → WizardInputs
+// ---------------------------------------------------------------------------
+
+/// Walk the operator through every setup knob and assemble a [`WizardInputs`].
+///
+/// Returns `Ok(None)` when the operator cancels (declines to overwrite an
+/// existing config or to wipe an existing data directory). Performs no work
+/// beyond resolving the operator's intent — the engine ([`apply_inputs`]) does
+/// the rest.
+async fn gather_inputs(
+    p: &dyn Prompter,
+    default_config_path: Option<PathBuf>,
+) -> Result<Option<WizardInputs>, DynErr> {
+    // 1. Config file path.
+    let default_path = default_config_path
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            std::env::var("VTA_CONFIG_PATH").unwrap_or_else(|_| "config.toml".into())
+        });
+    let config_path = PathBuf::from(
+        p.text("Config file path", Some(&default_path), false, None)?
+            .trim(),
+    );
+    // Record the operator's intent; do *not* delete the file here. Gathering
+    // is a further dozen prompts, any of which can cancel — deleting now
+    // would leave an operator who backs out at the data-directory question
+    // with no config and a VTA that no longer starts. The engine overwrites
+    // it at the end, once everything else has succeeded.
+    let mut overwrite_config = false;
+    if config_path.exists() {
+        if !p.confirm(
+            &format!("{} already exists. Overwrite?", config_path.display()),
+            false,
+        )? {
+            eprintln!("Setup cancelled.");
+            return Ok(None);
+        }
+        overwrite_config = true;
+    }
+
+    // 2. VTA name.
+    let vta_name = p.text("VTA name (leave empty to skip)", None, true, None)?;
+    let vta_name = if vta_name.is_empty() {
+        None
+    } else {
+        Some(vta_name)
+    };
+
+    // 3. Services.
+    let ServiceSelection {
+        rest: enable_rest,
+        didcomm: enable_didcomm,
+        tsp: mut enable_tsp,
+    } = prompt_services(p)?;
+
+    // 4. Server host + port + REST URL (URL asked after the port so the
+    //    localhost default can use it).
+    let (public_url, host, port) = if enable_rest {
+        let host = p.text("Server host", Some("0.0.0.0"), false, None)?;
+        let port: u16 = p
+            .text(
+                "Server port",
+                Some("8100"),
+                false,
+                Some(&|s: &str| {
+                    s.parse::<u16>()
+                        .map(|_| ())
+                        .map_err(|e| format!("invalid port: {e}"))
+                }),
+            )?
+            .parse()
+            .expect("validated above");
+
+        eprintln!();
+        eprintln!(
+            "  REST is enabled — the VTA needs a public URL to publish as a service endpoint in its DID document. Other parties (CLI clients, other VTAs) resolve the DID and use this URL to reach the REST API."
+        );
+        eprintln!("  Examples:");
+        eprintln!("    • Local development: http://localhost:{port}");
+        eprintln!("    • Production:        https://vta.example.com");
+        eprintln!();
+        let default_url = format!("http://localhost:{port}");
+        let public_url = p.text(
+            "VTA REST URL",
+            Some(&default_url),
+            false,
+            Some(&|s: &str| {
+                let s = s.trim();
+                if s.is_empty() {
+                    Err("VTA REST URL is required when REST is enabled".into())
+                } else if !(s.starts_with("http://") || s.starts_with("https://")) {
+                    Err(
+                        "URL must start with http:// or https:// (e.g. http://localhost:8100)"
+                            .into(),
+                    )
+                } else {
+                    Ok(())
+                }
+            }),
+        )?;
+        let public_url = public_url.trim().trim_end_matches('/').to_string();
+        (Some(public_url), host, port)
+    } else {
+        (
+            None,
+            ServerConfig::default().host,
+            ServerConfig::default().port,
+        )
+    };
+
+    // 5. Log level + format.
+    let log_level = p.text("Log level", Some("info"), false, None)?;
+    let log_format = match p.select("Log format", &["text", "json"], 0)? {
+        1 => LogFormat::Json,
+        _ => LogFormat::Text,
+    };
+
+    // 6. Optional remote DID resolver — TEE/Nitro builds only (the enclave
+    //    can't reach the network, so resolution is bridged over vsock).
+    #[cfg(feature = "tee")]
+    let resolver_url = {
+        eprintln!();
+        eprintln!("DID resolution");
+        eprintln!("  In a TEE the enclave cannot reach the network directly, so DID");
+        eprintln!("  resolution is dispatched to an external resolver-cache-server on the");
+        eprintln!("  parent, bridged over vsock. Example: ws://127.0.0.1:4445/did/v1/ws");
+        eprintln!();
+        let entered = p.text("Remote DID resolver WebSocket URL", None, true, None)?;
+        if entered.is_empty() {
+            None
+        } else {
+            Some(entered)
+        }
+    };
+    #[cfg(not(feature = "tee"))]
+    let resolver_url: Option<String> = None;
+
+    // 7. Audit-log retention.
+    let retention_days: u32 = p
+        .text(
+            "Audit-log retention (days)",
+            Some(&AuditConfig::default().retention_days.to_string()),
+            false,
+            Some(&|s: &str| match s.parse::<u32>() {
+                Ok(0) => {
+                    Err("retention must be > 0; the audit sweeper assumes a positive window".into())
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!("invalid number: {e}")),
+            }),
+        )?
+        .parse()
+        .expect("validated above");
+    let mut audit = AuditConfig::default();
+    audit.retention_days = retention_days;
+
+    // 8. Data directory + existing-store policy. Trimmed because operators
+    //    paste paths, and a stray trailing space silently becomes part of
+    //    the path on Unix (and a different path again on Windows).
+    let data_dir = PathBuf::from(
+        p.text("Data directory", Some("data/vta"), false, None)?
+            .trim(),
+    );
+    let mut data_dir_exists = ExistingDataDirPolicy::default();
+    // Ask only when the directory holds an actual store. An empty
+    // directory — the normal state of a freshly-mounted Docker volume or a
+    // path the operator just created — is initialized into silently.
+    if vti_common::store::local_store_exists(&data_dir) {
+        eprintln!();
+        eprintln!(
+            "  Data directory \"{}\" already contains a VTA store.",
+            data_dir.display()
+        );
+        eprintln!();
+        let choice = p.select(
+            "How should setup proceed?",
+            &[
+                "Cancel setup (leave the existing data untouched)",
+                "Keep the existing contents and initialize into it",
+                "Delete everything in it and start fresh",
+            ],
+            0,
+        )?;
+        match choice {
+            1 => data_dir_exists = ExistingDataDirPolicy::Reuse,
+            2 => data_dir_exists = ExistingDataDirPolicy::Delete,
+            _ => {
+                eprintln!("Setup cancelled.");
+                return Ok(None);
+            }
+        }
+    }
+
+    // 9. Advanced server options (REST only). Opt-in so the common path stays
+    //    short; defaults match the pre-P1.2 hardcoded values.
+    let (cors_origins, trust_xff_cidrs, webauthn) = if enable_rest
+        && p.confirm(
+            "Configure advanced server options (CORS, trusted proxy CIDRs, WebAuthn)?",
+            false,
+        )? {
+        let cors_raw = p.text(
+            "Allowed CORS origins (comma-separated, leave empty for none)",
+            None,
+            true,
+            None,
+        )?;
+        let cors_origins: Vec<String> = cors_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        let cidrs_raw = p.text(
+            "Trusted proxy CIDRs (comma-separated, e.g. 10.0.0.0/24 — every \
+             reverse proxy in front of this VTA, and only ones that rewrite \
+             X-Forwarded-For; a plain TCP forwarder listed here is a \
+             rate-limit bypass. Leave empty to key on the raw peer IP)",
+            None,
+            true,
+            Some(&|s: &str| {
+                for entry in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let cidr = entry
+                        .parse::<ipnetwork::IpNetwork>()
+                        .map_err(|e| format!("'{entry}' is not a valid CIDR: {e}"))?;
+                    // The config loader applies the same rule; catch it here
+                    // rather than write a config the VTA will not start with.
+                    vti_common::rate_limit::check_trusted_proxy_cidrs(&[cidr])
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }),
+        )?;
+        let trust_xff_cidrs: Vec<ipnetwork::IpNetwork> = cidrs_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().expect("validated above"))
+            .collect();
+        let webauthn = p.confirm("Advertise a WebAuthn-RP service in the VTA DID?", false)?;
+        (cors_origins, trust_xff_cidrs, webauthn)
+    } else {
+        (Vec::new(), Vec::new(), false)
+    };
+
+    // 10. Secrets backend.
+    let secrets = configure_secrets(p).await?;
+
+    // 11. Hardened configuration.
+    let hardened = prompt_hardened(p)?;
+
+    // 12. Messaging — the mediator, for whichever transports ride it.
+    //
+    // Reached by TSP as well as DIDComm: both arrive on the same mediator
+    // socket, and `#tsp`'s serviceEndpoint is that mediator's DID. Asking only
+    // in the DIDComm branch is what made TSP-without-DIDComm inexpressible —
+    // there was nowhere to put the mediator a TSP-only VTA needs.
+    let messaging = if enable_didcomm || enable_tsp {
+        if enable_tsp && !enable_didcomm {
+            eprintln!();
+            eprintln!(
+                "  \x1b[2mTSP rides a mediator, the same way DIDComm does — `#tsp` in your DID \
+                 document names the mediator's DID, and the transport URL lives in the \
+                 mediator's own document.\x1b[0m"
+            );
+            eprintln!(
+                "  \x1b[2mThe questions below configure that mediator. It must route TSP; an \
+                 existing one is checked for it.\x1b[0m"
+            );
+        }
+        configure_messaging(p).await?
+    } else {
+        MessagingInput::Skip
+    };
+
+    // A mediator the operator brings must carry the TSP advertised through it
+    // (Keyring VTI-33). Asked here, where the answer can still change the
+    // selection, rather than left for `apply_inputs` to refuse after every
+    // question has been answered. A mediator this wizard mints is minted with
+    // `#tsp`, so needs no check.
+    if enable_tsp && let MessagingInput::Existing { did, .. } = &messaging {
+        let verdict = super::existing_mediator_tsp(did, resolver_url.as_deref()).await;
+        enable_tsp = keep_tsp_after_mediator_check(did, &verdict, enable_rest || enable_didcomm)?;
+    }
+
+    // 13. VTA DID.
+    let vta_did = create_vta_did(p)?;
+    let dids = prompt_did_presentation(p, &vta_did)?;
+
+    Ok(Some(WizardInputs {
+        config_path,
+        overwrite_config,
+        vta_name,
+        public_url,
+        data_dir,
+        data_dir_exists,
+        services: ServicesConfig {
+            rest: enable_rest,
+            didcomm: enable_didcomm,
+            webauthn,
+            tsp: enable_tsp,
+        },
+        dids,
+        server: {
+            // `ServerConfig` is `#[non_exhaustive]`: start from its defaults
+            // (the rate limits among them) and set what the wizard asked.
+            let mut server = ServerConfig::default();
+            server.host = host;
+            server.port = port;
+            server.cors_origins = cors_origins;
+            server.trust_xff_cidrs = trust_xff_cidrs;
+            server
+        },
+        log: {
+            let mut log = LogConfig::default();
+            log.level = log_level;
+            log.format = log_format;
+            log
+        },
+        secrets,
+        messaging,
+        vta_did,
+        // The interactive wizard never seeds an admin inline — operators use
+        // `pnm setup` + `vta import-did` after setup. `--from` exposes these.
+        admin_did: None,
+        admin_label: None,
+        resolver_url,
+        audit,
+        // Staff provisioning is a non-interactive (enterprise) feature, exposed
+        // only via `--from <toml>`.
+        staff: Vec::new(),
+        hardened,
+    }))
+}
+
+/// Entry point for `vta setup`. Gathers inputs interactively, then runs the
+/// shared engine.
+pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), DynErr> {
+    require_terminal(std::io::IsTerminal::is_terminal(&std::io::stdin()))?;
+    eprintln!("Welcome to the VTA setup wizard.\n");
+    let prompter = DialoguerPrompter;
+    let Some(inputs) = gather_inputs(&prompter, config_path).await? else {
+        return Ok(());
+    };
+    apply_inputs(
+        inputs,
+        &InteractiveUi {
+            prompter: &prompter,
+        },
+    )
+    .await
+}
+
+/// Refuse the interactive wizard without a terminal on stdin, naming the
+/// unattended path (#2593).
+///
+/// Without this, `vta setup` in a Dockerfile, a systemd unit or CI dies at its
+/// first prompt with a terminal I/O error that says nothing about
+/// `vta setup --from`, which exists for exactly that.
+fn require_terminal(stdin_is_terminal: bool) -> Result<(), DynErr> {
+    if stdin_is_terminal {
+        return Ok(());
+    }
+    Err(
+        "`vta setup` is interactive and stdin is not a terminal. For unattended setup run: \
+         `vta setup --from <setup.toml>` (see docs/02-vta/non-interactive-setup.md)."
+            .into(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// #2593: without a terminal the wizard refuses before its first prompt
+    /// and names `vta setup --from`.
+    #[test]
+    fn without_a_terminal_the_wizard_names_the_unattended_setup() {
+        assert!(require_terminal(true).is_ok());
+        let message = require_terminal(false).unwrap_err().to_string();
+        assert!(message.contains("vta setup --from"), "{message}");
+        assert!(
+            message.contains("docs/02-vta/non-interactive-setup.md"),
+            "{message}"
+        );
+    }
+    use std::collections::VecDeque;
+
+    /// A single scripted answer, consumed in prompt-call order.
+    #[derive(Clone)]
+    enum Answer {
+        Text(String),
+        Bool(bool),
+        Index(usize),
+        /// Pick a `select` option by its **label** rather than its position.
+        ///
+        /// Prefer this over [`Answer::Index`] whenever the option list depends
+        /// on which features are compiled. The secrets-backend menu is the
+        /// motivating case: it is built up feature by feature (`aws-secrets`,
+        /// `config-seed`, `keyring`, …), so `Index(0)` means "OS keyring" in the
+        /// default build and "Config file" once `config-seed` is on. That
+        /// silently picked the wrong backend, which skipped the keyring-service
+        /// prompt, which shifted every later answer by one — surfacing as a
+        /// bogus "expected Index answer for prompt: VTA DID" far downstream.
+        ///
+        /// Matching on the label is immune to options being added, removed, or
+        /// reordered, and fails at the *right* prompt when a label disappears.
+        Label(&'static str),
+        /// [`Answer::Label`] for a `multiselect`: pick every listed option by
+        /// label. The services prompt needs it for the same reason — its option
+        /// list grows a "TSP" entry under `--features tsp`.
+        Labels(Vec<&'static str>),
+    }
+
+    /// Head-less [`Prompter`] that replays a fixed script of answers. Panics on
+    /// a script/prompt-kind mismatch or exhaustion so a wrong test script fails
+    /// loudly rather than silently.
+    struct ScriptedPrompter {
+        answers: RefCell<VecDeque<Answer>>,
+    }
+
+    impl ScriptedPrompter {
+        fn new(answers: Vec<Answer>) -> Self {
+            Self {
+                answers: RefCell::new(answers.into()),
+            }
+        }
+        fn next(&self, prompt: &str) -> Answer {
+            self.answers
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| panic!("script exhausted at prompt: {prompt}"))
+        }
+    }
+
+    impl Prompter for ScriptedPrompter {
+        fn text(
+            &self,
+            prompt: &str,
+            _default: Option<&str>,
+            _allow_empty: bool,
+            validate: Option<&dyn Fn(&str) -> Result<(), String>>,
+        ) -> Result<String, DynErr> {
+            match self.next(prompt) {
+                Answer::Text(s) => {
+                    if let Some(v) = validate {
+                        v(&s)
+                            .map_err(|e| format!("scripted answer {s:?} failed validation: {e}"))?;
+                    }
+                    Ok(s)
+                }
+                _ => panic!("expected Text answer for prompt: {prompt}"),
+            }
+        }
+        fn confirm(&self, prompt: &str, _default: bool) -> Result<bool, DynErr> {
+            match self.next(prompt) {
+                Answer::Bool(b) => Ok(b),
+                _ => panic!("expected Bool answer for prompt: {prompt}"),
+            }
+        }
+        fn select(&self, prompt: &str, items: &[&str], _default: usize) -> Result<usize, DynErr> {
+            match self.next(prompt) {
+                Answer::Index(i) => Ok(i),
+                Answer::Label(want) => items.iter().position(|it| *it == want).ok_or_else(|| {
+                    format!(
+                        "scripted label {want:?} is not an option for prompt {prompt:?}; \
+                         available: {items:?}"
+                    )
+                    .into()
+                }),
+                _ => panic!("expected Index or Label answer for prompt: {prompt}"),
+            }
+        }
+        fn multiselect(
+            &self,
+            prompt: &str,
+            items: &[&str],
+            _defaults: &[bool],
+        ) -> Result<Vec<usize>, DynErr> {
+            match self.next(prompt) {
+                Answer::Labels(want) => want
+                    .iter()
+                    .map(|w| {
+                        items.iter().position(|it| it == w).ok_or_else(|| {
+                            format!(
+                                "scripted label {w:?} is not an option for prompt {prompt:?}; \
+                                 available: {items:?}"
+                            )
+                            .into()
+                        })
+                    })
+                    .collect(),
+                _ => panic!("expected Labels answer for prompt: {prompt}"),
+            }
+        }
+    }
+
+    fn text(s: &str) -> Answer {
+        Answer::Text(s.to_string())
+    }
+
+    /// Golden test: a scripted run of the interactive wizard produces a
+    /// `WizardInputs` structurally identical to the equivalent `--from` TOML.
+    /// REST + DIDComm, keyring backend, create-mediator, simple webvh VTA DID,
+    /// advanced server options — exercises the divergence-prone mappings.
+    #[tokio::test]
+    async fn interactive_matches_equivalent_toml() {
+        // Scripted answers, in the exact order the prompts fire.
+        //
+        // Selects whose option list varies with the compiled feature set use
+        // `Answer::Label` rather than `Answer::Index` — see [`Answer::Label`].
+        // The secrets-backend menu is the one that bites: it is assembled
+        // feature by feature, so a positional answer picks a different backend
+        // under `config-seed`/`aws-secrets`/… than it does by default.
+        let answers = vec![
+            text("/tmp/vta-golden/config.toml"), // config path (doesn't exist)
+            text("golden-vta"),                  // vta name
+            // Labels, not indices: the services list grows a TSP option
+            // under `--features tsp`.
+            Answer::Labels(vec![REST_ITEM, DIDCOMM_ITEM]), // services
+            text("0.0.0.0"),                               // host
+            text("8100"),                                  // port
+            text("https://trust.example.com"),             // REST URL
+            text("info"),                                  // log level
+            Answer::Index(0),                              // log format = text
+            // TEE builds add an extra "Remote DID resolver WebSocket URL"
+            // prompt here (vsock-bridged resolution); empty = skip. Only
+            // scripted when `tee` is active so the answer sequence stays
+            // aligned under both feature sets (CI's `--workspace` build
+            // unifies `tee` onto this binary via vta-enclave).
+            #[cfg(feature = "tee")]
+            text(""), // TEE-only: remote DID resolver URL (skip)
+            text("90"),                      // audit retention
+            text("/tmp/vta-golden/data"),    // data dir (doesn't exist)
+            Answer::Bool(true),              // configure advanced server opts?
+            text("https://app.example.com"), // cors origins
+            text("10.0.0.0/24"),             // trust_xff_cidrs
+            Answer::Bool(true),              // webauthn
+            // Label, not index: the backend menu grows with features (config-seed etc.).
+            Answer::Label("OS keyring"),
+            text("golden-keyring"),                    // keyring service
+            Answer::Bool(false),                       // hardened configuration? no
+            Answer::Index(1),                          // messaging = create mediator
+            text("mediator"),                          // mediator context
+            text("https://mediator.example.com"),      // mediator DIDComm url
+            text("wss://mediator.example.com/ws"),     // mediator ws url
+            text("https://dids.example.com/mediator"), // mediator DID URL (split host)
+            text(""),                                  // mediator host (skip)
+            text(""),                                  // routing keys (skip)
+            Answer::Bool(false),                       // setup_acl (disable)
+            Answer::Index(1),                          // VTA DID = did:key
+        ];
+        let p = ScriptedPrompter::new(answers);
+        let gathered = gather_inputs(&p, None)
+            .await
+            .expect("gather should succeed")
+            .expect("gather should not cancel");
+
+        let toml_str = r#"
+            config_path = "/tmp/vta-golden/config.toml"
+            vta_name    = "golden-vta"
+            public_url  = "https://trust.example.com"
+            data_dir    = "/tmp/vta-golden/data"
+
+            [services]
+            rest     = true
+            didcomm  = true
+            webauthn = true
+            # The script above unticks TSP, which a setup file defaults on.
+            tsp      = false
+
+            [server]
+            host            = "0.0.0.0"
+            port            = 8100
+            cors_origins    = ["https://app.example.com"]
+            trust_xff_cidrs = ["10.0.0.0/24"]
+
+            [log]
+            level  = "info"
+            format = "text"
+
+            [audit]
+            retention_days = 90
+
+            [secrets]
+            backend = "keyring"
+            service = "golden-keyring"
+
+            [messaging]
+            kind      = "create_mediator"
+            context   = "mediator"
+            url       = "https://mediator.example.com"
+            ws_url    = "wss://mediator.example.com/ws"
+            webvh_url = "https://dids.example.com/mediator"
+            setup_acl = false
+
+            [vta_did]
+            kind = "create_did_key"
+        "#;
+        let from_toml: WizardInputs = toml::from_str(toml_str).expect("equivalent TOML parses");
+
+        let a = serde_json::to_value(&gathered).unwrap();
+        let b = serde_json::to_value(&from_toml).unwrap();
+        assert_eq!(
+            a, b,
+            "interactive-gathered inputs must equal the equivalent --from TOML\n\
+             interactive = {a:#}\n--from = {b:#}"
+        );
+    }
+
+    /// A `data_dir` that exists but holds no store is *not* a conflict, so
+    /// the wizard must not ask about it at all. This is the reported
+    /// failure: a Docker volume / K8s PVC / hand-created directory is
+    /// always there before setup runs, and the old `exists()` gate offered
+    /// only "delete everything" or "cancel".
+    ///
+    /// The scripted prompter panics on an unexpected prompt kind or a
+    /// short script, so a spurious question fails the test loudly.
+    #[tokio::test]
+    async fn a_pre_created_empty_data_dir_is_never_asked_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("vta-data");
+        std::fs::create_dir_all(&data_dir).expect("pre-create the mount point");
+
+        let answers = vec![
+            text(dir.path().join("config.toml").to_str().unwrap()), // doesn't exist
+            text(""),                                               // vta name (skip)
+            Answer::Labels(vec![REST_ITEM]),                        // services: REST only
+            text("0.0.0.0"),                                        // host
+            text("8100"),                                           // port
+            text("https://t.example.com"),                          // REST URL
+            text("info"),                                           // log level
+            Answer::Index(0),                                       // log format
+            #[cfg(feature = "tee")]
+            text(""),            // TEE-only: remote DID resolver URL (skip)
+            text("28"),                                             // audit retention
+            text(data_dir.to_str().unwrap()),                       // data dir — exists, but empty
+            Answer::Bool(false),                                    // advanced server opts? no
+            Answer::Label("OS keyring"), // label, not index: menu grows with features
+            text("vta"),                 // keyring service
+            Answer::Bool(false),         // hardened configuration? no
+            Answer::Index(1),            // VTA DID = did:key
+        ];
+        let gathered = gather_inputs(&ScriptedPrompter::new(answers), None)
+            .await
+            .expect("gather should succeed")
+            .expect("an empty data directory must not cancel setup");
+
+        assert_eq!(
+            gathered.data_dir_exists,
+            ExistingDataDirPolicy::Error,
+            "with nothing to lose the policy stays at its fail-closed default"
+        );
+        assert!(!gathered.overwrite_config);
+    }
+
+    /// Backing out at the data-directory question must leave the operator's
+    /// existing `config.toml` exactly where it was. The wizard used to
+    /// delete it up-front, so an operator who answered "no" here was left
+    /// with no config and a VTA that no longer started.
+    #[tokio::test]
+    async fn cancelling_at_the_data_dir_prompt_leaves_the_config_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        const ORIGINAL: &str = "vta_did = \"did:key:zExistingInstall\"\n";
+        std::fs::write(&config_path, ORIGINAL).unwrap();
+
+        // A directory that looks like a store: fjall's version marker is
+        // exactly what `local_store_exists` (and fjall itself) keys on.
+        let data_dir = dir.path().join("vta-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("version"), b"fjall").unwrap();
+
+        let answers = vec![
+            text(config_path.to_str().unwrap()), // config path — exists
+            Answer::Bool(true),                  // overwrite? yes
+            text(""),                            // vta name (skip)
+            Answer::Labels(vec![DIDCOMM_ITEM]),  // services: DIDComm only (no URL prompts)
+            text("info"),                        // log level
+            Answer::Index(0),                    // log format
+            #[cfg(feature = "tee")]
+            text(""), // TEE-only: remote DID resolver URL (skip)
+            text("28"),                          // audit retention
+            text(data_dir.to_str().unwrap()),    // data dir — holds a store
+            Answer::Index(0),                    // → cancel
+        ];
+        let gathered = gather_inputs(&ScriptedPrompter::new(answers), None)
+            .await
+            .expect("cancelling is not an error");
+
+        assert!(gathered.is_none(), "cancelling must abort setup");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            ORIGINAL,
+            "cancelling must not have touched the operator's config"
+        );
+        assert!(
+            data_dir.join("version").is_file(),
+            "cancelling must not have touched the operator's data"
+        );
+    }
+
+    /// The other two answers to the same question map to the policies that
+    /// let setup proceed.
+    #[tokio::test]
+    async fn existing_store_offers_reuse_and_delete() {
+        for (choice, expected) in [
+            (1, ExistingDataDirPolicy::Reuse),
+            (2, ExistingDataDirPolicy::Delete),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = dir.path().join("vta-data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::write(data_dir.join("version"), b"fjall").unwrap();
+
+            let answers = vec![
+                text(dir.path().join("config.toml").to_str().unwrap()),
+                text(""),                           // vta name (skip)
+                Answer::Labels(vec![DIDCOMM_ITEM]), // services: DIDComm only
+                text("info"),                       // log level
+                Answer::Index(0),                   // log format
+                #[cfg(feature = "tee")]
+                text(""), // TEE-only: remote DID resolver URL (skip)
+                text("28"),                         // audit retention
+                text(data_dir.to_str().unwrap()),   // data dir — holds a store
+                Answer::Index(choice),              // reuse / delete
+                Answer::Label("OS keyring"),        // label, not index: menu grows with features
+                text("vta"),                        // keyring service
+                Answer::Bool(false),                // hardened configuration? no
+                Answer::Index(2),                   // messaging = skip
+                Answer::Index(1),                   // VTA DID = did:key
+            ];
+            let gathered = gather_inputs(&ScriptedPrompter::new(answers), None)
+                .await
+                .expect("gather should succeed")
+                .expect("choosing reuse/delete must not cancel");
+            assert_eq!(gathered.data_dir_exists, expected, "choice {choice}");
+        }
+    }
+
+    /// The advanced webvh "use existing keys" mode maps to the right
+    /// `VtaDidInput::CreateWebvh` fields.
+    #[tokio::test]
+    async fn advanced_existing_keys_mode_maps_through() {
+        let answers = vec![
+            text("/tmp/vta-golden2/config.toml"),
+            text(""),                        // vta name (skip)
+            Answer::Labels(vec![REST_ITEM]), // services: REST only
+            text("0.0.0.0"),                 // host
+            text("8100"),                    // port
+            text("https://t.example.com"),   // REST URL
+            text("info"),                    // log level
+            Answer::Index(0),                // log format
+            // TEE-only "Remote DID resolver WebSocket URL" prompt; empty =
+            // skip. See the note in `interactive_matches_equivalent_toml`.
+            #[cfg(feature = "tee")]
+            text(""), // TEE-only: remote DID resolver URL (skip)
+            text("28"),                    // audit retention
+            text("/tmp/vta-golden2/data"), // data dir
+            Answer::Bool(false),           // advanced server opts? no
+            // Label, not index: the backend menu grows with features (config-seed etc.).
+            Answer::Label("OS keyring"),
+            text("vta"),         // keyring service
+            Answer::Bool(false), // hardened configuration? no
+            // messaging skipped (REST only)
+            Answer::Index(0),                       // VTA DID = create_webvh
+            text("https://t.example.com/dids/vta"), // webvh url
+            Answer::Index(1),                       // advanced mode
+            Answer::Index(2),                       // "use existing keys"
+            text("did:key:z6MkSigner#key-0"),       // signing key id
+            text("did:key:z6MkKa#key-1"),           // ka key id
+            Answer::Bool(true), // portable (existing-keys still prompts — no pre-signed log)
+            text("2"),          // pre-rotation count
+            Answer::Index(0),   // present the VTA's DIDs as did:webvh
+            Answer::Bool(true), // ...listing the did:scid alias
+        ];
+        let p = ScriptedPrompter::new(answers);
+        let gathered = gather_inputs(&p, None)
+            .await
+            .expect("gather should succeed")
+            .expect("gather should not cancel");
+        assert_eq!(gathered.dids, crate::config::DidsConfig::default());
+
+        match gathered.vta_did {
+            VtaDidInput::CreateWebvh {
+                ref url,
+                portable,
+                pre_rotation_count,
+                ref did_document_file,
+                ref did_log_file,
+                ref signing_key_id,
+                ref ka_key_id,
+            } => {
+                assert_eq!(url, "https://t.example.com/dids/vta");
+                assert!(portable);
+                assert_eq!(pre_rotation_count, 2);
+                assert!(did_document_file.is_none());
+                assert!(did_log_file.is_none());
+                assert_eq!(signing_key_id.as_deref(), Some("did:key:z6MkSigner#key-0"));
+                assert_eq!(ka_key_id.as_deref(), Some("did:key:z6MkKa#key-1"));
+            }
+            other => panic!("expected CreateWebvh, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Transport selection
+    //
+    // The three helpers below are deliberately feature-independent: they
+    // take the option list as an argument, so these tests exercise the
+    // TSP mapping in *every* build. CI runs a plain `cargo test
+    // --workspace` (no `tsp`), so a `#[cfg(feature = "tsp")]` test of the
+    // mapping would never run there.
+    // -----------------------------------------------------------------
+
+    /// TSP is offered iff this build can serve it.
+    #[test]
+    fn service_items_lists_tsp_only_in_a_tsp_build() {
+        let items = service_items();
+        assert!(items.contains(&REST_ITEM) && items.contains(&DIDCOMM_ITEM));
+        assert_eq!(
+            items.contains(&TSP_ITEM),
+            cfg!(feature = "tsp"),
+            "a build without the TSP dispatcher must not offer to advertise `#tsp`"
+        );
+    }
+
+    /// Answers map to flags by label, so the same index means different
+    /// things in the two-option and three-option lists.
+    #[test]
+    fn services_from_selection_maps_by_label_not_position() {
+        let without_tsp = [REST_ITEM, DIDCOMM_ITEM];
+        let with_tsp = [REST_ITEM, DIDCOMM_ITEM, TSP_ITEM];
+
+        // Index 1 is DIDComm in both lists — and TSP in neither.
+        for items in [&without_tsp[..], &with_tsp[..]] {
+            let sel = services_from_selection(items, &[1]);
+            assert_eq!(
+                sel,
+                ServiceSelection {
+                    rest: false,
+                    didcomm: true,
+                    tsp: false
+                },
+                "items {items:?}"
+            );
+        }
+
+        // Index 2 is TSP only where TSP is on the menu; a selection that
+        // can't be resolved to a label leaves the flag off rather than
+        // guessing.
+        assert_eq!(
+            services_from_selection(&with_tsp, &[1, 2]),
+            ServiceSelection {
+                rest: false,
+                didcomm: true,
+                tsp: true
+            }
+        );
+        assert_eq!(
+            services_from_selection(&without_tsp, &[1, 2]),
+            ServiceSelection {
+                rest: false,
+                didcomm: true,
+                tsp: false
+            }
+        );
+
+        // Everything ticked.
+        assert_eq!(
+            services_from_selection(&with_tsp, &[0, 1, 2]),
+            ServiceSelection {
+                rest: true,
+                didcomm: true,
+                tsp: true
+            }
+        );
+    }
+
+    /// At least one transport — and that is now the *only* rule. TSP used to
+    /// imply DIDComm because the mediator was collected in the DIDComm branch
+    /// and the TSP dispatcher was compiled behind the DIDComm one; neither is
+    /// true any more.
+    #[test]
+    fn validate_services_requires_at_least_one_and_tsp_may_stand_alone() {
+        let none = ServiceSelection::default();
+        assert!(
+            validate_services(&none)
+                .unwrap_err()
+                .contains("at least one service")
+        );
+
+        for ok in [
+            // TSP alone — the selection this whole change exists to permit.
+            ServiceSelection {
+                rest: false,
+                didcomm: false,
+                tsp: true,
+            },
+            ServiceSelection {
+                rest: true,
+                didcomm: false,
+                tsp: true,
+            },
+            ServiceSelection {
+                rest: true,
+                didcomm: false,
+                tsp: false,
+            },
+            ServiceSelection {
+                rest: false,
+                didcomm: true,
+                tsp: false,
+            },
+            ServiceSelection {
+                rest: true,
+                didcomm: true,
+                tsp: true,
+            },
+        ] {
+            assert!(validate_services(&ok).is_ok(), "{ok:?} must be accepted");
+        }
+    }
+
+    /// End-to-end: ticking TSP in the wizard reaches `services.tsp` in the
+    /// plan the engine consumes. Only meaningful where TSP is on the menu
+    /// — the mapping itself is covered feature-independently above.
+    #[cfg(feature = "tsp")]
+    #[tokio::test]
+    async fn ticking_tsp_reaches_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let answers = vec![
+            text(dir.path().join("config.toml").to_str().unwrap()),
+            text(""), // vta name (skip)
+            Answer::Labels(vec![DIDCOMM_ITEM, TSP_ITEM]),
+            text("info"),     // log level
+            Answer::Index(0), // log format
+            #[cfg(feature = "tee")]
+            text(""), // TEE-only: remote DID resolver URL (skip)
+            text("28"),       // audit retention
+            text(dir.path().join("data").to_str().unwrap()), // data dir (fresh)
+            Answer::Label("OS keyring"),
+            text("vta"),         // keyring service
+            Answer::Bool(false), // hardened configuration? no
+            Answer::Index(2),    // messaging = skip
+            Answer::Index(1),    // VTA DID = did:key
+        ];
+        let gathered = gather_inputs(&ScriptedPrompter::new(answers), None)
+            .await
+            .expect("gather should succeed")
+            .expect("gather should not cancel");
+
+        assert!(gathered.services.tsp, "ticking TSP must set services.tsp");
+        assert!(gathered.services.didcomm);
+        assert!(!gathered.services.rest);
+    }
+
+    /// Keyring VTI-33: what the wizard does with TSP once it has read the
+    /// existing mediator's DID document.
+    #[test]
+    fn an_existing_mediator_without_tsp_drops_it_from_the_selection() {
+        use super::super::MediatorTsp;
+        let did = "did:web:mediator.example";
+        assert!(keep_tsp_after_mediator_check(did, &MediatorTsp::Carried, true).unwrap());
+        assert!(!keep_tsp_after_mediator_check(did, &MediatorTsp::NotCarried, true).unwrap());
+        // TSP alone, through a mediator that does not carry it: nothing to set up.
+        let err = keep_tsp_after_mediator_check(did, &MediatorTsp::NotCarried, false)
+            .expect_err("a TSP-only VTA cannot drop its only transport");
+        assert!(err.to_string().contains("services.tsp = false"), "{err}");
+        // Unresolvable: kept, with a warning — setup runs offline too.
+        let unknown = MediatorTsp::Unknown("offline".into());
+        assert!(keep_tsp_after_mediator_check(did, &unknown, true).unwrap());
+    }
+
+    /// Selecting TSP without DIDComm re-asks instead of proceeding.
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn tsp_alone_is_accepted_and_an_empty_selection_reasks() {
+        // TSP on its own: accepted at the prompt, no re-ask. This is the
+        // selection the wizard used to refuse.
+        let p = ScriptedPrompter::new(vec![Answer::Labels(vec![TSP_ITEM])]);
+        assert_eq!(
+            prompt_services(&p).expect("TSP alone is a valid selection"),
+            ServiceSelection {
+                rest: false,
+                didcomm: false,
+                tsp: true
+            }
+        );
+
+        // Selecting nothing is still the one thing that re-asks.
+        let p = ScriptedPrompter::new(vec![
+            Answer::Labels(vec![]), // refused → re-prompt
+            Answer::Labels(vec![TSP_ITEM]),
+        ]);
+        assert_eq!(
+            prompt_services(&p).expect("second answer is valid"),
+            ServiceSelection {
+                rest: false,
+                didcomm: false,
+                tsp: true
+            }
+        );
+    }
+}

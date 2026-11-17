@@ -1,0 +1,17 @@
+//! `GET /api/health`: the unauthenticated liveness probe.
+
+use axum::Json;
+use serde::Serialize;
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+}
+
+pub async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}

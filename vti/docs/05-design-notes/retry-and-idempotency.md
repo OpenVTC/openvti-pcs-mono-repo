@@ -1,0 +1,344 @@
+# Retry and idempotency — who owns what
+
+**Status:** implemented (VTA + SDK). Closes the retry-safety half of #1009.
+
+A client's request times out. Usually it never arrived, so retrying is correct.
+Sometimes the VTA processed it and **only the reply was lost** — and there, a
+retry produces a second durable effect that the party responsible for it never
+learns about.
+
+That asymmetry is the whole subject of this note. Everything below exists to
+make the second case safe without making the first case slower.
+
+---
+
+## 1. The three layers, and which one owns retry
+
+Three layers can independently decide to send a request again. Left
+uncoordinated they multiply: three attempts at the application layer over three
+at the transport layer is nine executions of an operation the server dedups at
+neither.
+
+| Layer | Retries? | Owns |
+|---|---|---|
+| **Messaging delivery** (`affinidi-messaging-delivery`) | yes — durable outbox, exponential backoff | *Delivery* of a message. Dedups at the receiver. |
+| **`vta-sdk` client** | yes — `VtaClient::idempotent` | *One logical operation*, under one idempotency key. **This is the application-layer owner.** |
+| **Application code** (OpenVTC, CLIs, integrations) | **no** | Nothing. Call `idempotent`; do not wrap it in a loop. |
+
+**The rule: exactly one owner per failure domain.** The delivery layer owns
+message delivery. `VtaClient::idempotent` owns operation completion. Application
+code owns neither and must not add a third.
+
+A hand-rolled application loop is not merely redundant — it is *actively worse
+than nothing*, because it cannot hold a key stable. It re-invokes a client
+method, which builds a fresh document, which means the VTA sees an unrelated
+request. It converts "one operation, retried" into "two operations", which is
+the exact failure the key exists to prevent.
+
+### Migrating off a hand-rolled loop
+
+```rust
+// Before — bounded and well-intentioned, but every attempt is a new operation.
+let resp = my_retry("create key", || client.create_key(build())).await?;
+
+// After — one key across every attempt.
+let resp = client.idempotent(|| client.create_key(build())).await?;
+```
+
+`op` is re-invoked from scratch per attempt, so it must rebuild any by-value
+request — the same contract the hand-rolled loop had. The difference is that all
+attempts now share one key.
+
+---
+
+## 2. What a lost reply costs each operation
+
+`vta_sdk::retry_safety` classifies **every** URI in `ALL_URIS`. A census test
+fails if a task joins the catalog unclassified, so this cannot silently drift.
+
+| Class | Meaning | Needs a key? |
+|---|---|---|
+| `ReadOnly` | No durable effect. | no |
+| `RetrySafe` | Mutating, but a repeat is harmless — it converges, or leaves an inert self-expiring duplicate. | no |
+| `Keyed` | A repeat leaves a second durable artefact that persists and matters. | **yes** |
+| `KeyedSecret` | As `Keyed`, but the response carries secret material. | **yes** |
+
+`RetrySafe` is deliberately **not** called "idempotent", because half its members
+are not. A second `auth/challenge` mints a second challenge. They are grouped
+because the only question a retry layer asks is *"does a repeat do harm"*, and
+for both members the answer is no.
+
+**When adding a task, classify it.** Where convergence is not obvious from the
+contract, choose `Keyed`. The asymmetry is nearly free: over-classifying costs
+one dedup record, under-classifying loses the protection in exactly the rare case
+the table exists for.
+
+### The motivating example
+
+`webvh/dids/create` is `Keyed` because production callers use
+`WebvhPathMode::AutoAssign`. A retried create is assigned a **different** path,
+so the first DID stays published in the log with nobody holding a reference to
+it. With an explicit path the retry would collide and surface as a `Conflict` —
+visible and recoverable. Auto-assign orphans silently, which is why it needed a
+key rather than a convention.
+
+---
+
+## 3. The key
+
+A top-level `idempotencyKey` member on the Trust Task document.
+
+- It lands in `TrustTask::extra` (`#[serde(flatten)]`), so the upstream
+  `trust-tasks-rs` document type needs no change.
+- A Data-Integrity proof covers every member except `proof`, so **the key is
+  signed**. A relayer cannot rewrite it to split one operation into two, or merge
+  two into one.
+- The request hash binds the **type URI as well as the payload**, so one key
+  cannot carry a `keys/create` answer to a `dids/create` retry.
+- Scoped per **principal** (`Principal::Did`), so callers can neither collide
+  with nor probe each other's keys.
+
+`Principal::Did` rather than the bearer token, for two reasons: a token rotation
+mid-retry would otherwise start a fresh namespace and re-run the operation, and
+DIDComm and TSP carry no bearer token at all.
+
+### Absence is not an error
+
+A request with **no** key, or with an unusable one (empty, or over 255 chars), is
+dispatched exactly as it always was. Nothing that worked before this feature can
+begin failing because of it. Rejecting a malformed key would break callers to
+enforce a convenience.
+
+---
+
+## 4. Server-side semantics
+
+Claimed **before** dispatch, via `insert_if_absent`. That ordering is the point:
+`get` then `put` leaves a window where two concurrent attempts both read nothing
+and both run.
+
+| Found | Answer |
+|---|---|
+| nothing | claim it, run the handler, record the outcome |
+| in flight, fresh | `unavailable` (503) + `retryAfter` — the first attempt is still running |
+| in flight, stale (>10 min) | `taskFailed`, outcome unknown — the attempt died; **never** re-run (below) |
+| completed, same request, replayable | the original response, verbatim |
+| completed, same request, not replayable | `taskFailed` naming the first outcome |
+| completed, **different** request | `taskFailed` — one key, two different requests |
+
+Two orderings worth knowing:
+
+- **Conflict is reported ahead of in-flight.** A mismatched body under a live
+  claim gets `Conflict`, not "try again" — telling that caller to retry would
+  loop it forever on a request that can never be accepted.
+- **A failed task releases its claim** rather than recording it. The effect never
+  happened, so the retry should actually run. Caching failures would turn one
+  transient error into a sticky one for the record's whole lifetime.
+
+### A dead attempt is never re-run
+
+The handler commits its effect, then `record_outcome` marks the key done. The
+two are not one write, so a process can die between them: the effect exists and
+the record still says "in flight". Nothing distinguishes that from a process
+that died *before* the effect, so the claim is never reclaimed. Inside the
+10-minute grace a retry gets `unavailable` (the attempt may be alive); after
+it, `taskFailed` with `details.claimedAt` — outcome unknown. The caller checks
+whether the effect exists with the corresponding read operation and, if it is
+still wanted, sends the request under a **new** key. Reclaiming instead would
+perform the operation twice in exactly the case the key exists for
+(VTI-OPS-061 — "at most once per key"; #2402, which measured it: a reclaimed
+`keys/create` minted a second key). The refusal is terminal, so
+`VtaClient::idempotent` does not loop on it. The key is free again only when
+its record expires.
+
+`vta-service/tests/it/idempotency_trust_task.rs` holds this across a real
+restart: two app lifetimes over one retained store, the second built only after
+fjall has released the first's directory lock.
+
+### Retention window
+
+**At least 24 hours** (`IdempotencyClass::NonDestructive`), and longer when a
+document under the key is acceptable for longer (**VTI-OPS-066**): the record is
+kept until the latest acceptance end, plus the skew, of any document accepted
+under the key (`IdempotencyStore::claim_retained`). The attempts at one
+operation are separate documents, and a document stating an `expiresAt` is
+acceptable for up to thirty days (VTI-OPS-028). A record kept only for 24 hours
+would let the attempt arriving on the second day perform the operation again.
+Each repeat of the same request under the key extends the record to its own
+acceptance end; a different request under the key (a conflict) extends nothing.
+
+Swept by `vta_sweepers::idempotency_sweeper`, which goes by each record's own
+expiry. Records are also read-through-expiry, so a stale one is never served
+even between sweeps.
+
+Sized for the two real retry shapes: an automated backoff loop finishes within
+seconds, and an operator re-running a failed provisioning step comes back within
+minutes to hours. Every keyed Trust Task uses `NonDestructive`, including tasks
+that destroy something — the `Destructive` 60s class exists for HTTP routes whose
+key *is* the target's UUID, where a long TTL would silently no-op a later
+intentional re-create. A Trust-Task key is per-attempt-group and carries no
+resource identity, so that hazard cannot arise.
+
+### Why some responses are never replayed
+
+`seeds/export-mnemonic`, `backup/complete-export` and `provision/integration`
+return a mnemonic, the whole VTA under a passphrase, and a sealed bundle
+respectively. Caching those to serve a retry would persist the secret a second
+time, indefinitely, in a keyspace that exists for retry bookkeeping — and would
+break the standing invariant that the mnemonic plaintext is never cached
+anywhere.
+
+Those tasks record the **fact** of completion without the body. The duplicate
+effect is still prevented; only the replay is refused, with an error saying so
+and naming the read operation that can fetch the result. Responses over 64 KiB
+take the same path, so one large listing cannot let a caller size a dedup record
+with whatever it asked for.
+
+### A store error refuses the request
+
+A store error while claiming answers `unavailable` (transient, so the client
+retries under the same key). It used to dispatch unguarded, on the reasoning
+that idempotency was an improvement rather than a precondition — but
+VTI-OPS-061 makes at-most-once per key a MUST, and a request run without its
+claim is one a later retry can run again (#2402). A failure *recording* an
+outcome leaves the claim in flight, which the rule above then answers as
+outcome unknown.
+
+---
+
+## 5. Retry hints
+
+The VTA emits `retryAfter` in the rejection **document** when it answers
+`unavailable`. `VtaClient::idempotent` honours it, **capped at 30 seconds** — an
+unbounded wait on a server-chosen value is a stall the server can trigger at
+will. A hint already in the past retries promptly rather than being treated as a
+reason to wait.
+
+Two deliberate limits:
+
+- **The hint is in the document, not an HTTP `Retry-After` header.** DIDComm and
+  TSP drop HTTP status entirely, so a header would serve one transport of three.
+  The document is the transport-agnostic answer. Adding the header as well is a
+  reasonable follow-up for HTTP intermediaries; it is not a correctness gap.
+- **No outbound client in this repo currently retries HTTP at all** —
+  the DID hosting client (`webvh_host`) and the foreign-fetch path make a single
+  attempt. So DRARM
+  `RLA-029` (Retry-After non-compliance) has nothing to remediate here today. The
+  rule below is what keeps it that way.
+
+---
+
+## 5a. Pushes: the node is the producer
+
+The same contract holds when a node is the producer — a VTA or VTC pushing a
+Trust Task to a peer through `vti_common::trust_task_push`. The push engine is
+the retry owner there, and it has a problem the SDK's short-lived calls do not:
+a push's deadline runs to hours or days, while a VTI consumer accepts a document
+only for `vti_common::trust_task::acceptance::VTI_ACCEPTANCE_WINDOW` (10
+minutes, plus 60 s skew) after its `issuedAt`. An escalation an hour in, a hop the mediator refused for
+twenty minutes, or a copy collected when the recipient reconnects would carry a
+document the recipient refuses as `expired`.
+
+Re-signing the document under its own `id` is not a retry (SPEC §8.4) and a
+consumer that accepted the original answers it `idConflict` (§7.2 item 11). So
+the engine issues a **new attempt** — `trust_task_push::new_attempt`: a fresh
+`id`, a fresh `issuedAt`, the node's proof again, the original's thread — and
+the key does the rest. A document carrying an `idempotencyKey` carries it
+through every attempt (VTI-OPS-064), so a keying consumer performs the task
+once however many attempts reach it.
+
+So the rule for a push site is the rule for any producer: **a pushed task whose
+repeat leaves a second artefact carries an `idempotencyKey`.** The
+credential-exchange steps do (`issue` deposits a vault row per execution), keyed
+by their first document's `id`. A notice or a consent request does not need
+one: its repeat converges.
+
+The consumer keys a task the catalogue does not classify (VTI-OPS-062), which
+is what makes that key count for the counterparty tasks — the credential-exchange
+steps — that are served here but are not in `retry_safety`.
+
+What no producer can reach is a copy already held by a mediator for a recipient
+that is offline past the window: it is sealed and out of the node's hands. The
+engine issues a new attempt when that copy is collected, so the recipient
+refuses one stale copy and then receives a fresh one.
+
+### Whose window (VTI-TRN-044–047)
+
+The window is the *recipient's*, and VTI-TRN-045 says where a sender learns it:
+the recipient's authenticated `trust-task-discovery` answer where it
+advertises one (a per-type entry over the response-level value), otherwise the
+task specification's window, otherwise a documented constant.
+
+Both VTI nodes now **advertise** theirs (VTI-TRN-047): each answers discovery
+0.4 with `VTI_ACCEPTANCE_WINDOW` at response level, built by
+`vti_common::trust_task::discovery::respond_v0_4` from the same value its
+spine's `freshness_policy()` applies — so the advertisement cannot be wider
+than the enforcement, and a test on each node reads the window back out of its
+own answer and checks it against the policy. The 0.4 window includes the
+thirty-day expiry horizon (VTI-OPS-028): a sender may state an `expiresAt`
+within it and have the document accepted until then, instead of issuing new
+attempts every `max_age`. The superseded 0.3 is still answered, with the same
+maximum age and skew and no horizon, which 0.3 has no member for.
+
+The push engine does **not yet read** an advertised window. It applies the
+constant — VTI-TRN-045's last tier — to every recipient, deliberately:
+
+- a lookup is a request/reply exchange, and the engine's pushes are one-way;
+  neither node lends it a correlated reply path;
+- its recipients (approvers' devices, members' wallets, requesters) serve no
+  `trust-task-discovery` today, so every lookup would time out into the
+  fallback;
+- the window only matters for a document the engine *holds* — a recipient
+  offline, a mediator refusing hops — which is exactly when a lookup cannot be
+  answered;
+- the engine never observes an `expired` refusal, so discovery's "ask again
+  after an unexpected refusal" would have no trigger.
+
+That gap is the specification's divergence F.3 against VTI-TRN-045, narrowed by
+this change to the producer side only. The seam for closing it is the engine's
+two predicates (`past_acceptance`, `refused_when_collected`), which take the
+window from `AcceptanceWindow` rather than from two constants.
+
+## 6. Rules for new code
+
+1. **Classify every new Trust Task** in `vta_sdk::retry_safety`. The census test
+   will fail otherwise. When unsure, `Keyed`.
+2. **Never add an application-level retry loop over a `VtaClient` call.** Use
+   `VtaClient::idempotent`. If you believe you need your own, you are adding a
+   second owner to a failure domain that has one.
+3. **Any new outbound HTTP client that retries must honour and cap
+   `Retry-After`.** Cap it; an uncapped hint is a server-triggered stall.
+4. **A new secret-bearing response must be `KeyedSecret`**, never `Keyed`. Ask
+   what the dedup record would hold if the response were cached.
+5. **Do not cache a failure.** Release the claim; let the retry run.
+6. **A pushed task whose repeat leaves a second artefact carries an
+   `idempotencyKey`** (§5a): the push engine may deliver it as several new
+   attempts, and only the key makes them one operation.
+
+---
+
+## Where the code lives
+
+| Concern | Location |
+|---|---|
+| Classification + census | `vta-sdk/src/retry_safety.rs` |
+| Client key scope + retry owner | `vta-sdk/src/idempotency.rs`, `VtaClient::idempotent` |
+| Wire `retryAfter` → typed error | `VtaError::Unavailable` |
+| Store (shared with the VTC's HTTP path) | `vti-common/src/idempotency/` |
+| Dispatch policy | `vta-service/src/trust_tasks/idempotency.rs` |
+| Accepted-document-id record (the *other* layer) | `vti-trust-task-server/src/accepted_store.rs` (`StoreAcceptedIds`, keyspace `accepted_ids`), claimed in `vta-service/src/trust_tasks/mod.rs` |
+| TTL sweep | `vta-sweepers/src/idempotency_sweeper.rs` |
+| Acceptance tests | `vta-service/tests/it/idempotency_trust_task.rs` |
+
+### The two dedup layers are not the same thing
+
+The accepted-document-id record (SPEC §7.2 item 11, VTI-OPS-025 … 027) keys on
+the document `id` alone and compares digests: the same document again is a
+duplicate, answered with the first result; a different document under that `id`
+is `idConflict`. It is in the store, shared with the VTC's implementation, so it
+survives a restart and every binding consults one record; its rows live until
+the document's acceptance end plus the skew (VTI-OPS-029): ten minutes after
+`issuedAt`, or a stated `expiresAt` up to thirty days after it. It **cannot** catch a genuine retry, because every
+dispatch mints a fresh document `id`. `idempotency.rs` keys on
+`(actor, idempotency-key)`, which is stable across attempts of one operation.
+Both stay; they answer different questions.

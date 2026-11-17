@@ -1,0 +1,1020 @@
+# Changelog
+
+Notable changes to the published crates. Generated from conventional commits by
+[git-cliff](https://git-cliff.org) when a release is cut — do not edit by hand.
+## [0.42.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.41.0...vta-vault-v0.42.0) — 2026-11-15
+
+
+### Build & CI
+
+- **deps**: Affinidi-messaging-sdk 0.47, TDK 0.45, trust-tasks 0.39 and mediator 0.52, with delivery receipts and mediator wake ([#2741](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2741))
+
+* build(deps)!: move to affinidi-messaging-sdk 0.47, affinidi-tdk 0.45 and trust-tasks 0.39
+
+  affinidi-messaging-sdk 0.47.2 (-core 0.1.12, -delivery 0.2.0), affinidi-tdk
+  0.45 with what it carries (affinidi-crypto 0.3, data-integrity 0.8.7,
+  did-common 0.4.7, vc 0.3, sd-jwt 0.2, sd-jwt-vc 0.3, mdoc 0.6,
+  oid4vc-core 0.1.11), trust-tasks-* 0.39 (the SDK's own copy, so one
+  trust-tasks-rs across the boundary) and mediator 0.52 (test-mediator,
+  -admin, -tui).
+
+  affinidi-sd-jwt 0.2 builds the kb-jwt verifier from the credential's own
+  cnf.jwk and requires aud, nonce and a fresh iat: the VTC's OpenID4VP
+  verifier now checks the kb-jwt iat (600 s, RFC 9901 §7.3), which it did
+  not before.
+
+  SchemaValidator, so the private jsonschema 0.46 copy
+  (jsonschema-trust-tasks) is gone. CompiledSchema is removed and
+  SchemaError is trust_tasks_rs::validate::ValidationError.
+
+  cargo deny: the fancy-regex skip goes; jsonschema and jsonwebtoken stay
+  duplicated upstream (trust-tasks-rs 0.39 on jsonschema 0.49,
+  trust-tasks-https 0.39 on jsonwebtoken 10).
+
+
+
+## [0.41.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.40.0...vta-vault-v0.41.0) — 2026-11-14
+
+
+### Build & CI
+
+- **deps**: Enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe ([#2708](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2708))
+
+* build(deps): enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe
+
+  pgp, openssl only via webauthn-rs 0.5, no wildcards, and
+  multiple-versions = "deny" with a skip list of today's duplicates grouped by
+  cause. The two advisory ignores cargo-deny reports as not detected
+  (RUSTSEC-2026-0381, RUSTSEC-2024-0436) are removed, the stale [graph]
+  comment rewritten, and the yanked crypto-bigint 0.7.6 moved to 0.7.11.
+
+  ring leaves the VTA and VTC graphs; it stays only under attest-verify.
+
+  removed from 19 crates; deliberate ones are listed under
+  [package.metadata.cargo-machete] ignored. A tier-0 "manifest hygiene" CI job
+  runs cargo-machete and the lint check.
+
+  once in [workspace.dependencies]; vta-tee inherits aws-lc-rs. The five
+  crypto crates carry real minimum-patch floors, enforced by
+  check-workspace-version-reqs.py.
+
+  (check-workspace-lints.py); unsafe_code = "forbid" workspace-wide, with
+  the four crates that need unsafe restating the table at "deny" and
+  rewritten safely. The two missing publish = false comments are added.
+
+
+
+## [0.40.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.39.0...vta-vault-v0.40.0) — 2026-11-12
+
+
+### Fixed
+
+- **status-list**: Bound every size read from a fetched Bitstring Status List ([#2674](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2674))
+
+* fix(status-list): bound every size read from a fetched Bitstring Status List
+
+  A fetched BitstringStatusListCredential is someone else's document, and
+  the VTC sized its decode from it: `credentialSubject.statusSize` was taken
+  as the list length, unbounded, and handed to the decoder, which allocates
+  in proportion. In W3C Bitstring Status List v1.0 `statusSize` is the bits
+  per entry, on the BitstringStatusListEntry (§2.1), not a list length — so
+  a list carrying the conformant `"statusSize": 1` was also read as a
+  one-entry list and refused for any index past 0.
+
+  vtc-service (`recognition::verify`, used by recognise, join presentation
+  and invitation checks):
+  - The bit is read by `read_status_bit`, which bounds everything before
+    decoding: the index (at most 4,194,304 entries, checked before the fetch
+    too), the `encodedList` length, and the decoded length, which is the
+    larger of `index + 1` and the spec minimum of 131,072 entries. Nothing
+    the list declares sizes a buffer.
+  - A list shorter than 131,072 entries, or than the index, is refused
+    (§3.2 steps 9 and 10).
+  - `statusSize` on an entry, or on a list, must be 1: the reader supports
+    only 1-bit entries, which §1.3 allows. Anything else is refused rather
+    than read as one bit.
+  - A multibase `u`-prefixed `encodedList` (§2.2) is now read.
+
+  The same reads elsewhere:
+  - vta-sdk `vetting::status`: `MAX_STATUS_LIST_BITS` is now 1 << 22 (was
+    1 << 26), since the decoder allocates about a byte per entry read; an
+    entry whose `statusSize` is not 1 reads as Unknown.
+  - vta-vault `status`: the resolver-supplied list size and `encodedList`
+    length are bounded before decoding, the index is checked against the
+    size first, and an entry whose `statusSize` is not 1 is refused.
+  - vti-vtn: `VtnClient::get_url` reads the body under a 2 MiB cap
+    (`MAX_FETCHED_BODY`) instead of buffering it whole; `StatusChecker`
+    refuses an index past the end of the list (it read as clear) and an
+    entry whose `statusSize` is not 1. `Bitstring::len_bits` is new.
+
+  Behaviour changes: entries declaring `statusSize` other than 1 are
+  refused (status Unknown / error) everywhere; in vtc-service a list
+  carrying `statusSize: 1` is now read in full, one carrying any other
+  value is refused, and a list longer than 131,072 entries is read past
+  that point (it used to be read only to the first 131,072); indexes past
+  4,194,304 are refused in vtc-service and vta-sdk; vti-vtn's checker
+  errors on an out-of-range index instead of reporting Valid.
+
+
+
+## [0.39.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.38.0...vta-vault-v0.39.0) — 2026-11-10
+
+
+## [0.38.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.37.0...vta-vault-v0.38.0) — 2026-11-09
+
+
+## [0.37.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.36.0...vta-vault-v0.37.0) — 2026-11-05
+
+
+## [0.36.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.35.0...vta-vault-v0.36.0) — 2026-11-05
+
+
+## [0.35.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.34.0...vta-vault-v0.35.0) — 2026-11-05
+
+
+## [0.34.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.33.0...vta-vault-v0.34.0) — 2026-11-04
+
+
+## [0.33.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.32.0...vta-vault-v0.33.0) — 2026-11-04
+
+
+## [0.32.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.31.0...vta-vault-v0.32.0) — 2026-11-04
+
+
+### Fixed
+
+- **contexts**: Purge every context-scoped record on delete ([#2419](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2419))
+
+vta/contexts/delete removed a context's keys, DIDs, ACL scope, DID
+  templates, app state and memory ([#2415](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2415)), but every other store that holds
+  data for a context kept its rows. Most are keyed by the context id, or by a
+  digest of it, so a context later created under the same id inherited them.
+
+  Seen with OpenVTC: a context deleted and recreated under the same id failed
+  vta/pcs/root-request with memberMismatch. The vetter engine record
+  (pcs_engine vetter:<sha256(ctx, community)>) had survived, still pinned to
+  the old member DID and to a derivation path under the old context's base.
+
+  delete_context now purges, for every context in the subtree:
+
+  - pcs_engine: vetter, applicant, voter and trustee records whose contextId
+    is the context, with the wrapped state beside each (secret:<key>, and a
+    voter's secret:voter-casts:<digest>). The keys are digests, so the purge
+    scans each record prefix and matches the record's own contextId.
+  - persona: every context-scoped prefix (pb, pc, pcr, pca, pcl, pd, plp, plb),
+    driven from PREFIX_SCOPES so a new context-scoped prefix is purged without
+    anyone remembering to; and the agent-scoped face-value edges that name one
+    of the context's local profiles.
+  - vault: credentials in the context's custody (with their index rows) and
+    vault entries, hard-deleted whatever their lifecycle state.
+  - notifications: held records with their dedup and bound rows (the sweep's
+    removal, factored out and shared).
+  - consent: grants decided in, and pending requests scoped to, the context;
+    consent_approvers: its approver bindings.
+  - external_accounts / external_secrets: each live account deleted the way
+    external/accounts/delete deletes one (secret gone, id retired).
+  - contexts: the daily quota counters (quota:<ctx>:...).
+  - imported_secrets / internal_keys: the material of each key record the
+    purge removes, as revoke_key does for an imported key.
+
+  Each store purges itself next to the code that writes it, and the counts go
+  in the deletion's log line. As in #2415 none of this is in the not-empty
+  gate: the gate must agree with preview-delete, whose wire shape has no
+  member for these, so surfacing them needs a spec revision.
+
+  Kept on purpose: the audit log; issued credentials (revoked through the DID
+  cascade, never deleted); operator policy; room groups and invitations (keyed
+  by persona DID / credential id, unreachable from a recreated context); and
+  external accounts' retired: tombstones, which hold no data and stop a
+  recreated context reusing an account id a provider-side trust policy may
+  still name.
+
+  The census is now a claim the code is held to:
+
+  - vta_keyspaces::context_delete_effect classifies every keyspace for a
+    context deletion (Purged / Retained / Lapses / Unrelated), and
+    context_delete_labels_match_the_cascade ties the Purged set to the
+    cascade's own list.
+  - did_delete_effect labelled most keyspaces Cascade (and five Blocks) though
+    the DID deletion reaches only keys, webvh, acl, sessions, issued
+    credentials and contexts. Those labels are now Orphaned, with the intended
+    effect beside each, and did_delete_labels_match_the_cascade holds
+    Cascade / Blocks / Revoke to DID_DELETE_REACHES.
+
+
+
+## [0.31.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.30.0...vta-vault-v0.31.0) — 2026-11-03
+
+
+## [0.30.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.29.0...vta-vault-v0.30.0) — 2026-11-03
+
+
+## [0.29.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.28.0...vta-vault-v0.29.0) — 2026-11-02
+
+
+## [0.28.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.27.0...vta-vault-v0.28.0) — 2026-10-30
+
+
+## [0.27.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.26.0...vta-vault-v0.27.0) — 2026-10-30
+
+
+## [0.26.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.25.0...vta-vault-v0.26.0) — 2026-10-28
+
+
+### Added
+
+- **vta**: Serve only the current vault/* and device/* versions ([#2309](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2309))
+
+The VTA, its SDK, CLI and MCP bridge move off the superseded vault and device
+  Trust Task versions, and the VTA stops serving the old ones:
+
+  - vault/list 0.1/0.2/0.3 -> 0.4: request `pageSize` -> `limit`, response
+    `truncated`/`cursor` -> `nextCursor`. The VTA now pages for real (keyset on
+    entry id, the cursor bound to the filters it was minted for) and answers a
+    foreign cursor `vault/list:cursorInvalid`, since 0.4 requires a `nextCursor`
+    whenever more entries match.
+  - vault/get 0.1/0.2 -> 0.3, vault/upsert 0.1/0.2/0.3 -> 0.4 (`created` ->
+    `wasCreated`), vault/release, proxy-login and sign-trust-task 0.1 -> 0.2.
+  - vault/credentials/get 0.1 (retired) -> 0.2, which carries the body as stored
+    in the member its format calls for: `credential` for a Data Integrity
+    credential, `credentialBase64` for an SD-JWT or an mdoc (dtgwg-trust-tasks-tf
+    #919). 0.1 could only answer with a JSON object, so every SD-JWT VC in the
+    vault failed to fetch.
+  - device/register, wipe, set-wake 0.1 -> 0.2, device/list 0.1/0.2 -> 0.3
+    (`limit`/`nextCursor`, keyset paging), device/heartbeat 0.1/0.2 -> 0.3
+    (`serverTime` -> `respondedAt`). The device handlers parse the generated
+    payloads and emit camelCase enum values themselves.
+
+  The `wire_v0_2` edge transform no longer retypes a request to a 0.1 URI and
+  dispatches it through a 0.1 handler: the dispatch table registers the served
+  version, and the transform only rewrites the vault enum values between the
+  wire's camelCase and the storage types' kebab-case. The JWE-sealing handlers
+  always seal camelCase cleartext, so the task-local wire version is gone. The
+  vault and device rows leave `deprecation::SUPERSEDED_TASKS`.
+
+  `vault/_shared/0.3`'s `VaultEntry` no longer declares the archival-lifecycle
+  members `vault/_shared/0.1` carried (`status`, `archivedAt`, `deletedAt`,
+  `graceUntil`) and is `additionalProperties: false`, so an archived or deleted
+  entry now carries them in `ext["org.openvtc.vault-lifecycle"]` (SPEC §4.5.1);
+  an active entry carries none, as before. Restoring them to the shared
+  component is a registry change.
+
+
+
+## [0.25.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.24.0...vta-vault-v0.25.0) — 2026-10-27
+
+
+## [0.24.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.23.0...vta-vault-v0.24.0) — 2026-10-26
+
+
+### Added
+
+- **vta-vault**: Narrow a vault query to one subject with subjectDid (vault/credentials/query/0.1) ([#2284](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2284))
+
+vault/credentials/query/0.1 gained a `subjectDid` request member
+  (dtgwg-trust-tasks-tf #884, in trust-tasks-rs 0.34): it narrows the other
+  constraints to credentials whose subject — the DID a presentation of the
+  credential is made as — is that DID. The VTA now honours it, matching the
+  stored `subject_did` (Data Integrity `credentialSubject.id`, SD-JWT `sub`).
+
+  It narrows only. On its own it is no filter, so a query naming nothing
+  but `subjectDid` is still refused as an enumeration.
+
+  This lets a wallet offer a VTC member-directory verification only the
+  credentials bound to the member's DID, which is the only holder the
+  VTC accepts.
+
+- Growth types in published crates are #[non_exhaustive] ([#2196](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2196))
+
+A new variant on a public enum, or a new field on a public struct a consumer
+  can build with a literal, is a breaking change in a published crate. It kept
+  happening on types that were always going to grow (#1231, #1234, #1244, #1247,
+  #1250); #1262 fixed it for Capability and AuditEvent only.
+
+  This marks the rest once. 143 enums are marked: every error and refusal enum
+  (VtaError, AppError, ...) and the growth vocabularies (kinds, statuses,
+  reasons, codes, transports, SealedPayloadV1). 32 structs are marked: config
+  and response bags that no caller builds with a literal. Adding the attribute
+  is itself breaking, once. After it, additions to these types are minor
+  changes.
+
+  Left exhaustive on purpose, and pinned that way by the census:
+  VerifiedAssertion, AssertionProof, ActScope, ApproveScope, ContextDirection,
+  SigningDomain, TokenStatus and Role. For each of these, every arm must be
+  considered, and a downstream wildcard would be the bug.
+
+  Every downstream match in the workspace gets a `_ =>` arm that takes the most
+  restrictive or most generic reading: an internal error, a hidden or refused
+  entry, a stale attribute. None is unreachable!().
+
+  vta-sdk/tests/non_exhaustive_census.rs fails on a public enum in a published
+  library crate whose name ends in Error, Refusal, Violation, Kind, Event,
+  Status, Capability, Reason or Code and that is not #[non_exhaustive], unless
+  it is listed as deliberately exhaustive with a reason. It also fails when a
+  listed enum gains the attribute or disappears.
+
+
+
+## [0.23.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.22.0...vta-vault-v0.23.0) — 2026-10-18
+
+
+## [0.22.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.21.0...vta-vault-v0.22.0) — 2026-10-18
+
+
+## [0.21.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.20.0...vta-vault-v0.21.0) — 2026-10-16
+
+
+## [0.20.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.19.0...vta-vault-v0.20.0) — 2026-10-15
+
+
+### Added
+
+- **store**: Conditional atomic batches across local and vsock backends ([#2106](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2106))
+- **vault**: Present P-256-bound SD-JWT-VCs with an ES256 kb-jwt ([#1988](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1988)) ([#2099](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2099))
+
+A credential bound to a P-256 `cnf.jwk` (swiyu, EUDI) can now be presented
+  from the VTA's vault. Its holder is the key's own `did:key` (`zDn…`), a
+  derived P-256 key the VTA custodies.
+
+  - `resolve_holder_keys` accepts a P-256 holder key: the `kb-jwt` signer is
+    ES256 (raw r||s), the consent secret P-256.
+  - `vta_vault::consent::holder_suite` fixes the Data Integrity suite by the
+    holder key: `eddsa-jcs-2022` for Ed25519, `ecdsa-jcs-2019` for P-256. Consent
+    receipts and DI presentations sign under it; `verify_proof` requires the
+    suite the subject `did:key`'s type takes, never the one the proof names.
+
+  This also fixes mdoc presentation, which signs its consent receipt with the
+  P-256 device key: `consent::create` asked that key to sign `eddsa-jcs-2022`,
+  which affinidi-data-integrity refuses, so no mdoc could be presented.
+
+  CLAUDE.md's key policy names the holder-key exception alongside the
+  foreign-protocol identity one.
+
+
+
+## [0.19.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.18.0...vta-vault-v0.19.0) — 2026-10-13
+
+
+## [0.18.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.17.0...vta-vault-v0.18.0) — 2026-10-12
+
+
+## [0.17.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.16.0...vta-vault-v0.17.0) — 2026-10-11
+
+
+## [0.16.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.15.0...vta-vault-v0.16.0) — 2026-10-11
+
+
+### Added
+
+- Read IETF Token Status Lists for SD-JWT VCs, signed by the credential's issuer ([#1988](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1988)) ([#2015](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2015))
+
+An SD-JWT VC from the swiyu stack or an EUDI issuer names its status as
+  `status.status_list = { idx, uri }`, a `statuslist+jwt`. The VTC fed that
+  reference to the W3C Bitstring fetcher, which could never read it (Unknown at
+  every join), and the vault held such credentials Unknown for good. Both now
+  read it, through affinidi-status-list 0.1.7's `token` module.
+
+  - `vta_sdk::token_status_list` (new): `verify_status_list_token` and
+    `resolve_token_status`. A list decides revocation, so it is trusted only as
+    the credential issuer's: the token's `kid` must name one of that issuer's
+    `assertionMethod` keys (`sd_jwt_issuer_method`), the signature is checked
+    with that key's algorithm (`JwsKey`) before the payload is read, and an
+    `iss` naming anyone else is refused. `typ`, `sub` = the referenced `uri`,
+    `iat` and `exp` are checked by the TDK, and the list is decompressed under
+    a cap. The fetch is SSRF-guarded, takes no redirects and caps the body. A
+    separate Status Issuer linked by certificate chain (draft §13.5) is not
+    supported; its lists are refused.
+  - `vta-vault`: `StatusListResolver::resolve_token_status` (a defaulted method,
+    so existing resolvers compile and refuse) is implemented by
+    `HttpStatusListResolver`. `refresh_status`, which the present gate runs
+    first, takes the Token path when a credential carries `status.status_list`
+    and no W3C `credentialStatus`: `INVALID` → `Revoked` (terminal),
+    `SUSPENDED` → `Revoked` tagged `tokenStatus:suspended` so a later `VALID`
+    restores it, an application-specific or unregistered value → `Unknown`
+    (VTI-CRD-012). Receive still stores such a credential `Unknown`: its status
+    has not been read until that refresh.
+  - `vtc-service`: `StatusListFetcher::check_token_status`, implemented by the
+    verifying `HttpStatusListFetcher`. `resolve_presented_status` (join, join
+    criteria, invitations) maps `VALID` / `INVALID` / `SUSPENDED` to Valid /
+    Revoked / Suspended, and anything unreadable to Unknown for the join policy.
+  - `affinidi-status-list` 0.1.3 → 0.1.7. `docs/03-vtc/credentials.md` gains
+    *Reading another issuer's status*.
+
+- Verify ES256 / ES256K SD-JWT-VCs from did:web and did:webvh issuers ([#1988](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1988)) ([#2010](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2010))
+
+Credentials issued on the swiyu stack and the EUDI profiles could not be
+  received or verified: the vault and the VTC verifier accepted only EdDSA,
+  the vault only a `did:key` issuer, the shared resolver only a
+  `publicKeyMultibase` key, and holder binding only an Ed25519 `cnf.jwk`.
+
+  - `vta_sdk::jws` (new): compact-JWS verification over a resolved key —
+    EdDSA, ES256 (P-256) and ES256K (secp256k1). The header's `alg` must be
+    the one the resolved key's curve signs with, checked before the
+    signature; `crit` is refused. `JwsKey::from_jwk` reads a `cnf.jwk`
+    (refusing one that carries `d`), `did_key()` names a P-256 holder
+    `did:key:zDn…` and a secp256k1 one `did:key:zQ3s…`.
+    `sd_jwt_issuer_method` binds the issuer JWS `kid` to `iss`: a `did:key`
+    issuer's own key whatever the fragment, any other DID must name its
+    method with a DID-URL `kid` (VTI-CRD-002: the issuer is resolved, not
+    guessed).
+  - `TrustTaskVmResolver` reads a `publicKeyJwk` method (Ed25519, X25519,
+    P-256, secp256k1) and a secp256k1 Multikey; PQC keys stay Multikey-only.
+  - `vta-vault`: `receive_sd_jwt_vc` and `stored_claims` take the issuer
+    resolver, so a `did:web` / `did:webvh` issuer resolves for
+    `assertionMethod`. `receive` with `IssuerKey::None` resolves locally
+    (`did:key` / `did:peer`); the VTA's issued-credential path passes its DID
+    cache. A credential carrying an IETF `status.status_list` reference is
+    stored `Unknown`, not `Valid`: no `statuslist+jwt` resolver exists yet, so
+    its status cannot be read (VTI-CRD-012).
+  - `vtc-service`: the SD-JWT-VC presentation verifier takes ES256 / ES256K
+    issuers and P-256 / secp256k1 `cnf.jwk` holders.
+
+
+
+## [0.15.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.14.0...vta-vault-v0.15.0) — 2026-10-06
+
+
+## [0.14.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.13.0...vta-vault-v0.14.0) — 2026-10-06
+
+
+## [0.13.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.12.0...vta-vault-v0.13.0) — 2026-10-05
+
+
+## [0.12.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.11.0...vta-vault-v0.12.0) — 2026-10-04
+
+
+## [0.11.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.10.0...vta-vault-v0.11.0) — 2026-10-02
+
+
+## [0.10.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.9.0...vta-vault-v0.10.0) — 2026-10-02
+
+
+## [0.9.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.8.0...vta-vault-v0.9.0) — 2026-10-01
+
+
+## [0.8.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.7.0...vta-vault-v0.8.0) — 2026-10-01
+
+
+### Fixed
+
+- Keyring findings round — proof sets, verify-as-received, VTC delivery (VTI-44, VTI-45, VTI-50, VTI-56) ([#1868](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1868))
+
+* fix(vta-cli-common): opening a bundle to inspect it keeps the request seed
+
+  pnm, cnm and vta `bootstrap open` consumed the single-use request seed
+  right after decrypting, even when they wrote nothing. The seed is the only
+  key that opens the bundle, so inspecting a template bundle destroyed the
+  integration's keys, and cnm's own follow-up hint (`cnm auth login
+  --credential-bundle`) could never succeed (VTI-53).
+
+  Inspection now opens with the seed kept and says where it is. pnm consumes
+  it only after a successful --out write, so a refused bundle no longer costs
+  a fresh request cycle either. open_armored_bundle_keeping_secret and
+  consume_request_secret are now public.
+
+
+
+## [0.7.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.7...vta-vault-v0.7.0) — 2026-09-30
+
+
+### Added
+
+- DTG Credentials v1 — role VACs, vetted/1 and witnessed/1 statements, IDVCs, issuerScope ([#1859](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1859))
+
+* feat(vta-sdk)!: vetting statements are vetted/1 VSCs; role credentials are VACs
+
+  Conform the SDK's vetting artifacts to the DTG Credentials Core
+  Specification (v1 context, `issuerScope`) and the DTG VSC predicate
+  registry, following the regenerated vetting specifications
+  (dtgwg-trust-tasks-tf feat/dtg-vsc-conformance).
+
+  Vetting Statement (vetting/session/0.1): no longer an
+  EndorsementCredential. `sign_statement` builds a StatementCredential with
+  `new_vetted_vsc` under `https://registry.trustoverip.org/dtg/vsc/vetted/1`;
+  the body is `credentialSubject.object.value`, with no `type` member.
+  `taskContext` and `taskDigestMultibase` are both read from the
+  `vetting/session` document, which `StatementDraft::session` now carries
+  in place of `task_context`, and `StatementDraft::issuer_scope` is
+  `directed` or `public` (pairwise is refused by the profile).
+  `verify_statement` parses through `dtg-credentials`, so the v1 context,
+  the one-subtype rule and the profile are checked by the code that issues
+  them; `VerifiedVettingStatement::check_against_session` binds a statement
+  to the session document by id and task digest.
+
+  - `IdentityVettingEndorsement` -> `VettedObjectValue` (no `type`; digests
+    and commitment must be base58btc, as the registry schema requires).
+  - `IDENTITY_VETTING_ENDORSEMENT_TYPE` -> `VETTED_PREDICATE`.
+  - `VerifiedVettingStatement::endorsement()` -> `value()`; new
+    `issuer_scope()`, `task_digest_multibase()`.
+
+  Vetter role credential (vtc/vetting/vetters/grant/0.1, vetting/request/0.1):
+  a community-issued VAC, `issuerScope` public, `authority` { scope:
+  <community DID>, actions: ["role:vetter"], maxAttenuation: 0 }.
+  `eligibility::community_role` -> `community_roles`, returning every
+  `role:<name>` of a VAC the community issued in its own scope with no
+  parent; `verify_eligibility_vp` parses the VAC strictly and refuses a
+  non-public scope or an attenuation.
+
+  - `COMMUNITY_ROLE_ENDORSEMENT_TYPE` removed; new `ROLE_ACTION_PREFIX`,
+    `VETTER_ROLE_ACTION`, `role_action`, `role_of_action`.
+  - `protocols::members::ENDORSEMENT_CREDENTIAL_TYPE` removed; new
+    `AUTHORITY_CREDENTIAL_TYPE` and `STATEMENT_CREDENTIAL_TYPE`.
+  - `VerdictWith::role_vec` -> `role_vac` (wire `roleVac`).
+
+
+
+## [0.6.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.6...vta-vault-v0.6.7) — 2026-09-30
+
+
+## [0.6.6](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.5...vta-vault-v0.6.6) — 2026-09-27
+
+
+## [0.6.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.4...vta-vault-v0.6.5) — 2026-09-26
+
+
+## [0.6.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.3...vta-vault-v0.6.4) — 2026-09-26
+
+
+## [0.6.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.2...vta-vault-v0.6.3) — 2026-09-24
+
+
+## [0.6.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.1...vta-vault-v0.6.2) — 2026-09-23
+
+
+## [0.6.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.6.0...vta-vault-v0.6.1) — 2026-09-23
+
+
+## [0.6.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.18...vta-vault-v0.6.0) — 2026-09-22
+
+
+### Fixed
+
+- **persona**: A credential-backed value follows its credential, and fails closed ([#1653](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1653))
+
+Credential-backed attributes were never resolved against their
+  credential: not at write (persona/attribute/put rule 3,
+  `credentialNotFound`) and, worse, not on read, where the Provenance
+  contract requires the maintainer to re-derive the value and fail closed
+  once the credential is revoked, expired, archived or deleted. A revoked
+  credential's value went on being presented.
+
+  vta-persona gains `derive`: a `CredentialSource` hook the service
+  implements over the vault, so the persona crate still does not depend
+  on it. The store asks it wherever a credential-backed value is about to
+  be believed:
+  - put: resolves the credential and takes its value (the supplied one is
+    a display cache the spec lets the maintainer overwrite); one it cannot
+    back is refused. `credential_refusal` gives the dispatcher the code.
+  - resolving a face (and so materialising a binding): the credential's
+    current value, or nothing and `stale`.
+  - listing the pool: `stale` with `staleReason`, no value; a withheld
+    value stays withheld.
+  - building a preview: re-derived from the context's copy, which carries
+    the provenance; a withdrawn credential shows stale before approval.
+  - presenting: checked again, so a credential revoked between preview
+    and present is not presented.
+  A pinned kept value is withheld too once its credential is withdrawn.
+
+  vta-vault `receive::stored_claims`: the claims a stored credential
+  carries — SD-JWT-VC re-verified against its issuer and reconstructed,
+  Data-Integrity read as stored, mdoc refused. vta-service's
+  `VaultCredentials` maps held/lifecycle/status/validity window/path to a
+  value or a StaleReason; attribute/put maps a refusal to
+  `persona/attribute/put:credentialNotFound`, and reads the stored value
+  back for its correlation count.
+
+
+
+## [0.5.18](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.17...vta-vault-v0.5.18) — 2026-09-22
+
+
+## [0.5.17](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.16...vta-vault-v0.5.17) — 2026-09-21
+
+
+## [0.5.16](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.15...vta-vault-v0.5.16) — 2026-09-21
+
+
+## [0.5.15](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.14...vta-vault-v0.5.15) — 2026-09-21
+
+
+## [0.5.14](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.13...vta-vault-v0.5.14) — 2026-09-20
+
+
+## [0.5.13](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.12...vta-vault-v0.5.13) — 2026-09-18
+
+
+## [0.5.12](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.11...vta-vault-v0.5.12) — 2026-09-17
+
+
+## [0.5.11](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.10...vta-vault-v0.5.11) — 2026-09-16
+
+
+## [0.5.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.9...vta-vault-v0.5.10) — 2026-09-16
+
+
+## [0.5.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.8...vta-vault-v0.5.9) — 2026-09-16
+
+
+## [0.5.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.7...vta-vault-v0.5.8) — 2026-09-12
+
+
+## [0.5.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.6...vta-vault-v0.5.7) — 2026-09-10
+
+
+## [0.5.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.4...vta-vault-v0.5.5) — 2026-09-09
+
+
+## [0.5.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.3...vta-vault-v0.5.4) — 2026-09-07
+
+
+## [0.5.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.2...vta-vault-v0.5.3) — 2026-09-07
+
+
+## [0.5.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.1...vta-vault-v0.5.2) — 2026-09-01
+
+
+## [0.5.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.5.0...vta-vault-v0.5.1) — 2026-08-29
+
+
+## [0.5.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.4.0...vta-vault-v0.5.0) — 2026-08-28
+
+
+### Fixed
+
+- **vault**: Name the BBS pseudonym-secret pair to satisfy type_complexity ([#1142](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1142))
+
+`main` is red, and the gate that caught it is the one #1140 added: the
+  workspace all-features clippy step runs `-D warnings`, and
+  `clippy::type_complexity` fires on `holder_pseudonym_secrets`'s
+  `Result<Option<(Vec<u8>, Vec<u8>)>, AppError>`.
+
+  That is the gate doing its job rather than being wrong. Nothing built
+  `vta-vault` under `--all-features` with `-D warnings` before, so the lint sat
+  unreported; the step that now does it is two days old.
+
+  `PseudonymSecrets` is worth naming on its own terms. The pair is meaningless
+  split — a `prover_nym` without its `secret_prover_blind` derives no pseudonym —
+  and the function's own doc comment had to spell the tuple out in prose because
+  the signature could not.
+
+  No behaviour change.
+
+
+
+### Chore
+
+- **sdk**: Release vta-sdk 0.30.0 for the added CreateKeyBody field ([#1156](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1156))
+
+`CreateKeyBody` gained a `key_id` field while the crate stayed at 0.29.0.
+  The struct is exhaustively constructible through the public API, so an
+  existing literal no longer compiles — a breaking change under 0.x rules,
+  which the semver report has been flagging as its one real finding
+  (195 pass, 1 fail) since the field landed.
+
+  Bumps the crate and the nineteen intra-workspace requirements that pin it,
+  so `cargo check --workspace` still resolves the path copy and a consumer
+  resolving from the registry gets a version that admits the break.
+
+
+
+## [0.4.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.3.4...vta-vault-v0.4.0) — 2026-08-26
+
+
+### Chore
+
+- **deps**: Bring every dependency to latest, collapsing two duplicates ([#1055](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1055))
+
+`cargo outdated` reported 13 direct dependencies behind and `cargo update`
+  had 36 compatible updates waiting. Both are now clear: `cargo outdated`
+  reports "All dependencies are up to date".
+
+  Two of these were not cosmetic.
+
+  **p256 was duplicated in the build.** Our crates declared `0.13` while
+  `affinidi-crypto` — reached through `affinidi-data-integrity` and the TDK —
+  already pulled `0.14`, so the graph carried two copies of a curve
+  implementation. The lock now holds a single `p256 0.14.0`. The bump brings
+  `elliptic-curve` 0.14 and `ecdsa` 0.17, which rename the SEC1 family:
+  `EncodedPoint` -> `Sec1Point`, `From/ToEncodedPoint` -> `From/ToSec1Point`.
+  Renamed across `vta-keys`, `vta-service` and `vti-webauthn`.
+
+  **tokio-tungstenite was load-bearing, not incidental.** `vta-mobile-core`
+  depends on it solely as a feature enabler: iOS has no native trust store, so
+  `rustls-tls-webpki-roots` has to be on graph-wide or the mediator WebSocket
+  fails with "no native root CA certificates found". Features unify per major
+  version, so the declaration only works while it matches the version
+  `affinidi-messaging-sdk` pulls — and the SDK moved to 0.30 in this refresh.
+  Updating everything *except* this one would have stranded the enabler and
+  broken iOS `wss://` silently.
+
+  The rest:
+
+  - `rcgen` 0.13 -> 0.14 (dev). `signed_by` takes an `Issuer` rather than a
+    `(certificate, key)` pair, and `self_signed` borrows instead of consuming.
+    The mdoc IACA test helper builds its issuer with `Issuer::from_params`,
+    which is also a more direct statement of what it wanted.
+  - `syn` 2 -> 3 (dev). No source change; syn 3 was already in the graph via
+    `trust-tasks-rs`.
+  - `rmcp` 1.7 -> 3.1.4. Two majors, one rename: `Content` -> `ContentBlock`.
+    The `#[tool_router]` / `#[tool_handler]` macro surface the crate is built
+    on is unchanged.
+  - 36 lockfile updates, including `trust-tasks-rs` 0.11.3 (the corrected
+    `vta/app-state` error taxonomy from dtgwg-trust-tasks-tf#253) and the AWS
+    SDK set. `rustls-pemfile`, one of the unmaintained crates `cargo audit`
+    flags, drops out of the graph entirely.
+
+  Two deliberate choices where the shortest path was worse:
+
+  `vti-webauthn` keeps parse-then-validate rather than collapsing to the
+  one-shot `PublicKey::from_sec1_bytes`. That call merges "malformed SEC1
+  encoding" and "valid encoding, point not on the curve" into one error, and
+  those say different things to whoever reads the log — a broken client versus
+  a point somebody chose.
+
+  BIP-32 P-256 derivation replaces the now-deprecated `FieldBytes::from_slice`
+  with `TryFrom` and a real error arm. The input is a fixed 32-byte window of a
+  SHA-512 HMAC so it cannot fail, but the length check is now explicit rather
+  than resting on a panic inside a deprecated helper.
+
+  Unchanged and still suppressed: the four `cargo audit` advisories ignored in
+  `deny.toml`, all transitive through the AWS SDK's hyper 0.14 / rustls 0.21
+  path. `cargo deny check advisories` passes.
+
+
+
+## [0.3.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.3.3...vta-vault-v0.3.4) — 2026-08-22
+
+
+## [0.3.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.3.2...vta-vault-v0.3.3) — 2026-08-21
+
+
+## [0.3.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.3.1...vta-vault-v0.3.2) — 2026-08-20
+
+
+## [0.3.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.3.0...vta-vault-v0.3.1) — 2026-08-18
+
+
+## [0.3.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.2.0...vta-vault-v0.3.0) — 2026-08-17
+
+
+### Added
+
+- **vta-service**: Present ISO mdoc credentials over OID4VP ([#993](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/993))
+
+* feat(vta-service)!: present ISO mdoc credentials over OID4VP
+
+  Completes mdoc support. A VTA could receive, verify and store an mdoc; it could
+  not present one. This is the last piece, and it needed three things the other
+  formats do not.
+
+  An OID4VP session on the query wire. An mdoc's holder binding is a DeviceAuth
+  signature over an ISO 18013-7 SessionTranscript, whose handover is
+  [clientId, responseUri, nonce, mdocGeneratedNonce]. Two of those exist only in
+  an OID4VP exchange, so a verifier that wants an mdoc supplies them; QueryBody
+  gains an optional oid4vp_session carrying OID4VP's own field names, so a
+  verifier can copy them out of its authorization request unrenamed.
+
+  Absent, an mdoc is not offered at all rather than offered unbound. A DeviceAuth
+  over invented handover values verifies nowhere and, worse, looks bound. The gate
+  lives in match_held so matchable and presentable stay the same set: a
+  matched-but-unpresentable credential bails the entire vp_token, not just itself,
+  taking every other credential the verifier legitimately asked for with it. A
+  mutation removing the gate fails the test that pins this.
+
+  Holder identity that is key-shaped. ConsentGrant.holder_did becomes
+  HolderIdentity::{Subject, DeviceKey}: every other format names a subject DID,
+  while an mdoc names a device key discovered at receive. Both resolve to a
+  did:key because ConsentRecord::verify_proof binds the proof's
+  verificationMethod to the data subject — the variant records provenance that
+  would otherwise be silently lost, not a different kind of value.
+
+  A P-256 consent receipt. The device key signs its own receipt under
+  ecdsa-jcs-2019 (affinidi-data-integrity 0.7.10), where every other format uses
+  eddsa-jcs-2022. Signing the receipt with some other key would break the
+  verificationMethod binding above; that is why the cryptosuite was added upstream
+  rather than worked around here.
+
+  Presentation itself is not a present_single arm: an mdoc vp_token entry is
+  base64url CBOR of a DeviceResponse, not a W3C VP object, so present_mdoc sits
+  beside it. Selective disclosure is by omission — only the [namespace, element]
+  paths the query asked for are included.
+
+
+
+## [0.2.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.1.4...vta-vault-v0.2.0) — 2026-08-16
+
+
+### Added
+
+- **vta-vault**: Bind an mdoc to the VTA key that can present it ([#990](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/990))
+
+An mdoc's holder binding is a key, not a DID: the MSO carries a deviceKey, and
+  only its private half can sign DeviceAuth. Nothing in the stored envelope said
+  which VTA key that was, so a received mdoc could be stored and then turn out to
+  be unpresentable — with the failure surfacing much later, at presentation, and
+  nothing pointing at the cause.
+
+  Receive now resolves that binding and refuses the credential if this VTA does
+  not hold the key. Storing a credential you can never present is a trap, and the
+  right moment to find out is the moment it arrives.
+
+  mdoc_device_key_sec1 extracts the MSO deviceKey as a compressed SEC1 point —
+  the same encoding the VTA stores its own P-256 public keys in — so the caller
+  can compare without re-deriving either side. Extraction lives in vta-vault
+  because it reads mdoc internals; the matching lives in vta-service because that
+  is the layer that can see the keyspace. vta-vault does not depend on vta-keys,
+  and this keeps it that way.
+
+  find_key_by_public_multibase is a linear scan: the keyspace is indexed by key
+  id, not by public key, and a reverse index for one receive-path caller is not
+  worth the write amplification on every mint. It takes no AuthClaims because it
+  answers a factual question, not an authorization one — the caller gates on the
+  returned record's context_id, because binding a credential to a key in a
+  context the caller cannot act in would be a cross-tenant escape.
+
+- **vta-vault**: Resolve mdoc issuers against configured IACA trust anchors ([#987](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/987))
+
+Answers the one question mdoc asks differently from every other credential
+  format here: which key do I trust to have issued this?
+
+  Every other format names its issuer as a DID, so receiving resolves that DID
+  and verifies against whatever comes back — the VTA holds no list and there is
+  no operator step. An mdoc has no issuer DID. It carries an X.509 chain in the
+  issuerAuth COSE unprotected header (x5chain, label 33): a Document Signer
+  certificate issued by an IACA. Verifying it means the VTA must already hold the
+  roots it accepts, which is a trust store, not a lookup.
+
+  The decision taken is a configured set of IACA root certificates — how
+  production EUDI verifiers work, and what Member State trusted lists (ETSI TS
+  119 612) distribute. It keeps X.509 at the boundary: nothing below this module
+  learns certificates exist, and receive_mdoc still takes a plain resolved key.
+
+  Validation is scoped to what ISO 18013-5 Annex B actually specifies — a
+  two-level IACA to Document Signer hierarchy, so no general RFC 5280 path
+  building. Checks the leaf issuer DN against a configured anchor subject, the
+  leaf signature against that anchor key, the leaf validity window, that the
+  anchor is a CA (a DS certificate configured by mistake cannot become a root),
+  and keyUsage.digitalSignature where present.
+
+  Deliberately not checked, both documented in the module: revocation (CRL/OCSP
+  needs egress and an unavailability policy — its own decision), and the ISO mDL
+  EKU 1.0.18013.5.1.2, which the EUDI PID profile does not share, so enforcing it
+  would reject valid PID credentials as what looks exactly like a trust failure.
+
+  Fails closed. An empty anchor set is an error, not permissive — mdoc is the one
+  format whose issuer is not a resolvable DID, so there is no safe default. The
+  config field defaults to empty, so an existing config still loads and an upgrade
+  neither breaks a deployment nor silently starts trusting mdocs.
+
+  Anchors are inline PEM in [vault] rather than file paths: an enclave has no
+  convenient filesystem, and inline values are covered by the effective-config
+  digest boot attestation commits to, so a verifier can see which issuers a TEE
+  VTA was trusting when it was attested.
+
+  x509-parser takes the verify-aws feature rather than the default verify, which
+  pulls ring — ring currently only reaches this workspace through a
+  dev-dependency, while aws-lc-rs is already a real dependency. Same crypto, no
+  new production tree.
+
+
+
+## [0.1.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.1.3...vta-vault-v0.1.4) — 2026-08-16
+
+
+### Added
+
+- **vta-vault**: Verify and store ISO mdoc credentials on receive ([#986](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/986))
+
+#984 gave mdoc a CredentialFormat identity but receive still refused it, because
+  affinidi-mdoc had no way to turn a stored body back into an IssuerSigned. 0.2.6
+  added that codec, so receive can now do the real work.
+
+  Verifies three things per ISO 18013-5 S9.3.1, rejecting-without-storing on any
+  failure: the issuerAuth COSE_Sign1 over the MSO, every item digest against the
+  MSO valueDigests (a good signature over an MSO whose digests do not match means
+  the items were swapped after signing), and the validityInfo window.
+
+  issuer_pub is the caller-resolved Document Signer key — deliberately the same
+  shape as the DI path's issuer key, and for the same reason: deciding *which*
+  key to trust is policy that belongs to the wire layer. That seam matters more
+  here, because mdoc anchors issuer trust in an X.509 chain (x5chain, COSE label
+  33, rooted in an IACA) while this stack is DID-rooted end to end. Taking a
+  resolved key keeps that unresolved question out of the storage layer instead of
+  quietly settling it.
+
+  ES256 only, checked explicitly before the signature so a mismatched algorithm
+  is refused by name rather than failing as an opaque bad signature. ISO 18013-5
+  and the EUDI profiles mandate ES256, which the VTA already has via
+  KeyType::P256, so no new curve enters the graph.
+
+  subject_did and issuer_did are left None: an mdoc binds to its holder through
+  the MSO deviceKey, not a subject DID, and carries no issuer DID. Inventing
+  either would put an unverifiable identifier into a secondary index.
+
+  coset and time are declared as direct dependencies rather than used
+  transitively through affinidi-mdoc — the receive path names their types, and
+  depending on a transitive is how an unrelated version bump breaks a crate.
+
+  DCQL matching and presentation are deliberately NOT in this change. dcql_format
+  still returns None for mdoc: admitting it without a present_single arm trips
+  formats_admitted_for_dcql_are_all_presentable, and that guard is right — a
+  matched-but-unpresentable credential bails the entire vp_token, not just itself.
+  Presenting an mdoc needs DeviceResponse::to_cbor_bytes (affinidi-mdoc 0.2.7,
+  under review as affinidi/affinidi-tdk-rs#712), so matching and presentation land
+  together in a follow-up.
+
+- **vta-vault**: Give ISO mdoc a first-class CredentialFormat identity ([#984](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/984))
+
+An mdoc arriving at the credential vault previously deserialised into the
+  `Other(String)` escape hatch, so every downstream `match` treated one of
+  the two eIDAS-mandated credential formats as an unknown vendor tag.
+
+  Adds `CredentialFormat::MsoMdoc`, tagged `mso_mdoc` — the OpenID4VP
+  `CredentialQuery.format` spelling, explicitly renamed rather than taking
+  the enum's kebab-case `mso-mdoc`, so storage and protocol agree on one
+  token. A test pins the exact bytes, not just the round-trip.
+
+  Receive refuses an mdoc rather than storing a body it cannot re-read, and
+  `dcql_format` returns `None` for it, keeping the existing matchable-implies-
+  presentable invariant true. Both carry the reason: affinidi-mdoc 0.2.5 has
+  no CBOR codec for `IssuerSigned` (it derives only Debug + Clone, with no
+  Serialize/Deserialize and no to/from_cbor_bytes), so the body cannot be
+  decoded, verified, or re-encoded for presentation. Wiring receive, DCQL
+  matching and presentation is blocked on that codec landing upstream.
+
+  The invariant guard in credential_exchange enumerates formats by hand, so
+  MsoMdoc is added there too — otherwise a new variant is silently uncovered.
+
+
+
+## [0.1.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-vault-v0.1.2...vta-vault-v0.1.3) — 2026-08-13
+
+
+### Added
+
+- **release**: Publish vta-service and its closure again ([#962](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/962))
+
+* feat(release): publish vta-service and its closure again
+
+  #938 unpublished `vta-service` and the twelve subsystem crates behind it,
+  on the finding that nothing external depended on them. The audit read
+  normal dependencies. `openvtc-core` depends on `vta-service` as a
+  **dev-dependency**, for `test_support::MockVta` — an in-process VTA its
+  end-to-end tests run against. That harness boots the real service, so no
+  client crate can stand in for it.
+
+  Unpublishing did not merely freeze the crate. It broke it.
+
+  `vti-common` re-exports `vta_sdk::acl::{ActScope, ApproveScope,
+  ContextDirection}` as its own public API, so **a re-export makes the
+  re-exported crate's version part of your public API**: any graph
+  combining `vti-common` with another `vta-sdk` consumer must resolve one
+  `vta-sdk`. The frozen `vta-service` 0.14.37 asks for `vta-sdk ^0.21`
+  while `vti-common` has moved to `^0.23`. A downstream `cargo update`
+  resolves both and `vta-service` fails to compile with
+
+    expected `vti_common::acl::ApproveScope`,
+       found `vta_sdk::acl::ApproveScope`
+
+  at ten call sites — which is how this surfaced, in openvtc #213. Nothing
+  downstream can fix that; only a release that moves the requirements
+  together can.
+
+  So the thirteen manifests go back to the workspace default. The cost is
+  the closure — twelve subsystem crates return to crates.io, which is
+  exactly what #938 set out to stop. Taken deliberately over the
+  alternatives: yanking the published copies breaks OpenVTC's tests with no
+  replacement, and leaving them up ships a crate on the registry that
+  cannot be built.
+
+  **On release ordering.** `cargo publish --dry-run -p vta-service` fails
+  today, and will until the closure is on the registry: packaging strips
+  path deps, so `vta-keys = "0.2"` resolves the *published* 0.2.1, which
+  still asks for `vta-sdk ^0.21` — two nodes, same error. That resolves
+  itself in the release, which publishes in dependency order: every
+  subsystem crate in this workspace already requires `vta-sdk = "0.23"`, so
+  once they upload, `vta-service` verifies against them. Crates whose
+  dependencies are all published already dry-run clean (verified on
+  `vta-keyspaces` and `vta-config`).
+
+  Docs updated to match: CLAUDE.md, RELEASING.md and the release-plz.toml
+  header all said 7-of-21. They now say 20-of-26, name the six that stay
+  internal, and record the rule the audit missed — check dev-dependencies,
+  in sibling repos, before unpublishing anything.
+
+
+
+### Build & CI
+
+- **release**: Adopt release-plz, publish 7 crates instead of 21 ([#938](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/938))
+
+Merging and releasing were the same act. publish.yml fired on every push to
+  main and shipped whatever versions were newly present, and a CI guard required
+  the version bump to live in the feature PR — so every PR was a release
+  decision, taken by whoever opened it, days before it merged. Two open PRs
+  touching one crate wrote the same number into the same line of the same
+  Cargo.toml, and the second to merge had to rebase, renumber, and fix a
+  changelog entry that had gone stale. #932/#936/#937 hit it three times in one
+  afternoon.
+
+

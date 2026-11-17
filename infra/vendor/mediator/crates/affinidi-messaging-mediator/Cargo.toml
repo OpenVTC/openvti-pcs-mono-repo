@@ -1,0 +1,368 @@
+[package]
+name = "affinidi-messaging-mediator"
+version.workspace = true
+description = "Messaging Mediator service for Affinidi Messaging (DIDComm and TSP)"
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+publish.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mediator"
+path = "src/main.rs"
+
+[features]
+## Default: DIDComm v2 and TSP protocol support + Redis storage backend +
+## jemalloc, plus VTA-backed key management.
+## AWS integration is opt-in: use --features aws when deploying to AWS.
+default = ["didcomm", "tsp", "redis-backend", "jemalloc", "vta"]
+
+## VTA-backed key management — the mediator fetches its operating secrets from
+## a Verifiable Trust Agent at boot, refreshes them periodically, and offers
+## `mediator rotate-admin`. ON by default: this is how the VTA-linked
+## deployment works, and turning it off changes what the binary can do.
+##
+## It exists to be turned OFF by *library* consumers, and that is the point.
+## `vta-sdk` lives in the VTI workspace, which depends on this crate back
+## through `vtc-service [dev-dependencies] -> affinidi-messaging-test-mediator
+## -> affinidi-messaging-mediator -> vta-sdk` — a dependency cycle across two
+## repositories. VTI papers over it with `[patch.crates-io] vta-sdk = { path =
+## "vta-sdk" }`, which holds only while the workspace copy satisfies the
+## requirement below; under 0.x semver a minor bump breaks it, the registry
+## node the patch exists to delete comes back, and their release is blocked
+## until this crate is re-released. That has now happened at 0.20, 0.21 and
+## 0.22.
+##
+## `affinidi-messaging-test-mediator` already depends on this crate with
+## `default-features = false, features = ["didcomm", "memory-backend"]`, so
+## gating `vta-sdk` here drops it from that build entirely. The cycle stops
+## existing, and VTI can delete the patch rather than keep re-releasing this
+## crate to keep it applying.
+##
+## Self-hosted mediators (operating secrets from the unified secret backend's
+## well-known entry) are unaffected either way — that path never touches
+## `vta-sdk`.
+vta = ["dep:vta-sdk"]
+
+## Use jemalloc as the binary's global allocator (see the dependency comment).
+## On by default: with the system allocator the process holds its RSS high-water
+## mark for its lifetime. Disable (`--no-default-features`) if you need to
+## profile against the system allocator or are building for a target jemalloc
+## doesn't support.
+jemalloc = ["dep:tikv-jemallocator"]
+
+## Test-only pause points inside race windows (`mux::connection::test_hooks`),
+## for integration tests that must land a change at an exact moment. Never
+## enable it in a deployed build; `affinidi-messaging-test-mediator` turns it on
+## for its own tests only, through a dev-dependency.
+test-hooks = []
+
+## Storage backends for the `MediatorStore` trait. At least one must be
+## enabled for the binary to function. Multiple may be enabled, but the
+## binary still picks one at startup based on its config.
+##
+## Cross-process pub/sub (multiple mediator instances sharing a backend)
+## is only supported by `redis-backend` — `fjall-backend` and
+## `memory-backend` are inherently single-process. The mediator binary
+## refuses to start with multi-instance config when the chosen backend
+## doesn't support it.
+redis-backend = ["affinidi-messaging-mediator-common/redis-backend"]
+fjall-backend = ["dep:fjall"]
+memory-backend = []
+
+## DIDComm v2 — industry-standard DID-based secure messaging.
+## Enables inbound/outbound message handling, authentication, and OOB discovery.
+## At least one of `didcomm` or `tsp` must be enabled (see the `compile_error!`
+## in `lib.rs`); the two are NOT mutually exclusive — they are designed to run
+## together (`--features didcomm,tsp`), which is the dual-protocol deployment.
+didcomm = [
+  "dep:affinidi-messaging-didcomm",
+  "dep:affinidi-encoding",
+  "dep:affinidi-crypto",
+  "dep:trust-tasks-rs",
+  "dep:trust-tasks-proof",
+  "dep:affinidi-data-integrity",
+]
+
+## DIDComm v1 (Aries RFC 0019) — additive alongside DIDComm v2.1, and requires
+## it: a v1 sender still reaches the mediator over the v2-authenticated session
+## unless `allow_unauthenticated_forwards` is turned on, and the mediator's v1
+## routing verkey is derived from the same Ed25519 authentication key its v2
+## identity uses. Accepts inbound v1 forwards and stores them for the local
+## recipient; the Aries coordinate-mediation and message-pickup protocols a
+## wallet needs to register keys and collect messages land separately, so this
+## feature alone does not yet make the mediator usable by a stock Credo wallet.
+didcomm-v1 = ["didcomm", "dep:affinidi-messaging-didcomm-v1"]
+
+## TSP (Trust Spanning Protocol) — ON by default, additive alongside DIDComm, and
+## complete without it. Carries TSP Direct / Routed / Nested / Control messages, the
+## TSP↔DIDComm bridge, Trust Tasks over TSP, and advertises a TSPTransport service for
+## discovery. A `tsp`-only build authenticates clients with `POST /tsp/authenticate`.
+## The Trust Task stack comes with it, since Trust Tasks run over TSP too.
+tsp = [
+  "dep:affinidi-tsp",
+  "dep:trust-tasks-rs",
+  "dep:trust-tasks-proof",
+  "dep:affinidi-data-integrity",
+]
+
+## Secret storage backends — forwarded to `mediator-common`'s `secrets-*`
+## features. Enabled per-deployment so operators only compile the backends
+## their deployment target needs.
+secrets-keyring = ["affinidi-messaging-mediator-common/secrets-keyring"]
+secrets-aws = ["affinidi-messaging-mediator-common/secrets-aws", "aws"]
+secrets-gcp = ["affinidi-messaging-mediator-common/secrets-gcp"]
+secrets-azure = ["affinidi-messaging-mediator-common/secrets-azure"]
+secrets-vault = ["affinidi-messaging-mediator-common/secrets-vault"]
+secrets-k8s = ["affinidi-messaging-mediator-common/secrets-k8s"]
+
+## AWS integration used by `did_web_self_hosted = "aws_parameter_store://..."`
+## or `"s3://..."` (still loaded directly by the mediator, not via the secret
+## store). Enabled automatically by `secrets-aws`.
+aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3"]
+
+[build-dependencies]
+# Generates `crate::task_specs` from trust-tasks.lock and the bundles in trust-tasks/.
+trust-tasks-build = "0.1.2"
+
+[dependencies]
+# ── Affinidi Crates ──────────────────────────────────────────────────────
+# The minimum lives in the root Cargo.toml's [workspace.dependencies]: 0.46.3,
+# which collects a Trust Task reply sent over REST and asks for typed
+# `trust-task-error` refusals. A minimum below what the code uses would let
+# `cargo publish --dry-run` resolve an older SDK and fail to compile on a
+# missing type, which the dry-run guard cannot tell from real registry drift.
+affinidi-messaging-sdk.workspace = true
+## Optional: DIDComm v2.1 protocol implementation (activated by `didcomm` feature)
+affinidi-messaging-didcomm = { workspace = true, optional = true }
+## Optional: DIDComm v1 (Aries RFC 0019) implementation (activated by `didcomm-v1`)
+affinidi-messaging-didcomm-v1 = { workspace = true, optional = true }
+## Trust Tasks runtime — consumes Trust Task documents carried over the binding
+## envelope. The task types are generated at build time from trust-tasks.lock
+## (see build.rs and `crate::task_specs`), so no prebuilt spec module is compiled.
+trust-tasks-rs = { workspace = true, optional = true }
+# Verifies Trust Task proofs (eddsa-jcs-2022) before any handler runs.
+trust-tasks-proof = { workspace = true, optional = true, features = ["affinidi"] }
+affinidi-data-integrity = { workspace = true, optional = true }
+## Optional: JOSE key-agreement types for the didcomm compat layer (affinidi-tdk-rs#327)
+affinidi-crypto = { workspace = true, optional = true, features = ["jose"] }
+## Optional: Trust Spanning Protocol (activated by `tsp` feature)
+affinidi-tsp = { workspace = true, optional = true }
+## Multibase/multicodec encoding helpers (needed by didcomm for key encoding)
+affinidi-encoding = { version = "0.1.6", optional = true }
+## Shared types: DatabaseHandler, errors, config structs, secret storage.
+## Backend features are enabled below via the mediator's own cargo features
+## so operators only compile the backends their deployment needs.
+# An EXACT version, as every internal requirement is (RELEASES.md, "Versions
+# and tags"): the mediator uses mediator-common APIs that an older published
+# release lacks. A looser requirement resolves one anyway in
+# `cargo publish --dry-run` and fails to compile on the missing types, which the
+# guard cannot tell from real registry drift.
+#
+# BUMP THIS IN LOCKSTEP with mediator-common's own version. Leaving it behind
+# names a version that no longer exists locally either, so the guard's "waiting
+# on a sibling" exemption — which requires the requirement to match the local
+# sibling exactly — stops applying and a `wait` becomes a `FAIL`.
+affinidi-messaging-mediator-common = { version = "0.54.0", path = "affinidi-messaging-mediator-common" }
+## Raw TOML config schema — the `*ConfigRaw` types are defined here and the
+## mediator re-exports them; the runtime `Config` + conversions stay local.
+# An EXACT version, for the same reason: the runtime config reads fields an
+# older published config crate lacks. scripts/release_lib.py moves it in
+# lockstep with that crate's own version.
+affinidi-messaging-mediator-config = { version = "0.54.0", path = "affinidi-messaging-mediator-config" }
+## Humantime for the VTA cache TTL (`[secrets].cache_ttl = "30d"`).
+humantime.workspace = true
+## CLI parsing for the mediator binary's subcommands (`mediator`,
+## `mediator rotate-admin`, …). Added in Phase I — pre-Phase-I builds
+## had no subcommand surface so `main.rs` skipped clap.
+clap = { workspace = true, features = ["derive"] }
+## DID resolution with in-memory cache (capacity: 1000 DIDs, TTL: 300s).
+## `did-webs` (0.8.47): a did:webs client or recipient resolves when its KERI
+## key event log verifies, under the same host policy as did:web and
+## did:webvh. 0.8.47 does not turn on serde_json's `preserve_order`.
+affinidi-did-resolver-cache-sdk = { workspace = true, features = ["network", "did-webs"] }
+affinidi-did-common.workspace = true
+affinidi-secrets-resolver.workspace = true
+## Shared background-task supervision (restart-on-failure + health registry)
+affinidi-task-utils = "0.1"
+## VTA SDK for centralized DID/key management via Verifiable Trust Agent.
+## Optional, behind the default-on `vta` feature — see that feature's comment
+## for why the optionality matters more than the version range does.
+##
+## Tightened back to a plain caret now that the release it was waiting on has
+## shipped. The `>=0.21.0, <0.23.0` range was a stopgap for a version that was
+## not yet on crates.io, and it outlived its reason: VTI went on to 0.23, 0.24
+## and 0.25 while the ceiling held this crate on 0.21.6, and *that* is what kept
+## a second `trust-tasks-rs` (0.2.57, from vta-sdk 0.21.6) in this workspace's
+## lockfile long after everything else had moved to 0.9. A bounded range is a
+## tax that comes due silently; prefer a caret and move it deliberately.
+vta-sdk = { workspace = true, features = ["integration"], optional = true }
+
+# ── Web Framework ────────────────────────────────────────────────────────
+axum = { workspace = true, features = ["ws"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+## TLS termination for direct HTTPS (alternative: use a reverse proxy)
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+http = "1"
+## Response-body wrapper that defers delivery bookkeeping until the body is
+## written (`after_write`). Already in the tree through axum/hyper.
+http-body = "1"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors", "trace", "limit", "timeout"] }
+## `TokioTimer`: hyper enforces its header-read timeout only with a timer.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+
+# ── Database (Redis) ─────────────────────────────────────────────────────
+## Redis 7.1+ required. Uses multiplexed connection (not pool).
+## TLS: use `rediss://` URL scheme. Auth: `redis://:password@host/`.
+redis = { workspace = true, features = [
+  "tokio-rustls-comp",       # TLS via rustls (for rediss:// URLs)
+  "tls-rustls-insecure",     # Allow self-signed certs (dev only, controlled by config)
+  "connection-manager",      # Auto-reconnecting multiplexed connection
+  "ahash",                   # Faster hashing for internal maps
+] }
+
+# ── Database (Fjall, optional) ──────────────────────────────────────────
+## Embedded LSM-tree key-value store; activated by `fjall-backend` feature.
+## Single-process backend for self-hosted mediators that don't want a
+## separate Redis. Cross-process pub/sub is not supported (Fjall is
+## inherently single-instance).
+fjall = { version = "3.1", optional = true }
+
+# ── DID Infrastructure ───────────────────────────────────────────────────
+didwebvh-rs.workspace = true
+
+# ── AWS Integration (optional, behind `aws` feature) ────────────────────
+## Used for Secrets Manager (aws_secrets://), Parameter Store (aws_parameter_store://)
+## To build without: --no-default-features --features didcomm
+aws-config = { workspace = true, optional = true }
+
+# TLS-stack feature set: see the aws-sdk-* comment in the root Cargo.toml.
+aws-sdk-ssm = { workspace = true, optional = true }
+# TLS-stack feature set: see the aws-sdk-* comment in the root Cargo.toml.
+aws-sdk-s3 = { workspace = true, optional = true }
+
+# ── Cryptography & Security ─────────────────────────────────────────────
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+ring.workspace = true
+rustls.workspace = true
+## Constant-time comparison for DID authorization checks
+subtle.workspace = true
+## Wipes key material (operating keys, the JWT key) from memory on drop
+zeroize.workspace = true
+
+# ── Serialization & Encoding ────────────────────────────────────────────
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json.workspace = true
+base64.workspace = true
+toml.workspace = true
+sha256.workspace = true
+url.workspace = true
+
+# ── Async Runtime ────────────────────────────────────────────────────────
+tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+async-convert = "1"
+async-trait.workspace = true
+futures-util = { workspace = true, features = ["default"] }
+
+# ── Observability ────────────────────────────────────────────────────────
+## Prometheus metrics via /metrics endpoint
+metrics.workspace = true
+metrics-exporter-prometheus = "0.18"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["default", "env-filter", "fmt", "json"] }
+
+# ── Rate Limiting & Resilience ───────────────────────────────────────────
+## Per-IP and per-DID rate limiting (in-memory, not distributed)
+affinidi-rate-limit = "0.1.4"
+governor = "0.10"
+
+# ── HTTP Client (for forwarding to remote mediators) ─────────────────────
+reqwest = { workspace = true, features = ["default", "rustls", "json"] }
+tokio-tungstenite = { workspace = true, features = ["default", "rustls-tls-native-roots"] }
+
+# ── Utilities ────────────────────────────────────────────────────────────
+ahash = { workspace = true, features = ["serde"] }
+## Lock-free concurrent set for the streaming task's in-flight redelivery
+## guard (no poison-on-panic, unlike std::sync::Mutex). Already compiled in
+## the tree via `governor`.
+dashmap = "6.2"
+chrono = { workspace = true, features = ["default"] }
+hostname = "0.4"
+itertools.workspace = true
+num-format.workspace = true
+rand.workspace = true
+regex = "1"
+semver.workspace = true
+uuid = { workspace = true, features = ["v4", "fast-rng"] }
+
+# ── Allocator ────────────────────────────────────────────────────────────
+## jemalloc, used by the `mediator` binary only (set as the global allocator
+## in main.rs — a library must never impose an allocator on its consumers).
+##
+## The default system allocator (glibc malloc on Linux) does not return the
+## mediator's freed pages to the OS: the storage backend's write-buffer churn
+## is a sawtooth of large short-lived allocations, and glibc retains those
+## arenas, so RSS ratchets up to its high-water mark and stays there. That
+## reads as a leak in monitoring even though the live heap is flat. jemalloc's
+## decay-based purging returns the pages, so RSS tracks live memory.
+##
+## Not available on MSVC; the cfg gate below falls back to the system
+## allocator there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7", optional = true }
+
+[dev-dependencies]
+## The `/tsp/authenticate` unit test builds a `did:key` multikey; without
+## `didcomm` nothing else pulls this in.
+affinidi-encoding = "0.1.6"
+lazy_static = "1"
+## `FjallStore` smoke tests open a temp directory.
+tempfile.workspace = true
+## `did_example` lets curve-negotiation regression tests inject local DID
+## documents into the resolver without any network I/O. Feature-unified with
+## the `network` build above only for test targets.
+affinidi-did-resolver-cache-sdk = { workspace = true, features = ["did_example"] }
+## In-memory secrets + example DID docs for the `pack_encrypted` regression.
+affinidi-secrets-resolver.workspace = true
+## `test-util` enables `tokio::time::pause/advance` so the task-supervisor
+## backoff tests run deterministically without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
+## ES256K test signing for the `verify_inner_jws` secp256k1 path (the runtime
+## is verify-only, via affinidi-crypto / affinidi-messaging-didcomm).
+k256 = { version = "0.14", features = ["ecdsa"] }
+## `DebuggingRecorder`, so the request-metrics tests can read what a request
+## recorded. Already in the tree through metrics-exporter-prometheus.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+# Every feature but the test-only `test-hooks`, so the storage and secret
+# backends appear in the docs with their feature badges.
+features = [
+  "didcomm",
+  "didcomm-v1",
+  "tsp",
+  "redis-backend",
+  "fjall-backend",
+  "memory-backend",
+  "secrets-keyring",
+  "secrets-aws",
+  "secrets-gcp",
+  "secrets-azure",
+  "secrets-vault",
+  "secrets-k8s",
+  "aws",
+  "vta",
+]
+rustdoc-args = ["--cfg", "docsrs", "--cfg", "tracing_unstable"]
+rustc-args = ["--cfg", "tracing_unstable"]

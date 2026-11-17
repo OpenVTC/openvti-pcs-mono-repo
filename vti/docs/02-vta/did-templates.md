@@ -1,0 +1,493 @@
+# DID templates — authoring guide
+
+DID templates are JSON files that describe the **shape** of a DID document with
+`{TOKEN}` placeholders. The VTA renders them server-side during DID creation,
+filling in keys it just minted, context metadata, and caller-supplied
+variables, and hands the result to the underlying DID-method library
+(`didwebvh-rs` today).
+
+One template replaces ad-hoc "build a DID document" code across every setup
+wizard, provisioning script, and CLI consumer. Swap the template → every
+consumer gets the new shape on the next create. No redeploy.
+
+## Why templates
+
+- **Data, not code.** An operator can ship a new agent kind by dropping a JSON
+  file, no recompile. The built-ins (`ai-agent`, `didcomm-mediator`,
+  `push-gateway`, `trust-registry`, `vta-admin`, `vtc-host`, `vtc-host-classical`, `dtg-witness`, `ballot-box`, `did-host-http-didcomm`,
+  `did-host-http`, `did-host-didcomm`, `did-host-http-tsp`, `did-host-tsp`)
+  are baseline shapes, not the only shapes.
+- **Method-agnostic.** Same format works for `did:webvh`, `did:web`, or
+  `did:key` — the loader only knows about `{TOKEN}` placeholders. Method-
+  specific details (SCID, log endpoints) are just placeholders the VTA fills.
+- **Single source of truth.** The mediator setup wizard, `pnm did-mgmt
+  dids create --template …`, and any future provisioning surface all go
+  through the same template.
+
+## The format
+
+A template is a single JSON file:
+
+```json
+{
+  "schemaVersion": 1,
+  "name": "didcomm-mediator",
+  "kind": "mediator",
+  "description": "DIDComm v2 routing mediator",
+  "methods": ["webvh", "web"],
+  "requiredVars": ["URL", "WS_URL"],
+  "optionalVars": { "ACCEPT": ["didcomm/v2"], "ROUTING_KEYS": [] },
+  "defaults": { "preRotationCount": 2, "portable": true },
+  "document": {
+    "@context": ["https://www.w3.org/ns/did/v1"],
+    "id": "{DID}",
+    "verificationMethod": [{
+      "id": "{DID}#key-0",
+      "type": "Multikey",
+      "controller": "{DID}",
+      "publicKeyMultibase": "{SIGNING_KEY_MB}"
+    }],
+    "service": [{
+      "id": "{DID}#service",
+      "type": ["DIDCommMessaging"],
+      "serviceEndpoint": [
+        { "uri": "{URL}",    "accept": "{ACCEPT}", "routingKeys": "{ROUTING_KEYS}" },
+        { "uri": "{WS_URL}", "accept": "{ACCEPT}", "routingKeys": "{ROUTING_KEYS}" }
+      ]
+    }]
+  }
+}
+```
+
+### Required fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `schemaVersion` | integer | Currently `1`. The loader rejects versions it doesn't support. |
+| `name` | string | `[a-z0-9-]+`, 1–64 chars. Unique per scope. |
+| `kind` | string | Classification hint (e.g. `"mediator"`, `"webvh-hosting"`, `"custom"`). Not interpreted by the renderer; consumed by setup wizards and listing UX. |
+| `document` | object | The DID document body with `{TOKEN}` placeholders. Must have an `id` field containing `{DID}`. |
+
+### Optional fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `description` | string | Human-readable, shown in listings. |
+| `methods` | array of strings | DID methods this template is designed for (advisory only). |
+| `requiredVars` | array of strings | Variables the caller MUST supply at render time. Names must not be in the reserved set. |
+| `optionalVars` | object | Variables with default values. Caller-supplied values override. |
+| `defaults` | object | Hints for setup wizards (e.g. `preRotationCount`, `portable`). Not consumed by the renderer itself. |
+
+### Substitution rules
+
+- **Embedded token** — `{TOKEN}` inside a larger string is replaced with the
+  string form of the variable value (compact JSON for non-string types).
+- **Whole-string token** — a JSON string value that is *exactly* `"{TOKEN}"`
+  is replaced with the variable's native JSON type. This lets a template
+  write `"routingKeys": "{ROUTING_KEYS}"` and get back an array, not a
+  string containing `"[]"`.
+- **Object keys** are substituted the same way as values (but only as
+  strings — whole-string substitution doesn't apply to keys).
+- **Lowercase braces** like `{did}` are ignored. Token names must match
+  `[A-Z_][A-Z0-9_]*`.
+
+### Rendering semantics
+
+At render time the engine:
+
+1. Starts with `optionalVars` defaults.
+2. Merges server-supplied ambient vars.
+3. Merges caller-supplied vars (these override ambient and defaults).
+4. Fails loud if any `requiredVars` is missing.
+5. Substitutes placeholders throughout `document`.
+6. Fails loud if any `{TOKEN}` remains for a variable the caller didn't
+   supply — catches typos and missing ambient vars immediately.
+
+## Variables
+
+### Reserved (ambient) — supplied automatically
+
+These are filled by the server during a DID-create flow. **Never put them in
+`requiredVars` or `optionalVars` — the loader rejects that.**
+
+| Name | When available | Source |
+|---|---|---|
+| `DID` | always during create | passthrough sentinel; `didwebvh-rs` substitutes the final DID string after SCID computation |
+| `SIGNING_KEY_MB` | always during create | multibase-encoded public signing key the VTA just minted |
+| `KA_KEY_MB` | when a KA key is in play | multibase-encoded public key-agreement key |
+| `{SLOT}_KEY_MB` / `{SLOT}_KEY_JWK` | for each slot a `schemaVersion` 2 `keys` block declares | the slot's public key, as a multibase string or as a JWK object (`kty`, `crv`, `x`, `y`, `alg`). `SIGNING_KEY_JWK` and `KA_KEY_JWK` are the same for the historical pair. Write the JWK form as a whole string — `"publicKeyJwk": "{VERIFIER_KEY_JWK}"` — and it renders as the object |
+| `VTA_DID` | always | from VTA config |
+| `VTA_URL` | always | from VTA config |
+| `CONTEXT_ID` | always | the context the DID is being provisioned in |
+| `CONTEXT_DID` | when the context has a DID set | useful for cross-reference service endpoints |
+| `NOW` | always | RFC 3339 UTC timestamp |
+
+### Keys a document does not publish, and profiles that need JWKs
+
+A slot is published when the document uses its `{SLOT}_KEY_MB` or
+`{SLOT}_KEY_JWK` placeholder, and validation refuses a declared slot the
+document never publishes. One slot may opt out: `"publish": false` on the
+`signing` slot, which is the `did:webvh` **update key**. It signs the log and is
+named in the log's `updateKeys`, which is where a resolver finds it; some
+profiles keep it out of the document. Any other slot with `publish: false` is
+refused, as is a `publish: false` slot the document uses anyway.
+
+A template's `defaults.portable: false` is binding: the VTA mints that DID
+non-portable whatever the caller asked (`pnm`'s `--portable` defaults to
+`true`). Every other `defaults` entry is a hint.
+
+The built-in **`swiyu-verifier`** uses all three. It is the identity a VTC
+presents to swiyu wallets as an OpenID4VP verifier, shaped by the Swiss Profile
+Anchor: one P-256 key as a `JsonWebKey2020` `publicKeyJwk` under
+`authentication` and `assertionMethod`, no `keyAgreement`, services or
+`@context`, the Ed25519 update key unpublished, `profile_version` set, and
+non-portable. Mint it serverless at the identifier-registry slot URL swiyu's
+API assigned, then upload the log to that slot; swiyu wallets do not accept a
+self-hosted log. See `docs/05-design-notes/oid4vp-wallet-verifier.md`.
+
+### Caller-supplied
+
+Anything else. Declare them in `requiredVars` (must be provided) or
+`optionalVars` (with a default). Common examples:
+
+- `URL` — the public endpoint (mediator URL, hosting URL, etc.)
+- `ACCEPT` — DIDComm accept list
+- `ROUTING_KEYS` — DIDComm routing DIDs
+
+### Retired: `HOSTING_PATH` / `hostingPath`
+
+The `did-host-http*` templates used to stamp a `hostingPath` beside `uri` in
+the `WebVHHosting` endpoint. **It has been removed, and a `hostingPath` found
+in an existing document carries no meaning — ignore it.**
+
+It never had one. No caller ever supplied `HOSTING_PATH`
+(`build_webvh_provision_ask` in `affinidi-webvh-service` sets `URL` and nothing
+else), so every document that carries the field carries this template's own
+default, `/webvh`. No server in the ecosystem ever read it back. It described
+neither of the two paths a reader might assume:
+
+- **Not the DID-log location.** That is derived from the DID identifier itself
+  — `did:webvh:<scid>:<domain>[:<path>]` resolves to
+  `https://<domain>/<path>/did.jsonl`. `webvh.storm.ws` advertises
+  `hostingPath: "/webvh"` and serves its logs at the root
+  (`/magic-depart/did.jsonl` → 200, `/webvh/magic-depart/did.jsonl` → 404).
+- **Not the REST control-plane base.** The hosting service nests its whole API
+  at `/api` off the origin root and has no prefix setting to configure
+  (`/api/health` → 200, `/webvh/api/health` → 404 on that same host).
+
+The REST base for a `WebVHHosting` endpoint is **`serviceEndpoint.uri`, alone**.
+#756 joined the prefix onto it on the untested assumption that it was the
+control-plane base, which would have 404'd every REST-only server advertising
+one; #759 settled it against the live deployment and reverted the join. Add a
+field to a signed, permanent document only once something writes it *and*
+something reads it.
+
+## Wallet sign-in on a DID-hosting node (`SignInPortal`)
+
+Signing in to a DID-hosting console with a wallet uses a sign-in trigger link
+(`auth/oob`, sign-in trigger-link contract C4 and C9). The wallet resolves the
+node's DID and needs two entries in its document:
+
+- `TrustTaskHTTPS` — the base it POSTs `<base>/trust-tasks` to. The
+  `did-host-http*` templates publish `{URL}/api`.
+- `SignInPortal` — the page the sign-in link is activated from. The wallet
+  compares the **origin** of this endpoint with the page's origin and refuses
+  a mismatch, or a document without the entry. The user sees "This code can't
+  be used".
+
+The control plane (and a self-managed daemon) serves its console login page at
+`<origin>/login` and publishes exactly that when it builds its own document.
+`did-host-http`, `did-host-http-tsp` and `did-host-http-didcomm` now publish
+the same entry:
+
+```json
+{
+  "id": "<did>#sign-in-portal",
+  "type": "SignInPortal",
+  "serviceEndpoint": "<origin of URL>/login"
+}
+```
+
+The renderer derives it from `URL` (`vta_sdk::did_templates::sign_in_portal_service`)
+because the template format cannot compute an origin: the templates declare
+`SERVICE_SIGN_IN_PORTAL` with a `null` default and place it as a bare `service`
+member. It is emitted only for an `https` `URL`; a plain-`http` development
+node gets no entry. A caller can supply `SERVICE_SIGN_IN_PORTAL` itself (for a
+console on another origin), or supply `null` to leave the entry out.
+
+The templates for nodes that serve no login page — `did-host-didcomm`,
+`did-host-tsp` (witnesses, watchers) and `didcomm-mediator` — do not declare
+it. `vtc-host` publishes its own `SignInPortal`, at the member portal
+(`SIGN_IN_PORTAL_PATH`, default `/members/`).
+
+### Adding it to an existing DID
+
+Only DIDs minted from now on get the entry; an existing document is never
+changed for you. A node minted earlier from a `did-host-http*` template (the
+case that surfaced this was `webvh.storm.ws`) gets it with a document edit at
+the VTA that manages the DID:
+
+```sh
+pnm did-mgmt dids edit --did <did>
+```
+
+Add this to `service`, with the origin your console is served on, then save
+and confirm. The VTA publishes the new log entry to the host.
+
+```json
+{
+  "id": "<did>#sign-in-portal",
+  "type": "SignInPortal",
+  "serviceEndpoint": "https://<console-host>/login"
+}
+```
+
+If the document has no `TrustTaskHTTPS` entry either, add
+`{ "id": "<did>#trust-tasks", "type": "TrustTaskHTTPS", "serviceEndpoint": "https://<console-host>/api" }`
+in the same edit. For a scripted run pass the edited document with
+`--document <file> --no-confirm`
+(see [did:webvh update](did-webvh-update.md)).
+
+## Scopes and resolution
+
+Templates live in one of three scopes. Resolution order when a caller names a
+template without explicit scope is **context → global → builtin**:
+
+- **Built-in** — embedded in the SDK at compile time. Always available. Fork
+  with `pnm did-templates init <kind>`. Current built-ins:
+  - `ai-agent` — personal AI agent identity (open-claw / nano-claw / hermes).
+    Signing + key-agreement methods and a single `DIDCommMessaging` service
+    routing inbound traffic through the operator's mediator, so the agent is
+    reachable over DIDComm as a Service consumer (`serviceKind: aiAgent`).
+    Requires `MEDIATOR_DID`. See `personal-ai-agents.md` for the full
+    enablement runbook.
+  - `didcomm-mediator` — DIDComm v2 routing mediator with a URL-based service
+    endpoint.
+  - `push-gateway` — push wake-up gateway identity: signing + key-agreement
+    methods and a `DIDCommMessaging` service so devices, VTAs, and mediators
+    can authcrypt `push/*` Trust Tasks (register / provision / wake) to it.
+    Requires `URL` (the gateway's DIDComm endpoint). Provisioned like the
+    mediator; implements the push wake-up binding. The gateway also serves
+    Trust Tasks over TSP and HTTPS, so it can optionally advertise a
+    `TSPTransport` service naming the same mediator DID — supply
+    `SERVICE_TSP`, built by `vta_sdk::did_templates::tsp_service(mediator_did)`,
+    same null-pruning slot and shape as `vtc-host`'s messaging transports.
+    Omit it and the gateway advertises DIDComm alone, unchanged from before.
+  - `vta-admin` — did:key admin DID for provision-integration admin rollover.
+  - `vtc-group` — a community group's own identity (`vtc/groups/create`). A
+    did:webvh with a signing key (`assertionMethod`, `authentication`) and a
+    key-agreement key, and **no service**: nothing delivers messages to a group
+    yet, and group messaging adds one by a DID update. It takes no name,
+    description or label, so resolving the DID says nothing about the group.
+    Requires `WEBVH_SERVER`; optional `WITNESSES`. The community's VTA mints and
+    holds it; the group's DID issues its members' membership credentials under
+    an authorization credential the community issues it.
+  - `vtc-host-classical` — `vtc-host` without its post-quantum `pq-signing`
+    slot: one Ed25519 signing key and one X25519 key agreement key, with every
+    `vtc-host` variable and service. Derived from `vtc-host` when it is loaded,
+    not a second file, so the two cannot drift. It is what `vtc setup` names for
+    a did:webs VTC, because a level-1 did:webs holds one signing key and
+    CONVENTIONS.md 0.2 §9.2 refuses `vtc-host`'s second signing slot rather than
+    letting the VTA drop it ([did:webs DIDs](did-webs.md#a-vtc-as-a-didwebs)).
+  - `vtc-host` — Verifiable Trust Community (VTC) service identity. Mints
+    the did:webvh under which a `vtc-service` binary operates and advertises
+    its REST endpoint plus a placeholder URL for the BitstringStatusList
+    credentials (populated in Phase 2 of the VTC MVP). Messaging
+    transports (`SERVICE_TSP`, `SERVICE_DIDCOMM`) are advertised only when
+    supplied — `vtc setup` asks — and can be added or changed after mint (see
+    [community lifecycle](../03-vtc/community-lifecycle.md#changing-the-communitys-transports-after-mint)). Requires `URL`; optional
+    `STATUS_LIST_PATH` (default `/v1/status-lists`). `URL` must not have a
+    trailing slash.
+    Optionally advertises a `TrustRegistry` **referral** naming the registry
+    authoritative for this community by DID, so a client holding only the
+    community's DID resolves one hop to its registry rather than being
+    configured with both. Supply the whole entry as `SERVICE_TRUST_REGISTRY`,
+    built by `vta_sdk::did_templates::referral_service(registry_did)` — the
+    SDK owns the `TrustRegistry` type and the TRQP profile URI so the wire
+    constants have one source. Omit it and the element is pruned; a community
+    with no registry is unchanged. `vtc setup` surfaces this as a prompt and
+    as `registry_did` in the `--from` TOML.
+    Changing the entry after mint is a VTA-side `pnm did-mgmt dids edit`.
+    The VTA holds the keys that extend the log, so a community on a DID host
+    is done there — the VTA publishes to the host — while a serverless VTC
+    serving its own `did.jsonl` then takes the new log with
+    `cnm did-log install` (see
+    [community lifecycle](../03-vtc/community-lifecycle.md#changing-the-communitys-transports-after-mint)).
+    The `did-host-*` names describe the DID-document shape the template
+    mints — `http` = a `WebVHHosting` (HTTP resolution) endpoint,
+    `didcomm` = a `DIDCommMessaging` endpoint, `tsp` = a `TSPTransport`
+    endpoint — not the service that uses it. `didcomm` and `tsp` both route
+    through the shared mediator.
+  - `ballot-box` — a `vti-voting-service` identity (integration kind
+    `ballot-box`). The `dtg-witness` shape — `#key-0` under `authentication` and
+    `assertionMethod` (it answers Trust Tasks and signs receipts and board heads),
+    `#key-1` for key agreement, `#tsp` and `#didcomm` at `MEDIATOR_DID` — plus
+    `#trust-tasks` (`TrustTaskHTTPS`) at `HTTPS_URL` (both required): a cast from a
+    key made for that cast has no mediator session, so it must be accepted over
+    HTTPS (VTI-VOT-004). Communities and auditors use TSP or DIDComm.
+  - `dtg-witness` — a `vti-witness` identity (integration kind `dtg-witness`; see
+    [the witness host service](../06-witness/README.md)). An Ed25519 key
+    (`#key-0`) under both `authentication` and `assertionMethod` — it answers
+    Trust Tasks and signs the Verifiable Witness Credentials it issues — and an
+    X25519 `keyAgreement` key (`#key-1`). Advertises `#tsp` (`TSPTransport`) and
+    `#didcomm` (`DIDCommMessaging`), both naming `MEDIATOR_DID` (required), TSP
+    first, and **no** `VTARest` or other HTTP endpoint: a witness has no HTTPS
+    door in v1. As with `did-host-didcomm`, `URL` or `WEBVH_SERVER` tells the VTA
+    where to publish the log but appears nowhere in the document. Not the
+    did:webvh log witness the `did-host-*` descriptions mention (for which
+    `pnm did-templates init witness` remains an alias of `did-host-didcomm`) —
+    this is the witness of `witness/session/0.2`. Curated builder:
+    `ProvisionAsk::dtg_witness(context, mediator_did)`.
+  - `did-host-http-didcomm` — node whose DID exposes both a `WebVHHosting`
+    service (URL-based) **and** a `DIDCommMessaging` service routed through
+    a mediator. Use for nodes that publish DID logs over HTTP and accept
+    DIDComm (admin RPC, witness coordination, control-plane traffic).
+    Like every `did-host-http*` template it also advertises `TrustTaskHTTPS`
+    at `{URL}/api` and `SignInPortal` at `<origin of URL>/login` (see
+    [Wallet sign-in on a DID-hosting node](#wallet-sign-in-on-a-did-hosting-node-signinportal)).
+  - `did-host-http` — node whose DID exposes a `WebVHHosting` service and
+    **no** DIDComm. Use for nodes whose only role is hosting DID logs. If
+    you also need DIDComm, use `did-host-http-didcomm`.
+  - `did-host-didcomm` — node whose DID exposes a `DIDCommMessaging` service
+    via a shared mediator and **no** HTTP resolution endpoint. Use for
+    witness, watcher, or any service consumed via DIDComm only.
+  - `did-host-http-tsp` — TSP-only sibling of `did-host-http-didcomm`:
+    exposes a `WebVHHosting` service **and** a `TSPTransport` service via a
+    mediator, but **no** DIDComm. Use for a TSP-only node that also
+    publishes DID logs over HTTP.
+  - `did-host-tsp` — TSP-only sibling of `did-host-didcomm`: exposes a single
+    `TSPTransport` service via a shared mediator and **no** HTTP resolution
+    endpoint or DIDComm. Use for a witness, watcher, or any service consumed
+    over TSP only.
+
+  Legacy template names from two earlier generations — `webvh-control` /
+  `webvh-daemon` / `webvh-server` and `did-hosting-control` /
+  `did-hosting-daemon` / `did-hosting-server` — **no longer resolve**. Their
+  one-release alias window has closed in both the builtin loader and
+  `did-templates init`. Use the canonical `did-host-*` names; a stale name now
+  fails with "unknown builtin kind" rather than silently resolving.
+- **Global** (`tpl:global:<name>`) — super-admin-managed. Visible across every
+  context.
+- **Context** (`tpl:ctx:<id>:<name>`) — context-admin-managed (or super
+  admin). Visible only inside the named context. May share a name with a
+  global template; the context version shadows the global one during
+  resolution.
+
+Use the same `name` at different scopes to get natural overrides — a context
+can customize `mediator` without affecting any other context.
+
+## CLI
+
+### Offline (never touches the VTA)
+
+```sh
+# Scaffold a starter by forking a built-in
+pnm did-templates init mediator > my-mediator.json
+
+# Lint a local file
+pnm did-templates validate my-mediator.json
+
+# See what ships with the SDK
+pnm did-templates list-builtins
+```
+
+### Online (stored templates)
+
+```sh
+# Global scope (super admin only)
+pnm did-templates create --file my-mediator.json
+pnm did-templates list
+pnm did-templates show didcomm-mediator
+pnm did-templates update didcomm-mediator --file my-mediator.json
+pnm did-templates delete didcomm-mediator
+
+# Context scope (context admin or super admin)
+pnm did-templates create --context my-ctx --file my-mediator.json
+pnm did-templates list --context my-ctx
+pnm did-templates show didcomm-mediator --context my-ctx
+
+# Preview the rendered output without creating a DID
+pnm did-templates show didcomm-mediator \
+  --rendered \
+  --var URL=https://mediator.example.com \
+  --var DID=did:webvh:example.com:test \
+  --var SIGNING_KEY_MB=z6MkPreview \
+  --var KA_KEY_MB=z6LSPreview
+
+# Portability + drift detection
+pnm did-templates export didcomm-mediator > backup.json
+pnm did-templates diff didcomm-mediator --file local.json
+```
+
+Every command is mirrored on `cnm` — context admins running primarily in
+CNM use the same surface.
+
+### Using a template to create a DID
+
+```sh
+pnm did-mgmt dids create \
+  --context my-ctx \
+  --did-url https://mediator.example.com/.well-known/did/did.jsonl \
+  --template didcomm-mediator \
+  --var URL=https://mediator.example.com
+```
+
+`--template-context` defaults to the DID's `--context`, so a stored
+context-local `didcomm-mediator` shadows the global one (or the built-in)
+automatically. Override with `--template-context other-ctx` to pull a
+template from a different scope.
+
+`--template` is mutually exclusive with `--did-document` and `--did-log`
+— you can't supply a template AND a hand-crafted document in the same
+request.
+
+## Validation
+
+Every load (file, stored, or built-in) runs the validator:
+
+- `schemaVersion` within supported range
+- `name` matches `[a-z0-9-]+` and is 1–64 chars
+- `kind` is non-empty
+- `document.id` contains `{DID}`
+- Reserved variable names not in `requiredVars` or `optionalVars`
+- No overlap between `requiredVars` and `optionalVars`
+- Every `{TOKEN}` in the document is declared (required, optional, or
+  reserved ambient) — typos fail at validate time, not render time
+
+At render time, additional checks catch missing required vars and
+unresolved placeholders (for ambient vars the caller forgot to supply).
+
+## Audit
+
+Writes emit audit entries:
+
+- `did_template.created`
+- `did_template.updated`
+- `did_template.deleted`
+
+Renders are **not** audited — they're read-only, frequent, and the
+consuming operation (like `did.created`) already records the resulting DID
+document.
+
+## Versioning
+
+`schemaVersion` is checked at load. The SDK declares a supported range; bumping
+the major version means a breaking format change. New optional fields are
+accepted transparently — unknown fields round-trip through
+serialize/deserialize, so a newer VTA's extra metadata survives an older CLI's
+edit-then-upload cycle.
+
+## Tips
+
+- Prefer **one template per concern**. If you need "mediator with TLS" and
+  "mediator without TLS", ship two templates rather than one with conditionals
+  (the format is deliberately declarative — no conditionals, loops, or
+  includes).
+- Keep `defaults` in sync with the actual recommended operational settings.
+  Setup wizards read `defaults.preRotationCount`, `defaults.portable`, etc. to
+  pre-fill prompts.
+- When forking a built-in, change the `name` and `description` first. Keeping
+  the built-in name at a global scope shadows the embedded version, which may
+  surprise future operators.
+- Use `pnm did-templates diff` in CI to catch drift between a repo-committed
+  template and what's actually installed on a given VTA.

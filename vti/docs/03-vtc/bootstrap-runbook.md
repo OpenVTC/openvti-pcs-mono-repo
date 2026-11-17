@@ -1,0 +1,541 @@
+# Bootstrapping a new community: first admin, first vetter
+
+`vtc setup` leaves a community with an identity and no one in it. Two things
+have to happen, in a particular order, before it can admit anyone by vetting:
+
+1. **The first admin has to be able to authenticate.** A fresh VTC's access
+   list is empty — including for the admin DID setup prints.
+2. **The first vetter has to be admitted as a member before the community asks
+   for vetting.** An admin cannot be named a vetter, and a community that
+   requires vetting from the start can never admit the vetter it needs.
+
+Neither is a bug to work around; both follow from how admission is built. This
+runbook gives the order and the reason for each step. It starts where
+[`getting-started.md`](getting-started.md) (interactive) or
+[`non-interactive-setup.md`](non-interactive-setup.md) (headless) finishes.
+
+## What setup leaves you with
+
+| | After `vtc setup` |
+|---|---|
+| Community DID, keys, `did.jsonl`, `config.toml` | Written |
+| Admin DID | Minted by the VTA and printed (`Admin DID:`, or `admin_did=` headless) |
+| One install URL + claim code for that admin DID | Minted, **15-minute** TTL |
+| ACL | **Empty** — no entry for anyone, the admin DID included |
+| Community profile | Not created until the first admin is bootstrapped |
+| Members, vetters, admission criteria | None |
+
+The admin DID is recorded in the install token, not in the ACL. The ACL entry
+is written by `POST /v1/admin/bootstrap`, the last step of the install claim.
+That is the only place the first admin's entry is written
+(`vtc-service/src/install/ops/bootstrap.rs`).
+
+## Part 1 — the first admin
+
+### Why the admin cannot sign in yet
+
+Authentication checks the ACL. Until an entry exists for the DID:
+
+- `POST /v1/auth/challenge` still answers. It is deliberately not an oracle
+  for who is enrolled.
+- `POST /v1/auth/` refuses with `403`. The key was never the problem: the DID
+  has no entry.
+
+Passkey sign-in to the admin console resolves the role from the same ACL, so it
+fails in the same way.
+
+### Path A (recommended): claim the install URL
+
+1. **Start the daemon.** The browser has to reach it.
+
+   ```sh
+   vtc --config /srv/vtc/config.toml
+   ```
+
+2. **Open the install URL** that setup printed
+   (`https://<host>/admin/install?token=…`) and enter the **claim code**. The
+   URL and the code travel separately, so a leaked URL alone is not enough.
+3. **Register a passkey.** The browser asks twice: once to create the passkey,
+   once to sign with it. The page sends, as unsigned Trust Task documents,
+   `vtc/install/claim/passkey/start/0.1`, then
+   `vtc/install/claim/passkey/finish/0.1` — which verifies the registration,
+   verifies the signature as proof you hold the passkey, and answers the
+   administrator's DID: the **`did:key` of the passkey's own key**
+   (`did:key:z6Mk…` for Ed25519, `did:key:zDn…` for P-256, which most
+   platform passkeys use) — and `vtc/admin/bootstrap/0.1`, which writes the
+   admin ACL entry for that DID, labelled `first admin (install bootstrap)`,
+   and creates the community profile.
+4. **Sign in** at `https://<host>/admin/` with the passkey. **Access control**
+   now lists the admin.
+
+The install URL does **not** make the admin DID setup printed an
+administrator; the passkey's own DID is the first administrator. To give the
+setup's admin DID administrator access too (for `cnm`), grant it as in Path B.
+
+**If the URL expired** before you claimed it, stop the daemon and mint a fresh
+URL and claim code:
+
+```sh
+vtc --config /srv/vtc/config.toml admin invite
+```
+
+Without `--did`, `admin invite` mints a **passkey invitation**: the token names
+no DID, nothing is written to the ACL now, and the administrator is whatever
+passkey claims it. On a fresh community the bootstrap writes the entry, as
+above; on one that already has an administrator, the claim's `finish` writes it
+for the passkey's DID, as a community administrator. With `--did <DID>` it is a
+**wallet invitation** instead: the token names that DID, whose holder claims it
+by signing as it (Path C), and the DID is granted an admin ACL entry now if it
+has none. `--ttl <seconds>` changes the default 900. It needs the daemon stopped because it opens the store
+directly. Once an admin exists, invite further admins from the running console
+(**Access control → Admin invites → Invite admin**, choosing *with a passkey*
+or *with a wallet*) or with a signed `vtc/admin/invites/create/0.2` document,
+sent over any transport the VTC serves — `did` omitted for a passkey
+invitation, given for a wallet one. A passkey invitation, and a wallet
+invitation for a DID with no entry, makes a new community administrator, so it
+waits in **Actions** for a second administrator's approval
+([`admin-access.md`](admin-access.md) §3.2). A passkey invitation's authority
+is recorded with it, delegated by the inviting administrator, and written for
+the passkey's DID when it is claimed.
+
+> **Adding another admin first is safe.** `vtc/admin/bootstrap/0.1` refuses
+> with `alreadyBootstrapped` once *any* admin ACL entry exists, and the install
+> page treats that as success, because an invited admin sees it too. A passkey
+> claim on a community that already has an administrator is an invitation, so
+> its `finish` writes the passkey DID's entry itself, with the authority the
+> invitation recorded — the setup's install URL records a community
+> administrator.
+
+### Path B: no browser — seed the ACL offline
+
+With the daemon **stopped**:
+
+```sh
+# Grant the admin DID that setup printed
+vtc --config /srv/vtc/config.toml acl add --did <admin DID> --role admin --label "first admin"
+
+# Check it
+vtc --config /srv/vtc/config.toml acl list
+```
+
+This makes the DID able to authenticate. It does not register a passkey, and
+it does not create the community profile. A passkey belongs to its own DID
+(the install claim makes the passkey's `did:key` an administrator beside this
+one); to sign in to the console as *this* DID, use the browser wallet holding
+it, or `vtc admin invite --did <admin DID>` and claim with the wallet.
+
+Like every offline write, this one is raised in **Actions** at the next start
+for the administrators to acknowledge. With no administrator when it ran, it
+is for every administrator there is now, so the first admin acknowledges it
+after signing in (see [below](#adding-a-second-admin-later)).
+
+**You also need the DID's private key.** Setup never prints it: both the
+wizard and `vtc setup --from` write it to `<data_dir>/keys/admin-key.json`
+(owner-only, `0600`) and print only that path (`admin_key_file=…` in the
+terse block). Move it to wherever the client that acts as this DID keeps its
+keys, then delete the copy. For scripts and CI, mint a dedicated admin key on
+the VTC instead:
+
+```sh
+vtc --config /srv/vtc/config.toml create-did-key --admin --label "automation"
+```
+
+It writes an admin ACL entry for a fresh `did:key`, prints the DID on stderr,
+and prints a credential on **stdout**. The credential is a base64url-encoded
+JSON `CredentialBundle`: `did`, `privateKeyMultibase`, `vtaDid` (this is the
+community's DID; the field is named for the shared bundle type) and `vtaUrl`
+(the VTC's `public_url`). Treat stdout as a secret. Mint this key **after**
+the install claim, or it trips the `409` rule above.
+
+### Authenticating a script
+
+- **API base**: `<base_url>/v1`. A community minted after #1615 advertises it
+  as the `VTCRest` service in its DID document. One minted before advertises
+  the bare base URL, and a client that trusts that entry gets `405`.
+- **Every route needs a `Trust-Task` header** naming its task, and answers
+  `400` without it. Only `/health` and the browser wallet's `/v1/wallet/auth/*`
+  aliases are exempt.
+- **Rust**: `vtc_client::VtcClient::connect(base, vtc_did, did,
+  private_key_multibase)` runs the challenge-response and returns a client that
+  attaches the header for you.
+- **On the wire**: `POST /v1/auth/challenge` with header
+  `Trust-Task: https://trusttasks.org/spec/auth/challenge/0.1` and body
+  `{"did": "<did>"}`. Then `POST /v1/auth/` with header
+  `Trust-Task: https://trusttasks.org/spec/auth/authenticate/0.3` and a
+  Data-Integrity-signed `auth/authenticate/0.3` document
+  (`vta_sdk::auth_di::sign_authenticate_doc`). The response carries the bearer
+  token.
+
+### `cnm` needs its own administrator entry
+
+`cnm vetting …`, `cnm audit verify`, `cnm backup …`, `cnm did-log install`,
+`cnm access …` and `cnm actions …` drive this VTC's administrative Trust Tasks
+([`vetting.md`](vetting.md) §7). They sign in to the VTC directly, with the
+VTC's DID as the audience, as the `cnm` community profile's **own** DID, which
+`cnm community list` shows as `Identity`. A fresh VTC's ACL has no entry for
+that DID. Each command needs the capability its task is gated on
+([`admin-access.md`](admin-access.md) §1.2) — `vtc.backup.export` for a backup,
+`vtc.audit.read` for `audit verify`, `vtc.vetting.manage` for vetting — so a
+`community-admin` entry covers them all, and a narrower role covers the
+commands its capabilities reach.
+
+#### The usual way: a fresh identity for this community
+
+`cnm community add` mints a `did:key` for this community alone — an operator
+who runs several communities holds a different key in each, so nothing links
+them — and walks the grant the way `pnm setup` does for a VTA:
+
+```sh
+# 1. Mint the community's identity; prints the grant routes and one JSON line.
+cnm community add "Storm Network" --vtc-did <VTC DID>
+#    {"slug":"storm-network","admin_did":"did:key:z6Mk…","state":"pending"}
+
+# 2. Grant that DID admin at the VTC — any one of:
+#    a. new community: co_admin_did = "<did>" in the `vtc setup --from` TOML
+#    b. VTC host, daemon stopped:
+vtc --config /srv/vtc/config.toml acl add --did <did> --role admin --label cnm
+#    c. an existing administrator, online:
+#       cnm --community <theirs> access grant <did> --admin-role community-admin --label cnm
+#       or the console's Access control → Add entry. A community-admin grant
+#       made online waits in Actions for a second administrator, unless the
+#       community runs in single-administrator mode.
+
+# 3. Confirm: cnm signs in to the VTC as that DID and makes the profile usable.
+cnm community continue storm-network
+#    {"slug":"storm-network","admin_did":"did:key:z6Mk…","state":"complete"}
+```
+
+Until `continue` succeeds the community is listed as *pending grant* and no
+command can select it. A `continue` before the grant prints the routes again
+and changes nothing, so re-run it once the grant lands.
+
+Once the grant is confirmed, `continue` **rotates** the identity, as the
+personal VTA's setup does: it mints a fresh `did:key` and asks the VTC to move
+the granted entry onto it (`acl/swap-key/0.1`, signed by the granted key and
+carrying a short-lived link proof from the new one). The entry keeps exactly
+the authority it was granted — a rotation is never a grant, so no second
+administrator is asked — and the DID that travelled to the granting
+administrator loses all standing. The JSON line names the new DID. The new key
+is stored before the swap is sent and promoted once the VTC accepts it, so an
+interruption between the two is recovered on the next run. If the VTC refuses
+the swap, the granted key stays in use and `continue` says why; retry with
+`cnm community rotate storm-network`, which also rotates a configured
+community's key at any later time (after a suspected compromise, say).
+
+Two identities are not rotated, because their key is held somewhere the VTC's
+swap does not reach: one bound to a community VTA (`--vta-did`), whose own ACL
+entry would be left naming the old DID, and one shared with another community
+(`--reuse-identity`).
+
+`--reuse-identity <community>` shares another community's key instead. It is
+never done without that flag, because the shared key links the two
+communities to anyone who sees both ACLs. Holding a community identity as a
+persona on the personal VTA, rather than as a local `did:key`, is not
+supported yet.
+
+#### A profile that already exists
+
+For a community added before this — from a sealed credential, or "Generate
+from personal VTA" — the profile's DID is the one `cnm auth status` shows as
+`Client DID`:
+
+1. **Tell `cnm` which VTC.** The DID is the one `vtc setup` printed for the
+   community, not the community VTA's:
+
+   ```sh
+   cnm community set-vtc <VTC DID>
+   ```
+
+   `cnm` then calls the API base that DID's document advertises as `VTCRest`.
+   Use `cnm --vtc-did <VTC DID> …` for a single command, and
+   `cnm --url https://<host>/v1 …` to override the API base. `cnm` never reads
+   the VTC's DID from the server: it is the audience the sign-in is signed for,
+   so the operator names it.
+2. **Give the profile's DID an administrator entry.** `set-vtc` prints the
+   command with the DID filled in. With the daemon **stopped**:
+
+   ```sh
+   vtc --config /srv/vtc/config.toml acl add --did <cnm Client DID> --role admin --label cnm
+   ```
+
+   (`--role admin` writes a `community-admin`; add `--admin-role` and
+   `--capability` for a narrower one.) From a running console, use **Access
+   control → Add entry** with the administrative role `community-admin`. The
+   console asks for your step-up before it writes: granting administrative
+   authority requires one (VTI-OPS-051), so the operator doing the granting
+   must already hold a passkey or an approver device. If they do not, use the
+   offline command above. A `community-admin` grant also waits in **Actions**
+   until another holder of what it confers approves it (below).
+
+When the VTC refuses the sign-in, `cnm` prints that same `vtc acl add`
+command. A VTC gives the same refusal whether or not the DID is enrolled, so
+also check that the DID named is the one `cnm auth status` shows now. A
+profile provisioned from a temporary `did:key` rotates to a new one the first
+time it signs in to the VTA, so run a VTA command (`cnm acl list`) before you
+add the row.
+
+Nothing below depends on `cnm`.
+
+### Path C: a founder who signs in only with a wallet
+
+A founder whose identity is a VTA wallet persona claims the community under
+that DID instead of registering a passkey (`vtc/install/claim/{start,finish}/0.3`):
+
+1. Mint the install token for the persona's DID (`vtc setup`, or `vtc admin
+   invite --did <persona DID>` with the daemon stopped). Deliver the URL and
+   the claim code separately.
+2. Open the install URL. The console's install page offers this claim (0.3)
+   alongside the passkey claim (0.2). It sends the token and claim code; the
+   founder's wallet signs the finish **as the persona** — checked against the
+   persona's live DID document — and the browser plugin's approver identity
+   signs an enrolment statement over the claim's challenge, as the founder's
+   step-up factor. Five wrong claim codes void the install token; each is
+   answered `invalidToken`, so the answers don't reveal the count.
+3. The bootstrap writes the founder's admin row and binds the approver as their
+   step-up factor (`enrolledVia: install`). They step up with it from then on;
+   no passkey is ever registered.
+
+An **additional** administrator invited with `vtc admin invite --did` claims
+the same way, but there is no bootstrap: the invitation already wrote their
+admin row, so the claim binds their approver itself (claim/finish 0.3 item 7).
+
+### Recovering a wallet administrator who has no step-up factor
+
+An administrator who signs in with a wallet and holds neither a passkey nor a
+step-up approver can't do anything that needs a step-up, and can't enrol a
+factor themselves (that would rest the second factor on the first). Another
+community administrator invites them from Members → the member → **Invite to
+enrol an approver**. If there is no such administrator — every administrator is
+wallet-only — the operator mints the same invite on the host:
+
+```sh
+# daemon stopped
+vtc admin enrol-approver --did did:webvh:…:alice --ttl 900
+# prints the enrolment URL and, separately, the claim code
+# start the daemon; it audits the invite as AclBreakGlassWritten
+# and raises it in Actions for the administrators to acknowledge
+```
+
+The subject opens the URL, types the code, and signs the redemption with their
+own DID; their approver device proves possession. Five wrong codes void the
+invite. The binding is recorded with `enrolledVia: offline`.
+
+### Adding a second admin later
+
+Two paths, and both ask the *granting* operator for their step-up first — a
+passkey gesture or their approver device (VTI-OPS-051 — conferring
+administrative authority takes a fresh second factor, not just a live
+session):
+
+- **Promote an existing member.** Console → **Members → *the member* → Promote
+  to admin**. Over the API this is a signed `vtc/members/role/set/0.1` document
+  (`POST /v1/trust-tasks`, or any transport the VTC serves) with
+  `{"subject": "<did>", "fromRole": "<their current role>", "toRole":
+  "admin"}`; the ACL has no REST route. `fromRole` is a compare-and-swap guard — if their role moved since
+  you read it, the change is refused rather than applied over the top.
+  `PATCH /v1/members/{did}` with `{"role": "admin"}` is **not** this: it
+  answers `adminRoleForbidden` and points here.
+- **Add an ACL entry for a DID that is not a member.** Console → **Access
+  control → Add entry**, choosing the administrative role (and, to narrow it,
+  the capabilities), or `acl/grant/0.2`.
+
+You cannot promote *yourself*, with or without a second factor: admin
+elevation takes a second person, not a second factor. If you are the only
+admin and have lost every step-up factor, the offline `vtc … acl add` above is
+the break-glass.
+
+Granting an **authority-conferring** capability — a `community-admin`,
+anything holding `vtc.roles.assign`, `vtc.config.admin`, `vtc.policy.admin` for
+an authority purpose, and so on ([`admin-access.md`](admin-access.md) §1.2) —
+or minting an admin invite takes a second person in a stronger sense too:
+another holder of what it confers has to consent (VTI-APV-018, the generalised
+VTI-APV-014). The VTC does not refuse the operation: once your step-up is
+spent it **parks** it as an action and answers HTTP 202 with the action's id.
+You send nothing again. When enough other holders have approved, the VTC
+re-checks everything against the community as it is then and runs the
+operation itself (VTI-APV-017). One decline closes it. Actions last 72 hours by
+default (`acl.action_lifetime`, 15 minutes to 14 days, runtime-patchable).
+The same applies to removing or narrowing another administrator, lowering the
+consent threshold, changing authority policy, defining a custom role, and
+committing a backup restore ([`admin-access.md`](admin-access.md) §3.2). A
+narrower role — `moderator`, `auditor`, `credential-officer`, `vetting-lead` —
+confers no authority, so it takes only your step-up. When only the requester
+and the subject hold what a removal takes away, it has nobody to approve it,
+so it lands after a 24-hour cooling-off the requester can cancel
+(`acl.removal_cooling_off`, [`admin-access.md`](admin-access.md) §3.4),
+during which the subject is suspended — its entry authorizes nothing.
+
+When the operation makes a new community administrator, the VTC also issues
+that admin an approver enrolment invite. The requester sees it once, on the
+completed action in **Actions**: send the new admin the URL, and the claim
+code by a separate channel. They redeem it at `/admin/enrol-approver` to bind
+their approver device as their step-up factor
+([`admin-access.md`](admin-access.md) §3.1a).
+
+Approvers find waiting actions in the console's **Actions** page and approve
+there with the browser wallet, which signs the decision as their own DID. An
+approver without a wallet answers from `cnm`:
+
+```sh
+cnm actions list --view waiting                  # what is waiting for you
+cnm actions show <actionId>
+cnm consent approve --action <actionId>          # or pass --match-code <code>
+cnm consent deny    --action <actionId> --reason "not expected"
+```
+
+`cnm` fetches the action, renders what it does from the payload itself, and
+shows a six-character match code derived from the payload digest. With
+`--match-code`, a code that differs means the change being approved is not the
+change that would run, so nothing is sent. The file-based `cnm consent approve
+<request-file>` still answers a pushed `task-consent/request` document.
+
+A community with a single community administrator has
+nobody to ask, which is why `vtc setup` takes an optional `co_admin_did`. A
+community that really is run by one person is installed in
+**single-administrator mode** instead (`vtc setup --single-admin`, or
+`single_admin_mode = true` in the setup TOML; VTI-APV-022): your step-up
+bound to the operation stands in for another administrator's consent, so you
+can add your other identifiers (one per device) as administrators online —
+and consent stays waived beside them, since they are all you. Removals keep
+their cooling-off even then, unless you choose **Remove now** (a typed
+confirmation and a passkey gesture bound to it). Turn it on only where every administrator is the
+same person. It is host configuration
+(`[acl] single_admin_mode` in `config.toml`, changed only there and by a
+restart), every administrator sees a permanent banner while it is on, and each
+waived consent is audited at `Critical`
+([`admin-access.md`](admin-access.md) §2.1a). The same goes for the git side:
+`cnm git adopt <resource> --owner <your DID>` and the other elevated
+self-grants run on your step-up
+([`git-namespaces.md`](git-namespaces.md#single-administrator-mode-waives-it)). If you installed with neither, add
+the second offline with `vtc acl add`, daemon stopped.
+
+Every offline ACL change — `vtc acl add` and `remove`, `vtc create-did-key
+--admin`, `vtc admin invite`, `vtc admin enrol-approver`, `vtc admin
+emergency-bootstrap` — skips these checks by design, and each is recorded:
+the daemon writes an `AclBreakGlassWritten` (or `EmergencyBootstrapInvoked`)
+audit row for it when it next starts, naming the command, the DID and the host
+it ran on.
+
+It also raises the write in **Actions** as an item to acknowledge
+(VTI-VTC-023). It is for the administrators who held an admin role when the
+write was made and still hold one; if none remain — and always after an
+emergency bootstrap — it is for every administrator now. **After any offline
+`vtc acl` or `vtc admin` command, those administrators must sign in and
+acknowledge it**: until they do, the console shows each of them a `Critical`
+banner that cannot be dismissed. Acknowledging is audited, and does not undo
+the write; it closes the item once everyone it is for has acknowledged
+([`admin-access.md`](admin-access.md) §3.5).
+
+## Part 2 — the first vetter
+
+### Why the order matters
+
+- **A vetter must be a current member.** `POST /v1/vetting/vetters` checks for a
+  Member row, not an ACL entry, and answers `400 "<did> is not a current member
+  of this community"` otherwise (`vtc-service/src/vetting/vetters.rs`).
+- **The admin cannot become a member.** An ACL entry is not membership: the ACL
+  says who may run the service, and membership is the credential pair the
+  community issues. An invitation to a DID that already has an ACL entry is
+  refused with `409 "… is already a current member — no invitation needed"`
+  (`join/invitations.rs`). A join by that DID fails too, because admission
+  would write a second ACL row for it. So the first vetter is a **different
+  identity** from the admin, held by the person who will vet.
+- **A vetting criterion counts only vetters' statements.** A statement
+  counts only if an eligible vetter issued it, so a criterion that requires
+  vetting admits nobody until a vetter exists. Other criteria are unaffected:
+  each [join criterion](join-criteria.md) is its own way in, so an invitation
+  still admits through a criterion that asks for one, whatever else the
+  community publishes.
+
+So: admit the vetter through an invitation, grant the role, and add the
+vetting criterion when you want applicants to be able to join by it.
+
+### Steps
+
+1. **Check the criteria.** A new community starts with three (**Vetting →
+   Requirements**): `invited` — an invitation this community issued admits
+   automatically; `member-credential` — a membership credential admits
+   automatically; `review` — anything else is referred to an administrator.
+   If you have removed `invited`, add a criterion with **Applicants must hold
+   an invitation this community issued** and **Admit them automatically**
+   first.
+
+2. **Invite the vetter-to-be.** Use **Invitations** in the console, or:
+
+   ```http
+   POST /v1/invitations
+   Trust-Task: https://trusttasks.org/spec/vtc/invitations/issue/0.1
+   Authorization: Bearer <admin token>
+
+   { "subjectDid": "did:…", "validityDays": 7 }
+   ```
+
+   The response's `vic` is a signed Invitation Credential bound to that DID.
+   Send it to the invitee **out of band**. The console offers copy, download
+   and a QR code, but a large VIC can exceed QR capacity, so keep copy or
+   download as the fallback. Nothing delivers the invitation to the invitee
+   for you.
+
+   The vetter-to-be's DID must be able to **sign**. Vetting statements are
+   credentials the vetter signs, so a DID that has only a key-agreement key
+   passes admission and the grant but can never vet anyone.
+
+3. **The vetter-to-be applies**, with the VIC in the presentation. That is
+   `vtc/join-requests/submit/0.3` over `POST /v1/trust-tasks`, a DIDComm
+   session or TSP (in Rust, `vtc_client::VtcClient::submit_join_as`). The
+   submission meets `invited`, so it is answered **`allow`**: the applicant is
+   admitted as a member (or at the role the invitation names), the invitation
+   is spent, and they receive the membership credential and role endorsement.
+   See [`credential-delivery.md`](credential-delivery.md) for how they arrive.
+
+   *Without an invitation* the same submission meets only `review`, and is
+   referred to an administrator. Approve it in **Join requests**, or with
+   `POST /v1/join-requests/{id}/decide`, body `{"decision": "approved"}`.
+
+4. **Name them a vetter.** Open **Members**, choose the member, then **Grant
+   vetter role**. Or:
+
+   ```http
+   POST /v1/vetting/vetters
+   Trust-Task: https://trusttasks.org/spec/vtc/vetting/vetters/grant/0.1
+   Authorization: Bearer <admin token>
+
+   { "memberDid": "did:…", "validitySeconds": 31536000 }
+   ```
+
+   `201` issues the vetter role credential and delivers it to the member; `200`
+   means a live grant already existed and returns it.
+
+5. **Add the vetting criterion.** Register the statement type and add the
+   criterion: [`vetting.md`](vetting.md) §1–2, or **Vetting → Requirements**.
+   It goes last in the decision order, after `review`, so applicants reach it
+   by naming it — which the OpenVTC client does when it gathers statements for
+   a criterion. To make vetting the way in for applicants who name nothing,
+   remove `review` and add it again, so it goes after the vetting criterion.
+
+6. **Grow the vetter pool** as members join: one at a time (step 4), by the
+   automatic-grant sweep ([`vetting.md`](vetting.md) §5), or from an existing
+   OpenPGP web of trust ([`vetting.md`](vetting.md) §8). Each of these needs
+   the people to be members first.
+
+## Checklist
+
+| Check | How |
+|---|---|
+| The admin can sign in | Console sign-in with the passkey (or wallet, Path C), or `vtc acl list` (daemon stopped) shows a `community-admin` entry |
+| Every administrator can step up | each holds a passkey here or an approver device (Members → the member) |
+| Offline writes are acknowledged | No `Critical` operator-write banner in the console; **Actions** has nothing left to acknowledge |
+| A script can authenticate | `POST /v1/auth/` returns a token, not `403` |
+| `cnm` can administer the community | `cnm vetting vetters list` answers; if it prints `vtc acl add`, run that |
+| The first vetter is a member | **Members** lists the DID |
+| The vetter grant is live | **Vetting → Vetters** shows the grant as `live` |
+| Applicants can join by vetting | **Vetting → Requirements** has a vetting criterion, added after the grant |
+
+## See also
+
+- [Getting started](getting-started.md) and
+  [Non-interactive setup](non-interactive-setup.md) — what comes before this.
+- [Peer identity vetting](vetting.md) — the vetting model, criteria, statements.
+- [Credential delivery](credential-delivery.md) — how an admitted member
+  receives its credentials.
+- [Website + admin UX](website-and-admin.md) — the admin console.

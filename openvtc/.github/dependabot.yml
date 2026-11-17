@@ -1,0 +1,52 @@
+version: 2
+
+# The workflows pin every action to a commit SHA with the tag in a trailing
+# comment; Dependabot understands that shape and bumps the SHA and the comment
+# together, which is what keeps pinning from going stale.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      # Let a hijacked or re-tagged release be noticed before it is proposed
+      # here. Security updates bypass the cooldown.
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+    # These three move with the OpenPGP stack, never alone. Re-check them
+    # together at least quarterly and on every `pgp` / `openpgp-card-rpgp`
+    # release: two ignored RUSTSEC advisories (rsa, crypto-bigint 0.5) enter
+    # through `pgp`.
+    # Last checked 2026-11-15: `pgp` 0.21.1 and `openpgp-card-rpgp` 0.9.1
+    # (`pgp ^0.21.1`) are out; both still need `rand ^0.8` and `x25519-dalek ^2`,
+    # so a coordinated `pgp` + `openpgp-card-rpgp` move is possible and the other
+    # two holds remain.
+    ignore:
+      # `pgp` (0.20 and 0.21) takes an `R: CryptoRng + Rng` from the rand 0.8
+      # trait set, and we hand it our `OsRng`. A 0.10 bump merged once and
+      # stopped `main` compiling (0.10 removes `OsRng`, splits `RngCore`).
+      - dependency-name: "rand"
+      # Our `StaticSecret` goes straight to pgp's `ecdh::Curve25519Legacy`, and
+      # a 3.x secret is a different type there. The 3.x copy in the graph comes
+      # from the TDK crypto stack and no type crosses.
+      - dependency-name: "x25519-dalek"
+      # Must stay on the line `openpgp-card-rpgp` requires: the card's
+      # `CardSlot` implements that line's key traits, so a lone `pgp` bump puts
+      # two `pgp`s in the graph and `openpgp_card::crypt` stops compiling.
+      - dependency-name: "pgp"

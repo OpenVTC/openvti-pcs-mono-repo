@@ -1,0 +1,856 @@
+// Rule IR + compiler — visual ceremony authoring.
+//
+// A decision policy is authored as a constrained JSON AST (the Rule
+// IR): an ordered list of routes, each `when` (a conjunction of
+// vocabulary conditions) → `then` (a four-valued effect). The compiler
+// emits Rego (the `decision` else-chain + the structural default +
+// the helper rules used). Rego becomes a compiled artifact; operators
+// author the IR. Canonical spec: docs/05-design-notes/
+// vtc-ceremony-rule-ir.md.
+//
+// Round-trip: the compiled Rego carries the IR as a `# @vtc-rule-ir:`
+// comment header (base64 JSON) so a policy authored here can be loaded
+// back into the editor. A policy without that header was hand-written
+// and isn't visually editable.
+
+export type Condition = string | Record<string, string>;
+
+export interface Effect {
+  effect: "allow" | "deny" | "refer" | "request_more";
+  with: Record<string, unknown>;
+}
+
+export interface Route {
+  name: string;
+  when: { all: Condition[] };
+  then: Effect;
+}
+
+export interface RuleIR {
+  purpose: string;
+  routes: Route[];
+}
+
+// ---------------------------------------------------------------------------
+// Condition vocabulary (per the rule-ir spec §2). Each condition
+// compiles to a Rego body expression; helper-backed ones also pull in
+// a named helper rule.
+// ---------------------------------------------------------------------------
+
+/** The verified-Facts shape the local condition evaluator reads — a
+ * permissive view of the daemon's `input` document. */
+export interface ExplainFacts {
+  actor?: { did?: string; role?: string; authenticated?: boolean };
+  subject?: { did?: string };
+  state?: { subject_member?: { role?: string } | null };
+  evidence?: {
+    invitation?: { verified?: boolean; consumed?: boolean };
+    vetting?: {
+      satisfied?: boolean;
+      commitments_consistent?: boolean;
+      independence_ok?: boolean;
+      invitation_required?: boolean;
+      needs?: string[];
+    };
+    presentation?: {
+      credentials?: Array<{
+        type?: string;
+        /** A DTG statement's `credentialSubject.predicate` — what it means. */
+        predicate?: string;
+        issuer_trusted?: boolean;
+        status?: string;
+      }>;
+    };
+    request?: {
+      agreements?: Record<string, boolean>;
+      disposition?: string;
+      target_role?: string;
+      step_up?: boolean;
+      /** Directory: who the entry is projected for. */
+      viewer?: { public?: boolean };
+    };
+  };
+  // The automatic vetter-grant sweep decides on a member record rather than a
+  // request, so its facts sit at the top level and it has no actor, subject or
+  // evidence at all (`EligibilityFacts`, vtc-service/src/vetting/auto_grant.rs).
+  status?: string;
+  roles?: string[];
+  tenureDays?: number;
+  admittedVia?: string;
+  underReview?: boolean;
+  depth?: number | null;
+}
+
+const creds = (f: ExplainFacts) => f.evidence?.presentation?.credentials ?? [];
+
+export interface ConditionDef {
+  id: string;
+  label: string;
+  /**
+   * Argument spec, when the condition is parametrized.
+   *
+   * `options` makes the argument a choice rather than free text — for a value
+   * the daemon compares exactly, where a typo compiles cleanly and then matches
+   * nobody. `kind: "number"` is compiled unquoted, so the editor holds the
+   * operator to a whole number.
+   */
+  arg?: {
+    label: string;
+    placeholder: string;
+    options?: readonly string[];
+    kind?: "number";
+  };
+  /** Rego body expression for a (possibly arg'd) use. */
+  expr: (arg?: string) => string;
+  /** Helper-rule id pulled in when this condition is used. */
+  helper?: string;
+  /** How the condition reads in English, when `label arg` does not. */
+  phrase?: (arg?: string) => string;
+  /** Local mirror of `expr` for the decision trace — evaluates the
+   * condition against the facts client-side. Kept in lock-step with
+   * `expr` (both describe the same predicate). */
+  test: (facts: ExplainFacts, arg?: string) => boolean;
+}
+
+/** Shared by every vetting condition that depends on the invitation
+ * requirement. Identical rule bodies may be emitted more than once — Rego
+ * treats repeated boolean rule definitions as one. */
+const VETTING_INVITATION_HELPERS =
+  "vetting_invitation_missing if {\n\tinput.evidence.vetting.satisfied == true\n\tinput.evidence.vetting.invitation_required == true\n\tnot vetting_invitation_held\n}\n\n" +
+  "vetting_invitation_held if {\n\tinput.evidence.invitation.verified\n\tnot input.evidence.invitation.consumed\n}";
+
+const HELPERS: Record<string, string> = {
+  cred_held:
+    'cred_held(t) if {\n\tsome c in input.evidence.presentation.credentials\n\tc.type == t\n\tc.status == "valid"\n}',
+  cred_trusted:
+    'cred_trusted(t) if {\n\tsome c in input.evidence.presentation.credentials\n\tc.type == t\n\tc.issuer_trusted\n\tc.status == "valid"\n}',
+  statement_trusted:
+    'statement_trusted(p) if {\n\tsome c in input.evidence.presentation.credentials\n\tc.type == "StatementCredential"\n\tc.predicate == p\n\tc.issuer_trusted\n\tc.status == "valid"\n}',
+  cred_any_trusted:
+    'cred_any_trusted if {\n\tsome c in input.evidence.presentation.credentials\n\tc.issuer_trusted\n\tc.status == "valid"\n}',
+  has_valid_invitation:
+    "has_valid_invitation if {\n\tinput.evidence.invitation.verified\n\tnot input.evidence.invitation.consumed\n}",
+  agreed:
+    "agreed(tag) if {\n\tinput.evidence.request.agreements[tag] == true\n}",
+  target_role: "target_role := input.evidence.request.target_role",
+  vetting_inconsistent:
+    "vetting_inconsistent if {\n\tinput.evidence.vetting.commitments_consistent == false\n}",
+  vetting_incomplete:
+    "vetting_incomplete if {\n\tinput.evidence.vetting.commitments_consistent == true\n\tcount(input.evidence.vetting.needs) > 0\n}",
+  vetting_not_independent:
+    "vetting_not_independent if {\n\tinput.evidence.vetting.commitments_consistent == true\n\tcount(input.evidence.vetting.needs) == 0\n\tinput.evidence.vetting.independence_ok == false\n}",
+  vetting_invitation_missing: VETTING_INVITATION_HELPERS,
+  vetting_satisfied:
+    "vetting_satisfied if {\n\tinput.evidence.vetting.satisfied == true\n\tnot vetting_invitation_missing\n}\n\n" +
+    VETTING_INVITATION_HELPERS,
+  vetting_ok:
+    "vetting_ok if not input.evidence.vetting\n\nvetting_ok if {\n\tinput.evidence.vetting.satisfied == true\n\tnot vetting_invitation_missing\n}\n\n" +
+    VETTING_INVITATION_HELPERS,
+  member_holds_role:
+    "member_holds_role(r) if {\n\tsome role in input.roles\n\trole == r\n}",
+  // `depth` is null when the community cannot tell how far a member is from a
+  // founding one, and an unknown depth must not read as a shallow one.
+  vetting_depth_within:
+    "vetting_depth_within(n) if {\n\tis_number(input.depth)\n\tinput.depth <= n\n}",
+};
+
+/**
+ * A whole number for an unquoted Rego operand.
+ *
+ * The editor only offers whole numbers for a `kind: "number"` argument, so this
+ * is the compiler staying total rather than a second gate: anything else is
+ * emitted as a string, which Rego compares across types and finds false, rather
+ * than as text that would not compile at all.
+ */
+function whole(arg?: string): string {
+  return /^[0-9]+$/.test((arg ?? "").trim())
+    ? (arg ?? "").trim()
+    : JSON.stringify(arg ?? "");
+}
+
+/** The catch-all, the one condition every policy's facts can satisfy. */
+const ALWAYS: ConditionDef = {
+  id: "always",
+  label: "always",
+  expr: () => "true",
+  test: () => true,
+};
+
+const SHARED: ConditionDef[] = [
+  ALWAYS,
+  {
+    id: "actor_is_admin",
+    label: "actor is admin",
+    expr: () => 'input.actor.role == "admin"',
+    test: (f) => f.actor?.role === "admin",
+  },
+  {
+    id: "actor_is_self",
+    label: "actor is the subject",
+    expr: () => "input.actor.did == input.subject.did",
+    test: (f) => !!f.actor?.did && f.actor.did === f.subject?.did,
+  },
+  {
+    id: "subject_is_admin",
+    label: "subject is admin",
+    expr: () => 'input.state.subject_member.role == "admin"',
+    test: (f) => f.state?.subject_member?.role === "admin",
+  },
+];
+
+/** Client-side mirror of the `vetting_invitation_missing` helper. */
+const vettingInvitationMissing = (f: ExplainFacts) =>
+  f.evidence?.vetting?.satisfied === true &&
+  f.evidence?.vetting?.invitation_required === true &&
+  !(
+    f.evidence?.invitation?.verified === true &&
+    f.evidence?.invitation?.consumed !== true
+  );
+
+const vettingSatisfied = (f: ExplainFacts) =>
+  f.evidence?.vetting?.satisfied === true && !vettingInvitationMissing(f);
+
+const JOIN: ConditionDef[] = [
+  // Peer identity vetting. The daemon verifies and counts the statements;
+  // these read its verdicts (OpenVTC docs/design/vetting-process.md §10).
+  {
+    id: "vetting_inconsistent",
+    label: "vetters verified different identities",
+    expr: () => "vetting_inconsistent",
+    helper: "vetting_inconsistent",
+    test: (f) => f.evidence?.vetting?.commitments_consistent === false,
+  },
+  {
+    id: "vetting_incomplete",
+    label: "vetting is incomplete",
+    expr: () => "vetting_incomplete",
+    helper: "vetting_incomplete",
+    test: (f) =>
+      f.evidence?.vetting?.commitments_consistent === true &&
+      (f.evidence?.vetting?.needs?.length ?? 0) > 0,
+  },
+  {
+    id: "vetting_not_independent",
+    label: "vetters are not independent enough",
+    expr: () => "vetting_not_independent",
+    helper: "vetting_not_independent",
+    test: (f) =>
+      f.evidence?.vetting?.commitments_consistent === true &&
+      (f.evidence?.vetting?.needs?.length ?? 0) === 0 &&
+      f.evidence?.vetting?.independence_ok === false,
+  },
+  {
+    id: "vetting_invitation_missing",
+    label: "vetting is met but an invitation is required",
+    expr: () => "vetting_invitation_missing",
+    helper: "vetting_invitation_missing",
+    test: vettingInvitationMissing,
+  },
+  {
+    id: "vetting_satisfied",
+    label: "vetting requirements are met",
+    expr: () => "vetting_satisfied",
+    helper: "vetting_satisfied",
+    test: vettingSatisfied,
+  },
+  {
+    id: "vetting_ok",
+    label: "no vetting is required, or it is met",
+    expr: () => "vetting_ok",
+    helper: "vetting_ok",
+    test: (f) => !f.evidence?.vetting || vettingSatisfied(f),
+  },
+  {
+    id: "has_valid_invitation",
+    label: "holds a valid invitation",
+    expr: () => "has_valid_invitation",
+    helper: "has_valid_invitation",
+    test: (f) =>
+      f.evidence?.invitation?.verified === true &&
+      f.evidence?.invitation?.consumed !== true,
+  },
+  {
+    id: "holds_any_trusted",
+    label: "holds any trusted credential",
+    expr: () => "cred_any_trusted",
+    helper: "cred_any_trusted",
+    test: (f) =>
+      creds(f).some(
+        (c) => c.issuer_trusted === true && c.status === "valid",
+      ),
+  },
+  {
+    id: "holds_trusted",
+    label: "holds a trusted credential",
+    arg: { label: "credential type", placeholder: "MembershipCredential" },
+    expr: (a) => `cred_trusted(${JSON.stringify(a ?? "")})`,
+    helper: "cred_trusted",
+    test: (f, a) =>
+      creds(f).some(
+        (c) => c.type === a && c.issuer_trusted === true && c.status === "valid",
+      ),
+  },
+  {
+    // A DTG statement is told apart by its predicate, never its type: every
+    // statement is a `StatementCredential`. A witness is `witnessed/1`.
+    id: "holds_trusted_statement",
+    label: "holds a trusted statement",
+    arg: {
+      label: "statement predicate",
+      placeholder: "https://registry.trustoverip.org/dtg/vsc/witnessed/1",
+    },
+    expr: (a) => `statement_trusted(${JSON.stringify(a ?? "")})`,
+    helper: "statement_trusted",
+    phrase: (a) => `holds a trusted statement under ${a ?? "a predicate"}`,
+    test: (f, a) =>
+      creds(f).some(
+        (c) =>
+          c.type === "StatementCredential" &&
+          c.predicate === a &&
+          c.issuer_trusted === true &&
+          c.status === "valid",
+      ),
+  },
+  {
+    id: "holds",
+    label: "holds a credential",
+    arg: { label: "credential type", placeholder: "EmailCredential" },
+    expr: (a) => `cred_held(${JSON.stringify(a ?? "")})`,
+    helper: "cred_held",
+    test: (f, a) =>
+      creds(f).some((c) => c.type === a && c.status === "valid"),
+  },
+  {
+    id: "agreed",
+    label: "agreed to",
+    arg: { label: "agreement tag", placeholder: "code-of-conduct" },
+    expr: (a) => `agreed(${JSON.stringify(a ?? "")})`,
+    helper: "agreed",
+    test: (f, a) => f.evidence?.request?.agreements?.[a ?? ""] === true,
+  },
+];
+
+const LEAVE: ConditionDef[] = [
+  {
+    id: "subject_not_admin",
+    label: "subject is not an admin",
+    expr: () => 'input.state.subject_member.role != "admin"',
+    test: (f) => f.state?.subject_member?.role !== "admin",
+  },
+  {
+    id: "disposition_requested",
+    label: "a disposition was requested",
+    expr: () => "input.evidence.request.disposition",
+    test: (f) => !!f.evidence?.request?.disposition,
+  },
+];
+
+const DIRECTORY: ConditionDef[] = [
+  {
+    id: "viewer_is_admin",
+    label: "viewer is admin",
+    expr: () => 'input.actor.role == "admin"',
+    test: (f) => f.actor?.role === "admin",
+  },
+  {
+    id: "viewer_is_member",
+    label: "viewer is authenticated",
+    expr: () => "input.actor.authenticated == true",
+    test: (f) => f.actor?.authenticated === true,
+  },
+  {
+    id: "viewer_is_public",
+    label: "viewer is the public (an external card)",
+    expr: () => "input.evidence.request.viewer.public == true",
+    test: (f) => f.evidence?.request?.viewer?.public === true,
+  },
+];
+
+const ROLE_CHANGE: ConditionDef[] = [
+  {
+    id: "target_role_standard",
+    label: "target role is not admin",
+    expr: () => 'input.evidence.request.target_role != "admin"',
+    test: (f) => f.evidence?.request?.target_role !== "admin",
+  },
+  {
+    id: "promotes_to_admin",
+    label: "promotes to admin",
+    expr: () => 'input.evidence.request.target_role == "admin"',
+    test: (f) => f.evidence?.request?.target_role === "admin",
+  },
+  {
+    id: "step_up_done",
+    label: "step-up verified",
+    expr: () => "input.evidence.request.step_up == true",
+    test: (f) => f.evidence?.request?.step_up === true,
+  },
+];
+
+/** How a member came into the community, as `admittedVia` spells it. */
+const ADMITTED_VIA = ["genesis", "vetting", "invitation", "open"] as const;
+
+// Which members the automatic sweep names vetters (docs/03-vtc/vetting.md).
+// Whom to trust as a vetter, and after how long, is each community's decision —
+// the shipped default names only its founding members, deliberately.
+const VETTER_ELIGIBILITY: ConditionDef[] = [
+  {
+    id: "member_active",
+    label: "membership is active",
+    expr: () => 'input.status == "active"',
+    test: (f) => f.status === "active",
+  },
+  {
+    id: "not_under_review",
+    label: "their own admission is not under review",
+    expr: () => "input.underReview == false",
+    test: (f) => f.underReview === false,
+  },
+  {
+    id: "under_review",
+    label: "their own admission is under review",
+    expr: () => "input.underReview == true",
+    test: (f) => f.underReview === true,
+  },
+  {
+    id: "admitted_via",
+    label: "was admitted",
+    arg: { label: "how", placeholder: "vetting", options: ADMITTED_VIA },
+    expr: (a) => `input.admittedVia == ${JSON.stringify(a ?? "")}`,
+    phrase: (a) =>
+      a === "genesis"
+        ? "is a founding member"
+        : `was admitted by ${a ?? "?"}`,
+    test: (f, a) => f.admittedVia === a,
+  },
+  {
+    id: "tenure_at_least",
+    label: "has been a member for at least",
+    arg: { label: "days", placeholder: "180", kind: "number" },
+    expr: (a) => `input.tenureDays >= ${whole(a)}`,
+    phrase: (a) => `has been a member for at least ${a ?? "?"} days`,
+    test: (f, a) => (f.tenureDays ?? -1) >= Number(a),
+  },
+  {
+    id: "vetting_depth_at_most",
+    label: "is within vetting hops of a founding member",
+    arg: { label: "hops", placeholder: "2", kind: "number" },
+    expr: (a) => `vetting_depth_within(${whole(a)})`,
+    helper: "vetting_depth_within",
+    phrase: (a) =>
+      `is at most ${a ?? "?"} vetting hops from a founding member`,
+    test: (f, a) =>
+      typeof f.depth === "number" && f.depth <= Number(a),
+  },
+  {
+    id: "holds_role",
+    label: "holds the community role",
+    arg: { label: "role", placeholder: "maintainer" },
+    expr: (a) => `member_holds_role(${JSON.stringify(a ?? "")})`,
+    helper: "member_holds_role",
+    phrase: (a) => `holds the "${a ?? "?"}" role`,
+    test: (f, a) => (f.roles ?? []).includes(a ?? ""),
+  },
+];
+
+/** The vocabulary each policy purpose is authored in. */
+const CONDITIONS_BY_PURPOSE: Record<string, ConditionDef[]> = {
+  join: JOIN,
+  removal: LEAVE,
+  directory: DIRECTORY,
+  roleChange: ROLE_CHANGE,
+  vetterEligibility: VETTER_ELIGIBILITY,
+};
+
+/// Conditions available when authoring a given policy purpose.
+export function conditionsFor(purpose: string): ConditionDef[] {
+  // The sweep decides about a member, not about somebody's request: there is no
+  // actor, no subject and no state in its input, so the shared conditions would
+  // every one of them be false. Offering them would be offering a trap.
+  const base = purpose === "vetterEligibility" ? [ALWAYS] : SHARED;
+  return [...base, ...(CONDITIONS_BY_PURPOSE[purpose] ?? [])];
+}
+
+/**
+ * Whether a purpose can be authored visually — that is, whether there is a
+ * condition vocabulary for the facts its policy decides on. A purpose without
+ * one is still uploadable as Rego; it just has nothing to click, and offering
+ * an editor stocked only with conditions its facts cannot satisfy would be
+ * worse than offering none.
+ */
+export function canAuthorVisually(purpose: string): boolean {
+  return CONDITIONS_BY_PURPOSE[purpose] !== undefined;
+}
+
+/// The effects an operator can choose, and the `with` field each
+/// carries (so the editor shows the right input).
+export interface EffectDef {
+  effect: Effect["effect"];
+  label: string;
+  /** The primary `with` field this effect carries, if any. */
+  field?: { key: string; label: string; placeholder: string };
+}
+
+export function effectsFor(purpose: string): EffectDef[] {
+  // The sweep understands `allow` (name them a vetter) and `deny` (withdraw a
+  // grant the sweep itself issued) and nothing else: any other effect is logged
+  // as undecided and acts on no one. Offering the other two would be offering a
+  // policy that quietly does nothing. Neither carries a `with` field, because
+  // the sweep reads none.
+  if (purpose === "vetterEligibility") {
+    return [
+      { effect: "allow", label: "Name a vetter" },
+      { effect: "deny", label: "Do not name a vetter" },
+    ];
+  }
+  const allowField: EffectDef["field"] =
+    purpose === "removal"
+      ? { key: "disposition", label: "disposition", placeholder: "tombstone" }
+      : purpose === "directory"
+        ? { key: "fields", label: "fields (comma-sep)", placeholder: "did,role" }
+        : { key: "role", label: "role", placeholder: "member" };
+  return [
+    { effect: "allow", label: "Allow", field: allowField },
+    {
+      effect: "deny",
+      label: "Deny",
+      field: { key: "code", label: "code", placeholder: "denied" },
+    },
+    {
+      effect: "refer",
+      label: "Refer",
+      field: { key: "queue", label: "queue", placeholder: "moderator" },
+    },
+    {
+      effect: "request_more",
+      label: "Request more",
+      field: { key: "needs", label: "needs (comma-sep)", placeholder: "agreed:code-of-conduct" },
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Compile IR → Rego
+// ---------------------------------------------------------------------------
+
+const IR_HEADER = "# @vtc-rule-ir:";
+
+function regoCondition(cond: Condition, purpose: string): string | null {
+  const defs = conditionsFor(purpose);
+  if (typeof cond === "string") {
+    const d = defs.find((x) => x.id === cond);
+    return d ? d.expr() : null;
+  }
+  const [id, arg] = Object.entries(cond)[0] ?? [];
+  const d = defs.find((x) => x.id === id);
+  return d ? d.expr(arg) : null;
+}
+
+/** The `then` decision object as Rego — `$target` resolves to the
+ * `target_role` helper variable (unquoted). */
+function regoThen(then: Effect): string {
+  const json = JSON.stringify(then);
+  return json.replace(/"\$target"/g, "target_role");
+}
+
+/** Compile a Rule IR to a Rego decision module. `pkg` is the full
+ * package (e.g. `vtc.removal`); the IR is embedded for round-trip. */
+export function compileToRego(ir: RuleIR, pkg: string): string {
+  const usedHelpers = new Set<string>();
+  const defs = conditionsFor(ir.purpose);
+
+  const noteHelper = (cond: Condition) => {
+    const id = typeof cond === "string" ? cond : Object.keys(cond)[0];
+    const d = defs.find((x) => x.id === id);
+    if (d?.helper) usedHelpers.add(d.helper);
+  };
+
+  const lines: string[] = [];
+  lines.push(`package ${pkg}`, "", "import rego.v1", "");
+
+  const irB64 =
+    typeof btoa === "function"
+      ? btoa(unescape(encodeURIComponent(JSON.stringify(ir))))
+      : JSON.stringify(ir);
+  lines.push(`${IR_HEADER} ${irB64}`, "");
+
+  lines.push(
+    "# structural totality — compiler-appended, operator cannot remove",
+    'default decision := {"effect": "deny", "with": {"code": "no-matching-route"}}',
+    "",
+  );
+
+  ir.routes.forEach((route, i) => {
+    const body = route.when.all
+      .map((c) => {
+        noteHelper(c);
+        return `\t${regoCondition(c, ir.purpose) ?? "true"}`;
+      })
+      .join("\n");
+    const head = i === 0 ? "decision :=" : "else :=";
+    if (route.name) lines.push(`# ${route.name}`);
+    lines.push(`${head} ${regoThen(route.then)} if {`, body, "}", "");
+  });
+
+  // `$target` pulls in the target_role helper.
+  if (ir.routes.some((r) => JSON.stringify(r.then).includes("$target"))) {
+    usedHelpers.add("target_role");
+  }
+
+  if (usedHelpers.size > 0) {
+    lines.push("# ---- helpers ----");
+    for (const h of usedHelpers) {
+      if (HELPERS[h]) lines.push(HELPERS[h]!, "");
+    }
+  }
+
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+}
+
+/** Recover the IR embedded in a compiled policy's `@vtc-rule-ir`
+ * header, or null when the policy wasn't authored visually. */
+export function parseRego(rego: string): RuleIR | null {
+  const line = rego
+    .split("\n")
+    .find((l) => l.startsWith(IR_HEADER));
+  if (!line) return null;
+  const payload = line.slice(IR_HEADER.length).trim();
+  try {
+    const json =
+      typeof atob === "function"
+        ? decodeURIComponent(escape(atob(payload)))
+        : payload;
+    return JSON.parse(json) as RuleIR;
+  } catch {
+    return null;
+  }
+}
+
+/** A fresh single-route IR (catch-all refer/deny) to start authoring. */
+export function blankIR(purpose: string): RuleIR {
+  const fallback: Effect =
+    purpose === "directory"
+      ? { effect: "deny", with: { code: "not-a-member" } }
+      : purpose === "vetterEligibility"
+        ? // The shipped posture, and the only backstop the sweep acts on.
+          { effect: "deny", with: {} }
+        : { effect: "refer", with: { queue: "moderator" } };
+  return {
+    purpose,
+    routes: [{ name: "Catch-all", when: { all: ["always"] }, then: fallback }],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Plain-English rendering — turn an IR into a readable summary so an
+// operator who doesn't read Rego can confirm what the policy does.
+// ---------------------------------------------------------------------------
+
+export function condId(c: Condition): string {
+  return typeof c === "string" ? c : (Object.keys(c)[0] ?? "");
+}
+export function condArg(c: Condition): string | undefined {
+  return typeof c === "string" ? undefined : Object.values(c)[0];
+}
+function isCatchAll(when: { all: Condition[] }): boolean {
+  return (
+    when.all.length === 0 ||
+    (when.all.length === 1 && condId(when.all[0] as Condition) === "always")
+  );
+}
+
+/** A human phrase for a single condition, e.g. "holds a trusted
+ * credential MembershipCredential". */
+export function conditionToEnglish(cond: Condition, purpose: string): string {
+  const defs = conditionsFor(purpose);
+  const id = condId(cond);
+  const arg = condArg(cond);
+  const def = defs.find((x) => x.id === id);
+  if (def?.phrase) return def.phrase(arg);
+  const label = def?.label ?? id;
+  return arg ? `${label} ${arg}` : label;
+}
+
+/** A human phrase for an effect, e.g. "admit as member" / "refer to the
+ * moderator queue". */
+export function effectToEnglish(effect: Effect, purpose?: string): string {
+  const w = effect.with ?? {};
+  // The sweep grants or withholds one thing, so name it rather than saying
+  // "allow" about a decision no applicant is waiting on.
+  if (purpose === "vetterEligibility") {
+    return effect.effect === "allow" ? "name them a vetter" : "do not name them";
+  }
+  switch (effect.effect) {
+    case "allow":
+      if (w.role === "$target") return "admit — set the requested role";
+      if (typeof w.role === "string") return `admit — set role to ${w.role}`;
+      if (typeof w.disposition === "string")
+        return `allow — remove (${w.disposition})`;
+      if (Array.isArray(w.fields))
+        return `allow — share ${(w.fields as unknown[]).join(", ")}`;
+      return "allow";
+    case "deny":
+      return typeof w.code === "string" ? `deny (${w.code})` : "deny";
+    case "refer":
+      return typeof w.queue === "string"
+        ? `refer to the ${w.queue} queue`
+        : "refer for review";
+    case "request_more":
+      return Array.isArray(w.needs) && (w.needs as unknown[]).length
+        ? `ask for ${(w.needs as unknown[]).join(", ")}`
+        : "ask for more evidence";
+  }
+}
+
+export interface EnglishLine {
+  name: string;
+  effect: Effect["effect"];
+  /** A full sentence describing the route. */
+  text: string;
+  isCatchAll: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Semantic diff — compare two IR revisions at the route level, so a
+// version bump reads as "what changed" rather than a Rego text diff.
+// ---------------------------------------------------------------------------
+
+function condKey(c: Condition): string {
+  const a = condArg(c);
+  return a ? `${condId(c)}:${a}` : condId(c);
+}
+
+export interface RouteDiff {
+  name: string;
+  status: "added" | "removed" | "changed" | "unchanged";
+  /** Human change lines, e.g. "when: + agreed to code-of-conduct". */
+  changes: string[];
+}
+
+/** Route-level diff of two IR revisions (prev → next), matched by name. */
+export function diffIR(prev: RuleIR, next: RuleIR): RouteDiff[] {
+  const prevByName = new Map(prev.routes.map((r) => [r.name, r]));
+  const nextByName = new Map(next.routes.map((r) => [r.name, r]));
+  const order: string[] = [];
+  for (const r of next.routes) order.push(r.name);
+  for (const r of prev.routes) if (!nextByName.has(r.name)) order.push(r.name);
+
+  const seen = new Set<string>();
+  const diffs: RouteDiff[] = [];
+  for (const name of order) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const a = prevByName.get(name);
+    const b = nextByName.get(name);
+    if (a && !b) {
+      diffs.push({ name, status: "removed", changes: [] });
+      continue;
+    }
+    if (!a && b) {
+      diffs.push({ name, status: "added", changes: [] });
+      continue;
+    }
+    if (!a || !b) continue;
+    const changes: string[] = [];
+    const ak = new Set(a.when.all.map(condKey));
+    const bk = new Set(b.when.all.map(condKey));
+    for (const c of b.when.all)
+      if (!ak.has(condKey(c)))
+        changes.push(`when: + ${conditionToEnglish(c, next.purpose)}`);
+    for (const c of a.when.all)
+      if (!bk.has(condKey(c)))
+        changes.push(`when: − ${conditionToEnglish(c, prev.purpose)}`);
+    if (JSON.stringify(a.then) !== JSON.stringify(b.then))
+      changes.push(
+        `then: ${effectToEnglish(a.then, next.purpose)} → ${effectToEnglish(b.then, next.purpose)}`,
+      );
+    diffs.push({
+      name,
+      status: changes.length ? "changed" : "unchanged",
+      changes,
+    });
+  }
+  return diffs;
+}
+
+/** Render an IR as ordered plain-English lines (first-match framing). */
+export function irToEnglish(ir: RuleIR): EnglishLine[] {
+  return ir.routes.map((route, i) => {
+    const catchAll = isCatchAll(route.when);
+    const lead = i === 0 ? "If" : "else if";
+    const when = route.when.all
+      .map((c) => conditionToEnglish(c, ir.purpose))
+      .join(" and ");
+    const then = effectToEnglish(route.then, ir.purpose);
+    const text = catchAll
+      ? `Otherwise, ${then}.`
+      : `${lead} ${when}, then ${then}.`;
+    return {
+      name: route.name,
+      effect: route.then.effect,
+      text,
+      isCatchAll: catchAll,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Decision trace — evaluate the routes against a facts document locally
+// (mirroring the compiled Rego) to explain which route fired and why.
+// Only meaningful for IR-authored policies, where the local `test`
+// predicates are the same logic the Rego compiles from.
+// ---------------------------------------------------------------------------
+
+export interface ConditionTrace {
+  label: string;
+  passed: boolean;
+}
+export interface RouteTrace {
+  name: string;
+  effect: Effect["effect"];
+  conditions: ConditionTrace[];
+  /** All conditions held. */
+  matched: boolean;
+  /** The first matching route — the one whose effect the verdict takes. */
+  fired: boolean;
+  /** First-match short-circuits: routes after the fired one aren't run. */
+  reached: boolean;
+  isCatchAll: boolean;
+}
+export interface DecisionTrace {
+  routes: RouteTrace[];
+  fired: RouteTrace | null;
+}
+
+/** Evaluate an IR against a facts document, first-match, and report the
+ * per-route / per-condition outcome. */
+export function explainDecision(
+  ir: RuleIR,
+  facts: ExplainFacts,
+): DecisionTrace {
+  const defs = conditionsFor(ir.purpose);
+  let firedIdx = -1;
+  const routes: RouteTrace[] = ir.routes.map((route, i) => {
+    const conditions = route.when.all.map((c) => {
+      const def = defs.find((x) => x.id === condId(c));
+      const passed = def ? def.test(facts, condArg(c)) : false;
+      return { label: conditionToEnglish(c, ir.purpose), passed };
+    });
+    const matched = conditions.every((c) => c.passed);
+    if (matched && firedIdx === -1) firedIdx = i;
+    return {
+      name: route.name,
+      effect: route.then.effect,
+      conditions,
+      matched,
+      fired: false,
+      reached: true,
+      isCatchAll: isCatchAll(route.when),
+    };
+  });
+  routes.forEach((r, i) => {
+    r.fired = i === firedIdx;
+    r.reached = firedIdx === -1 || i <= firedIdx;
+  });
+  return { routes, fired: firedIdx >= 0 ? (routes[firedIdx] ?? null) : null };
+}

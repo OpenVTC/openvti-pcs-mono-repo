@@ -1,0 +1,370 @@
+// Member sign-in. In order:
+//
+// 1. **Sign in with your wallet** — the trigger-link key grant (`auth/oob/*`,
+//    `WalletSignIn`), the default (contract C7).
+// 2. A portal passkey.
+// 3. **Using an older wallet?** — SIOPv2 issued by the member's VTA through
+//    the browser extension. Deprecated (contract C7): kept, not deleted, until
+//    a removal date is set.
+//
+// `/members/?join` (the website's Join button) is the same page for someone
+// who is not a member yet: the same wallet code, worded for joining, with
+// nothing a newcomer cannot use (passkeys and the older sign-in need a
+// membership). The wallet, not this page, decides to offer a join: it does so
+// for a community it holds no identity for.
+//
+// Only an active member of this community is admitted; the daemon says so in
+// one message whatever the reason, and so does this page. There is
+// deliberately no "sign in with this browser's wallet" button: the
+// extension's own `login()` presents its holder `did:key`, which no community
+// admitted as a member.
+
+import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Fingerprint, Wallet } from "lucide-react";
+
+import { Protected } from "@/components/Protected";
+import { shortenDid } from "@/lib/format";
+
+import { HomeLink, OlderWalletOptions, SignInPage } from "../signin/SignInLayout";
+
+import { MemberApiError } from "./api";
+import { InstallWallet } from "./InstallWallet";
+import { WalletSignIn } from "./WalletSignIn";
+import {
+  isIdentityChoiceAvailable,
+  isVtaSignInAvailable,
+  listVtaIdentities,
+  passkeysSupported,
+  PresentedDidError,
+  signInWithPasskey,
+  signInWithVta,
+  signInWithVtaAs,
+  type VtaIdentity,
+} from "./auth";
+
+type Method = "vta" | "passkey" | "choose";
+
+type Phase =
+  | { kind: "idle" }
+  | { kind: "running"; method: Method }
+  | {
+      kind: "error";
+      message: string;
+      hint?: string;
+      /** The DID a refused VTA sign-in presented. */
+      presentedDid?: string;
+    };
+
+const NOT_A_MEMBER_HINT =
+  "Sign-in is for active members of this community. If you have joined, make " +
+  "sure you are signing in with the identity the community admitted — your " +
+  "VTA can hold more than one.";
+
+function describe(err: unknown, method: Method): Phase {
+  if (err instanceof DOMException && err.name === "NotAllowedError") {
+    return { kind: "error", message: "The passkey prompt was cancelled." };
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof MemberApiError && (err.status === 401 || err.status === 403)) {
+    return {
+      kind: "error",
+      message: "This community didn't accept that sign-in.",
+      hint:
+        method === "passkey"
+          ? "Passkeys work once you have added one after signing in with your wallet. " +
+            NOT_A_MEMBER_HINT
+          : NOT_A_MEMBER_HINT,
+      ...(err instanceof PresentedDidError ? { presentedDid: err.presentedDid } : {}),
+    };
+  }
+  return { kind: "error", message };
+}
+
+/** Whether the page was opened to join (`?join`), not to sign in. */
+export function isJoinIntent(search: string = window.location.search): boolean {
+  return new URLSearchParams(search).has("join");
+}
+
+export function SignIn({
+  communityName,
+  signedInAs,
+  sessionEnded,
+}: {
+  communityName?: string | null;
+  /** The join page only: the member this browser is already signed in as. */
+  signedInAs?: string;
+  /** The member was signed in on this page and the session ended (#2612). */
+  sessionEnded?: boolean;
+}) {
+  if (isJoinIntent()) return <Join communityName={communityName} signedInAs={signedInAs} />;
+  return <SignInMember communityName={communityName} sessionEnded={sessionEnded} />;
+}
+
+function Join({
+  communityName,
+  signedInAs,
+}: {
+  communityName?: string | null;
+  signedInAs?: string;
+}) {
+  const qc = useQueryClient();
+  // Signed in through the join page (a community that admits at once): on to
+  // the member pages, not the join page again.
+  const onSignedIn = () => {
+    window.history.replaceState({}, "", "/members/");
+    return qc.invalidateQueries({ queryKey: ["member-me"] });
+  };
+  return (
+    <SignInPage
+      eyebrow="Join"
+      title={<>Join {communityName || "this community"}</>}
+      lead={
+        <>
+          Ask to become a member with the wallet that holds your keys. An
+          administrator reviews each request; once yours is approved, you sign
+          in here.
+        </>
+      }
+      foot={[
+        <>
+          Already a member? <a href="/members/">Sign in</a>. New to Verifiable
+          Trust Communities? Start at{" "}
+          <a href="https://openvtc.net" target="_blank" rel="noopener noreferrer">
+            openvtc.net
+          </a>
+          .
+        </>,
+        <HomeLink communityName={communityName} />,
+      ]}
+    >
+      {signedInAs && (
+        <div className="alert" role="status" data-testid="join-signed-in">
+          <p className="alert-title">You're already signed in as a member.</p>
+          <p>
+            You're signed in as <code title={signedInAs}>{signedInAs}</code>. To
+            join again with a separate identity, use the code below: your
+            wallet offers a new identity for this community.{" "}
+            <a href="/members/">Go to your member pages</a>.
+          </p>
+        </div>
+      )}
+      <Protected>
+        <WalletSignIn intent="join" communityName={communityName} onSignedIn={onSignedIn} />
+      </Protected>
+      <p className="option-note">
+        You need a Verifiable Trust Agent and its browser wallet. The wallet
+        connects this browser to your agent.
+      </p>
+      <InstallWallet open={false} />
+    </SignInPage>
+  );
+}
+
+function SignInMember({
+  communityName,
+  sessionEnded,
+}: {
+  communityName?: string | null;
+  sessionEnded?: boolean;
+}) {
+  const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const qc = useQueryClient();
+  const [choices, setChoices] = useState<VtaIdentity[] | null>(null);
+  const vtaAvailable = isVtaSignInAvailable();
+  const canChoose = isIdentityChoiceAvailable();
+  const busy = phase.kind === "running";
+
+  const attempt = async (method: Method, signIn: () => Promise<void>) => {
+    setPhase({ kind: "running", method });
+    try {
+      await signIn();
+      setPhase({ kind: "idle" });
+      setChoices(null);
+      await qc.invalidateQueries({ queryKey: ["member-me"] });
+    } catch (err) {
+      setPhase(describe(err, method));
+    }
+  };
+
+  const run = (method: "vta" | "passkey") =>
+    attempt(method, method === "vta" ? signInWithVta : signInWithPasskey);
+
+  // Lists the wallet's identities pinned to this community. Behind an explicit
+  // click because the wallet asks consent before disclosing its vault entries.
+  const chooseIdentity = async () => {
+    setPhase({ kind: "running", method: "choose" });
+    setChoices(null);
+    try {
+      const found = await listVtaIdentities();
+      if (found.length === 0) {
+        setPhase({
+          kind: "error",
+          message: "Your wallet has no other identities set up for this community.",
+          hint:
+            "Use “Sign in with your VTA” — the wallet asks which of your VTA's " +
+            "identities to use and remembers it for this community.",
+        });
+        return;
+      }
+      setPhase({ kind: "idle" });
+      setChoices(found);
+    } catch (err) {
+      setPhase(describe(err, "choose"));
+    }
+  };
+
+  return (
+    <SignInPage
+      eyebrow="Member portal"
+      title={<>Sign in to {communityName || "your community"}</>}
+      lead={
+        <>
+          Sign in with the wallet that holds your membership, or with a passkey
+          you've added here. There are no passwords.
+        </>
+      }
+      after={
+        phase.kind !== "error" ? (
+          sessionEnded && (
+            <p className="alert alert-info" role="status">
+              Your session ended. Sign in again to continue.
+            </p>
+          )
+        ) : (
+          <Protected>
+            <div className="alert" role="alert">
+              <p className="alert-title">{phase.message}</p>
+              {phase.presentedDid && (
+                <p>
+                  Your VTA signed in as{" "}
+                  <code className="did-inline" title={phase.presentedDid}>
+                    {shortenDid(phase.presentedDid)}
+                  </code>
+                  .
+                </p>
+              )}
+              {phase.hint && <p>{phase.hint}</p>}
+              {phase.presentedDid && canChoose && (
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={chooseIdentity}
+                  disabled={busy}
+                >
+                  Sign in as a different identity…
+                </button>
+              )}
+            </div>
+          </Protected>
+        )
+      }
+      foot={[
+        <>
+          Not a member yet? <a href="/members/?join">Join this community</a>. Running this community? The <a href="/admin/">operator console</a> is
+          separate.
+        </>,
+        <HomeLink communityName={communityName} />,
+      ]}
+    >
+      {/* The number a member matches against their wallet, and the identity
+          they confirm: out of the community theme's reach
+          (`vtc/community/theme/show/0.1`, client item 2). */}
+      <Protected>
+        <WalletSignIn
+          communityName={communityName}
+          onSignedIn={() => qc.invalidateQueries({ queryKey: ["member-me"] })}
+        />
+      </Protected>
+
+      <button
+        type="button"
+        className="btn btn-secondary btn-lg"
+        onClick={() => run("passkey")}
+        disabled={busy || !passkeysSupported()}
+      >
+        <Fingerprint size={18} aria-hidden="true" />
+        {phase.kind === "running" && phase.method === "passkey"
+          ? "Waiting for your passkey…"
+          : "Sign in with a passkey"}
+      </button>
+      <p className="option-note">
+        First time? Sign in with your wallet, then add a passkey for this
+        device.
+      </p>
+
+      <OlderWalletOptions>
+        <p className="option-note">
+          The VTA Wallet browser extension's older sign-in (SIOPv2). It is
+          deprecated and will be removed; use “Sign in with your wallet”
+          when your wallet supports it.
+        </p>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={() => run("vta")}
+          disabled={busy || !vtaAvailable}
+        >
+          <Wallet size={18} aria-hidden="true" />
+          {phase.kind === "running" && phase.method === "vta"
+            ? "Waiting for your VTA…"
+            : "Sign in with your VTA"}
+        </button>
+        <p className="option-note">
+          {vtaAvailable
+            ? "SIOPv2: your VTA signs as your member identity. Its key never leaves your VTA."
+            : "Needs the VTA Wallet browser extension, which connects this page to your VTA — install it below, then reload."}
+        </p>
+        {canChoose && (
+          <button
+            type="button"
+            className="btn btn-link"
+            onClick={chooseIdentity}
+            disabled={busy}
+          >
+            {phase.kind === "running" && phase.method === "choose"
+              ? "Asking your wallet…"
+              : "Sign in as a different identity…"}
+          </button>
+        )}
+
+        {choices && (
+          <Protected>
+            <section className="identity-picker" aria-labelledby="identity-picker-heading">
+              <h2 id="identity-picker-heading">Choose an identity</h2>
+              <p className="option-note">
+                Your wallet holds these identities for this community. Pick the
+                one the community admitted you as.
+              </p>
+              <ul className="identity-choices">
+                {choices.map((c) => (
+                  <li key={c.entryId}>
+                    <button
+                      type="button"
+                      className="identity-choice"
+                      onClick={() => attempt("vta", () => signInWithVtaAs(c))}
+                      disabled={busy}
+                      title={c.did}
+                    >
+                      <span className="identity-choice-label">{c.label || "Identity"}</span>
+                      <code className="identity-choice-did">{shortenDid(c.did)}</code>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setChoices(null)}
+              >
+                Cancel
+              </button>
+            </section>
+          </Protected>
+        )}
+
+        <InstallWallet open={false} />
+      </OlderWalletOptions>
+    </SignInPage>
+  );
+}

@@ -1,0 +1,565 @@
+# Changelog
+
+Notable changes to the published crates. Generated from conventional commits by
+[git-cliff](https://git-cliff.org) when a release is cut — do not edit by hand.
+## [0.38.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.37.0...vta-audit-v0.38.0) — 2026-11-15
+
+
+## [0.37.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.36.0...vta-audit-v0.37.0) — 2026-11-14
+
+
+### Build & CI
+
+- **deps**: Enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe ([#2708](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2708))
+
+* build(deps): enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe
+
+  pgp, openssl only via webauthn-rs 0.5, no wildcards, and
+  multiple-versions = "deny" with a skip list of today's duplicates grouped by
+  cause. The two advisory ignores cargo-deny reports as not detected
+  (RUSTSEC-2026-0381, RUSTSEC-2024-0436) are removed, the stale [graph]
+  comment rewritten, and the yanked crypto-bigint 0.7.6 moved to 0.7.11.
+
+  ring leaves the VTA and VTC graphs; it stays only under attest-verify.
+
+  removed from 19 crates; deliberate ones are listed under
+  [package.metadata.cargo-machete] ignored. A tier-0 "manifest hygiene" CI job
+  runs cargo-machete and the lint check.
+
+  once in [workspace.dependencies]; vta-tee inherits aws-lc-rs. The five
+  crypto crates carry real minimum-patch floors, enforced by
+  check-workspace-version-reqs.py.
+
+  (check-workspace-lints.py); unsafe_code = "forbid" workspace-wide, with
+  the four crates that need unsafe restating the table at "deny" and
+  rewritten safely. The two missing publish = false comments are added.
+
+
+
+### Changed
+
+- **vtc**: Vtc-audit leaf crate, one regorus engine, typed error codes, trust_tasks split, AdminActor ([#2728](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2728))
+
+* refactor(vti-common)!: move the VTC's audit-event vocabulary to a new vtc-audit leaf crate
+
+
+
+### Performance
+
+- **vta**: Cache compiled schemas and policies, verify once, bound sweeps and list pages ([#2713](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2713))
+
+* perf(vta-sdk,vta-service): compile each Trust Task payload schema once ([#2622](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2622))
+
+  trust-tasks-rs 0.37's against_schema / validate_value parse and compile the
+  schema on every call. vta_sdk::schema_cache keeps the compiled validator by
+  the &'static schema text's address (the same technique as trust-tasks-rs
+  0.38's SchemaValidator), with the jsonschema release trust-tasks-rs 0.37 uses
+  so the check and its error text are unchanged. The dispatch spine, the SDK's
+  send-side check, room act, notifications, rooms, task consent, vetting and
+  the VTA's per-handler payload checks use it.
+
+  trust-tasks-rs 0.38 moves in lockstep with affinidi-tdk and the messaging
+  SDK, so the bump is left to that train; this module then wraps
+  SchemaValidator.
+
+
+
+## [0.36.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.35.0...vta-audit-v0.36.0) — 2026-11-12
+
+
+## [0.35.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.34.0...vta-audit-v0.35.0) — 2026-11-10
+
+
+## [0.34.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.33.0...vta-audit-v0.34.0) — 2026-11-09
+
+
+### Added
+
+- **vta-service**: Memory reads are audited per item, and the trail names items by commitment, never by key ([#2116](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2116)) ([#2522](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2522))
+
+#2116 asked which agent saw which memory. Answering it showed a problem
+  with what the trail already held: the chained sink commits a DID-shaped
+  resource but keeps any other resource in the clear inside the hashed
+  event, on the rule that only a DID is personal data. A memory key is not
+  a DID and is personal (it names what was remembered, often a person), so
+  every memory.put and memory.delete wrote one where no erasure can reach
+  it without breaking verification (VTI-AUD-005).
+
+  - `AuditSink::commit` (provided, default `None`) and
+    `vti_common::audit::commit_reference`: a domain-separated HMAC under the
+    active audit key, `hmac-sha256:<key id>:<hex>`. The chained sink
+    implements it. A sink with no key returns `None`, and the caller then
+    records no reference: an unkeyed digest of a short name is a dictionary
+    lookup away from the name.
+  - Memory audit records now name each item by its commitment over
+    (contextId, key):
+    - put / delete: the commitment as the resource;
+    - get: `items=N refs=…`, one per item returned (never a deferred or
+      missing key);
+    - list: `items=N keySet=…`, one commitment to the returned key set.
+  - `pnm memory history --context … [--actor] [--from] [--to] [--limit]`:
+    who read or changed a context's memory and when, newest first, from
+    `audit/list` (one query per memory action, since the action filter is
+    exact).
+  - `MockVta` writes the chained trail production writes, not the flat
+    keyless one. Three persona tests that read raw audit rows as flat
+    entries now read both forms, as the VTA's own reader does.
+
+  Records written before this change keep their keys until the retention
+  sweep. That is recorded in the specification's divergence register
+  (trustoverip/dtgwg-vti-spec#113).
+
+
+
+## [0.33.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.32.0...vta-audit-v0.33.0) — 2026-11-05
+
+
+## [0.32.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.31.0...vta-audit-v0.32.0) — 2026-11-05
+
+
+## [0.31.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.30.0...vta-audit-v0.31.0) — 2026-11-05
+
+
+## [0.30.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.29.0...vta-audit-v0.30.0) — 2026-11-04
+
+
+## [0.29.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.28.0...vta-audit-v0.29.0) — 2026-11-04
+
+
+## [0.28.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.27.0...vta-audit-v0.28.0) — 2026-11-04
+
+
+## [0.27.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.26.0...vta-audit-v0.27.0) — 2026-11-03
+
+
+## [0.26.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.25.0...vta-audit-v0.26.0) — 2026-11-02
+
+
+## [0.25.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.24.0...vta-audit-v0.25.0) — 2026-10-30
+
+
+## [0.24.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.23.0...vta-audit-v0.24.0) — 2026-10-30
+
+
+## [0.23.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.22.0...vta-audit-v0.23.0) — 2026-10-28
+
+
+## [0.22.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.21.0...vta-audit-v0.22.0) — 2026-10-27
+
+
+## [0.21.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.20.0...vta-audit-v0.21.0) — 2026-10-26
+
+
+### Fixed
+
+- **audit**: Bounded chain-head recovery and paged audit readers ([#2229](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2229))
+
+* fix(audit): bounded chain-head recovery and paged audit readers
+
+  Chain-head recovery read the whole audit keyspace to find one row, which
+  cannot work over vsock where the result must fit a single 16 MiB frame.
+  Recovery now scans the newest rows under the writer's own prefix, falling
+  back to a bounded deep scan only while a legacy log is being migrated, and
+  failing closed rather than silently re-anchoring.
+
+  Adds `ScanOpts` / `KeyspaceHandle::scan_raw` (a bounded, directional read
+  with an exclusive resume key) across both backends, and `OP_SCAN` on the
+  enclave proxy with the usual capability negotiation. `ScanPager` decides its
+  strategy once per walk, so a proxy that cannot bound a read is asked for the
+  range once rather than once per page.
+
+  Audit verification and listing walk through the pager instead of
+  materialising the keyspace.
+
+
+
+## [0.20.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.19.0...vta-audit-v0.20.0) — 2026-10-18
+
+
+## [0.19.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.18.0...vta-audit-v0.19.0) — 2026-10-18
+
+
+## [0.18.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.17.0...vta-audit-v0.18.0) — 2026-10-16
+
+
+## [0.17.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.16.0...vta-audit-v0.17.0) — 2026-10-15
+
+
+### Fixed
+
+- **store**: Make VTA/VTC multi-step store writes atomic ([#2109](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2109))
+
+* test(store): expose the local journal sequence number to atomicity tests
+
+
+
+## [0.16.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.15.0...vta-audit-v0.16.0) — 2026-10-13
+
+
+## [0.15.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.14.0...vta-audit-v0.15.0) — 2026-10-12
+
+
+## [0.14.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.13.0...vta-audit-v0.14.0) — 2026-10-11
+
+
+## [0.13.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.12.0...vta-audit-v0.13.0) — 2026-10-11
+
+
+## [0.12.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.11.0...vta-audit-v0.12.0) — 2026-10-06
+
+
+## [0.11.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.10.0...vta-audit-v0.11.0) — 2026-10-06
+
+
+## [0.10.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.9.0...vta-audit-v0.10.0) — 2026-10-05
+
+
+## [0.9.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.8.0...vta-audit-v0.9.0) — 2026-10-04
+
+
+## [0.8.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.7.0...vta-audit-v0.8.0) — 2026-10-02
+
+
+## [0.7.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.6.0...vta-audit-v0.7.0) — 2026-10-02
+
+
+## [0.6.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.5.0...vta-audit-v0.6.0) — 2026-10-01
+
+
+## [0.5.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.4.0...vta-audit-v0.5.0) — 2026-10-01
+
+
+## [0.4.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.27...vta-audit-v0.4.0) — 2026-09-30
+
+
+## [0.3.27](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.26...vta-audit-v0.3.27) — 2026-09-30
+
+
+## [0.3.26](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.25...vta-audit-v0.3.26) — 2026-09-27
+
+
+## [0.3.25](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.24...vta-audit-v0.3.25) — 2026-09-27
+
+
+## [0.3.24](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.23...vta-audit-v0.3.24) — 2026-09-26
+
+
+## [0.3.23](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.22...vta-audit-v0.3.23) — 2026-09-26
+
+
+## [0.3.22](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.21...vta-audit-v0.3.22) — 2026-09-24
+
+
+## [0.3.21](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.20...vta-audit-v0.3.21) — 2026-09-23
+
+
+## [0.3.20](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.19...vta-audit-v0.3.20) — 2026-09-23
+
+
+## [0.3.19](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.18...vta-audit-v0.3.19) — 2026-09-22
+
+
+## [0.3.18](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.17...vta-audit-v0.3.18) — 2026-09-22
+
+
+## [0.3.17](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.16...vta-audit-v0.3.17) — 2026-09-21
+
+
+## [0.3.16](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.15...vta-audit-v0.3.16) — 2026-09-21
+
+
+## [0.3.15](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.14...vta-audit-v0.3.15) — 2026-09-21
+
+
+## [0.3.14](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.13...vta-audit-v0.3.14) — 2026-09-20
+
+
+## [0.3.13](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.12...vta-audit-v0.3.13) — 2026-09-18
+
+
+## [0.3.12](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.11...vta-audit-v0.3.12) — 2026-09-17
+
+
+## [0.3.11](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.10...vta-audit-v0.3.11) — 2026-09-16
+
+
+## [0.3.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.9...vta-audit-v0.3.10) — 2026-09-16
+
+
+## [0.3.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.8...vta-audit-v0.3.9) — 2026-09-16
+
+
+## [0.3.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.7...vta-audit-v0.3.8) — 2026-09-12
+
+
+## [0.3.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.6...vta-audit-v0.3.7) — 2026-09-10
+
+
+### Added
+
+- **audit**: Write the VTA's audit log as a hash chain ([#1420](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1420))
+
+* feat(audit): write the VTA's audit log as a hash chain
+
+  The sink writes envelopes through the shared writer rather than flat
+  rows: each entry commits to its predecessor, and the actor and any
+  DID-shaped target are committed under a keyed hash with the plaintext
+  beside them, so an erasure can null the plaintext while the row stays
+  correlatable and the chain still verifies.
+
+  The chain opens with the creation of the key that chains it. The key is
+  established on the first write — there is nothing to audit before a
+  node can act, and a node cannot act before it has somewhere to record
+  what it did — so the first entry is the record of that key coming into
+  existence, committing to its id. A verifier reading from the start
+  learns which key the entries after it are hashed under, from an entry
+  hashed under that same key.
+
+  The keyspace and the storage-key format are unchanged except for one
+  addition. The seconds stay the leading field, because the retention
+  sweep compares keys against a cutoff in that shape and a different
+  leading field would make every chained row sort past every cutoff and
+  never expire. The nanoseconds are new and are not optional: whole
+  seconds put two entries written in the same second in uuid order, so a
+  verifier reading in key order sees them out of chain order and reports
+  a break in a chain that is intact — a false alarm indistinguishable
+  from the thing it exists to detect. The tests found this rather than
+  review.
+
+  The read path now accepts both shapes. A reader that knows only one
+  does not fail loudly; it skips what it cannot parse, so a reader that
+  knew only the older shape would have reported a log that stops at the
+  moment chaining began.
+
+
+
+### Changed
+
+- **audit**: One construction point for the audit sink, and the prerequisites for chaining it ([#1412](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1412))
+
+* refactor(audit): build the keyspace audit sink in one place
+
+  The workspace built the same sink over the same keyspace in
+  thirty-one places, including three times inside one function
+  (run_create_did_webvh, which already had one in scope two hundred
+  lines above the other two). Each was somewhere a later change to what
+  a VTA's audit writes would have to be found and repeated.
+
+  There is now one constructor, vta_audit::shared_keyspace_sink, and
+  every caller goes through it. A server still takes its sink from
+  AppState — that path was already correct, and its comment already said
+  why. The factory is for the callers with no AppState to take one from:
+  offline CLI commands, setup, sweepers and tests.
+
+  No behaviour change. The next change to this subsystem — writing
+  chained envelopes rather than flat rows — is now one edit instead of a
+  search.
+
+
+
+## [0.3.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.4...vta-audit-v0.3.5) — 2026-09-09
+
+
+## [0.3.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.3...vta-audit-v0.3.4) — 2026-09-07
+
+
+## [0.3.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.2...vta-audit-v0.3.3) — 2026-09-07
+
+
+## [0.3.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.1...vta-audit-v0.3.2) — 2026-09-06
+
+
+### Documentation
+
+- **audit**: Say at the macro that `audit!` never reaches the sink ([#1240](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1240))
+
+The module docs already explain the split — the macro emits a tracing
+  event, `record`/`record_with_detail` persist, call both. The macro's own
+  doc comment said only "Emit a structured audit event to the tracing
+  subsystem", and that is what a reader sees on hover or jump-to-definition
+  at a call site.
+
+  The gap matters because the call site carries no other signal. A handler
+  with `audit!("session.revoke", …)` three lines above its response reads,
+  on every measure a reviewer applies, as a handler that audits: it
+  compiles, it is named `audit`, it emits an event — and the row an operator
+  goes looking for is not there.
+
+  Not hypothetical. `vta/management/reload-services` shipped with this macro
+  and no sink write, so restarting an agent left nothing in the queryable
+  trail. It took a runtime census to notice, and the census could not see
+  the task at all until it was specified upstream ([#1239](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1239)). Two layers of
+  checking passed over a handler that looked audited and was not.
+
+  Docs only; no behaviour change. `cargo test -p vta-audit`, `cargo doc` and
+  `cargo fmt --check` clean.
+
+
+
+## [0.3.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.3.0...vta-audit-v0.3.1) — 2026-08-29
+
+
+## [0.3.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.2.0...vta-audit-v0.3.0) — 2026-08-28
+
+
+### Added
+
+- **audit**: Bound the operator reason an audit row keeps ([#1132](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1132))
+
+Framework 0.5.0 requires every free-text member to carry a bound. Most of that
+  is upstream schema work, but one free-text path is this workspace's own and was
+  bounded by nothing: the operator `reason` that `record_with_detail` writes into
+  the audit log.
+
+  The cost here is worse than the wire cost 0.5.0 argues from. The row goes into
+  a hash-chained, append-only log, so an oversized `detail` is permanent and
+  cannot be trimmed later without breaking the chain that makes the log evidence.
+
+  Truncated at 4096 characters rather than rejected, and that choice is the
+  substance: this runs after the operation it records has already happened, so
+  refusing the row would trade an over-long reason for no audit record at all —
+  losing the evidence to protect its formatting. The cut is marked, because a
+  silently shortened reason reads as the operator's own words.
+
+  Cut on a character boundary: byte-slicing panics mid-codepoint, and would do so
+  on the first operator who wrote a reason in a language this workspace did not
+  anticipate.
+
+  The rest of the free-text rule is upstream and already in hand: 1013 of 1067
+  registry free-text members carry no maxLength, and dtgwg-trust-tasks-tf#296 is
+  open across 275 files to fix exactly that. Taking the latest trust-tasks-rs
+  today would not bound free text — 0.14.0 predates it.
+
+
+
+### Chore
+
+- **sdk**: Release vta-sdk 0.30.0 for the added CreateKeyBody field ([#1156](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1156))
+
+`CreateKeyBody` gained a `key_id` field while the crate stayed at 0.29.0.
+  The struct is exhaustively constructible through the public API, so an
+  existing literal no longer compiles — a breaking change under 0.x rules,
+  which the semver report has been flagging as its one real finding
+  (195 pass, 1 fail) since the field landed.
+
+  Bumps the crate and the nineteen intra-workspace requirements that pin it,
+  so `cargo check --workspace` still resolves the path copy and a consumer
+  resolving from the registry gets a version that admits the break.
+
+
+
+## [0.2.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.10...vta-audit-v0.2.0) — 2026-08-26
+
+
+### Added
+
+- **audit**: Make the audit destination a deployment choice, not a protocol one ([#1049](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1049))
+
+`AuditLogEntry` is `{id, timestamp, action, actor, resource, outcome, channel,
+  contextId, detail}` — no signature, no hash chain. The log corroborates what
+  happened; it cannot prove it, and a compromised VTA can rewrite its own history.
+  The canonical `AuditEnvelope` already names the members that would change that
+  (`prevHash`, `entryHash`, `schemaVersion`) and records why this maintainer omits
+  them: its log is flat and unchained.
+
+  This does not add tamper-evidence, deliberately. It adds the seam, so an
+  operator who needs a stronger guarantee implements one — an append-only file, a
+  transparency log, a blockchain anchor, a hash chain filling in those three
+  members — without the VTA committing to any scheme. Closes #1031.
+
+  ## The shape
+
+
+
+## [0.1.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.9...vta-audit-v0.1.10) — 2026-08-22
+
+
+## [0.1.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.8...vta-audit-v0.1.9) — 2026-08-21
+
+
+## [0.1.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.7...vta-audit-v0.1.8) — 2026-08-20
+
+
+## [0.1.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.6...vta-audit-v0.1.7) — 2026-08-18
+
+
+## [0.1.6](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.5...vta-audit-v0.1.6) — 2026-08-17
+
+
+## [0.1.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.4...vta-audit-v0.1.5) — 2026-08-16
+
+
+## [0.1.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.3...vta-audit-v0.1.4) — 2026-08-16
+
+
+## [0.1.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-audit-v0.1.2...vta-audit-v0.1.3) — 2026-08-13
+
+
+### Added
+
+- **release**: Publish vta-service and its closure again ([#962](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/962))
+
+* feat(release): publish vta-service and its closure again
+
+  #938 unpublished `vta-service` and the twelve subsystem crates behind it,
+  on the finding that nothing external depended on them. The audit read
+  normal dependencies. `openvtc-core` depends on `vta-service` as a
+  **dev-dependency**, for `test_support::MockVta` — an in-process VTA its
+  end-to-end tests run against. That harness boots the real service, so no
+  client crate can stand in for it.
+
+  Unpublishing did not merely freeze the crate. It broke it.
+
+  `vti-common` re-exports `vta_sdk::acl::{ActScope, ApproveScope,
+  ContextDirection}` as its own public API, so **a re-export makes the
+  re-exported crate's version part of your public API**: any graph
+  combining `vti-common` with another `vta-sdk` consumer must resolve one
+  `vta-sdk`. The frozen `vta-service` 0.14.37 asks for `vta-sdk ^0.21`
+  while `vti-common` has moved to `^0.23`. A downstream `cargo update`
+  resolves both and `vta-service` fails to compile with
+
+    expected `vti_common::acl::ApproveScope`,
+       found `vta_sdk::acl::ApproveScope`
+
+  at ten call sites — which is how this surfaced, in openvtc #213. Nothing
+  downstream can fix that; only a release that moves the requirements
+  together can.
+
+  So the thirteen manifests go back to the workspace default. The cost is
+  the closure — twelve subsystem crates return to crates.io, which is
+  exactly what #938 set out to stop. Taken deliberately over the
+  alternatives: yanking the published copies breaks OpenVTC's tests with no
+  replacement, and leaving them up ships a crate on the registry that
+  cannot be built.
+
+  **On release ordering.** `cargo publish --dry-run -p vta-service` fails
+  today, and will until the closure is on the registry: packaging strips
+  path deps, so `vta-keys = "0.2"` resolves the *published* 0.2.1, which
+  still asks for `vta-sdk ^0.21` — two nodes, same error. That resolves
+  itself in the release, which publishes in dependency order: every
+  subsystem crate in this workspace already requires `vta-sdk = "0.23"`, so
+  once they upload, `vta-service` verifies against them. Crates whose
+  dependencies are all published already dry-run clean (verified on
+  `vta-keyspaces` and `vta-config`).
+
+  Docs updated to match: CLAUDE.md, RELEASING.md and the release-plz.toml
+  header all said 7-of-21. They now say 20-of-26, name the six that stay
+  internal, and record the rule the audit missed — check dev-dependencies,
+  in sibling repos, before unpublishing anything.
+
+
+
+### Build & CI
+
+- **release**: Adopt release-plz, publish 7 crates instead of 21 ([#938](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/938))
+
+Merging and releasing were the same act. publish.yml fired on every push to
+  main and shipped whatever versions were newly present, and a CI guard required
+  the version bump to live in the feature PR — so every PR was a release
+  decision, taken by whoever opened it, days before it merged. Two open PRs
+  touching one crate wrote the same number into the same line of the same
+  Cargo.toml, and the second to merge had to rebase, renumber, and fix a
+  changelog entry that had gone stale. #932/#936/#937 hit it three times in one
+  afternoon.
+
+

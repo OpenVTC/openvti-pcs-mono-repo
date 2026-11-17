@@ -1,0 +1,597 @@
+//! WebVH server + DID methods on [`VtaClient`].
+
+use super::{
+    AddWebvhServerRequest, CreateDidWebvhRequest, GetDidLogResponse, UpdateWebvhServerRequest,
+    VtaClient,
+};
+use crate::error::VtaError;
+
+#[cfg(feature = "client")]
+use crate::protocols::did_management;
+#[cfg(feature = "client")]
+use crate::protocols::did_management::agent_name;
+#[cfg(feature = "client")]
+use crate::protocols::did_management::get::GetDidWebvhResultBody;
+
+#[cfg(feature = "client")]
+impl VtaClient {
+    // ── WebVH server methods ──────────────────────────────────────────
+
+    pub async fn add_webvh_server(
+        &self,
+        req: AddWebvhServerRequest,
+    ) -> Result<crate::webvh::WebvhServerRecord, VtaError> {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_SERVERS_REGISTER_1_0,
+            serde_json::to_value(&req)?,
+            30,
+        )
+        .await
+    }
+
+    pub async fn list_webvh_servers(
+        &self,
+    ) -> Result<crate::protocols::did_management::servers::ListWebvhServersResultBody, VtaError>
+    {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_SERVERS_LIST_1_0,
+            serde_json::json!({}),
+            30,
+        )
+        .await
+    }
+
+    /// Fetch the registered hosting server's `did-management/me/domains`
+    /// view (caller-scoped subset of hosting domains, with the system
+    /// default flagged). Used by `pnm did-mgmt dids list-domains` and the
+    /// interactive `--domain` prompt in `create-did` /
+    /// `register-did`. The VTA asks the server with a Trust Task signed
+    /// by its own operational key.
+    pub async fn list_webvh_server_domains(
+        &self,
+        server_id: &str,
+    ) -> Result<crate::protocols::did_management::servers::ListWebvhServerDomainsResultBody, VtaError>
+    {
+        // `vta/webvh/servers/domains/0.1` (dtgwg-trust-tasks-tf#171) — the last
+        // webvh read that had no published task, and so no TSP path.
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_SERVERS_DOMAINS_0_1,
+            serde_json::json!({ "serverId": server_id }),
+            30,
+        )
+        .await
+    }
+
+    /// Ask the VTA to compare a hosting server's DIDs against its own records.
+    ///
+    /// Read-only. The VTA is the only party that can answer it — the CLI has no
+    /// host credentials, and the host has no view of the VTA's records — which
+    /// is why this is a VTA task rather than something the caller assembles
+    /// from two listings.
+    /// Retire an orphaned slot on a hosting server — one the host serves and
+    /// this VTA has no record of.
+    ///
+    /// Obtain `slot_id` (and `expected_did`, when the slot has one) from a
+    /// [`Self::reconcile_webvh_server_dids`] report rather than constructing
+    /// them. The VTA re-derives orphanhood itself and refuses if it holds any
+    /// record for the slot, so naming a live DID here is refused rather than
+    /// obeyed — but `expected_did` is what turns a *stale* report into a
+    /// refusal instead of retiring something the caller never saw.
+    ///
+    /// Destructive and irreversible: the DID stops resolving, and every relying
+    /// party that held it sees that without being able to tell retirement from
+    /// compromise.
+    pub async fn retire_orphan_slot(
+        &self,
+        body: &crate::protocols::did_management::servers::RetireOrphanSlotBody,
+    ) -> Result<crate::protocols::did_management::servers::RetireOrphanSlotResultBody, VtaError>
+    {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_SERVERS_RETIRE_ORPHAN_0_1,
+            serde_json::to_value(body)?,
+            // As reconcile: this reads the host's full listing to prove
+            // orphanhood before it removes anything.
+            60,
+        )
+        .await
+    }
+
+    pub async fn reconcile_webvh_server_dids(
+        &self,
+        server_id: &str,
+    ) -> Result<
+        crate::protocols::did_management::servers::ReconcileWebvhServerDidsResultBody,
+        VtaError,
+    > {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_SERVERS_RECONCILE_0_1,
+            serde_json::json!({ "serverId": server_id }),
+            // Longer than the domains read beside it: this makes a listing call
+            // to the host and the host may be paging thousands of slots.
+            60,
+        )
+        .await
+    }
+
+    pub async fn update_webvh_server(
+        &self,
+        id: &str,
+        req: UpdateWebvhServerRequest,
+    ) -> Result<crate::webvh::WebvhServerRecord, VtaError> {
+        // `webvh/servers/register/1.0` is the canonical twin: #850 folded
+        // add + update into it, and a payload with no `did` is exactly the
+        // label-only patch this method performs (the maintainer refuses to
+        // create a registration from one). Same body, so the move costs
+        // nothing and buys the TSP leg, which the legacy message has no
+        // dispatcher for.
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_SERVERS_REGISTER_1_0,
+            serde_json::json!({ "id": id, "label": &req.label }),
+            30,
+        )
+        .await
+    }
+
+    pub async fn remove_webvh_server(&self, id: &str) -> Result<(), VtaError> {
+        self.rpc_tt_void(
+            crate::trust_tasks::TASK_WEBVH_SERVERS_REMOVE_1_0,
+            serde_json::json!({ "id": id }),
+            30,
+        )
+        .await
+    }
+
+    /// Promote a serverless WebVH DID to a server-managed one.
+    ///
+    /// The target server must already be registered via
+    /// [`Self::add_webvh_server`]. The DID's local `did.jsonl` is
+    /// pushed to the host and the local record's `server_id` flips
+    /// to `server_id` so subsequent `update_did_webvh` calls
+    /// (including the runtime `services` mutations) auto-publish
+    /// there.
+    ///
+    /// Refused if the DID is already server-managed — re-pointing a
+    /// hosted DID at a different server is a separate operation.
+    pub async fn register_did_with_server(
+        &self,
+        did: &str,
+        server_id: &str,
+        force: bool,
+        domain: Option<&str>,
+    ) -> Result<crate::protocols::did_management::servers::RegisterDidWithServerResultBody, VtaError>
+    {
+        let body = crate::protocols::did_management::servers::RegisterDidWithServerBody {
+            did: did.to_string(),
+            server_id: server_id.to_string(),
+            force,
+            domain: domain.map(|d| d.to_string()),
+        };
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_DIDS_REGISTER_WITH_SERVER_1_0,
+            serde_json::to_value(&body)?,
+            60,
+        )
+        .await
+    }
+
+    // ── WebVH DID methods ──────────────────────────────────────────
+
+    pub async fn create_did_webvh(
+        &self,
+        req: CreateDidWebvhRequest,
+    ) -> Result<crate::protocols::did_management::create::CreateDidWebvhResultBody, VtaError> {
+        self.create_did_webvh_presented(req, Default::default())
+            .await
+    }
+
+    /// [`create_did_webvh`](Self::create_did_webvh), choosing how the new log is
+    /// presented: as its did:webvh or its did:scid:vh:1 DID, and whether it
+    /// lists its did:scid alias (VTI-VTA-036).
+    ///
+    /// Sends `vta/webvh/dids/create/1.2`; a member `presentation` leaves unstated
+    /// is left to the VTA's `[dids]` configuration. Read
+    /// [`log_did`](crate::protocols::did_management::create::CreateDidWebvhResultBody::log_did)
+    /// for the did:webvh handle the rest of the family takes.
+    pub async fn create_did_webvh_presented(
+        &self,
+        req: CreateDidWebvhRequest,
+        presentation: super::types::DidPresentation,
+    ) -> Result<crate::protocols::did_management::create::CreateDidWebvhResultBody, VtaError> {
+        let mut payload = serde_json::to_value(&req)?;
+        if let Some(method) = presentation.did_method {
+            payload["didMethod"] = serde_json::to_value(method)?;
+        }
+        if let Some(listed) = presentation.scid_also_known_as {
+            payload["scidAlsoKnownAs"] = serde_json::Value::Bool(listed);
+        }
+        self.rpc_tt(crate::trust_tasks::TASK_WEBVH_DIDS_CREATE_1_2, payload, 60)
+            .await
+    }
+
+    pub async fn get_did_webvh(&self, did: &str) -> Result<crate::webvh::WebvhDidRecord, VtaError> {
+        // `spec/vta/webvh/dids/get/1.0` carries the record under `record`, so
+        // decode the envelope and hand back the record itself — this method's
+        // return type is the record, and callers should not have to know the
+        // task grew a `log` sibling.
+        //
+        // It decoded straight into `WebvhDidRecord` while the response was
+        // flattened. That worked only because `WebvhDidRecord` does not set
+        // `deny_unknown_fields`, which is precisely the fragility
+        // `webvh_get_did_round_trips_after_the_get_log_fold` was written to
+        // warn about.
+        let body: GetDidWebvhResultBody = self
+            .rpc_tt(
+                crate::trust_tasks::TASK_WEBVH_DIDS_GET_1_0,
+                serde_json::json!({ "did": did }),
+                30,
+            )
+            .await?;
+        Ok(body.record)
+    }
+
+    pub async fn get_did_webvh_log(&self, did: &str) -> Result<GetDidLogResponse, VtaError> {
+        // The dedicated get-log task folded into `dids/get` + `includeLog`
+        // (see `GetDidWebvhBody`). `did` now lives on the nested record and
+        // `log` beside it, so this projects the envelope onto the two-member
+        // shape this method has always returned.
+        let body: GetDidWebvhResultBody = self
+            .rpc_tt(
+                crate::trust_tasks::TASK_WEBVH_DIDS_GET_1_0,
+                serde_json::json!({ "did": did, "includeLog": true }),
+                30,
+            )
+            .await?;
+        Ok(GetDidLogResponse {
+            did: body.record.did,
+            log: body.log,
+        })
+    }
+
+    /// Delete a DID, discarding the response.
+    ///
+    /// Prefer [`delete_did_webvh_with_outcome`](Self::delete_did_webvh_with_outcome):
+    /// a successful `webvh/dids/delete/1.0` can still carry
+    /// `daemonCleanupError`, which the specification says a consumer MUST
+    /// surface, and this method cannot.
+    pub async fn delete_did_webvh(&self, did: &str) -> Result<(), VtaError> {
+        self.rpc_tt_void(
+            crate::trust_tasks::TASK_WEBVH_DIDS_DELETE_1_0,
+            serde_json::json!({ "did": did }),
+            60,
+        )
+        .await
+    }
+
+    /// Delete a DID and return the `webvh/dids/delete/1.0` response.
+    ///
+    /// A success whose `daemon_cleanup_error` is set is a partial success: the
+    /// VTA removed its record, but the hosting server did not confirm removing
+    /// the published log, so the DID may still resolve. The specification
+    /// requires a consumer to surface it rather than treat the deletion as
+    /// complete.
+    ///
+    /// A DID whose hosting server is no longer registered on the VTA is refused
+    /// as [`VtaError::Conflict`], whose message names the commands to run.
+    pub async fn delete_did_webvh_with_outcome(
+        &self,
+        did: &str,
+    ) -> Result<vti_specs::vta::webvh::dids::delete::v1_0::Response, VtaError> {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_WEBVH_DIDS_DELETE_1_0,
+            serde_json::json!({ "did": did }),
+            60,
+        )
+        .await
+    }
+
+    /// Apply a generic update to an existing webvh DID, identified by the DID
+    /// itself.
+    ///
+    /// Sends canonical `webvh/dids/update/1.0` on **every** transport, or
+    /// `1.1` when `body.scid_also_known_as` is set — the one member 1.0 does
+    /// not have. An unset member keeps the request a 1.0 request, so it still
+    /// reaches a VTA that serves only 1.0 (the same rule as
+    /// [`create_did_webvh_presented`](Self::create_did_webvh_presented) and
+    /// `create/1.2`).
+    ///
+    /// The canonical task keys on the DID, not `(context_id, scid)` — which is
+    /// what kept this call on the legacy message after #861. Callers already
+    /// hold the DID; `pnm did-mgmt dids edit` was fetching the record purely
+    /// to translate it into the pair this method no longer needs.
+    pub async fn update_did_webvh_by_did(
+        &self,
+        did: &str,
+        body: crate::protocols::did_management::update::UpdateDidWebvhBody,
+    ) -> Result<crate::protocols::did_management::update::UpdateDidWebvhResultBody, VtaError> {
+        let task = update_task_for(&body);
+        let payload = flatten_with_did(did, &body)?;
+        let response = self.dispatch_trust_task(task, payload, 60).await?;
+        serde_json::from_value(response)
+            .map_err(|e| VtaError::Protocol(format!("webvh/dids/update response decode: {e}")))
+    }
+
+    /// Rotate every verificationMethod's keys on a webvh DID, identified by the
+    /// DID itself.
+    ///
+    /// The canonical `webvh/dids/rotate-keys/1.0` form of
+    /// [`rotate_did_webvh_keys`](Self::rotate_did_webvh_keys), and likewise the
+    /// only one that reaches a TSP client.
+    pub async fn rotate_did_webvh_keys_by_did(
+        &self,
+        did: &str,
+        body: crate::protocols::did_management::update::RotateDidWebvhKeysBody,
+    ) -> Result<crate::protocols::did_management::update::UpdateDidWebvhResultBody, VtaError> {
+        let payload = flatten_with_did(did, &body)?;
+        let response = self
+            .dispatch_trust_task(
+                crate::trust_tasks::TASK_WEBVH_DIDS_ROTATE_KEYS_1_0,
+                payload,
+                60,
+            )
+            .await?;
+        serde_json::from_value(response)
+            .map_err(|e| VtaError::Protocol(format!("webvh/dids/rotate-keys response decode: {e}")))
+    }
+
+    /// Realign a DID's key records with the verification methods its published
+    /// document carries — the repair for a DID minted before create read its
+    /// own document.
+    ///
+    /// `dry_run` returns the plan without writing, which is what an operator
+    /// should read first: this moves key records.
+    ///
+    /// The `webvh/dids/realign-keys/1.0` Trust Task, over whichever transport
+    /// the client holds. The agent computes every target name from the DID's
+    /// own log, so the DID and `dry_run` are the whole request.
+    pub async fn realign_did_webvh_keys(
+        &self,
+        did: &str,
+        dry_run: bool,
+    ) -> Result<did_management::realign::RealignDidKeysResultBody, VtaError> {
+        let payload = serde_json::to_value(did_management::realign::RealignDidKeysBody {
+            did: did.to_string(),
+            dry_run,
+        })
+        .map_err(|e| VtaError::Protocol(format!("webvh/dids/realign-keys payload: {e}")))?;
+        let response = self
+            .dispatch_trust_task(
+                crate::trust_tasks::TASK_WEBVH_DIDS_REALIGN_KEYS_1_0,
+                payload,
+                60,
+            )
+            .await?;
+        serde_json::from_value(response).map_err(|e| {
+            VtaError::Protocol(format!("webvh/dids/realign-keys response decode: {e}"))
+        })
+    }
+
+    // ── Agent names ───────────────────────────────────────────────────
+    //
+    // An agent name is a human-memorable `domain/@name` that resolves to a
+    // DID. Binding one edits the DID document's `alsoKnownAs` and republishes
+    // the signed log — that claim is the *sole* authorisation for the hosting
+    // server's `/@name` redirect, which is why every verb here goes through
+    // the VTA rather than talking to the host directly: only the VTA can sign.
+    //
+    // These are trust-task-only by design — there is no bespoke REST route,
+    // and none is needed: `dispatch_trust_task` posts to `/trust-tasks`
+    // on a REST transport and rides the DIDComm envelope otherwise, so both
+    // transports reach the same handler.
+
+    /// Bind `name` to `did`, adding `https://{domain}/@{name}` to the
+    /// document's `alsoKnownAs` and republishing.
+    ///
+    /// The hosting server refuses a binding whose document does not claim it,
+    /// so a success here means the claim is live.
+    pub async fn set_agent_name(
+        &self,
+        did: &str,
+        name: &str,
+    ) -> Result<agent_name::AgentNameResultBody, VtaError> {
+        self.agent_name_verb(crate::trust_tasks::TASK_WEBVH_AGENT_NAME_SET_1_0, did, name)
+            .await
+    }
+
+    /// Release `name` entirely, dropping the claim from the document.
+    ///
+    /// Distinct from [`disable_agent_name`](Self::disable_agent_name): remove
+    /// frees the name for anyone else to claim, disable parks it so it stops
+    /// resolving while staying reserved to this DID.
+    pub async fn remove_agent_name(
+        &self,
+        did: &str,
+        name: &str,
+    ) -> Result<agent_name::AgentNameResultBody, VtaError> {
+        self.agent_name_verb(
+            crate::trust_tasks::TASK_WEBVH_AGENT_NAME_REMOVE_1_0,
+            did,
+            name,
+        )
+        .await
+    }
+
+    /// Stop `name` resolving while keeping it reserved to this DID.
+    ///
+    /// Drops the claim from the document — the reservation lives in the
+    /// hosting server's registry, not in the DID.
+    pub async fn disable_agent_name(
+        &self,
+        did: &str,
+        name: &str,
+    ) -> Result<agent_name::AgentNameResultBody, VtaError> {
+        self.agent_name_verb(
+            crate::trust_tasks::TASK_WEBVH_AGENT_NAME_DISABLE_1_0,
+            did,
+            name,
+        )
+        .await
+    }
+
+    /// Bring a parked name back into service, re-adding its claim.
+    pub async fn enable_agent_name(
+        &self,
+        did: &str,
+        name: &str,
+    ) -> Result<agent_name::AgentNameResultBody, VtaError> {
+        self.agent_name_verb(
+            crate::trust_tasks::TASK_WEBVH_AGENT_NAME_ENABLE_1_0,
+            did,
+            name,
+        )
+        .await
+    }
+
+    /// Every name bound to `did`, including parked ones.
+    ///
+    /// Read live from the hosting control plane's registry, which is
+    /// authoritative — a parked name is absent from the DID document by
+    /// design, so the document alone cannot answer this.
+    pub async fn list_agent_names(
+        &self,
+        did: &str,
+    ) -> Result<vti_specs::vta::webvh::agent_name::list::v1_1::Response, VtaError> {
+        self.dispatch_trust_task(
+            crate::trust_tasks::TASK_WEBVH_AGENT_NAME_LIST_1_1,
+            serde_json::json!({ "did": did }),
+            30,
+        )
+        .await
+        .and_then(|v| {
+            serde_json::from_value(v)
+                .map_err(|e| VtaError::Protocol(format!("agent-name list decode: {e}")))
+        })
+    }
+
+    /// Whether `name` is free on the domain `did` is hosted under.
+    ///
+    /// Advisory only — the name can be taken between this call and a
+    /// [`set_agent_name`](Self::set_agent_name), which is why `set` reports
+    /// its own conflict rather than relying on a prior check.
+    pub async fn check_agent_name(
+        &self,
+        did: &str,
+        name: &str,
+    ) -> Result<agent_name::AgentNameCheckResultBody, VtaError> {
+        self.dispatch_trust_task(
+            crate::trust_tasks::TASK_WEBVH_AGENT_NAME_CHECK_1_0,
+            serde_json::json!({ "did": did, "name": name }),
+            30,
+        )
+        .await
+        .and_then(|v| {
+            serde_json::from_value(v)
+                .map_err(|e| VtaError::Protocol(format!("agent-name check decode: {e}")))
+        })
+    }
+
+    /// The four mutating verbs share a body and differ only by task URI.
+    async fn agent_name_verb(
+        &self,
+        task_uri: &str,
+        did: &str,
+        name: &str,
+    ) -> Result<agent_name::AgentNameResultBody, VtaError> {
+        // Republishing a signed log is slower than a plain read; the DID
+        // document is rebuilt, re-signed and pushed to the host.
+        let payload = self
+            .dispatch_trust_task(
+                task_uri,
+                serde_json::json!({ "did": did, "name": name }),
+                60,
+            )
+            .await?;
+        serde_json::from_value(payload)
+            .map_err(|e| VtaError::Protocol(format!("agent-name response decode: {e}")))
+    }
+}
+
+/// Build a `webvh/dids/*` task payload: the body's own members at the top
+/// level, plus the `did` the task keys on.
+///
+/// The maintainer reads this back with `#[serde(flatten)]`, so `did` has to sit
+/// beside the body's members rather than nested under one. Anything that does
+/// not serialize to a JSON object — or that already carries a `did` — is a
+/// programming error here, and is refused rather than silently reshaped: a
+/// dropped member on an update body is a DID-document change the operator
+/// believes they published.
+/// **Public because the wire shape must be testable from outside.**
+///
+/// This function *is* the `vta/webvh/dids/*` request shape — body members
+/// flattened beside `did`. While it was private, the only way to assert that
+/// shape from another crate was to hand-write the JSON, and a hand-written
+/// fixture stops tracking the code the moment the code changes. The
+/// conformance sweep's witness for `dids/update` did exactly that, for the task
+/// that had already shipped broken once (#895). Exporting the shaping is what
+/// lets a witness be built rather than transcribed.
+pub fn flatten_with_did<T: serde::Serialize>(
+    did: &str,
+    body: &T,
+) -> Result<serde_json::Value, VtaError> {
+    let mut map = match serde_json::to_value(body)? {
+        serde_json::Value::Object(m) => m,
+        other => {
+            return Err(VtaError::Protocol(format!(
+                "webvh task body must serialize to an object, got {}",
+                match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "a boolean",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::String(_) => "a string",
+                    serde_json::Value::Array(_) => "an array",
+                    serde_json::Value::Object(_) => unreachable!(),
+                }
+            )));
+        }
+    };
+    if map.contains_key("did") {
+        return Err(VtaError::Protocol(
+            "webvh task body already carries a `did` member; refusing to overwrite it with the \
+             target DID"
+                .into(),
+        ));
+    }
+    map.insert("did".into(), serde_json::Value::String(did.to_string()));
+    Ok(serde_json::Value::Object(map))
+}
+
+/// The `vta/webvh/dids/update` version a body needs: `1.1` when it sets
+/// `scidAlsoKnownAs`, the one member 1.0 does not define, and `1.0` otherwise.
+pub fn update_task_for(
+    body: &crate::protocols::did_management::update::UpdateDidWebvhBody,
+) -> &'static str {
+    if body.scid_also_known_as.is_some() {
+        crate::trust_tasks::TASK_WEBVH_DIDS_UPDATE_1_1
+    } else {
+        crate::trust_tasks::TASK_WEBVH_DIDS_UPDATE_1_0
+    }
+}
+
+#[cfg(test)]
+mod update_version_tests {
+    use super::update_task_for;
+    use crate::protocols::did_management::update::UpdateDidWebvhBody;
+    use crate::trust_tasks::{TASK_WEBVH_DIDS_UPDATE_1_0, TASK_WEBVH_DIDS_UPDATE_1_1};
+
+    /// 1.1 only when stated: an ordinary update still reaches a VTA that
+    /// serves only 1.0, and the alias — either way — is never sent as 1.0,
+    /// whose closed schema would refuse it.
+    #[test]
+    fn only_the_scid_alias_selects_1_1() {
+        assert_eq!(
+            update_task_for(&UpdateDidWebvhBody {
+                label: Some("x".into()),
+                ..Default::default()
+            }),
+            TASK_WEBVH_DIDS_UPDATE_1_0
+        );
+        for on in [true, false] {
+            assert_eq!(
+                update_task_for(&UpdateDidWebvhBody {
+                    scid_also_known_as: Some(on),
+                    ..Default::default()
+                }),
+                TASK_WEBVH_DIDS_UPDATE_1_1
+            );
+        }
+    }
+}

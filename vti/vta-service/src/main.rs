@@ -1,0 +1,3399 @@
+// jemalloc as the global allocator (the `jemalloc` feature, on by default).
+// glibc malloc keeps freed pages in its arenas rather than returning them, so
+// RSS ratchets to the high-water mark and never falls back — indistinguishable
+// from a leak on a memory graph. jemalloc purges freed pages back to the OS.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc tuning, read by jemalloc itself at startup via this well-known symbol.
+///
+/// `background_thread:true` runs the purger on its own thread, so freed pages
+/// are returned even while the process is idle (without it, purging only
+/// happens as a side effect of later allocator calls). `dirty_decay_ms` /
+/// `muzzy_decay_ms` are how long freed pages linger before being returned;
+/// 5s (default 10s) keeps RSS close to the live heap at negligible cost for an
+/// I/O-bound service.
+///
+/// The name is `_rjem_malloc_conf`, not `malloc_conf`: `tikv-jemalloc-sys`
+/// builds jemalloc with the `_rjem_` symbol prefix, so an unprefixed
+/// `malloc_conf` would be silently ignored.
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. This is the name jemalloc documents for
+/// exactly this, it is defined once (in the binary, never the library), and
+/// the value is the NUL-terminated static string jemalloc expects. The type is a
+/// reference to a fixed-size array, a thin pointer matching jemalloc's
+/// `const char *malloc_conf`; a `&[u8]` slice reference would be two words.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+// CLI-only modules (not part of the library)
+mod acl_cli;
+mod approvals_cli;
+mod bootstrap_cli;
+mod did_key;
+#[cfg(feature = "setup")]
+mod did_peer;
+#[cfg(feature = "setup")]
+mod did_webvh;
+mod import_did;
+mod keys_cli;
+mod services_cli;
+#[cfg(feature = "setup")]
+mod setup;
+#[cfg(feature = "tsp")]
+mod tsp_relationships_cli;
+mod vault_cli;
+#[cfg(feature = "webvh")]
+mod webvh_cli;
+
+// Re-export library modules for use by CLI commands
+use vta_service::*;
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use clap::{ArgGroup, Parser, Subcommand};
+use config::AppConfig;
+use ed25519_dalek::SigningKey;
+use keys::seed_store::create_seed_store;
+use keys::seeds::load_seed_bytes;
+use multibase::Base;
+use std::path::PathBuf;
+use std::sync::Arc;
+use vti_common::slip10::{DerivationPath, ExtendedSigningKey};
+
+// There must be a valid mix of transports for the VTA Service
+// The following checks if a valid set of features is enabled at compile time and produces a
+// helpful error message if not.
+#[cfg(not(any(feature = "rest", feature = "didcomm")))]
+compile_error!("At least one of 'rest' or 'didcomm' must be enabled.");
+
+#[derive(Parser)]
+#[command(name = "vta", about = "Verifiable Trust Agent", version)]
+struct Cli {
+    /// Path to the configuration file
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Boot the daemon even when the VTA has no usable signing identity
+    /// (missing `vta_did` or JWT signing key). Without this flag the daemon
+    /// refuses to start rather than come up in a state where every
+    /// authenticated endpoint returns 401 (P0.9b). Use only to inspect or
+    /// finish provisioning a half-set-up instance. Ignored by subcommands.
+    #[arg(long)]
+    allow_degraded: bool,
+
+    /// On startup, before going live, purge BOTH this DID's mediator inbox and
+    /// its outbound (sender) queue. Recovery for a queue wedged full by a
+    /// message loop: once the mediator's per-sender cap (`limits.queue.sender`)
+    /// trips, it rejects every new send until the backlog is cleared. Implies
+    /// the inbox drain and additionally clears the outbound queue the
+    /// config-driven `drain_inbox_on_start` can't reach. Ignored by subcommands.
+    #[arg(long)]
+    flush_queues: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the setup wizard.
+    ///
+    /// Without arguments, prompts interactively. With `--from <file>`, reads
+    /// a TOML setup-inputs file and runs end-to-end without prompts —
+    /// suitable for CI, immutable images, or any unattended provisioning.
+    /// See `vta_service::setup::WizardInputs` for the schema.
+    Setup {
+        /// Path to a TOML setup-inputs file. When set, setup runs
+        /// non-interactively. The file format mirrors the on-disk
+        /// `config.toml` plus a few one-shot fields (`admin_did`,
+        /// `data_dir_exists`, etc.) that the interactive wizard normally
+        /// collects via prompts.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// Bootstrap the first admin and seal the VTA against offline CLI modifications.
+    ///
+    /// This is a ONE-TIME operation. After sealing, all CLI commands that modify
+    /// state (ACL, keys, import, export) are disabled. Management is only possible
+    /// via the authenticated REST API or DIDComm.
+    BootstrapAdmin {
+        /// DID to grant super admin access (must be a DID you control)
+        #[arg(long)]
+        did: String,
+        /// Human-readable label for the admin ACL entry
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Unseal the VTA — re-enables offline CLI commands (emergency recovery).
+    ///
+    /// Requires proof of super admin key ownership via challenge-response:
+    /// the VTA generates a random challenge, you sign it with your admin
+    /// private key using either `pnm auth sign-challenge <hex>` (online,
+    /// uses PNM's stored admin key) or `vta auth sign-challenge --did
+    /// <did> --challenge <hex>` (offline cold-start, signs from the local
+    /// keystore — daemon must be stopped). Paste the signature back into
+    /// the prompt.
+    Unseal,
+    /// Authentication helpers (offline; safe to run while sealed).
+    ///
+    /// Today: only the `sign-challenge` subcommand, which signs the
+    /// challenge from `vta unseal` using a key from the local fjall
+    /// keystore. Useful for cold-start operators who can't reach PNM
+    /// yet (no network, no PNM auth setup, etc.).
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+    /// Export admin DID and credential (blocked when sealed)
+    ExportAdmin,
+    /// Show VTA status and statistics
+    Status,
+    /// Inspect the configuration file (offline, no server required).
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+    /// Inspect and unwedge the approval rules (offline break-glass).
+    ///
+    /// Reads and writes the policy keyspace directly — no auth, no running
+    /// VTA. Approvals are self-gating on purpose (two-person control over the
+    /// gate itself is a feature), so a rule that gates `policy/*` with an
+    /// unreachable approver set cannot be removed over the wire. This is the
+    /// way out. Replaces the retired `vta step-up`, which did the same job for
+    /// the config floors. Daemon must be stopped; not available in TEE.
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommands,
+    },
+    /// Inspect and remove stored policy modules (offline break-glass).
+    ///
+    /// The hand-authored-Rego half of the above: a module installed with
+    /// `pnm policy upsert` can deny everything, including the `policy/delete`
+    /// that would remove it.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
+    /// Create a did:key in a context (offline, no server required)
+    CreateDidKey {
+        /// Target context ID
+        #[arg(long)]
+        context: String,
+        /// Also create an ACL entry with Admin role for the new DID
+        #[arg(long)]
+        admin: bool,
+        /// Human-readable label for the key record and ACL entry
+        #[arg(long)]
+        label: Option<String>,
+        /// Import an EXTERNAL Ed25519 private key from this file (64 hex chars
+        /// = 32 bytes) instead of deriving a fresh key from the VTA seed. The
+        /// resulting did:key is deterministic in that key material, so re-runs
+        /// on a fresh volume reproduce the SAME did:key — used to bind a vault
+        /// signing entry to a persona DID whose key is held off-box.
+        ///
+        /// A file, not a flag value: an argv-borne secret is visible in `ps`,
+        /// shell history, and container/CI process listings. Keep it 0600.
+        ///
+        /// With --admin this grants admin to a DID whose private key lives
+        /// outside the VTA. Only point it at key material you control.
+        #[arg(long, value_name = "PATH")]
+        private_key_file: Option<PathBuf>,
+    },
+    /// Create a did:webvh DID for a context (interactive wizard, no server required).
+    ///
+    /// Passing `--url` makes the command fully non-interactive (no prompts) so
+    /// it can be scripted: combine with `--export-secrets` to emit the secrets
+    /// bundle to stdout and `--admin` to grant the new DID admin in the context.
+    CreateDidWebvh {
+        /// Target context ID
+        #[arg(long)]
+        context: String,
+        /// Human-readable label prefix for key records (default: context id)
+        #[arg(long)]
+        label: Option<String>,
+        /// Hosting URL for the DID (e.g. https://example.com). When set, the
+        /// command runs fully non-interactive — no hosting-URL, save-log, or
+        /// export-secrets prompts.
+        #[arg(long)]
+        url: Option<String>,
+        /// Emit the `DidSecretsBundle` JSON to stdout (the only thing on
+        /// stdout; human text goes to stderr) and skip the save-log /
+        /// export-secrets prompts.
+        #[arg(long)]
+        export_secrets: bool,
+        /// Also create an ACL entry with Admin role for the new did:webvh in
+        /// the target context (mirrors `create-did-key --admin`).
+        #[arg(long)]
+        admin: bool,
+        /// Write the DID log (did.jsonl) to this file path. Useful for
+        /// publishing to external hosting (e.g. GitLab Pages).
+        #[arg(long)]
+        did_log_file: Option<PathBuf>,
+        /// Present the DID as its did:webvh (`webvh`) or its did:scid:vh:1
+        /// DID (`scid`). Default: the VTA's `[dids] default_did_method`.
+        #[arg(long, value_name = "webvh|scid")]
+        did_method: Option<vta_sdk::did_scid::DidMethod>,
+        /// List the did:scid alias in alsoKnownAs (`true`/`false`). Default:
+        /// the VTA's `[dids] scid_also_known_as`.
+        #[arg(long, value_name = "BOOL")]
+        scid_also_known_as: Option<bool>,
+    },
+    /// Create a self-contained did:peer:2 agent identity for a context.
+    ///
+    /// A did:peer encodes its keys and service endpoints in the DID itself, so
+    /// it resolves locally with no hosting — ideal for testing/dev and
+    /// ephemeral agents (production uses did:webvh). Fully non-interactive:
+    /// there is no hosting step, so nothing to prompt for. Mirrors
+    /// `create-did-webvh` minus all hosting (no `--url`, no did.jsonl, no log).
+    ///
+    /// Exactly one of `--mediator-url` / `--mediator-did` is required; the
+    /// `mediator` arg group makes that a clap usage error rather than a
+    /// runtime one.
+    #[command(group(
+        ArgGroup::new("mediator")
+            .required(true)
+            .args(["mediator_url", "mediator_did"])
+    ))]
+    CreateDidPeer {
+        /// Target context ID
+        #[arg(long)]
+        context: String,
+        /// Mediator HTTP endpoint (e.g. http://127.0.0.1:61881/mediator/v1)
+        /// used to build the did:peer's DIDComm + Authentication services so
+        /// the agent is reachable (URL-style). The ws:// endpoint is derived
+        /// from it. Mutually exclusive with --mediator-did.
+        #[arg(long, group = "mediator")]
+        mediator_url: Option<String>,
+        /// Mediator DID (e.g. did:webvh:...:mediator). Builds a DID-style
+        /// DIDComm service (serviceEndpoint.uri = the mediator DID), matching
+        /// the online provision-integration path and the ai-agent template.
+        /// Required for mediators that route by DID: they treat a URL endpoint
+        /// as a remote hop and self-forward the reply, so the agent never
+        /// receives one. Mutually exclusive with --mediator-url.
+        #[arg(long, group = "mediator")]
+        mediator_did: Option<String>,
+        /// Emit the `DidSecretsBundle` JSON to stdout (the only thing on
+        /// stdout; human text goes to stderr).
+        #[arg(long)]
+        export_secrets: bool,
+        /// Also create an ACL entry with Admin role for the new did:peer in
+        /// the target context (mirrors `create-did-webvh --admin`).
+        #[arg(long)]
+        admin: bool,
+        /// Human-readable label for the ACL entry / display.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Import an external DID and create an ACL entry (offline, no server required)
+    ImportDid {
+        /// The DID to import
+        #[arg(long)]
+        did: String,
+        /// Role to assign (admin, initiator, application, reader)
+        #[arg(long)]
+        role: Option<String>,
+        /// Human-readable label for the ACL entry
+        #[arg(long)]
+        label: Option<String>,
+        /// Restrict to specific context(s); omit for unrestricted access
+        #[arg(long)]
+        context: Vec<String>,
+    },
+    /// Manage Access Control List entries (offline, no server required)
+    Acl {
+        #[command(subcommand)]
+        command: AclCommands,
+    },
+    /// Hardened configuration management (offline; requires `[hardened] enabled = true`).
+    Hardened {
+        #[command(subcommand)]
+        command: HardenedCommands,
+    },
+    /// Manage keys (offline, no server required)
+    Keys {
+        #[command(subcommand)]
+        command: KeyCliCommands,
+    },
+    /// Manage application contexts (offline, no server required)
+    ///
+    /// Mirrors `pnm contexts` so cold-start / air-gapped operators
+    /// have an identical CLI surface (list/get/create/update/delete)
+    /// against the local keystore. The historical `vta context`
+    /// (singular) form is retained as a hidden alias for scripts
+    /// already in production.
+    #[command(alias = "context")]
+    Contexts {
+        #[command(subcommand)]
+        command: ContextCommands,
+    },
+    /// Manage the VTA's DIDs and the DID-hosting servers they live
+    /// on. Offline equivalent of `pnm did-mgmt …` — operates
+    /// directly on the local fjall keystore, so the daemon must be
+    /// stopped.
+    ///
+    /// `vta did-mgmt servers {add,list,update,delete}` manages the
+    /// controller's registered DID-hosting servers. `vta did-mgmt
+    /// dids {…}` operates on the DIDs themselves.
+    ///
+    /// Replaced the earlier `vta webvh …` surface, whose hidden alias
+    /// was retired after its one-release deprecation window. The DID
+    /// method itself remains `did:webvh`; only the operator UX
+    /// category was renamed.
+    #[cfg(feature = "webvh")]
+    DidMgmt {
+        #[command(subcommand)]
+        command: DidMgmtCommands,
+    },
+
+    /// Sealed-transfer bootstrap — seal payloads for offline consumer
+    /// provisioning (mediators, webvh servers, and other complex clients).
+    Bootstrap {
+        #[command(subcommand)]
+        command: BootstrapCommands,
+    },
+    /// Dev-only vault operations (offline). M1 ships `seed` — populates the
+    /// `vault:` keyspace from a JSON file or a built-in demo set so operators
+    /// can exercise vault/list/0.1 against a running VTA. Daemon must be
+    /// stopped (fjall exclusive lock); not available in TEE deployments
+    /// (the enclave's vsock-store is the only writer there — use the
+    /// upcoming `vault/upsert/0.1` Trust Task instead).
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommands,
+    },
+    /// Manage the VTA's advertised transport services offline.
+    ///
+    /// Mirrors the `pnm services …` surface but operates directly
+    /// on the local fjall keystore — no HTTP, no auth ceremony,
+    /// no running VTA required. Filesystem access to the data
+    /// directory is the security boundary (same model as
+    /// `vta acl …`, `vta keys …`, etc.).
+    ///
+    /// **Not for TEE deployments.** Inside a Nitro Enclave the VTA's
+    /// fjall store lives behind a vsock proxy; the offline `vta`
+    /// binary on the parent has no access. Use `pnm services …`
+    /// against the running VTA instead.
+    ///
+    /// **Don't run while the VTA daemon is running.** fjall's file
+    /// lock will reject the open if the daemon holds it, so
+    /// concurrent corruption is impossible — but offline writes
+    /// won't be picked up until the daemon restarts. Prefer
+    /// `pnm services` against the live VTA when both are available.
+    #[cfg(feature = "webvh")]
+    Services {
+        #[command(subcommand)]
+        command: ServicesCommands,
+    },
+    /// Inspect and clear this VTA's persisted TSP relationships (offline).
+    ///
+    /// Each endpoint keeps its own half of every relationship; the mediator
+    /// holds none, so wiping it resets nothing. To make this VTA and a peer
+    /// meet as strangers again, clear both halves — here and on the peer.
+    /// Daemon must be stopped; `reset` and `delete` are refused when sealed.
+    #[cfg(feature = "tsp")]
+    TspRelationships {
+        #[command(subcommand)]
+        command: TspRelationshipCommands,
+    },
+}
+
+#[cfg(feature = "tsp")]
+#[derive(Subcommand)]
+enum TspRelationshipCommands {
+    /// List the established relationships, with when each was last active.
+    List,
+    /// Reset our half of a relationship to `None`, so the next send to the peer
+    /// re-invites. Keeps the cached peer capability.
+    Reset {
+        /// The peer's DID (its TSP VID).
+        #[arg(long)]
+        peer: String,
+        /// This VTA's VID for the pair. Needed only for a half-formed
+        /// relationship, which `list` cannot show.
+        #[arg(long)]
+        our: Option<String>,
+    },
+    /// Delete relationship records outright.
+    Delete {
+        /// The peer's DID (its TSP VID).
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        peer: Option<String>,
+        /// This VTA's VID for the pair. Needed only for a half-formed
+        /// relationship, which `list` cannot show.
+        #[arg(long, requires = "peer", conflicts_with = "all")]
+        our: Option<String>,
+        /// Delete every record, established or half-formed.
+        #[arg(long)]
+        all: bool,
+        /// Confirm `--all`. Without it, only reports what would be deleted.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VaultCommands {
+    /// Populate the `vault:` keyspace with VaultEntry records.
+    ///
+    /// Reads entries from a JSON file (array of canonical VaultEntry shape,
+    /// per `https://trusttasks.org/spec/vault/_shared/0.1/vault-entry`), or
+    /// — when `--entries-file` is omitted and `--context` is supplied —
+    /// seeds three built-in demo entries that exercise every field shown
+    /// in the wallet popup's vault panel (web + iOS targets, password and
+    /// passkey kinds, tags, a breach flag, a never-used entry).
+    ///
+    /// Refuses to overwrite an entry with an existing id unless `--force`
+    /// is passed — vault entries with stable ids generally shouldn't be
+    /// silently rewritten.
+    ///
+    /// Daemon must be stopped (fjall holds an exclusive lock); restart
+    /// after seeding to make the entries visible via vault/list/0.1.
+    Seed {
+        /// Path to a JSON file containing an array of VaultEntry objects.
+        /// Mutually exclusive with `--context` for the demo set.
+        #[arg(long)]
+        entries_file: Option<std::path::PathBuf>,
+        /// Trust context id the demo entries land under. Required when
+        /// `--entries-file` is omitted; ignored when entries supply their
+        /// own `contextId`.
+        #[arg(long)]
+        context: Option<String>,
+        /// Print the entries that would be seeded without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite an existing entry with the same id.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete every row in the `vault:` keyspace.
+    ///
+    /// Use cases:
+    /// - Clear out stale-format rows after a schema migration
+    ///   (e.g. M1's bare `VaultEntry` rows became unreadable after
+    ///   M2A introduced the `StoredVaultEntry { entry, secret }`
+    ///   wrapper — a fresh wipe is faster than writing a one-shot
+    ///   re-wrapper).
+    /// - Reset the demo state between test runs.
+    ///
+    /// A hard, bulk delete — there is no soft-delete or grace window on
+    /// this path. Refuses to run unless `--yes` is supplied (without it,
+    /// it reports what would be deleted): this is irreversible against the
+    /// local store and you'd lose any real entries the wallet has saved.
+    ///
+    /// Daemon must be stopped (fjall holds an exclusive lock); the
+    /// `vault:` keyspace is the only one touched, so other VTA
+    /// state (ACL, contexts, keys, audit) is preserved.
+    Wipe {
+        /// Required confirmation flag. Without it the command lists
+        /// the row count and exits without writing. `--force` is accepted
+        /// as a hidden alias.
+        #[arg(long = "yes", short = 'y', alias = "force")]
+        yes: bool,
+        /// Optional: only wipe rows whose `contextId` matches.
+        /// Useful when the user wants to reset a single persona's
+        /// vault without clearing the others. Omit to wipe every row.
+        #[arg(long)]
+        context: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BootstrapCommands {
+    /// Generate a fresh BootstrapRequest (consumer side).
+    ///
+    /// Mints an ephemeral Ed25519 keypair, persists the seed under
+    /// `<seed-dir>/bootstrap-secrets/<bundle_id>.key`, and writes the
+    /// `BootstrapRequest` JSON. Hand the JSON to the VTA operator; they
+    /// return an armored sealed bundle which `vta bootstrap open` decrypts
+    /// using the persisted seed.
+    ///
+    /// Used in cold-start scenarios where `pnm bootstrap request` isn't
+    /// available — same wire format, different binary.
+    Request {
+        /// Output path for the BootstrapRequest JSON.
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional human-readable label echoed back in the request.
+        #[arg(long)]
+        label: Option<String>,
+        /// Override the default seed cache directory
+        /// (`~/.config/vta/bootstrap-secrets/`). Useful in CI or sealed
+        /// images where `$HOME` isn't writable.
+        #[arg(long)]
+        seed_dir: Option<PathBuf>,
+    },
+    /// Open an armored sealed bundle returned by the producer (consumer side).
+    ///
+    /// Looks up the seed by `bundle_id` under `<seed-dir>/bootstrap-secrets/`,
+    /// derives the X25519 HPKE secret, decrypts, and prints the payload.
+    /// Counterpart to `vta bootstrap request`.
+    ///
+    /// When `--expect-vta-did` is set and the payload is a
+    /// `TemplateBootstrap`, the VTA-issued authorization VC is verified
+    /// end-to-end: the pinned DID is cross-checked against the bundle's
+    /// `vta_trust.vta_did` and against `credentialSubject.adminOf.vta`,
+    /// the issuer's pubkey is extracted from the bundled DID document's
+    /// verificationMethod array, and the Data Integrity proof is
+    /// verified. The DidSigned producer assertion (when present) is
+    /// verified against the same key. Without this flag the opener
+    /// trusts only the OOB SHA-256 digest; the printed payload is
+    /// labelled "unverified trust bundle" so it's obvious.
+    Open {
+        /// Path to the armored sealed bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest, communicated by the producer
+        /// out-of-band. Required unless `--no-verify-digest` is set.
+        #[arg(long)]
+        expect_digest: Option<String>,
+        /// Skip out-of-band digest verification. Prints a warning;
+        /// intended for testing only.
+        #[arg(long, default_value_t = false)]
+        no_verify_digest: bool,
+        /// Pin the VTA DID out-of-band. When supplied and the payload is
+        /// a `TemplateBootstrap`, the VC + producer assertion are
+        /// verified end-to-end against this DID; mismatches are
+        /// rejected (no silent fallback). Without this flag,
+        /// verification is digest-only.
+        #[arg(long)]
+        expect_vta_did: Option<String>,
+        /// Override the default seed cache directory
+        /// (`~/.config/vta/bootstrap-secrets/`). Must match the value
+        /// passed to `vta bootstrap request`.
+        #[arg(long)]
+        seed_dir: Option<PathBuf>,
+    },
+    /// Seal a payload for a consumer's BootstrapRequest (offline / Mode C).
+    ///
+    /// Reads the consumer's request (containing their ephemeral X25519 pubkey
+    /// and a nonce), seals the supplied payload to that pubkey using HPKE,
+    /// and writes an armored bundle. Prints the canonical SHA-256 digest the
+    /// operator must communicate to the consumer out-of-band so they can
+    /// pass it to `vta bootstrap open --expect-digest` (or
+    /// `pnm bootstrap open` if the consumer has pnm installed).
+    ///
+    /// Producer authenticity in this mode is `PinnedOnly`: the consumer
+    /// trusts the producer pubkey embedded in the bundle because they
+    /// pinned it out-of-band.
+    Seal {
+        /// Path to the consumer's BootstrapRequest JSON.
+        #[arg(long)]
+        request: PathBuf,
+        /// Path to a JSON file containing a SealedPayloadV1.
+        #[arg(long)]
+        payload: PathBuf,
+        /// Output path for the armored bundle.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Generate a VP-framed BootstrapRequest for the provision-integration
+    /// flow (consumer side).
+    ///
+    /// Mints an ephemeral Ed25519 keypair, persists the seed under
+    /// `<seed-dir>/bootstrap-secrets/<bundle_id>.key`, and writes a signed
+    /// VP (VC Data Model 2.0 `VerifiablePresentation` + `BootstrapRequest`
+    /// types) carrying a `TemplateBootstrap` ask naming the target
+    /// template and variables. Hand the JSON to the VTA operator; they
+    /// return an armored sealed bundle which `vta bootstrap open`
+    /// decrypts using the persisted seed.
+    ///
+    /// Used by integration operators (mediator, DID-hosting control plane and
+    /// daemon, witness, etc.) to request enrollment from a VTA that may not
+    /// yet be network-reachable. See
+    /// `docs/02-vta/provision-integration.md` for the end-to-end
+    /// flow.
+    ProvisionRequest {
+        /// DID template name the VTA should render: a built-in or an
+        /// operator-uploaded custom template.
+        #[arg(long, long_help = template_name_help())]
+        template: String,
+        /// Template variable, repeat for each binding. Format `KEY=VALUE`.
+        /// Values are parsed as JSON when the value starts with `{`, `[`,
+        /// `"`, digit, `true`, `false`, or `null`; otherwise treated as a
+        /// string.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+        /// Hint the target VTA context. The VTA operator may override
+        /// but if they do and the hint disagrees, the request is
+        /// rejected rather than silently normalised.
+        #[arg(long)]
+        context_hint: Option<String>,
+        /// Opt into long-term admin-DID rollover: the VTA mints a
+        /// fresh admin DID under its own key custody (default template
+        /// `vta-admin`) and binds authorization to that DID instead
+        /// of the ephemeral `client_did`. Recommended for any
+        /// integration that stays up long-term.
+        #[arg(long)]
+        admin_template: Option<String>,
+        /// Freshness window in hours for the VP's `validUntil`.
+        /// Default 168 (7 days) — setup-file shuffling between hosts
+        /// is slow.
+        #[arg(long, value_name = "HOURS", default_value_t = 168.0)]
+        validity_hours: f64,
+        /// Free-form human label echoed back in audit logs.
+        #[arg(long)]
+        label: Option<String>,
+        /// Override the default seed cache directory
+        /// (`~/.config/vta/bootstrap-secrets/`). Must match the
+        /// `--seed-dir` passed to `vta bootstrap open` on the same host.
+        #[arg(long)]
+        seed_dir: Option<PathBuf>,
+        /// Output path for the signed BootstrapRequest JSON.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Provision a template-driven integration (mediator, webvh-host,
+    /// future kinds) for a consumer's VP-framed BootstrapRequest.
+    ///
+    /// Mints integration key material, renders the named DID template,
+    /// creates an admin ACL entry for the consumer's `client_did`,
+    /// issues a VTA-signed authorization VC, and seals everything to
+    /// the consumer's X25519 pubkey (derived from `client_did`).
+    ///
+    /// See `docs/02-vta/provision-integration.md` for the full flow.
+    #[cfg(feature = "webvh")]
+    ProvisionIntegration {
+        /// Path to the consumer's VP-framed BootstrapRequest JSON
+        /// (`pnm bootstrap request --out …`).
+        #[arg(long)]
+        request: PathBuf,
+        /// VTA context the integration will live in. Must be an
+        /// existing context the operator is admin of (or pass
+        /// `--create-context` to create it inline). If the request
+        /// carries a `contextHint`, this flag must either match it or
+        /// be omitted.
+        #[arg(long)]
+        context: Option<String>,
+        /// Create the target context if it does not already exist.
+        /// Idempotent — silently succeeds if the context exists. The
+        /// context is created with `name = <id>`; rename later via the
+        /// REST API if needed. Without this flag, a missing context
+        /// fails with operator-remediation guidance.
+        #[arg(long)]
+        create_context: bool,
+        /// Producer assertion mode on the returned sealed bundle.
+        /// `did-signed` (default) signs with the VTA's `{vta_did}#key-0`.
+        /// `pinned-only` is a dev/test escape hatch — no in-band
+        /// signature, digest-pinning only.
+        #[arg(long, default_value = "did-signed")]
+        assertion: crate::bootstrap_cli::AssertionModeFlag,
+        /// Override for the VC's `validUntil` window, in hours. Default
+        /// is 1h. Fractional hours accepted (e.g. `0.25` for 15min).
+        #[arg(long, value_name = "HOURS")]
+        vc_validity_hours: Option<f64>,
+        /// Output path for the armored bundle.
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCliCommands {
+    /// List keys
+    List {
+        /// Filter by context ID
+        #[arg(long)]
+        context: Option<String>,
+        /// Filter by status (active or revoked)
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Export secret key material for one or more keys
+    Secrets {
+        /// Key IDs to export (omit to export all active keys in --context)
+        key_ids: Vec<String>,
+        /// Export all active keys in this context
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// List seed generations and their status
+    Seeds,
+    /// Rotate to a new master seed (retires the current seed)
+    RotateSeed {
+        /// BIP-39 mnemonic for the new seed (generates random if omitted)
+        #[arg(long)]
+        mnemonic: Option<String>,
+    },
+    /// Export all active keys in a context as a sealed DidSecrets bundle.
+    ///
+    /// Reads the local keystore directly — no running VTA or network
+    /// required. Mirrors `pnm keys bundle` but works in cold-start /
+    /// air-gapped environments where PNM cannot reach the VTA.
+    Bundle {
+        /// Context ID whose active keys should be exported.
+        #[arg(long)]
+        context: String,
+        /// Path to the consumer's BootstrapRequest JSON (v1). Mutually
+        /// exclusive with `--recipient-did` / `--recipient-nonce`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<PathBuf>,
+        /// Inline consumer DID (`did:key:z6Mk...`). Requires `--recipient-nonce`.
+        #[arg(long, requires = "recipient_nonce")]
+        recipient_did: Option<String>,
+        /// Inline consumer nonce (32 hex chars == 16 bytes). Requires
+        /// `--recipient-did`.
+        #[arg(long, requires = "recipient_did")]
+        recipient_nonce: Option<String>,
+        /// Output path for the armored sealed bundle. If omitted, the
+        /// armor is written to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContextCommands {
+    /// List all application contexts.
+    List,
+    /// Get a context by ID.
+    Get {
+        /// Context ID.
+        id: String,
+    },
+    /// Create an application context (offline, no running VTA required).
+    ///
+    /// Allocates the next BIP-32 context index and writes the context
+    /// record. Mirrors the online `POST /contexts` endpoint (and
+    /// `pnm contexts create`) for cold-start / air-gapped operators
+    /// who need to provision a context before standing the service up.
+    ///
+    /// Without `--admin-did` no keys, ACL entries, or DID are minted —
+    /// pair with `vta bootstrap provision-integration` (or run it with
+    /// `--create-context`) to populate the context. Supplying
+    /// `--admin-did` writes an admin ACL entry scoped to the new
+    /// context atomically with the context record, mirroring the
+    /// `pnm contexts create --admin-did` shorthand.
+    Create {
+        /// Context ID (slug). Lowercase alphanumeric + hyphens, ≤64
+        /// chars, no leading/trailing hyphen.
+        #[arg(long)]
+        id: String,
+        /// Human-readable name. Defaults to the id when omitted.
+        #[arg(long)]
+        name: Option<String>,
+        /// Free-form description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Parent context path to nest under (e.g. `acme/eng`). Creates a
+        /// sub-context; omit for a top-level context.
+        #[arg(long)]
+        parent: Option<String>,
+        /// DID to grant admin access to (must start with `did:`). When
+        /// set, atomically creates an ACL entry with role=admin scoped
+        /// to this context.
+        #[arg(long)]
+        admin_did: Option<String>,
+        /// Human-readable label for the admin ACL entry.
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Setup-ACL expiry — accepts `N[s|m|h|d|w]` (e.g. `24h`, `7d`).
+        /// When set, the admin ACL entry auto-expires via the server's
+        /// ACL sweeper. Without this flag the entry is permanent.
+        /// Requires `--admin-did`.
+        #[arg(long, requires = "admin_did")]
+        admin_expires: Option<String>,
+        /// Mark the admin entry as a one-time hand-off (VTI-ACL-054), so the
+        /// admin DID can roll over once to a VTA-minted long-term admin.
+        /// Requires `--admin-expires`.
+        #[arg(long, requires = "admin_expires")]
+        admin_handoff: bool,
+    },
+    /// Update an existing context.
+    Update {
+        /// Context ID.
+        id: String,
+        /// New name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Set the DID for this context.
+        #[arg(long, conflicts_with = "clear_did")]
+        did: Option<String>,
+        /// Leave the context with no DID of its own. The DID itself is not
+        /// deleted, so it can then be deleted or assigned again.
+        #[arg(long)]
+        clear_did: bool,
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a context and all associated resources (keys, ACL
+    /// entries, DID records, scoped templates).
+    Delete {
+        /// Context ID.
+        id: String,
+        /// Skip the confirmation prompt. `--force` / `-f` are accepted as
+        /// hidden aliases.
+        #[arg(long = "yes", short = 'y', alias = "force", short_alias = 'f')]
+        yes: bool,
+    },
+    /// Export an existing context — its admin credential + all DID
+    /// keys (signing + KA + any pre-rotation) + DID document + log —
+    /// as a sealed ContextProvision bundle for a new/backup admin to
+    /// import.
+    ///
+    /// Reads the local keystore directly — no running VTA or network
+    /// required. Mirrors `pnm contexts reprovision` but works in
+    /// cold-start / air-gapped environments where PNM cannot reach the
+    /// VTA.
+    ///
+    /// The bundle always contains every key tied to the context's DID
+    /// document (operational keys are auto-included). `--admin-key`
+    /// separately names the existing Ed25519 seed that becomes the
+    /// **admin credential** — the `did:key` the mediator operator uses
+    /// to authenticate back to the VTA for ACL-gated operations.
+    /// When omitted, a fresh admin key is minted in the context and
+    /// the derived `did:key` is granted admin access automatically.
+    Reprovision {
+        /// Context ID to export.
+        #[arg(long)]
+        id: String,
+        /// Existing Ed25519 key whose seed backs the exported admin
+        /// credential. When omitted, a fresh admin key is minted in
+        /// the context. Kept as `--key` for backward compatibility.
+        #[arg(long = "admin-key", alias = "key")]
+        admin_key: Option<String>,
+        /// Label applied to the freshly-minted admin key when
+        /// `--admin-key` is omitted. Defaults to
+        /// `"admin-reprovision"`.
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Path to the consumer's BootstrapRequest JSON (v1). Mutually
+        /// exclusive with `--recipient-did` / `--recipient-nonce`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<PathBuf>,
+        /// Inline consumer DID (`did:key:z6Mk...`). Requires `--recipient-nonce`.
+        #[arg(long, requires = "recipient_nonce")]
+        recipient_did: Option<String>,
+        /// Inline consumer nonce (32 hex chars == 16 bytes). Requires
+        /// `--recipient-did`.
+        #[arg(long, requires = "recipient_did")]
+        recipient_nonce: Option<String>,
+        /// Output path for the armored sealed bundle. If omitted, the
+        /// armor is written to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum WebvhCommands {
+    /// Add a WebVH server
+    AddServer {
+        /// Server identifier
+        #[arg(long)]
+        id: String,
+        /// Server DID (must resolve to a DID document the VTA can reach it through: TSPTransport, DIDCommMessaging, TrustTaskHTTPS, or WebVHHosting at an https:// origin)
+        #[arg(long)]
+        did: String,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List configured WebVH servers
+    ListServers,
+    /// Update a WebVH server
+    UpdateServer {
+        /// Server identifier to update
+        id: String,
+        /// New label (empty string to clear)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Delete a WebVH server
+    DeleteServer {
+        /// Server identifier to delete
+        id: String,
+    },
+    /// Create a did:webvh DID and publish to a WebVH server
+    CreateDid {
+        /// Target context ID
+        #[arg(long)]
+        context: String,
+        /// WebVH server ID
+        #[arg(long)]
+        server: String,
+        /// Optional path on the server (server allocates if omitted)
+        #[arg(long)]
+        path: Option<String>,
+        /// Human-readable label for the DID and key records
+        #[arg(long)]
+        label: Option<String>,
+        /// Make the DID portable (default: true)
+        #[arg(long, default_value_t = true)]
+        portable: bool,
+        /// Add mediator DIDComm service endpoint
+        #[arg(long)]
+        mediator_service: bool,
+        /// Additional services as JSON array
+        #[arg(long)]
+        services: Option<String>,
+        /// Number of pre-rotation keys to generate
+        #[arg(long)]
+        pre_rotation: Option<u32>,
+        /// Present the DID as its did:webvh (`webvh`) or its did:scid:vh:1
+        /// DID (`scid`). Default: the VTA's `[dids] default_did_method`.
+        #[arg(long, value_name = "webvh|scid")]
+        did_method: Option<vta_sdk::did_scid::DidMethod>,
+        /// List the did:scid alias in alsoKnownAs (`true`/`false`). Default:
+        /// the VTA's `[dids] scid_also_known_as`.
+        #[arg(long, value_name = "BOOL")]
+        scid_also_known_as: Option<bool>,
+        /// Print the generated mnemonic to stderr. **Off by default** —
+        /// printing puts the master seed in shell history, terminal
+        /// scrollback, CI log collectors, and tmux/screen buffers. The
+        /// mnemonic is also persisted via the configured seed-store. No
+        /// command prints it again later, so if you need a paper backup pass
+        /// this flag deliberately, in a terminal nothing records.
+        #[arg(long)]
+        print_mnemonic: bool,
+    },
+    /// List WebVH DIDs
+    ListDids {
+        /// Filter by context ID
+        #[arg(long)]
+        context: Option<String>,
+        /// Filter by server ID
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Delete a WebVH DID
+    DeleteDid {
+        /// The DID to delete
+        did: String,
+        /// Delete only the local record of a DID whose hosting server is no
+        /// longer registered, leaving its published log on that host.
+        /// Without it such a delete is refused. Refused for a DID whose
+        /// server is registered, or that is serverless.
+        #[arg(long)]
+        local_only: bool,
+        /// Skip the confirmation prompt. Skips the *prompt* only — a DID
+        /// something still depends on is refused regardless, and that refusal
+        /// has no override. `--force` is accepted as a hidden alias.
+        #[arg(long = "yes", short = 'y', alias = "force")]
+        yes: bool,
+    },
+    /// Print the raw `did.jsonl` log for a webvh DID the VTA knows.
+    ///
+    /// Snapshot from provisioning time — use this for audit or
+    /// republication fallback, not as a live resolver (the integration
+    /// itself becomes the live source once it publishes).
+    DidLog {
+        /// The DID to retrieve the log for.
+        did: String,
+        /// Optional output file. Stdout if omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Edit an existing WebVH DID document. Offline equivalent of
+    /// `pnm did-mgmt dids edit`. Operates directly on the local fjall
+    /// keystore — VTA daemon must be stopped (fjall lock).
+    ///
+    /// Interactive mode opens the latest DID document in `$EDITOR`,
+    /// then asks about webvh parameters. Non-interactive mode takes
+    /// `--document` / `--options-file` and per-field flags.
+    EditDid {
+        /// The DID to edit.
+        #[arg(long)]
+        did: String,
+        /// Path to a JSON file with the new DID document. Skips
+        /// `$EDITOR`.
+        #[arg(long)]
+        document: Option<PathBuf>,
+        /// Path to a JSON file with a full UpdateDidWebvhBody.
+        /// Mutually exclusive with the per-field flags below.
+        #[arg(long)]
+        options_file: Option<PathBuf>,
+        #[arg(long)]
+        pre_rotation: Option<u32>,
+        #[arg(long)]
+        ttl: Option<u32>,
+        #[arg(long = "watcher")]
+        watchers: Vec<String>,
+        #[arg(long)]
+        no_watchers: bool,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        no_confirm: bool,
+    },
+    /// Register an existing serverless WebVH DID with a registered
+    /// hosting server. Pushes the local `did.jsonl` to the host and
+    /// flips the DID's `server_id` so future updates auto-publish.
+    ///
+    /// Offline equivalent of `pnm did-mgmt dids register`. Operates
+    /// directly on the local fjall keystore — VTA daemon must be
+    /// stopped (fjall holds an exclusive lock when the daemon is
+    /// running).
+    RegisterDid {
+        /// The serverless WebVH DID to promote.
+        #[arg(long)]
+        did: String,
+        /// Registered server id (from `vta did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+        /// Take over a slot owned by a different DID. Honoured only
+        /// when this VTA's DID authenticates to the host as an admin.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+}
+
+// ── vta did-mgmt {servers,dids} (new surface) ──────────────────────
+//
+// Restructured replacement for `vta webvh …`. Variant fields are
+// duplicated from `WebvhCommands` so the new structure can stand on
+// its own; `From<DidMgmtCommands> for WebvhCommands` converts into
+// the legacy enum so the existing dispatch handler stays the single
+// source of business logic. Drop the legacy enum + conversion in
+// the next minor release.
+
+/// Two-tier split: server-registration management vs DID lifecycle.
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum DidMgmtCommands {
+    /// Manage registered DID-hosting servers.
+    Servers {
+        #[command(subcommand)]
+        command: DidMgmtServerCommands,
+    },
+    /// Manage DIDs hosted by a registered server or published serverlessly.
+    Dids {
+        #[command(subcommand)]
+        command: DidMgmtDidCommands,
+    },
+}
+
+/// `vta did-mgmt servers {…}` — local server registry.
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum DidMgmtServerCommands {
+    /// Add a DID-hosting server to the local registry.
+    Add {
+        /// Server identifier.
+        #[arg(long)]
+        id: String,
+        /// Server DID (must resolve to a DID document the VTA can reach it
+        /// through: TSPTransport, DIDCommMessaging, TrustTaskHTTPS, or
+        /// WebVHHosting at an https:// origin).
+        #[arg(long)]
+        did: String,
+        /// Human-readable label.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List configured DID-hosting servers.
+    List,
+    /// Update a DID-hosting server.
+    Update {
+        /// Server identifier to update.
+        id: String,
+        /// New label (empty string to clear).
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Delete a DID-hosting server from the registry.
+    ///
+    /// Only the registry row goes. DIDs registered against the server keep
+    /// naming it and their logs stay hosted on it — the command lists any
+    /// such DIDs and how to delete them completely.
+    #[command(alias = "remove")]
+    Delete {
+        /// Server identifier to delete.
+        id: String,
+    },
+}
+
+/// `vta did-mgmt dids {…}` — DID lifecycle (offline).
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum DidMgmtDidCommands {
+    /// Create a did:webvh DID and publish to a registered server.
+    Create {
+        /// Target context ID.
+        #[arg(long)]
+        context: String,
+        /// DID-hosting server ID.
+        #[arg(long)]
+        server: String,
+        /// Optional path on the server (server allocates if omitted).
+        #[arg(long)]
+        path: Option<String>,
+        /// Human-readable label for the DID and key records.
+        #[arg(long)]
+        label: Option<String>,
+        /// Make the DID portable (default: true).
+        #[arg(long, default_value_t = true)]
+        portable: bool,
+        /// Add mediator DIDComm service endpoint.
+        #[arg(long)]
+        mediator_service: bool,
+        /// Additional services as JSON array.
+        #[arg(long)]
+        services: Option<String>,
+        /// Number of pre-rotation keys to generate.
+        #[arg(long)]
+        pre_rotation: Option<u32>,
+        /// Present the DID as its did:webvh (`webvh`) or its did:scid:vh:1
+        /// DID (`scid`). Default: the VTA's `[dids] default_did_method`.
+        #[arg(long, value_name = "webvh|scid")]
+        did_method: Option<vta_sdk::did_scid::DidMethod>,
+        /// List the did:scid alias in alsoKnownAs (`true`/`false`). Default:
+        /// the VTA's `[dids] scid_also_known_as`.
+        #[arg(long, value_name = "BOOL")]
+        scid_also_known_as: Option<bool>,
+        /// Print the generated mnemonic to stderr. **Off by default** —
+        /// printing puts the master seed in shell history, terminal
+        /// scrollback, CI log collectors, and tmux/screen buffers. The
+        /// mnemonic is also persisted via the configured seed-store. No
+        /// command prints it again later, so if you need a paper backup pass
+        /// this flag deliberately, in a terminal nothing records.
+        #[arg(long)]
+        print_mnemonic: bool,
+    },
+    /// Edit an existing DID document. Offline equivalent of
+    /// `pnm did-mgmt dids edit`. Operates directly on the local
+    /// fjall keystore — VTA daemon must be stopped.
+    Edit {
+        /// The DID to edit.
+        #[arg(long)]
+        did: String,
+        /// Path to a JSON file with the new DID document. Skips
+        /// `$EDITOR`.
+        #[arg(long)]
+        document: Option<PathBuf>,
+        /// Path to a JSON file with a full UpdateDidWebvhBody.
+        /// Mutually exclusive with the per-field flags below.
+        #[arg(long)]
+        options_file: Option<PathBuf>,
+        #[arg(long)]
+        pre_rotation: Option<u32>,
+        #[arg(long)]
+        ttl: Option<u32>,
+        #[arg(long = "watcher")]
+        watchers: Vec<String>,
+        #[arg(long)]
+        no_watchers: bool,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        no_confirm: bool,
+    },
+    /// Register an existing serverless DID with a registered
+    /// hosting server. Pushes the local `did.jsonl` to the host and
+    /// flips the DID's `server_id` so future updates auto-publish.
+    /// Offline equivalent of `pnm did-mgmt dids register`.
+    Register {
+        /// The serverless DID to promote.
+        #[arg(long)]
+        did: String,
+        /// Registered server id (from `vta did-mgmt servers add`).
+        #[arg(long)]
+        server: String,
+        /// Take over a slot owned by a different DID. Honoured only
+        /// when this VTA's DID authenticates to the host as an admin.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// List DIDs.
+    List {
+        /// Filter by context ID.
+        #[arg(long)]
+        context: Option<String>,
+        /// Filter by server ID.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Delete a DID.
+    Delete {
+        /// The DID to delete.
+        did: String,
+        /// Delete only the local record of a DID whose hosting server is no
+        /// longer registered, leaving its published log on that host.
+        /// Without it such a delete is refused. Refused for a DID whose
+        /// server is registered, or that is serverless.
+        #[arg(long)]
+        local_only: bool,
+        /// Skip the confirmation prompt. Skips the *prompt* only — a DID
+        /// something still depends on is refused regardless, and that refusal
+        /// has no override. `--force` is accepted as a hidden alias.
+        #[arg(long = "yes", short = 'y', alias = "force")]
+        yes: bool,
+    },
+    /// Print the raw `did.jsonl` log for a DID the VTA knows.
+    ///
+    /// Snapshot from provisioning time — use this for audit or
+    /// republication fallback, not as a live resolver (the
+    /// integration itself becomes the live source once it
+    /// publishes).
+    GetLog {
+        /// The DID to retrieve the log for.
+        did: String,
+        /// Optional output file. Stdout if omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[cfg(feature = "webvh")]
+impl From<DidMgmtCommands> for WebvhCommands {
+    /// Bridge the new structured surface into the legacy flat
+    /// `WebvhCommands` so the existing dispatch handler remains the
+    /// single source of business logic. Drop together with the
+    /// legacy enum in the next minor release.
+    fn from(cmd: DidMgmtCommands) -> Self {
+        match cmd {
+            DidMgmtCommands::Servers { command } => match command {
+                DidMgmtServerCommands::Add { id, did, label } => {
+                    WebvhCommands::AddServer { id, did, label }
+                }
+                DidMgmtServerCommands::List => WebvhCommands::ListServers,
+                DidMgmtServerCommands::Update { id, label } => {
+                    WebvhCommands::UpdateServer { id, label }
+                }
+                DidMgmtServerCommands::Delete { id } => WebvhCommands::DeleteServer { id },
+            },
+            DidMgmtCommands::Dids { command } => match command {
+                DidMgmtDidCommands::Create {
+                    context,
+                    server,
+                    path,
+                    label,
+                    portable,
+                    mediator_service,
+                    services,
+                    pre_rotation,
+                    print_mnemonic,
+                    did_method,
+                    scid_also_known_as,
+                } => WebvhCommands::CreateDid {
+                    context,
+                    server,
+                    path,
+                    label,
+                    portable,
+                    mediator_service,
+                    services,
+                    pre_rotation,
+                    print_mnemonic,
+                    did_method,
+                    scid_also_known_as,
+                },
+                DidMgmtDidCommands::Edit {
+                    did,
+                    document,
+                    options_file,
+                    pre_rotation,
+                    ttl,
+                    watchers,
+                    no_watchers,
+                    label,
+                    no_confirm,
+                } => WebvhCommands::EditDid {
+                    did,
+                    document,
+                    options_file,
+                    pre_rotation,
+                    ttl,
+                    watchers,
+                    no_watchers,
+                    label,
+                    no_confirm,
+                },
+                DidMgmtDidCommands::Register { did, server, force } => {
+                    WebvhCommands::RegisterDid { did, server, force }
+                }
+                DidMgmtDidCommands::List { context, server } => {
+                    WebvhCommands::ListDids { context, server }
+                }
+                DidMgmtDidCommands::Delete {
+                    did,
+                    local_only,
+                    yes,
+                } => WebvhCommands::DeleteDid {
+                    did,
+                    local_only,
+                    yes,
+                },
+                DidMgmtDidCommands::GetLog { did, out } => WebvhCommands::DidLog { did, out },
+            },
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Print the VTA's identity and service settings.
+    ///
+    /// Output matches what `pnm setup` asks for (VTA DID, public URL,
+    /// mediator) plus the config/data paths. No network calls; the data
+    /// store is not opened, so this works while the VTA is running.
+    Show,
+}
+
+/// `vta approvals …` — the offline break-glass over the declarative rules.
+///
+/// Read-mostly by design. There is no offline `require`: adding a gate is never
+/// an emergency, and a break-glass path that can install one is a way to plant a
+/// control that never passed through the authenticated surface.
+#[derive(Subcommand)]
+enum ApprovalsCommands {
+    /// Show the approval rules and approver sets, read from the store.
+    ///
+    /// Also names any hand-authored policy modules present — an empty rule list
+    /// does not mean nothing is gating you, and an operator diagnosing a lockout
+    /// will otherwise conclude that it does.
+    List,
+    /// Drop the rule(s) for one task type — the surgical fix.
+    Remove {
+        /// Trust Task Type URI, e.g.
+        /// `https://trusttasks.org/spec/policy/upsert/0.3`.
+        task_type: String,
+        /// Remove only the rule scoped to exactly these contexts.
+        #[arg(long, value_delimiter = ',')]
+        context: Option<Vec<String>>,
+    },
+    /// Delete the whole declarative row — every rule and every approver set.
+    ///
+    /// The hammer, for when no single rule is identifiable or the row itself is
+    /// unparseable. Every task goes back to running on the caller's own
+    /// authority.
+    DeleteAll,
+    /// Former name of `delete-all`, which says what it does: this never
+    /// disabled anything, it deletes every rule and approver set. Still
+    /// works; prints a note naming the new command.
+    #[command(hide = true)]
+    Disable,
+}
+
+/// `vta policy …` — the offline break-glass over hand-authored Rego.
+#[derive(Subcommand)]
+enum PolicyCommands {
+    /// List stored policy modules.
+    List {
+        /// Print each module's Rego source, not just its metadata.
+        #[arg(long)]
+        show_module: bool,
+    },
+    /// Delete one policy module by id.
+    Delete {
+        /// Module id, as shown by `vta policy list`.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Sign an unseal challenge using a key from the local fjall keystore.
+    ///
+    /// The cold-start companion to `pnm auth sign-challenge`. When
+    /// `vta unseal` prints a challenge, run this in a *second* terminal
+    /// (the daemon must be stopped — fjall takes an exclusive lock per
+    /// data dir) to produce the Ed25519 signature, then paste it back
+    /// into the unseal prompt.
+    ///
+    /// Only supports `did:key:` admin DIDs; for other DID methods the
+    /// unseal flow itself rejects via the verifier in `seal::
+    /// verify_challenge_signature`.
+    SignChallenge {
+        /// The admin DID to sign as. Must match a key record in the
+        /// local keystore — typically the super-admin's `did:key:zXxx`
+        /// from `vta bootstrap-admin`.
+        #[arg(long)]
+        did: String,
+        /// The 32-byte challenge in hex (exactly as printed by
+        /// `vta unseal`).
+        #[arg(long)]
+        challenge: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HardenedCommands {
+    /// Rotate the JWT signing key (hardened configuration).
+    ///
+    /// Deletes `hardened:jwt_ciphertext` and `hardened:jwt_fingerprint` from
+    /// the `bootstrap` keyspace. On next daemon start a new random 32-byte JWT
+    /// key is generated, sealed under the storage key, and stored — all
+    /// existing sessions and access tokens are immediately invalidated.
+    ///
+    /// Requires `[hardened] enabled = true` in `config.toml`.
+    /// The daemon must be stopped before running this command (fjall holds an
+    /// exclusive lock per data dir).
+    RotateJwt,
+}
+
+#[derive(Subcommand)]
+enum AclCommands {
+    /// Create an ACL entry.
+    ///
+    /// **Break-glass: no authorization check is performed.** There is no
+    /// authenticated caller on this surface — it is direct store access by
+    /// whoever holds the filesystem, so `validate_role_assignment`,
+    /// `validate_acl_modification` and `validate_approve_scope_grant` are not
+    /// consulted, exactly as `vta acl update` already does. That is deliberate
+    /// and is the point of the surface; it is stated here so its absence does
+    /// not read as an oversight.
+    ///
+    /// `vta import-did` is not a substitute: it hardcodes an admin role with
+    /// empty contexts and sits behind the bootstrap seal, so it cannot mint a
+    /// reader entry or set an approve scope.
+    Create {
+        /// The DID this entry authorizes
+        #[arg(long)]
+        did: String,
+        /// Role (admin, initiator, application, reader)
+        #[arg(long)]
+        role: String,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Comma-separated context IDs. Omit for an empty list, which is
+        /// unrestricted for `--role admin` and no access at all otherwise.
+        #[arg(long, value_delimiter = ',')]
+        contexts: Vec<String>,
+        /// Optional expiry — `N[s|m|h|d|w]` (e.g. `24h`, `7d`).
+        #[arg(long)]
+        expires: Option<String>,
+        /// Delegated step-up approver VID (`stepUp.approver`).
+        #[arg(long)]
+        step_up_approver: Option<String>,
+        /// Per-entry step-up override (`self` | `delegated`).
+        #[arg(long)]
+        step_up_require: Option<String>,
+        /// Grant approve-authority over ALL contexts.
+        #[arg(long, conflicts_with = "approve_contexts")]
+        approve_all: bool,
+        /// Grant approve-authority scoped to these contexts (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        approve_contexts: Vec<String>,
+        /// Capabilities to grant, by their wire name (comma-separated), e.g.
+        /// `context-create`. Omit to leave the entry at whatever its role
+        /// implies.
+        ///
+        /// A role-derived capability only ever narrows; an additive one (see
+        /// `ADDITIVE_CAPABILITIES`) is how an entry holds something its role
+        /// does not, which is the only way to grant a non-admin the ability to
+        /// provision sub-contexts.
+        #[arg(long, value_delimiter = ',')]
+        capabilities: Vec<String>,
+    },
+    /// List all ACL entries
+    List {
+        /// Filter by context
+        #[arg(long)]
+        context: Option<String>,
+        /// Filter by role (admin, initiator, application, reader)
+        #[arg(long)]
+        role: Option<String>,
+        /// Which way --context reads along the hierarchy:
+        /// `acting-in` (default — who may act IN the context: entries scoped
+        /// to it or to an ancestor), `subtree` (what is granted BENEATH it:
+        /// entries scoped to it or to a descendant — the revocation-sweep
+        /// direction), or `any` (both).
+        #[arg(long, requires = "context")]
+        direction: Option<String>,
+    },
+    /// Show details of a single ACL entry
+    Get {
+        /// The DID to look up
+        did: String,
+    },
+    /// Update an existing ACL entry
+    Update {
+        /// The DID to update
+        did: String,
+        /// New role (admin, initiator, application, reader)
+        #[arg(long)]
+        role: Option<String>,
+        /// New label (empty string to clear)
+        #[arg(long)]
+        label: Option<String>,
+        /// New context list (comma-separated; omit flag to keep unchanged)
+        #[arg(long, value_delimiter = ',')]
+        contexts: Option<Vec<String>>,
+        /// Set the delegated step-up approver VID (`stepUp.approver`). Empty
+        /// string clears it; omit to keep unchanged. Break-glass: direct store
+        /// write, no wire auth.
+        #[arg(long)]
+        step_up_approver: Option<String>,
+        /// Set the per-entry step-up override (`self` | `delegated`;
+        /// `stepUp.require`). Empty string clears it; omit to keep unchanged.
+        #[arg(long)]
+        step_up_require: Option<String>,
+        /// Grant approve-authority over ALL contexts.
+        #[arg(long, conflicts_with_all = ["approve_contexts", "approve_none"])]
+        approve_all: bool,
+        /// Replace approve-authority with exactly these contexts.
+        #[arg(long, value_delimiter = ',', conflicts_with = "approve_none")]
+        approve_contexts: Option<Vec<String>>,
+        /// Revoke this entry's approve-authority entirely. An explicit flag,
+        /// because an empty list cannot mean both "confer nothing" and "leave
+        /// unchanged".
+        #[arg(long)]
+        approve_none: bool,
+        /// Replace the entry's capabilities (comma-separated wire names), e.g.
+        /// `context-create`. Omitted leaves them unchanged; `--capabilities ''`
+        /// clears them back to whatever the role implies.
+        #[arg(long, value_delimiter = ',')]
+        capabilities: Option<Vec<String>>,
+    },
+    /// Delete an ACL entry
+    Delete {
+        /// The DID to delete
+        did: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+// ── `vta services …` offline subcommand surface (mirrors `pnm
+//    services …` from spec §5.1) ────────────────────────────────
+
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum ServicesCommands {
+    /// Show currently-advertised transport services.
+    List,
+    /// Manage TSP advertisement.
+    Tsp {
+        #[command(subcommand)]
+        command: TspCommands,
+    },
+    /// Manage REST advertisement.
+    Rest {
+        #[command(subcommand)]
+        command: RestCommands,
+    },
+    /// Manage DIDComm advertisement.
+    #[cfg(feature = "didcomm")]
+    Didcomm {
+        #[command(subcommand)]
+        command: DidcommCommands,
+    },
+    /// Show inbound-message attribution by mediator and sender.
+    /// Note: the offline binary's telemetry sink is fresh per
+    /// invocation, so the report is empty by design — for the
+    /// running VTA's full record use `pnm services report`.
+    Report {
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum TspCommands {
+    Enable {
+        #[arg(long = "mediator-did")]
+        mediator_did: String,
+    },
+    Update {
+        #[arg(long = "mediator-did")]
+        mediator_did: String,
+    },
+    Disable,
+    Rollback,
+}
+
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum RestCommands {
+    Enable {
+        #[arg(long)]
+        url: String,
+    },
+    Update {
+        #[arg(long)]
+        url: String,
+    },
+    Disable,
+    Rollback,
+}
+
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum DidcommCommands {
+    Enable {
+        #[arg(long)]
+        mediator_did: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        handshake_timeout: Option<u64>,
+    },
+    Update {
+        #[arg(long = "mediator-did", visible_alias = "to")]
+        new_mediator_did: String,
+        #[arg(long, default_value_t = 86_400)]
+        drain_ttl: u64,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        handshake_timeout: Option<u64>,
+    },
+    Disable {
+        #[arg(long, default_value_t = 86_400)]
+        drain_ttl: u64,
+    },
+    Rollback {
+        #[arg(long)]
+        drain_ttl: Option<u64>,
+    },
+    Drain {
+        #[command(subcommand)]
+        command: DrainCommands,
+    },
+}
+
+#[cfg(feature = "webvh")]
+#[derive(Subcommand)]
+enum DrainCommands {
+    List,
+    Cancel {
+        #[arg(long)]
+        mediator_did: String,
+    },
+}
+
+/// Environment variable naming this deployment's claim-type extension file.
+const CLAIM_TYPE_EXTENSIONS_ENV: &str = "VTA_CLAIM_TYPE_EXTENSIONS";
+
+/// Load the deployment's own claim types, if it declares any.
+///
+/// The core table is the published registry and is the same everywhere; the
+/// words a particular ecosystem keeps about its people are not. Without this,
+/// teaching an agent `profile.github` meant a pull request against the
+/// specification repository, a publish, a hand-transcription, a release and a
+/// deploy — so nobody did, and every local token resolved to the floor and was
+/// shown to its holder masked as though it were a passport number.
+///
+/// **Nothing here stops the agent starting.** It used to: a bad file exited,
+/// on the reasoning that serving a table the operator did not write is worse
+/// than not serving at all. That is right for a laptop and wrong for a hosted
+/// agent, where refusing to boot takes out sessions, credentials and mediation
+/// over a mis-typed claim type — and where nobody is reading stderr.
+///
+/// So a bad row is refused, the rest apply, and every refusal is carried on
+/// `persona/claim-types/list` so the holder's own console can say so where a
+/// person will see it. The log below is the second-best place for that, not the
+/// only one.
+fn install_claim_type_extensions() {
+    let Ok(path) = std::env::var(CLAIM_TYPE_EXTENSIONS_ENV) else {
+        return;
+    };
+    let json = match std::fs::read_to_string(&path) {
+        Ok(j) => j,
+        Err(e) => {
+            // The file itself, rather than a row in it. Reported the same way
+            // and for the same reason: an operator who mounted the wrong path
+            // has a registry that is quietly the core table, and no boot
+            // failure to tell them so.
+            tracing::error!(
+                path = %path,
+                error = %e,
+                "{CLAIM_TYPE_EXTENSIONS_ENV} names a file that cannot be read — this deployment's own \
+                 claim types are NOT in force"
+            );
+            vta_persona::claim_types::note_extension_file_error(format!("{path}: {e}"));
+            return;
+        }
+    };
+    let entries = match vta_persona::claim_types::parse_extensions(&json) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(
+                path = %path,
+                error = %e,
+                "claim-type extension file could not be read as a table — this deployment's own \
+                 claim types are NOT in force"
+            );
+            vta_persona::claim_types::note_extension_file_error(format!("{path}: {e}"));
+            return;
+        }
+    };
+    match vta_persona::claim_types::install_extensions(entries) {
+        Ok(report) => {
+            for rejected in &report.rejected {
+                // One line per refusal, at error level. A refused row is not a
+                // detail: the token it names resolves as though the deployment
+                // had never mentioned it, which for an intended tightening is
+                // the loose answer staying in force.
+                tracing::error!(
+                    token = %rejected.token,
+                    reason = %rejected.why,
+                    "claim type refused — it is NOT in force, and this token resolves from the core table"
+                );
+            }
+            tracing::info!(
+                path = %path,
+                applied = report.applied,
+                rejected = report.rejected.len(),
+                "claim-type registry extended by this deployment"
+            );
+        }
+        Err(e) => {
+            // Only `AlreadyInstalled`, which is a programming mistake rather
+            // than operator input — and still not a reason to refuse service.
+            tracing::error!(error = %e, "claim-type extensions were already installed");
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    // Pin rustls to the aws-lc-rs backend before any TLS object is built;
+    // see `vta_sdk::crypto_init`. Without this, rustls 0.23 panics on
+    // backend auto-detection when both backends are compiled in.
+    vta_sdk::crypto_init::install_default_crypto_provider();
+
+    let cli = Cli::parse();
+
+    // Not fatal here, unlike the CLIs. The VTA's secrets live in whichever
+    // `[secrets] backend` resolves to — aws, gcp, azure, vault, k8s, tee-kms or
+    // keyring — and config is not loaded until well after this point. Hard
+    // failing would break every cloud deployment on a host that has no
+    // credential store, which is most of them. The keyring-backed seed store
+    // fails closed on its own; this only makes it diagnosable.
+    #[cfg(feature = "keyring")]
+    vta_sdk::keyring_init::warn_store_unavailable("vta");
+
+    print_banner();
+
+    install_claim_type_extensions();
+
+    match cli.command {
+        Some(Commands::Setup { from }) => {
+            #[cfg(feature = "setup")]
+            {
+                let result = match from {
+                    Some(path) => setup::run_setup_from_file(path).await,
+                    None => setup::run_setup_wizard(cli.config).await,
+                };
+                if let Err(e) = result {
+                    eprintln!("Setup failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "setup"))]
+            {
+                let _ = from;
+                eprintln!("Setup wizard not available (compiled without 'setup' feature)");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::BootstrapAdmin { did, label }) => {
+            if let Err(e) = run_bootstrap_admin(cli.config, did, label).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Unseal) => {
+            let config = match AppConfig::load(cli.config) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            // run_unseal_challenge opens and drops the store twice on
+            // purpose so the fjall lock is not held while the operator
+            // is pasting a signature — see the doc comment on that
+            // function. Derive the storage key for hardened configuration
+            // so the ACL keyspace can be decrypted.
+            // Propagate rather than defaulting to `None`: `Ok(None)` means
+            // "hardened is off", but `Err` means "we could not reach the secret
+            // store". Collapsing both to `None` opens bare handles against an
+            // encrypted store, so a transient keyring/Vault outage surfaces as a
+            // confusing deserialization error instead of the real cause.
+            let enc_key = match cli_store::load_storage_key_for_cli(&config).await {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = seal::run_unseal_challenge(&config.store, enc_key).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Auth { command }) => {
+            // `auth` subcommands are intentionally not gated on the seal —
+            // sign-challenge produces an Ed25519 signature offline; it
+            // never mutates state and is the cold-start companion to
+            // `vta unseal` itself. Gating it on `check_seal` would be a
+            // chicken-and-egg paradox.
+            let config = match AppConfig::load(cli.config) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let result = match command {
+                AuthCommands::SignChallenge { did, challenge } => {
+                    auth_sign_challenge(&config, &did, &challenge).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::ExportAdmin) => {
+            // SEALED CHECK: export-admin leaks private keys
+            check_seal(&cli.config).await;
+            if let Err(e) = export_admin(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Status) => {
+            if let Ok(config) = AppConfig::load(cli.config.clone()) {
+                init_tracing(&config);
+            }
+            if let Err(e) = status::run_status(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Config { command }) => {
+            let result = match command {
+                ConfigCommands::Show => run_config_show(cli.config),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Approvals { command }) => {
+            let result = match command {
+                ApprovalsCommands::List => approvals_cli::run_list(cli.config).await,
+                ApprovalsCommands::Remove { task_type, context } => {
+                    approvals_cli::run_remove(cli.config, task_type, context).await
+                }
+                ApprovalsCommands::DeleteAll => approvals_cli::run_delete_all(cli.config).await,
+                ApprovalsCommands::Disable => {
+                    eprintln!(
+                        "Note: `vta approvals disable` is now `vta approvals delete-all` — it \
+                         deletes every rule and approver set. The old name still works."
+                    );
+                    approvals_cli::run_delete_all(cli.config).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Policy { command }) => {
+            let result = match command {
+                PolicyCommands::List { show_module } => {
+                    approvals_cli::run_policy_list(cli.config, show_module).await
+                }
+                PolicyCommands::Delete { id } => {
+                    approvals_cli::run_policy_delete(cli.config, id).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::CreateDidKey {
+            context,
+            admin,
+            label,
+            private_key_file,
+        }) => {
+            // SEALED CHECK: creates keys and optionally admin ACL entries
+            check_seal(&cli.config).await;
+            let args = did_key::CreateDidKeyArgs {
+                config_path: cli.config,
+                context,
+                admin,
+                label,
+                private_key_file,
+            };
+            if let Err(e) = did_key::run_create_did_key(args).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::CreateDidWebvh {
+            context,
+            label,
+            url,
+            export_secrets,
+            admin,
+            did_log_file,
+            did_method,
+            scid_also_known_as,
+        }) => {
+            // SEALED CHECK: creates keys and DIDs
+            check_seal(&cli.config).await;
+            #[cfg(feature = "setup")]
+            {
+                let args = did_webvh::CreateDidWebvhArgs {
+                    config_path: cli.config,
+                    context,
+                    label,
+                    url,
+                    export_secrets,
+                    admin,
+                    did_log_file,
+                    did_method,
+                    scid_also_known_as,
+                };
+                if let Err(e) = did_webvh::run_create_did_webvh(args).await {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "setup"))]
+            {
+                let _ = (context, label, url, export_secrets, admin);
+                eprintln!("create-did-webvh is not available (compiled without 'setup' feature)");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::CreateDidPeer {
+            context,
+            mediator_url,
+            mediator_did,
+            export_secrets,
+            admin,
+            label,
+        }) => {
+            // SEALED CHECK: creates keys and DIDs
+            check_seal(&cli.config).await;
+            #[cfg(feature = "setup")]
+            {
+                let args = did_peer::CreateDidPeerArgs {
+                    config_path: cli.config,
+                    context,
+                    label,
+                    mediator_url,
+                    mediator_did,
+                    export_secrets,
+                    admin,
+                };
+                if let Err(e) = did_peer::run_create_did_peer(args).await {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "setup"))]
+            {
+                let _ = (
+                    context,
+                    label,
+                    mediator_url,
+                    mediator_did,
+                    export_secrets,
+                    admin,
+                );
+                eprintln!("create-did-peer is not available (compiled without 'setup' feature)");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::ImportDid {
+            did,
+            role,
+            label,
+            context,
+        }) => {
+            // SEALED CHECK: imports DIDs with arbitrary roles
+            check_seal(&cli.config).await;
+            let args = import_did::ImportDidArgs {
+                config_path: cli.config,
+                did,
+                role,
+                label,
+                context,
+            };
+            if let Err(e) = import_did::run_import_did(args).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Hardened { command }) => {
+            let result = match command {
+                HardenedCommands::RotateJwt => run_hardened_rotate_jwt(cli.config).await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Vault { command }) => match command {
+            VaultCommands::Seed {
+                entries_file,
+                context,
+                dry_run,
+                force,
+            } => {
+                let args = vault_cli::VaultSeedArgs {
+                    config_path: cli.config,
+                    entries_file,
+                    context,
+                    dry_run,
+                    force,
+                };
+                if let Err(e) = vault_cli::run_vault_seed(args).await {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            VaultCommands::Wipe { yes, context } => {
+                let args = vault_cli::VaultWipeArgs {
+                    config_path: cli.config,
+                    yes,
+                    context,
+                };
+                if let Err(e) = vault_cli::run_vault_wipe(args).await {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        },
+        Some(Commands::Keys { command }) => {
+            // SEALED CHECK: secrets export and seed rotation
+            match &command {
+                KeyCliCommands::List { .. } | KeyCliCommands::Seeds => {}
+                KeyCliCommands::Secrets { .. }
+                | KeyCliCommands::RotateSeed { .. }
+                | KeyCliCommands::Bundle { .. } => {
+                    check_seal(&cli.config).await;
+                }
+            }
+            let result = match command {
+                KeyCliCommands::List { context, status } => {
+                    keys_cli::run_keys_list(cli.config, context, status).await
+                }
+                KeyCliCommands::Secrets { key_ids, context } => {
+                    keys_cli::run_keys_secrets(cli.config, key_ids, context).await
+                }
+                KeyCliCommands::Seeds => keys_cli::run_keys_seeds_list(cli.config).await,
+                KeyCliCommands::RotateSeed { mnemonic } => {
+                    keys_cli::run_rotate_seed(cli.config, mnemonic).await
+                }
+                KeyCliCommands::Bundle {
+                    context,
+                    recipient,
+                    recipient_did,
+                    recipient_nonce,
+                    out,
+                } => {
+                    bootstrap_cli::run_keys_bundle(
+                        cli.config,
+                        context,
+                        recipient,
+                        recipient_did,
+                        recipient_nonce,
+                        out,
+                    )
+                    .await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Contexts { command }) => {
+            // SEALED CHECK: only commands that mutate state need the
+            // unsealed-store guard. List/Get are read-only.
+            match &command {
+                ContextCommands::List | ContextCommands::Get { .. } => {}
+                ContextCommands::Create { .. }
+                | ContextCommands::Update { .. }
+                | ContextCommands::Delete { .. }
+                | ContextCommands::Reprovision { .. } => {
+                    check_seal(&cli.config).await;
+                }
+            }
+            let result = match command {
+                ContextCommands::List => bootstrap_cli::run_context_list(cli.config).await,
+                ContextCommands::Get { id } => bootstrap_cli::run_context_get(cli.config, id).await,
+                ContextCommands::Create {
+                    id,
+                    name,
+                    description,
+                    parent,
+                    admin_did,
+                    admin_label,
+                    admin_expires,
+                    admin_handoff,
+                } => {
+                    bootstrap_cli::run_context_create(
+                        cli.config,
+                        id,
+                        name,
+                        description,
+                        parent,
+                        admin_did,
+                        admin_label,
+                        admin_expires,
+                        admin_handoff,
+                    )
+                    .await
+                }
+                ContextCommands::Update {
+                    id,
+                    name,
+                    did,
+                    clear_did,
+                    description,
+                } => {
+                    bootstrap_cli::run_context_update(
+                        cli.config,
+                        id,
+                        name,
+                        did,
+                        clear_did,
+                        description,
+                    )
+                    .await
+                }
+                ContextCommands::Delete { id, yes } => {
+                    bootstrap_cli::run_context_delete(cli.config, id, yes).await
+                }
+                ContextCommands::Reprovision {
+                    id,
+                    admin_key,
+                    admin_label,
+                    recipient,
+                    recipient_did,
+                    recipient_nonce,
+                    out,
+                } => {
+                    bootstrap_cli::run_context_reprovision(
+                        cli.config,
+                        id,
+                        admin_key,
+                        admin_label,
+                        recipient,
+                        recipient_did,
+                        recipient_nonce,
+                        out,
+                    )
+                    .await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Acl { command }) => {
+            // SEALED CHECK: update and delete modify ACL
+            match &command {
+                AclCommands::List { .. } | AclCommands::Get { .. } => {}
+                AclCommands::Create { .. }
+                | AclCommands::Update { .. }
+                | AclCommands::Delete { .. } => {
+                    // Create modifies the ACL, so it is sealed like the other
+                    // two writes rather than treated as a read.
+                    check_seal(&cli.config).await;
+                }
+            }
+            let result = match command {
+                AclCommands::List {
+                    context,
+                    role,
+                    direction,
+                } => acl_cli::run_acl_list(cli.config, context, role, direction).await,
+                AclCommands::Get { did } => acl_cli::run_acl_get(cli.config, did).await,
+                AclCommands::Create {
+                    did,
+                    role,
+                    label,
+                    contexts,
+                    expires,
+                    step_up_approver,
+                    step_up_require,
+                    approve_all,
+                    approve_contexts,
+                    capabilities,
+                } => {
+                    acl_cli::run_acl_create(
+                        cli.config,
+                        did,
+                        role,
+                        label,
+                        contexts,
+                        expires,
+                        step_up_approver,
+                        step_up_require,
+                        approve_all,
+                        approve_contexts,
+                        capabilities,
+                    )
+                    .await
+                }
+                AclCommands::Update {
+                    did,
+                    role,
+                    label,
+                    contexts,
+                    step_up_approver,
+                    step_up_require,
+                    approve_all,
+                    approve_contexts,
+                    approve_none,
+                    capabilities,
+                } => {
+                    acl_cli::run_acl_update(
+                        cli.config,
+                        did,
+                        role,
+                        label,
+                        contexts,
+                        step_up_approver,
+                        step_up_require,
+                        approve_all,
+                        approve_contexts,
+                        approve_none,
+                        capabilities,
+                    )
+                    .await
+                }
+                AclCommands::Delete { did, yes } => {
+                    acl_cli::run_acl_delete(cli.config, did, yes).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "webvh")]
+        Some(Commands::DidMgmt { command }) => {
+            // Funnel the new structure through `WebvhCommands` so the existing
+            // dispatch / seal-check / handler chain stays the single source of
+            // business logic. That enum is now purely internal plumbing — the
+            // operator-facing `vta webvh …` alias it was named for is gone —
+            // so it should be renamed to the did-mgmt shape and the conversion
+            // inlined; tracked separately, since it touches every handler.
+            run_webvh_dispatch(cli.config.clone(), command.into()).await;
+        }
+        Some(Commands::Bootstrap { command }) => {
+            let result = match command {
+                BootstrapCommands::Seal {
+                    request,
+                    payload,
+                    out,
+                } => bootstrap_cli::run_seal(cli.config.clone(), request, payload, out).await,
+                BootstrapCommands::Request {
+                    out,
+                    label,
+                    seed_dir,
+                } => bootstrap_cli::run_request(out, label, seed_dir).await,
+                BootstrapCommands::Open {
+                    bundle,
+                    expect_digest,
+                    no_verify_digest,
+                    expect_vta_did,
+                    seed_dir,
+                } => {
+                    bootstrap_cli::run_open(
+                        bundle,
+                        expect_digest,
+                        no_verify_digest,
+                        expect_vta_did,
+                        seed_dir,
+                    )
+                    .await
+                }
+                BootstrapCommands::ProvisionRequest {
+                    template,
+                    vars,
+                    context_hint,
+                    admin_template,
+                    validity_hours,
+                    label,
+                    seed_dir,
+                    out,
+                } => {
+                    bootstrap_cli::run_provision_request(
+                        template,
+                        vars,
+                        context_hint,
+                        admin_template,
+                        validity_hours,
+                        label,
+                        seed_dir,
+                        out,
+                    )
+                    .await
+                }
+                #[cfg(feature = "webvh")]
+                BootstrapCommands::ProvisionIntegration {
+                    request,
+                    context,
+                    create_context,
+                    assertion,
+                    vc_validity_hours,
+                    out,
+                } => {
+                    bootstrap_cli::run_provision_integration(
+                        cli.config.clone(),
+                        request,
+                        context,
+                        create_context,
+                        assertion,
+                        vc_validity_hours,
+                        out,
+                    )
+                    .await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "webvh")]
+        #[cfg(feature = "tsp")]
+        Some(Commands::TspRelationships { command }) => {
+            // SEALED CHECK: reset and delete write the relationships keyspace.
+            if !matches!(command, TspRelationshipCommands::List) {
+                check_seal(&cli.config).await;
+            }
+            let result = match command {
+                TspRelationshipCommands::List => tsp_relationships_cli::run_list(cli.config).await,
+                TspRelationshipCommands::Reset { peer, our } => {
+                    tsp_relationships_cli::run_reset(cli.config, peer, our).await
+                }
+                TspRelationshipCommands::Delete {
+                    peer,
+                    our,
+                    all,
+                    yes,
+                } => {
+                    use tsp_relationships_cli::Target;
+                    let target = match peer {
+                        Some(peer) if !all => Target::Peer { peer, our },
+                        _ => Target::All,
+                    };
+                    tsp_relationships_cli::run_delete(cli.config, target, yes).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Services { command }) => {
+            // SEALED CHECK: every service mutation modifies the
+            // VTA's state on disk + publishes a new LogEntry.
+            // List/report/drain-list are read-only and skip the
+            // check.
+            match &command {
+                ServicesCommands::List | ServicesCommands::Report { .. } => {}
+                // `drain list` is the DIDComm family's only read-only member.
+                #[cfg(feature = "didcomm")]
+                ServicesCommands::Didcomm {
+                    command:
+                        DidcommCommands::Drain {
+                            command: DrainCommands::List,
+                        },
+                } => {}
+                _ => check_seal(&cli.config).await,
+            }
+            let result = match command {
+                ServicesCommands::List => services_cli::run_services_list(cli.config).await,
+                ServicesCommands::Tsp { command } => match command {
+                    TspCommands::Enable { mediator_did } => {
+                        services_cli::run_services_tsp_enable(cli.config, mediator_did).await
+                    }
+                    TspCommands::Update { mediator_did } => {
+                        services_cli::run_services_tsp_update(cli.config, mediator_did).await
+                    }
+                    TspCommands::Disable => {
+                        services_cli::run_services_tsp_disable(cli.config).await
+                    }
+                    TspCommands::Rollback => {
+                        services_cli::run_services_tsp_rollback(cli.config).await
+                    }
+                },
+                ServicesCommands::Rest { command } => match command {
+                    RestCommands::Enable { url } => {
+                        services_cli::run_services_rest_enable(cli.config, url).await
+                    }
+                    RestCommands::Update { url } => {
+                        services_cli::run_services_rest_update(cli.config, url).await
+                    }
+                    RestCommands::Disable => {
+                        services_cli::run_services_rest_disable(cli.config).await
+                    }
+                    RestCommands::Rollback => {
+                        services_cli::run_services_rest_rollback(cli.config).await
+                    }
+                },
+                // The DIDComm family of `vta services …` exists only in a
+                // build with a DIDComm dispatcher; the clap subcommand is
+                // gated alongside it, so this arm is unreachable elsewhere.
+                #[cfg(feature = "didcomm")]
+                ServicesCommands::Didcomm { command } => match command {
+                    DidcommCommands::Enable {
+                        mediator_did,
+                        force,
+                        handshake_timeout,
+                    } => {
+                        services_cli::run_services_didcomm_enable(
+                            cli.config,
+                            mediator_did,
+                            force,
+                            handshake_timeout,
+                        )
+                        .await
+                    }
+                    DidcommCommands::Update {
+                        new_mediator_did,
+                        drain_ttl,
+                        force,
+                        handshake_timeout,
+                    } => {
+                        services_cli::run_services_didcomm_update(
+                            cli.config,
+                            new_mediator_did,
+                            drain_ttl,
+                            force,
+                            handshake_timeout,
+                        )
+                        .await
+                    }
+                    DidcommCommands::Disable { drain_ttl } => {
+                        services_cli::run_services_didcomm_disable(cli.config, drain_ttl).await
+                    }
+                    DidcommCommands::Rollback { drain_ttl } => {
+                        services_cli::run_services_didcomm_rollback(cli.config, drain_ttl).await
+                    }
+                    DidcommCommands::Drain { command } => match command {
+                        DrainCommands::List => {
+                            services_cli::run_services_didcomm_drain_list(cli.config).await
+                        }
+                        DrainCommands::Cancel { mediator_did } => {
+                            services_cli::run_services_didcomm_drain_cancel(
+                                cli.config,
+                                mediator_did,
+                            )
+                            .await
+                        }
+                    },
+                },
+                ServicesCommands::Report {
+                    since,
+                    until,
+                    format,
+                } => services_cli::run_services_report(cli.config, since, until, format).await,
+            };
+            if let Err(e) = result {
+                // services_cli already prints typed VtaError via
+                // print_cli_error and surfaces a SilentExit so we
+                // don't double-print. Other error kinds get a
+                // simple format here.
+                let s = e.to_string();
+                if !s.is_empty() {
+                    eprintln!("Error: {s}");
+                }
+                std::process::exit(1);
+            }
+        }
+        None => {
+            let mut config = match AppConfig::load(cli.config) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    eprintln!();
+                    eprintln!("To set up a new VTA instance, run:");
+                    eprintln!("  vta setup");
+                    eprintln!();
+                    eprintln!("Or specify a config file:");
+                    eprintln!("  vta --config <path>");
+                    std::process::exit(1);
+                }
+            };
+
+            init_tracing(&config);
+
+            let store = store::Store::open_with(&config.store, &config.fjall)
+                .expect("failed to open store");
+            let seed_store: Arc<dyn keys::seed_store::SeedStore> =
+                Arc::from(create_seed_store(&config).expect("failed to create seed store"));
+
+            // A committed backup restore is applied before anything reads the
+            // store: under the storage key the (restored) seed now yields, and —
+            // on a hardened VTA — before the JWT key is loaded from the store it
+            // replaces. See `restore::apply_pending_restore`.
+            if let Some(seed) = seed_store.get().await.ok().flatten() {
+                let (storage_key, environment) = if config.hardened.enabled {
+                    let key = *hardened_bootstrap::derive_storage_key(
+                        &seed,
+                        &config.hardened.storage_key_salt,
+                    );
+                    (
+                        Some(key),
+                        vta_service::restore::environment_of(Some(key), false),
+                    )
+                } else {
+                    (None, vta_service::restore::environment_of(None, false))
+                };
+                if let Err(e) = vta_service::restore::apply_pending_restore(
+                    &store,
+                    storage_key,
+                    environment,
+                    &seed,
+                    &mut config,
+                )
+                .await
+                {
+                    tracing::error!(
+                        "applying the committed backup restore failed: {e}. The restore is                          still staged and is applied again on the next start."
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            // Hardened configuration: derive the storage-encryption key and the JWT
+            // signing key from the master seed so neither secret lives in
+            // config.toml or on disk.  Mirrors what `vta-enclave` does inside a
+            // Nitro enclave without requiring KMS.  See `hardened_bootstrap.rs`.
+            let storage_encryption_key = if config.hardened.enabled {
+                // Gap 4: if VTA_AUTH_JWT_SIGNING_KEY is set in the environment, its
+                // value would sit in /proc/<pid>/environ visible to root even though
+                // hardened configuration never uses it (the derived/sealed key overwrites
+                // config.auth.jwt_signing_key below). Remove it from the process
+                // environment immediately so it is no longer visible after this point.
+                if std::env::var("VTA_AUTH_JWT_SIGNING_KEY").is_ok() {
+                    tracing::warn!(
+                        "SECURITY: VTA_AUTH_JWT_SIGNING_KEY was set in the environment but \
+                             hardened.enabled = true — the env var is not used and \
+                             has been removed from the process environment. Remove it from your \
+                             deployment configuration to avoid this warning."
+                    );
+                    // SAFETY: single-threaded at this point in main() — no other thread
+                    // is reading environment variables concurrently.
+                    #[allow(unused_unsafe, unsafe_code)]
+                    unsafe {
+                        std::env::remove_var("VTA_AUTH_JWT_SIGNING_KEY")
+                    };
+                }
+
+                // `[secrets] seed` is the hex seed inlined in config.toml itself
+                // (the config-seed backend). That is the single worst pairing
+                // with this feature: the whole point is keeping secrets out of
+                // config.toml, and here the storage key and the sealed JWT key
+                // are both re-derivable by anyone who can read that one file —
+                // exactly the adversary this module's header names.
+                //
+                // It belongs on the warn side. Treating it as evidence of a
+                // "real" backend, as the first cut did, meant the deployment
+                // that most needs this warning was the only one that never saw
+                // it.
+                if config.secrets.seed.is_some() {
+                    tracing::warn!(
+                        "SECURITY: hardened.enabled = true but the master seed is inlined in \
+                         config.toml via [secrets] seed. The storage-encryption key and the JWT \
+                         signing key are both derived from that seed, so anyone who can read \
+                         config.toml can re-derive both, decrypt the whole store and forge any \
+                         token — the exact capability hardened configuration exists to remove. \
+                         At-rest encryption is providing no protection in this configuration. \
+                         Move the seed to a real secret-store backend (OS keyring, aws-secrets, \
+                         gcp-secrets, azure-secrets, vault, k8s) before relying on it."
+                    );
+                }
+
+                // Separately, warn when the factory would fall back to the
+                // plaintext seed *file*: no backend field is set AND the
+                // keyring feature is not compiled in (keyring is on by
+                // default, so this fires only in stripped builds).
+                let looks_like_plaintext_backend = config.secrets.seed.is_none()
+                    && config.secrets.aws_secret_name.is_none()
+                    && config.secrets.gcp_project.is_none()
+                    && config.secrets.azure_vault_url.is_none()
+                    && config.secrets.vault_addr.is_none()
+                    && config.secrets.k8s_secret_name.is_none()
+                    && !cfg!(feature = "keyring");
+                if looks_like_plaintext_backend {
+                    tracing::warn!(
+                        "SECURITY: hardened.enabled = true but the [secrets] backend resolves to \
+                         the plaintext seed file, which sits in the same data directory as the \
+                         store it is meant to protect. Anyone who can read that file re-derives \
+                         the storage-encryption key and the JWT signing key, decrypts the whole \
+                         store and forges any token. At-rest encryption is providing no \
+                         protection in this configuration. Use a real secret-store backend (OS \
+                         keyring, aws-secrets, gcp-secrets, azure-secrets, vault, k8s) before \
+                         relying on it."
+                    );
+                }
+
+                // Derives the storage key, migrates any pre-hardened plaintext
+                // rows, then loads or establishes the JWT signing key — in that
+                // order, because the key now lives in the encrypted KEYS
+                // keyspace and reading it against an unmigrated store would
+                // fail. HardenedBootSecrets zeroizes both keys on drop,
+                // mirroring TEE's BootstrappedSecrets.
+                let boot_secrets =
+                    hardened_bootstrap::load_boot_secrets(&config, &*seed_store, &store)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::error!("{e}");
+                            std::process::exit(1);
+                        });
+
+                store
+                    .persist()
+                    .await
+                    .expect("failed to persist hardened boot state");
+
+                // Encode jwt_key into in-memory config — never written to config.toml.
+                // The raw [u8;32] in boot_secrets is zeroized when it drops below.
+                config.auth.jwt_signing_key = Some(BASE64.encode(boot_secrets.jwt_key));
+                let storage_key_copy = boot_secrets.storage_key;
+                // boot_secrets drops here → jwt_key and storage_key are zeroized.
+
+                Some(storage_key_copy)
+            } else {
+                None // standard non-TEE: plaintext fjall, JWT key from config.toml
+            };
+
+            if let Err(e) = server::run(
+                config,
+                store,
+                seed_store,
+                storage_encryption_key,
+                None, // no TEE context (use vta-enclave for TEE mode)
+                cli.allow_degraded,
+                cli.flush_queues,
+            )
+            .await
+            {
+                tracing::error!("server error: {e}");
+                std::process::exit(1);
+            }
+            // A backup import committed: boot again so it is applied.
+            if vta_service::restore::reboot_requested() {
+                vta_service::restore::reexec();
+            }
+        }
+    }
+}
+
+/// Dispatch a legacy `WebvhCommands` value through `webvh_cli`. Used
+/// by both the new `vta did-mgmt …` surface (after `From<DidMgmtCommands>`
+/// conversion) and the legacy `vta webvh …` shim. Drop together with
+/// the legacy `Webvh` enum in the next minor release.
+#[cfg(feature = "webvh")]
+async fn run_webvh_dispatch(config_path: Option<PathBuf>, command: WebvhCommands) {
+    // Read-only commands skip the seal check; everything else writes.
+    match &command {
+        WebvhCommands::ListServers
+        | WebvhCommands::ListDids { .. }
+        | WebvhCommands::DidLog { .. } => {}
+        _ => check_seal(&config_path).await,
+    }
+    let result = match command {
+        WebvhCommands::AddServer { id, did, label } => {
+            webvh_cli::run_add_server(config_path, id, did, label).await
+        }
+        WebvhCommands::ListServers => webvh_cli::run_list_servers(config_path).await,
+        WebvhCommands::UpdateServer { id, label } => {
+            webvh_cli::run_update_server(config_path, id, label).await
+        }
+        WebvhCommands::DeleteServer { id } => webvh_cli::run_remove_server(config_path, id).await,
+        WebvhCommands::CreateDid {
+            context,
+            server,
+            path,
+            label,
+            portable,
+            mediator_service,
+            services,
+            pre_rotation,
+            print_mnemonic,
+            did_method,
+            scid_also_known_as,
+        } => {
+            webvh_cli::run_create_did(
+                config_path,
+                context,
+                server,
+                path,
+                label,
+                portable,
+                mediator_service,
+                services,
+                pre_rotation,
+                print_mnemonic,
+                did_method,
+                scid_also_known_as,
+            )
+            .await
+        }
+        WebvhCommands::ListDids { context, server } => {
+            webvh_cli::run_list_dids(config_path, context, server).await
+        }
+        WebvhCommands::DeleteDid {
+            did,
+            local_only,
+            yes,
+        } => webvh_cli::run_delete_did(config_path, did, local_only, yes).await,
+        WebvhCommands::DidLog { did, out } => webvh_cli::run_did_log(config_path, did, out).await,
+        WebvhCommands::EditDid {
+            did,
+            document,
+            options_file,
+            pre_rotation,
+            ttl,
+            watchers,
+            no_watchers,
+            label,
+            no_confirm,
+        } => {
+            webvh_cli::run_edit_did(
+                config_path,
+                did,
+                document,
+                options_file,
+                pre_rotation,
+                ttl,
+                watchers,
+                no_watchers,
+                label,
+                no_confirm,
+            )
+            .await
+        }
+        WebvhCommands::RegisterDid { did, server, force } => {
+            webvh_cli::run_register_did(config_path, did, server, force).await
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn print_banner() {
+    let cyan = "\x1b[36m";
+    let magenta = "\x1b[35m";
+    let yellow = "\x1b[33m";
+    let dim = "\x1b[2m";
+    let reset = "\x1b[0m";
+
+    eprintln!(
+        r#"
+{cyan} ██╗   ██╗{magenta}████████╗{yellow} █████╗{reset}
+{cyan} ██║   ██║{magenta}╚══██╔══╝{yellow}██╔══██╗{reset}
+{cyan} ██║   ██║{magenta}   ██║   {yellow}███████║{reset}
+{cyan} ╚██╗ ██╔╝{magenta}   ██║   {yellow}██╔══██║{reset}
+{cyan}  ╚████╔╝ {magenta}   ██║   {yellow}██║  ██║{reset}
+{cyan}   ╚═══╝  {magenta}   ╚═╝   {yellow}╚═╝  ╚═╝{reset}
+{dim}  Verifiable Trust Agent v{version}{reset}
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+    );
+}
+
+/// Check if the VTA is sealed; exit with an error if so.
+/// Called before any CLI command that modifies state.
+/// `vta hardened rotate-jwt` — clear the sealed JWT signing key so the daemon
+/// generates a new random key on next boot.
+///
+/// Deletes `hardened:jwt_ciphertext` and `hardened:jwt_fingerprint` from the
+/// `bootstrap` keyspace. The daemon must be stopped before running this (fjall
+/// exclusive lock); restart it after to apply the new key. All existing sessions
+/// and access tokens are invalidated when the daemon boots with the new key.
+async fn run_hardened_rotate_jwt(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+
+    if !config.hardened.enabled {
+        return Err(
+            "hardened.enabled is not enabled — this command only applies \
+             to VTAs running in hardened configuration"
+                .into(),
+        );
+    }
+
+    let store = store::Store::open(&config.store)?;
+
+    // The JWT signing key now lives in the *encrypted* KEYS keyspace, so
+    // clearing it needs the storage key — the row is a VAE1 envelope like every
+    // other secret, not a self-contained sealed blob that could be deleted
+    // blind. Deriving it here also means a wrong salt or an unreachable secret
+    // store fails now, with a clear cause, rather than at the next daemon boot.
+    let enc_key = cli_store::load_storage_key_for_cli(&config)
+        .await?
+        .ok_or("hardened: storage key unavailable")?;
+    let keys_ks = store
+        .keyspace(crate::keyspaces::KEYS)?
+        .with_encryption(enc_key);
+    // Legacy rows, if this VTA has not yet booted since the key moved.
+    let bootstrap_ks = store.keyspace(crate::keyspaces::BOOTSTRAP)?;
+
+    let current = keys_ks
+        .get_raw(hardened_bootstrap::HARDENED_JWT_KEY)
+        .await?
+        .is_some();
+    let legacy_ct = bootstrap_ks
+        .get_raw(hardened_bootstrap::LEGACY_JWT_CT_KEY)
+        .await?
+        .is_some();
+    let legacy_fp = bootstrap_ks
+        .get_raw(hardened_bootstrap::LEGACY_JWT_FINGERPRINT_KEY)
+        .await?
+        .is_some();
+
+    if !current && !legacy_ct && !legacy_fp {
+        eprintln!("Nothing to rotate — no JWT signing key is stored yet.");
+        return Ok(());
+    }
+
+    let mut removed: Vec<&str> = Vec::new();
+    if current {
+        keys_ks.remove(hardened_bootstrap::HARDENED_JWT_KEY).await?;
+        removed.push("keys/hardened:jwt_key");
+    }
+    // Clear the legacy pair too, so rotating never leaves a stale row that the
+    // next boot would "carry over" as if it were the current key.
+    if legacy_ct {
+        bootstrap_ks
+            .remove(hardened_bootstrap::LEGACY_JWT_CT_KEY)
+            .await?;
+        removed.push("bootstrap/hardened:jwt_ciphertext (legacy)");
+    }
+    if legacy_fp {
+        bootstrap_ks
+            .remove(hardened_bootstrap::LEGACY_JWT_FINGERPRINT_KEY)
+            .await?;
+        removed.push("bootstrap/hardened:jwt_fingerprint (legacy)");
+    }
+    store.persist().await?;
+
+    eprintln!();
+    eprintln!("\x1b[1;32mJWT signing key rotation prepared.\x1b[0m");
+    eprintln!();
+    for row in &removed {
+        eprintln!("  Deleted: {row}");
+    }
+    eprintln!();
+    eprintln!("  On next daemon start a new random JWT key will be generated");
+    eprintln!("  and stored in the encrypted KEYS keyspace.");
+    eprintln!();
+    eprintln!("  \x1b[1;33mAll existing sessions and access tokens are invalidated\x1b[0m");
+    eprintln!("  once the daemon restarts with the new key.");
+    eprintln!();
+    eprintln!("  Restart the daemon to apply:");
+    eprintln!("    vta --config {}", config.config_path.display());
+    eprintln!();
+
+    Ok(())
+}
+
+async fn check_seal(config_path: &Option<PathBuf>) {
+    let config = match AppConfig::load(config_path.clone()) {
+        Ok(c) => c,
+        Err(_) => return, // Config not loadable — let the actual command handle it
+    };
+    let store = match store::Store::open(&config.store) {
+        Ok(s) => s,
+        Err(_) => return, // Store not openable — let the actual command handle it
+    };
+    // In hardened configuration the ACL keyspace is encrypted — derive the storage key
+    // so the seal row can be decrypted and the proper "VTA is sealed" error is
+    // emitted instead of an opaque JSON-parse failure.
+    let acl_ks = match store.keyspace(crate::keyspaces::ACL) {
+        Ok(ks) => match cli_store::load_storage_key_for_cli(&config).await {
+            Ok(Some(key)) => ks.with_encryption(key),
+            Ok(None) => ks,
+            Err(_) => return, // seed unavailable — let the actual command surface the error
+        },
+        Err(_) => return,
+    };
+    if let Err(e) = seal::require_unsealed(&acl_ks).await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Bootstrap the first super admin and seal the VTA.
+async fn run_bootstrap_admin(
+    config_path: Option<PathBuf>,
+    did: String,
+    label: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = cli_store::CliStore::open(&config).await?;
+    let acl_ks = cs.keyspace(crate::keyspaces::ACL)?;
+
+    // Check if already sealed
+    if let Some(existing) = seal::get_seal(&acl_ks).await? {
+        eprintln!(
+            "VTA is already sealed (by {} on {}).",
+            existing.sealed_by,
+            existing
+                .sealed_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+        );
+        eprintln!("Cannot bootstrap again. Manage admins via the REST API or DIDComm.");
+        std::process::exit(1);
+    }
+
+    // Check no existing super admins
+    let entries = acl::list_acl_entries(&acl_ks).await?;
+    let existing_super_admins: Vec<_> = entries.iter().filter(|e| e.is_super_admin()).collect();
+
+    if !existing_super_admins.is_empty() {
+        eprintln!(
+            "WARNING: {} existing super admin(s) found:",
+            existing_super_admins.len()
+        );
+        for admin in &existing_super_admins {
+            eprintln!(
+                "  - {} ({})",
+                admin.did,
+                admin.label.as_deref().unwrap_or("no label")
+            );
+        }
+        eprintln!();
+        eprintln!("Proceeding will add another super admin and seal the VTA.");
+        eprintln!("Press Ctrl+C to cancel, or Enter to continue...");
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+    }
+
+    // Create the super admin ACL entry
+    // Empty contexts = super admin
+    let entry =
+        acl::AclEntry::new(did.clone(), acl::Role::Admin, "cli:bootstrap-admin").with_label(label);
+    acl::store_acl_entry(&acl_ks, &entry).await?;
+
+    // Seal the VTA
+    let seal_record = seal::seal(&acl_ks, &did).await?;
+
+    cs.persist().await?;
+
+    eprintln!();
+    eprintln!("=== VTA Bootstrapped and Sealed ===");
+    eprintln!();
+    eprintln!("  Admin DID: {}", did);
+    eprintln!(
+        "  Sealed at: {}",
+        seal_record
+            .sealed_at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S %:z")
+    );
+    eprintln!();
+    eprintln!("  The VTA is now sealed. Offline CLI commands that modify state are disabled.");
+    eprintln!("  All management must go through the authenticated REST API or DIDComm.");
+    eprintln!();
+    eprintln!("  To start the VTA server:");
+    eprintln!("    vta --config config.toml");
+    eprintln!();
+
+    Ok(())
+}
+
+// init_tracing is now in vta_service::init_tracing (lib.rs)
+
+/// Print the VTA's identity and service settings from `config.toml`.
+///
+/// Explicitly does NOT open the data store, so it works while the VTA
+/// process is running. Also doesn't resolve DIDs or touch the network —
+/// this is the quick, safe "what did setup write?" command.
+fn run_config_show(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+
+    const BOLD: &str = "\x1b[1m";
+    const CYAN: &str = "\x1b[36m";
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
+
+    fn line(label: &str, value: Option<&str>) {
+        match value {
+            Some(v) if !v.is_empty() => {
+                println!("  {CYAN}{:<13}{RESET} {v}", label);
+            }
+            _ => {
+                println!("  {CYAN}{:<13}{RESET} {DIM}(not set){RESET}", label);
+            }
+        }
+    }
+
+    println!();
+    println!("{BOLD}VTA configuration{RESET}");
+    println!();
+    line("Name", config.vta_name.as_deref());
+    line("VTA DID", config.vta_did.as_deref());
+    line("Public URL", config.public_url.as_deref());
+
+    let mut svc_list = Vec::new();
+    if config.services.rest {
+        svc_list.push("REST");
+    }
+    if config.services.didcomm {
+        svc_list.push("DIDComm");
+    }
+    let svc_display = if svc_list.is_empty() {
+        "(none)".to_string()
+    } else {
+        svc_list.join(", ")
+    };
+    line("Services", Some(&svc_display));
+    line(
+        "Listen",
+        Some(&format!("{}:{}", config.server.host, config.server.port)),
+    );
+
+    if let Some(msg) = &config.messaging {
+        line("Mediator DID", Some(&msg.mediator_did));
+        if !msg.mediator_url.is_empty() {
+            line("Mediator URL", Some(&msg.mediator_url));
+        }
+    } else {
+        line("Mediator DID", None);
+    }
+
+    line(
+        "Config file",
+        Some(&config.config_path.display().to_string()),
+    );
+    line(
+        "Data store",
+        Some(&config.store.data_dir.display().to_string()),
+    );
+    println!();
+    Ok(())
+}
+
+/// `vta auth sign-challenge` — sign the 32-byte challenge from `vta unseal`
+/// using the admin's Ed25519 private key, loaded from the local fjall
+/// keystore. The cold-start companion to `pnm auth sign-challenge` for
+/// operators who can't reach PNM yet (no network, no PNM auth setup).
+///
+/// Daemon must be stopped — fjall holds an exclusive lock per data dir.
+/// Only `did:key:` admin DIDs are supported (matches the verifier in
+/// `seal::verify_challenge_signature`).
+async fn auth_sign_challenge(
+    config: &AppConfig,
+    did: &str,
+    challenge_hex: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ed25519_dalek::Signer;
+    use keys::{KeyRecord, KeyType};
+
+    if !did.starts_with("did:key:") {
+        return Err(format!(
+            "vta auth sign-challenge only supports did:key admin DIDs (got: {did}). \
+             For other DID methods, unseal via the REST API with a running VTA."
+        )
+        .into());
+    }
+
+    // 32-byte challenge from `vta unseal`.
+    let challenge_bytes: [u8; 32] = hex::decode(challenge_hex.trim())
+        .map_err(|e| format!("challenge is not valid hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("challenge must be 32 bytes (got {} bytes)", v.len()))?;
+
+    // For `did:key:zXxx` the key_id is `did:key:zXxx#zXxx` (the
+    // verifying key's multibase IS the DID-suffix). Construct
+    // directly rather than scanning the keyspace.
+    let multibase = did.strip_prefix("did:key:").unwrap();
+    let key_id = format!("{did}#{multibase}");
+
+    let store = store::Store::open(&config.store)?;
+    let keys_ks = match cli_store::load_storage_key_for_cli(config).await {
+        Ok(Some(key)) => store.keyspace(crate::keyspaces::KEYS)?.with_encryption(key),
+        Ok(None) => store.keyspace(crate::keyspaces::KEYS)?,
+        Err(e) => return Err(format!("hardened: {e}").into()),
+    };
+    let record: KeyRecord = keys_ks
+        .get(keys::store_key(&key_id))
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "no key record found for `{did}` in this VTA's keystore. \
+                 If the admin DID was minted on a different host, run \
+                 `pnm auth sign-challenge {challenge_hex}` from that host instead."
+            )
+        })?;
+
+    if record.key_type != KeyType::Ed25519 {
+        return Err(format!(
+            "key for `{did}` is not Ed25519 (found: {:?}); cannot sign unseal challenge",
+            record.key_type
+        )
+        .into());
+    }
+
+    let seed_store = create_seed_store(config).map_err(|e| e.to_string())?;
+    let seed = load_seed_bytes(&keys_ks, &*seed_store, record.seed_id).await?;
+
+    let bip32 = ExtendedSigningKey::from_seed(&seed)
+        .map_err(|e| format!("BIP-32 root key derivation failed: {e}"))?;
+    let derivation_path: DerivationPath = record
+        .derivation_path
+        .parse()
+        .map_err(|e| format!("invalid stored derivation path: {e}"))?;
+    let derived = bip32
+        .derive(&derivation_path)
+        .map_err(|e| format!("key derivation failed: {e}"))?;
+
+    let signing_key = SigningKey::from_bytes(derived.signing_key.as_bytes());
+    let signature = signing_key.sign(&challenge_bytes);
+
+    eprintln!();
+    eprintln!("  Signature (hex):");
+    println!("{}", hex::encode(signature.to_bytes()));
+    eprintln!();
+    eprintln!("  Paste the signature above into the `vta unseal` prompt.");
+    eprintln!();
+
+    Ok(())
+}
+
+async fn export_admin(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+    let cs = cli_store::CliStore::open(&config).await?;
+    let acl_ks = cs.keyspace(crate::keyspaces::ACL)?;
+    let keys_ks = cs.keyspace(crate::keyspaces::KEYS)?;
+    let seed_store = create_seed_store(&config)?;
+
+    let vta_did = config.vta_did.as_deref().unwrap_or("(not set)");
+
+    // Find admin ACL entries
+    let entries = acl::list_acl_entries(&acl_ks).await?;
+    let admins: Vec<_> = entries
+        .iter()
+        .filter(|e| e.role == acl::Role::Admin)
+        .collect();
+
+    if admins.is_empty() {
+        eprintln!("No admin entries found in ACL.");
+        return Ok(());
+    }
+
+    eprintln!("VTA DID: {vta_did}");
+    if let Some(msg) = &config.messaging {
+        eprintln!("Mediator DID: {}", msg.mediator_did);
+    }
+    eprintln!();
+
+    for admin in &admins {
+        eprintln!("Admin DID: {}", admin.did);
+        if let Some(label) = &admin.label {
+            eprintln!("  Label: {label}");
+        }
+
+        // For did:key admins, reconstruct the credential
+        if admin.did.starts_with("did:key:") {
+            match reconstruct_credential(&*seed_store, &admin.did, vta_did, &keys_ks).await {
+                Ok(credential) => {
+                    eprintln!();
+                    eprintln!("  Credential:");
+                    eprintln!("  {credential}");
+                }
+                Err(e) => {
+                    eprintln!("  Could not reconstruct credential: {e}");
+                }
+            }
+        }
+        eprintln!();
+    }
+
+    Ok(())
+}
+
+/// Re-derive the admin private key from BIP-32 seed and build the credential bundle.
+async fn reconstruct_credential(
+    seed_store: &dyn keys::seed_store::SeedStore,
+    admin_did: &str,
+    vta_did: &str,
+    keys_ks: &store::KeyspaceHandle,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // The did:key fragment is {did}#{multibase_pubkey}
+    let multibase_pubkey = admin_did.strip_prefix("did:key:").unwrap();
+    let key_id = format!("{admin_did}#{multibase_pubkey}");
+
+    // Look up the key record to get the derivation path
+    let record: keys::KeyRecord = keys_ks
+        .get(keys::store_key(&key_id))
+        .await?
+        .ok_or("admin key record not found in store")?;
+
+    // Load seed for this key's generation
+    let seed = load_seed_bytes(keys_ks, seed_store, record.seed_id).await?;
+
+    // Re-derive the private key
+    let root = ExtendedSigningKey::from_seed(&seed)
+        .map_err(|e| format!("failed to create BIP-32 root key: {e}"))?;
+    let derivation_path: DerivationPath = record
+        .derivation_path
+        .parse()
+        .map_err(|e| format!("invalid derivation path: {e}"))?;
+    let derived = root
+        .derive(&derivation_path)
+        .map_err(|e| format!("key derivation failed: {e}"))?;
+
+    let signing_key = SigningKey::from_bytes(derived.signing_key.as_bytes());
+    let private_key_multibase = multibase::encode(Base::Base58Btc, signing_key.as_bytes());
+
+    let bundle = serde_json::json!({
+        "did": admin_did,
+        "privateKeyMultibase": private_key_multibase,
+        "vtaDid": vta_did,
+    });
+    let bundle_json = serde_json::to_string(&bundle)?;
+    Ok(BASE64.encode(bundle_json.as_bytes()))
+}
+
+/// Long help for `--template`: the built-ins this build ships, read from
+/// `vta_sdk::did_templates::BUILTIN_NAMES` so the help cannot name a retired
+/// template (#2635).
+fn template_name_help() -> String {
+    format!(
+        "DID template name the VTA should render: a built-in ({}) or an \
+         operator-uploaded custom template.",
+        vta_sdk::did_templates::BUILTIN_NAMES.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod removal_verb_tests {
+    use super::*;
+
+    /// Prompt-skip (and, on `vault wipe`, the required confirmation) is
+    /// `--yes`; the `--force` spellings these commands used to take still
+    /// parse, so no script breaks.
+    #[test]
+    fn prompt_skip_is_yes_and_force_still_parses() {
+        for flag in ["--yes", "-y", "--force", "-f"] {
+            let cli = Cli::try_parse_from(["vta", "contexts", "delete", "ctx", flag])
+                .unwrap_or_else(|e| panic!("contexts delete {flag}: {e}"));
+            let Some(Commands::Contexts {
+                command: ContextCommands::Delete { yes, .. },
+            }) = cli.command
+            else {
+                panic!("expected contexts delete");
+            };
+            assert!(yes, "contexts delete {flag} did not set yes");
+        }
+        for flag in ["--yes", "-y", "--force"] {
+            let cli = Cli::try_parse_from(["vta", "vault", "wipe", flag])
+                .unwrap_or_else(|e| panic!("vault wipe {flag}: {e}"));
+            let Some(Commands::Vault {
+                command: VaultCommands::Wipe { yes, .. },
+            }) = cli.command
+            else {
+                panic!("expected vault wipe");
+            };
+            assert!(yes, "vault wipe {flag} did not set yes");
+        }
+    }
+
+    /// `delete-all` is the name; `disable` stays reachable (hidden) and
+    /// dispatches to the same delete.
+    #[test]
+    fn approvals_delete_all_keeps_disable() {
+        let cli = Cli::try_parse_from(["vta", "approvals", "delete-all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Approvals {
+                command: ApprovalsCommands::DeleteAll
+            })
+        ));
+        let cli = Cli::try_parse_from(["vta", "approvals", "disable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Approvals {
+                command: ApprovalsCommands::Disable
+            })
+        ));
+    }
+
+    /// Every `vta` command an operator-facing error string tells the operator
+    /// to run must parse (#2631): `register_server.rs`, `provision_integration`.
+    #[cfg(feature = "webvh")]
+    #[test]
+    fn remediation_commands_in_error_strings_parse() {
+        let commands: &[&[&str]] = &[
+            &[
+                "vta",
+                "did-mgmt",
+                "servers",
+                "add",
+                "--id",
+                "host-1",
+                "--did",
+                "did:web:h.example",
+            ],
+            &[
+                "vta",
+                "did-mgmt",
+                "dids",
+                "get-log",
+                "did:webvh:x:h.example",
+            ],
+        ];
+        for argv in commands {
+            if let Err(e) = Cli::try_parse_from(*argv) {
+                panic!("`{}` does not parse: {e}", argv.join(" "));
+            }
+        }
+    }
+
+    #[cfg(feature = "webvh")]
+    #[test]
+    fn did_mgmt_servers_delete_keeps_remove_and_dids_delete_keeps_force() {
+        for verb in ["delete", "remove"] {
+            let cli = Cli::try_parse_from(["vta", "did-mgmt", "servers", verb, "host-1"])
+                .unwrap_or_else(|e| panic!("{verb}: {e}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::DidMgmt {
+                        command: DidMgmtCommands::Servers {
+                            command: DidMgmtServerCommands::Delete { .. }
+                        }
+                    })
+                ),
+                "servers {verb} did not parse as servers delete"
+            );
+        }
+        for flag in ["--yes", "--force"] {
+            let cli = Cli::try_parse_from(["vta", "did-mgmt", "dids", "delete", "did:x", flag])
+                .unwrap_or_else(|e| panic!("dids delete {flag}: {e}"));
+            assert!(
+                matches!(
+                    cli.command,
+                    Some(Commands::DidMgmt {
+                        command: DidMgmtCommands::Dids {
+                            command: DidMgmtDidCommands::Delete { yes: true, .. }
+                        }
+                    })
+                ),
+                "dids delete {flag} did not set yes"
+            );
+        }
+    }
+}

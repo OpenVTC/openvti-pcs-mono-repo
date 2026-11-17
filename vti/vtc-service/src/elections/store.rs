@@ -1,0 +1,696 @@
+//! The registrar's records: one per election, one per ticket issued.
+//!
+//! Plain data, compiled whatever the build's features, because the action list pins a parked
+//! binding election to whether a record exists under its identifier
+//! (`acl::admin_consent::pin_for`), and that pin must be readable by every build that can hold
+//! the action.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::error::AppError;
+use crate::store::KeyspaceHandle;
+
+/// Where an election stands with its ballot box, as the community records it. The clock turns
+/// [`Standing::Registered`] into the state a reader sees ([`ElectionRecord::state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Standing {
+    /// Recorded, and the registration is still being delivered (create item 8).
+    PendingRegistration,
+    /// The ballot box refused the registration on a later delivery. Only a cancellation clears it.
+    RegistrationRefused,
+    /// The ballot box registered it.
+    Registered,
+    /// The ballot box closed it early, on this community's request.
+    Closed,
+    /// The community certified its result.
+    Tallied,
+    /// Cancelled.
+    Cancelled,
+}
+
+/// A registration still being delivered: the community is the only retry owner (create item 8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Delivery {
+    pub attempts: u32,
+    pub next_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// A close or cancellation the community has asked for and not yet had answered: the elections
+/// sweeper is its one retry owner (VTI-BRD-006). Written before the ballot box is asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingEnd {
+    pub kind: EndKind,
+    pub reason: String,
+    pub attempts: u32,
+    pub next_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Which end a [`PendingEnd`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EndKind {
+    /// Close voting early (VTI-VOT-013): the count as it stands is final.
+    Close,
+    /// Cancel the election.
+    Cancel,
+}
+
+/// What the community keeps of an election on a deleted board (VTI-BRD-007): its identifier,
+/// its manifest's digest and the board heads it kept (VTI-VOT-051) — never its title,
+/// description, roll or tickets. Removed once `remove_at` passes; kept for ever without one
+/// (VTI-BRD-008).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tombstone {
+    pub election_id: String,
+    pub manifest_digest: String,
+    pub ballot_box: String,
+    #[serde(default)]
+    pub checkpoints: Vec<Value>,
+    pub deleted_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_at: Option<DateTime<Utc>>,
+}
+
+impl Tombstone {
+    /// The tombstone of `rec`, removed at `remove_at` (none: kept for ever).
+    #[must_use]
+    pub fn of(
+        rec: &ElectionRecord,
+        deleted_at: DateTime<Utc>,
+        remove_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            election_id: rec.election_id.clone(),
+            manifest_digest: rec.manifest_digest.clone(),
+            ballot_box: rec.ballot_box.clone(),
+            checkpoints: rec.checkpoints.clone(),
+            deleted_at,
+            remove_at,
+        }
+    }
+}
+
+/// What the ballot box said when it refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoxRefusal {
+    pub code: String,
+    pub message: String,
+}
+
+/// Under a credential roll, what the DID `roll.memberOf` names was to this community when the
+/// election was created (VTI-VOT-026), kept so a claim reads the roll from the community's own
+/// records: a group the community has since deleted is still known as one of its groups, never
+/// mistaken for a party outside it (VTI-VOT-029).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum RollParty {
+    /// The community itself.
+    ThisCommunity,
+    /// One of the community's groups, by its local identifier.
+    #[serde(rename_all = "camelCase")]
+    CommunityGroup { group_id: String },
+    /// A party outside the community that is itself an active member of it.
+    MemberParty,
+}
+
+impl RollParty {
+    /// `RollCredentialDisclosure.memberOfKind`.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RollParty::ThisCommunity => "thisCommunity",
+            RollParty::CommunityGroup { .. } => "communityGroup",
+            RollParty::MemberParty => "memberParty",
+        }
+    }
+}
+
+/// One election.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElectionRecord {
+    pub election_id: String,
+    /// The manifest exactly as registered: every ticket, cast and certification is bound to it.
+    pub manifest: Value,
+    /// Its digest, multibase multihash.
+    pub manifest_digest: String,
+    pub standing: Standing,
+    pub binding: bool,
+    pub ballot_box: String,
+    pub registration_opens: DateTime<Utc>,
+    pub voting_opens: DateTime<Utc>,
+    pub voting_closes: DateTime<Utc>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    /// The parked action a binding creation executed from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    /// Set durably before anything else on a cancellation, and never cleared (VTI-VOT-024).
+    #[serde(default)]
+    pub issuance_stopped: bool,
+    /// A close sent and not yet answered: no ticket is issued meanwhile (close item 4).
+    #[serde(default)]
+    pub close_in_flight: bool,
+    /// When a restore found this election able to issue tickets. A ticket issued after the
+    /// backup was taken is not in it, so its holder could take a second one (VTI-VOT-022): no
+    /// ticket is issued after a restore, ever. Never cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuance_closed_by_restore: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tickets_issued: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<BoxRefusal>,
+    /// Board heads kept, oldest first: `{head, document}`, the document exactly as the ballot
+    /// box signed it.
+    #[serde(default)]
+    pub checkpoints: Vec<Value>,
+    /// When the community last asked for a head, by its own clock: what checkpoints are paced
+    /// by, never a time the ballot box wrote into a head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_asked_at: Option<DateTime<Utc>>,
+    /// Whether the head as it stood at close is among them.
+    #[serde(default)]
+    pub final_checkpoint: bool,
+    /// The certification, once recorded: `{result, certifiedAt, auditAttestations}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certified: Option<Value>,
+    /// A sealed or tallied-encrypted election's key, once its trustees formed it, as the ballot
+    /// box reported it and checked against the dealings it reported with it (show item 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub election_key: Option<Value>,
+    /// With `election_key`: the trustees' signed steps it forms from, as received — what a
+    /// voter's VTA forms the key from itself (show item 6, CONVENTIONS §9.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceremony: Option<Value>,
+    /// Whether the ballot box has accepted this community's decryption authorization
+    /// (CONVENTIONS §9.7).
+    #[serde(default)]
+    pub decryption_authorized: bool,
+    /// Under a credential roll, what `roll.memberOf` was to the community at creation; absent
+    /// under every other rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_party: Option<RollParty>,
+    /// The ballot box's published result, verified by the community from the board and its own
+    /// voting key exactly as certification verifies it, but **not certified**: `{result, head,
+    /// verifiedAt}`. Kept for a board's election (`crate::boards`), whose facilitators select
+    /// with the result in view and may not hold `vtc.elections.manage` (VTI-BRD-040). It decides
+    /// nothing and is never shown as a certification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<Value>,
+    /// A close or cancellation asked for by closing the election's board and not yet answered
+    /// (VTI-BRD-006); the elections sweeper retries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_end: Option<PendingEnd>,
+}
+
+impl ElectionRecord {
+    /// The DID a credential roll names, when the roll is one.
+    #[must_use]
+    pub fn roll_member_of(&self) -> Option<&str> {
+        (self.manifest["roll"]["rule"] == "credential")
+            .then(|| self.manifest["roll"]["memberOf"].as_str())
+            .flatten()
+    }
+
+    /// Whether the roll names a member party (VTI-VOT-015 item 3): the election is then shown
+    /// only to managers, the party itself, and a reader who presents its membership.
+    #[must_use]
+    pub fn is_member_party_election(&self) -> bool {
+        matches!(self.roll_party, Some(RollParty::MemberParty))
+    }
+
+    /// The state a reader is shown (`RegistrarState`): the record's standing, with the clock
+    /// read for a registered election as the ballot box would.
+    #[must_use]
+    pub fn state(&self, now: DateTime<Utc>) -> &'static str {
+        match self.standing {
+            Standing::PendingRegistration => "pendingRegistration",
+            Standing::RegistrationRefused => "registrationRefused",
+            Standing::Cancelled => "cancelled",
+            Standing::Tallied => "tallied",
+            Standing::Closed => "closed",
+            Standing::Registered if now < self.registration_opens => "registered",
+            Standing::Registered if now < self.voting_opens => "registration",
+            Standing::Registered if now < self.voting_closes => "voting",
+            Standing::Registered => "closed",
+        }
+    }
+
+    /// Whether the ballot box has registered it (whatever has happened since).
+    #[must_use]
+    pub fn is_registered(&self) -> bool {
+        matches!(
+            self.standing,
+            Standing::Registered | Standing::Closed | Standing::Tallied
+        )
+    }
+}
+
+/// A ticket issued: the record that spends the signer's one ticket (VTI-VOT-022), and what a
+/// resend of the same request is answered from (tickets/issue item 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketIssued {
+    pub election_id: String,
+    pub signer: String,
+    pub issued_at: DateTime<Utc>,
+    /// The request document's `id`, and a digest of its bytes as received.
+    pub doc_id: String,
+    pub doc_digest: String,
+    /// The pre-credential answered, kept until voting closes and then discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_credential: Option<String>,
+}
+
+const ELECTION_PREFIX: &str = "election:";
+const TICKET_PREFIX: &str = "ticket:";
+
+fn election_key(election_id: &str) -> String {
+    format!("{ELECTION_PREFIX}{election_id}")
+}
+
+/// Hashed, so a DID's length or characters never shape the key.
+fn ticket_key(election_id: &str, signer: &str) -> String {
+    let mut h = Sha256::new();
+    for part in [election_id, signer] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part.as_bytes());
+    }
+    format!("{TICKET_PREFIX}{election_id}:{}", hex::encode(h.finalize()))
+}
+
+/// The election under `election_id`.
+///
+/// # Errors
+/// A store failure.
+pub async fn get(
+    ks: &KeyspaceHandle,
+    election_id: &str,
+) -> Result<Option<ElectionRecord>, AppError> {
+    ks.get(election_key(election_id)).await
+}
+
+/// Write `record` whole. Only for a record nobody else can be writing — one just made, or
+/// one written under [`WRITE_LOCK`]; every change to a stored election goes through
+/// [`update`].
+///
+/// # Errors
+/// A store failure.
+pub async fn put(ks: &KeyspaceHandle, record: &ElectionRecord) -> Result<(), AppError> {
+    ks.insert(election_key(&record.election_id), record).await
+}
+
+/// Every change to a stored election is a read, a change and a write under this lock, so two
+/// writers — a task, the board's closing in the background, the sweeper's tick — never write
+/// over what the other just wrote. Held only from the read to the write, never across a call
+/// to the ballot box (R1.3).
+pub(crate) static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Apply `change` to the election under `election_id` as it is stored now, and write it:
+/// `None` when there is no such election. `change` sets only the fields its caller decided,
+/// never a whole record read earlier.
+///
+/// # Errors
+/// A store failure.
+pub async fn update<T>(
+    ks: &KeyspaceHandle,
+    election_id: &str,
+    change: impl FnOnce(&mut ElectionRecord) -> T,
+) -> Result<Option<T>, AppError> {
+    let _guard = WRITE_LOCK.lock().await;
+    let Some(mut rec) = get(ks, election_id).await? else {
+        return Ok(None);
+    };
+    let out = change(&mut rec);
+    put(ks, &rec).await?;
+    Ok(Some(out))
+}
+
+/// Write `record` only when no election holds its identifier: `false` when one does.
+///
+/// # Errors
+/// A store failure.
+pub async fn put_new(ks: &KeyspaceHandle, record: &ElectionRecord) -> Result<bool, AppError> {
+    ks.insert_if_absent(election_key(&record.election_id), record)
+        .await
+}
+
+/// Remove the election (a registration the ballot box refused at once records nothing).
+///
+/// # Errors
+/// A store failure.
+pub async fn remove(ks: &KeyspaceHandle, election_id: &str) -> Result<(), AppError> {
+    ks.remove(election_key(election_id)).await
+}
+
+/// Every election.
+///
+/// # Errors
+/// A store failure, or a record that does not parse.
+pub async fn all(ks: &KeyspaceHandle) -> Result<Vec<ElectionRecord>, AppError> {
+    ks.prefix_iter_raw(ELECTION_PREFIX)
+        .await?
+        .into_iter()
+        .map(|(_, v)| {
+            serde_json::from_slice(&v)
+                .map_err(|e| AppError::Internal(format!("an election record does not parse: {e}")))
+        })
+        .collect()
+}
+
+/// The ticket `signer` took for `election_id`.
+///
+/// # Errors
+/// A store failure.
+pub async fn ticket(
+    ks: &KeyspaceHandle,
+    election_id: &str,
+    signer: &str,
+) -> Result<Option<TicketIssued>, AppError> {
+    ks.get(ticket_key(election_id, signer)).await
+}
+
+/// Record a ticket. `false` when `signer` already holds one for the election.
+///
+/// # Errors
+/// A store failure.
+pub async fn put_ticket(ks: &KeyspaceHandle, t: &TicketIssued) -> Result<bool, AppError> {
+    ks.insert_if_absent(ticket_key(&t.election_id, &t.signer), t)
+        .await
+}
+
+/// Copy every ticket `from` holds, in every election, to `to` — never over one `to` already
+/// holds. Idempotent: a rotation retried after a failure copies nothing twice.
+///
+/// # Errors
+/// A store failure, or a record that does not parse.
+pub async fn carry_tickets(ks: &KeyspaceHandle, from: &str, to: &str) -> Result<usize, AppError> {
+    let mut carried = 0;
+    for (_, v) in ks.prefix_iter_raw(TICKET_PREFIX).await? {
+        let t: TicketIssued = serde_json::from_slice(&v)
+            .map_err(|e| AppError::Internal(format!("a ticket record does not parse: {e}")))?;
+        if t.signer != from {
+            continue;
+        }
+        let moved = TicketIssued {
+            signer: to.to_string(),
+            ..t
+        };
+        if put_ticket(ks, &moved).await? {
+            carried += 1;
+        }
+    }
+    Ok(carried)
+}
+
+/// Every ticket of one election (to discard stored pre-credentials after voting closes).
+///
+/// # Errors
+/// A store failure, or a record that does not parse.
+pub async fn tickets(
+    ks: &KeyspaceHandle,
+    election_id: &str,
+) -> Result<Vec<TicketIssued>, AppError> {
+    ks.prefix_iter_raw(format!("{TICKET_PREFIX}{election_id}:"))
+        .await?
+        .into_iter()
+        .map(|(_, v)| {
+            serde_json::from_slice(&v)
+                .map_err(|e| AppError::Internal(format!("a ticket record does not parse: {e}")))
+        })
+        .collect()
+}
+
+/// Overwrite a ticket record (to discard its pre-credential).
+///
+/// # Errors
+/// A store failure.
+pub async fn replace_ticket(ks: &KeyspaceHandle, t: &TicketIssued) -> Result<(), AppError> {
+    ks.insert(ticket_key(&t.election_id, &t.signer), t).await
+}
+
+/// Remove every ticket record of `election_id` — the community's record of the tickets it
+/// issued, which a deleted board's election does not keep (VTI-BRD-007). Returns how many.
+///
+/// # Errors
+/// A store failure.
+pub async fn remove_tickets(ks: &KeyspaceHandle, election_id: &str) -> Result<usize, AppError> {
+    let rows = ks
+        .prefix_iter_raw(format!("{TICKET_PREFIX}{election_id}:"))
+        .await?;
+    let n = rows.len();
+    for (k, _) in rows {
+        ks.remove(k).await?;
+    }
+    Ok(n)
+}
+
+const TOMBSTONE_PREFIX: &str = "tombstone:";
+
+/// Keep `t` (VTI-BRD-007).
+///
+/// # Errors
+/// A store failure.
+pub async fn put_tombstone(ks: &KeyspaceHandle, t: &Tombstone) -> Result<(), AppError> {
+    ks.insert(format!("{TOMBSTONE_PREFIX}{}", t.election_id), t)
+        .await
+}
+
+/// The tombstone of `election_id`, if one is kept.
+///
+/// # Errors
+/// A store failure.
+pub async fn tombstone(
+    ks: &KeyspaceHandle,
+    election_id: &str,
+) -> Result<Option<Tombstone>, AppError> {
+    ks.get(format!("{TOMBSTONE_PREFIX}{election_id}")).await
+}
+
+/// Every tombstone kept.
+///
+/// # Errors
+/// A store failure, or a record that does not parse.
+pub async fn tombstones(ks: &KeyspaceHandle) -> Result<Vec<Tombstone>, AppError> {
+    ks.prefix_iter_raw(TOMBSTONE_PREFIX)
+        .await?
+        .into_iter()
+        .map(|(_, v)| {
+            serde_json::from_slice(&v)
+                .map_err(|e| AppError::Internal(format!("a tombstone does not parse: {e}")))
+        })
+        .collect()
+}
+
+/// Remove the tombstone of `election_id` (VTI-BRD-008).
+///
+/// # Errors
+/// A store failure.
+pub async fn remove_tombstone(ks: &KeyspaceHandle, election_id: &str) -> Result<(), AppError> {
+    ks.remove(format!("{TOMBSTONE_PREFIX}{election_id}")).await
+}
+
+const PRESENTATION_PREFIX: &str = "presented:";
+
+/// A read document whose presentation was accepted (show/0.6 Conformance item 8.1), kept for
+/// the acceptance window so the same document cannot be accepted twice (VTI-CRD-022). Only its
+/// `id`: never the presentation, the credential or a claim of it (VTI-CRD-042).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresentationAccepted {
+    until: DateTime<Utc>,
+}
+
+fn presentation_key(doc_id: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(doc_id.as_bytes());
+    format!("{PRESENTATION_PREFIX}{}", hex::encode(h.finalize()))
+}
+
+/// Whether a presentation was already accepted in the document `doc_id`, within its window.
+///
+/// # Errors
+/// A store failure.
+pub async fn presentation_accepted(
+    ks: &KeyspaceHandle,
+    doc_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let seen: Option<PresentationAccepted> = ks.get(presentation_key(doc_id)).await?;
+    Ok(seen.is_some_and(|s| s.until > now))
+}
+
+/// Record that a presentation was accepted in `doc_id`, until `until`. `false` when one already
+/// was and its window has not passed.
+///
+/// # Errors
+/// A store failure.
+pub async fn accept_presentation(
+    ks: &KeyspaceHandle,
+    doc_id: &str,
+    until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    if presentation_accepted(ks, doc_id, now).await? {
+        return Ok(false);
+    }
+    ks.insert(presentation_key(doc_id), &PresentationAccepted { until })
+        .await?;
+    Ok(true)
+}
+
+/// Forget accepted presentations whose window has passed. Returns how many.
+///
+/// # Errors
+/// A store failure.
+pub async fn prune_presentations(
+    ks: &KeyspaceHandle,
+    now: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    let mut gone = 0;
+    for (key, raw) in ks
+        .prefix_iter_raw(PRESENTATION_PREFIX.as_bytes().to_vec())
+        .await?
+    {
+        let expired =
+            serde_json::from_slice::<PresentationAccepted>(&raw).map_or(true, |p| p.until <= now);
+        if expired {
+            ks.remove(key).await?;
+            gone += 1;
+        }
+    }
+    Ok(gone)
+}
+
+/// A registered election opening tomorrow, for tests.
+#[cfg(all(test, feature = "voting"))]
+pub(crate) fn test_record(now: DateTime<Utc>) -> ElectionRecord {
+    tests::record(now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    pub(super) fn record(now: DateTime<Utc>) -> ElectionRecord {
+        ElectionRecord {
+            election_id: "agm".into(),
+            manifest: Value::Null,
+            manifest_digest: "z".into(),
+            standing: Standing::Registered,
+            binding: false,
+            ballot_box: "did:key:z6MkBox".into(),
+            registration_opens: now + Duration::days(1),
+            voting_opens: now + Duration::days(2),
+            voting_closes: now + Duration::days(3),
+            created_by: "did:key:z6MkAdmin".into(),
+            created_at: now,
+            action_id: None,
+            issuance_stopped: false,
+            close_in_flight: false,
+            issuance_closed_by_restore: None,
+            tickets_issued: 0,
+            delivery: None,
+            refusal: None,
+            checkpoints: Vec::new(),
+            checkpoint_asked_at: None,
+            final_checkpoint: false,
+            certified: None,
+            election_key: None,
+            ceremony: None,
+            decryption_authorized: false,
+            roll_party: None,
+            verified: None,
+            pending_end: None,
+        }
+    }
+
+    #[test]
+    fn a_registered_election_reads_its_state_off_the_clock() {
+        let now = Utc::now();
+        let r = record(now);
+        assert_eq!(r.state(now), "registered");
+        assert_eq!(r.state(now + Duration::hours(25)), "registration");
+        assert_eq!(r.state(now + Duration::hours(49)), "voting");
+        assert_eq!(r.state(now + Duration::hours(73)), "closed");
+        let cancelled = ElectionRecord {
+            standing: Standing::Cancelled,
+            ..r
+        };
+        assert_eq!(cancelled.state(now + Duration::hours(49)), "cancelled");
+    }
+
+    /// VTI-VOT-022: a rotation carries the party's tickets to its new DID, so the new DID is
+    /// refused a second ticket; another party's tickets stay where they are, and carrying again
+    /// copies nothing twice.
+    #[tokio::test]
+    async fn vot_022_a_rotation_carries_the_tickets_to_the_new_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = vti_common::store::test_fixture::open_with_keyspaces(
+            &dir.path().join("db"),
+            &["elections"],
+        )
+        .unwrap();
+        let ks = store.keyspace("elections").unwrap();
+        let ticket = |election: &str, signer: &str| TicketIssued {
+            election_id: election.into(),
+            signer: signer.into(),
+            issued_at: Utc::now(),
+            doc_id: "urn:uuid:1".into(),
+            doc_digest: "z".into(),
+            pre_credential: None,
+        };
+        for t in [
+            ticket("agm", "did:key:A"),
+            ticket("budget", "did:key:A"),
+            ticket("agm", "did:key:C"),
+        ] {
+            assert!(put_ticket(&ks, &t).await.unwrap());
+        }
+        assert_eq!(
+            carry_tickets(&ks, "did:key:A", "did:key:B").await.unwrap(),
+            2
+        );
+        for election in ["agm", "budget"] {
+            let carried = super::ticket(&ks, election, "did:key:B").await.unwrap();
+            assert_eq!(carried.unwrap().signer, "did:key:B");
+            assert!(
+                !put_ticket(&ks, &ticket(election, "did:key:B"))
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            super::ticket(&ks, "budget", "did:key:C")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            carry_tickets(&ks, "did:key:A", "did:key:B").await.unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn ticket_keys_separate_elections_and_signers() {
+        assert_ne!(ticket_key("a", "did:x"), ticket_key("a", "did:y"));
+        assert_ne!(ticket_key("a", "did:x"), ticket_key("b", "did:x"));
+        assert!(ticket_key("a", "did:x").starts_with("ticket:a:"));
+    }
+}

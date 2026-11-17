@@ -1,0 +1,151 @@
+[package]
+name = "vti-rooms"
+description = "Data-room storage, wire types, and authorization — the parts of a room that are not a service"
+version = "0.37.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["host"]
+# Everything a room's **host** needs, and the only reason this crate depends on
+# `vti-common`. On by default, because a host is what this crate was extracted
+# for; off, what remains is the member half — the group keys, sealing, the epoch
+# chain and the wire types — which needs no store, no `AppError`, and no server.
+#
+# The split is not new here, it was only unnamed: `vta-service` already uses
+# `mls`/`sealed`/`wire` and nothing else, while `vtc-service`, `room-host` and
+# `vti-rooms-dtg` use `storage`/`authz`/`audit`. Naming it is what lets the member
+# half build for `wasm32-unknown-unknown`, and so lets a browser be a real member
+# rather than a client of one. See `docs/05-design-notes/data-rooms-demo-site.md`.
+#
+# `lifecycle` is deliberately **not** gated. Only hosts consume it today, but it
+# needs nothing from `vti-common`, and a member computing a room's lifecycle
+# state to explain it on screen is a thing that should not require a host's
+# dependencies.
+host = ["dep:vti-common", "dep:tokio", "dep:uuid", "dep:tracing"]
+# The room's group-key layer (`mls`) and record sealing (`sealed`). Off by
+# default: a host that only stores ciphertext needs none of it, and OpenMLS is a
+# substantial dependency to make such a host carry. Mirrors how `vtc-service`
+# gates its `bbs` verifier.
+mls = [
+  "files",
+  "dep:openmls",
+  "dep:openmls_rust_crypto",
+  "dep:openmls_basic_credential",
+  "dep:openmls_traits",
+  "dep:tls_codec",
+  "dep:getrandom_02",
+]
+# A file's key and its STREAM sealing (`files`), without the group layer. For a
+# party that is handed one file's key — a CLI or the wallet extension, which get
+# it from the member's VTA — and so needs no OpenMLS. `mls` implies it, because a
+# member holding the group derives file keys itself.
+files = ["dep:chacha20poly1305", "dep:hkdf", "dep:getrandom"]
+# Hooks for a host's own tests (`BlobHost::lapse_direct_uploads`). Never in a
+# production build.
+test-support = ["host", "dep:tempfile"]
+
+[dependencies]
+# The Trust Task framework. A normal dependency rather than a dev one, because
+# `wire.rs` now implements `trust_tasks_rs::Payload` for each request body: the
+# type states which task URI it is the payload of, so a dispatcher can be keyed
+# on the type rather than on a URI written out at the registration site. That is
+# production API, not a test aid.
+#
+# It has to live here. `Payload` is a foreign trait and these are this crate's
+# types, so the orphan rule puts the impls in this crate or nowhere — a consumer
+# cannot add them.
+#
+# Note this does not adopt the generated `specs::rooms` types; see `wire.rs`'s
+# header for why these stay hand-written. The dependency buys the trait and the
+# schema index, not a replacement for the shapes.
+trust-tasks-rs = { workspace = true }
+# The generated Trust Task wire types, at the versions VTI pins (CLAUDE.md,
+# "Pinning a task version").
+vti-specs-rooms = { path = "../vti-specs-rooms", version = "0.10" }
+# The store abstraction and AppError. This crate's only internal dependency:
+# a room's storage and authorization need nothing from a community service,
+# which is the whole reason they are extractable.
+#
+# Optional, and load-bearing that it is: `vti-common` is server-side by its own
+# description and pulls axum, fjall and tokio, none of which build for wasm. It
+# is the `host` feature's whole content.
+vti-common = { path = "../vti-common", version = "0.66", optional = true }
+# Room files (`blobs`), also host-only: the host lock over reservations and
+# reference counts, per-room record locks, minted transfer handles, and the
+# collection log line. `rt` for `spawn_blocking`: a room's commitment is hashed
+# off the async executor (`storage`).
+tokio = { workspace = true, optional = true, features = ["sync", "fs", "rt"] }
+uuid = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+# The published schema types `updatedAt` as an RFC 3339 string.
+chrono = { workspace = true }
+# A member's name is bounded in code points after NFC (`MemberName`, `member_profile`).
+unicode-normalization = { workspace = true }
+
+# The record commitment (`merkle`). RFC 8785 canonicalisation so a leaf commits
+# to the record's *meaning* rather than to one serialiser's field order, and
+# SHA-256 with RFC 6962's domain separation.
+serde_json_canonicalizer = { workspace = true }
+sha2 = { workspace = true }
+# `dataCommitment` travels as a multibase-encoded multihash, never bare hex.
+multibase = { workspace = true }
+
+# MLS (RFC 9420) for room group keys, behind the `mls` feature. The design note
+# adopts MLS rather than a hand-rolled epoch scheme: post-compromise security and
+# O(log n) membership change are not things to reimplement.
+openmls = { version = "0.9", optional = true }
+openmls_rust_crypto = { workspace = true, optional = true }
+openmls_basic_credential = { version = "0.6", optional = true }
+openmls_traits = { version = "0.6", optional = true }
+tls_codec = { version = "0.5", optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+# `files` encodes a `fileId` on both halves, so this is not behind `mls`.
+base64 = { workspace = true }
+# The file key (`files`), HKDF-SHA256 over the epoch storage key.
+hkdf = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+# Verification may resolve a DID, so ChainVerifier is async; async-trait keeps it
+# dyn-compatible, as it does for vti_common::auth::backend.
+async-trait = { workspace = true }
+tempfile = { workspace = true, optional = true }
+
+# On wasm, OpenMLS needs its `js` feature: it swaps `std::time` for `web-time`
+# (there is no `SystemTime` on `wasm32-unknown-unknown`) and routes randomness
+# through `getrandom`'s JS backend. Declared per-target rather than as a feature
+# of this crate so that building for wasm simply works, with nothing for a
+# consumer to remember — cargo unions these onto the general declaration above.
+#
+# **This is not sufficient on its own.** Two things the artifact crate must also
+# do, because neither can be set from here:
+#
+# `getrandom_02` is a **feature shim, not a dependency this crate calls**. There
+# are two getrandom majors in the graph: the 0.4 above, which `mls` uses
+# directly, and an 0.2 that RustCrypto's elliptic-curve stack pulls in under
+# `openmls_rust_crypto`. The second is transitive, so no feature declared for the
+# first can reach it — and without `js` it fails with a `compile_error!` saying
+# wasm "is not supported by default", which reads like an unsupported target and
+# is not. Naming it here turns the feature on for the whole graph.
+#
+# Doing it in this crate rather than leaving it to each artifact crate is
+# deliberate. The choice is target-specific and, on wasm32, there is only one
+# correct answer; the `cfg` means no native build can see it. The alternative is
+# a footgun in a doc comment, paid for once per consumer.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+openmls = { version = "0.9", features = ["js"], optional = true }
+getrandom = { workspace = true, features = ["wasm_js"], optional = true }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,369 @@
+//! Op-layer for the backup-blob byte transport (`GET/POST /backup/blob/{id}`).
+//!
+//! The token-gated state machine that moves the staged `.vtabak` bytes —
+//! GET streams an export bundle (one-shot, delete-before-flip), POST
+//! accepts an import upload (size + SHA-256 verified) — lives here. The
+//! HTTP route adapters in `routes/backup_blob.rs` handle only transport
+//! concerns (path/header parsing, body cap, response framing) and
+//! delegate the state machine to these two functions.
+//!
+//! See `docs/05-design-notes/backup-descriptor-pattern.md` for the full
+//! state machine, and §"Auth model" for why the bearer token — not a
+//! JWT — is the authenticator.
+
+use std::path::Path;
+
+use chrono::Utc;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use crate::backup_bundle_store::{self, BundleKind, BundleRecord, BundleState, verify_token};
+use vti_common::error::AppError;
+use vti_common::store::KeyspaceHandle;
+
+/// Download the encrypted bytes of an export bundle. One-shot: on
+/// success the record transitions to `ExportDownloaded` (terminal) and
+/// the bytes are removed from disk.
+///
+/// Returns the staged bytes; the route adapter frames them as an
+/// `application/octet-stream` attachment.
+///
+/// Failure modes (the route maps the `AppError` variants to HTTP status):
+/// - bundle_id not found → `NotFound`
+/// - token doesn't match the stored hash → `Forbidden`
+/// - bundle is an import bundle, or already-downloaded / aborted /
+///   expired → `NotFound` / `Conflict` / `Gone` (see [`enforce_export_ready`])
+/// - bundle expired by clock → `Gone` (410, via [`gone`])
+/// - blob bytes missing on disk → `Gone` (already swept)
+pub async fn read_export_blob(
+    bundles_ks: &KeyspaceHandle,
+    bundle_id: Uuid,
+    token: &str,
+) -> Result<Vec<u8>, AppError> {
+    let mut record = match backup_bundle_store::get_bundle(bundles_ks, &bundle_id).await? {
+        Some(r) => r,
+        None => {
+            warn!(bundle_id = %bundle_id, "GET blob: bundle not found");
+            return Err(AppError::NotFound(format!("bundle not found: {bundle_id}")));
+        }
+    };
+
+    enforce_token(&record, token)?;
+    enforce_export_ready(&record)?;
+    enforce_not_expired(&record)?;
+
+    let blob_path = record
+        .blob_path
+        .clone()
+        .ok_or_else(|| AppError::Internal(format!("bundle {bundle_id} has no blob path")))?;
+
+    let bytes = match tokio::fs::read(&blob_path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                bundle_id = %bundle_id,
+                path = %blob_path.display(),
+                "GET blob: file missing on disk; bundle treated as expired"
+            );
+            return Err(gone(format!("bundle {bundle_id} expired (blob missing)")));
+        }
+        Err(e) => return Err(AppError::Io(e)),
+    };
+
+    // One-shot semantics: bytes are gone after this call. We delete
+    // the file BEFORE flipping the state so a crash mid-transition
+    // leaves the bytes deleted and the state recoverable on next
+    // boot's sweeper pass.
+    if let Err(e) = tokio::fs::remove_file(&blob_path).await {
+        // Best-effort: failure to delete is not fatal — the sweeper
+        // will clean up. But log loud since the file is now
+        // operator-visible after the response.
+        warn!(
+            bundle_id = %bundle_id,
+            path = %blob_path.display(),
+            error = %e,
+            "GET blob: failed to delete blob after read; sweeper will retry"
+        );
+    }
+    record.state = BundleState::ExportDownloaded;
+    record.blob_path = None;
+    backup_bundle_store::store_bundle(bundles_ks, &record).await?;
+
+    info!(bundle_id = %bundle_id, bytes = bytes.len(), "GET blob: served");
+
+    Ok(bytes)
+}
+
+/// An import upload whose bundle, token, kind, state and expiry have been
+/// checked, before any of the body is read. Only [`admit_import_upload`]
+/// builds one.
+///
+/// The route reads the body only after admission, and reads at most
+/// [`AdmittedImport::expected_size_bytes`] of it, so a request that names
+/// an unknown bundle or carries the wrong token never has its body read.
+#[derive(Debug)]
+pub struct AdmittedImport {
+    record: BundleRecord,
+}
+
+impl AdmittedImport {
+    /// The bundle this upload is for.
+    pub fn bundle_id(&self) -> Uuid {
+        self.record.bundle_id
+    }
+
+    /// The exact byte count the descriptor declared. The upload must be
+    /// this long; the route refuses a longer body as soon as it passes
+    /// this count.
+    pub fn expected_size_bytes(&self) -> u64 {
+        self.record.expected_size_bytes
+    }
+}
+
+/// Check an import upload's bundle id and token, and that the bundle is
+/// an import still waiting for its bytes and not expired. Reads no body.
+///
+/// Failure modes:
+/// - bundle_id not found → `NotFound`
+/// - token doesn't match the stored hash → `Forbidden`
+/// - not an import bundle → `NotFound`; upload already accepted →
+///   `Conflict`; aborted / expired → `Gone` (see [`enforce_import_pending`])
+pub async fn admit_import_upload(
+    bundles_ks: &KeyspaceHandle,
+    bundle_id: Uuid,
+    token: &str,
+) -> Result<AdmittedImport, AppError> {
+    let record = match backup_bundle_store::get_bundle(bundles_ks, &bundle_id).await? {
+        Some(r) => r,
+        None => {
+            warn!(bundle_id = %bundle_id, "POST blob: bundle not found");
+            return Err(AppError::NotFound(format!("bundle not found: {bundle_id}")));
+        }
+    };
+
+    enforce_token(&record, token)?;
+    enforce_import_pending(&record)?;
+    enforce_not_expired(&record)?;
+
+    Ok(AdmittedImport { record })
+}
+
+/// Verify and stage the bytes of an admitted import upload. The byte
+/// count must match `expected_size_bytes` and the SHA-256 must match
+/// `expected_sha256`. On success the state moves to `ImportReceived` (no
+/// further uploads accepted against this bundle_id).
+///
+/// The record is read again before staging, and the state, expiry and
+/// token are checked against that fresh copy, so a bundle that was
+/// accepted, aborted or expired while the body was being read is not
+/// staged over.
+///
+/// Multi-shot until the first successful upload — a failed upload
+/// (mismatched hash or interrupted transfer) can be retried without
+/// re-running `initiate-import`.
+///
+/// Failure modes, beyond those of [`admit_import_upload`] on the fresh
+/// record:
+/// - body size doesn't match `expected_size_bytes` → `Validation`
+/// - body SHA-256 doesn't match `expected_sha256` → `Validation`
+/// - I/O error staging to disk → `Io`
+pub async fn stage_import_blob(
+    bundles_ks: &KeyspaceHandle,
+    blob_dir: &Path,
+    admitted: AdmittedImport,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let bundle_id = admitted.record.bundle_id;
+    let admitted = admitted.record;
+
+    if bytes.len() as u64 != admitted.expected_size_bytes {
+        return Err(AppError::Validation(format!(
+            "upload size mismatch for bundle {bundle_id}: expected {} bytes, got {}",
+            admitted.expected_size_bytes,
+            bytes.len()
+        )));
+    }
+
+    let actual_sha = sha256_hex(bytes);
+    if actual_sha != admitted.expected_sha256 {
+        return Err(AppError::Validation(format!(
+            "upload integrity check failed for bundle {bundle_id}: \
+             expected sha256={}, got {}",
+            admitted.expected_sha256, actual_sha
+        )));
+    }
+
+    // The body read can take a while; re-read the record so a state change
+    // in the meantime (another upload accepted, an abort, the TTL passing)
+    // is seen before anything is written.
+    let mut record = match backup_bundle_store::get_bundle(bundles_ks, &bundle_id).await? {
+        Some(r) => r,
+        None => {
+            warn!(bundle_id = %bundle_id, "POST blob: bundle removed during upload");
+            return Err(gone(format!("bundle {bundle_id} removed during upload")));
+        }
+    };
+    if record.token_hash != admitted.token_hash
+        || record.expected_sha256 != admitted.expected_sha256
+        || record.expected_size_bytes != admitted.expected_size_bytes
+    {
+        return Err(AppError::Conflict(format!(
+            "bundle {bundle_id} changed during upload"
+        )));
+    }
+    enforce_import_pending(&record)?;
+    enforce_not_expired(&record)?;
+
+    // Stage the bytes on disk. Ensure the blob dir exists; this is
+    // the first place that may need to create it (export-side
+    // creates at descriptor mint time).
+    tokio::fs::create_dir_all(blob_dir)
+        .await
+        .map_err(AppError::Io)?;
+    #[cfg(unix)]
+    set_dir_mode_700(blob_dir).await?;
+
+    let blob_path = blob_dir.join(format!("{bundle_id}.vtabak"));
+    tokio::fs::write(&blob_path, bytes)
+        .await
+        .map_err(AppError::Io)?;
+    #[cfg(unix)]
+    set_file_mode_600(&blob_path).await?;
+
+    record.state = BundleState::ImportReceived;
+    record.blob_path = Some(blob_path);
+    backup_bundle_store::store_bundle(bundles_ks, &record).await?;
+
+    info!(bundle_id = %bundle_id, bytes = bytes.len(), "POST blob: accepted");
+
+    Ok(())
+}
+
+/// Admit and stage an import upload whose bytes are already in memory:
+/// [`admit_import_upload`] then [`stage_import_blob`]. The HTTP route
+/// calls the two separately so it can check the token before it reads
+/// the body.
+pub async fn write_import_blob(
+    bundles_ks: &KeyspaceHandle,
+    blob_dir: &Path,
+    bundle_id: Uuid,
+    token: &str,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let admitted = admit_import_upload(bundles_ks, bundle_id, token).await?;
+    stage_import_blob(bundles_ks, blob_dir, admitted, bytes).await
+}
+
+// ─── State-machine guards ──────────────────────────────────────────────
+
+fn enforce_token(record: &BundleRecord, provided: &str) -> Result<(), AppError> {
+    if !verify_token(provided, &record.token_hash) {
+        return Err(AppError::Forbidden(format!(
+            "token does not match for bundle {}",
+            record.bundle_id
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_not_expired(record: &BundleRecord) -> Result<(), AppError> {
+    if record.expires_at < Utc::now() {
+        return Err(gone(format!(
+            "bundle {} expired at {}",
+            record.bundle_id, record.expires_at
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_export_ready(record: &BundleRecord) -> Result<(), AppError> {
+    if record.kind != BundleKind::Export {
+        // Treat as not-found — the bundle exists but doesn't fit
+        // this endpoint's verb. Don't leak the kind.
+        return Err(AppError::NotFound(format!(
+            "bundle not found: {}",
+            record.bundle_id
+        )));
+    }
+    match record.state {
+        BundleState::ExportReady => Ok(()),
+        BundleState::ExportDownloaded => Err(gone(format!(
+            "bundle {} already downloaded (one-shot)",
+            record.bundle_id
+        ))),
+        BundleState::Aborted => Err(gone(format!("bundle {} was aborted", record.bundle_id))),
+        BundleState::Expired => Err(gone(format!("bundle {} expired", record.bundle_id))),
+        _ => Err(AppError::Conflict(format!(
+            "bundle {} is in state {:?}, not ready for download",
+            record.bundle_id, record.state
+        ))),
+    }
+}
+
+fn enforce_import_pending(record: &BundleRecord) -> Result<(), AppError> {
+    if record.kind != BundleKind::Import {
+        return Err(AppError::NotFound(format!(
+            "bundle not found: {}",
+            record.bundle_id
+        )));
+    }
+    match record.state {
+        BundleState::ImportPending => Ok(()),
+        BundleState::ImportReceived
+        | BundleState::ImportPreviewed
+        | BundleState::ImportCommitted => Err(AppError::Conflict(format!(
+            "bundle {} upload already accepted",
+            record.bundle_id
+        ))),
+        BundleState::Aborted => Err(gone(format!("bundle {} was aborted", record.bundle_id))),
+        BundleState::Expired => Err(gone(format!("bundle {} expired", record.bundle_id))),
+        _ => Err(AppError::Conflict(format!(
+            "bundle {} is in state {:?}, not ready for upload",
+            record.bundle_id, record.state
+        ))),
+    }
+}
+
+fn gone(message: String) -> AppError {
+    // 410, not 409: the blob endpoints need the operator CLI to be able to
+    // distinguish "this slot was valid but is now consumed/expired" from
+    // "this slot never existed" (404). Both route annotations have declared
+    // `410` since they were written; until `AppError::Gone` existed this
+    // helper had to approximate it with `Conflict`, which rendered 409 and
+    // quietly contradicted the documented contract.
+    AppError::Gone(message)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    hex_lower(&digest)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+#[cfg(unix)]
+async fn set_dir_mode_700(path: &std::path::Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o700);
+    tokio::fs::set_permissions(path, perms)
+        .await
+        .map_err(AppError::Io)
+}
+
+#[cfg(unix)]
+async fn set_file_mode_600(path: &std::path::Path) -> Result<(), AppError> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    tokio::fs::set_permissions(path, perms)
+        .await
+        .map_err(AppError::Io)
+}

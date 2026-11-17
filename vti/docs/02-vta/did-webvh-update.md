@@ -1,0 +1,301 @@
+# did:webvh — Update + Key Rotation
+
+> **See also:** for the operator-facing surface that drives DIDComm
+> protocol changes through this update primitive, see
+> [DIDComm Protocol Management](didcomm-protocol-management.md).
+
+Generic update + key-rotation operations for an existing webvh DID
+managed by a VTA. Two operations sit on top of `didwebvh_rs::update_did`:
+
+- **Update DID** — apply new state (optional new document, witnesses,
+  watchers, TTL, pre-rotation toggle).
+- **Rotate keys** — convenience that mints fresh BIP-32 keys for every
+  verificationMethod, rebuilds the document, and drives the update path.
+  Auth keys + pre-rotation rotate as a consequence.
+
+Both are exposed via three surfaces: REST, DIDComm, and `vta-sdk`'s
+`VtaClient`. ACL is `require_admin` scoped to the DID's context.
+
+## Coupling rules
+
+- **Document update ⇒ key rotation.** Whenever you supply a new DID
+  document, the VTA forces a parallel rotation of the webvh
+  authorization keys (`update_keys`) and pre-rotation commitments
+  (`next_key_hashes`). Doc keys and auth keys are not independent — a
+  doc update without rotating auth would leave the chain inconsistent.
+- **Metadata-only updates skip key rotation.** Witness / watcher / TTL
+  changes (and toggling pre-rotation on/off) all leave VM keys
+  untouched.
+- **The entry that turns pre-rotation on does not rotate `update_keys`,
+  even when it carries a new document.** From that entry forward the
+  next update is authorized by the key committed in `next_key_hashes`,
+  not by anything minted alongside the document — so a fresh update key
+  here would be published, stored, and never able to sign. The previous
+  entry's `update_keys` stay in force (inheritance is legal because
+  pre-rotation was not yet active on that entry), and the next update
+  reveals the committed key as required. Later entries, with pre-rotation
+  already active, restate `update_keys` on every update.
+- **`rotate-keys`** is the explicit "rotate everything" entry point.
+  Same effective state as `update` with a freshly rebuilt doc.
+
+## Trust Tasks
+
+Both operations are Trust Tasks keyed on the DID, reached the same way over
+TSP, DIDComm or HTTPS (`POST /trust-tasks`):
+
+- `https://trusttasks.org/spec/vta/webvh/dids/update/1.0`
+- `https://trusttasks.org/spec/vta/webvh/dids/update/1.1` — 1.0 plus
+  `scidAlsoKnownAs` (see *The did:scid alias* below). It extends 1.0, so the
+  same handler serves both and an approval rule naming either holds both.
+- `https://trusttasks.org/spec/vta/webvh/dids/rotate-keys/1.0`
+- `https://trusttasks.org/spec/vta/webvh/dids/realign-keys/1.0` — the repair
+  that renames a DID's key records onto the verification-method ids its
+  published document declares (`dryRun` returns the plan without writing).
+
+The earlier `POST /contexts/{ctx_id}/dids/{scid}/{update,rotate-keys}` and
+`POST /webvh/dids/{did}/realign-keys` routes, and the `did-management/1.0`
+`update-did-webvh` / `rotate-did-webvh-keys` messages, are removed.
+
+### Update payload
+
+```json
+{
+  "did":                "did:webvh:Q...:host:slug",
+  "document":           { "id": "did:webvh:...", "@context": [...], ... },
+  "preRotationCount":   2,
+  "witnesses":          { "threshold": 1, "witnesses": [{ "id": "z6Mk..." }] },
+  "watchers":           ["https://watcher.example.com"],
+  "ttl":                3600,
+  "label":              "rotate after audit",
+  "expectedVersionId":  "2-zMk..."
+}
+```
+
+Every member but `did` is optional.
+
+### The did:scid alias (`update/1.1`)
+
+Every did:webvh log is also `did:scid:vh:1:<scid>`, and the two forms are one
+subject only while the did:webvh document lists
+`did:scid:vh:1:<scid>?src=<source>` in `alsoKnownAs` (VTI-KEY-164).
+`create/1.2` lists it at creation; `update/1.1` lists or removes it on a log
+that already exists:
+
+```json
+{ "did": "did:webvh:Q...:host:slug", "scidAlsoKnownAs": true, "expectedVersionId": "3-Qm..." }
+```
+
+- The VTA derives `<source>` from the DID (the part after `did:webvh:<scid>:`,
+  `:` → `/`, percent-encoding kept) with `vta_sdk::did_scid::scid_forms`; the
+  caller never writes the URL. It applies to `document` when one is supplied,
+  otherwise to the current document.
+- `true` appends the URL after the existing entries unless it is listed; a
+  did:scid entry for this SCID naming an older `src` is replaced in place.
+  `false` removes every did:scid entry for this SCID, with or without `src`.
+- An identity this VTA **presents** as its did:scid keeps its alias: `false`,
+  or any `document` without it (1.0 or 1.1), is refused —
+  `vta/webvh/dids/update:scidAliasRequired` under 1.1, and under 1.0 a
+  validation refusal whose message leads with `scidAliasRequired`.
+  "Presented" is the `presented` flag on the did:scid identity record
+  `create/1.2` writes (`webvh_store::ScidIdentity`), or the VTA's configured
+  `vta_did` being this log's did:scid DID.
+- A request whose resulting document and parameters equal the latest entry's
+  is `vta/webvh/dids/update:noChange`: nothing is published, no key rotates.
+- Otherwise it is a document change: it publishes an entry and **rotates the
+  update key**, like `document`. The response adds `scidAlsoKnownAs` (as
+  published) and `scidDidUrl` (always).
+- The did:scid identity record follows the published document, so a webvh/dids
+  task takes the did:scid DID exactly while the alias is listed.
+
+CLI: `pnm did-mgmt dids scid-alias --did <did> --list|--remove [--yes]` (`--no-confirm` is still accepted).
+`VtaClient::update_did_webvh_by_did` sends 1.1 only when
+`UpdateDidWebvhBody::scid_also_known_as` is set, and 1.0 otherwise.
+
+### Rotate-keys payload
+
+```json
+{
+  "did":              "did:webvh:Q...:host:slug",
+  "preRotationCount": 2,
+  "label":            "scheduled key rotation"
+}
+```
+
+### Response
+
+Both answer the same body:
+
+```json
+{
+  "did":                 "did:webvh:Q...:host:slug",
+  "newVersionId":        "3-zMk...",
+  "newScid":             "Q...",
+  "newLogEntry":         "{\"versionId\":\"3-...\",...}",
+  "updateKeysCount":     1,
+  "preRotationKeyCount": 2
+}
+```
+
+Refusals: `malformedRequest` for an invalid document (id mismatch, missing
+required fields), witness DID or watcher URL; `taskFailed` with
+`details.reason` `not_found` for an unknown DID or one outside the caller's
+context (collapsed for cross-context privacy), and with `conflict` when
+`expectedVersionId` no longer matches, so retry against the new head.
+
+## SDK
+
+```rust
+use vta_sdk::client::VtaClient;
+use vta_sdk::protocols::did_management::update::{
+    UpdateDidWebvhBody, RotateDidWebvhKeysBody,
+};
+
+// Update
+let result = client.update_did_webvh_by_did(
+    "did:webvh:Q...:host:slug",
+    UpdateDidWebvhBody {
+        pre_rotation_count: Some(0),
+        ..Default::default()
+    },
+).await?;
+
+// Rotate keys
+let result = client.rotate_did_webvh_keys_by_did(
+    "did:webvh:Q...:host:slug",
+    RotateDidWebvhKeysBody {
+        label: Some("scheduled".into()),
+        ..Default::default()
+    },
+).await?;
+```
+
+`UpdateDidWebvhBody.witnesses` is opaque JSON in the SDK wire types so
+the SDK stays free of a `didwebvh-rs` dependency. The vta-service
+intake handler deserializes into `didwebvh_rs::witness::Witnesses` and
+validates each witness DID resolves (5s timeout per witness) before
+committing the new log entry.
+
+## Key-label convention
+
+The VTA stores per-DID, per-log-version key handles in the keys
+keyspace under:
+
+```
+webvh:<scid>:<version-id>:<hash>                         ← active update key
+webvh:<scid>:<version-id>:pre-rotation:<hash>            ← committed pre-rotation key
+webvh:<scid>:<version-id>:vm:<fragment-id>:<hash>        ← verificationMethod key
+superseded:webvh:<scid>:<version-id>:...                 ← any of the above, retired
+```
+
+The hash is the `base58btc(sha256(public_key_multibase))` form that
+webvh stores in the log entry's `update_keys` / `next_key_hashes`,
+so a hash from any log entry maps directly to a stored handle.
+
+### Lazy migration
+
+DIDs created before this convention existed have their keys under the
+legacy `key:{key_id}` records. The first call to `update_did_webvh`
+falls back to scanning the legacy keyspace for a public-key match and
+synthesising a `WebvhKeyHandle` with `version_id: "legacy"` so the
+update can proceed. New keys allocated by the update are written under
+the new convention; subsequent updates use the fast path.
+
+## Behaviour notes
+
+- **Rotate-keys replaces key material in place.** Each verification method
+  keeps its id, `type` and algorithm (an X25519 key-agreement method gets a
+  new X25519 key, an ML-DSA method a new ML-DSA key) and every relationship —
+  all five, including `capabilityInvocation` / `capabilityDelegation` — keeps
+  pointing at it. Consumers that address their own keys by id (the VTA's
+  `{vta_did}#key-0` / `#key-1`, the VTC's `#key-0` / `#key-1`) keep working;
+  `did:webvh`'s version history is what tells the key an id named before the
+  rotation from the one it names now. **Changed:** earlier builds renumbered
+  every method to a fresh `#key-N` (from `next_fragment_id`), minted Ed25519
+  for every method whatever its algorithm, remapped only three relationships
+  and wrote no key records for the new keys — so a rotated DID could not be
+  signed or decrypted as. A DID rotated by such a build should be rotated
+  again (or its document repaired with `update`) after upgrading.
+- **Key records follow the rotation.** Each new key gets an active record
+  under its method id, inheriting the old one's label and exportability (a
+  non-exportable key's replacement is non-exportable). The replaced record is
+  kept as `{method id}@{versionId}` with status `revoked`, so history is
+  queryable and the VTA refuses to sign with it. A method backed by an
+  internal (non-extractable) key is refused rather than downgraded to a
+  derived one.
+- **A rotation that published always promotes its records.** The new keys are
+  staged as inert `{method id}@rotating-{uuid}` records before the log entry is
+  written. Their promotion runs in the same spawned task as the log write, so a
+  client that disconnects or a transport that times out after the write was
+  issued cannot leave published keys behind only revoked staging records. A
+  crash in that window is finished at the next boot, before the VTA loads its
+  own keys: a staging record whose key the DID's stored log publishes is
+  promoted (the key it replaces retired under the version it was last current
+  at), and every other staging record is removed.
+- **Old authorization keys are not deleted.** After a rotation, the previous
+  version's handles move from `webvh:` to `superseded:webvh:` for
+  audit / recovery.
+- **Rotating the VTA's own DID reloads its live keys at once.** The new
+  signing and key-agreement secrets replace the old ones in the resolver the
+  DIDComm and TSP legs read, so the VTA signs with the new key from that moment
+  and never with the retired one. Because method ids are preserved, the old and
+  new key-agreement keys share one id and cannot both be held: a message
+  encrypted to the retired key and still in transit fails to decrypt and must be
+  resent.
+- **Other services holding a rotated DID's keys must reload them.** A mediator
+  or other integration that fetched its DID's secrets (`vta/contexts/secrets`)
+  keeps using the old keys until it fetches again. **Do not rotate a VTC's
+  `vtc-host` DID yet:** the VTC derives its at-rest storage key, audit key and
+  install-token key from its DID's `#key-0` seed, so adopting rotated keys would
+  leave it unable to read its own encrypted state.
+- **Concurrent updates** are detected via optimistic concurrency on
+  `WebvhDidRecord.log_entry_count`. Within one VTA process, updates to the
+  same DID are serialized from log-head read through persistence and publish,
+  so rapid callers append consecutive entries with distinct whole-second
+  `versionTime` values. The VTA waits for the next valid second when needed,
+  up to a few seconds; past that it stamps the entry anyway rather than
+  parking the request, because a timestamp briefly ahead of a peer's clock
+  self-heals whereas a non-increasing one bricks the DID. This process-local
+  lock matches the VTA's single-process deployment model and does not
+  coordinate replicas.
+- **Serialization does not make a prebuilt document current.** `document` is a
+  complete replacement, not a patch, so an update carrying one is refused with
+  `409` if the chain moved while that update waited its turn — otherwise a
+  later, structurally valid append would silently replace an intervening edit.
+  A caller deriving `document` from an earlier read should send that entry's
+  `expectedVersionId`, which pins the version explicitly and takes the richer
+  precondition path. Updates that carry no document (key rotation, witnesses,
+  watchers, ttl) compose onto whichever head they find and are never refused
+  on this ground.
+- **Witness DIDs are resolved (not signature-verified).** The VTA
+  checks each witness DID resolves through the cache resolver within
+  5 seconds. Witness signature verification happens at log-entry
+  resolve time, not at update intake.
+- **Watchers** must be `https://` URLs in production builds (`http://`
+  allowed under `cfg(debug_assertions)` for local dev), no fragment,
+  no query string.
+- **Out of scope for these endpoints**: deactivate, migrate-to-new-URL,
+  portable toggle. The underlying `didwebvh-rs` library exposes them
+  but the VTA reserves separate operations for those.
+
+## Promoting a serverless DID to a server-managed one
+
+If a DID was created with `server_id: "serverless"` (no webvh host
+at the time) and the operator later wants it published to a host,
+use:
+
+```bash
+pnm did-mgmt servers add --id primary --did did:web:webvh.example.com
+pnm did-mgmt dids register --did <serverless-did> --server primary
+```
+
+The second command pushes the existing local `did.jsonl` to the
+host and flips `server_id` so subsequent updates auto-publish.
+The DID identifier is unchanged. See
+`docs/02-vta/runtime-service-management.md` for the full
+walkthrough. Refused if the DID is already server-managed.
+
+## Open follow-ups
+
+- `did.update` audit event emission.
+- End-to-end integration test against `didwebvh_rs::resolve` (the
+  log-entry-validity invariant).

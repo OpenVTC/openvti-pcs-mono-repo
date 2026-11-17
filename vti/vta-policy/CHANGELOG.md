@@ -1,0 +1,571 @@
+# Changelog
+
+Notable changes to the published crates. Generated from conventional commits by
+[git-cliff](https://git-cliff.org) when a release is cut — do not edit by hand.
+## [0.39.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.38.0...vta-policy-v0.39.0) — 2026-11-15
+
+
+## [0.38.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.37.0...vta-policy-v0.38.0) — 2026-11-14
+
+
+### Build & CI
+
+- **deps**: Enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe ([#2708](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2708))
+
+* build(deps): enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe
+
+  pgp, openssl only via webauthn-rs 0.5, no wildcards, and
+  multiple-versions = "deny" with a skip list of today's duplicates grouped by
+  cause. The two advisory ignores cargo-deny reports as not detected
+  (RUSTSEC-2026-0381, RUSTSEC-2024-0436) are removed, the stale [graph]
+  comment rewritten, and the yanked crypto-bigint 0.7.6 moved to 0.7.11.
+
+  ring leaves the VTA and VTC graphs; it stays only under attest-verify.
+
+  removed from 19 crates; deliberate ones are listed under
+  [package.metadata.cargo-machete] ignored. A tier-0 "manifest hygiene" CI job
+  runs cargo-machete and the lint check.
+
+  once in [workspace.dependencies]; vta-tee inherits aws-lc-rs. The five
+  crypto crates carry real minimum-patch floors, enforced by
+  check-workspace-version-reqs.py.
+
+  (check-workspace-lints.py); unsafe_code = "forbid" workspace-wide, with
+  the four crates that need unsafe restating the table at "deny" and
+  rewritten safely. The two missing publish = false comments are added.
+
+
+
+### Changed
+
+- **vtc**: Vtc-audit leaf crate, one regorus engine, typed error codes, trust_tasks split, AdminActor ([#2728](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2728))
+
+* refactor(vti-common)!: move the VTC's audit-event vocabulary to a new vtc-audit leaf crate
+
+
+
+### Performance
+
+- **vta**: Cache compiled schemas and policies, verify once, bound sweeps and list pages ([#2713](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2713))
+
+* perf(vta-sdk,vta-service): compile each Trust Task payload schema once ([#2622](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2622))
+
+  trust-tasks-rs 0.37's against_schema / validate_value parse and compile the
+  schema on every call. vta_sdk::schema_cache keeps the compiled validator by
+  the &'static schema text's address (the same technique as trust-tasks-rs
+  0.38's SchemaValidator), with the jsonschema release trust-tasks-rs 0.37 uses
+  so the check and its error text are unchanged. The dispatch spine, the SDK's
+  send-side check, room act, notifications, rooms, task consent, vetting and
+  the VTA's per-handler payload checks use it.
+
+  trust-tasks-rs 0.38 moves in lockstep with affinidi-tdk and the messaging
+  SDK, so the bump is left to that train; this module then wraps
+  SchemaValidator.
+
+
+
+## [0.37.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.36.0...vta-policy-v0.37.0) — 2026-11-12
+
+
+## [0.36.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.35.0...vta-policy-v0.36.0) — 2026-11-10
+
+
+### Added
+
+- **acl**: Purpose of use on ACL entries and memory reads (VTI-ACL-100 – 110) ([#2539](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2539))
+
+
+## [0.35.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.34.0...vta-policy-v0.35.0) — 2026-11-09
+
+
+## [0.34.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.33.0...vta-policy-v0.34.0) — 2026-11-05
+
+
+## [0.33.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.32.0...vta-policy-v0.33.0) — 2026-11-05
+
+
+## [0.32.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.31.0...vta-policy-v0.32.0) — 2026-11-05
+
+
+## [0.31.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.30.0...vta-policy-v0.31.0) — 2026-11-04
+
+
+## [0.30.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.29.0...vta-policy-v0.30.0) — 2026-11-04
+
+
+## [0.29.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.28.0...vta-policy-v0.29.0) — 2026-11-04
+
+
+## [0.28.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.27.0...vta-policy-v0.28.0) — 2026-11-03
+
+
+## [0.27.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.26.0...vta-policy-v0.27.0) — 2026-11-03
+
+
+## [0.26.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.25.0...vta-policy-v0.26.0) — 2026-11-02
+
+
+## [0.25.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.24.0...vta-policy-v0.25.0) — 2026-10-30
+
+
+## [0.24.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.23.0...vta-policy-v0.24.0) — 2026-10-30
+
+
+### Added
+
+- **auth**: Answer step-ups with auth/step-up/approve-response/0.7, and stop serving 0.4 and 0.6 ([#2346](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2346))
+
+Every step-up answer moves to approve-response 0.7
+  (trustoverip/dtgwg-trust-tasks-tf#983). A user-verified WebAuthn assertion
+  by the approver's own registered passkey is evidence on its own, so the admin
+  console answers unsigned. A delegated key's proof never counts as the
+  approver's. A didSigned or approverSigned answer, and every denial, still
+  needs the approver's own proof.
+
+
+
+## [0.23.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.22.0...vta-policy-v0.23.0) — 2026-10-28
+
+
+### Added
+
+- **vta**: Speak AclEntry 0.2 — acl/*/0.2 and acl/list/0.3 ([#2324](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2324))
+
+The VTA moves its ACL surface to AclEntry 0.2 (`acl/_shared/0.2`), where every
+  authority axis is explicit, and stops serving acl/{grant,show,update,
+  change-role,revoke}/0.1 and acl/list/0.1. `operations::acl_v0_2` maps each
+  0.2 value onto the stored (role, contexts) model and refuses the ones the
+  store cannot hold (`act: all` on a non-admin, `act: none` on admin →
+  invalidActScope) rather than approximating them. change-role carries the act
+  scope across unchanged; update never narrows act (revoke {kind: act} does);
+  list/0.3 pages with signed, filter-bound cursors and honours role,
+  subjectPrefix and capability. RETIRED_TASK_TYPES moves approval rules naming
+  the 0.1 URIs to their successors at boot.
+
+- **policy**: A requireConsent decision states its quorum and requester exclusion (policy/_shared 0.4) ([#2322](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2322))
+
+trust-tasks-rs 0.36 publishes policy/_shared/0.4 and policy/evaluate/0.4,
+  which make requireConsent.minApprovals and excludeRequester REQUIRED with no
+  default (SPEC §6.6 rule 5: a shared component supplies no governance
+  default). Under 0.3 a decision omitting either meant a quorum of one, or a
+  requester allowed to approve itself, with nothing on the wire to show it.
+
+  vta-policy's mirror of the schema moves to 0.4: RequireConsent no longer
+  defaults either member, so a policy whose decision omits one no longer
+  deserialises and the PDP fails closed (deny), as for any other malformed
+  decision. The declarative approvals generator (vta-sdk::approvals) and the
+  VTC already emit both members; hand-written operator policies that omit
+  them must add them.
+
+  policy/evaluate is still not served (its PolicyInput.site remains required
+  in 0.4), so there is no wire version to move.
+
+- **auth**: Serve only the current auth, audit/list, policy, task-consent and discovery versions ([#2313](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2313))
+
+The VTA, the VTC and every client in the workspace move off superseded Trust
+  Task versions of these families, and the services stop serving the old ones:
+
+  - auth/authenticate 0.1/0.2 -> 0.3 (proxied-login members; a `principal` that
+    is not the signer is refused `delegationNotRecognized`), auth/refresh 0.1 ->
+    0.2, auth/revoke-session -> 0.2, auth/signing-key/enroll 0.1 -> 0.2.
+  - auth/step-up/approve-response 0.1/0.2/0.3 -> 0.6 on the VTA (one typed
+    handler; vta-mobile-core builds 0.6, a bound approval may carry no
+    `sessionId`).
+  - auth/oob/{request,redeem,claim} 0.1 -> 0.2, grant 0.1/0.2 -> 0.3, respond
+    0.1 -> 0.3 (`claimClosesAt`, `decisionClosesAt`, `sessionEndsAt` as RFC 3339
+    instants rather than epoch seconds), on the VTC and the member portal.
+  - audit/list 0.1 -> 0.2 and policy/list 0.2 -> 0.3 (`limit`/`nextCursor`),
+    policy/upsert 0.1/0.2 -> 0.3 (`created` -> `wasCreated`), on both services
+    and their clients.
+  - task-consent/decision 0.1 -> 0.2, trust-task-discovery 0.1 -> 0.3.
+
+  An approval rule names its task by exact versioned Type URI, so a stored rule
+  naming a version the VTA no longer serves would never match again and the task
+  it gated would run ungated. `vta_policy::approvals::RETIRED_TASK_TYPES` maps
+  each retired version to its successor; boot moves stored rules onto it, and the
+  policy write path refuses a new rule naming a retired type.
+
+  Deliberately not moved, because a peer outside this workspace pins them:
+
+  - auth/step-up/approve-request stays at 0.2 on the VTA: the fielded approvers
+    (vta-mobile-agent-ios, which routes by a hard-coded 0.1/0.2 type list, and the
+    browser plugin) accept only 0.1 and 0.2.
+  - the VTC still serves auth/step-up/approve-response/0.4 beside 0.6, for the
+    console's unsigned session-passkey answer, which 0.5 onward forbids.
+
+- **vta**: Serve only the current vault/* and device/* versions ([#2309](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2309))
+
+The VTA, its SDK, CLI and MCP bridge move off the superseded vault and device
+  Trust Task versions, and the VTA stops serving the old ones:
+
+  - vault/list 0.1/0.2/0.3 -> 0.4: request `pageSize` -> `limit`, response
+    `truncated`/`cursor` -> `nextCursor`. The VTA now pages for real (keyset on
+    entry id, the cursor bound to the filters it was minted for) and answers a
+    foreign cursor `vault/list:cursorInvalid`, since 0.4 requires a `nextCursor`
+    whenever more entries match.
+  - vault/get 0.1/0.2 -> 0.3, vault/upsert 0.1/0.2/0.3 -> 0.4 (`created` ->
+    `wasCreated`), vault/release, proxy-login and sign-trust-task 0.1 -> 0.2.
+  - vault/credentials/get 0.1 (retired) -> 0.2, which carries the body as stored
+    in the member its format calls for: `credential` for a Data Integrity
+    credential, `credentialBase64` for an SD-JWT or an mdoc (dtgwg-trust-tasks-tf
+    #919). 0.1 could only answer with a JSON object, so every SD-JWT VC in the
+    vault failed to fetch.
+  - device/register, wipe, set-wake 0.1 -> 0.2, device/list 0.1/0.2 -> 0.3
+    (`limit`/`nextCursor`, keyset paging), device/heartbeat 0.1/0.2 -> 0.3
+    (`serverTime` -> `respondedAt`). The device handlers parse the generated
+    payloads and emit camelCase enum values themselves.
+
+  The `wire_v0_2` edge transform no longer retypes a request to a 0.1 URI and
+  dispatches it through a 0.1 handler: the dispatch table registers the served
+  version, and the transform only rewrites the vault enum values between the
+  wire's camelCase and the storage types' kebab-case. The JWE-sealing handlers
+  always seal camelCase cleartext, so the task-local wire version is gone. The
+  vault and device rows leave `deprecation::SUPERSEDED_TASKS`.
+
+  `vault/_shared/0.3`'s `VaultEntry` no longer declares the archival-lifecycle
+  members `vault/_shared/0.1` carried (`status`, `archivedAt`, `deletedAt`,
+  `graceUntil`) and is `additionalProperties: false`, so an archived or deleted
+  entry now carries them in `ext["org.openvtc.vault-lifecycle"]` (SPEC §4.5.1);
+  an active entry carries none, as before. Restoring them to the shared
+  component is a registry change.
+
+
+
+## [0.22.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.21.0...vta-policy-v0.22.0) — 2026-10-27
+
+
+## [0.21.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.20.0...vta-policy-v0.21.0) — 2026-10-26
+
+
+## [0.20.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.19.0...vta-policy-v0.20.0) — 2026-10-18
+
+
+## [0.19.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.18.0...vta-policy-v0.19.0) — 2026-10-18
+
+
+## [0.18.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.17.0...vta-policy-v0.18.0) — 2026-10-16
+
+
+## [0.17.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.16.0...vta-policy-v0.17.0) — 2026-10-15
+
+
+## [0.16.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.15.0...vta-policy-v0.16.0) — 2026-10-13
+
+
+## [0.15.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.14.0...vta-policy-v0.15.0) — 2026-10-12
+
+
+## [0.14.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.13.0...vta-policy-v0.14.0) — 2026-10-11
+
+
+## [0.13.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.12.0...vta-policy-v0.13.0) — 2026-10-11
+
+
+## [0.12.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.11.0...vta-policy-v0.12.0) — 2026-10-06
+
+
+## [0.11.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.10.0...vta-policy-v0.11.0) — 2026-10-06
+
+
+## [0.10.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.9.0...vta-policy-v0.10.0) — 2026-10-05
+
+
+## [0.9.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.8.0...vta-policy-v0.9.0) — 2026-10-04
+
+
+## [0.8.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.7.0...vta-policy-v0.8.0) — 2026-10-02
+
+
+## [0.7.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.6.0...vta-policy-v0.7.0) — 2026-10-02
+
+
+## [0.6.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.5.0...vta-policy-v0.6.0) — 2026-10-01
+
+
+## [0.5.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.4.0...vta-policy-v0.5.0) — 2026-10-01
+
+
+## [0.4.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.26...vta-policy-v0.4.0) — 2026-09-30
+
+
+## [0.3.26](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.25...vta-policy-v0.3.26) — 2026-09-30
+
+
+## [0.3.25](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.24...vta-policy-v0.3.25) — 2026-09-27
+
+
+## [0.3.24](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.23...vta-policy-v0.3.24) — 2026-09-26
+
+
+## [0.3.23](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.22...vta-policy-v0.3.23) — 2026-09-26
+
+
+### Changed
+
+- **vti-common**: Move the task-consent core out of vta-policy so the VTC can share it (VTI-APV-014) ([#1730](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1730))
+
+VTI-APV-014 requires consent from a party other than the requester before
+  anyone is granted unrestricted act scope. The VTC is to meet it with the same
+  `task-consent/*` ceremony the VTA runs (VTI-VTC-020: one model, not a parallel
+  one), but the ceremony's data layer lived in `vta-policy`, which the VTC cannot
+  depend on. This moves it to `vti-common` first, so the VTC work that follows
+  reuses it rather than copying it.
+
+  - `vta-policy/src/consent.rs` -> `vti_common::task_consent` and
+    `vta-policy/src/effects.rs` -> `vti_common::task_consent::effects`, moved
+    with their history. `vta_policy::{consent, effects}` re-export them, so
+    every existing path still resolves and the VTA's behaviour is unchanged.
+  - `domain_digest(domain, type_uri, payload, salt)` exposes the digest
+    construction for another domain tag. The VTC's operation-bound step-up
+    carried a byte-for-byte copy of it under `vtc/step-up/v1\0`; it now calls
+    this instead.
+  - `digest_matches_its_pinned_vectors` pins both domains against vectors
+    computed independently of this code, so the move provably changed no
+    digest: a stored pending or grant, and a mark in flight, still resolve
+    after an upgrade.
+  - The `vta/task-consent/v1\0` tag is kept, since it keys the pendings and
+    grants in flight. It separates this digest from others, not one node from
+    another, because a pending never leaves the node that minted it.
+
+  No wire change and no behaviour change.
+
+
+
+## [0.3.22](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.21...vta-policy-v0.3.22) — 2026-09-24
+
+
+## [0.3.21](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.20...vta-policy-v0.3.21) — 2026-09-23
+
+
+## [0.3.20](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.19...vta-policy-v0.3.20) — 2026-09-23
+
+
+## [0.3.19](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.18...vta-policy-v0.3.19) — 2026-09-22
+
+
+## [0.3.18](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.17...vta-policy-v0.3.18) — 2026-09-22
+
+
+### Fixed
+
+- **vta**: Warn at boot when approval rules exist but policy enforcement is off ([#1633](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1633))
+
+Keyring KR-22 (Refs #1608). `policy.enforcement` defaults to false and stays
+  that way: flipping it would turn every written-but-not-intended policy into a
+  gate across existing deployments on upgrade. The defect was the silence — a
+  rule written with `pnm approvals require` is stored, listed and explained, and
+  then gates nothing, with no signal anywhere that enforcement is off.
+
+  - vta-policy: `unenforced_policies()` (+ `#[non_exhaustive]`
+    `UnenforcedPolicies`) reports the approval rules on the enabled declarative
+    row and the ids of enabled hand-authored rows. The boot-installed baseline,
+    disabled rows and a declarative row carrying only approver sets are not
+    counted — none would gate a task with enforcement on.
+  - vta-service: on boot with enforcement off, log a WARN naming what is being
+    ignored and the exact change (`[policy] enforcement = true` + restart).
+    Advisory only: a failure to read the rows is logged and never stops boot.
+    The enforcement flag is copied out so the config lock is not held across
+    the keyspace read.
+  - docs/02-vta/approvals.md: state up front that approvals are opt-in and off
+    by default, show the config snippet, and document the boot warning.
+
+
+
+## [0.3.17](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.16...vta-policy-v0.3.17) — 2026-09-21
+
+
+## [0.3.16](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.15...vta-policy-v0.3.16) — 2026-09-21
+
+
+## [0.3.15](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.14...vta-policy-v0.3.15) — 2026-09-21
+
+
+## [0.3.14](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.13...vta-policy-v0.3.14) — 2026-09-20
+
+
+## [0.3.13](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.12...vta-policy-v0.3.13) — 2026-09-18
+
+
+## [0.3.12](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.11...vta-policy-v0.3.12) — 2026-09-17
+
+
+## [0.3.11](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.10...vta-policy-v0.3.11) — 2026-09-16
+
+
+## [0.3.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.9...vta-policy-v0.3.10) — 2026-09-16
+
+
+## [0.3.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.8...vta-policy-v0.3.9) — 2026-09-16
+
+
+## [0.3.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.7...vta-policy-v0.3.8) — 2026-09-12
+
+
+## [0.3.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.6...vta-policy-v0.3.7) — 2026-09-10
+
+
+## [0.3.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.4...vta-policy-v0.3.5) — 2026-09-09
+
+
+## [0.3.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.3...vta-policy-v0.3.4) — 2026-09-07
+
+
+## [0.3.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.2...vta-policy-v0.3.3) — 2026-09-07
+
+
+## [0.3.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.1...vta-policy-v0.3.2) — 2026-09-01
+
+
+## [0.3.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.3.0...vta-policy-v0.3.1) — 2026-08-29
+
+
+## [0.3.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.12...vta-policy-v0.3.0) — 2026-08-28
+
+
+### Added
+
+- **vta**: Mint the consent ceremony's correlator instead of deriving it ([#1133](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1133))
+
+* feat(vta): mint the consent ceremony's correlator instead of deriving it
+
+  Framework 0.5.0, *Identifier correlation and linkability*: `id`, `threadId` and
+  `ceremony.enactment` MUST be freshly minted and unguessable, and MUST NOT be
+  derived from subject data.
+
+  The `task-consent/granted` notice threaded on `wire_digest` — a function of the
+  task payload, and the same string the document carries as `payloadDigest`.
+
+  The challenge is 256 bits of randomness, so the digest is not guessable from
+  the payload; this is not the "UUIDv5 over a subject identifier" case. The
+  mediator is the exposure. `threadId` is routing metadata, and the mediator also
+  forwards documents carrying `payloadDigest`; with the same value in both it can
+  tie the routing it performs to the digest it carries and link the refusal, the
+  approval pushes and the notice into one ceremony with named counterparties.
+
+  `PendingTaskConsent` gains a minted `correlator`, created alongside the
+  challenge. The notice threads on it and the body still carries `payloadDigest`
+  unchanged, so a requester matching on the digest is unaffected. The requester
+  is told the correlator in the `auth:consent_required` refusal beside the digest
+  it already receives.
+
+  Smaller than it first looked: the request push to approvers already threaded on
+  the request document's own id, so only the requester-facing notice was derived.
+  The notice is produced but never consumed in this workspace and is explicitly
+  non-load-bearing — the grant check at re-submit is the real gate.
+
+
+
+### Chore
+
+- **sdk**: Release vta-sdk 0.30.0 for the added CreateKeyBody field ([#1156](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1156))
+
+`CreateKeyBody` gained a `key_id` field while the crate stayed at 0.29.0.
+  The struct is exhaustively constructible through the public API, so an
+  existing literal no longer compiles — a breaking change under 0.x rules,
+  which the semver report has been flagging as its one real finding
+  (195 pass, 1 fail) since the field landed.
+
+  Bumps the crate and the nineteen intra-workspace requirements that pin it,
+  so `cargo check --workspace` still resolves the path copy and a consumer
+  resolving from the registry gets a version that admits the break.
+
+
+
+## [0.2.12](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.11...vta-policy-v0.2.12) — 2026-08-26
+
+
+## [0.2.11](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.10...vta-policy-v0.2.11) — 2026-08-22
+
+
+## [0.2.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.9...vta-policy-v0.2.10) — 2026-08-21
+
+
+## [0.2.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.8...vta-policy-v0.2.9) — 2026-08-20
+
+
+## [0.2.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.7...vta-policy-v0.2.8) — 2026-08-18
+
+
+## [0.2.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.6...vta-policy-v0.2.7) — 2026-08-17
+
+
+## [0.2.6](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.5...vta-policy-v0.2.6) — 2026-08-16
+
+
+## [0.2.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.4...vta-policy-v0.2.5) — 2026-08-16
+
+
+## [0.2.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.3...vta-policy-v0.2.4) — 2026-08-14
+
+
+## [0.2.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-policy-v0.2.2...vta-policy-v0.2.3) — 2026-08-13
+
+
+### Added
+
+- **release**: Publish vta-service and its closure again ([#962](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/962))
+
+* feat(release): publish vta-service and its closure again
+
+  #938 unpublished `vta-service` and the twelve subsystem crates behind it,
+  on the finding that nothing external depended on them. The audit read
+  normal dependencies. `openvtc-core` depends on `vta-service` as a
+  **dev-dependency**, for `test_support::MockVta` — an in-process VTA its
+  end-to-end tests run against. That harness boots the real service, so no
+  client crate can stand in for it.
+
+  Unpublishing did not merely freeze the crate. It broke it.
+
+  `vti-common` re-exports `vta_sdk::acl::{ActScope, ApproveScope,
+  ContextDirection}` as its own public API, so **a re-export makes the
+  re-exported crate's version part of your public API**: any graph
+  combining `vti-common` with another `vta-sdk` consumer must resolve one
+  `vta-sdk`. The frozen `vta-service` 0.14.37 asks for `vta-sdk ^0.21`
+  while `vti-common` has moved to `^0.23`. A downstream `cargo update`
+  resolves both and `vta-service` fails to compile with
+
+    expected `vti_common::acl::ApproveScope`,
+       found `vta_sdk::acl::ApproveScope`
+
+  at ten call sites — which is how this surfaced, in openvtc #213. Nothing
+  downstream can fix that; only a release that moves the requirements
+  together can.
+
+  So the thirteen manifests go back to the workspace default. The cost is
+  the closure — twelve subsystem crates return to crates.io, which is
+  exactly what #938 set out to stop. Taken deliberately over the
+  alternatives: yanking the published copies breaks OpenVTC's tests with no
+  replacement, and leaving them up ships a crate on the registry that
+  cannot be built.
+
+  **On release ordering.** `cargo publish --dry-run -p vta-service` fails
+  today, and will until the closure is on the registry: packaging strips
+  path deps, so `vta-keys = "0.2"` resolves the *published* 0.2.1, which
+  still asks for `vta-sdk ^0.21` — two nodes, same error. That resolves
+  itself in the release, which publishes in dependency order: every
+  subsystem crate in this workspace already requires `vta-sdk = "0.23"`, so
+  once they upload, `vta-service` verifies against them. Crates whose
+  dependencies are all published already dry-run clean (verified on
+  `vta-keyspaces` and `vta-config`).
+
+  Docs updated to match: CLAUDE.md, RELEASING.md and the release-plz.toml
+  header all said 7-of-21. They now say 20-of-26, name the six that stay
+  internal, and record the rule the audit missed — check dev-dependencies,
+  in sibling repos, before unpublishing anything.
+
+
+
+### Build & CI
+
+- **release**: Adopt release-plz, publish 7 crates instead of 21 ([#938](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/938))
+
+Merging and releasing were the same act. publish.yml fired on every push to
+  main and shipped whatever versions were newly present, and a CI guard required
+  the version bump to live in the feature PR — so every PR was a release
+  decision, taken by whoever opened it, days before it merged. Two open PRs
+  touching one crate wrote the same number into the same line of the same
+  Cargo.toml, and the second to merge had to rebase, renumber, and fix a
+  changelog entry that had gone stale. #932/#936/#937 hit it three times in one
+  afternoon.
+
+

@@ -1,0 +1,912 @@
+use ratatui::{
+    layout::Constraint,
+    style::{Color, Modifier, Style},
+    widgets::{Block, Cell, Row, Table},
+};
+use vta_sdk::acl::{ApproveScope, ContextDirection};
+use vta_sdk::client::ChangeAclRoleRequest;
+use vta_sdk::prelude::*;
+use vti_common::acl::{Role, act_scope_for};
+
+use crate::display::{
+    NAME_HEADER, NameBook, NameSource, book_from_acl, did_cell, full_display_pairs, name_cell,
+    named_did_cell, resolve_agent_names_into,
+};
+use crate::render::{is_full_display, print_full_entry_owned, print_full_list_title, print_widget};
+
+/// Human-readable context list — **role-aware**, because an empty
+/// `allowed_contexts` means opposite things depending on the role.
+///
+/// `AuthClaims::is_super_admin` requires `Role::Admin` *and* an empty list;
+/// `has_context_access` otherwise iterates `allowed_contexts`, and an empty
+/// list matches nothing. So empty means "every context" for an admin and
+/// "no context at all" for every other role.
+///
+/// Rendering both as `(unrestricted)` misled in both directions on a
+/// security-relevant display: a correctly-scoped least-privilege approver
+/// looked like a blanket grant, and an operator auditing for over-broad
+/// access saw `(unrestricted)` on rows that were in fact inert.
+pub fn format_contexts(role: &str, contexts: &[String]) -> String {
+    // The wire form carries the role as a string, so parse it back before
+    // decoding. An unrecognised role falls to the most restrictive reading:
+    // a display must never invent authority it cannot confirm.
+    //
+    // `format_role` already renders an unrestricted admin as "super admin", so
+    // the two columns read together without repeating the term.
+    let role = Role::parse(role).unwrap_or(Role::Monitor);
+    act_scope_for(&role, contexts).to_string()
+}
+
+/// What this entry may do, for display. **Always rendered, including when the
+/// stored list is empty** — an omitted line is indistinguishable from a tool
+/// that does not show capabilities at all, and reads as "not a field" rather
+/// than "not granted".
+///
+/// That distinction is the whole value of the line. `persona-holder` is
+/// additive: no role derives it, so it is held only where an operator granted
+/// it by name, and its absence is a fact about the entry rather than a gap in
+/// the output. An operator checking whether an install has it got silence, and
+/// silence answers a different question than the one they asked.
+///
+/// The names are echoed as stored, not decoded into `Capability` and
+/// re-rendered. That type is `#[non_exhaustive]` precisely so a consumer
+/// meeting a capability it has never heard of must decide what to do with it —
+/// and for a *display* the only safe decision is to show it. Decoding first
+/// would drop an unrecognised grant from the very output somebody is reading to
+/// find out whether a grant is there.
+pub fn format_capabilities(role: &str, held: &[String]) -> String {
+    if held.is_empty() {
+        format!("(none granted by name — everything `{role}` allows)")
+    } else {
+        held.join(", ")
+    }
+}
+
+pub fn format_role(role: &str, contexts: &[String]) -> String {
+    if role == "admin" && contexts.is_empty() {
+        "super admin".to_string()
+    } else {
+        role.to_string()
+    }
+}
+
+/// Human-readable approve-authority — what this entry may *confer* via an
+/// approval (task-consent delegation / step-up ratification) while acting
+/// nowhere. `None` when it confers nothing, so callers omit the line entirely.
+pub fn format_approve_scope(approve_all: bool, approve_contexts: &[String]) -> Option<String> {
+    if approve_all {
+        Some("all contexts".to_string())
+    } else if !approve_contexts.is_empty() {
+        Some(format!("contexts [{}]", approve_contexts.join(", ")))
+    } else {
+        None
+    }
+}
+
+/// Human-readable signing-key filter (#818). `None` (no filter) omits the
+/// line entirely; the empty filter is the state that must never be
+/// misrendered — "no keys" and "no filter" are opposite grants, so the empty
+/// set is spelled out rather than shown as a blank list.
+pub fn format_allowed_keys(allowed_keys: Option<&[String]>) -> Option<String> {
+    match allowed_keys {
+        None => None,
+        Some([]) => Some("(none — may invoke the signing oracle on no keys)".to_string()),
+        Some(keys) => Some(format!("keys [{}]", keys.join(", "))),
+    }
+}
+
+/// Resolve the two mutually-exclusive allowed-keys flags into the wire value.
+///
+/// `None` means "leave unchanged"; `Some(None)` clears the filter
+/// (`--allowed-keys-unrestricted`); `Some(Some(keys))` replaces it. Clearing
+/// needs its own flag for the same reason `--approve-none` does: an empty
+/// `--allowed-keys` cannot mean both "no keys at all" and "no filter".
+pub fn allowed_keys_from_flags(
+    allowed_keys: Option<Vec<String>>,
+    allowed_keys_unrestricted: bool,
+) -> Option<Option<Vec<String>>> {
+    if allowed_keys_unrestricted {
+        Some(None)
+    } else {
+        allowed_keys.map(Some)
+    }
+}
+
+/// Resolve the two mutually-exclusive capability flags into the wire value.
+///
+/// `None` leaves the narrowing unchanged; `Some(vec![])` clears it
+/// (`--capabilities-all`, a privilege increase); `Some(names)` narrows to
+/// exactly those. Clearing needs its own flag because an empty
+/// `--capabilities` cannot mean both "narrowed to nothing" and "not narrowed" —
+/// and of those two readings, the one an operator would get by accident is the
+/// one that hands the entry back everything.
+/// `--purposes a,b` / `--purposes-any` as the purpose scope to write
+/// (VTI-ACL-100): `None` when neither was given. Each name is checked here, so a
+/// mistyped purpose is refused before anything is sent.
+pub fn purposes_from_flags(
+    purposes: Option<Vec<String>>,
+    any: bool,
+) -> Result<Option<vta_sdk::acl::PurposeScope>, Box<dyn std::error::Error>> {
+    match (purposes, any) {
+        (_, true) => Ok(Some(vta_sdk::acl::PurposeScope::Any)),
+        (Some(names), false) => Ok(Some(vta_sdk::acl::PurposeScope::listed(names)?)),
+        (None, false) => Ok(None),
+    }
+}
+
+/// An entry's purposes for display.
+pub fn format_purposes(purposes: Option<&vta_sdk::acl::PurposeScope>) -> String {
+    match purposes {
+        Some(vta_sdk::acl::PurposeScope::Any) => "any (never modelTraining)".to_string(),
+        Some(p) => p.to_string().replace(',', ", "),
+        None => "(not stated by this VTA)".to_string(),
+    }
+}
+
+pub fn capabilities_from_flags(
+    capabilities: Option<Vec<String>>,
+    capabilities_all: bool,
+) -> Option<Vec<String>> {
+    if capabilities_all {
+        Some(Vec::new())
+    } else {
+        capabilities
+    }
+}
+
+pub fn validate_role(role: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match role {
+        "admin" | "initiator" | "application" | "reader" => Ok(()),
+        _ => Err(format!(
+            "invalid role '{role}', expected: admin, initiator, application, or reader"
+        )
+        .into()),
+    }
+}
+
+/// Parse the operator's `--direction` value, defaulting to the historical
+/// "who may act in this context" reading and refusing anything else with the
+/// valid set — the same table the wire uses, so flag and payload cannot drift.
+pub fn parse_direction(
+    direction: Option<&str>,
+) -> Result<ContextDirection, Box<dyn std::error::Error>> {
+    match direction {
+        None => Ok(ContextDirection::default()),
+        Some(d) => Ok(d.parse::<ContextDirection>()?),
+    }
+}
+
+/// The question a `--context` + `--direction` pair actually asked, in words.
+///
+/// On screen because the two directions are equally plausible readings of the
+/// same flag and produce different lists: a subtree sweep that quietly ran as
+/// an act-in query returns the ancestors it is not revoking and looks like a
+/// complete answer (#822).
+pub fn describe_filter(context: &str, direction: ContextDirection) -> String {
+    match direction {
+        ContextDirection::ActingIn => format!("able to act in {context}"),
+        ContextDirection::Subtree => format!("granted at or beneath {context}"),
+        ContextDirection::Any => format!("with authority touching {context}"),
+    }
+}
+
+pub async fn cmd_acl_list(
+    client: &VtaClient,
+    context: Option<&str>,
+    direction: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let direction = parse_direction(direction)?;
+    if context.is_none() && direction != ContextDirection::default() {
+        return Err(format!(
+            "--direction {direction} says how to read --context, and no --context was given.\n\
+             Try: pnm acl list --context <id> --direction {direction}"
+        )
+        .into());
+    }
+    let resp = client.list_acl_in_direction(context, direction).await?;
+
+    // `--json` short-circuits all rendering and emits a single JSON
+    // document. Empty result returns an empty array, NOT a printed
+    // "no entries" string — automation scripts depend on the JSON
+    // shape being consistent across populated and empty results.
+    if crate::render::is_json_output() {
+        crate::render::print_json(&resp.entries)?;
+        return Ok(());
+    }
+
+    if resp.entries.is_empty() {
+        // An empty subtree sweep is the answer that most needs qualifying:
+        // it can equally mean "nothing is granted beneath this context" and
+        // "you asked the other direction". Name the question that was asked.
+        match context {
+            Some(ctx) => println!("No ACL entries found {}.", describe_filter(ctx, direction)),
+            None => println!("No ACL entries found."),
+        }
+        return Ok(());
+    }
+
+    // One pass over the entries names every subject from its label — and,
+    // for free, the `Created By` column too, since a granting admin nearly
+    // always holds an ACL entry of their own.
+    let mut book = NameBook::new();
+    book_from_acl(&mut book, &resp.entries);
+    // Opt-in, and only over the DIDs actually on screen — including the
+    // `created_by` column, which is where an unfamiliar DID most often shows up.
+    resolve_agent_names_into(
+        &mut book,
+        resp.entries
+            .iter()
+            .flat_map(|e| [e.did.as_str(), e.created_by.as_str()]),
+    )
+    .await;
+
+    // Name the question on screen whenever a context filter narrowed the
+    // answer. Two opposite readings of the same `--context` produce two
+    // legitimate, differently-shaped lists, and an operator who cannot see
+    // which one they got cannot tell a short list from a wrong one.
+    let heading = match context {
+        Some(ctx) => format!("ACL Entries — {}", describe_filter(ctx, direction)),
+        None => "ACL Entries".to_string(),
+    };
+
+    if is_full_display() {
+        print_full_list_title(&heading, resp.entries.len());
+        for entry in &resp.entries {
+            let contexts = format_contexts(&entry.role, &entry.allowed_contexts);
+            let role = format_role(&entry.role, &entry.allowed_contexts);
+            let approve =
+                format_approve_scope(entry.approve_all_contexts(), entry.approve_contexts());
+
+            // Name + full DID. Full display exists so an operator can copy a
+            // complete identifier, so the DID is never abbreviated here.
+            let mut fields = full_display_pairs(&book, &entry.did);
+            fields.push(("Role", role));
+            // The raw label is normally what the Name line already shows; keep
+            // it only when something higher-ranked (an agent name) displaced it.
+            if let Some(label) = entry.label.as_deref()
+                && book.name_of(&entry.did).as_deref() != Some(label)
+            {
+                fields.push(("Label", label.to_string()));
+            }
+            fields.push(("Contexts", contexts));
+            if let Some(k) = format_allowed_keys(entry.allowed_keys.as_deref()) {
+                fields.push(("Allowed Keys", k));
+            }
+            if let Some(a) = approve {
+                fields.push(("Approve", a));
+            }
+            fields.push(("Created By", book.render_inline(&entry.created_by)));
+            print_full_entry_owned(&fields);
+        }
+        return Ok(());
+    }
+
+    // Only give up a column to names if at least one entry has one — on a VTA
+    // where nothing has been labelled, a column of dashes is worse than no
+    // column.
+    let show_names = book.names_any(resp.entries.iter().map(|e| e.did.as_str()));
+
+    let header_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let mut header_cells = vec!["DID", "Role", "Contexts", "Created By"];
+    if show_names {
+        header_cells.insert(0, NAME_HEADER);
+    }
+    let header = Row::new(header_cells).style(header_style).bottom_margin(1);
+
+    let rows: Vec<Row> = resp
+        .entries
+        .iter()
+        .map(|entry| {
+            let contexts = format_contexts(&entry.role, &entry.allowed_contexts);
+            let mut cells = vec![
+                did_cell(&entry.did),
+                Cell::from(format_role(&entry.role, &entry.allowed_contexts)),
+                Cell::from(contexts),
+                named_did_cell(&book, &entry.created_by),
+            ];
+            if show_names {
+                cells.insert(0, name_cell(&book, &entry.did));
+            }
+            Row::new(cells)
+        })
+        .collect();
+
+    let title = format!(" {heading} ({}) ", resp.entries.len());
+
+    // DIDs are abbreviated by `shorten_did` (SCID squeezed, domain tail kept),
+    // which frees the width the name column needs. `--full-display` and
+    // `--json` still carry every DID in full.
+    let mut constraints = vec![
+        Constraint::Min(34),    // DID
+        Constraint::Length(12), // Role
+        Constraint::Length(24), // Contexts
+        Constraint::Min(30),    // Created By
+    ];
+    if show_names {
+        constraints.insert(0, Constraint::Min(16));
+    }
+
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .column_spacing(2)
+        .block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+
+    let height = resp.entries.len() as u16 + 4;
+    print_widget(table, height);
+
+    Ok(())
+}
+
+pub async fn cmd_acl_get(client: &VtaClient, did: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = client.get_acl(did).await?;
+    // JSON under --json or off a terminal, like every read (#2588).
+    if crate::render::is_json_output() {
+        crate::render::print_json(&entry)?;
+        return Ok(());
+    }
+
+    let mut book = NameBook::new();
+    book.insert_opt(&entry.did, entry.label.as_deref(), NameSource::AclLabel);
+    resolve_agent_names_into(&mut book, [entry.did.as_str()]).await;
+
+    // Name above DID, DID in full — a single-entry view is where an operator
+    // copies an identifier from.
+    match book.name_of(&entry.did) {
+        Some(name) => {
+            println!("Name:             {name}");
+            println!("DID:              {}", entry.did);
+        }
+        None => println!("DID:              {}", entry.did),
+    }
+    println!(
+        "Role:             {}",
+        format_role(&entry.role, &entry.allowed_contexts)
+    );
+    // Normally the Name line above; shown separately only when something
+    // higher-ranked (a verified agent name) displaced the operator's label.
+    if let Some(label) = entry.label.as_deref()
+        && book.name_of(&entry.did).as_deref() != Some(label)
+    {
+        println!("Label:            {label}");
+    }
+    println!(
+        "Contexts:         {}",
+        format_contexts(&entry.role, &entry.allowed_contexts)
+    );
+    if let Some(keys) = format_allowed_keys(entry.allowed_keys.as_deref()) {
+        println!("Allowed keys:     {keys}");
+    }
+    println!(
+        "Capabilities:     {}",
+        format_capabilities(&entry.role, &entry.capabilities())
+    );
+    println!("Purposes:         {}", format_purposes(entry.purposes()));
+    if let Some(scope) =
+        format_approve_scope(entry.approve_all_contexts(), entry.approve_contexts())
+    {
+        println!("Approve:          {scope}");
+    }
+    println!("Created At:       {}", entry.created_at);
+    println!("Created By:       {}", entry.created_by);
+    if entry.handoff() {
+        println!("Hand-off:         one-time, not yet exercised (VTI-ACL-054)");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_acl_create(
+    client: &VtaClient,
+    did: String,
+    role: String,
+    label: Option<String>,
+    contexts: Vec<String>,
+    expires_at: Option<u64>,
+    step_up_approver: Option<String>,
+    step_up_require: Option<String>,
+    approve_all: bool,
+    approve_contexts: Vec<String>,
+    allowed_keys: Option<Vec<String>>,
+    capabilities: Option<Vec<String>>,
+    handoff: bool,
+    purposes: Option<vta_sdk::acl::PurposeScope>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_role(&role)?;
+    let mut req = CreateAclRequest::new(did, role).contexts(contexts);
+    if let Some(p) = purposes {
+        req = req.purposes(p);
+    }
+    if handoff {
+        req = req.handoff();
+    }
+    if let Some(ref caps) = capabilities {
+        req = req.capabilities(caps.clone());
+    }
+    if let Some(keys) = allowed_keys {
+        req = req.allowed_keys(keys);
+    }
+    if let Some(l) = label {
+        req = req.label(l);
+    }
+    if let Some(secs) = expires_at {
+        req = req.expires_at(secs);
+    }
+    if let Some(ref approver) = step_up_approver {
+        req = req.step_up_approver(approver.clone());
+    }
+    if let Some(ref require) = step_up_require {
+        req = req.step_up_require(require.clone());
+    }
+    if approve_all {
+        req = req.approve_all();
+    } else if !approve_contexts.is_empty() {
+        req = req.approve_contexts(approve_contexts);
+    }
+    let entry = client.create_acl(req).await?;
+    println!("ACL entry created:");
+    println!("  DID:        {}", entry.did);
+    println!(
+        "  Role:       {}",
+        format_role(&entry.role, &entry.allowed_contexts)
+    );
+    if let Some(label) = &entry.label {
+        println!("  Label:      {label}");
+    }
+    println!(
+        "  Contexts:   {}",
+        format_contexts(&entry.role, &entry.allowed_contexts)
+    );
+    if let Some(keys) = format_allowed_keys(entry.allowed_keys.as_deref()) {
+        println!("  Allowed keys: {keys}");
+    }
+    // Echoed from the entry the VTA stored, so an operator sees the narrowing
+    // that actually took effect rather than the one they asked for — and shown
+    // even when empty, so a `--capabilities persona-holder` the server declined
+    // is visible here rather than at the gate it was meant to open.
+    println!(
+        "  Capabilities: {}",
+        format_capabilities(&entry.role, &entry.capabilities())
+    );
+    println!("  Purposes:   {}", format_purposes(entry.purposes()));
+    if let Some(scope) =
+        format_approve_scope(entry.approve_all_contexts(), entry.approve_contexts())
+    {
+        println!("  Approve:    {scope}");
+    }
+    if let Some(approver) = &step_up_approver {
+        println!("  Step-up approver: {approver}");
+    }
+    if let Some(require) = &step_up_require {
+        println!("  Step-up require:  {require}");
+    }
+    match entry.expires_at {
+        Some(secs) => println!(
+            "  Expires at: {} ({})",
+            crate::duration::format_local_time(secs),
+            crate::duration::format_remaining(secs),
+        ),
+        None => println!("  Expires at: (permanent)"),
+    }
+    Ok(())
+}
+
+/// Resolve the three mutually-exclusive approve flags into the wire value.
+///
+/// `None` means "leave unchanged" — which is why revoking needs its own flag
+/// rather than an empty `--approve-contexts`: an empty list cannot mean both
+/// "confer nothing" and "don't touch it".
+pub fn approve_scope_from_flags(
+    approve_all: bool,
+    approve_contexts: Option<Vec<String>>,
+    approve_none: bool,
+) -> Option<ApproveScope> {
+    if approve_none {
+        Some(ApproveScope::None)
+    } else if approve_all {
+        Some(ApproveScope::All)
+    } else {
+        approve_contexts.map(ApproveScope::Contexts)
+    }
+}
+
+/// `pnm acl change-role` — transition a subject's role with a
+/// compare-and-swap on the role they currently hold.
+pub async fn cmd_acl_change_role(
+    client: &VtaClient,
+    did: &str,
+    from_role: &str,
+    to_role: &str,
+    reason: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_role(from_role)?;
+    validate_role(to_role)?;
+
+    let entry = client
+        .change_acl_role(
+            did,
+            ChangeAclRoleRequest {
+                from_role: from_role.to_string(),
+                to_role: to_role.to_string(),
+                reason,
+            },
+        )
+        .await?;
+
+    println!("ACL role changed:");
+    println!("  DID:  {}", entry.did);
+    println!(
+        "  Role: {} \u{2192} {}",
+        from_role,
+        format_role(&entry.role, &entry.allowed_contexts)
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_acl_update(
+    client: &VtaClient,
+    did: &str,
+    role: Option<String>,
+    label: Option<String>,
+    contexts: Option<Vec<String>>,
+    step_up_approver: Option<String>,
+    step_up_require: Option<String>,
+    approve_scope: Option<ApproveScope>,
+    allowed_keys: Option<Option<Vec<String>>>,
+    capabilities: Option<Vec<String>>,
+    purposes: Option<vta_sdk::acl::PurposeScope>,
+    reason: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Role transitions moved to `acl change-role`, which carries the
+    // compare-and-swap that makes a concurrent edit an error instead of a
+    // silent overwrite. Rather than just refusing, look up the role the
+    // subject actually holds so the operator can copy the fixed command —
+    // `--from` is the one argument they cannot guess.
+    if let Some(ref r) = role {
+        validate_role(r)?;
+        let current = client
+            .get_acl(did)
+            .await
+            .ok()
+            .map(|e| e.role)
+            .unwrap_or_else(|| "<current-role>".to_string());
+        return Err(format!(
+            "role changes are not part of `acl update` — they need the compare-and-swap that \
+             `acl change-role` carries.\n\n  Run: pnm acl change-role --did {did} --from \
+             {current} --to {r}"
+        )
+        .into());
+    }
+    let approve_scope_echo = approve_scope.clone();
+    let allowed_keys_echo = allowed_keys.clone();
+    let req = UpdateAclRequest {
+        label,
+        allowed_contexts: contexts,
+        step_up_approver: step_up_approver.clone(),
+        step_up_require: step_up_require.clone(),
+        approve_scope,
+        allowed_keys,
+        capabilities: capabilities.clone(),
+        purposes: purposes.clone(),
+    };
+    let entry = client.update_acl_with_reason(did, req, reason).await?;
+    println!("ACL entry updated:");
+    println!("  DID:      {}", entry.did);
+    println!(
+        "  Role:     {}",
+        format_role(&entry.role, &entry.allowed_contexts)
+    );
+    if let Some(label) = &entry.label {
+        println!("  Label:    {label}");
+    }
+    println!(
+        "  Contexts: {}",
+        format_contexts(&entry.role, &entry.allowed_contexts)
+    );
+    if let Some(approver) = &step_up_approver {
+        if approver.is_empty() {
+            println!("  Step-up approver: (cleared)");
+        } else {
+            println!("  Step-up approver: {approver}");
+        }
+    }
+    if let Some(require) = &step_up_require {
+        if require.is_empty() {
+            println!("  Step-up require:  (cleared)");
+        } else {
+            println!("  Step-up require:  {require}");
+        }
+    }
+    // Echo the filter only when this call set it — and spell out the two
+    // extremes, since "(cleared — every key in scope)" and "no keys at all"
+    // are the grants an operator most needs to see they just made.
+    if let Some(replacement) = &allowed_keys_echo {
+        let rendered = match replacement.as_deref() {
+            None => "(cleared — every key within the entry's contexts)".to_string(),
+            Some([]) => "(none — may invoke the signing oracle on no keys)".to_string(),
+            Some(keys) => format!("keys [{}]", keys.join(", ")),
+        };
+        println!("  Allowed keys: {rendered}");
+    }
+    // Echo the scope only when this call set it, so "unchanged" is visibly
+    // different from "set to confer nothing".
+    if let Some(scope) = &approve_scope_echo {
+        let rendered = match scope {
+            ApproveScope::None => "(revoked — confers nothing)".to_string(),
+            ApproveScope::All => "all contexts".to_string(),
+            ApproveScope::Contexts(cs) => format!("contexts [{}]", cs.join(", ")),
+        };
+        println!("  Approve:  {rendered}");
+    }
+    // Echoed from the entry the VTA returned, not from the flags: a narrowing
+    // an operator cannot read back is one they cannot verify, and the whole
+    // point of the field is that somebody later trusts what it says.
+    if capabilities.is_some() {
+        let held = entry.capabilities();
+        let rendered = if held.is_empty() {
+            "(cleared — everything the role allows)".to_string()
+        } else {
+            held.join(", ")
+        };
+        println!("  Capabilities: {rendered}");
+    }
+    if purposes.is_some() {
+        println!("  Purposes: {}", format_purposes(entry.purposes()));
+    }
+    Ok(())
+}
+
+/// `acl delete <did>`: show the entry, confirm, delete with the operator's
+/// `reason` (#2583). Deleting the entry this session authenticates as locks
+/// the operator out, so that case is said in so many words before asking.
+pub async fn cmd_acl_delete(
+    client: &VtaClient,
+    did: &str,
+    reason: Option<&str>,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // What is about to go, so the confirmation is about a thing, not a string.
+    let entry = client.get_acl(did).await?;
+    eprintln!(
+        "ACL entry {did}: role {}, contexts [{}]{}",
+        entry.role,
+        entry.allowed_contexts.join(", "),
+        entry
+            .label
+            .as_deref()
+            .map(|l| format!(", label \"{l}\""))
+            .unwrap_or_default()
+    );
+    if crate::render::session_did() == Some(did) {
+        eprintln!(
+            "warning: {did} is the identity this session is signed in as. Deleting it ends \
+             your own access to this VTA."
+        );
+    }
+    if !crate::confirm::confirm_or_cancel(&format!("delete the ACL entry for {did}"), yes)? {
+        return Ok(());
+    }
+    client.delete_acl_with_reason(did, reason).await?;
+    if crate::render::is_json_output() {
+        crate::render::print_json(&serde_json::json!({ "ok": true, "deleted": did }))?;
+    } else {
+        println!("ACL entry deleted: {did}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_capabilities ────────────────────────────────────────
+
+    /// The regression this formatter exists for. An install whose agent
+    /// credential had never been granted `persona-holder` printed no
+    /// `Capabilities:` line at all, so `pnm acl get` looked like a tool that
+    /// does not report capabilities rather than one reporting none — and the
+    /// grant's absence was only discovered later, at the gate it was meant to
+    /// open. Empty must render as *something*.
+    #[test]
+    fn test_empty_capabilities_still_render() {
+        let rendered = format_capabilities("admin", &[]);
+        assert!(
+            !rendered.is_empty(),
+            "an entry with no named capabilities must still print a line"
+        );
+        assert!(
+            rendered.contains("none granted by name"),
+            "empty must say it is empty, not go silent: {rendered}"
+        );
+        // And it must say what the entry *does* hold, so "none granted by
+        // name" is not misread as "this DID can do nothing".
+        assert!(
+            rendered.contains("admin"),
+            "empty must name the role that still applies: {rendered}"
+        );
+    }
+
+    /// A capability name is echoed exactly as the VTA stored it, so an
+    /// operator can compare it against the `--capabilities` they passed.
+    #[test]
+    fn test_granted_capabilities_are_echoed_verbatim() {
+        assert_eq!(
+            format_capabilities("admin", &["persona-holder".to_string()]),
+            "persona-holder"
+        );
+        assert_eq!(
+            format_capabilities(
+                "reader",
+                &["vault-read".to_string(), "persona-holder".to_string()]
+            ),
+            "vault-read, persona-holder"
+        );
+    }
+
+    /// A name this build has never heard of must still be shown. `Capability`
+    /// is `#[non_exhaustive]`, so a newer VTA can store one; dropping it here
+    /// would hide a grant from the display used to look for grants.
+    #[test]
+    fn test_unrecognised_capability_is_not_dropped() {
+        let rendered = format_capabilities("admin", &["capability-from-the-future".to_string()]);
+        assert_eq!(rendered, "capability-from-the-future");
+    }
+
+    // ── format_contexts ────────────────────────────────────────────
+
+    /// Empty means "every context" only for an admin. This test previously
+    /// asserted `(unrestricted)` for an empty list regardless of role, which
+    /// pinned the bug rather than the behaviour.
+    #[test]
+    fn test_format_contexts_empty_is_role_dependent() {
+        assert_eq!(format_contexts("admin", &[]), "(unrestricted)");
+        for role in ["reader", "initiator", "application"] {
+            assert_eq!(
+                format_contexts(role, &[]),
+                "(none — acts nowhere)",
+                "empty contexts must not read as unrestricted for role {role}"
+            );
+        }
+    }
+
+    /// The shape the `--approve-all` help text itself recommends: a reader
+    /// with no contexts whose authority is entirely `approve_scope`. It acts
+    /// nowhere, and the display must not suggest otherwise.
+    #[test]
+    fn test_least_privilege_approver_does_not_read_as_unrestricted() {
+        let contexts: Vec<String> = vec![];
+        assert_eq!(
+            format_contexts("reader", &contexts),
+            "(none — acts nowhere)"
+        );
+        assert_eq!(format_role("reader", &contexts), "reader");
+        assert_eq!(
+            format_approve_scope(false, &["openvtc".to_string()]).as_deref(),
+            Some("contexts [openvtc]")
+        );
+    }
+
+    #[test]
+    fn test_format_approve_scope() {
+        assert_eq!(
+            format_approve_scope(true, &[]).as_deref(),
+            Some("all contexts")
+        );
+        assert_eq!(
+            format_approve_scope(false, &["openvtc".to_string()]).as_deref(),
+            Some("contexts [openvtc]")
+        );
+        assert_eq!(
+            format_approve_scope(false, &["a".to_string(), "b".to_string()]).as_deref(),
+            Some("contexts [a, b]")
+        );
+        // Confers nothing ⇒ no line.
+        assert_eq!(format_approve_scope(false, &[]), None);
+    }
+
+    #[test]
+    fn test_format_contexts_single() {
+        let ctx = vec!["vta".to_string()];
+        assert_eq!(format_contexts("reader", &ctx), "vta");
+    }
+
+    #[test]
+    fn test_format_contexts_multiple() {
+        let ctx = vec!["vta".to_string(), "payments".to_string()];
+        assert_eq!(format_contexts("reader", &ctx), "vta, payments");
+    }
+
+    // ── format_allowed_keys (#818) ─────────────────────────────────
+
+    /// "No filter" and "no keys" are opposite grants; the display must never
+    /// blur them (the same lesson as #746 one axis over).
+    #[test]
+    fn test_format_allowed_keys_distinguishes_absent_from_empty() {
+        assert_eq!(format_allowed_keys(None), None, "no filter → no line");
+        assert_eq!(
+            format_allowed_keys(Some(&[])).as_deref(),
+            Some("(none — may invoke the signing oracle on no keys)")
+        );
+        assert_eq!(
+            format_allowed_keys(Some(&["k1".to_string(), "k2".to_string()])).as_deref(),
+            Some("keys [k1, k2]")
+        );
+    }
+
+    #[test]
+    fn test_allowed_keys_from_flags() {
+        // Neither flag → leave unchanged.
+        assert_eq!(allowed_keys_from_flags(None, false), None);
+        // Replace with exactly these ids.
+        assert_eq!(
+            allowed_keys_from_flags(Some(vec!["k1".into()]), false),
+            Some(Some(vec!["k1".to_string()]))
+        );
+        // Clear the filter — its own flag, because an empty `--allowed-keys`
+        // cannot mean both "no keys at all" and "no filter".
+        assert_eq!(allowed_keys_from_flags(None, true), Some(None));
+    }
+
+    // ── format_role ────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_role_admin_no_contexts_is_super_admin() {
+        assert_eq!(format_role("admin", &[]), "super admin");
+    }
+
+    #[test]
+    fn test_format_role_admin_with_contexts_stays_admin() {
+        let ctx = vec!["vta".to_string()];
+        assert_eq!(format_role("admin", &ctx), "admin");
+    }
+
+    #[test]
+    fn test_format_role_initiator_unchanged() {
+        assert_eq!(format_role("initiator", &[]), "initiator");
+    }
+
+    #[test]
+    fn test_format_role_application_unchanged() {
+        let ctx = vec!["app".to_string()];
+        assert_eq!(format_role("application", &ctx), "application");
+    }
+
+    // ── validate_role ──────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_role_admin_ok() {
+        assert!(validate_role("admin").is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_initiator_ok() {
+        assert!(validate_role("initiator").is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_application_ok() {
+        assert!(validate_role("application").is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_reader_ok() {
+        assert!(validate_role("reader").is_ok());
+    }
+
+    #[test]
+    fn test_validate_role_unknown_fails() {
+        let err = validate_role("superuser").unwrap_err();
+        assert!(err.to_string().contains("invalid role 'superuser'"));
+    }
+
+    #[test]
+    fn test_validate_role_empty_fails() {
+        assert!(validate_role("").is_err());
+    }
+}

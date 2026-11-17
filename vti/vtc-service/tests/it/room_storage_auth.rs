@@ -1,0 +1,733 @@
+//! Ambient and sealed storage authentication (trust-tasks-tf #866):
+//! `vtc/storage/configs/{list,get,create,update}/0.2` and
+//! `vtc/storage/credentials/set/0.2`, driven through the signed-document door as an
+//! administrator's client does.
+//!
+//! What is held here: each version is answered at its own version; `ambient` and
+//! `sealed` exist only where the host's `[rooms.files.auth]` permits them
+//! (`create/0.2` item 9); a sealed credential is opened only with the community's key,
+//! checked as received, kept encrypted, reported by a keyed fingerprint and never
+//! returned or audited; and it goes when the config's `auth` leaves `sealed`.
+
+use axum::http::StatusCode;
+use serde_json::{Value, json};
+use vta_sdk::sealed_transfer::{
+    AssertionProof, InMemoryNonceStore, ProducerAssertion, SealedPayloadV1,
+    StorageCredentialPayload, armor, bundle_digest_multibase, seal_payload,
+};
+use vti_rooms_dtg::test_support::Party;
+
+use vtc_service::acl::{AdminAuthority, VtcAclEntry, VtcRole, store_acl_entry};
+use vtc_service::config::StorageAuthHostConfig;
+use vtc_service::rooms::storage_configs::codes::*;
+use vtc_service::test_support::{
+    TEST_VTC_DID, TestVtc, test_community_ed25519_public, test_community_x25519_public,
+};
+
+use crate::common::second_party::Gesturer;
+use crate::common::signed::{error_code, post, signed, signed_to};
+
+const RP_ORIGIN: &str = "https://vtc.example.com";
+const LIST: &str = "https://trusttasks.org/spec/vtc/storage/configs/list/0.2";
+const GET: &str = "https://trusttasks.org/spec/vtc/storage/configs/get/0.2";
+const CREATE: &str = "https://trusttasks.org/spec/vtc/storage/configs/create/0.3";
+const UPDATE: &str = "https://trusttasks.org/spec/vtc/storage/configs/update/0.3";
+const SET: &str = "https://trusttasks.org/spec/vtc/storage/credentials/set/0.3";
+const RECIPIENT: &str = "https://trusttasks.org/spec/vtc/storage/credentials/recipient/0.1";
+
+const ROLE: &str = "arn:aws:iam::123456789012:role/northwind-rooms-writer";
+const SECRET: &str = "example-secret-not-a-real-one";
+
+/// A `trust-task-error` reply's code — the census reads witnesses by this name.
+fn tt_error_code(doc: &Value) -> Option<&str> {
+    error_code(doc)
+}
+
+struct Fixture {
+    vtc: TestVtc,
+    gesturer: Gesturer,
+}
+
+async fn fixture(auth: StorageAuthHostConfig) -> Fixture {
+    let vtc = TestVtc::builder()
+        .vtc_did(TEST_VTC_DID)
+        .with_public_url(RP_ORIGIN)
+        .with_signers(true)
+        .with_audit(true)
+        .with_storage_auth(auth)
+        .build()
+        .await;
+    vtc_service::policy::default::install_defaults(
+        &vtc.state.policies_ks,
+        &vtc.state.active_policies_ks,
+    )
+    .await
+    .unwrap();
+    Fixture {
+        vtc,
+        gesturer: Gesturer::new(),
+    }
+}
+
+fn permits(ambient: bool, sealed: bool) -> StorageAuthHostConfig {
+    StorageAuthHostConfig {
+        ambient,
+        sealed,
+        ..Default::default()
+    }
+}
+
+async fn admin(fix: &Fixture) -> Party {
+    let p = Party::new();
+    let admin = AdminAuthority::community_admin();
+    let row = VtcAclEntry {
+        did: p.did.clone(),
+        role: VtcRole::implied_by(admin.admin_role.as_ref()),
+        label: None,
+        admin,
+        delegated_by: None,
+        created_at: 0,
+        created_by: "did:key:vtc-install".into(),
+        updated_at: None,
+        updated_by: None,
+        expires_at: None,
+        resource_grants: Vec::new(),
+        group_grants: Vec::new(),
+        label_set_by_subject: false,
+        suspension: None,
+    };
+    store_acl_entry(&fix.vtc.state.acl_ks, &row).await.unwrap();
+    p
+}
+
+async fn requester(fix: &mut Fixture) -> Party {
+    let p = admin(fix).await;
+    fix.gesturer.enrol(&fix.vtc, &p.did).await;
+    p
+}
+
+async fn send(fix: &Fixture, by: &Party, uri: &str, payload: Value) -> Value {
+    post(&fix.vtc, &signed(by, uri, payload).await).await.1
+}
+
+async fn through(
+    fix: &mut Fixture,
+    by: &Party,
+    approvers: &[&Party],
+    uri: &str,
+    payload: Value,
+) -> (StatusCode, Value) {
+    let doc = signed(by, uri, payload).await;
+    fix.gesturer
+        .send_through(&fix.vtc, by, approvers, &doc)
+        .await
+}
+
+fn s3() -> Value {
+    json!({ "kind": "s3", "region": "eu-west-1", "bucket": "northwind-rooms-eu" })
+}
+
+/// An R2-style bucket a sealed key presigns for. The endpoint is never reached here.
+fn r2() -> Value {
+    json!({
+        "kind": "s3", "region": "auto", "bucket": "northwind-archive",
+        "endpoint": "https://account.r2.cloudflarestorage.com", "pathStyle": true,
+    })
+}
+
+/// A config stored directly, as an executed create leaves it.
+async fn stored(fix: &Fixture, id: &str, settings: Value, auth: Value) {
+    let record = json!({
+        "id": id,
+        "label": id,
+        "settings": settings,
+        "auth": auth,
+        "state": "active",
+        "createdBy": "did:key:zAdmin",
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let _guard = fix.vtc.state.room_storage.lock().await;
+    fix.vtc.state.room_storage.put_config(record).await.unwrap();
+}
+
+fn s3_credential(config: &str) -> Value {
+    json!({
+        "kind": "s3",
+        "configId": config,
+        "accessKeyId": "EXAMPLEKEYID0001",
+        "secretAccessKey": SECRET,
+    })
+}
+
+/// `cleartext`, sealed to the community as an administrator's client seals it.
+async fn sealed_to_community(cleartext: Value) -> (String, String) {
+    let mut id = [0u8; 16];
+    rand::fill(&mut id);
+    let bundle = seal_payload(
+        &test_community_x25519_public(),
+        id,
+        ProducerAssertion {
+            producer_did: "did:key:zAdmin".into(),
+            proof: AssertionProof::PinnedOnly,
+        },
+        &SealedPayloadV1::StorageCredential(Box::new(StorageCredentialPayload(cleartext))),
+        &InMemoryNonceStore::new(),
+    )
+    .await
+    .unwrap();
+    (armor::encode(&bundle), bundle_digest_multibase(&bundle))
+}
+
+async fn set_payload(config: &str, cleartext: Value) -> Value {
+    let (sealed, digest) = sealed_to_community(cleartext).await;
+    json!({ "configId": config, "sealed": sealed, "digestMultibase": digest, "reason": "evaluation" })
+}
+
+async fn audit_text(fix: &Fixture) -> String {
+    fix.vtc
+        .state
+        .audit_ks
+        .prefix_iter_raw(Vec::new())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, v)| String::from_utf8_lossy(&v).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn action_text(fix: &Fixture) -> String {
+    fix.vtc
+        .state
+        .admin_actions_ks
+        .prefix_iter_raw(b"action:".to_vec())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, v)| String::from_utf8_lossy(&v).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ─── the flows ───────────────────────────────────────────────────────────
+
+/// On a host permitting `ambient`, a config naming the role it assumes lands on
+/// approval, and a reader sees the role.
+#[tokio::test]
+async fn an_ambient_config_names_its_role() {
+    let mut fix = fixture(permits(true, false)).await;
+    let a = requester(&mut fix).await;
+    let b = admin(&fix).await;
+    let (status, reply) = through(
+        &mut fix,
+        &a,
+        &[&b],
+        CREATE,
+        json!({
+            "id": "eu-s3-instance",
+            "label": "EU — S3 (instance role)",
+            "settings": s3(),
+            "auth": { "mode": "ambient", "roleArn": ROLE },
+            "reason": "the community runs in the bucket's account",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(
+        reply["type"].as_str().unwrap().starts_with(CREATE),
+        "{reply}"
+    );
+    assert_eq!(reply["payload"]["config"]["auth"]["roleArn"], ROLE);
+
+    let got = send(&fix, &a, GET, json!({ "configId": "eu-s3-instance" })).await;
+    assert_eq!(got["payload"]["config"]["auth"]["roleArn"], ROLE, "{got}");
+    assert_eq!(got["payload"]["facts"]["credential"]["status"], "ambient");
+    assert_eq!(
+        got["payload"]["facts"]["credential"]["roomsHoldingCredentials"],
+        0
+    );
+}
+
+/// A host that no longer permits a mode keeps the config, reports it `notAllowed`, and
+/// accepts an update moving it to a
+/// permitted mode (`update/0.2` item 8).
+#[tokio::test]
+async fn a_mode_the_host_withdrew_reads_not_allowed_and_can_be_moved_off() {
+    let mut fix = fixture(permits(false, false)).await;
+    stored(
+        &fix,
+        "eu-amb",
+        s3(),
+        json!({ "mode": "ambient", "roleArn": ROLE }),
+    )
+    .await;
+    let a = requester(&mut fix).await;
+    let b = admin(&fix).await;
+
+    let got = send(&fix, &a, GET, json!({ "configId": "eu-amb" })).await;
+    assert_eq!(
+        got["payload"]["facts"]["credential"],
+        json!({ "status": "notAllowed" }),
+        "{got}"
+    );
+    let listed = send(&fix, &a, LIST, json!({})).await;
+    let item = listed["payload"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["config"]["id"] == "eu-amb")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        item["facts"]["credential"]["status"], "notAllowed",
+        "{item}"
+    );
+
+    // A label alone is accepted on a config whose mode is withdrawn.
+    let (status, reply) = through(
+        &mut fix,
+        &a,
+        &[&b],
+        UPDATE,
+        json!({ "configId": "eu-amb", "label": "EU (old)", "reason": "renamed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["payload"]["config"]["label"], "EU (old)");
+}
+
+/// The whole sealed path: a credential sealed to the community is set through the
+/// action list, stored encrypted, reported by fingerprint; it never comes back through
+/// any task, the audit trail or the parked action once closed; and it goes when the
+/// config's `auth` leaves `sealed`.
+#[tokio::test]
+async fn a_sealed_credential_is_set_through_consent_and_never_returned_or_audited() {
+    let mut fix = fixture(permits(true, true)).await;
+    let a = requester(&mut fix).await;
+    let b = admin(&fix).await;
+    stored(&fix, "r2-archive", r2(), json!({ "mode": "sealed" })).await;
+
+    let before = send(&fix, &a, GET, json!({ "configId": "r2-archive" })).await;
+    assert_eq!(
+        before["payload"]["facts"]["credential"],
+        json!({ "status": "required" })
+    );
+
+    let payload = set_payload("r2-archive", s3_credential("r2-archive")).await;
+    let (status, reply) = through(&mut fix, &a, &[&b], SET, payload).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let state = &reply["payload"]["credentialState"];
+    assert_eq!(state["status"], "sealed", "{reply}");
+    let fingerprint = state["fingerprint"].as_str().unwrap().to_string();
+    assert!(state["setAt"].is_string());
+    // Probed with the new credential; the store is unreachable here, so not ok — but
+    // reported.
+    assert!(reply["payload"]["probeOk"].is_boolean(), "{reply}");
+    assert!(!reply.to_string().contains(SECRET));
+
+    let got = send(&fix, &a, GET, json!({ "configId": "r2-archive" })).await;
+    assert_eq!(
+        got["payload"]["facts"]["credential"]["fingerprint"],
+        fingerprint
+    );
+    assert!(!got.to_string().contains(SECRET), "{got}");
+    assert!(!audit_text(&fix).await.contains(SECRET), "audited");
+    assert!(audit_text(&fix).await.contains(&fingerprint));
+    let actions = action_text(&fix).await;
+    assert!(
+        !actions.contains("BEGIN VTA SEALED BUNDLE"),
+        "the closed action still holds the sealed block"
+    );
+
+    // `auth` leaves `sealed`: the credential is destroyed.
+    let (status, reply) = through(
+        &mut fix,
+        &a,
+        &[&b],
+        UPDATE,
+        json!({ "configId": "r2-archive", "settings": s3(), "auth": { "mode": "ambient" }, "reason": "the instance role now" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let sealed = fix.vtc.state.room_storage.sealed_credentials().unwrap();
+    assert!(sealed.get("r2-archive").await.unwrap().is_none());
+}
+
+// ─── declared codes ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn vtc_storage_configs_list_v0_2_refuses_a_foreign_cursor() {
+    let fix = fixture(permits(false, false)).await;
+    let a = admin(&fix).await;
+    let reply = send(&fix, &a, LIST, json!({ "cursor": "not-ours" })).await;
+    assert_eq!(tt_error_code(&reply), Some(LIST_INVALID_CURSOR), "{reply}");
+}
+
+#[tokio::test]
+async fn vtc_storage_configs_get_v0_2_answers_not_found() {
+    let fix = fixture(permits(false, false)).await;
+    let a = admin(&fix).await;
+    let reply = send(&fix, &a, GET, json!({ "configId": "nowhere" })).await;
+    assert_eq!(tt_error_code(&reply), Some(GET_NOT_FOUND), "{reply}");
+}
+
+/// `create/0.2`'s codes, and `authNotAllowed`'s three reasons, each refused before
+/// anyone is asked for a gesture.
+#[tokio::test]
+async fn vtc_storage_configs_create_v0_2_refuses_with_its_declared_codes() {
+    let fix = fixture(permits(false, false)).await;
+    let a = admin(&fix).await;
+    let create = |id: &str, settings: Value, auth: Option<Value>| {
+        let mut p = json!({ "id": id, "label": id, "settings": settings, "reason": "test" });
+        if let Some(auth) = auth {
+            p["auth"] = auth;
+        }
+        p
+    };
+
+    let reply = send(
+        &fix,
+        &a,
+        CREATE,
+        create("local", json!({ "kind": "local", "root": "/x/y" }), None),
+    )
+    .await;
+    assert_eq!(tt_error_code(&reply), Some(CREATE_EXISTS), "{reply}");
+
+    let reply = send(
+        &fix,
+        &a,
+        CREATE,
+        create("etc", json!({ "kind": "local", "root": "/etc/vtc" }), None),
+    )
+    .await;
+    assert_eq!(
+        tt_error_code(&reply),
+        Some(CREATE_INVALID_SETTINGS),
+        "{reply}"
+    );
+
+    for (settings, auth, reason) in [
+        (s3(), None, "doesNotFitKind"),
+        (
+            json!({ "kind": "gcs", "bucket": "northwind-rooms" }),
+            Some(json!({ "mode": "ambient", "roleArn": ROLE })),
+            "roleArnNotApplicable",
+        ),
+        (s3(), Some(json!({ "mode": "ambient" })), "disabledByHost"),
+        (s3(), Some(json!({ "mode": "sealed" })), "disabledByHost"),
+    ] {
+        let reply = send(&fix, &a, CREATE, create("amb", settings, auth)).await;
+        assert_eq!(
+            tt_error_code(&reply),
+            Some(CREATE_AUTH_NOT_ALLOWED),
+            "{reply}"
+        );
+        assert_eq!(
+            reply["payload"]["details"],
+            json!({ "reason": reason }),
+            "{reply}"
+        );
+    }
+}
+
+/// `update/0.2`'s codes.
+#[tokio::test]
+async fn vtc_storage_configs_update_v0_2_refuses_with_its_declared_codes() {
+    let fix = fixture(permits(false, false)).await;
+    let a = admin(&fix).await;
+    stored(&fix, "eu-amb", s3(), json!({ "mode": "ambient" })).await;
+
+    let reply = send(
+        &fix,
+        &a,
+        UPDATE,
+        json!({ "configId": "nowhere", "label": "x", "reason": "x" }),
+    )
+    .await;
+    assert_eq!(tt_error_code(&reply), Some(UPDATE_NOT_FOUND), "{reply}");
+
+    let reply = send(
+        &fix,
+        &a,
+        UPDATE,
+        json!({ "configId": "local", "settings": s3(), "reason": "x" }),
+    )
+    .await;
+    assert_eq!(
+        tt_error_code(&reply),
+        Some(UPDATE_KIND_IMMUTABLE),
+        "{reply}"
+    );
+
+    let reply = send(
+        &fix,
+        &a,
+        UPDATE,
+        json!({ "configId": "local", "settings": { "kind": "local", "root": "/etc/vtc" }, "reason": "x" }),
+    )
+    .await;
+    assert_eq!(
+        tt_error_code(&reply),
+        Some(UPDATE_INVALID_SETTINGS),
+        "{reply}"
+    );
+
+    // Its mode is withdrawn: changing its settings under that mode is refused, naming why.
+    let reply = send(
+        &fix,
+        &a,
+        UPDATE,
+        json!({ "configId": "eu-amb", "capacityBytes": 5, "settings": { "kind": "s3", "region": "eu-west-2", "bucket": "other" }, "reason": "x" }),
+    )
+    .await;
+    assert_eq!(
+        tt_error_code(&reply),
+        Some(UPDATE_AUTH_NOT_ALLOWED),
+        "{reply}"
+    );
+    assert_eq!(reply["payload"]["details"]["reason"], "disabledByHost");
+
+    // Retired: only the label changes.
+    {
+        let mut rec = fix
+            .vtc
+            .state
+            .room_storage
+            .config("eu-amb")
+            .await
+            .unwrap()
+            .unwrap();
+        rec["state"] = json!("retired");
+        fix.vtc.state.room_storage.put_config(rec).await.unwrap();
+    }
+    let reply = send(
+        &fix,
+        &a,
+        UPDATE,
+        json!({ "configId": "eu-amb", "capacityBytes": 5, "reason": "x" }),
+    )
+    .await;
+    assert_eq!(tt_error_code(&reply), Some(UPDATE_NOT_ACTIVE), "{reply}");
+}
+
+/// A blob is found where it was written: the bucket cannot move under it.
+#[tokio::test]
+async fn vtc_storage_configs_update_v0_2_refuses_to_move_a_config_holding_blobs() {
+    let fix = fixture(permits(true, false)).await;
+    let a = admin(&fix).await;
+    stored(&fix, "eu-amb", s3(), json!({ "mode": "ambient" })).await;
+    let entry = json!({
+        "roomId": "did:key:zSomeRoom",
+        "blobRef": "zQmBlob",
+        "size": 10,
+        "manifest": {},
+        "configId": "eu-amb",
+        "backendRef": { "kind": "s3", "key": "rooms/x/zQmBlob" },
+        "state": "committed",
+        "refs": 1,
+        "committedAt": 0,
+    });
+    fix.vtc
+        .state
+        .room_files
+        .index_keyspace()
+        .insert("blob:test:eu-amb", &entry)
+        .await
+        .unwrap();
+    let reply = send(
+        &fix,
+        &a,
+        UPDATE,
+        json!({ "configId": "eu-amb", "settings": { "kind": "s3", "region": "eu-west-1", "bucket": "elsewhere" }, "reason": "x" }),
+    )
+    .await;
+    assert_eq!(
+        tt_error_code(&reply),
+        Some(UPDATE_LOCATION_IMMUTABLE),
+        "{reply}"
+    );
+}
+
+/// `credentials/set/0.2`'s codes: the host's permission first, before anything is
+/// opened; then the config; then the block.
+#[tokio::test]
+async fn vtc_storage_credentials_set_refuses_with_its_declared_codes() {
+    let off = fixture(permits(false, false)).await;
+    let a = admin(&off).await;
+    stored(&off, "r2-archive", r2(), json!({ "mode": "sealed" })).await;
+    let reply = send(
+        &off,
+        &a,
+        SET,
+        set_payload("r2-archive", s3_credential("r2-archive")).await,
+    )
+    .await;
+    assert_eq!(tt_error_code(&reply), Some(SET_AUTH_NOT_ALLOWED), "{reply}");
+
+    let fix = fixture(permits(true, true)).await;
+    let a = admin(&fix).await;
+    stored(&fix, "r2-archive", r2(), json!({ "mode": "sealed" })).await;
+    stored(&fix, "eu-amb", s3(), json!({ "mode": "ambient" })).await;
+
+    let reply = send(
+        &fix,
+        &a,
+        SET,
+        set_payload("nowhere", s3_credential("nowhere")).await,
+    )
+    .await;
+    assert_eq!(tt_error_code(&reply), Some(SET_NOT_FOUND), "{reply}");
+
+    let reply = send(
+        &fix,
+        &a,
+        SET,
+        set_payload("eu-amb", s3_credential("eu-amb")).await,
+    )
+    .await;
+    assert_eq!(tt_error_code(&reply), Some(SET_NOT_SEALED_MODE), "{reply}");
+
+    // Its digest is not the block's.
+    let mut p = set_payload("r2-archive", s3_credential("r2-archive")).await;
+    p["digestMultibase"] =
+        set_payload("r2-archive", s3_credential("r2-archive")).await["digestMultibase"].clone();
+    let reply = send(&fix, &a, SET, p).await;
+    assert_eq!(tt_error_code(&reply), Some(SET_CANNOT_OPEN), "{reply}");
+
+    // Sealed for another config: refused, and never quoted back.
+    let reply = send(
+        &fix,
+        &a,
+        SET,
+        set_payload("r2-archive", s3_credential("another-config")).await,
+    )
+    .await;
+    assert_eq!(
+        tt_error_code(&reply),
+        Some(SET_INVALID_CREDENTIAL),
+        "{reply}"
+    );
+    assert!(!reply.to_string().contains(SECRET));
+    assert!(
+        fix.vtc
+            .state
+            .room_storage
+            .sealed_credentials()
+            .unwrap()
+            .get("r2-archive")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ─── credentials/recipient ───────────────────────────────────────────────
+
+const WEBS_VTC_DID: &str = "did:webs:vtc.example.com:communities:EAbcAid";
+
+/// A did:webs community whose own DID resolves to `published` (an Ed25519 key as a
+/// JWK under its own id, as a did:webs publishes it).
+async fn webs_community(published: [u8; 32]) -> Fixture {
+    use base64::Engine as _;
+    let vtc = TestVtc::builder()
+        .vtc_did(WEBS_VTC_DID)
+        .with_public_url(RP_ORIGIN)
+        .with_signers(true)
+        .with_did_resolver(true)
+        .build()
+        .await;
+    let id = format!("{WEBS_VTC_DID}#DKeyOne");
+    let doc = json!({
+        "id": WEBS_VTC_DID,
+        "verificationMethod": [{
+            "id": id, "type": "JsonWebKey", "controller": WEBS_VTC_DID,
+            "publicKeyJwk": { "kty": "OKP", "crv": "Ed25519",
+                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(published) },
+        }],
+        "authentication": [id],
+        "assertionMethod": [id],
+    });
+    let mut resolver = vtc.state.did_resolver.clone().expect("resolver attached");
+    resolver
+        .add_did_document(
+            WEBS_VTC_DID,
+            serde_json::from_value(doc).expect("a DID document"),
+        )
+        .await;
+    Fixture {
+        vtc,
+        gesturer: Gesturer::new(),
+    }
+}
+
+async fn ask_webs(fix: &Fixture, by: &Party) -> Value {
+    post(
+        &fix.vtc,
+        &signed_to(by, WEBS_VTC_DID, RECIPIENT, json!({})).await,
+    )
+    .await
+    .1
+}
+
+/// `vtc/storage/credentials/recipient/0.1` item 2: a did:webs community answers with
+/// the key it opens sealed blocks with, as its did:key, under the verification method
+/// its resolved document publishes it as — and a block sealed to it opens.
+#[tokio::test]
+async fn vtc_storage_credentials_recipient_names_the_key_a_did_webs_community_opens_with() {
+    let fix = webs_community(test_community_ed25519_public()).await;
+    let a = admin(&fix).await;
+    let reply = ask_webs(&fix, &a).await;
+    let p = &reply["payload"];
+    assert_eq!(p["communityDid"], WEBS_VTC_DID, "{reply}");
+    assert_eq!(
+        p["verificationMethod"],
+        format!("{WEBS_VTC_DID}#DKeyOne"),
+        "{reply}"
+    );
+    let key = p["recipientKey"].as_str().expect("recipientKey");
+    let public = vta_sdk::did_key::decode_ed25519_public_key_multibase(
+        key.strip_prefix("did:key:").expect("a did:key"),
+    )
+    .unwrap();
+    assert_eq!(
+        vta_sdk::didcomm_light::ed25519_pub_to_x25519_pub(&public).unwrap(),
+        test_community_x25519_public(),
+        "the answer is the key the community opens with"
+    );
+}
+
+/// Item 3: a document that publishes another signing key — a rotation not yet
+/// published — is `notPublished`, with no key.
+#[tokio::test]
+async fn vtc_storage_credentials_recipient_refuses_a_key_its_document_does_not_publish() {
+    let fix = webs_community([3u8; 32]).await;
+    let a = admin(&fix).await;
+    let reply = ask_webs(&fix, &a).await;
+    assert_eq!(
+        tt_error_code(&reply),
+        Some(RECIPIENT_NOT_PUBLISHED),
+        "{reply}"
+    );
+    assert_eq!(reply["payload"]["retryable"], true, "{reply}");
+    assert!(reply["payload"].get("recipientKey").is_none(), "{reply}");
+}
+
+/// Item 3's allowance: a community that cannot resolve its own DID answers from the
+/// key it holds; and item 1: only `vtc.rooms.admin` may ask.
+#[tokio::test]
+async fn vtc_storage_credentials_recipient_answers_unresolved_and_only_a_rooms_admin() {
+    let fix = fixture(permits(false, true)).await;
+    let a = admin(&fix).await;
+    let reply = send(&fix, &a, RECIPIENT, json!({})).await;
+    assert_eq!(reply["payload"]["communityDid"], TEST_VTC_DID, "{reply}");
+    assert_eq!(
+        reply["payload"]["verificationMethod"],
+        format!("{TEST_VTC_DID}#key-0"),
+        "{reply}"
+    );
+
+    let stranger = Party::new();
+    let reply = send(&fix, &stranger, RECIPIENT, json!({})).await;
+    assert_eq!(tt_error_code(&reply), Some("permissionDenied"), "{reply}");
+}

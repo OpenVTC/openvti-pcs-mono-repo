@@ -1,0 +1,1217 @@
+//! The storage abstraction: [`Store`], keyspace handles, batches and paged
+//! walks over one of the configured backends (fjall, Redis, DynamoDB,
+//! Firestore, Cosmos DB).
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
+#[cfg(feature = "store-cosmosdb")]
+mod cosmosdb;
+#[cfg(feature = "store-dynamodb")]
+mod dynamodb;
+#[cfg(feature = "store-firestore")]
+mod firestore;
+#[cfg(feature = "store-fjall")]
+mod fjall;
+#[cfg(feature = "store-fjall")]
+pub mod flusher;
+pub mod keyspaces;
+#[cfg(feature = "store-redis")]
+mod redis;
+#[cfg(all(test, feature = "store-fjall"))]
+pub(crate) mod test_support;
+
+pub use keyspaces::{
+    ALL_KEYSPACES, KS_ACL, KS_ASSIGNMENTS, KS_DIDS, KS_DOMAINS, KS_IDENTITY, KS_META,
+    KS_OUTBOUND_QUEUE, KS_PASSKEY_STEP_UP, KS_PENDING_PURGES, KS_REGISTRY, KS_SCID_FLOORS,
+    KS_SESSIONS, KS_STATS, KS_TIMESERIES, KS_TSP_RELATIONSHIPS, KS_WITNESSES,
+};
+
+use std::cell::Cell;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use super::config::{FjallTuning, StoreConfig};
+use super::error::AppError;
+
+// ---------------------------------------------------------------------------
+// Key prefix constants — used across keyspaces to namespace stored data.
+//
+// session:<id>         — auth session record
+// refresh:<token>      — reverse index: refresh token → session_id
+// did:<mnemonic>       — DID record (DidRecord)
+// content:<m>:log      — raw JSONL did-log content
+// content:<m>:witness  — raw witness JSON content
+// owner:<did>:<m>      — reverse index: owner DID → mnemonic
+// watcher_sync:<m>     — per-DID watcher sync status
+// pk_user:/pk_did:/pk_cred: — WebAuthn passkey records (`server::passkey`)
+// acl:<did>            — ACL entry
+// stats:<mnemonic>     — per-DID counters and coarse series (`stats_tiers`)
+// t5:<mnemonic>:<slot> — fine time-series ring slot (`stats_tiers`)
+// ---------------------------------------------------------------------------
+pub mod key_prefix {
+    pub const SESSION: &str = "session:";
+    pub const REFRESH: &str = "refresh:";
+    pub const DID: &str = "did:";
+    pub const CONTENT: &str = "content:";
+    pub const OWNER: &str = "owner:";
+    pub const WATCHER_SYNC: &str = "watcher_sync:";
+    pub const PASSKEY: &str = "passkey:";
+    pub const ACL: &str = "acl:";
+    pub const STATS: &str = "stats:";
+    pub const TIMESERIES: &str = "ts:";
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// A key-value pair of raw bytes from a prefix scan.
+pub type RawKvPair = (Vec<u8>, Vec<u8>);
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Refuse a write whose stored item, `size` bytes as `backend` counts it,
+/// is over that backend's per-item `limit`.
+///
+/// Backends with a per-item limit (DynamoDB, Firestore, Cosmos DB) check every item
+/// before they send anything, so a refused batch writes nothing. The error is
+/// [`AppError::QuotaExceeded`], whose message reaches the caller: a Trust Task
+/// answers `taskFailed` with it (HTTPS `422`), and an edge or watcher refuses
+/// the sync as `taskFailed` rather than retrying it. Left to the backend, the
+/// same write failed as a store error (`500`) that no retry could fix. The
+/// backend is logged here, not told to the caller.
+#[cfg(any(
+    feature = "store-dynamodb",
+    feature = "store-firestore",
+    feature = "store-cosmosdb"
+))]
+fn check_item_size(backend: &str, size: usize, limit: usize) -> Result<(), AppError> {
+    if size > limit {
+        tracing::warn!(
+            backend,
+            size,
+            limit,
+            "write refused: item over the store's per-item limit"
+        );
+        return Err(AppError::quota(
+            crate::server::error::QuotaKind::Size,
+            format!("item size {size} bytes is over the store's per-item limit of {limit} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Traits
+// ---------------------------------------------------------------------------
+
+/// One page of a prefix walk ([`KeyspaceOps::prefix_page_raw`]).
+#[derive(Debug, Default)]
+pub struct PrefixPage {
+    /// The page's pairs within the prefix.
+    pub rows: Vec<RawKvPair>,
+    /// Where the next page starts, or `None` when the walk is complete.
+    /// Opaque: pass it back unchanged.
+    pub next: Option<Vec<u8>>,
+    /// Whether pages come in key order, so the rows sharing a key prefix
+    /// arrive together. A hash-ordered scan (DynamoDB) pages too, but a
+    /// caller grouping rows must then hold them until the walk completes.
+    pub ordered: bool,
+}
+
+/// Per-keyspace CRUD + prefix scan over raw bytes.
+pub trait KeyspaceOps: Send + Sync {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>>;
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>>;
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>>;
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>>;
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>>;
+
+    /// One page of [`Self::prefix_iter_raw`], so a caller can walk a large
+    /// prefix without holding all of it: the pairs whose key starts with
+    /// `prefix`, from where `cursor` (a previous page's
+    /// [`PrefixPage::next`]) left off, reading about `limit` keys.
+    ///
+    /// A page may be empty while more follow (a scan whose `limit` keys all
+    /// fell outside the prefix); the walk ends when `next` is `None`.
+    ///
+    /// Every backend in this crate pages (the conformance suite checks it),
+    /// so `Ok(None)` comes only from a backend that cannot: a test wrapper,
+    /// or a backend added without paging, which this default stands in for.
+    /// The caller then reads the whole prefix with [`Self::prefix_iter_raw`].
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        let _ = (prefix, cursor, limit);
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Whether [`Self::prefix_page_raw`] walks a prefix in key order with the
+    /// last key of a page as its cursor (fjall, Redis), so a caller may start
+    /// a walk *after any key it names* by passing that key as the cursor. A
+    /// hash-ordered backend (DynamoDB, Cosmos DB, Firestore) answers `false`:
+    /// its cursor is opaque and only a previous page's `next` resumes it.
+    fn pages_in_key_order(&self) -> bool {
+        false
+    }
+
+    /// The keys of [`Self::prefix_iter_raw`], without their values, in no
+    /// particular order. Backends that can list keys without reading values
+    /// (a Redis index, a DynamoDB projection, a Cosmos DB `SELECT c.id`)
+    /// override this; the default reads the pairs and drops the values.
+    fn prefix_keys_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            Ok(self
+                .prefix_iter_raw(prefix)
+                .await?
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect())
+        })
+    }
+
+    /// How many keys start with `prefix`. Redis answers from its index
+    /// (`ZLEXCOUNT`); the default counts [`Self::prefix_keys_raw`].
+    fn prefix_count(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<usize, AppError>> {
+        Box::pin(async move { Ok(self.prefix_keys_raw(prefix).await?.len()) })
+    }
+
+    /// Atomically read a key's value and remove it in one operation.
+    ///
+    /// Returns `Some(value)` if the key existed and was removed; `None` if
+    /// the key was already absent. The semantics are the same as Redis
+    /// `GETDEL` — exactly one concurrent caller observes `Some` for any
+    /// given key, and all others observe `None`.
+    ///
+    /// **Required for refresh-token rotation.** A leaked refresh token must
+    /// not be usable from two replicas simultaneously; this primitive is
+    /// the cross-replica claim the rotation handlers depend on.
+    ///
+    /// Backends are expected to use a native atomic primitive
+    /// (Redis `GETDEL`, DynamoDB `DeleteItem` + `ReturnValues=ALL_OLD`,
+    /// a Cosmos DB `If-Match` delete, a Firestore transaction).
+    /// Single-replica backends (fjall) wrap the non-atomic `get + remove`
+    /// in a process-local mutex.
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>>;
+
+    /// Atomically increment a counter stored under `key` and return its new
+    /// value. A key that does not exist yet starts at 0, so the first call
+    /// returns 1.
+    ///
+    /// **Required for cross-replica lockout counters** — the passkey
+    /// enrolment invite's wrong-claim-code count is the first user. A plain
+    /// `get` + increment + `insert` races across replicas: two of them can
+    /// both read the same count, both compute the same next value, and both
+    /// write it back, silently losing an attempt — the exact bug that would
+    /// let an attacker exceed the intended lockout threshold by spreading
+    /// guesses across replicas.
+    ///
+    /// Every shared backend makes this atomic in the store itself: Redis
+    /// `INCR`, DynamoDB `UpdateItem` with an `ADD` expression, Cosmos DB an
+    /// ETag-conditional create/replace, Firestore a read-write transaction.
+    /// Only fjall — single-process by construction — uses a process-local
+    /// mutex.
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>>;
+
+    /// Atomically write `new` under `key` only if the key currently holds
+    /// exactly `expected` (`None`: the key is absent). Returns whether the
+    /// write happened; `false` means the key held something else, and
+    /// nothing was written.
+    ///
+    /// **Required for state that must move forward once across replicas**
+    /// — a witness's furthest-witnessed mark is the first user. A plain
+    /// `get` + check + `insert` lets two processes sharing a store both pass
+    /// the check against the same old value and both write.
+    ///
+    /// Every shared backend decides the comparison in the store itself:
+    /// Redis a Lua script, DynamoDB a conditional `PutItem`, Cosmos DB a
+    /// create or an `If-Match` replace, Firestore a read-write transaction.
+    /// Only fjall, single-process by construction, uses a process-local
+    /// mutex.
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>>;
+}
+
+/// Atomic multi-key write batch identified by keyspace name.
+///
+/// Every backend applies a committed batch whole or not at all, across
+/// keyspaces: fjall one write batch, Redis one `MULTI`, DynamoDB one
+/// `TransactWriteItems`, Firestore one commit, Cosmos DB one transactional
+/// batch (every keyspace lives in one container and one partition for this).
+/// The bounded ones refuse a batch over their bound before writing anything;
+/// see [`Store::batch`].
+pub trait BatchOps: Send {
+    fn insert_raw(&mut self, keyspace: &str, key: Vec<u8>, value: Vec<u8>);
+    fn remove(&mut self, keyspace: &str, key: Vec<u8>);
+    /// Apply every operation or none. A backend whose transactions are
+    /// bounded (DynamoDB: 100 writes, 4 MB) refuses a batch over its bound
+    /// before writing anything, rather than splitting it.
+    fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>>;
+    /// Apply every operation, in as many store transactions as the backend
+    /// needs: a failure part-way leaves the earlier parts written. Only for
+    /// bulk loads that are safe to re-run, such as a backup restore. The
+    /// default is [`Self::commit`], for backends with no such bound.
+    fn commit_in_parts(self: Box<Self>) -> BoxFuture<'static, Result<(), AppError>> {
+        self.commit()
+    }
+}
+
+/// Factory: create keyspaces, create batches, persist/flush.
+pub trait StorageBackend: Send + Sync {
+    fn keyspace(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError>;
+
+    /// [`Self::keyspace`], with every `get_raw` and `contains_key` seeing
+    /// all writes that committed before it. DynamoDB overrides this; fjall,
+    /// Redis (against a primary) and Firestore already read their latest
+    /// write. Cosmos DB does only if the account's consistency level gives
+    /// it: nothing here asks for more.
+    fn keyspace_consistent(&self, name: &str) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.keyspace(name)
+    }
+
+    /// [`Self::keyspace_consistent`], with `prefix_iter_raw` consistent
+    /// too. DynamoDB overrides this; the other backends' scans already
+    /// read their latest write, with the same Cosmos DB caveat.
+    fn keyspace_consistent_with_scans(
+        &self,
+        name: &str,
+    ) -> Result<(String, Arc<dyn KeyspaceOps>), AppError> {
+        self.keyspace_consistent(name)
+    }
+
+    fn batch(&self) -> Box<dyn BatchOps>;
+    fn persist(&self) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// See [`Store::max_item_bytes`]. `None` (the default) when the backend
+    /// has no per-item limit a caller would reach.
+    fn max_item_bytes(&self) -> Option<usize> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write tracking
+// ---------------------------------------------------------------------------
+
+tokio::task_local! {
+    /// Set once the task running under [`track_writes`] attempts a store write.
+    static WROTE: Cell<bool>;
+}
+
+/// Run `f` and report whether it attempted a store write, through any
+/// keyspace or batch. A write that failed counts too: a backend may have
+/// applied it, or part of a batch, before reporting the failure. Writes made
+/// by tasks `f` spawns are not seen. Box a large `f` (a dispatch) before
+/// passing it: built on the stack and nested in the scope's future, it can
+/// overflow a thread's stack.
+pub async fn track_writes<F: Future>(f: F) -> (F::Output, bool) {
+    WROTE
+        .scope(
+            Cell::new(false),
+            Box::pin(async {
+                let out = f.await;
+                (out, WROTE.with(Cell::get))
+            }),
+        )
+        .await
+}
+
+fn note_write() {
+    let _ = WROTE.try_with(|wrote| wrote.set(true));
+}
+
+// ---------------------------------------------------------------------------
+// Public wrapper types (same API surface as before)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct Store {
+    inner: Arc<dyn StorageBackend>,
+}
+
+#[derive(Clone)]
+pub struct KeyspaceHandle {
+    pub name: String,
+    inner: Arc<dyn KeyspaceOps>,
+    /// The backend this keyspace belongs to, so helpers handed only a
+    /// keyspace can still make a multi-row change atomic ([`Self::batch`]).
+    backend: Arc<dyn StorageBackend>,
+}
+
+/// An atomic write batch that collects operations and commits them in a single call.
+pub struct WriteBatch {
+    inner: Box<dyn BatchOps>,
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// Open a local store, with fjall's own memory tuning (block cache /
+    /// write buffer / journal size — see [`FjallTuning`])
+    /// left at its defaults. Every pre-existing call site uses this.
+    pub async fn open(config: &StoreConfig) -> Result<Self, AppError> {
+        Self::open_with(config, &FjallTuning::default()).await
+    }
+
+    /// [`Self::open`], applying `tuning`'s fjall memory settings. Only the
+    /// real startup paths (did-hosting-control, did-hosting-server,
+    /// webvh-witness, webvh-watcher, and did-hosting-daemon) build a
+    /// non-default [`FjallTuning`] (their loaded
+    /// config file, then an env var override) and call this directly —
+    /// everywhere else keeps calling [`Self::open`], which is this with
+    /// `FjallTuning::default()` (every field unset), so nothing that
+    /// already opened a store needed to change. Backends other than
+    /// `store-fjall` (redis, dynamodb, firestore, cosmosdb) ignore
+    /// `tuning` entirely — these settings are fjall-specific.
+    pub async fn open_with(config: &StoreConfig, tuning: &FjallTuning) -> Result<Self, AppError> {
+        let backend = create_backend(config, tuning).await?;
+        Ok(Self {
+            inner: Arc::from(backend),
+        })
+    }
+
+    /// A store over a backend built by hand, for a test that needs to
+    /// configure the backend in a way [`StoreConfig`] cannot (an emulator).
+    #[cfg(all(test, feature = "cosmosdb-emulator"))]
+    pub(crate) fn from_backend(backend: Box<dyn StorageBackend>) -> Self {
+        Self {
+            inner: Arc::from(backend),
+        }
+    }
+
+    pub fn keyspace(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
+        let (ks_name, ops) = self.inner.keyspace(name)?;
+        Ok(KeyspaceHandle {
+            name: ks_name,
+            inner: ops,
+            backend: self.inner.clone(),
+        })
+    }
+
+    /// [`Self::keyspace`] for code whose reads decide a write: a key read
+    /// through this handle reflects every write committed before the read
+    /// (on Cosmos DB, only as far as the account's consistency level
+    /// allows; see [`StorageBackend::keyspace_consistent`]). Prefix scans
+    /// are not covered; see [`Self::keyspace_consistent_with_scans`]. Costs
+    /// more on DynamoDB (twice the read units), so read-heavy paths keep
+    /// [`Self::keyspace`]: an edge reads DID records through it on every
+    /// resolve.
+    pub fn keyspace_consistent(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
+        let (ks_name, ops) = self.inner.keyspace_consistent(name)?;
+        Ok(KeyspaceHandle {
+            name: ks_name,
+            inner: ops,
+            backend: self.inner.clone(),
+        })
+    }
+
+    /// [`Self::keyspace_consistent`], with prefix scans consistent too. A
+    /// consistent scan costs twice the read units of the whole keyspace on
+    /// DynamoDB, so this is for small keyspaces whose scan decides
+    /// something, such as the domains resolution checks.
+    pub fn keyspace_consistent_with_scans(&self, name: &str) -> Result<KeyspaceHandle, AppError> {
+        let (ks_name, ops) = self.inner.keyspace_consistent_with_scans(name)?;
+        Ok(KeyspaceHandle {
+            name: ks_name,
+            inner: ops,
+            backend: self.inner.clone(),
+        })
+    }
+
+    /// Create a new atomic write batch. It may span keyspaces, and every
+    /// backend commits it whole or not at all. A backend whose transactions
+    /// are bounded refuses a batch over the bound as
+    /// [`AppError::QuotaExceeded`], writing nothing: DynamoDB 100 writes and
+    /// 4 MB, Firestore 500 writes and 10 MB, Cosmos DB 100 writes and 2 MB.
+    /// Nothing a batch reads is isolated from other writers: it is a set of
+    /// writes, not a read-modify-write transaction.
+    pub fn batch(&self) -> WriteBatch {
+        WriteBatch {
+            inner: self.inner.batch(),
+        }
+    }
+
+    pub async fn persist(&self) -> Result<(), AppError> {
+        self.inner.persist().await
+    }
+
+    /// The largest item, key and value bytes together, the backend stores in
+    /// one row; `None` when it has no limit a caller would reach (fjall,
+    /// Redis).
+    /// A write over it is refused as [`AppError::QuotaExceeded`] (DynamoDB,
+    /// Firestore, Cosmos DB), so a caller storing something that grows (a DID
+    /// log) can split it before it gets there. Measured against the backend's
+    /// own encoding: Firestore and Cosmos DB store the value base64-encoded,
+    /// so their figure is about three quarters of their document limit. Keep
+    /// some headroom: a batch carrying the item is bounded too.
+    pub fn max_item_bytes(&self) -> Option<usize> {
+        self.inner.max_item_bytes()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WriteBatch
+// ---------------------------------------------------------------------------
+
+impl WriteBatch {
+    /// Add a serializable insert to the batch.
+    pub fn insert<V: Serialize>(
+        &mut self,
+        ks: &KeyspaceHandle,
+        key: impl Into<Vec<u8>>,
+        value: &V,
+    ) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec(value)?;
+        self.inner.insert_raw(&ks.name, key.into(), bytes);
+        Ok(())
+    }
+
+    /// Add a raw-bytes insert to the batch.
+    pub fn insert_raw(
+        &mut self,
+        ks: &KeyspaceHandle,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) {
+        self.inner.insert_raw(&ks.name, key.into(), value.into());
+    }
+
+    /// Add a remove to the batch.
+    pub fn remove(&mut self, ks: &KeyspaceHandle, key: impl Into<Vec<u8>>) {
+        self.inner.remove(&ks.name, key.into());
+    }
+
+    /// Commit all batched operations atomically. On DynamoDB a batch over
+    /// one transaction's bound (100 writes, 4 MB) is refused as
+    /// [`AppError::QuotaExceeded`] and writes nothing.
+    pub async fn commit(self) -> Result<(), AppError> {
+        note_write();
+        self.inner.commit().await
+    }
+
+    /// Commit all batched operations, **not** atomically: a backend with a
+    /// transaction bound splits the batch, and a failure part-way leaves the
+    /// earlier parts written. Only for bulk loads that are safe to re-run
+    /// (a backup restore); anything that must change together uses
+    /// [`Self::commit`].
+    pub async fn commit_in_parts(self) -> Result<(), AppError> {
+        note_write();
+        self.inner.commit_in_parts().await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KeyspaceHandle
+// ---------------------------------------------------------------------------
+
+impl KeyspaceHandle {
+    /// A new atomic write batch on the store this keyspace belongs to —
+    /// [`Store::batch`] for code that holds only a keyspace handle. The
+    /// batch may span keyspaces like any other.
+    pub fn batch(&self) -> WriteBatch {
+        WriteBatch {
+            inner: self.backend.batch(),
+        }
+    }
+
+    pub async fn insert<V: Serialize>(
+        &self,
+        key: impl Into<Vec<u8>>,
+        value: &V,
+    ) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec(value)?;
+        note_write();
+        self.inner.insert_raw(key.into(), bytes).await
+    }
+
+    pub async fn get<V: DeserializeOwned + Send + 'static>(
+        &self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<Option<V>, AppError> {
+        match self.inner.get_raw(key.into()).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically get-and-remove a key, returning the deserialized value.
+    ///
+    /// Backed by `KeyspaceOps::take_raw_atomic` — exactly one concurrent
+    /// caller observes `Some` for a given key. Suitable for refresh-token
+    /// rotation, single-use enrolment tokens, and any other "consume
+    /// exactly once" pattern across multiple webvh replicas.
+    pub async fn take<V: DeserializeOwned + Send + 'static>(
+        &self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<Option<V>, AppError> {
+        note_write();
+        match self.inner.take_raw_atomic(key.into()).await? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically get-and-remove a key's raw bytes.
+    ///
+    /// See [`Self::take`] for the deserialised version. Use this when the
+    /// stored value is not JSON (e.g. a raw session_id under a refresh-
+    /// token index).
+    pub async fn take_raw(&self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, AppError> {
+        note_write();
+        self.inner.take_raw_atomic(key.into()).await
+    }
+
+    /// Atomically increment a counter and return its new value.
+    ///
+    /// Backed by `KeyspaceOps::incr_raw` — safe across replicas that share a
+    /// store, so a caller relying on the returned count for a lockout
+    /// decision gets the same guarantee `take` gives a single-use token.
+    pub async fn incr_raw(&self, key: impl Into<Vec<u8>>) -> Result<u64, AppError> {
+        note_write();
+        self.inner.incr_raw(key.into()).await
+    }
+
+    /// Atomically replace a key's raw bytes, only if it still holds
+    /// `expected` (`None`: only if it is absent). Returns whether it wrote.
+    ///
+    /// Backed by `KeyspaceOps::compare_and_swap_raw` — safe across replicas
+    /// that share a store: of several callers swapping from the same
+    /// `expected`, at most one sees `true`.
+    pub async fn compare_and_swap_raw(
+        &self,
+        key: impl Into<Vec<u8>>,
+        expected: Option<Vec<u8>>,
+        new: impl Into<Vec<u8>>,
+    ) -> Result<bool, AppError> {
+        note_write();
+        self.inner
+            .compare_and_swap_raw(key.into(), expected, new.into())
+            .await
+    }
+
+    pub async fn remove(&self, key: impl Into<Vec<u8>>) -> Result<(), AppError> {
+        note_write();
+        self.inner.remove(key.into()).await
+    }
+
+    pub async fn insert_raw(
+        &self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<(), AppError> {
+        note_write();
+        self.inner.insert_raw(key.into(), value.into()).await
+    }
+
+    pub async fn get_raw(&self, key: impl Into<Vec<u8>>) -> Result<Option<Vec<u8>>, AppError> {
+        self.inner.get_raw(key.into()).await
+    }
+
+    pub async fn contains_key(&self, key: impl Into<Vec<u8>>) -> Result<bool, AppError> {
+        self.inner.contains_key(key.into()).await
+    }
+
+    /// Iterate all key-value pairs in the keyspace.
+    pub async fn iter_all(&self) -> Result<Vec<RawKvPair>, AppError> {
+        self.prefix_iter_raw(b"").await
+    }
+
+    /// Iterate all key-value pairs whose key starts with `prefix`.
+    pub async fn prefix_iter_raw(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<Vec<RawKvPair>, AppError> {
+        self.inner.prefix_iter_raw(prefix.into()).await
+    }
+
+    /// One page of [`Self::prefix_iter_raw`], from `cursor` (a previous
+    /// page's `next`), or `None` when this backend cannot page (read the
+    /// whole prefix instead). See [`KeyspaceOps::prefix_page_raw`].
+    pub async fn prefix_page_raw(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Option<PrefixPage>, AppError> {
+        self.inner
+            .prefix_page_raw(prefix.into(), cursor, limit)
+            .await
+    }
+
+    /// The keys starting with `prefix`, without their values, in no
+    /// particular order. See [`KeyspaceOps::prefix_keys_raw`].
+    pub async fn prefix_keys_raw(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, AppError> {
+        self.inner.prefix_keys_raw(prefix.into()).await
+    }
+
+    /// How many keys start with `prefix`. See [`KeyspaceOps::prefix_count`].
+    pub async fn prefix_count(&self, prefix: impl Into<Vec<u8>>) -> Result<usize, AppError> {
+        self.inner.prefix_count(prefix.into()).await
+    }
+
+    /// Whether this keyspace pages in key order, so a walk may start after
+    /// any named key. See [`KeyspaceOps::pages_in_key_order`].
+    pub fn pages_in_key_order(&self) -> bool {
+        self.inner.pages_in_key_order()
+    }
+
+    /// Walk the pairs under `prefix` a page of about `page_size` keys at a
+    /// time, so a caller never holds more than one page. See [`PrefixWalk`].
+    pub fn walk(&self, prefix: impl Into<Vec<u8>>, page_size: usize) -> PrefixWalk<'_> {
+        PrefixWalk {
+            ks: self,
+            prefix: prefix.into(),
+            cursor: None,
+            page_size,
+            done: false,
+        }
+    }
+
+    /// [`Self::walk`] starting strictly after the key `after`. Only a
+    /// keyspace that [pages in key order](Self::pages_in_key_order) can
+    /// start mid-prefix; any other walks from the start of the prefix, so
+    /// check first when skipping matters.
+    pub fn walk_after(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+        after: Option<Vec<u8>>,
+        page_size: usize,
+    ) -> PrefixWalk<'_> {
+        let mut walk = self.walk(prefix, page_size);
+        if self.pages_in_key_order() {
+            walk.cursor = after;
+        }
+        walk
+    }
+
+    /// The number of keys in the keyspace (counted without reading values
+    /// where the backend allows).
+    pub async fn approximate_len(&self) -> Result<usize, AppError> {
+        self.prefix_count(b"".to_vec()).await
+    }
+
+    /// Verify integrity of all entries in this keyspace.
+    ///
+    /// Walks the keyspace a page at a time and attempts to parse each JSON
+    /// value. Returns the number of corrupted (unparseable) entries found.
+    /// Corrupted entries are logged as warnings. Memory stays at one page,
+    /// whatever the keyspace holds.
+    pub async fn verify_integrity(&self) -> Result<u64, AppError> {
+        let mut corrupted = 0u64;
+        let mut walk = self.walk(b"".to_vec(), INTEGRITY_PAGE_ROWS);
+        while let Some(rows) = walk.next_page().await? {
+            for (key, value) in rows {
+                if !holds_json(&key) {
+                    continue;
+                }
+                if serde_json::from_slice::<serde::de::IgnoredAny>(&value).is_err() {
+                    let key_str = String::from_utf8_lossy(&key);
+                    tracing::warn!(key = %key_str, "integrity check: corrupted entry (invalid JSON)");
+                    corrupted += 1;
+                }
+            }
+        }
+        Ok(corrupted)
+    }
+}
+
+/// Rows a page of [`KeyspaceHandle::verify_integrity`] reads.
+const INTEGRITY_PAGE_ROWS: usize = 256;
+
+/// Whether a row under `key` stores JSON. Raw-byte rows are skipped by the
+/// integrity check: logs (`content:`, the edge's `hw:` high-water marks) and
+/// reverse indexes whose value is a bare mnemonic (`owner:`, the agent-name
+/// `name:`, the `domain:` index), plus the opaque `refresh:` and `ts:` rows.
+fn holds_json(key: &[u8]) -> bool {
+    const RAW: &[&[u8]] = &[
+        b"content:",
+        b"owner:",
+        b"name:",
+        b"hw:",
+        b"refresh:",
+        b"ts:",
+        b"domain:",
+    ];
+    !RAW.iter().any(|p| key.starts_with(p))
+}
+
+/// A page-at-a-time walk over a prefix ([`KeyspaceHandle::walk`]).
+///
+/// Each [`Self::next_page`] reads one [`KeyspaceHandle::prefix_page_raw`]
+/// page; on a backend that cannot page it reads the whole prefix once, as
+/// [`KeyspaceHandle::prefix_iter_raw`] would. A page may be empty while more
+/// follow; the walk ends when `next_page` answers `None`.
+pub struct PrefixWalk<'a> {
+    ks: &'a KeyspaceHandle,
+    prefix: Vec<u8>,
+    cursor: Option<Vec<u8>>,
+    page_size: usize,
+    done: bool,
+}
+
+impl PrefixWalk<'_> {
+    /// The next page's pairs, or `None` once the walk is complete.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<RawKvPair>>, AppError> {
+        if self.done {
+            return Ok(None);
+        }
+        match self
+            .ks
+            .prefix_page_raw(self.prefix.clone(), self.cursor.take(), self.page_size)
+            .await?
+        {
+            Some(page) => {
+                self.cursor = page.next;
+                self.done = self.cursor.is_none();
+                Ok(Some(page.rows))
+            }
+            None => {
+                self.done = true;
+                Ok(Some(self.ks.prefix_iter_raw(self.prefix.clone()).await?))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend factory
+// ---------------------------------------------------------------------------
+
+#[allow(unused_variables)]
+async fn create_backend(
+    config: &StoreConfig,
+    tuning: &FjallTuning,
+) -> Result<Box<dyn StorageBackend>, AppError> {
+    #[cfg(feature = "store-fjall")]
+    {
+        return fjall::FjallBackend::open_with(config, tuning);
+    }
+
+    #[cfg(feature = "store-redis")]
+    {
+        return redis::RedisBackend::open(config).await;
+    }
+
+    #[cfg(feature = "store-dynamodb")]
+    {
+        return dynamodb::DynamoDbBackend::open(config).await;
+    }
+
+    #[cfg(feature = "store-firestore")]
+    {
+        return firestore::FirestoreBackend::open(config).await;
+    }
+
+    #[cfg(feature = "store-cosmosdb")]
+    {
+        return cosmosdb::CosmosDbBackend::open(config).await;
+    }
+
+    // build.rs enforces exactly one feature, so this is unreachable
+    #[allow(unreachable_code)]
+    Err(AppError::Config(
+        "no storage backend compiled — enable a store-* feature".into(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Test support: a keyspace whose writes start failing
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceHandle {
+    /// Wrap this keyspace so that once `allowed` writes have succeeded,
+    /// every further write fails with a store error, as a throttled store
+    /// would. Reads are untouched. Raise `allowed` to let writes through
+    /// again.
+    pub fn failing_writes_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, false, injected_write_failure)
+    }
+
+    /// Like [`Self::failing_writes_after`], but a failing write is refused as
+    /// a throttled store would ([`AppError::store_throttled`]).
+    pub fn throttled_writes_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, false, AppError::store_throttled)
+    }
+
+    /// Like [`Self::failing_writes_after`], but a failing write is applied
+    /// before it reports failure, as when a store times out after the write
+    /// landed.
+    pub fn failing_acks_after(&self, allowed: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        self.wrap_failing(allowed, true, injected_write_failure)
+    }
+
+    /// Wrap this keyspace so every read fails as a throttled store would
+    /// ([`AppError::store_throttled`]). Writes are untouched.
+    pub fn throttled_reads(&self) -> Self {
+        self.failing_reads_after(0, AppError::store_throttled)
+    }
+
+    /// Wrap this keyspace so that once `allowed` reads have succeeded, every
+    /// further read fails with `error()`. Writes are untouched.
+    pub fn failing_reads_after(&self, allowed: usize, error: fn() -> AppError) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(FailingReads {
+                inner: self.inner.clone(),
+                allowed: std::sync::atomic::AtomicUsize::new(allowed),
+                error,
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+
+    fn wrap_failing(
+        &self,
+        allowed: Arc<std::sync::atomic::AtomicUsize>,
+        apply: bool,
+        error: fn() -> AppError,
+    ) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(FailingWrites {
+                inner: self.inner.clone(),
+                allowed,
+                apply,
+                error,
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct FailingWrites {
+    inner: Arc<dyn KeyspaceOps>,
+    allowed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Apply a failing write before reporting the failure.
+    apply: bool,
+    error: fn() -> AppError,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn injected_write_failure() -> AppError {
+    AppError::Store("injected write failure".into())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FailingWrites {
+    fn take_write(&self) -> Result<(), AppError> {
+        use std::sync::atomic::Ordering;
+        self.allowed
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| (self.error)())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for FailingWrites {
+    fn pages_in_key_order(&self) -> bool {
+        self.inner.pages_in_key_order()
+    }
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            match self.take_write() {
+                Ok(()) => self.inner.insert_raw(key, value).await,
+                Err(e) => {
+                    if self.apply {
+                        self.inner.insert_raw(key, value).await?;
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.get_raw(key)
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.remove(key).await
+        })
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.contains_key(key)
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        self.inner.prefix_iter_raw(prefix)
+    }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        self.inner.prefix_page_raw(prefix, cursor, limit)
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.take_raw_atomic(key).await
+        })
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.incr_raw(key).await
+        })
+    }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            self.take_write()?;
+            self.inner.compare_and_swap_raw(key, expected, new).await
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct FailingReads {
+    inner: Arc<dyn KeyspaceOps>,
+    allowed: std::sync::atomic::AtomicUsize,
+    error: fn() -> AppError,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FailingReads {
+    fn take_read(&self) -> Result<(), AppError> {
+        use std::sync::atomic::Ordering;
+        self.allowed
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| (self.error)())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for FailingReads {
+    fn pages_in_key_order(&self) -> bool {
+        self.inner.pages_in_key_order()
+    }
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.insert_raw(key, value)
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.get_raw(key).await
+        })
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.remove(key)
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.contains_key(key).await
+        })
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.prefix_iter_raw(prefix).await
+        })
+    }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            self.take_read()?;
+            self.inner.prefix_page_raw(prefix, cursor, limit).await
+        })
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.take_raw_atomic(key)
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        self.inner.incr_raw(key)
+    }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.compare_and_swap_raw(key, expected, new)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test support: a keyspace that cannot list a prefix in key order
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceHandle {
+    /// Wrap this keyspace so [`Self::prefix_page_raw`] answers `None`, as a
+    /// backend whose listing is a hash-ordered scan does. Everything else is
+    /// untouched.
+    pub fn without_ordered_pages(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(Unordered {
+                inner: self.inner.clone(),
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct Unordered {
+    inner: Arc<dyn KeyspaceOps>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for Unordered {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.insert_raw(key, value)
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.get_raw(key)
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.remove(key)
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.contains_key(key)
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        self.inner.prefix_iter_raw(prefix)
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.take_raw_atomic(key)
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        self.inner.incr_raw(key)
+    }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.compare_and_swap_raw(key, expected, new)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test support: a keyspace that pages like a hash-ordered scan
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceHandle {
+    /// Wrap this keyspace so [`Self::prefix_page_raw`] pages the way
+    /// DynamoDB's `Scan` does: the whole keyspace in hash order, `limit`
+    /// keys evaluated a page and then filtered to the prefix (so a page can
+    /// be empty while more follow), the cursor the last key evaluated, and
+    /// `ordered: false`. Everything else is untouched.
+    pub fn with_hash_ordered_pages(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            inner: Arc::new(HashOrdered {
+                inner: self.inner.clone(),
+            }),
+            backend: self.backend.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct HashOrdered {
+    inner: Arc<dyn KeyspaceOps>,
+}
+
+/// FNV-1a: a stable, well-mixed order unrelated to key order.
+#[cfg(any(test, feature = "test-support"))]
+fn scan_order(key: &[u8]) -> (u64, Vec<u8>) {
+    let h = key.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    (h, key.to_vec())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl KeyspaceOps for HashOrdered {
+    fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.insert_raw(key, value)
+    }
+    fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.get_raw(key)
+    }
+    fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
+        self.inner.remove(key)
+    }
+    fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.contains_key(key)
+    }
+    fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
+        self.inner.prefix_iter_raw(prefix)
+    }
+    fn prefix_page_raw(
+        &self,
+        prefix: Vec<u8>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Option<PrefixPage>, AppError>> {
+        Box::pin(async move {
+            let mut all = self.inner.prefix_iter_raw(Vec::new()).await?;
+            all.sort_by_cached_key(|(k, _)| scan_order(k));
+            let start = cursor.map(|c| scan_order(&c));
+            let mut evaluated = all
+                .into_iter()
+                .filter(|(k, _)| start.as_ref().is_none_or(|s| scan_order(k) > *s))
+                .peekable();
+            let mut page = PrefixPage::default();
+            let mut last = None;
+            for (k, v) in evaluated.by_ref().take(limit.max(1)) {
+                last = Some(k.clone());
+                if k.starts_with(&prefix) {
+                    page.rows.push((k, v));
+                }
+            }
+            if evaluated.peek().is_some() {
+                page.next = last;
+            }
+            Ok(Some(page))
+        })
+    }
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        self.inner.take_raw_atomic(key)
+    }
+    fn incr_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<u64, AppError>> {
+        self.inner.incr_raw(key)
+    }
+    fn compare_and_swap_raw(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Vec<u8>>,
+        new: Vec<u8>,
+    ) -> BoxFuture<'_, Result<bool, AppError>> {
+        self.inner.compare_and_swap_raw(key, expected, new)
+    }
+}

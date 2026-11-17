@@ -1,0 +1,624 @@
+//! The administrator's operational verbs on the signed-document spine: the
+//! trust-registry reconciler, the audit log, the runtime configuration, admin
+//! onboarding invites, and the auth service's sessions.
+//!
+//! | task | signed by | authority (the signer's ACL row, read now) |
+//! |---|---|---|
+//! | `vtc/registry/diagnostics/0.1` | an administrator | `Admin` |
+//! | `vtc/registry/sync-jobs/{list,retry}/0.2`, `vtc/registry/sync-jobs/discard/0.1` | an administrator | `Admin` |
+//! | `vtc/registry/records/list/0.2` | an administrator | `Admin` |
+//! | `audit/list/0.2`, `audit/verify/0.1` | an unrestricted administrator | `Admin`, no context scope |
+//! | `config/show/0.1` | an administrator | `Admin` |
+//! | `config/{patch,reload,restart}/0.1` | an unrestricted administrator | `Admin`, no context scope: the configuration is the whole community's, and it holds the unrestricted-admin consent threshold |
+//! | `vtc/admin/invites/list/0.2`, `vtc/admin/invites/revoke/0.1` | an unrestricted administrator | `Admin`, no context scope: an admin invite confers unrestricted authority, so only an unrestricted admin manages them |
+//! | `vtc/admin/invites/create/0.2` | an unrestricted administrator | `Admin`, no context scope; writing the invitee's unrestricted entry — or issuing a passkey invite, which confers one at its claim — also takes the inviter's passkey gesture bound to this invite, and another unrestricted admin's consent |
+//! | `auth/sessions/list/0.1` | any member | their own sessions, and those of every subject whose access they could withdraw |
+//! | `auth/revoke-session/0.2` | any member | the same rule |
+//!
+//! Every one arrives here the same way over TSP, DIDComm or HTTPS. None of
+//! them has a REST route.
+//!
+//! # Where the authority comes from
+//!
+//! The bearer routes these replaced took the caller's session: `AdminAuth`,
+//! `SuperAdminAuth`, `ManageAuth`. A document has no session, so each arm reads
+//! the **verified signer's** ACL row at execution time
+//! ([`super::admin_signer`], which also honours a console-key delegation) and
+//! asks the same question the extractor asked. Where a route read a session's
+//! step-up (the admin invite that writes an unrestricted entry), the gesture is
+//! instead bound to this one document ([`crate::acl::bound_step_up`]).
+
+use super::routing::{Routes, on};
+use serde_json::Value;
+use trust_tasks_rs::{Payload, RejectReason, StandardCode, TrustTask, TrustTaskCode};
+use vti_specs::audit::{list::v0_2 as audit_list, verify::v0_1 as audit_verify};
+use vti_specs::auth::revoke_session::v0_2 as revoke_session;
+use vti_specs::auth::sessions::list::v0_1 as sessions_list;
+use vti_specs::config::{
+    patch::v0_1 as config_patch, reload::v0_1 as config_reload, restart::v0_1 as config_restart,
+    show::v0_1 as config_show,
+};
+use vti_specs::vtc::admin::invites::{
+    create::v0_2 as invite_create, list::v0_2 as invite_list, revoke::v0_1 as invite_revoke,
+};
+use vti_specs::vtc::registry::{
+    diagnostics::v0_1 as diagnostics, records::list::v0_2 as records_list,
+    sync_jobs::discard::v0_1 as sync_discard, sync_jobs::list::v0_2 as sync_list,
+    sync_jobs::retry::v0_2 as sync_retry,
+};
+
+use super::helpers::{
+    TrustTaskOutcome, app_error_to_reject, reject_with, reject_with_code, success_response,
+    task_error_to_reject,
+};
+use super::{JoinAuthCtx, admin_signer, capable_signer, parse_spec_payload};
+use crate::acl::Capability;
+use crate::error::AppError;
+use crate::server::AppState;
+
+#[cfg(test)]
+pub(crate) const SYNC_JOBS_LIST_TYPE: &str = <sync_list::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const RECORDS_LIST_TYPE: &str = <records_list::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const INVITES_LIST_TYPE: &str = <invite_list::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const DIAGNOSTICS_TYPE: &str = <diagnostics::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const CONFIG_SHOW_TYPE: &str = <config_show::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const CONFIG_PATCH_TYPE: &str = <config_patch::Payload as Payload>::TYPE_URI;
+
+#[cfg(test)]
+pub(crate) const AUDIT_VERIFY_TYPE: &str = <audit_verify::Payload as Payload>::TYPE_URI;
+
+pub(crate) const INVITES_CREATE_TYPE: &str = <invite_create::Payload as Payload>::TYPE_URI;
+
+/// Tasks whose response carries a bearer secret: an admin invite's claim code
+/// and install URL. The duplicate-execution record keeps no copy of these, so
+/// the secret does not sit in `accepted_ids` for the acceptance window.
+pub(crate) const SECRET_RESPONSES: &[&str] = &[INVITES_CREATE_TYPE];
+
+/// Register every task this family serves (#2579).
+pub(super) fn register(routes: Routes) -> Routes {
+    let routes =
+        on!(routes, diagnostics::Payload => |state, ctx, doc| handle_diagnostics(state, ctx, doc));
+    let routes =
+        on!(routes, sync_list::Payload => |state, ctx, doc| handle_sync_jobs_list(state, ctx, doc));
+    let routes = on!(routes, sync_retry::Payload => |state, ctx, doc| handle_sync_jobs_retry(state, ctx, doc));
+    let routes = on!(routes, sync_discard::Payload => |state, ctx, doc| handle_sync_jobs_discard(state, ctx, doc));
+    let routes = on!(routes, records_list::Payload => |state, ctx, doc| handle_records_list(state, ctx, doc));
+    let routes =
+        on!(routes, audit_list::Payload => |state, ctx, doc| handle_audit_list(state, ctx, doc));
+    let routes = on!(routes, audit_verify::Payload => |state, ctx, doc| handle_audit_verify(state, ctx, doc));
+    let routes =
+        on!(routes, config_show::Payload => |state, ctx, doc| handle_config_show(state, ctx, doc));
+    let routes = on!(routes, config_patch::Payload => |state, ctx, doc| handle_config_patch(state, ctx, doc));
+    let routes = on!(routes, config_reload::Payload => |state, ctx, doc| handle_config_reload(state, ctx, doc));
+    let routes = on!(routes, config_restart::Payload => |state, ctx, doc| handle_config_restart(state, ctx, doc));
+    let routes =
+        on!(routes, invite_list::Payload => |state, ctx, doc| handle_invites_list(state, ctx, doc));
+    let routes = on!(routes, invite_create::Payload => |state, ctx, doc| handle_invites_create(state, ctx, doc));
+    let routes = on!(routes, invite_revoke::Payload => |state, ctx, doc| handle_invites_revoke(state, ctx, doc));
+    let routes = on!(routes, sessions_list::Payload => |state, ctx, doc| handle_sessions_list(state, ctx, doc));
+    on!(routes, revoke_session::Payload => |state, ctx, doc| handle_revoke_session(state, ctx, doc))
+}
+
+/// The signer, holding `cap` (`vtc-admin-roles.md` §4 "Gates"), and its
+/// payload validated against the published schema.
+async fn capable_with<P>(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: &TrustTask<Value>,
+    cap: Capability,
+) -> Result<(crate::acl::AdminActor, P), TrustTaskOutcome>
+where
+    P: trust_tasks_rs::validate::ValidatedPayload + serde::de::DeserializeOwned,
+{
+    let actor = capable_signer(state, ctx, doc, cap, None).await?;
+    let payload = parse_spec_payload::<P>(doc)?;
+    Ok((actor, payload))
+}
+
+/// Who is asking about sessions: an administrator exactly as
+/// [`admin_signer`] resolves one, or any other signer holding a live ACL row,
+/// who may manage only their own sessions. A signer the community holds no
+/// entry for is refused, as the bearer session it would need was.
+///
+/// The fallback admits only a row that may act as a member: not a suspended
+/// one (a suspended subject may read the action list and nothing else,
+/// `vtc-action-list.md` §8.2, which [`admin_signer`] already answers), and not
+/// an `application` entry, which is never a membership (VTI-ACL-037).
+pub(super) async fn member_signer(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: &TrustTask<Value>,
+) -> Result<crate::acl::MemberSigner, TrustTaskOutcome> {
+    let Some(signer) = ctx.verified_signer.clone() else {
+        return Err(reject_with(doc, RejectReason::ProofRequired));
+    };
+    if let Ok(admin) = admin_signer(state, ctx, doc).await {
+        return Ok(crate::acl::MemberSigner { did: admin.did });
+    }
+    let entry = crate::acl::get_acl_entry(&state.acl_ks, &signer)
+        .await
+        .map_err(|e| app_error_to_reject(doc, &e))?;
+    match entry {
+        // Refused with what holds it, as `admin_signer` refuses a suspended
+        // administrator, not as a stranger.
+        Some(crate::acl::VtcAclEntry {
+            suspension: Some(s),
+            ..
+        }) => Err(app_error_to_reject(doc, &s.refusal(&signer))),
+        Some(entry)
+            if !entry.is_expired(crate::auth::session::now_epoch())
+                && !entry.is_suspended()
+                && !entry.is_application() =>
+        {
+            Ok(crate::acl::MemberSigner { did: signer })
+        }
+        _ => Err(app_error_to_reject(
+            doc,
+            &AppError::Forbidden("the signer holds no entry in this community".into()),
+        )),
+    }
+}
+
+// ─── the trust-registry reconciler ───────────────────────────────────────
+
+async fn handle_diagnostics(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(reject) =
+        capable_with::<diagnostics::Payload>(state, ctx, &doc, Capability::RegistryAdmin).await
+    {
+        return reject;
+    }
+    match crate::routes::health::diagnostics(state).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_sync_jobs_list(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (_, payload) =
+        match capable_with::<sync_list::Payload>(state, ctx, &doc, Capability::RegistryAdmin).await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    match crate::registry::admin::sync_jobs_list(state, payload).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_sync_jobs_retry(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, payload) = match capable_with::<sync_retry::Payload>(
+        state,
+        ctx,
+        &doc,
+        Capability::RegistryAdmin,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    match crate::registry::admin::sync_jobs_retry(state, &actor.did, payload).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_sync_jobs_discard(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, payload) =
+        match capable_with::<sync_discard::Payload>(state, ctx, &doc, Capability::RegistryAdmin)
+            .await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    match crate::registry::admin::sync_jobs_discard(state, &actor.did, payload).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_records_list(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (_, payload) =
+        match capable_with::<records_list::Payload>(state, ctx, &doc, Capability::RegistryAdmin)
+            .await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    match crate::registry::admin::records_list(state, payload).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+// ─── the audit log ───────────────────────────────────────────────────────
+
+/// `audit/list/0.2`. Unrestricted administrators only: the envelopes carry
+/// plaintext actor and target DIDs, the audit keyspace's own tier.
+async fn handle_audit_list(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, query) =
+        match capable_with::<audit_list::Payload>(state, ctx, &doc, Capability::AuditRead).await {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    match crate::audit_ops::list_audit(state, &actor.did, query).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_audit_verify(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, _) = match capable_with::<audit_verify::Payload>(
+        state,
+        ctx,
+        &doc,
+        Capability::AuditRead,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    match crate::audit_ops::verify_audit_chain_inner(state, &actor.did).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+// ─── the runtime configuration ───────────────────────────────────────────
+
+async fn handle_config_show(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (_, payload) =
+        match capable_with::<config_show::Payload>(state, ctx, &doc, Capability::ConfigAdmin).await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    let keys: Option<Vec<String>> = payload
+        .keys
+        .map(|keys| keys.into_iter().map(|k| k.to_string()).collect());
+    match crate::community::ops::config::get_config(state, keys.as_deref()).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_config_patch(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, payload) = match capable_with::<config_patch::Payload>(
+        state,
+        ctx,
+        &doc,
+        Capability::ConfigAdmin,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let request = crate::community::ops::config::PatchRequest {
+        overrides: payload.overrides.into_iter().collect(),
+    };
+    // VTI-CMP-090: any change to the trusted-witness list takes the gesture
+    // and the consent of the other holders of `vtc.config.admin`.
+    if let Err(refusal) =
+        super::acl_tasks::settle_witness_list_gate(state, &actor, &doc, &request.overrides, "")
+            .await
+    {
+        return refusal;
+    }
+    // VTI-APV-020: lowering the consent threshold takes the gesture and the
+    // consent of the threshold as it stands. Raising it does not.
+    match crate::community::ops::config::lowered_threshold(state, &request.overrides).await {
+        Ok(None) => {}
+        Ok(Some((from, to))) => {
+            if let Err(refusal) = super::acl_tasks::settle_consent_gate(
+                state,
+                &actor,
+                &doc,
+                crate::acl::admin_consent::Act::LowerThreshold,
+                crate::config_store::UNRESTRICTED_ADMIN_CONSENT_THRESHOLD,
+                &format!("Lower the unrestricted-admin consent threshold from {from} to {to}"),
+                &format!(
+                    "Lower the number of administrators who must consent to a new \
+                     unrestricted administrator from {from} to {to}"
+                ),
+            )
+            .await
+            {
+                return refusal;
+            }
+        }
+        Err(e) => return app_error_to_reject(&doc, &e),
+    }
+    match crate::community::ops::config::patch_config(state, &actor.did, request).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_config_reload(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, _) =
+        match capable_with::<config_reload::Payload>(state, ctx, &doc, Capability::ConfigAdmin)
+            .await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    match crate::community::ops::config::reload_config(state, &actor.did).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_config_restart(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, _) =
+        match capable_with::<config_restart::Payload>(state, ctx, &doc, Capability::ConfigAdmin)
+            .await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    match crate::community::ops::config::restart_config(state, &actor.did).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+// ─── admin onboarding invites ────────────────────────────────────────────
+
+async fn handle_invites_list(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(reject) =
+        capable_with::<invite_list::Payload>(state, ctx, &doc, Capability::RolesAssign).await
+    {
+        return reject;
+    }
+    match crate::install::ops::invites::list_invites(state).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+/// `vtc/admin/invites/create/0.2`. Every check that decides the invite runs
+/// first ([`crate::install::ops::invites::check_invite`]). A wallet invite for
+/// a DID the community holds no entry for writes an **unrestricted** admin
+/// entry, and a passkey invite (no `did`) confers one when it is claimed, so
+/// either costs what an unrestricted `acl/grant` costs on this door: the
+/// inviter's passkey gesture bound to this document, then another
+/// unrestricted admin's consent. Without the gesture the answer is
+/// `permissionDenied` with the ceremony inline as `details.stepUpRequest`, and
+/// the identical document succeeds once it is recorded.
+async fn handle_invites_create(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use crate::acl::admin_consent::{self, Operation, SignedGate};
+
+    // The schema bounds `ttlSeconds` at 24 hours as well, and the task
+    // declares its own code for exceeding it; answer with the code rather
+    // than the schema's generic refusal, as the operation does.
+    // The authority check still comes first: a stranger learns nothing.
+    if doc.payload["ttlSeconds"]
+        .as_u64()
+        .is_some_and(|ttl| ttl > crate::install::ops::invites::MAX_TTL_SECONDS)
+    {
+        if let Err(reject) = capable_signer(state, ctx, &doc, Capability::RolesAssign, None).await {
+            return reject;
+        }
+        return task_error_to_reject(
+            &doc,
+            &crate::error::TaskError::declared(
+                crate::install::ops::invites::CREATE_INVITE_ERR_TTL_TOO_LONG,
+                AppError::Validation(format!(
+                    "ttl_seconds must be between 1 and {}",
+                    crate::install::ops::invites::MAX_TTL_SECONDS
+                )),
+            ),
+        );
+    }
+    let (actor, request) =
+        match capable_with::<invite_create::Payload>(state, ctx, &doc, Capability::RolesAssign)
+            .await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    let plan = match crate::install::ops::invites::check_invite(state, &actor, &request).await {
+        Ok(p) => p,
+        Err(e) => return task_error_to_reject(&doc, &e),
+    };
+    if plan.grants_admin {
+        let type_uri = doc.type_uri.to_string();
+        // What a community administrator holds that confers authority: what
+        // the inviter's fellow holders must approve (VTI-APV-018).
+        let stake = crate::acl::AdminAuthority::community_admin().conferring();
+        // A passkey invitation always grants (create 0.2 item 4), for a DID
+        // that does not exist until it is claimed.
+        let (subject, reason, summary) = match request.did.as_ref().map(|d| d.as_str()) {
+            Some(did) => (
+                did,
+                format!("Invite {did} to become a community administrator of this community"),
+                crate::acl::ops::unrestricted_grant_summary(did),
+            ),
+            None => (
+                crate::install::ops::invites::PASSKEY_INVITATION_SUBJECT,
+                "Invite a new community administrator, who will sign in with a passkey".to_string(),
+                "Invite a new unrestricted administrator by passkey: whoever claims the \
+                 invitation's install URL and claim code becomes one, under their passkey's own \
+                 DID"
+                .to_string(),
+            ),
+        };
+        let gate = admin_consent::gesture_then_consent(
+            state,
+            &actor.did,
+            subject,
+            &stake,
+            Operation {
+                type_uri: &type_uri,
+                payload: &doc.payload,
+            },
+            &reason,
+            &summary,
+        )
+        .await;
+        let ready = match gate {
+            Ok(SignedGate::Ready(ready)) => ready,
+            Ok(SignedGate::StepUpRequired(request)) => {
+                return reject_with_code(
+                    &doc,
+                    TrustTaskCode::Standard(StandardCode::PermissionDenied),
+                    "a passkey gesture bound to this invite is required",
+                    Some(crate::acl::bound_step_up::refusal_details(&request)),
+                );
+            }
+            Err(e) => return app_error_to_reject(&doc, &e),
+        };
+        if let Err(e) = ready.spend(state).await {
+            return app_error_to_reject(&doc, &e);
+        }
+    }
+    match crate::install::ops::invites::commit_invite(state, &actor, request, plan).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => task_error_to_reject(&doc, &e),
+    }
+}
+
+async fn handle_invites_revoke(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let (actor, payload) =
+        match capable_with::<invite_revoke::Payload>(state, ctx, &doc, Capability::RolesAssign)
+            .await
+        {
+            Ok(p) => p,
+            Err(reject) => return reject,
+        };
+    match crate::install::ops::invites::revoke_invite(state, &actor.did, &payload.jti).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => task_error_to_reject(&doc, &e),
+    }
+}
+
+// ─── sessions ────────────────────────────────────────────────────────────
+
+/// `auth/sessions/list/0.1` — `{ sessions }`, the live sessions the signer may
+/// see ([`crate::routes::auth::list_sessions_for`]).
+async fn handle_sessions_list(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let actor = match member_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    if let Err(reject) = parse_spec_payload::<sessions_list::Payload>(&doc) {
+        return reject;
+    }
+    match crate::routes::auth::list_sessions_for(state, &actor.did).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}
+
+/// `auth/revoke-session/0.2` — exactly one of `sessionId`, `all: true` or
+/// `subject`. `all: false` targets nothing and is `malformedRequest`
+/// (consumer item 1); `all: true` is `subject` naming the producer.
+async fn handle_revoke_session(
+    state: &AppState,
+    ctx: &JoinAuthCtx,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use crate::routes::auth::RevokeTarget;
+
+    let actor = match member_signer(state, ctx, &doc).await {
+        Ok(a) => a,
+        Err(reject) => return reject,
+    };
+    let payload: revoke_session::Payload = match parse_spec_payload(&doc) {
+        Ok(p) => p,
+        Err(reject) => return reject,
+    };
+    let malformed = |reason: &str| {
+        reject_with(
+            &doc,
+            RejectReason::MalformedRequest {
+                reason: reason.to_string(),
+            },
+        )
+    };
+    let target = match (&payload.session_id, payload.all, &payload.subject) {
+        (Some(id), None, None) => RevokeTarget::Session(id.to_string()),
+        (None, Some(true), None) => RevokeTarget::Subject(actor.did.clone()),
+        (None, None, Some(subject)) => RevokeTarget::Subject(subject.to_string()),
+        (None, Some(false), None) => return malformed("`all: false` targets nothing"),
+        _ => return malformed("name exactly one of `sessionId`, `all: true` or `subject`"),
+    };
+    let reason = payload.reason.map(|r| r.to_string());
+    match crate::routes::auth::revoke_sessions_task(state, &actor.did, target, reason).await {
+        Ok(response) => success_response(&doc, response),
+        Err(e) => app_error_to_reject(&doc, &e),
+    }
+}

@@ -1,0 +1,448 @@
+import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import { Acl } from "@/plugins/acl";
+import {
+  mockFetch,
+  renderWithProviders,
+  sentPayloads,
+  taskRoute,
+} from "@/test/render";
+import { formatDateTime } from "@/lib/format";
+
+// The grant is a signed document; the stand-in sends it unsigned so the table
+// below answers it without a console key.
+vi.mock("@/lib/api", async (original) => ({
+  ...(await original<typeof import("@/lib/api")>()),
+  postSignedRead: (await import("@/test/signed-read")).unsignedRead,
+  postSignedTrustTask: (await import("@/test/signed-read")).unsignedTask,
+}));
+vi.mock("@/lib/signed-act", async (original) => ({
+  ...(await original<typeof import("@/lib/signed-act")>()),
+  postSignedWithStepUp: (await import("@/test/signed-read")).unsignedTask,
+}));
+
+const GRANT = "https://trusttasks.org/spec/acl/grant/0.2";
+const LIST = "https://trusttasks.org/spec/acl/list/0.3";
+
+// The payload schema types `label` and `expiresAt` as strings, so a blank
+// optional field must be absent from the request, never `null` (a 400).
+describe("New ACL entry — blank optional fields", () => {
+  it("omits label and expiresAt rather than sending null", async () => {
+    const requests = mockFetch([
+      taskRoute(LIST, { entries: [], truncated: false }),
+      taskRoute(GRANT, {
+        entry: {
+          subject: "did:example:test",
+          role: "member",
+          act: { scope: "none" },
+          keys: { scope: "none" },
+          capabilities: { scope: "none" },
+          approve: { scope: "none" },
+        },
+      }),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl", path: "/acl" });
+
+    fireEvent.click(await screen.findByRole("button", { name: /add entry/i }));
+    const did = await screen.findByPlaceholderText("did:key:z6Mk…");
+    fireEvent.change(did, { target: { value: "did:example:test" } });
+    fireEvent.click(screen.getByRole("button", { name: /create entry/i }));
+
+    await waitFor(() => expect(sentPayloads(requests, GRANT)).toHaveLength(1));
+    const payload = (
+      sentPayloads(requests, GRANT) as { entry: Record<string, unknown> }[]
+    )[0]!;
+    expect(payload.entry).toEqual({
+      subject: "did:example:test",
+      role: "member",
+      act: { scope: "none" },
+      keys: { scope: "none" },
+      capabilities: { scope: "none" },
+      approve: { scope: "none" },
+    });
+    expect("label" in payload.entry).toBe(false);
+    expect("expiresAt" in payload.entry).toBe(false);
+  });
+});
+
+
+// The Access-control page names an entry's administrative role and what it
+// administers — "everything" only for a community administrator with its full
+// ceiling (#746) — and Add entry grants a role narrowed to the capabilities
+// ticked, with a resource where one is given.
+describe("Access control — roles and capabilities", () => {
+  const row = (subject: string, role: string, capabilities: unknown, act = "all") => ({
+    subject,
+    role,
+    act: { scope: act },
+    keys: { scope: "none" },
+    capabilities,
+    approve: { scope: "none" },
+    ext: { "org.openvtc": { communityRole: role === "community-admin" ? "admin" : "member" } },
+  });
+
+  it("shows everything only for a full-ceiling community administrator", async () => {
+    mockFetch([
+      taskRoute(LIST, {
+        entries: [
+          row("did:example:ca", "community-admin", { scope: "ceiling" }),
+          row("did:example:mem", "member", { scope: "none" }, "none"),
+          row("did:example:rm", "repo-manager", {
+            scope: "listed",
+            grants: [{ capability: "git.repo.manage", resource: "git-ns:github.com/acme" }],
+          }),
+        ],
+        truncated: false,
+      }),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl", path: "/acl" });
+    const cells = await screen.findAllByTestId("administers");
+    expect(cells.map((c) => c.textContent)).toEqual([
+      "everything",
+      "nothing",
+      "git.repo.manage@git-ns:github.com/acme",
+    ]);
+    expect(screen.queryByText("Contexts")).toBeNull();
+  });
+
+  it("counts the entries in the header and narrows them with the search", async () => {
+    mockFetch([
+      taskRoute(LIST, {
+        entries: [
+          { ...row("did:example:ca", "community-admin", { scope: "ceiling" }), label: "Ops lead" },
+          row("did:example:mem", "member", { scope: "none" }, "none"),
+          row("did:example:rm", "repo-manager", { scope: "ceiling" }),
+        ],
+        truncated: false,
+      }),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl", path: "/acl" });
+    await screen.findAllByTestId("administers");
+    expect(screen.getByLabelText("3 entries").textContent).toBe("3");
+    // The entry column: label over DID.
+    const ops = screen.getByText("Ops lead").closest("td")!;
+    expect(ops.textContent).toContain("did:example:ca");
+
+    const search = screen.getByRole("searchbox", { name: "Search" });
+    fireEvent.change(search, { target: { value: "repo" } });
+    expect(screen.getAllByTestId("administers")).toHaveLength(1);
+    fireEvent.change(search, { target: { value: "ops" } });
+    expect(screen.getAllByTestId("administers")).toHaveLength(1);
+    fireEvent.change(search, { target: { value: "nobody-here" } });
+    expect(screen.queryAllByTestId("administers")).toHaveLength(0);
+    expect(screen.getByText("No entries match this search")).toBeTruthy();
+  });
+
+  it("grants an administrative role narrowed to a qualified capability", async () => {
+    const requests = mockFetch([
+      taskRoute(LIST, { entries: [], truncated: false }),
+      taskRoute(GRANT, {
+        entry: row("did:example:rm", "repo-manager", {
+          scope: "listed",
+          grants: [{ capability: "git.repo.manage", resource: "git-ns:github.com/acme" }],
+        }),
+      }),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl", path: "/acl" });
+
+    fireEvent.click(await screen.findByRole("button", { name: /add entry/i }));
+    fireEvent.change(await screen.findByPlaceholderText("did:key:z6Mk…"), {
+      target: { value: "did:example:rm" },
+    });
+    fireEvent.change(screen.getByLabelText("Administrative role"), {
+      target: { value: "repo-manager" },
+    });
+    fireEvent.click(screen.getByLabelText("git.repo.manage"));
+    fireEvent.change(screen.getByLabelText("git.repo.manage resource"), {
+      target: { value: "git-ns:github.com/acme" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /create entry/i }));
+
+    await waitFor(() => expect(sentPayloads(requests, GRANT)).toHaveLength(1));
+    const payload = (sentPayloads(requests, GRANT) as { entry: Record<string, unknown> }[])[0]!;
+    expect(payload.entry.role).toBe("repo-manager");
+    expect(payload.entry.act).toEqual({ scope: "all" });
+    expect(payload.entry.capabilities).toEqual({
+      scope: "listed",
+      grants: [{ capability: "git.repo.manage", resource: "git-ns:github.com/acme" }],
+    });
+  });
+
+  // The roles form layout: each capability's checkbox sits on the same line as
+  // its text, left-aligned (no `.row-actions`, which right-aligns), and the
+  // approve toggle is a switch label, not a column `.field`.
+  it("lays each checkbox out beside its label", async () => {
+    mockFetch([taskRoute(LIST, { entries: [], truncated: false })]);
+    renderWithProviders(<Acl />, { route: "/acl", path: "/acl" });
+    fireEvent.click(await screen.findByRole("button", { name: /add entry/i }));
+    fireEvent.change(await screen.findByLabelText("Administrative role"), {
+      target: { value: "community-admin" },
+    });
+    const box = screen.getByLabelText("vtc.roles.assign");
+    const label = box.closest("label")!;
+    expect(label.className).toBe("checkbox");
+    expect(label.closest(".row-actions")).toBeNull();
+    expect(label.querySelector(".checkbox-text .chip")?.textContent).toBe("confers authority");
+    // The approve setting is a switch (components/Switch.tsx), still a label
+    // around its control rather than a column `.field`.
+    const approve = screen.getByRole("switch", {
+      name: "May approve others' actions within this role",
+    });
+    expect(approve.closest("label")!.classList.contains("switch")).toBe(true);
+    expect(approve.closest(".field")).toBeNull();
+  });
+});
+
+// VTI-ACL-052: your own entry. Its label is always yours to change (item 2);
+// anything else only in single-administrator mode while the entry is
+// unrestricted (item 3) — otherwise the console says why rather than letting
+// the VTC answer 403. A label its subject set shows as self-set.
+describe("Access control — your own entry (VTI-ACL-052)", () => {
+  const ME = "did:example:me";
+  const UPDATE = "https://trusttasks.org/spec/acl/update/0.2";
+  const ACTIONS_LIST = "https://trusttasks.org/spec/vtc/admin/actions/list/0.3";
+  const whoami = {
+    session: {
+      id: "s1",
+      subject: ME,
+      issuedAt: "2026-10-02T10:00:00Z",
+      expiresAt: "2099-10-02T10:15:00Z",
+    },
+    roles: ["admin"],
+    scopes: [],
+  };
+  const mine = (label?: string, selfSet = false) => ({
+    subject: ME,
+    role: "community-admin",
+    act: { scope: "all" },
+    keys: { scope: "none" },
+    capabilities: { scope: "ceiling" },
+    approve: { scope: "all" },
+    ...(label ? { label } : {}),
+    ext: {
+      "org.openvtc": { communityRole: "admin", ...(selfSet ? { labelSetBySubject: true } : {}) },
+    },
+  });
+  const render = (singleAdminMode: boolean, entry = mine()) => {
+    const requests = mockFetch([
+      taskRoute(LIST, { entries: [entry], truncated: false }),
+      taskRoute(ACTIONS_LIST, {
+        actions: [],
+        counts: { waitingForMe: 0, requestedByMe: 0 },
+        ext: { "org.openvtc": { singleAdminMode } },
+      }),
+      taskRoute(UPDATE, { entry: mine("laptop", true) }),
+    ]);
+    renderWithProviders(<Acl />, {
+      route: "/acl",
+      path: "/acl",
+      whoami: whoami as never,
+    });
+    return requests;
+  };
+
+  it("lets you relabel your own entry", async () => {
+    const requests = render(false);
+    fireEvent.click(await screen.findByTitle("Click to edit label"));
+    const input = await screen.findByRole("textbox", { name: `Label for ${ME}` });
+    fireEvent.change(input, { target: { value: "laptop" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(sentPayloads(requests, UPDATE)).toHaveLength(1));
+    expect(sentPayloads(requests, UPDATE)[0]).toMatchObject({ subject: ME, label: "laptop" });
+  });
+
+  it("does not offer other edits of your own entry outside single-administrator mode, and says why", async () => {
+    render(false);
+    expect(await screen.findByText("you")).toBeTruthy();
+    const edit = screen.getByRole("button", { name: "Edit" }) as HTMLButtonElement;
+    expect(edit.disabled).toBe(true);
+    expect(edit.getAttribute("title")).toMatch(/You can change its label/);
+    expect(screen.getByText(/made by another administrator \(VTI-ACL-052\)/)).toBeTruthy();
+    const revoke = screen.getByRole("button", { name: "Revoke" }) as HTMLButtonElement;
+    expect(revoke.disabled).toBe(true);
+  });
+
+  it("offers them in single-administrator mode while your entry is unrestricted", async () => {
+    render(true);
+    await screen.findByText("you");
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Edit" }) as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Edit" }).getAttribute("title")).toMatch(
+      /passkey gesture, bound to this change/,
+    );
+  });
+
+  it("shows a label its subject set as self-set", async () => {
+    render(false, mine("laptop", true));
+    expect(await screen.findByText("self-set")).toBeTruthy();
+  });
+});
+
+// vtc-action-list.md §8.2 / §8.5: an entry whose removal is cooling off is
+// marked suspended until it lands; in single-administrator mode another
+// unrestricted administrator can be removed now, on their DID typed back and a
+// gesture bound to the immediate removal.
+describe("Access control — suspension and remove now", () => {
+  const OTHER = "did:example:other";
+  const REVOKE = "https://trusttasks.org/spec/acl/revoke/0.2";
+  const ACTIONS_LIST = "https://trusttasks.org/spec/vtc/admin/actions/list/0.3";
+  const LANDS_AT = "2026-10-05T09:00:00Z";
+  const other = (suspended = false) => ({
+    subject: OTHER,
+    role: "community-admin",
+    act: { scope: "all" },
+    keys: { scope: "none" },
+    capabilities: { scope: "ceiling" },
+    approve: { scope: "all" },
+    ext: {
+      "org.openvtc": {
+        communityRole: "admin",
+        ...(suspended
+          ? { suspended: { actionId: "act-9", landsAt: LANDS_AT, requester: "did:example:me" } }
+          : {}),
+      },
+    },
+  });
+  const render = (singleAdminMode: boolean, suspended = false) => {
+    const requests = mockFetch([
+      taskRoute(LIST, { entries: [other(suspended)], truncated: false }),
+      taskRoute(ACTIONS_LIST, {
+        actions: [],
+        counts: { waitingForMe: 0, requestedByMe: 0 },
+        ext: { "org.openvtc": { singleAdminMode } },
+      }),
+      taskRoute(REVOKE, { entry: null }),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl", path: "/acl" });
+    return requests;
+  };
+
+  it("marks a suspended entry with when its removal lands", async () => {
+    render(false, true);
+    const chip = await screen.findByTestId("suspended");
+    expect(chip.textContent).toContain("suspended — removal lands");
+    expect(chip.textContent).toContain(formatDateTime(LANDS_AT));
+    expect(chip.getAttribute("title")).toMatch(/act-9/);
+  });
+
+  it("offers no Remove now outside single-administrator mode", async () => {
+    render(false);
+    await screen.findByRole("button", { name: "Revoke" });
+    expect(screen.queryByRole("button", { name: "Remove now" })).toBeNull();
+  });
+
+  it("removes now only once the DID is typed back, with the immediate request", async () => {
+    const requests = render(true);
+    fireEvent.click(await screen.findByRole("button", { name: "Remove now" }));
+    const dialog = await screen.findByRole("dialog");
+    const submit = Array.from(dialog.querySelectorAll("button")).find(
+      (b) => b.textContent === "Remove now",
+    ) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    const input = screen.getByLabelText("Type the administrator's DID to confirm");
+    fireEvent.change(input, { target: { value: "did:example:wrong" } });
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(input, { target: { value: OTHER } });
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
+    await waitFor(() => expect(sentPayloads(requests, REVOKE)).toHaveLength(1));
+    expect(sentPayloads(requests, REVOKE)[0]).toEqual({
+      subject: OTHER,
+      revocation: { kind: "entry" },
+      ext: { "org.openvtc": { immediate: { confirm: OTHER } } },
+    });
+  });
+});
+
+// The command palette's "Add an access-control entry" and "Invite an
+// administrator" land here with a query string that opens the form.
+describe("Access control — forms opened from the URL", () => {
+  it("opens New ACL entry for ?add=1", async () => {
+    mockFetch([taskRoute(LIST, { entries: [], truncated: false })]);
+    renderWithProviders(<Acl />, { route: "/acl?add=1", path: "/acl" });
+    expect(await screen.findByPlaceholderText("did:key:z6Mk…")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "New ACL entry" })).toBeTruthy();
+  });
+
+  it("opens Invite a new admin for ?invite=1", async () => {
+    mockFetch([
+      taskRoute(LIST, { entries: [], truncated: false }),
+      taskRoute("https://trusttasks.org/spec/vtc/admin/invites/list/0.2", { invites: [] }),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl?invite=1", path: "/acl" });
+    expect(await screen.findByRole("heading", { name: "Invite a new admin" })).toBeTruthy();
+  });
+});
+
+// `vtc/admin/invites/create/0.2`: an invite is a passkey invitation unless the
+// administrator chooses a wallet one, and only a wallet invitation names a DID.
+describe("Admin invites — passkey or wallet", () => {
+  const INVITES_LIST = "https://trusttasks.org/spec/vtc/admin/invites/list/0.2";
+  const INVITES_CREATE = "https://trusttasks.org/spec/vtc/admin/invites/create/0.2";
+  const issued = (kind: "passkey" | "wallet") => ({
+    jti: "0b6f2a9e-4c1d-4e8f-9a2b-3c4d5e6f7a8b",
+    kind,
+    installUrl: "https://vtc.example/admin/install?token=t",
+    claimCode: "K7QF-2M9D-XR4T",
+    expiresAt: "2026-10-30T10:00:00Z",
+    aclEntryCreated: kind === "wallet",
+  });
+
+  it("mints a passkey invitation, naming no DID, by default", async () => {
+    const requests = mockFetch([
+      taskRoute(LIST, { entries: [], truncated: false }),
+      taskRoute(INVITES_LIST, { invites: [] }),
+      taskRoute(INVITES_CREATE, issued("passkey")),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl?invite=1", path: "/acl" });
+    await screen.findByRole("heading", { name: "Invite a new admin" });
+    expect(screen.queryByPlaceholderText("did:webvh:… or did:key:z6Mk…")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /mint invite/i }));
+
+    await waitFor(() => expect(sentPayloads(requests, INVITES_CREATE)).toHaveLength(1));
+    const payload = sentPayloads(requests, INVITES_CREATE)[0] as Record<string, unknown>;
+    expect("did" in payload).toBe(false);
+    expect(await screen.findByText(/register a passkey/)).toBeTruthy();
+  });
+
+  it("mints a wallet invitation for the DID given", async () => {
+    const requests = mockFetch([
+      taskRoute(LIST, { entries: [], truncated: false }),
+      taskRoute(INVITES_LIST, { invites: [] }),
+      taskRoute(INVITES_CREATE, issued("wallet")),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl?invite=1", path: "/acl" });
+    await screen.findByRole("heading", { name: "Invite a new admin" });
+    fireEvent.click(screen.getByRole("radio", { name: /with a wallet/i }));
+    fireEvent.change(screen.getByPlaceholderText("did:webvh:… or did:key:z6Mk…"), {
+      target: { value: "did:example:bob" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /mint invite/i }));
+
+    await waitFor(() => expect(sentPayloads(requests, INVITES_CREATE)).toHaveLength(1));
+    expect(sentPayloads(requests, INVITES_CREATE)[0]).toMatchObject({ did: "did:example:bob" });
+  });
+
+  it("lists a passkey invitation by its kind, its DID not yet created", async () => {
+    mockFetch([
+      taskRoute(LIST, { entries: [], truncated: false }),
+      taskRoute(INVITES_LIST, {
+        invites: [
+          {
+            jti: "0b6f2a9e-4c1d-4e8f-9a2b-3c4d5e6f7a8b",
+            kind: "passkey",
+            status: "issued",
+            expiresAt: "2026-10-30T10:00:00Z",
+          },
+        ],
+      }),
+    ]);
+    renderWithProviders(<Acl />, { route: "/acl", path: "/acl" });
+    expect(await screen.findByText("created when claimed")).toBeTruthy();
+    expect(screen.getByText("Passkey")).toBeTruthy();
+  });
+});

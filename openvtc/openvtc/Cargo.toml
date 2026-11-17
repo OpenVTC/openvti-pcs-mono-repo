@@ -1,0 +1,106 @@
+[package]
+name = "openvtc"
+description = "Client for Open Verifiable Trust Communities: join communities, manage DID personas, relationships and verifiable credentials from a terminal UI"
+documentation = "https://github.com/OpenVTC/openvtc/blob/main/docs/openvtc-tool-commands.md"
+keywords = ["did", "credentials", "didcomm", "trust", "tui"]
+categories = ["command-line-utilities", "cryptography", "authentication"]
+version = "0.8.0"
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+license.workspace = true
+repository = "https://github.com/OpenVTC/openvtc"
+
+[features]
+# Hardware OpenPGP-card key storage is off in the research build: it needs
+# PC/SC (pcscd) and nothing in the vetting flows uses it.
+default = []
+openpgp-card = [
+  "dep:openpgp-card",
+  "dep:openpgp-card-rpgp",
+  "dep:pgp",
+  "dep:x25519-dalek",
+  "openvtc-core/openpgp-card",
+]
+# Development builds only. Honours OPENVTC_VTA_URL, OPENVTC_VTA_DID and
+# OPENVTC_MEDIATOR_DID for the current run (validated, never saved, with a
+# DEV OVERRIDE indicator). Without it those variables are ignored and the user
+# is told so. Never enable this for a build you distribute.
+dev-overrides = []
+
+[dependencies]
+openvtc-core.workspace = true
+ratatui.workspace = true
+
+affinidi-tdk.workspace = true
+anyhow.workspace = true
+# did-git-sign's library reads and writes the signer's profiles, config and
+# commit-msg hook, so the Repos view and `openvtc repo sign` can set up and
+# check commit signing for a persona. Version and the `vta-sdk` lockstep rule
+# live in the root manifest.
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+arboard.workspace = true
+console.workspace = true
+crossterm.workspace = true
+dirs.workspace = true
+dialoguer.workspace = true
+didwebvh-rs.workspace = true
+dtg-credentials.workspace = true
+ed25519-dalek-bip32.workspace = true
+keyring-core.workspace = true
+qrcode.workspace = true
+# rand 0.8: the client's key generation is written against it (the workspace pins 0.10).
+rand = "0.8"
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tui-input.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+vta-sdk.workspace = true
+zeroize.workspace = true
+
+# OpenPGP card support (the default `openpgp-card` feature).
+openpgp-card = { workspace = true, optional = true }
+openpgp-card-rpgp = { workspace = true, optional = true }
+pgp = { version = "0.20", optional = true }
+x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
+
+# The platform keyring stores come from `vta-sdk`'s `keyring` feature
+# (`vta_sdk::keyring_init::install_default_store`). The kernel keyring is named
+# here only for `OPENVTC_SECURE_STORE=keyutils`, the migration path for
+# secrets an older build left there.
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store.workspace = true
+
+# Asking the terminal its background colour for the `auto` theme.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+# `test-util`: the paused clock (`start_paused`) for the save-debounce tests.
+# `net` / `io-util`: the loopback listener in the `health_cmd` tests.
+tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
+# `test-support`: the inbound `VerifyJob`s that hang or panic, for the
+# verify-queue tests. Dev-only, so a release build never carries them.
+openvtc-core = { workspace = true, features = ["test-support"] }
+
+[[bin]]
+name = "openvtc"
+path = "src/main.rs"
+
+[lints]
+workspace = true

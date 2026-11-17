@@ -1,0 +1,4697 @@
+//! VTA REST + DIDComm client.
+//!
+//! The public surface is the [`VtaClient`] struct and its methods.
+//! Methods are split into per-domain `impl` blocks across sibling
+//! files (`auth.rs`, `keys.rs`, `acl.rs`, `contexts.rs`, `webvh.rs`,
+//! `audit.rs`, `did_templates.rs`, `bootstrap.rs`, `backup.rs`,
+//! `vta_management.rs`, `secrets.rs`). This file holds the struct
+//! definition, transport plumbing, the constructor / connection
+//! surface, and the shared `rpc` / `rpc_tt` dispatch helpers used
+//! by every per-domain method.
+
+use crate::error::VtaError;
+use reqwest::{Client, RequestBuilder};
+
+// ── Internal transport ──────────────────────────────────────────────
+
+/// Stored credential for automatic token refresh.
+#[derive(Clone)]
+pub(super) struct AuthCredential {
+    pub(super) did: String,
+    pub(super) private_key_multibase: String,
+    pub(super) vta_did: String,
+}
+
+/// Mutable auth state protected by a mutex for auto-refresh.
+pub(super) struct RestAuth {
+    pub(super) token: Option<String>,
+    pub(super) expires_at: Option<u64>,
+    pub(super) refresh_token: Option<String>,
+    pub(super) refresh_expires_at: Option<u64>,
+    pub(super) credential: Option<AuthCredential>,
+}
+
+/// What a conforming *producer* needs to put on the wire, beyond the payload.
+///
+/// SPEC §7.2 turns two of these into hard requirements, and this SDK carried
+/// neither until the VTA started enforcing them:
+///
+/// * **item 5b** — 343 of the 344 published request payloads declare
+///   `recipient` REQUIRED, so a document with no in-band recipient is
+///   `malformedRequest`. `build_task_document` used to emit exactly that.
+/// * **item 7a** — 210 of them declare `proof` REQUIRED. A bearer token
+///   authenticates the *connection*; it says nothing about the document, and
+///   §7.2 item 7 admits no transport substitute.
+///
+/// Held together because they are not independent: attaching a proof without an
+/// in-band recipient trips item 8 (audience binding) on any non-bearer spec, so
+/// a client that can sign must also know who it is signing *to*.
+///
+/// # Any DID may be the producer
+///
+/// `client_did` is not restricted to `did:key`. A `did:webvh` holder — which is
+/// what every integration this workspace provisions actually has — signs by
+/// naming its key in [`verification_method`](Self::verification_method);
+/// see [`HolderKey`](crate::trust_task_sign::HolderKey).
+#[derive(Clone)]
+pub struct ClientIdentity {
+    /// The producer's DID. Becomes the document's `issuer`, and must match the
+    /// identity the transport authenticates as — item 6 rejects a document
+    /// whose in-band issuer disagrees with it.
+    pub client_did: String,
+    /// Multibase-encoded Ed25519 seed for the signing key.
+    pub private_key_multibase: String,
+    /// The VTA's DID. Becomes the document's `recipient`.
+    pub vta_did: String,
+    /// The verification method the proof names, when `client_did` does not
+    /// determine it.
+    ///
+    /// `None` means "derive it", which is only possible for a `did:key`, whose
+    /// key *is* its identifier. Every other method must name one —
+    /// `did:webvh:<scid>:example.com:glenn#key-0` — because a DID document
+    /// decides what its keys are called and no amount of string manipulation
+    /// can guess it.
+    pub verification_method: Option<String>,
+}
+
+/// Written by hand so the private key never reaches a log: a derived `Debug` would print it.
+impl std::fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientIdentity")
+            .field("client_did", &self.client_did)
+            .field("private_key_multibase", &"<redacted>")
+            .field("vta_did", &self.vta_did)
+            .field("verification_method", &self.verification_method)
+            .finish()
+    }
+}
+
+impl ClientIdentity {
+    /// A `did:key` producer, whose verification method is derivable.
+    pub fn did_key(
+        client_did: impl Into<String>,
+        private_key_multibase: impl Into<String>,
+        vta_did: impl Into<String>,
+    ) -> Self {
+        Self {
+            client_did: client_did.into(),
+            private_key_multibase: private_key_multibase.into(),
+            vta_did: vta_did.into(),
+            verification_method: None,
+        }
+    }
+
+    /// The signing key this identity produces proofs with.
+    ///
+    /// Fails only when the identity cannot name a key at all: no
+    /// `verification_method` and a `client_did` that is not a `did:key`.
+    pub fn holder_key(
+        &self,
+    ) -> Result<crate::trust_task_sign::HolderKey, crate::trust_task_sign::TrustTaskSignError> {
+        match &self.verification_method {
+            Some(vm) => crate::trust_task_sign::HolderKey::new(vm, &self.private_key_multibase),
+            None => crate::trust_task_sign::HolderKey::from_did_key(
+                &self.client_did,
+                &self.private_key_multibase,
+            ),
+        }
+    }
+}
+
+/// Cloneable transport layer.
+///
+/// Auth state is wrapped in `Arc<Mutex>` so cloned clients share tokens
+/// and avoid redundant authentication round-trips.
+#[derive(Clone)]
+pub(super) enum Transport {
+    Rest {
+        client: Client,
+        base_url: String,
+        auth: std::sync::Arc<tokio::sync::Mutex<RestAuth>>,
+    },
+    #[cfg(feature = "session")]
+    DIDComm {
+        session: crate::didcomm_session::DIDCommSession,
+        rest_client: Option<Client>,
+        rest_url: Option<String>,
+        /// The TSP leg Trust Tasks ride, when attached by
+        /// [`VtaClient::enable_tsp_trust_tasks`]. `None` means Trust Tasks go
+        /// over DIDComm.
+        ///
+        /// A client that holds both keeps its DIDComm session (the mediator's
+        /// one socket per DID, on which TSP receive arrives) and adds this leg,
+        /// rather than opening a second socket.
+        #[cfg(feature = "tsp")]
+        tsp: Option<TspLeg>,
+    },
+    /// TSP — the workspace's highest-preference transport.
+    ///
+    /// Carries the **Trust-Task** surface only ([`VtaClient::rpc_tt`]). The
+    /// VTA's TSP inbound dispatcher opens the binding envelope and hands the
+    /// document to
+    /// `dispatch_trust_task_core`, so a trust task routes over TSP unchanged.
+    /// Every client method is a Trust Task; the SDK sends no bare DIDComm
+    /// protocol messages any more.
+    #[cfg(feature = "tsp")]
+    Tsp {
+        session: std::sync::Arc<crate::session::TspSession>,
+        vta_did: String,
+        mediator_did: String,
+        rest_client: Option<Client>,
+        rest_url: Option<String>,
+    },
+}
+
+/// How a DIDComm client reaches TSP for the Trust-Task surface.
+///
+/// The distinction exists because **the mediator permits one websocket per
+/// DID**. Which arm applies is decided by comparing the VTA's advertised `#tsp`
+/// endpoint against the mediator the DIDComm session is already on — see
+/// [`tsp_leg_for`].
+#[cfg(all(feature = "session", feature = "tsp"))]
+#[derive(Clone)]
+pub(super) enum TspLeg {
+    /// The VTA advertises the **same** mediator for `#tsp` and
+    /// `#vta-didcomm` — the reference topology. TSP rides the DIDComm session's
+    /// existing socket (`DIDCommSession::request_tsp`). No second connection, so
+    /// nothing to fail and nothing to shut down.
+    Multiplexed,
+    /// The VTA advertises a **different** TSP mediator. There is no
+    /// one-socket-per-DID conflict across two mediators, so this leg owns its
+    /// own [`TspSession`](crate::session::TspSession) — and, being ours, must be
+    /// shut down with the client.
+    Separate {
+        session: std::sync::Arc<crate::session::TspSession>,
+        mediator_did: String,
+    },
+}
+
+/// Which TSP leg a DIDComm session on `didcomm_mediator_did` should use to reach
+/// a VTA advertising `tsp_mediator_did`.
+///
+/// Pure so the rule is testable without a mediator: `None` here would mean
+/// silently keeping trust tasks on DIDComm, and `Separate` on the reference
+/// deployment would mean a second socket for one DID — `duplicate-channel` plus
+/// duelling reconnect loops (#803). Both failure modes are decided entirely by
+/// this comparison, so it is worth pinning on its own.
+#[cfg(all(feature = "session", feature = "tsp"))]
+pub(super) fn tsp_leg_kind(didcomm_mediator_did: &str, tsp_mediator_did: &str) -> TspLegKind {
+    if didcomm_mediator_did == tsp_mediator_did {
+        TspLegKind::Multiplexed
+    } else {
+        TspLegKind::Separate
+    }
+}
+
+/// The decision [`tsp_leg_kind`] makes, before any connecting happens.
+#[cfg(all(feature = "session", feature = "tsp"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TspLegKind {
+    Multiplexed,
+    Separate,
+}
+
+/// Which transport carries the Trust-Task surface on this client.
+///
+/// Every client operation is a Trust Task, so there is one surface and
+/// [`VtaClient::trust_task_transport`] reports it. A DIDComm client that has
+/// attached a TSP leg reports TSP: its DIDComm session stays open only as the
+/// mediator's one socket per DID, on which TSP receive arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SurfaceTransport {
+    /// REST/HTTPS with a bearer token.
+    Rest,
+    /// DIDComm authcrypt via a mediator.
+    Didcomm,
+    /// TSP via a mediator.
+    Tsp,
+}
+
+impl std::fmt::Display for SurfaceTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rest => write!(f, "REST"),
+            Self::Didcomm => write!(f, "DIDComm"),
+            Self::Tsp => write!(f, "TSP"),
+        }
+    }
+}
+
+/// HTTP/DIDComm client for the VTA service API.
+///
+/// **Requires the `client` feature.** Without it the struct and all
+/// methods below are absent — enable in `Cargo.toml`:
+/// ```toml
+/// vta-sdk = { version = "…", features = ["client"] }
+/// ```
+///
+/// Cloning a `VtaClient` is cheap — clones share the underlying HTTP
+/// connection pool and authentication state.
+#[derive(Clone)]
+pub struct VtaClient {
+    pub(super) transport: Transport,
+    /// Test-only interception, ahead of the transport — see [`loopback`].
+    ///
+    /// A hook rather than a `Transport` variant on purpose. A variant would
+    /// have to be answered at every one of the ~20 sites that match on
+    /// `Transport`, almost all of which would say "unsupported", so 20 arms
+    /// of noise would be carried in production code to serve a test seam.
+    /// Intercepting ahead of the match touches only the three functions that
+    /// dispatch a Trust Task, and leaves every transport match exhaustive over
+    /// the transports that really exist.
+    #[cfg(feature = "test-loopback")]
+    pub(super) loopback: Option<std::sync::Arc<dyn loopback::LoopbackSink>>,
+    /// Set when this client can produce conforming documents — see
+    /// [`ClientIdentity`]. `None` emits the pre-§7.2 shape, which a conforming
+    /// consumer refuses; it is kept only so a caller that has not been given an
+    /// identity yet fails at the VTA with a message naming the missing member,
+    /// rather than at construction with one that does not.
+    pub(super) identity: Option<std::sync::Arc<ClientIdentity>>,
+    /// Resolver for verifying reply proofs, built on first use and shared by
+    /// clones — a `DIDCacheClient` *is* a cache, so one per client is right and
+    /// one per call would defeat it.
+    pub(super) reply_resolver: std::sync::Arc<
+        tokio::sync::OnceCell<Option<affinidi_did_resolver_cache_sdk::DIDCacheClient>>,
+    >,
+    /// Whether an unsigned reply is refused. See [`VtaClient::trusting_unsigned_replies`].
+    pub(super) require_signed_replies: bool,
+    /// Whether replies are reaching this client. Shared by clones, because the
+    /// receive leg belongs to the session they share. See
+    /// [`VtaClient::receive_health`].
+    pub(super) receive_leg: std::sync::Arc<ReceiveLeg>,
+    /// The room profiles' `recordMembers` this client resolved, per room epoch — see
+    /// [`VtaClient::room_record_members`]. Shared by clones.
+    pub(super) record_members: std::sync::Arc<rooms_records::RecordMembersCache>,
+}
+
+/// Reply timeouts in a row after which a client stops re-forming its TSP
+/// relationship and resending (the §7.2.2 D4 self-repair), and returns
+/// [`VtaError::RepliesNotArriving`] instead.
+///
+/// D4 exists for one failure: a peer that lost the relationship and silently
+/// drops our frames. One re-form and one resend answer it. It was never meant
+/// for a client whose *own* inbox has stopped being collected — there the VTA
+/// answers every request, each answer queues in the client's mediator inbox,
+/// and each D4 round added two more (the accept of the re-form, and the reply
+/// to the resend). With no limit across calls, a panel refreshing every few
+/// seconds filled the mediator's per-peer cap in minutes and the VTA's every
+/// reply was refused `limits.queue.peer` (2026-10-05). Two timeouts in a row is
+/// the first point at which "the peer dropped it" is no longer the likelier
+/// story: D4 has had its one attempt.
+pub const REPLY_TIMEOUT_BREAKER: u32 = 2;
+
+/// Whether replies are reaching this client — the receive leg, which a
+/// successful send says nothing about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReceiveLegHealth {
+    /// Requests in a row whose reply did not arrive within the timeout. Reset
+    /// by any reply. At [`REPLY_TIMEOUT_BREAKER`] the client reports
+    /// [`VtaError::RepliesNotArriving`] and stops re-forming the relationship.
+    pub consecutive_reply_timeouts: u32,
+    /// Time since the last reply (an inbound frame answering one of this
+    /// client's requests) arrived. `None` before the first.
+    pub since_last_reply: Option<std::time::Duration>,
+    /// Time since the last reply timeout. `None` if there has been none.
+    pub since_last_timeout: Option<std::time::Duration>,
+}
+
+impl ReceiveLegHealth {
+    /// Whether replies have stopped arriving (the breaker has tripped).
+    pub fn replies_not_arriving(&self) -> bool {
+        self.consecutive_reply_timeouts >= REPLY_TIMEOUT_BREAKER
+    }
+}
+
+/// The counters behind [`ReceiveLegHealth`].
+#[derive(Debug, Default)]
+pub(crate) struct ReceiveLeg {
+    consecutive_timeouts: std::sync::atomic::AtomicU32,
+    last_reply: std::sync::Mutex<Option<std::time::Instant>>,
+    last_timeout: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+// Only the TSP request path records into it today; without `tsp` the counters
+// stay at rest and `receive_health` reports no timeouts.
+#[cfg_attr(not(feature = "tsp"), allow(dead_code))]
+impl ReceiveLeg {
+    /// A reply arrived: the receive leg works.
+    pub(crate) fn record_reply(&self) {
+        self.consecutive_timeouts
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        *self.last_reply.lock().expect("receive-leg mutex") = Some(std::time::Instant::now());
+    }
+
+    /// A reply timed out. Returns the timeouts in a row, this one included.
+    pub(crate) fn record_timeout(&self) -> u32 {
+        *self.last_timeout.lock().expect("receive-leg mutex") = Some(std::time::Instant::now());
+        self.consecutive_timeouts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    pub(crate) fn snapshot(&self) -> ReceiveLegHealth {
+        let since = |at: &std::sync::Mutex<Option<std::time::Instant>>| {
+            at.lock().expect("receive-leg mutex").map(|t| t.elapsed())
+        };
+        ReceiveLegHealth {
+            consecutive_reply_timeouts: self
+                .consecutive_timeouts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            since_last_reply: since(&self.last_reply),
+            since_last_timeout: since(&self.last_timeout),
+        }
+    }
+}
+
+// ── Protocol response aliases ──────────────────────────────────────
+//
+// Response types that live in the `protocols::` layer are re-exported
+// here with `*Response` naming so callers can import everything they
+// need from `vta_sdk::client::*` (or `vta_sdk::prelude::*`) without
+// reaching into the protocol path. The original `*ResultBody` names
+// stay exported from `protocols/` for DIDComm-layer consumers.
+
+pub use crate::protocols::context_management::delete::{
+    DeleteContextPreviewResultBody as DeleteContextPreviewResponse,
+    DeleteContextResultBody as DeleteContextResponse,
+};
+
+pub use crate::protocols::did_management::create::CreateDidWebvhResultBody as CreateDidWebvhResponse;
+pub use crate::protocols::did_management::list::ListDidsWebvhResultBody as ListDidsWebvhResponse;
+pub use crate::protocols::did_management::servers::ListWebvhServersResultBody as ListWebvhServersResponse;
+
+// DID-template response shape (Phase 2+).
+pub use crate::did_templates::{
+    BUILTIN_NAMES as DID_TEMPLATE_BUILTINS, DidTemplate, DidTemplateRecord,
+    Scope as DidTemplateScope, TemplateError as DidTemplateError, TemplateVars,
+};
+
+// ── Request / Response types ────────────────────────────────────────
+//
+// All request/response DTOs live in `types.rs`; re-exported here so
+// callers can continue to use `vta_sdk::client::*` without reaching
+// into the submodule path.
+mod types;
+pub use dids::DidListFilter;
+pub use types::*;
+
+// ── Per-domain impl blocks ─────────────────────────────────────────
+
+mod acl;
+mod agent_devices;
+#[cfg(feature = "session")]
+mod auto_connect;
+mod backup_chunked;
+mod backup_descriptors;
+pub use backup_chunked::{ChunkedDownload, ChunkedUpload, TransferProgress};
+mod bootstrap;
+mod consent;
+mod contexts;
+mod credentials;
+mod did_templates;
+mod dids;
+mod keys;
+// Consumed from `vta-service`'s dev-dependency, which enables the feature the
+// ordinary way. `cargo -p vta-sdk --features test-loopback` does *not* rebuild
+// this crate — the workspace patches `vta-sdk` onto itself, so the `-p` node
+// and the built node differ and cargo reports the unit Fresh — which is why the
+// census lives downstream rather than in this crate's own tests.
+mod app_state;
+mod external;
+pub use external::presign_split_at;
+#[cfg(feature = "sealed-transfer")]
+pub use external::{open_external_credential, seal_external_secret};
+mod collection;
+#[cfg(feature = "test-loopback")]
+pub mod loopback;
+mod memory;
+mod notifications;
+mod pcs;
+mod persona;
+mod policy;
+mod rooms;
+mod rooms_records;
+mod rooms_watch;
+mod webs;
+mod witness;
+pub use rooms::{
+    RoomAction, RoomLabelEdit, RoomRecordRetention, RoomRegistration, RoomRetentionPolicy,
+    RoomSignalDelay, RoomVisibility, is_community_type, is_offer_type, room_label_payload,
+    room_read_marker_payload, unsigned_community_request, unsigned_room_request,
+};
+pub use rooms_records::{
+    MEMBER_PROFILE_KIND, RECORD_BODY_MEMBERS, RECORD_FILE_MEMBERS, RECORD_KIND_VALUES,
+    ROOM_READ_MAX_KEYS, RoomBrowse, RoomListOrder, check_record_members, record_members_permitted,
+    record_members_used, unsigned_room_request_v0_11,
+};
+pub use rooms_watch::{
+    LIVE_NOT_PERMITTED, LIVE_RENEW_EVERY, ROOM_WATCH_MAX_ROOMS, RoomWatch, room_changed_signal,
+    room_read_marker_moved, unsigned_room_request_v0_12,
+};
+pub use webs::webs_refusal_fix;
+mod secrets;
+mod vault;
+mod vta_management;
+mod webvh;
+/// The `vta/webvh/dids/*` request shaping — see [`webvh::flatten_with_did`].
+///
+/// Re-exported so the shape can be *built* by anything that needs to assert it,
+/// rather than hand-written a second time and left to drift.
+pub use webvh::{flatten_with_did, update_task_for};
+
+#[cfg(feature = "client")]
+mod audit;
+
+#[cfg(feature = "session")]
+pub use crate::session::TokenResult;
+#[cfg(feature = "session")]
+pub use auto_connect::{AutoConnect, ConnectedVta};
+
+// ── REST helpers ────────────────────────────────────────────────────
+
+impl VtaClient {
+    /// Attach Bearer token to a request if one is set.
+    pub(super) fn with_auth_token(req: RequestBuilder, token: &Option<String>) -> RequestBuilder {
+        match token {
+            Some(token) => req.bearer_auth(token),
+            None => req,
+        }
+    }
+
+    pub(super) async fn handle_response<T: serde::de::DeserializeOwned>(
+        resp: reqwest::Response,
+    ) -> Result<T, VtaError> {
+        if resp.status().is_success() {
+            Ok(resp.json::<T>().await?)
+        } else {
+            let status = resp.status();
+            // Headers and URL before the body consumes the response: a 429's
+            // attribution and wait hint live only there.
+            let headers = resp.headers().clone();
+            let url = resp.url().to_string();
+            let text = resp.text().await?;
+            // For 409 Conflict, preserve the full JSON body so callers can
+            // extract structured details (e.g. EnableDidcommConflictBody).
+            // Other error codes only need the `error` field string.
+            if status == reqwest::StatusCode::CONFLICT {
+                return Err(VtaError::Conflict(text));
+            }
+            if let Some(err) = VtaError::rate_limited_from_http(status, &headers, &text, &url) {
+                return Err(err);
+            }
+            let body = Self::extract_error_message(&text);
+            Err(VtaError::from_http(status, body))
+        }
+    }
+
+    /// Extract the `error` field from a JSON response body, or fall back to
+    /// "unknown error" with the raw text appended for diagnostics. The raw text
+    /// is truncated so a large non-JSON body (e.g. a 1 MB proxy error page)
+    /// can't bloat the error string that propagates into CLI output and logs.
+    fn extract_error_message(text: &str) -> String {
+        /// Max characters of raw body to surface in the fallback message.
+        const MAX_RAW_LEN: usize = 256;
+        serde_json::from_str::<ErrorResponse>(text)
+            .map(|e| e.error)
+            .unwrap_or_else(|_| {
+                if text.is_empty() {
+                    "unknown error".to_string()
+                } else {
+                    let truncated: String = text.chars().take(MAX_RAW_LEN).collect();
+                    let ellipsis = if truncated.len() < text.len() {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    format!("unknown error: {truncated}{ellipsis}")
+                }
+            })
+    }
+}
+
+// ── Constructor + transport surface ────────────────────────────────
+
+impl VtaClient {
+    /// Create a new REST-only client.
+    pub fn new(base_url: &str) -> Self {
+        Self {
+            #[cfg(feature = "test-loopback")]
+            loopback: None,
+            reply_resolver: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            // Refusing an unsigned reply is the default because a reply that
+            // attests to nothing is what this exists to stop being acceptable.
+            require_signed_replies: true,
+            receive_leg: Default::default(),
+            record_members: Default::default(),
+            identity: None,
+            transport: Transport::Rest {
+                client: crate::http::rest_client(),
+                base_url: base_url.trim_end_matches('/').to_string(),
+                auth: std::sync::Arc::new(tokio::sync::Mutex::new(RestAuth {
+                    token: None,
+                    expires_at: None,
+                    refresh_token: None,
+                    refresh_expires_at: None,
+                    credential: None,
+                })),
+            },
+        }
+    }
+
+    /// Create a client from a credential bundle.
+    ///
+    /// Performs lightweight challenge-response auth (no ATM/TDK initialization)
+    /// and stores the credential for automatic token refresh.
+    pub async fn from_credential(
+        credential: &crate::credentials::CredentialBundle,
+        url_override: Option<&str>,
+    ) -> Result<Self, VtaError> {
+        let (result, cred, http) =
+            crate::auth_light::authenticate_with_credential(credential, url_override).await?;
+        let base_url = url_override
+            .or(cred.vta_url.as_deref())
+            .ok_or_else(|| VtaError::Validation("no VTA URL".into()))?
+            .trim_end_matches('/')
+            .to_string();
+
+        // The credential *is* the identity — the same DID and key that just
+        // authenticated, and the VTA DID it authenticated against. Carrying it
+        // in `RestAuth` for refresh but not as the signing identity is the
+        // split that left this constructor's clients unable to produce a
+        // conforming document.
+        let identity = ClientIdentity {
+            client_did: cred.did.clone(),
+            private_key_multibase: cred.private_key_multibase.clone(),
+            vta_did: cred.vta_did.clone(),
+            verification_method: None,
+        };
+
+        Ok(Self {
+            #[cfg(feature = "test-loopback")]
+            loopback: None,
+            reply_resolver: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            // Refusing an unsigned reply is the default because a reply that
+            // attests to nothing is what this exists to stop being acceptable.
+            require_signed_replies: true,
+            receive_leg: Default::default(),
+            record_members: Default::default(),
+            identity: Some(std::sync::Arc::new(identity)),
+            transport: Transport::Rest {
+                client: http,
+                base_url,
+                auth: std::sync::Arc::new(tokio::sync::Mutex::new(RestAuth {
+                    token: Some(result.access_token),
+                    expires_at: Some(result.access_expires_at),
+                    refresh_token: result.refresh_token,
+                    refresh_expires_at: result.refresh_expires_at,
+                    credential: Some(AuthCredential {
+                        did: cred.did,
+                        private_key_multibase: cred.private_key_multibase,
+                        vta_did: cred.vta_did,
+                    }),
+                })),
+            },
+        })
+    }
+
+    /// Returns the token expiry timestamp, if known.
+    pub async fn token_expires_at(&self) -> Option<u64> {
+        match &self.transport {
+            Transport::Rest { auth, .. } => auth.lock().await.expires_at,
+            #[cfg(feature = "session")]
+            Transport::DIDComm { .. } => None,
+            // No token to expire: TSP authenticates by proven sender VID.
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => None,
+        }
+    }
+
+    /// Connect via DIDComm through a mediator.
+    ///
+    /// `rest_url` is an optional fallback for REST-only operations like `health()`.
+    ///
+    /// # You MUST call [`shutdown`](Self::shutdown) when done
+    ///
+    /// This opens a **persistent, auto-reconnecting** session. [`Drop`] cannot
+    /// close it (shutdown is `async`), so dropping a DIDComm `VtaClient` without
+    /// `shutdown()` **leaks a live session that keeps reconnecting** — and two
+    /// live sessions for the same DID fight on the mediator, so round-trips time
+    /// out. Always:
+    ///
+    /// ```ignore
+    /// let client = VtaClient::connect_didcomm(client_did, key, vta_did, mediator, rest).await?;
+    /// // ...use client...
+    /// client.shutdown().await;   // REQUIRED — not optional cleanup
+    /// ```
+    ///
+    /// Prefer [`with_didcomm`](Self::with_didcomm), which guarantees `shutdown()`
+    /// on scope exit (including the error path). Dropping a leaked client logs a
+    /// `WARN` (and trips a `debug_assert!` in debug builds).
+    #[cfg(feature = "session")]
+    pub async fn connect_didcomm(
+        client_did: &str,
+        private_key_multibase: &str,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+    ) -> Result<Self, VtaError> {
+        let session = crate::didcomm_session::DIDCommSession::connect(
+            client_did,
+            private_key_multibase,
+            vta_did,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| VtaError::DidcommTransport(e.to_string()))?;
+
+        Ok(Self::didcomm_transport(
+            session,
+            rest_url,
+            Some(ClientIdentity {
+                client_did: client_did.to_string(),
+                private_key_multibase: private_key_multibase.to_string(),
+                vta_did: vta_did.to_string(),
+                verification_method: None,
+            }),
+        ))
+    }
+
+    /// Wrap a connected [`DIDCommSession`](crate::didcomm_session::DIDCommSession)
+    /// in a client. One place to build the transport, so a new `connect_*_on`
+    /// variant cannot forget the REST fallback or the TSP-leg default.
+    ///
+    /// `identity` is a required argument rather than a `with_identity` call the
+    /// caller makes afterwards, because "afterwards" is exactly what every
+    /// DIDComm and TSP constructor skipped: they built the client with
+    /// `identity: None` and dispatched documents with no in-band `recipient`,
+    /// which a conforming VTA rejects as `malformedRequest`. Passing it here
+    /// makes forgetting it a compile error in the next variant.
+    #[cfg(feature = "session")]
+    fn didcomm_transport(
+        session: crate::didcomm_session::DIDCommSession,
+        rest_url: Option<String>,
+        identity: Option<ClientIdentity>,
+    ) -> Self {
+        let rest_client = rest_url.as_ref().map(|_| crate::http::rest_client());
+        Self {
+            #[cfg(feature = "test-loopback")]
+            loopback: None,
+            reply_resolver: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            // Refusing an unsigned reply is the default because a reply that
+            // attests to nothing is what this exists to stop being acceptable.
+            require_signed_replies: true,
+            receive_leg: Default::default(),
+            record_members: Default::default(),
+            identity: identity.map(std::sync::Arc::new),
+            transport: Transport::DIDComm {
+                session,
+                rest_client,
+                rest_url: rest_url.map(|u| u.trim_end_matches('/').to_string()),
+                #[cfg(feature = "tsp")]
+                tsp: None,
+            },
+        }
+    }
+
+    /// Connect via DIDComm as one identity **on a shared
+    /// [`SessionHub`](crate::session_hub::SessionHub)** — the multi-identity
+    /// counterpart to [`connect_didcomm`](Self::connect_didcomm).
+    ///
+    /// This is the constructor for a front door that terminates requests for N
+    /// tenants and has to *act as* each of them: build one hub, then one client
+    /// per tenant DID on it. Each client still gets its own profile and its own
+    /// mediator websocket (the mediator's ceiling is one socket per DID); what
+    /// they share is the TDK, the ATM, the secrets resolver, and the background
+    /// tasks — the N-of-everything this replaces (#830).
+    ///
+    /// # You MUST still call [`shutdown`](Self::shutdown)
+    ///
+    /// Same contract as [`connect_didcomm`](Self::connect_didcomm), with one
+    /// difference: `shutdown()` detaches **this** identity and leaves the hub —
+    /// and every sibling client on it — running. Shut the hub down yourself once
+    /// the last client on it is done.
+    ///
+    /// ```ignore
+    /// let hub = SessionHub::new().await?;
+    /// let finance = VtaClient::connect_didcomm_on(&hub, fin_did, key, vta, med, rest).await?;
+    /// let legal   = VtaClient::connect_didcomm_on(&hub, leg_did, key, vta, med, rest).await?;
+    /// // ...
+    /// finance.shutdown().await;
+    /// legal.shutdown().await;
+    /// hub.shutdown().await;
+    /// ```
+    #[cfg(feature = "session")]
+    pub async fn connect_didcomm_on(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        client_did: &str,
+        private_key_multibase: &str,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+    ) -> Result<Self, VtaError> {
+        let session = crate::didcomm_session::DIDCommSession::connect_on(
+            hub,
+            client_did,
+            private_key_multibase,
+            vta_did,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| VtaError::DidcommTransport(e.to_string()))?;
+
+        Ok(Self::didcomm_transport(
+            session,
+            rest_url,
+            Some(ClientIdentity {
+                client_did: client_did.to_string(),
+                private_key_multibase: private_key_multibase.to_string(),
+                vta_did: vta_did.to_string(),
+                verification_method: None,
+            }),
+        ))
+    }
+
+    /// Connect via DIDComm through a mediator using a hosted-DID secrets
+    /// bundle (`did:webvh` and any DID whose signing + key-agreement keys are
+    /// independent, exported as a [`DidSecretsBundle`]).
+    ///
+    /// The DIDComm `client_did` is taken from `bundle.did`; the secrets are
+    /// reconstructed from the bundle's entries via
+    /// [`crate::did_key::secrets_from_bundle`] (signing/key-agreement order
+    /// preserved). This is the bundle counterpart to
+    /// [`connect_didcomm`](Self::connect_didcomm), which derives both keys from
+    /// a single `did:key` seed.
+    ///
+    /// `rest_url` is an optional fallback for REST-only operations like
+    /// `health()`.
+    ///
+    /// # You MUST call [`shutdown`](Self::shutdown) when done
+    ///
+    /// See [`connect_didcomm`](Self::connect_didcomm) — the same live-session
+    /// leak contract applies. Prefer [`with_didcomm`](Self::with_didcomm).
+    ///
+    /// [`DidSecretsBundle`]: crate::did_secrets::DidSecretsBundle
+    #[cfg(feature = "session")]
+    pub async fn connect_didcomm_bundle(
+        bundle: &crate::did_secrets::DidSecretsBundle,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+    ) -> Result<Self, VtaError> {
+        let secrets = crate::did_key::secrets_from_bundle(bundle)
+            .map_err(|e| VtaError::DidcommTransport(e.to_string()))?;
+
+        let session = crate::didcomm_session::DIDCommSession::connect_with_secrets(
+            &bundle.did,
+            secrets,
+            vta_did,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| VtaError::DidcommTransport(e.to_string()))?;
+
+        Ok(Self::didcomm_transport(
+            session,
+            rest_url,
+            bundle_identity(bundle, vta_did),
+        ))
+    }
+
+    /// Connect from a hosted-DID secrets bundle as one identity **on a shared
+    /// [`SessionHub`](crate::session_hub::SessionHub)** — the bundle
+    /// counterpart to [`connect_didcomm_on`](Self::connect_didcomm_on).
+    ///
+    /// The same hub / per-identity split and the same `shutdown()` contract
+    /// apply; see [`connect_didcomm_on`](Self::connect_didcomm_on).
+    #[cfg(feature = "session")]
+    pub async fn connect_didcomm_bundle_on(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        bundle: &crate::did_secrets::DidSecretsBundle,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+    ) -> Result<Self, VtaError> {
+        let secrets = crate::did_key::secrets_from_bundle(bundle)
+            .map_err(|e| VtaError::DidcommTransport(e.to_string()))?;
+
+        let session = crate::didcomm_session::DIDCommSession::connect_with_secrets_on(
+            hub,
+            &bundle.did,
+            secrets,
+            vta_did,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| VtaError::DidcommTransport(e.to_string()))?;
+
+        Ok(Self::didcomm_transport(
+            session,
+            rest_url,
+            bundle_identity(bundle, vta_did),
+        ))
+    }
+
+    /// Connect via **TSP** through a mediator — the transport-agnostic
+    /// counterpart to [`connect_didcomm`](Self::connect_didcomm), so consumers
+    /// switch transport by construction rather than by rewriting call sites.
+    ///
+    /// `mediator_did` is the VTA's `#tsp` (`TSPTransport`) service endpoint —
+    /// the mediator the VTA is a local account on. Get it from
+    /// [`resolve_vta_endpoint`](crate::session::resolve_vta_endpoint), which
+    /// reads it from that entry rather than assuming it matches the DIDComm
+    /// mediator.
+    ///
+    /// `rest_url` is an optional fallback for the REST-only operations
+    /// (`health()`, the descriptor uploads) exactly as on the DIDComm client.
+    ///
+    /// # What routes over TSP
+    ///
+    /// The **Trust-Task surface** — the VTA's TSP inbound dispatcher feeds each
+    /// unpacked payload to the same `dispatch_trust_task_core` spine REST and
+    /// DIDComm use, so those operations are byte-identical across transports.
+    /// Every client operation is a Trust Task, so everything routes over TSP;
+    /// the older bare-DIDComm protocol-message surface is gone from the SDK.
+    ///
+    /// # Authentication
+    ///
+    /// None to perform. TSP `unpack` yields a cryptographically **proven**
+    /// sender VID, which the VTA resolves straight to its ACL grant — the same
+    /// intrinsic-sender model as DIDComm authcrypt. There is no challenge, no
+    /// bearer token, and no holder proof inside the document; the REST token
+    /// dance has no TSP analogue. [`set_token`](Self::set_token) is a no-op
+    /// here for that reason.
+    ///
+    /// # You MUST call [`shutdown`](Self::shutdown) when done
+    ///
+    /// The same live-session leak contract as
+    /// [`connect_didcomm`](Self::connect_didcomm): the mediator permits one
+    /// websocket per DID, so a leaked session makes the next connect for this
+    /// DID fight the old one.
+    #[cfg(feature = "tsp")]
+    pub async fn connect_tsp(
+        client_did: &str,
+        private_key_multibase: &str,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+    ) -> Result<Self, VtaError> {
+        let session =
+            crate::session::TspSession::connect(client_did, private_key_multibase, mediator_did)
+                .await
+                .map_err(|e| VtaError::TspTransport(e.to_string()))?;
+
+        // §7.2.2: the VTA drops an application message from a VID it holds no
+        // relationship with, so the control exchange is a precondition of every
+        // Trust Task this client will send — not an optional courtesy. Doing it
+        // here rather than exposing a `relate()` for callers to remember is the
+        // difference between a client that works and one that times out with
+        // nothing in any log on either side.
+        //
+        // Nothing to await: the VTA records the invite on arrival and
+        // `admits_application_message` is true for any state but `None`, so
+        // traffic flows without waiting for an accept (§3.6). `relate` is
+        // idempotent, so a reconnect against a durable relationship store is a
+        // no-op rather than an `InvalidTransition`.
+        session
+            .relate(vta_did)
+            .await
+            .map_err(|e| VtaError::TspTransport(format!("TSP relationship failed: {e}")))?;
+
+        Ok(Self::tsp_transport(
+            session,
+            vta_did,
+            mediator_did,
+            rest_url,
+            Some(ClientIdentity {
+                client_did: client_did.to_string(),
+                private_key_multibase: private_key_multibase.to_string(),
+                vta_did: vta_did.to_string(),
+                verification_method: None,
+            }),
+        ))
+    }
+
+    /// Connect via **TSP** as one identity **on a shared
+    /// [`SessionHub`](crate::session_hub::SessionHub)** — the multi-identity
+    /// counterpart to [`connect_tsp`](Self::connect_tsp).
+    ///
+    /// Each identity still opens its own TSP websocket to the mediator; the hub
+    /// shares everything above the socket. The same `shutdown()` contract as
+    /// [`connect_didcomm_on`](Self::connect_didcomm_on) applies — the client
+    /// detaches its identity and the hub keeps running for its siblings.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    pub async fn connect_tsp_on(
+        hub: &std::sync::Arc<crate::session_hub::SessionHub>,
+        client_did: &str,
+        private_key_multibase: &str,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+    ) -> Result<Self, VtaError> {
+        let session = crate::session::TspSession::connect_on(
+            hub,
+            client_did,
+            private_key_multibase,
+            mediator_did,
+        )
+        .await
+        .map_err(|e| VtaError::TspTransport(e.to_string()))?;
+
+        // §7.2.2: the VTA drops an application message from a VID it holds no
+        // relationship with, so the control exchange is a precondition of every
+        // Trust Task this client will send — not an optional courtesy. Doing it
+        // here rather than exposing a `relate()` for callers to remember is the
+        // difference between a client that works and one that times out with
+        // nothing in any log on either side.
+        //
+        // Nothing to await: the VTA records the invite on arrival and
+        // `admits_application_message` is true for any state but `None`, so
+        // traffic flows without waiting for an accept (§3.6). `relate` is
+        // idempotent, so a reconnect against a durable relationship store is a
+        // no-op rather than an `InvalidTransition`.
+        session
+            .relate(vta_did)
+            .await
+            .map_err(|e| VtaError::TspTransport(format!("TSP relationship failed: {e}")))?;
+
+        Ok(Self::tsp_transport(
+            session,
+            vta_did,
+            mediator_did,
+            rest_url,
+            Some(ClientIdentity {
+                client_did: client_did.to_string(),
+                private_key_multibase: private_key_multibase.to_string(),
+                vta_did: vta_did.to_string(),
+                verification_method: None,
+            }),
+        ))
+    }
+
+    /// Wrap a connected [`TspSession`](crate::session::TspSession) in a client —
+    /// the TSP counterpart of
+    /// [`didcomm_transport`](Self::didcomm_transport), including its required
+    /// `identity` argument and the reason for it.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    fn tsp_transport(
+        session: crate::session::TspSession,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+        identity: Option<ClientIdentity>,
+    ) -> Self {
+        let rest_client = rest_url.as_ref().map(|_| crate::http::rest_client());
+        Self {
+            #[cfg(feature = "test-loopback")]
+            loopback: None,
+            reply_resolver: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            // Refusing an unsigned reply is the default because a reply that
+            // attests to nothing is what this exists to stop being acceptable.
+            require_signed_replies: true,
+            receive_leg: Default::default(),
+            record_members: Default::default(),
+            identity: identity.map(std::sync::Arc::new),
+            transport: Transport::Tsp {
+                session: std::sync::Arc::new(session),
+                vta_did: vta_did.to_string(),
+                mediator_did: mediator_did.to_string(),
+                rest_client,
+                rest_url: rest_url.map(|u| u.trim_end_matches('/').to_string()),
+            },
+        }
+    }
+
+    /// Move the **Trust-Task surface** of this DIDComm client onto TSP, keeping
+    /// the DIDComm leg for everything TSP does not carry.
+    ///
+    /// This is the seam for a consumer that already holds a DIDComm session and
+    /// wants TSP too (#803). Before it existed, the only way to a TSP-capable
+    /// client was [`connect_tsp`](Self::connect_tsp), which opens its **own**
+    /// websocket — and since the mediator permits one websocket per DID, and the
+    /// reference deployment advertises the *same* mediator for `#tsp` and
+    /// `#vta-didcomm`, that second socket is rejected with `duplicate-channel`
+    /// and the two reconnect loops duel.
+    ///
+    /// # What moves, and what does not
+    ///
+    /// - [`dispatch_trust_task`](Self::dispatch_trust_task) and everything built
+    ///   on it (`rpc_tt`, the `device/*` and `vault/*` methods, the generic
+    ///   trust-task escape hatch) routes over TSP.
+    /// - The DIDComm session itself stays: it holds the mediator's one socket
+    ///   per DID, and TSP receive arrives on it. The SDK sends no bare DIDComm
+    ///   protocol messages any more, so nothing else stays behind.
+    ///
+    /// # Cost
+    ///
+    /// **No I/O, and it cannot fail on the transport.** TSP send is an HTTP post
+    /// to the mediator and TSP receive already arrives on the existing socket,
+    /// so there is nothing to connect.
+    ///
+    /// Get `tsp_mediator_did` from
+    /// [`resolve_vta_endpoint`](crate::session::resolve_vta_endpoint) — it reads
+    /// the `#tsp` (`TSPTransport`) service entry, which is **not** assumed to
+    /// match the DIDComm mediator. When it doesn't match, this refuses and names
+    /// [`attach_tsp_leg`](Self::attach_tsp_leg): a different mediator genuinely
+    /// needs its own session, and that one needs key material a `DIDCommSession`
+    /// deliberately does not keep.
+    ///
+    /// Errors with [`VtaError::Validation`] on a non-DIDComm client: a REST
+    /// client has no session to ride, and a [`connect_tsp`](Self::connect_tsp)
+    /// client is already entirely on TSP.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    pub fn enable_tsp_trust_tasks(&mut self, tsp_mediator_did: &str) -> Result<(), VtaError> {
+        let Transport::DIDComm { session, tsp, .. } = &mut self.transport else {
+            return Err(VtaError::Validation(
+                "enable_tsp_trust_tasks needs a DIDComm client — TSP rides its mediator \
+                 session. Connect with `connect_didcomm` first, or use `connect_tsp` for a \
+                 TSP-only client."
+                    .into(),
+            ));
+        };
+
+        match tsp_leg_kind(session.mediator_did(), tsp_mediator_did) {
+            TspLegKind::Multiplexed => {
+                *tsp = Some(TspLeg::Multiplexed);
+                Ok(())
+            }
+            TspLegKind::Separate => Err(VtaError::Validation(format!(
+                "this VTA advertises its TSP mediator ({tsp_mediator_did}) separately from \
+                 its DIDComm mediator ({}), so TSP cannot ride the DIDComm session — build \
+                 a TspSession against the TSP mediator and pass it to `attach_tsp_leg`, or \
+                 use `connect_didcomm_with_tsp`, which does both.",
+                session.mediator_did()
+            ))),
+        }
+    }
+
+    /// Attach a **separately-connected** TSP session as this DIDComm client's
+    /// Trust-Task leg, for the split-mediator topology where the VTA's `#tsp`
+    /// endpoint names a different mediator from its `#vta-didcomm` one.
+    ///
+    /// The client takes ownership: [`shutdown`](Self::shutdown) closes this
+    /// session along with the DIDComm one.
+    ///
+    /// **Refuses when the two mediators are the same.** A second socket for one
+    /// DID on one mediator is `duplicate-channel` and duelling reconnect loops
+    /// (#803) — the very defect this whole surface exists to prevent — so that
+    /// case is not merely discouraged here, it is unrepresentable. Use
+    /// [`enable_tsp_trust_tasks`](Self::enable_tsp_trust_tasks), which is free.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    pub fn attach_tsp_leg(
+        &mut self,
+        tsp_session: std::sync::Arc<crate::session::TspSession>,
+        tsp_mediator_did: &str,
+    ) -> Result<(), VtaError> {
+        let Transport::DIDComm { session, tsp, .. } = &mut self.transport else {
+            return Err(VtaError::Validation(
+                "attach_tsp_leg needs a DIDComm client — the TSP leg is the Trust-Task half \
+                 of a two-transport client. Use `connect_tsp` for a TSP-only client."
+                    .into(),
+            ));
+        };
+        if tsp_leg_kind(session.mediator_did(), tsp_mediator_did) == TspLegKind::Multiplexed {
+            return Err(VtaError::Validation(format!(
+                "refusing to attach a second session for {} on mediator {tsp_mediator_did}: \
+                 the mediator permits one websocket per DID, so this would be evicted as \
+                 `duplicate-channel`. This VTA advertises the same mediator for TSP and \
+                 DIDComm — call `enable_tsp_trust_tasks` instead (no second socket needed).",
+                session.client_did()
+            )));
+        }
+        *tsp = Some(TspLeg::Separate {
+            session: tsp_session,
+            mediator_did: tsp_mediator_did.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Connect via DIDComm and put the Trust-Task surface on TSP in one call,
+    /// picking the right leg for the VTA's topology: the DIDComm session's own
+    /// socket when both services name the same mediator, otherwise a TSP session
+    /// against the separate one.
+    ///
+    /// The same [`shutdown`](Self::shutdown) contract applies — and it closes
+    /// both legs.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    pub async fn connect_didcomm_with_tsp(
+        client_did: &str,
+        private_key_multibase: &str,
+        vta_did: &str,
+        mediator_did: &str,
+        tsp_mediator_did: &str,
+        rest_url: Option<String>,
+    ) -> Result<Self, VtaError> {
+        let mut client = Self::connect_didcomm(
+            client_did,
+            private_key_multibase,
+            vta_did,
+            mediator_did,
+            rest_url,
+        )
+        .await?;
+
+        let attached = match tsp_leg_kind(mediator_did, tsp_mediator_did) {
+            TspLegKind::Multiplexed => client.enable_tsp_trust_tasks(tsp_mediator_did),
+            TspLegKind::Separate => {
+                tracing::debug!(
+                    didcomm_mediator = %mediator_did,
+                    tsp_mediator = %tsp_mediator_did,
+                    "VTA advertises a separate TSP mediator; connecting a TSP session for it"
+                );
+                match crate::session::TspSession::connect(
+                    client_did,
+                    private_key_multibase,
+                    tsp_mediator_did,
+                )
+                .await
+                {
+                    Ok(s) => client.attach_tsp_leg(std::sync::Arc::new(s), tsp_mediator_did),
+                    Err(e) => Err(VtaError::TspTransport(e.to_string())),
+                }
+            }
+        };
+
+        // Shut the DIDComm session down rather than leaking it if the TSP leg
+        // can't be established — this constructor either returns a whole client
+        // or nothing.
+        if let Err(e) = attached {
+            client.shutdown().await;
+            return Err(e);
+        }
+
+        // §7.2.2 applies to the Trust-Task leg whichever shape it took: a
+        // multiplexed leg on the DIDComm session's own socket, or a separate
+        // TSP session. Both send application messages to the VTA, and the VTA
+        // drops them without a relationship.
+        //
+        // Failing here tears the client down for the same reason the block
+        // above does: a client that cannot form the relationship cannot send a
+        // Trust Task, and returning it half-working is how a caller discovers
+        // the problem as an unexplained timeout much later.
+        if let Err(e) = client.relate_trust_task_leg(vta_did).await {
+            client.shutdown().await;
+            return Err(e);
+        }
+        Ok(client)
+    }
+
+    /// Form the §7.2.2 relationship on whichever leg carries the Trust-Task
+    /// surface, or do nothing when that surface is not on TSP.
+    ///
+    /// Idempotent, because the underlying `relate` is: see
+    /// [`TspSession::relate`](crate::session::TspSession::relate).
+    ///
+    /// `pub(crate)` so the session-layer `Auto` connect path can form the
+    /// relationship on the leg it just attached, exactly as this constructor
+    /// does — without it that path returns a client that sends Trust Tasks over
+    /// TSP but drops every reply under §7.2.2.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    pub(crate) async fn relate_trust_task_leg(&self, vta_did: &str) -> Result<(), VtaError> {
+        match &self.transport {
+            Transport::Tsp { session, .. } => session
+                .relate(vta_did)
+                .await
+                .map_err(|e| VtaError::TspTransport(format!("TSP relationship failed: {e}"))),
+            Transport::DIDComm { session, tsp, .. } => match tsp {
+                // TSP rides the DIDComm session's own socket, so the
+                // relationship is formed on that session.
+                Some(TspLeg::Multiplexed) => session.relate_tsp(vta_did).await,
+                // The leg owns its own session; relate on that one.
+                Some(TspLeg::Separate { session, .. }) => session
+                    .relate(vta_did)
+                    .await
+                    .map_err(|e| VtaError::TspTransport(format!("TSP relationship failed: {e}"))),
+                // The Trust-Task surface is on DIDComm. Authcrypt carries its
+                // own sender authentication and has no relationship concept,
+                // so there is nothing to form.
+                None => Ok(()),
+            },
+            Transport::Rest { .. } => Ok(()),
+        }
+    }
+
+    /// Form the Rev 3 §7.2.2 relationship for the TSP Trust-Task leg, for a
+    /// caller that attached the leg with
+    /// [`enable_tsp_trust_tasks`](Self::enable_tsp_trust_tasks) — the
+    /// `connect_auto` + enable two-step — rather than
+    /// [`connect_didcomm_with_tsp`](Self::connect_didcomm_with_tsp), which
+    /// already relates internally.
+    ///
+    /// Without this step a Rev 3 VTA drops the leg's first Trust Task: the
+    /// relationship is what authorises the session to send application
+    /// messages, and the VTA silently discards messages that arrive without
+    /// one.
+    ///
+    /// Idempotent — the underlying relate is state-read guarded — so calling it
+    /// after `enable_tsp_trust_tasks` is safe, and a no-op when the Trust-Task
+    /// surface is not on TSP.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    pub async fn relate_tsp_trust_task_leg(&self, vta_did: &str) -> Result<(), VtaError> {
+        self.relate_trust_task_leg(vta_did).await
+    }
+
+    /// Revert this client to pure DIDComm, dropping any Trust-Task TSP leg that
+    /// [`enable_tsp_trust_tasks`](Self::enable_tsp_trust_tasks) or
+    /// [`attach_tsp_leg`](Self::attach_tsp_leg) put in place.
+    ///
+    /// A `Separate` leg owns its own socket, so it is shut down (the same
+    /// one-websocket-per-DID contract [`shutdown`](Self::shutdown) honours); a
+    /// `Multiplexed` leg shares the DIDComm socket and only needs clearing.
+    ///
+    /// Used by the `Auto` connect path to fall back cleanly when the §7.2.2
+    /// relationship cannot be formed: a leg left attached would keep routing
+    /// Trust Tasks over a relationship-less TSP session and drop every reply,
+    /// which is worse than never having advertised TSP at all.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    pub(crate) async fn disable_tsp_trust_tasks(&mut self) {
+        if let Transport::DIDComm { tsp, .. } = &mut self.transport
+            && let Some(TspLeg::Separate { session, .. }) = tsp.take()
+        {
+            session.shutdown().await;
+        }
+    }
+
+    /// Which transport carries the **Trust-Task** surface
+    /// ([`dispatch_trust_task`](Self::dispatch_trust_task), `rpc_tt`, the
+    /// `device/*` and `vault/*` methods).
+    ///
+    /// Every client operation is a Trust Task, so this is the client's
+    /// transport. A DIDComm client with a TSP leg reports TSP: the DIDComm
+    /// session remains only as the mediator's one socket per DID, carrying TSP
+    /// receive.
+    pub fn trust_task_transport(&self) -> SurfaceTransport {
+        match &self.transport {
+            Transport::Rest { .. } => SurfaceTransport::Rest,
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => SurfaceTransport::Tsp,
+            #[cfg(feature = "session")]
+            Transport::DIDComm {
+                #[cfg(feature = "tsp")]
+                tsp,
+                ..
+            } => {
+                #[cfg(feature = "tsp")]
+                if tsp.is_some() {
+                    return SurfaceTransport::Tsp;
+                }
+                SurfaceTransport::Didcomm
+            }
+        }
+    }
+
+    /// Set the Bearer token for authenticated requests (REST only, no-op for DIDComm).
+    ///
+    /// Can be called from sync or async contexts. For async contexts, use
+    /// [`set_token_async`](Self::set_token_async) to avoid potential blocking.
+    pub fn set_token(&self, token: String) {
+        match &self.transport {
+            Transport::Rest { auth, .. } => {
+                // try_lock avoids blocking the current thread if called from async
+                if let Ok(mut guard) = auth.try_lock() {
+                    guard.token = Some(token);
+                }
+            }
+            #[cfg(feature = "session")]
+            Transport::DIDComm { .. } => {}
+            // Intrinsic-sender auth — there is no bearer token on this path.
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => {}
+        }
+    }
+
+    /// Set the Bearer token (async version).
+    /// A client authenticated as `identity`, carrying both the token and the
+    /// identity it signs with.
+    ///
+    /// Prefer this over `new` + [`with_identity`](Self::with_identity) +
+    /// `set_token_async` wherever all three are known at once, which is every
+    /// post-authentication site: the three-step form is what let five of them
+    /// ship with the identity missing, because nothing about
+    /// `new(url).set_token(t)` looks incomplete.
+    pub async fn authenticated(url: &str, identity: ClientIdentity, token: String) -> Self {
+        let client = Self::new(url).with_identity(identity);
+        client.set_token_async(token).await;
+        client
+    }
+
+    /// Give this client the identity it signs and addresses documents with.
+    ///
+    /// Without one, every dispatched document is missing an in-band `recipient`
+    /// (SPEC §7.2 item 5b, required by all 109 dispatched specs) and a `proof`
+    /// (item 7a, required by 72 of them), and a conforming VTA refuses it.
+    pub fn with_identity(mut self, identity: ClientIdentity) -> Self {
+        self.identity = Some(std::sync::Arc::new(identity));
+        self
+    }
+
+    pub async fn set_token_async(&self, token: String) {
+        match &self.transport {
+            Transport::Rest { auth, .. } => {
+                auth.lock().await.token = Some(token);
+            }
+            #[cfg(feature = "session")]
+            Transport::DIDComm { .. } => {}
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => {}
+        }
+    }
+
+    /// The VTA's HTTP base URL, or `None` if this client has none.
+    ///
+    /// **This is the only accessor you may build an HTTP request from.**
+    /// `Some` on the REST transport. On DIDComm it yields the optional
+    /// REST side-channel (`None` unless the client was constructed with
+    /// one) — a DIDComm client is not guaranteed to know an HTTP URL at
+    /// all, so callers must handle `None` rather than assume one exists.
+    ///
+    /// Replaces the former `base_url()`, which returned the VTA *DID* on
+    /// DIDComm and so silently produced `did:…/some/path` when
+    /// interpolated into a URL.
+    pub fn rest_url(&self) -> Option<&str> {
+        match &self.transport {
+            Transport::Rest { base_url, .. } => Some(base_url),
+            #[cfg(feature = "session")]
+            Transport::DIDComm { rest_url, .. } => rest_url.as_deref(),
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { rest_url, .. } => rest_url.as_deref(),
+        }
+    }
+
+    /// The VTA's DID, or `None` if this client doesn't know it.
+    ///
+    /// `Some` on the DIDComm transport (the session is established
+    /// against it). `None` on REST — a REST client is never told the
+    /// VTA's DID.
+    pub fn vta_did(&self) -> Option<&str> {
+        match &self.transport {
+            Transport::Rest { .. } => None,
+            #[cfg(feature = "session")]
+            Transport::DIDComm { session, .. } => Some(&session.vta_did),
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { vta_did, .. } => Some(vta_did),
+        }
+    }
+
+    /// Open a reusable trust-ping session to `mediator_did`, paired with the VTA
+    /// DID to probe, with this client's own mediator account provisioned.
+    ///
+    /// A VTA's `--setup-acl` opens the *VTA's* account. The pong travels back
+    /// forwarded, which a mediator that refuses forwarded delivery by default
+    /// drops until this client's own account accepts it — the same step
+    /// `pnm health` takes before its forwarded ping. Returned rather than
+    /// pinged here so a caller polling for readiness pays the session setup
+    /// once instead of out of every probe window.
+    #[cfg(feature = "session")]
+    pub async fn open_vta_ping_session(
+        &self,
+        mediator_did: &str,
+        client_name: &str,
+    ) -> Result<(crate::session::TrustPingSession, String), Box<dyn std::error::Error>> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or("client has no identity for trust-ping")?;
+        let session = crate::session::TrustPingSession::new(
+            &identity.client_did,
+            &identity.private_key_multibase,
+            mediator_did,
+        )
+        .await?;
+        session.provision_client_acl(client_name).await;
+        Ok((session, identity.vta_did.clone()))
+    }
+
+    /// Human-readable identifier for the VTA this client talks to — the
+    /// REST URL, or the VTA DID on a DIDComm client with no REST URL.
+    ///
+    /// **Display and diagnostics only.** The value is a URL on one
+    /// transport and a DID on the other, so never interpolate it into a
+    /// request — use [`rest_url`](Self::rest_url) for that.
+    pub fn endpoint_label(&self) -> &str {
+        match &self.transport {
+            Transport::Rest { base_url, .. } => base_url,
+            #[cfg(feature = "session")]
+            Transport::DIDComm {
+                session, rest_url, ..
+            } => rest_url.as_deref().unwrap_or(&session.vta_did),
+            #[cfg(feature = "tsp")]
+            Transport::Tsp {
+                vta_did, rest_url, ..
+            } => rest_url.as_deref().unwrap_or(vta_did),
+        }
+    }
+
+    /// Provision this client's own allow-all mediator ACL over its live DIDComm
+    /// socket, awaiting the result. No-op on a REST or TSP-only client.
+    ///
+    /// Call before an operation whose reply the mediator must *forward* back to
+    /// this DID — a freshly bootstrapped or rotated client is otherwise closed
+    /// for forwarded delivery and the reply is dropped. Reuses the connection
+    /// already open here rather than building a second one for the same DID.
+    #[cfg(feature = "session")]
+    pub async fn provision_client_acl(&self, client_name: &str) {
+        if let Transport::DIDComm { session, .. } = &self.transport {
+            session.provision_client_acl(client_name).await;
+        }
+    }
+
+    /// Gracefully shut down the client.
+    ///
+    /// **Required for every DIDComm client** (no-op for REST). A DIDComm
+    /// `VtaClient` owns a live, auto-reconnecting mediator session that [`Drop`]
+    /// cannot close; failing to call this leaks the session and causes
+    /// duplicate-WebSocket mediator duels + round-trip timeouts. Idempotent and
+    /// safe to call on any clone. Prefer [`with_didcomm`](Self::with_didcomm) so
+    /// you can't forget.
+    pub async fn shutdown(&self) {
+        #[cfg(feature = "session")]
+        if let Transport::DIDComm { session, .. } = &self.transport {
+            session.shutdown().await;
+        }
+        // A `Separate` TSP leg owns its own socket, so it leaks exactly like a
+        // DIDComm session would if nothing closed it. `Multiplexed` has nothing
+        // of its own — the DIDComm shutdown above already took its socket down.
+        #[cfg(all(feature = "session", feature = "tsp"))]
+        if let Transport::DIDComm {
+            tsp: Some(TspLeg::Separate { session, .. }),
+            ..
+        } = &self.transport
+        {
+            session.shutdown().await;
+        }
+        // Same one-websocket-per-DID contract as DIDComm: a leaked TSP session
+        // makes the next connect for this DID fight the old one.
+        #[cfg(feature = "tsp")]
+        if let Transport::Tsp { session, .. } = &self.transport {
+            session.shutdown().await;
+        }
+    }
+
+    /// Run `f` with a DIDComm client that is **guaranteed to be shut down** on
+    /// the way out — the scoped, leak-proof alternative to
+    /// [`connect_didcomm`](Self::connect_didcomm) + a manual `shutdown()`.
+    ///
+    /// Connects, hands the client to `f`, then calls `shutdown().await`
+    /// **whether `f` returns `Ok` or `Err`** (the common forgotten-cleanup
+    /// path), and returns `f`'s result. The session can't outlive the scope, so
+    /// there's no duplicate-WebSocket duel between sequential uses.
+    ///
+    /// ```ignore
+    /// let dids = VtaClient::with_didcomm(client_did, key, vta_did, mediator, rest, |client| async move {
+    ///     client.list_webvh_dids().await   // ...use client...
+    /// })
+    /// .await?;   // shutdown() already ran
+    /// ```
+    ///
+    /// (If `f`'s future *panics*, the async `shutdown()` cannot run from the
+    /// unwinding drop, but the leak guard still logs a `WARN`.)
+    #[cfg(feature = "session")]
+    pub async fn with_didcomm<F, Fut, T>(
+        client_did: &str,
+        private_key_multibase: &str,
+        vta_did: &str,
+        mediator_did: &str,
+        rest_url: Option<String>,
+        f: F,
+    ) -> Result<T, VtaError>
+    where
+        F: FnOnce(VtaClient) -> Fut,
+        Fut: std::future::Future<Output = Result<T, VtaError>>,
+    {
+        let client = Self::connect_didcomm(
+            client_did,
+            private_key_multibase,
+            vta_did,
+            mediator_did,
+            rest_url,
+        )
+        .await?;
+        // Run the body, then shut down regardless of Ok/Err before returning.
+        let result = f(client.clone()).await;
+        client.shutdown().await;
+        result
+    }
+
+    // ── RPC helpers ─────────────────────────────────────────────────
+
+    /// Ensure the REST auth token is valid, refreshing if needed.
+    pub(super) async fn ensure_token_valid(
+        client: &Client,
+        base_url: &str,
+        auth: &tokio::sync::Mutex<RestAuth>,
+    ) -> Result<(), VtaError> {
+        let mut guard = auth.lock().await;
+
+        // Check if token is still valid (>30s remaining)
+        if let Some(expires_at) = guard.expires_at {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now + 30 < expires_at {
+                return Ok(()); // Token still valid
+            }
+        } else if guard.token.is_some() {
+            // Token without expiry — assume valid
+            return Ok(());
+        }
+
+        // No credential stored — can't auto-refresh
+        let Some(ref cred) = guard.credential else {
+            return Ok(());
+        };
+
+        // Try refresh token first (cheaper than full re-auth)
+        if let Some(ref refresh_tok) = guard.refresh_token
+            && let Some(refresh_exp) = guard.refresh_expires_at
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now < refresh_exp
+                && let Ok(result) = crate::auth_light::refresh_token_light(
+                    client,
+                    base_url,
+                    &cred.did,
+                    &cred.vta_did,
+                    refresh_tok,
+                )
+                .await
+            {
+                guard.token = Some(result.access_token);
+                guard.expires_at = Some(result.access_expires_at);
+                if let Some(new_refresh) = result.refresh_token {
+                    guard.refresh_token = Some(new_refresh);
+                }
+                guard.refresh_expires_at = result.refresh_expires_at;
+                return Ok(());
+            }
+            // Refresh failed or expired — fall through to full re-auth
+        }
+
+        // Full re-authentication
+        let did = cred.did.clone();
+        let pk = cred.private_key_multibase.clone();
+        let vta = cred.vta_did.clone();
+        drop(guard); // Release lock before async call
+
+        let result =
+            crate::auth_light::challenge_response_light(client, base_url, &did, &pk, &vta).await?;
+
+        let mut guard = auth.lock().await;
+        guard.token = Some(result.access_token);
+        guard.expires_at = Some(result.access_expires_at);
+        guard.refresh_token = result.refresh_token;
+        guard.refresh_expires_at = result.refresh_expires_at;
+        Ok(())
+    }
+
+    /// Force a **full** re-authentication (challenge-response), discarding
+    /// the cached access token *and* the refresh token. Unlike
+    /// [`ensure_token_valid`](Self::ensure_token_valid) — which trusts the
+    /// locally stored expiry — this is the reaction to the VTA actually
+    /// rejecting a request (401/403): the token the local clock believed
+    /// valid is stale server-side (clock skew, a VTA restart, or a
+    /// refresh-rotation desync), so both cached tokens are cleared before
+    /// re-authenticating from the stored credential.
+    ///
+    /// Returns `Ok(true)` if a re-auth ran, `Ok(false)` if no credential is
+    /// stored (nothing to retry with — e.g. a client given only a bare
+    /// token via [`set_token`](Self::set_token)).
+    pub(super) async fn force_reauth(
+        client: &Client,
+        base_url: &str,
+        auth: &tokio::sync::Mutex<RestAuth>,
+    ) -> Result<bool, VtaError> {
+        let cred = {
+            let mut guard = auth.lock().await;
+            let Some(cred) = guard.credential.clone() else {
+                return Ok(false);
+            };
+            // Invalidate every cached token up front so a racing
+            // `ensure_token_valid` can't hand back the just-rejected token.
+            guard.token = None;
+            guard.expires_at = None;
+            guard.refresh_token = None;
+            guard.refresh_expires_at = None;
+            cred
+        };
+
+        let result = crate::auth_light::challenge_response_light(
+            client,
+            base_url,
+            &cred.did,
+            &cred.private_key_multibase,
+            &cred.vta_did,
+        )
+        .await?;
+
+        let mut guard = auth.lock().await;
+        guard.token = Some(result.access_token);
+        guard.expires_at = Some(result.access_expires_at);
+        guard.refresh_token = result.refresh_token;
+        guard.refresh_expires_at = result.refresh_expires_at;
+        Ok(true)
+    }
+
+    /// Send an authenticated REST request, with a single reactive
+    /// re-auth-and-retry on a 401/403.
+    ///
+    /// Proactive refresh ([`ensure_token_valid`](Self::ensure_token_valid))
+    /// only reacts to the *local* clock; it can't catch a token the VTA
+    /// invalidated out-of-band. So if the response is `401`/`403`, we
+    /// [`force_reauth`](Self::force_reauth) once and replay the request,
+    /// turning a transient auth rejection into a self-heal instead of a
+    /// propagated error. The retry needs a cloneable request body
+    /// ([`RequestBuilder::try_clone`]); JSON bodies clone fine, streaming
+    /// bodies don't and simply skip the retry. A persistent denial (e.g. an
+    /// expired ACL entry) still surfaces — the replay is rejected too.
+    ///
+    /// `req` must be the request **before** the bearer token is attached;
+    /// this helper attaches it (and re-attaches the fresh one on retry).
+    pub(super) async fn send_authed(
+        client: &Client,
+        base_url: &str,
+        auth: &tokio::sync::Mutex<RestAuth>,
+        req: RequestBuilder,
+    ) -> Result<reqwest::Response, VtaError> {
+        Self::ensure_token_valid(client, base_url, auth).await?;
+        let retry_req = req.try_clone();
+        let token = auth.lock().await.token.clone();
+        let resp = Self::with_auth_token(req, &token).send().await?;
+
+        let status = resp.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) && let Some(retry_req) = retry_req
+        {
+            match Self::force_reauth(client, base_url, auth).await {
+                Ok(true) => {
+                    let token = auth.lock().await.token.clone();
+                    return Ok(Self::with_auth_token(retry_req, &token).send().await?);
+                }
+                // No credential to re-auth with — surface the original 401/403.
+                Ok(false) => {}
+                // Re-auth itself failed — keep the original response rather
+                // than masking the server's verdict with a transport error.
+                Err(e) => {
+                    tracing::debug!(
+                        %status,
+                        error = %e,
+                        "re-auth after auth rejection failed; surfacing original response"
+                    );
+                }
+            }
+        }
+        Ok(resp)
+    }
+
+    /// The DID this client sends as, when the transport has one.
+    ///
+    /// `None` over REST: a REST client authenticates with a bearer token, and
+    /// the token's subject is the VTA's business, not something to be inferred
+    /// here. Callers that need the DID on REST take it from the operator.
+    pub fn caller_did(&self) -> Option<&str> {
+        match &self.transport {
+            Transport::Rest { .. } => None,
+            #[cfg(feature = "session")]
+            Transport::DIDComm { session, .. } => Some(session.client_did()),
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { session, .. } => Some(session.client_did()),
+        }
+    }
+
+    /// The **DIDComm leg dispatches a Trust Task**
+    /// (binding envelope, `tt_uri`) instead of a raw protocol message, while the
+    /// **REST leg keeps using the dedicated route** built by `build_rest`.
+    ///
+    /// This is the bridge for surfaces (e.g. DID templates) that expose
+    /// dedicated REST endpoints but are only reachable over DIDComm through the
+    /// VTA's Trust-Task dispatcher (`trusttasks.org/spec/...`). The DIDComm
+    /// reply is a trust-task document whose `payload` is the result body.
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
+    pub(crate) async fn rpc_tt<T: serde::de::DeserializeOwned>(
+        &self,
+        tt_uri: &str,
+        payload: serde_json::Value,
+        timeout: u64,
+    ) -> Result<T, VtaError> {
+        // Ahead of the transport, and of the REST fork in particular: on a REST
+        // transport this method takes `build_rest` and never builds a Trust
+        // Task at all, so a loopback client that fell through to the match
+        // would observe nothing. See `client::loopback`.
+        #[cfg(feature = "test-loopback")]
+        if let Some(sink) = &self.loopback {
+            let response = sink.dispatch(tt_uri, &payload)?;
+            return serde_json::from_value(response)
+                .map_err(|e| VtaError::Protocol(format!("loopback response decode: {e}")));
+        }
+
+        match &self.transport {
+            // REST carries the Trust Task too, over the HTTPS binding
+            // (`POST /trust-tasks`) — the same document DIDComm and TSP
+            // send. It used to fork here into a bespoke per-operation route
+            // with its own request and response bodies, which is why REST was
+            // the one transport whose wire did not match the published
+            // schemas.
+            Transport::Rest { .. } => {
+                let payload = self.dispatch_trust_task(tt_uri, payload, timeout).await?;
+                serde_json::from_value(payload)
+                    .map_err(|e| VtaError::Protocol(format!("trust-task response decode: {e}")))
+            }
+            #[cfg(feature = "session")]
+            Transport::DIDComm { .. } => {
+                let payload = self.dispatch_trust_task(tt_uri, payload, timeout).await?;
+                serde_json::from_value(payload)
+                    .map_err(|e| VtaError::Protocol(format!("trust-task response decode: {e}")))
+            }
+            // Same trust-task path as DIDComm — `dispatch_trust_task` picks the
+            // transport, so this surface needed no per-operation work to reach
+            // TSP.
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => {
+                let payload = self.dispatch_trust_task(tt_uri, payload, timeout).await?;
+                serde_json::from_value(payload)
+                    .map_err(|e| VtaError::Protocol(format!("trust-task response decode: {e}")))
+            }
+        }
+    }
+
+    /// [`rpc_tt`](Self::rpc_tt) for operations that return `()` (e.g. DELETE).
+    /// The DIDComm leg still requires a non-rejection trust-task reply.
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
+    pub(crate) async fn rpc_tt_void(
+        &self,
+        tt_uri: &str,
+        payload: serde_json::Value,
+        timeout: u64,
+    ) -> Result<(), VtaError> {
+        // As in `rpc_tt` — see `client::loopback`.
+        #[cfg(feature = "test-loopback")]
+        if let Some(sink) = &self.loopback {
+            sink.dispatch(tt_uri, &payload)?;
+            return Ok(());
+        }
+
+        match &self.transport {
+            // Same fold as `rpc_tt`: the HTTPS binding carries the task.
+            Transport::Rest { .. } => {
+                let _ = self.dispatch_trust_task(tt_uri, payload, timeout).await?;
+                Ok(())
+            }
+            #[cfg(feature = "session")]
+            Transport::DIDComm { .. } => {
+                let _ = self.dispatch_trust_task(tt_uri, payload, timeout).await?;
+                Ok(())
+            }
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => {
+                let _ = self.dispatch_trust_task(tt_uri, payload, timeout).await?;
+                Ok(())
+            }
+        }
+    }
+
+    // ── Trust-task dispatch (device/vault slices) ──────────────────────
+
+    /// Dispatch a Trust Task over whichever transport this client uses and
+    /// return the success response's `payload`.
+    ///
+    /// The wire envelope is identical on both transports — `{ id, type,
+    /// payload }`:
+    /// - **REST** → `POST /trust-tasks` with the envelope; the HTTP status
+    ///   signals success/failure and the response body's `payload` is returned.
+    /// - **DIDComm** → a message of type [`TRUST_TASK_ENVELOPE_TYPE`] carrying
+    ///   the envelope as its body; the reply is itself a trust-task document
+    ///   (HTTP status is dropped on the wire), so a missing `payload` is treated
+    ///   as a rejection and surfaced as an error.
+    ///
+    /// Used by the `device/*` and `vault/*` client methods, which have no
+    /// dedicated REST route and are reachable only through the dispatcher; also
+    /// the generic escape hatch for invoking *any* of the VTA's trust-task
+    /// operations by URI (see `vta_sdk::trust_tasks::ALL_URIS` for the catalog).
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
+    /// Refuse a payload the recipient's schema will reject, before sending it.
+    ///
+    /// The recipient already runs this exact check — `validate_payload` on the
+    /// dispatch spine — and rejects with `malformedRequest`. Running it here
+    /// too changes *where the operator finds out*, which is the whole value:
+    ///
+    /// - **Locally, naming the member.** `keys/create` sending
+    ///   `"mnemonic": null` surfaced as `null is not of type "string"` from a
+    ///   remote service, with the client reporting a successful send. The
+    ///   payload never had to leave the process to be known bad.
+    /// - **On the pass-through surface especially.** `vault_*` and
+    ///   `device/list` take the whole payload as a caller-supplied `Value`, so
+    ///   no body struct guards them and no census can see them. This is the
+    ///   only check they can have.
+    ///
+    /// Skipped when the task has no published schema — `None` means "we cannot
+    /// know", not "anything goes", and refusing on that basis would break every
+    /// task the registry has not caught up with.
+    ///
+    /// This can only reject payloads the recipient would have rejected anyway;
+    /// the failure moves earlier and gets more legible, it does not get more
+    /// frequent.
+    fn check_payload_conforms(type_uri: &str, payload: &serde_json::Value) -> Result<(), VtaError> {
+        let Some(schema) = vti_specs::schema_index::schema_for(type_uri) else {
+            return Ok(());
+        };
+        crate::schema_cache::check(schema, payload).map_err(|e| {
+            VtaError::Protocol(format!(
+                "refusing to send a payload that does not conform to {type_uri}: {e}. \
+                 The recipient would reject this as `malformedRequest`. An unset optional \
+                 member must be ABSENT from the payload, not `null`."
+            ))
+        })
+    }
+
+    /// Run `op` as **one logical operation**, under one idempotency key, with
+    /// bounded retry on transient faults.
+    ///
+    /// This is the piece that makes the VTA's idempotency actually engage. A
+    /// retry loop written around a client method cannot carry a stable key,
+    /// because each call builds a fresh document — so the VTA sees an unrelated
+    /// request and the second durable effect happens anyway. Scoping the key
+    /// outside the call is the only place it can be held.
+    ///
+    /// ```no_run
+    /// # async fn f(
+    /// #     client: &vta_sdk::client::VtaClient,
+    /// #     build: impl Fn() -> vta_sdk::client::CreateKeyRequest,
+    /// # ) -> Result<(), vta_sdk::error::VtaError> {
+    /// let key = client.idempotent(|| client.create_key(build())).await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// `op` is re-invoked from scratch per attempt, so it must rebuild any
+    /// by-value request — but every attempt carries the *same* key, so a lost
+    /// reply converges on the first execution's result instead of repeating it.
+    ///
+    /// # Use this instead of your own retry loop, not around one
+    ///
+    /// Retry layers compose badly. The messaging delivery layer already retries
+    /// a durable outbox with backoff underneath this, so an application loop on
+    /// top multiplies attempts. This method is the application-layer owner:
+    /// bounded at [`MAX_ATTEMPTS`](crate::idempotency::MAX_ATTEMPTS), backed
+    /// off, and honouring the server's `retryAfter` hint up to a cap.
+    ///
+    /// Only transient faults are repeated
+    /// ([`is_transient`](crate::idempotency::is_transient)) — a validation
+    /// error or a conflict is returned immediately, because re-sending cannot
+    /// change it.
+    pub async fn idempotent<F, Fut, T>(&self, mut op: F) -> Result<T, VtaError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, VtaError>>,
+    {
+        use crate::idempotency::{IDEMPOTENCY_KEY, MAX_ATTEMPTS, backoff_for, is_transient};
+        let key = crate::idempotency::new_key();
+        IDEMPOTENCY_KEY
+            .scope(key.clone(), async move {
+                let mut attempt = 1usize;
+                loop {
+                    match op().await {
+                        Ok(v) => return Ok(v),
+                        Err(e) if attempt < MAX_ATTEMPTS && is_transient(&e) => {
+                            let wait = backoff_for(&e, attempt);
+                            #[cfg(feature = "client")]
+                            tracing::warn!(
+                                idempotency_key = %key,
+                                attempt,
+                                max = MAX_ATTEMPTS,
+                                error = %e,
+                                "VTA call failed; retrying under the same idempotency key in {wait:?}"
+                            );
+                            if !wait.is_zero() {
+                                tokio::time::sleep(wait).await;
+                            }
+                            attempt += 1;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            })
+            .await
+    }
+
+    /// After a TSP reply-timeout has re-formed the relationship, whether to
+    /// blind-resend the Trust Task once (`true`) or heal-only (`false`).
+    ///
+    /// A §7.2.2 drop is indistinguishable from a lost reply, so a blind resend
+    /// is safe only when a second execution does no harm — exactly what
+    /// `retry_safety` classifies. A `ReadOnly`/`RetrySafe` task is resent; a
+    /// `Keyed`/`KeyedSecret`/unknown task is left to [`idempotent`](Self::idempotent),
+    /// the one retry owner that holds a stable key, so this never double-executes
+    /// a mutation and never stacks a second retry loop on the idempotency one.
+    ///
+    /// Design note `tsp-relationship-recovery.md`, D4.
+    #[cfg(feature = "tsp")]
+    fn tsp_resend_after_reform(type_uri: &str) -> bool {
+        crate::retry_safety::retry_safety(type_uri).is_some_and(|c| c.is_blind_retry_safe())
+    }
+
+    /// Whether replies are reaching this client: reply timeouts in a row, and
+    /// how long since the last reply. A send that succeeds says nothing about
+    /// this — the request reached the mediator; whether its answer comes back
+    /// depends on this client's inbox being collected.
+    ///
+    /// A consumer showing connection state should show this beside it. A
+    /// session with `replies_not_arriving()` is one to rebuild, not retry.
+    pub fn receive_health(&self) -> ReceiveLegHealth {
+        self.receive_leg.snapshot()
+    }
+
+    /// Send a TSP request, with the §7.2.2 D4 self-repair on a reply timeout —
+    /// unless replies have stopped arriving altogether.
+    ///
+    /// `send` makes one request; `reform` re-forms the relationship and reports
+    /// whether it did. On a reply timeout the relationship is re-formed and, for
+    /// a retry-safe task, the request is sent once more — the D4 behaviour this
+    /// replaced, unchanged while the breaker is closed. Once
+    /// [`REPLY_TIMEOUT_BREAKER`] timeouts have happened in a row (across calls,
+    /// on any clone of this client) neither happens: the result is
+    /// [`VtaError::RepliesNotArriving`], and nothing more is queued for a
+    /// client that is not collecting. Any reply closes the breaker.
+    #[cfg(feature = "tsp")]
+    async fn tsp_request_with_self_repair<T, S, SF, R, RF>(
+        &self,
+        type_uri: &str,
+        mut send: S,
+        reform: R,
+    ) -> Result<T, VtaError>
+    where
+        S: FnMut() -> SF,
+        SF: std::future::Future<Output = Result<T, VtaError>>,
+        R: FnOnce() -> RF,
+        RF: std::future::Future<Output = bool>,
+    {
+        // `observe_tsp_reply` returns `Ok(Err(..))` only for a reply timeout
+        // below the breaker.
+        let first_err = match self.observe_tsp_reply(send().await)? {
+            Ok(reply) => return Ok(reply),
+            Err(e) => e,
+        };
+        if !reform().await || !Self::tsp_resend_after_reform(type_uri) {
+            return Err(first_err);
+        }
+        self.observe_tsp_reply(send().await)?
+    }
+
+    /// Record the receive-leg outcome of one TSP request.
+    ///
+    /// `Err(e)` for anything that is final now — a non-timeout failure, or
+    /// [`VtaError::RepliesNotArriving`] once the breaker trips. `Ok(Err(e))`
+    /// for a reply timeout below the breaker, which D4 may repair. `Ok(Ok(v))`
+    /// for a reply.
+    #[cfg(feature = "tsp")]
+    fn observe_tsp_reply<T>(
+        &self,
+        outcome: Result<T, VtaError>,
+    ) -> Result<Result<T, VtaError>, VtaError> {
+        match outcome {
+            Ok(v) => {
+                self.receive_leg.record_reply();
+                Ok(Ok(v))
+            }
+            Err(e) if e.is_tsp_reply_timeout() => {
+                let consecutive_timeouts = self.receive_leg.record_timeout();
+                if consecutive_timeouts >= REPLY_TIMEOUT_BREAKER {
+                    tracing::warn!(
+                        consecutive_timeouts,
+                        "replies from the VTA are not reaching this client; not re-forming the \
+                         TSP relationship or resending (each would queue another reply in an \
+                         inbox that is not being collected)"
+                    );
+                    Err(VtaError::RepliesNotArriving {
+                        consecutive_timeouts,
+                    })
+                } else {
+                    Ok(Err(e))
+                }
+            }
+            // A transport failure says nothing about the receive leg.
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn dispatch_trust_task(
+        &self,
+        type_uri: &str,
+        payload: serde_json::Value,
+        timeout: u64,
+    ) -> Result<serde_json::Value, VtaError> {
+        Self::check_payload_conforms(type_uri, &payload)?;
+
+        // Ahead of the transport: a loopback client answers the Trust-Task
+        // surface in-process. See `client::loopback`.
+        #[cfg(feature = "test-loopback")]
+        if let Some(sink) = &self.loopback {
+            return sink.dispatch(type_uri, &payload);
+        }
+
+        let reply = self.exchange_trust_task(type_uri, payload, timeout).await?;
+        Self::extract_trust_task_payload(reply)
+    }
+
+    /// [`dispatch_trust_task`](Self::dispatch_trust_task), answering the
+    /// **whole reply document** rather than its payload — the `#response`
+    /// document, or the `trust-task-error` document when the peer refused.
+    ///
+    /// For a caller that must read a refusal as the peer wrote it: a
+    /// specification's extended `code`, or the `details` a refusal carries for
+    /// the caller to act on (an inline step-up request, say). The typed
+    /// [`VtaError`] that `dispatch_trust_task` makes of a refusal keeps the
+    /// code and message and drops the rest.
+    ///
+    /// The request is the same document on every transport, signed by this
+    /// client's identity. A `#response` document is verified exactly as
+    /// `dispatch_trust_task` verifies it; a `trust-task-error` document is
+    /// returned as received (as `dispatch_trust_task` reads one unverified).
+    /// Transport failures and a reply that is not a Trust Task document are
+    /// still errors.
+    pub async fn dispatch_trust_task_document(
+        &self,
+        type_uri: &str,
+        payload: serde_json::Value,
+        timeout: u64,
+    ) -> Result<serde_json::Value, VtaError> {
+        Self::check_payload_conforms(type_uri, &payload)?;
+
+        #[cfg(feature = "test-loopback")]
+        if let Some(sink) = &self.loopback {
+            let payload = sink.dispatch(type_uri, &payload)?;
+            return Ok(serde_json::json!({
+                "type": format!("{type_uri}#response"),
+                "payload": payload,
+            }));
+        }
+
+        self.exchange_trust_task(type_uri, payload, timeout).await
+    }
+
+    /// Sign `payload` as a `type_uri` document, send it on this client's
+    /// transport, and answer the reply document — verified when it is a
+    /// `#response`, as received when it is a `trust-task-error`.
+    async fn exchange_trust_task(
+        &self,
+        type_uri: &str,
+        payload: serde_json::Value,
+        timeout: u64,
+    ) -> Result<serde_json::Value, VtaError> {
+        // Raise the budget to clear the VTA's own worst case when this is a
+        // task it answers by calling a third party (`budget::RELAYS_ONWARD`).
+        //
+        // Here rather than at the ~66 call sites because this is the one point
+        // every transport and every caller passes through — including a
+        // consumer outside this workspace calling `dispatch_trust_task`
+        // directly, which no amount of editing literals in `client/*.rs` would
+        // have reached. The literals stay as each caller's own floor; this only
+        // ever raises.
+        //
+        // Without it, `create_did_webvh`'s 60s sat below the VTA's ~60.5s and
+        // the caller stopped listening a few hundred milliseconds before the
+        // real error arrived — every time, on every attempt, so the operator
+        // saw a bare timeout and no diagnosis. Every other webvh verb carried
+        // the same latent inversion at 30s or 60s.
+        // Read only by the TSP and DIDComm arms below.
+        #[cfg_attr(
+            not(any(feature = "tsp", feature = "session")),
+            allow(unused_variables)
+        )]
+        let timeout = crate::budget::client_budget_secs(type_uri, timeout);
+
+        let doc = self.signed_task_document(type_uri, payload).await?;
+        match &self.transport {
+            Transport::Rest {
+                client,
+                base_url,
+                auth,
+            } => {
+                let req = client
+                    // `<base>/trust-tasks`, matching the published HTTPS
+                    // binding. `base_url` is the Trust-Task base — the
+                    // `#vta-rest` serviceEndpoint when discovered from the DID
+                    // document, else `--url`. This appended `/trust-tasks`
+                    // and worked only because the service happened to serve the
+                    // same prefix; a third-party client built from the binding
+                    // asked for `/trust-tasks` and got a 404. The service now
+                    // serves both, so this move is safe against any VTA that
+                    // has taken it, and the legacy path is marked superseded so
+                    // the usual metric decides when it goes.
+                    .post(format!("{base_url}/trust-tasks"))
+                    .json(&doc);
+                let resp = Self::send_authed(client, base_url, auth, req).await?;
+                if !resp.status().is_success() {
+                    // Parse the body before throwing on the status (R3.7).
+                    //
+                    // A refused task answers with a `trust-task-error` document
+                    // whose payload carries the machine-readable `code` and the
+                    // human `message`; deciding on the status alone throws both
+                    // away and reports the raw JSON as "unknown error". It is
+                    // also what surfaces `ConsentRequired`, so skipping it turns
+                    // an answerable question into a dead end.
+                    //
+                    // The fallback matches the bespoke REST routes this binding
+                    // replaced: read the document's `error` field, and truncate
+                    // an unparseable body rather than letting a
+                    // server-controlled page of text reach logs and CLI output.
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let url = resp.url().to_string();
+                    let text = resp.text().await.unwrap_or_default();
+
+                    // A 429 is refused before any handler runs, so its body is
+                    // never a Trust Task document; its meaning is in the headers.
+                    if let Some(err) =
+                        VtaError::rate_limited_from_http(status, &headers, &text, &url)
+                    {
+                        return Err(err);
+                    }
+                    // A refusal document is the reply: the caller reads it (the
+                    // payload extraction makes the same typed error of it that
+                    // was made here before).
+                    if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
+                        && let Some(payload) = doc.get("payload")
+                        && Self::trust_task_error(payload).is_some()
+                    {
+                        return Ok(doc);
+                    }
+                    if status == reqwest::StatusCode::CONFLICT {
+                        return Err(VtaError::Conflict(text));
+                    }
+                    return Err(VtaError::from_http(
+                        status,
+                        Self::extract_error_message(&text),
+                    ));
+                }
+                let response_doc: serde_json::Value = resp.json().await?;
+                self.verified_reply(response_doc).await
+            }
+            // The whole typed VTA surface over TSP. The VTA's inbound
+            // dispatcher opens the TSP binding envelope and hands the document
+            // to `dispatch_trust_task_core` — the same spine REST and DIDComm
+            // use — so the request and reply *documents* are byte-identical
+            // across all three transports. Only the carriage differs, and each
+            // binding names its own (`crate::tsp_binding` for this one).
+            #[cfg(feature = "tsp")]
+            Transport::Tsp {
+                session,
+                vta_did,
+                mediator_did,
+                ..
+            } => {
+                let body = Self::address_trust_task(doc, session.client_did(), vta_did)?;
+                let timeout = std::time::Duration::from_secs(timeout);
+                // §7.2.2 D4 self-repair: a reply-timeout may be a silent drop
+                // from a peer that lost the relationship. Re-form it (safe vs a
+                // false positive via the peer's reconcile transition); resend
+                // once only for a retry-safe task — a keyed one is healed for the
+                // next attempt but its resend is left to `idempotent`'s key.
+                // Not once replies have stopped arriving: see
+                // `REPLY_TIMEOUT_BREAKER`.
+                let reply = self
+                    .tsp_request_with_self_repair(
+                        type_uri,
+                        || async {
+                            session
+                                .request(vta_did, mediator_did, &body, timeout)
+                                .await
+                                .map_err(|e| VtaError::TspTransport(e.to_string()))
+                        },
+                        || async { session.force_relate(vta_did).await.is_ok() },
+                    )
+                    .await?;
+                self.verified_reply(Self::decode_trust_task_reply(&reply)?)
+                    .await
+            }
+            #[cfg(feature = "session")]
+            Transport::DIDComm {
+                session,
+                #[cfg(feature = "tsp")]
+                tsp,
+                ..
+            } => {
+                // With a TSP leg attached, trust tasks go over TSP while this
+                // session's DIDComm leg keeps the socket. The document is byte-identical either way — the VTA's TSP
+                // inbound dispatcher and its DIDComm envelope handler both feed
+                // `dispatch_trust_task_core`.
+                #[cfg(feature = "tsp")]
+                if let Some(leg) = tsp {
+                    let body =
+                        Self::address_trust_task(doc, session.client_did(), &session.vta_did)?;
+                    let timeout = std::time::Duration::from_secs(timeout);
+                    // §7.2.2 D4 self-repair on each leg shape: a reply-timeout may
+                    // be a silent drop from a peer that lost the relationship.
+                    // Re-form it and, for a retry-safe task, resend once; a keyed
+                    // task is healed but its resend is left to `idempotent`.
+                    let reply = match leg {
+                        // Rides the DIDComm session's own socket — no second
+                        // websocket for this DID (#803).
+                        TspLeg::Multiplexed => {
+                            self.tsp_request_with_self_repair(
+                                type_uri,
+                                || session.request_tsp(&session.vta_did, &body, timeout),
+                                || async {
+                                    session.force_relate_tsp(&session.vta_did).await.is_ok()
+                                },
+                            )
+                            .await?
+                        }
+                        TspLeg::Separate {
+                            session: tsp_session,
+                            mediator_did,
+                        } => {
+                            self.tsp_request_with_self_repair(
+                                type_uri,
+                                || async {
+                                    tsp_session
+                                        .request(&session.vta_did, mediator_did, &body, timeout)
+                                        .await
+                                        .map_err(|e| VtaError::TspTransport(e.to_string()))
+                                },
+                                || async {
+                                    tsp_session.force_relate(&session.vta_did).await.is_ok()
+                                },
+                            )
+                            .await?
+                        }
+                    };
+                    return self
+                        .verified_reply(Self::decode_trust_task_reply(&reply)?)
+                        .await;
+                }
+
+                const TRUST_TASK_ENVELOPE_TYPE: &str =
+                    "https://trusttasks.org/binding/didcomm/0.1/envelope";
+                let response_doc = session
+                    .send_and_wait_trust_task(TRUST_TASK_ENVELOPE_TYPE, doc, timeout)
+                    .await?;
+                self.verified_reply(response_doc).await
+            }
+        }
+    }
+
+    /// Address a trust-task document for a **mediator** transport and serialize
+    /// it.
+    ///
+    /// Both members are already set by [`build_task_document`] from the client's
+    /// [`ClientIdentity`]; this only fills them in for a document that somehow
+    /// arrived without them, and otherwise checks that the transport agrees with
+    /// what was signed.
+    ///
+    /// It used to assign both unconditionally, which is the shape of a bug this
+    /// path has already produced once in the other direction. A Data-Integrity
+    /// proof covers every member but `proof`, so writing `issuer` or `recipient`
+    /// *after* signing changes the bytes the signature was computed over: the
+    /// document leaves looking correctly addressed and is refused at the far end
+    /// as `proofInvalid`, which reads like a key problem rather than a
+    /// client-side rewrite. Today the values come from the same triple the
+    /// identity was built from, so the assignment was a no-op — but "it happens
+    /// to be equal" is not something the next constructor has to keep true, and
+    /// nothing was checking.
+    ///
+    /// A disagreement is refused rather than resolved, because neither answer is
+    /// safe: honouring the transport breaks the proof, and honouring the
+    /// document sends it somewhere the caller did not ask for.
+    #[cfg(feature = "tsp")]
+    fn address_trust_task(
+        mut doc: serde_json::Value,
+        issuer: &str,
+        recipient: &str,
+    ) -> Result<Vec<u8>, VtaError> {
+        for (member, from_transport) in [("issuer", issuer), ("recipient", recipient)] {
+            match doc.get(member).and_then(serde_json::Value::as_str) {
+                Some(signed) if signed == from_transport => {}
+                Some(signed) => {
+                    return Err(VtaError::Protocol(format!(
+                        "trust-task `{member}` is `{signed}` in the document but `{from_transport}`                          on the transport; rewriting it would invalidate the proof that covers it"
+                    )));
+                }
+                None => {
+                    doc[member] = serde_json::Value::String(from_transport.to_string());
+                }
+            }
+        }
+        serde_json::to_vec(&doc).map_err(|e| VtaError::Protocol(format!("trust-task encode: {e}")))
+    }
+
+    /// Parse a TSP reply frame back into a trust-task response document.
+    #[cfg(feature = "tsp")]
+    fn decode_trust_task_reply(reply: &str) -> Result<serde_json::Value, VtaError> {
+        serde_json::from_str(reply)
+            .map_err(|e| VtaError::Protocol(format!("trust-task reply decode: {e}")))
+    }
+
+    /// Accept replies that carry no proof.
+    ///
+    /// **A staging control, not a preference.** 265 published specifications
+    /// require a proof on their response, and an agent that predates
+    /// OpenVTC/verifiable-trust-infrastructure#1334 and #1335 sends none — so a
+    /// client upgraded ahead of the agent it talks to would refuse every answer
+    /// it got. This exists so that ordering can be chosen rather than endured.
+    ///
+    /// It weakens the check to almost nothing while set: an attacker who can
+    /// rewrite a reply can also remove its proof, so this catches accidental
+    /// corruption and a wrong-signer reply and stops nobody. A *present* proof
+    /// is still verified and still bound to the expected agent.
+    ///
+    /// Turn it off again as soon as the agent is upgraded.
+    #[must_use]
+    pub fn trusting_unsigned_replies(mut self) -> Self {
+        self.require_signed_replies = false;
+        self
+    }
+
+    /// Verify the reply and hand it back for the caller to read.
+    ///
+    /// # Why a client verifies at all
+    ///
+    /// A reply is bytes off a socket. Nothing else in this path establishes who
+    /// produced them: the transport proves a *connection*, and on REST it does
+    /// not even prove that much beyond TLS to a host name. Without the proof, an
+    /// intermediary can rewrite an ACL listing, flip a policy decision, or
+    /// answer for an agent that never spoke — and every check downstream passes,
+    /// because the checks downstream are about shape.
+    ///
+    /// SPEC §7.3 item 7 makes this the agent's obligation and this client's
+    /// business: a specification declaring a single `proofRequirement: REQUIRED`
+    /// binds its *response* as well as its request, and 265 of them do.
+    ///
+    /// # Two checks, and the second is the one easy to omit
+    ///
+    /// The proof must verify, **and its proven signer must be the agent this
+    /// client is talking to**. A proof by somebody else's key verifies perfectly
+    /// well; that it is not the party you expected is a separate comparison, and
+    /// skipping it turns "signed by somebody" into "signed by the agent".
+    ///
+    /// The expected signer is `ClientIdentity::vta_did`. A client with no
+    /// identity cannot produce conforming documents in the first place — it is
+    /// refused at the agent for a missing `recipient` — so there is nothing to
+    /// verify against and nothing worth verifying.
+    ///
+    /// # What is exempt
+    ///
+    /// An error document. Its `type` resolves to the framework's
+    /// `trust-task-error` specification, whose own proof requirement is
+    /// RECOMMENDED rather than REQUIRED (SPEC §8.1), so demanding one would make
+    /// every conforming refusal unreadable. A refusal confers nothing, which is
+    /// why the framework asks less of it.
+    async fn verified_reply(&self, doc: serde_json::Value) -> Result<serde_json::Value, VtaError> {
+        self.verify_reply(&doc).await?;
+        Ok(doc)
+    }
+
+    async fn verify_reply(&self, doc: &serde_json::Value) -> Result<(), VtaError> {
+        let Some(identity) = self.identity.as_ref() else {
+            return Ok(());
+        };
+        let doc_type = doc
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if doc_type.starts_with("https://trusttasks.org/spec/trust-task-error/") {
+            return Ok(());
+        }
+
+        let parsed: trust_tasks_rs::TrustTask<serde_json::Value> =
+            serde_json::from_value(doc.clone()).map_err(|e| {
+                VtaError::Protocol(format!("reply is not a Trust-Task document: {e}"))
+            })?;
+
+        if parsed.proof.is_none()
+            && !self.require_signed_replies
+            && !Self::reply_proof_is_load_bearing(doc_type)
+        {
+            return Ok(());
+        }
+
+        let resolver = self
+            .reply_resolver
+            // Must honour PNM_RESOLVER_URL like every other resolver in the SDK
+            // (#1515): resolving did:webvh directly here defeats a configured
+            // cache and lets the signer's host rate-limit verification. Shared,
+            // so the VTA DID this client already resolved to find its endpoint
+            // is answered from cache instead of fetched again.
+            .get_or_init(|| async { crate::resolver::shared_did_resolver_from_env().await.ok() })
+            .await;
+
+        // `None` means the resolver could not be built at all, which leaves a
+        // `did:key` signer verifiable and a `did:webvh` one refused by the
+        // resolver's own error — the honest outcome, and a legible one.
+        let vm_resolver =
+            crate::trust_task_proof::TrustTaskVmResolver::from_optional(resolver.clone());
+        // Over the reply as received, never a re-serialisation of `parsed`
+        // (VTI-45).
+        let signer = crate::trust_task_proof::verify_trust_task_proof_value(doc, &vm_resolver)
+            .await
+            .map_err(|e| match e {
+                crate::trust_task_proof::DiProofError::ResolverFailed(_) => {
+                    VtaError::Protocol(format!(
+                        "could not retrieve `{}`'s verification key, so its reply was not \
+                         checked and is not believed ({e}). This is a key-retrieval failure, \
+                         not a bad proof: the request may have taken effect, so check its \
+                         state before sending it again",
+                        identity.vta_did
+                    ))
+                }
+                other => VtaError::Protocol(format!(
+                    "the reply from `{}` is unsigned or its proof does not verify ({other}). An \
+                     unsigned answer is bytes, not evidence — every specification that requires \
+                     a proof on its request requires one on its response too (SPEC §7.3 item 7)",
+                    identity.vta_did
+                )),
+            })?;
+
+        if signer != identity.vta_did {
+            return Err(VtaError::Protocol(format!(
+                "the reply claiming to come from `{}` is signed by `{signer}`. The proof \
+                 verifies, which means somebody really signed it — just not the agent this \
+                 client is talking to",
+                identity.vta_did
+            )));
+        }
+        Ok(())
+    }
+
+    /// Replies whose proof is the whole point of the task, so an unsigned one
+    /// is refused even under [`trusting_unsigned_replies`](Self::trusting_unsigned_replies).
+    ///
+    /// `keys/import-wrapping-key`: a wrapping key an intermediary substituted
+    /// would read every private key sealed to it, and only the VTA's proof
+    /// detects the substitution (the task's own producer rule 2).
+    fn reply_proof_is_load_bearing(doc_type: &str) -> bool {
+        doc_type
+            .strip_suffix("#response")
+            .is_some_and(|uri| uri == crate::trust_tasks::TASK_KEYS_IMPORT_WRAPPING_KEY_0_1)
+    }
+
+    /// Pull `payload` out of a framework trust-task response document. A success
+    /// document carries `payload`; a rejection does not — surface its
+    /// `reason`/`comment` (or the whole document) as a protocol error so the
+    /// DIDComm path (which drops the HTTP status) still fails loudly.
+    pub(crate) fn extract_trust_task_payload(
+        doc: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        if let Some(payload) = doc.get("payload") {
+            // A failed task still carries a `payload` — the error envelope goes
+            // *inside* it (`{ code, message, retryable }`). Treating "a payload
+            // is present" as success therefore hands the caller an error object
+            // to deserialise as a result, and the caller reports whatever field
+            // its result type happened to be missing. The real message — which
+            // may be as specific as "not supported over the DIDComm transport" —
+            // is discarded, and the failure reads like a schema mismatch.
+            //
+            // Keyed on `code` + `message`, mirroring the service's own denial
+            // check (`vta-service`'s trust-task `denial_code`, which reads
+            // `payload.code`).
+            if let Some(err) = Self::trust_task_error(payload) {
+                return Err(err);
+            }
+            return Ok(payload.clone());
+        }
+        let reason = doc
+            .get("reason")
+            .or_else(|| doc.get("comment"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| doc.to_string());
+        Err(VtaError::Protocol(format!("trust task rejected: {reason}")))
+    }
+
+    /// Recognise a trust-task error envelope carried inside `payload`.
+    ///
+    /// Requires **both** `code` and `message` to be strings: `code` alone is a
+    /// plausible field on a legitimate result body, so demanding the pair keeps
+    /// a successful response from being mistaken for a failure.
+    fn trust_task_error(payload: &serde_json::Value) -> Option<VtaError> {
+        let code = payload.get("code")?.as_str()?;
+        let message = payload.get("message")?.as_str()?;
+
+        // A consent refusal is not a dead end — it is a question the caller can
+        // answer — so it gets a variant carrying what answering requires. The
+        // gate puts the machine-readable reason in `details.reason` precisely
+        // so a consumer keys on a stable field rather than the top-level `code`
+        // (`taskFailed` for every gated task) or the free-text message.
+        if let Some(details) = payload.get("details")
+            && details.get("reason").and_then(|r| r.as_str()) == Some("auth:consent_required")
+        {
+            let s = |k: &str| {
+                details
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            return Some(VtaError::ConsentRequired {
+                payload_digest: s("payloadDigest"),
+                challenge: s("challenge"),
+                approver_set: s("approverSet"),
+                min_approvals: details
+                    .get("minApprovals")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1) as u32,
+                // Absent on a server older than the field. `true` is the
+                // conservative read: it tells the caller to wait for another
+                // device rather than to offer a self-approval that the gate
+                // would refuse with `denied:requester_excluded`.
+                exclude_requester: details
+                    .get("excludeRequester")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            });
+        }
+
+        // The framework has no `notFound` / `conflict` / `gone` standard code,
+        // so all three arrive as `taskFailed` and the code alone cannot tell
+        // them from a genuine failure. The service marks them in
+        // `details.reason` for exactly this reason; recovering the typed
+        // variant here is what keeps a Trust-Task caller able to `match` on the
+        // same variants the REST (`from_http`) and DIDComm protocol-message
+        // (`from_problem_report`) paths already produce.
+        //
+        // Without it, a caller that treats an absent resource as a normal state
+        // cannot recognise one — which is how every `pnm approvals` subcommand
+        // came to fail on a VTA that had simply never had an approval rule.
+        if let Some(reason) = payload
+            .get("details")
+            .and_then(|d| d.get("reason"))
+            .and_then(|r| r.as_str())
+        {
+            use crate::protocols::trust_task_reject_reasons as r;
+            match reason {
+                r::NOT_FOUND => return Some(VtaError::NotFound(message.to_string())),
+                r::CONFLICT => return Some(VtaError::Conflict(message.to_string())),
+                r::GONE => return Some(VtaError::Gone(message.to_string())),
+                // What the REST path's `from_http` already makes of a 502, so a
+                // caller matching on `Server` sees the same thing whichever
+                // transport carried the call.
+                r::UPSTREAM_UNAVAILABLE => {
+                    return Some(VtaError::Server {
+                        status: 502,
+                        body: message.to_string(),
+                    });
+                }
+                r::NO_MATCHING_PROTOCOL => {
+                    if let Some(e) = payload
+                        .get("details")
+                        .and_then(VtaError::no_matching_protocol_from)
+                    {
+                        return Some(e);
+                    }
+                }
+                r::UNSUPPORTED_DID_METHOD => {
+                    if let Some(e) = payload
+                        .get("details")
+                        .and_then(VtaError::method_refusal_from)
+                    {
+                        return Some(e);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A task's own declared `<slug>:notFound` means the same thing as the
+        // `details.reason` marker above, and is the form a family that answers
+        // its specification's error codes sends — `vta/contexts/get:notFound`,
+        // `vta/app-state/…:notFound`, `persona/…:notFound`. Matching only the
+        // marker turned every one of those into a flat `Protocol` string when
+        // the contexts family started answering its declared codes (#1580), so
+        // a caller treating "absent" as a normal state — create it if missing —
+        // failed instead. The local part is matched, as for
+        // `transportUnavailable` below, because every task declaring it means
+        // it the same way.
+        if code
+            .rsplit_once(':')
+            .is_some_and(|(_, local)| local == "notFound")
+        {
+            return Some(VtaError::NotFound(message.to_string()));
+        }
+
+        // `permissionDenied` is the caller's authorization, which is a
+        // different thing to fix from every other rejection and already has a
+        // typed home. Left in `Protocol` it was a sentence a consumer had to
+        // string-match to tell "you have no grant here" from "this task
+        // failed" — the drift a typed error exists to prevent (see the
+        // `VtaError` doc: the CLI switches on variants to emit guidance).
+        if code == "permissionDenied" {
+            return Some(VtaError::Forbidden(message.to_string()));
+        }
+
+        // `vta/backup/initiate-{export,import}:transportUnavailable` — the VTA
+        // has no HTTPS address to publish the bytes at. Not a fault in the
+        // request and not a failure worth retrying: the transport is missing,
+        // which is exactly what `UnsupportedTransport` names, and the fix is
+        // on the VTA's configuration. Any task whose spec declares the same
+        // local code means the same thing, so match the local part.
+        if code
+            .rsplit_once(':')
+            .is_some_and(|(_, local)| local == "transportUnavailable")
+        {
+            return Some(VtaError::UnsupportedTransport(message.to_string()));
+        }
+
+        // `unsupportedType` / `unsupportedVersion` mean "upgrade something",
+        // and *which* thing depends on what the peer serves instead — so the
+        // peer's own answer travels as data rather than being flattened into a
+        // sentence. A VTA new enough to send `details.servedVersions` names the
+        // versions it does route; an older one sends nothing, which is why an
+        // empty list must not be read as "this family does not exist".
+        if code == "unsupportedType" || code == "unsupportedVersion" {
+            use crate::protocols::trust_task_reject_details as d;
+            let detail = |k: &str| payload.get("details").and_then(|v| v.get(k)).cloned();
+            let served_versions = detail(d::SERVED_VERSIONS)
+                .and_then(|v| v.as_array().cloned())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The framework carries the rejected URI only inside `message`, so
+            // a peer that does not send `requestedType` leaves string-slicing
+            // as the only way to recover it. Both prefixes are the framework's
+            // own `RejectReason` renderings and so are stable; anything else
+            // keeps the whole message, which is worse to read but never wrong.
+            let type_uri = detail(d::REQUESTED_TYPE)
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| {
+                    message
+                        .strip_prefix("unsupported type: ")
+                        .or_else(|| message.strip_prefix("unsupported version: "))
+                        .map(|rest| rest.split(" — ").next().unwrap_or(rest))
+                        .unwrap_or(message)
+                        .to_string()
+                });
+            return Some(VtaError::UnsupportedTaskType {
+                type_uri,
+                served_versions,
+            });
+        }
+
+        // `unavailable` is the one rejection that means "ask again" rather
+        // than "this failed" — the idempotency layer answers with it while a
+        // first attempt on the same key is still running. Collapsing it into
+        // `Protocol` would leave a retry loop unable to tell it apart from a
+        // terminal error, so it gets its own variant carrying the server's
+        // `retryAfter` hint.
+        if code == "unavailable" {
+            let retry_after = payload
+                .get("retryAfter")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            return Some(VtaError::Unavailable { retry_after });
+        }
+
+        Some(VtaError::Rejected {
+            code: code.to_string(),
+            message: message.to_string(),
+            details: payload.get("details").cloned(),
+        })
+    }
+
+    /// Seal a cleartext `VaultSecret` JSON for `vault/upsert`'s `sealedSecret`
+    /// field. Requires the DIDComm transport — the seal is a `didcomm-authcrypt`
+    /// JWE produced with this client's own keys, so a REST-only client (no key
+    /// material) cannot produce it and gets a clear `UnsupportedTransport`
+    /// error.
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
+    pub async fn seal_vault_secret(&self, secret: serde_json::Value) -> Result<String, VtaError> {
+        match &self.transport {
+            #[cfg(feature = "session")]
+            Transport::DIDComm { session, .. } => session.seal_to_vta(secret).await,
+            Transport::Rest { .. } => Err(VtaError::UnsupportedTransport(
+                "sealing a vault secret requires the DIDComm transport \
+                 (REST clients hold no key material to authcrypt with)"
+                    .into(),
+            )),
+            // A TSP client *has* key material, but the seal is specifically a
+            // `didcomm-authcrypt` JWE — a wire format tied to the DIDComm
+            // stack, not to holding keys. Producing one here would need the
+            // DIDComm packer this transport deliberately does not carry.
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => Err(VtaError::UnsupportedTransport(
+                "sealing a vault secret produces a didcomm-authcrypt JWE, which \
+                 requires the DIDComm transport:\n  <cli> --transport didcomm <command>"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Open a `didcomm-authcrypt` JWE the VTA sealed to this client (the
+    /// `sealedSecret` returned by `vault/release` / `vault/get`). DIDComm-only,
+    /// for the same reason as [`Self::seal_vault_secret`].
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
+    pub async fn open_sealed_secret(&self, jwe: &str) -> Result<serde_json::Value, VtaError> {
+        match &self.transport {
+            #[cfg(feature = "session")]
+            Transport::DIDComm { session, .. } => session.open_from_vta(jwe).await,
+            Transport::Rest { .. } => Err(VtaError::UnsupportedTransport(
+                "opening a sealed vault secret requires the DIDComm transport".into(),
+            )),
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => Err(VtaError::UnsupportedTransport(
+                "opening a sealed vault secret unwraps a didcomm-authcrypt JWE, which \
+                 requires the DIDComm transport:\n  <cli> --transport didcomm <command>"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Wait up to `timeout_secs` for the next **unsolicited** inbound DIDComm
+    /// message (e.g. a VTA-pushed wake / step-up request), returning the
+    /// serialized DIDComm `Message` JSON. `Ok(None)` on timeout with nothing
+    /// received. DIDComm-only — the inbound live stream needs the session.
+    ///
+    /// This is the receive half of an agent's event loop (see
+    /// `agent_session::AgentSession`).
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
+    pub async fn receive_next(&self, timeout_secs: u64) -> Result<Option<String>, VtaError> {
+        match &self.transport {
+            #[cfg(feature = "session")]
+            Transport::DIDComm { session, .. } => session.receive_next(timeout_secs).await,
+            // TSP has a real receive path: `TspSession::receive_next` hands
+            // back frames that matched no in-flight `request` — i.e. exactly
+            // the unsolicited pushes this method is for.
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { session, .. } => session
+                .receive_next(timeout_secs)
+                .await
+                .map_err(|e| VtaError::TspTransport(e.to_string())),
+            Transport::Rest { .. } => Err(VtaError::UnsupportedTransport(
+                "receiving inbound messages requires the DIDComm transport".into(),
+            )),
+        }
+    }
+
+    /// Send a one-way (fire-and-forget) DIDComm message of `msg_type` to
+    /// `recipient_did` and return as soon as the mediator accepts it — no
+    /// response is awaited and the body is **not** wrapped in a trust-task
+    /// envelope.
+    ///
+    /// This is the send-side counterpart to [`Self::receive_next`], for
+    /// asynchronous peer-to-peer data planes (e.g. `vti-message-bridge`'s
+    /// agent ⇄ bridge chat messages) where the traffic is one-way, not RPC.
+    /// The message is authcrypt-packed with this client's own keys, so the
+    /// recipient unpacks a cryptographically-authenticated sender DID. Safe to
+    /// call concurrently with a `receive_next` loop — it never touches the
+    /// inbound live stream. See issue #502.
+    ///
+    /// DIDComm-only — a REST client holds no key material to authcrypt with and
+    /// gets a clear [`VtaError::UnsupportedTransport`].
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
+    pub async fn send_message(
+        &self,
+        recipient_did: &str,
+        msg_type: &str,
+        body: serde_json::Value,
+    ) -> Result<(), VtaError> {
+        match &self.transport {
+            #[cfg(feature = "session")]
+            Transport::DIDComm { session, .. } => {
+                session.send_one_way(recipient_did, msg_type, body).await
+            }
+            Transport::Rest { .. } => Err(VtaError::UnsupportedTransport(
+                "one-way DIDComm send requires the DIDComm transport \
+                 (REST clients hold no key material to authcrypt with)"
+                    .into(),
+            )),
+            // Named for the DIDComm wire format it emits. TSP's own
+            // fire-and-forget send is `TspSession::send_document`.
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => Err(VtaError::UnsupportedTransport(
+                "one-way DIDComm send requires the DIDComm transport:\n  \
+                 <cli> --transport didcomm <command>"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Resolve an **arbitrary** DID to its DID document JSON, via the shared
+    /// DID-resolver cache (`affinidi-did-resolver-cache-sdk`). Independent of
+    /// this client's auth/transport — pure resolution. Requires the `didcomm`
+    /// feature (which pulls the resolver).
+    #[cfg(feature = "didcomm")]
+    pub async fn resolve_did(&self, did: &str) -> Result<serde_json::Value, VtaError> {
+        // The process-shared resolver, not a throwaway: a fresh client starts
+        // with an empty cache, so every call would fetch the document again.
+        let resolver = crate::resolver::shared_did_resolver_from_env()
+            .await
+            .map_err(|e| VtaError::Protocol(format!("resolver init: {e}")))?;
+        let resolved = resolver
+            .resolve(did)
+            .await
+            .map_err(|e| VtaError::Protocol(format!("resolve {did}: {e}")))?;
+        serde_json::to_value(resolved.doc).map_err(VtaError::from)
+    }
+
+    // ── Health ───────────────────────────────────────────────────────
+
+    /// GET /health (always REST, unauthenticated)
+    pub async fn health(&self) -> Result<HealthResponse, VtaError> {
+        match &self.transport {
+            Transport::Rest {
+                client, base_url, ..
+            } => {
+                let resp = client.get(format!("{base_url}/health")).send().await?;
+                Self::handle_response(resp).await
+            }
+            #[cfg(feature = "session")]
+            Transport::DIDComm {
+                rest_client,
+                rest_url,
+                ..
+            } => match (rest_client, rest_url) {
+                (Some(client), Some(url)) => {
+                    let resp = client.get(format!("{url}/health")).send().await?;
+                    Self::handle_response(resp).await
+                }
+                _ => Err(VtaError::UnsupportedTransport(
+                    "health check not available via DIDComm (no REST URL)".into(),
+                )),
+            },
+            #[cfg(feature = "tsp")]
+            Transport::Tsp {
+                rest_client,
+                rest_url,
+                ..
+            } => match (rest_client, rest_url) {
+                (Some(client), Some(url)) => {
+                    let resp = client.get(format!("{url}/health")).send().await?;
+                    Self::handle_response(resp).await
+                }
+                _ => Err(VtaError::UnsupportedTransport(
+                    "health check not available via TSP (no REST URL)".into(),
+                )),
+            },
+        }
+    }
+
+    /// The VTA's public health flags — `vta/health/details/0.1`.
+    ///
+    /// Status, the mediator its messaging routes through, the TEE it detected,
+    /// whether it is sealed, whether its key store is encrypted at rest, and
+    /// whether it advertises TSP. A public task: the VTA answers it for any
+    /// caller, the same for everyone, over TSP, DIDComm or HTTPS — and never
+    /// with its software version or restore record, which are
+    /// [`restore_status`](Self::restore_status)'s.
+    ///
+    /// The answer is the VTA's signed claim about itself, verified against its
+    /// DID like every reply to a client with an identity. It is not
+    /// attestation: `teeStatus` is what the VTA says, and only an attestation
+    /// report verified against the vendor root says what code runs.
+    #[cfg(feature = "client")]
+    pub async fn health_details(
+        &self,
+    ) -> Result<vti_specs::vta::health::details::v0_1::Response, VtaError> {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_VTA_HEALTH_DETAILS_0_1,
+            serde_json::json!({}),
+            30,
+        )
+        .await
+    }
+
+    /// The VTA's software version and whether its state derives from a backup
+    /// restore — `vta/restore/status/0.1`, administrators of the VTA only.
+    ///
+    /// `restored` is always present; the VTI-VTA-051 `restore` record (when,
+    /// staged by whom, from which DID and kind of deployment, which internal
+    /// keys did not come back, which hosted DIDs need registering again) is
+    /// present exactly when it is `true`. A response in which the two disagree
+    /// is refused here as malformed, as the specification requires of a
+    /// producer.
+    #[cfg(feature = "client")]
+    pub async fn restore_status(
+        &self,
+    ) -> Result<vti_specs::vta::restore::status::v0_1::Response, VtaError> {
+        let resp: vti_specs::vta::restore::status::v0_1::Response = self
+            .rpc_tt(
+                crate::trust_tasks::TASK_VTA_RESTORE_STATUS_0_1,
+                serde_json::json!({}),
+                30,
+            )
+            .await?;
+        if resp.restored != resp.restore.is_some() {
+            return Err(VtaError::Protocol(format!(
+                "vta/restore/status: `restored` is {} but the `restore` record is {} — the \
+                 specification requires them to agree, so the answer is malformed",
+                resp.restored,
+                if resp.restore.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                }
+            )));
+        }
+        Ok(resp)
+    }
+
+    // ── Sessions ───────────────────────────────────────────────────
+
+    /// Every active session the VTA holds for **this caller's own** subject —
+    /// `auth/sessions/list/0.1`.
+    #[cfg(feature = "client")]
+    pub async fn list_my_sessions(
+        &self,
+    ) -> Result<vti_specs::auth::sessions::list::v0_1::Response, VtaError> {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_AUTH_SESSIONS_LIST_0_1,
+            serde_json::json!({}),
+            30,
+        )
+        .await
+    }
+
+    /// End sessions — `auth/revoke-session/0.2`. Returns `revokedCount`, the
+    /// number of sessions this call invalidated; zero is a success (the
+    /// sessions were already gone, or a named session is not one this caller
+    /// may end — the VTA answers both the same way).
+    ///
+    /// Ending another subject's sessions needs the authority to withdraw that
+    /// subject's access (VTI-SES-043, VTI-ACL-050); a subject outside it is
+    /// refused with `permissionDenied`, the same whether or not the VTA knows
+    /// the subject. `reason` is recorded in the VTA's audit trail.
+    #[cfg(feature = "client")]
+    pub async fn revoke_sessions(
+        &self,
+        target: RevokeSessions<'_>,
+        reason: Option<&str>,
+    ) -> Result<u64, VtaError> {
+        let mut payload = match target {
+            RevokeSessions::Session(id) => serde_json::json!({ "sessionId": id }),
+            RevokeSessions::AllMine => serde_json::json!({ "all": true }),
+            RevokeSessions::Subject(did) => serde_json::json!({ "subject": did }),
+        };
+        if let Some(reason) = reason {
+            payload["reason"] = serde_json::Value::String(reason.to_string());
+        }
+        let resp: vti_specs::auth::revoke_session::v0_2::Response = self
+            .rpc_tt(
+                crate::trust_tasks::TASK_AUTH_REVOKE_SESSION_0_2,
+                payload,
+                30,
+            )
+            .await?;
+        Ok(resp.revoked_count)
+    }
+
+    // ── Discovery ──────────────────────────────────────────────────
+
+    // `capabilities()` was removed in #1043 along with the task behind it. Its
+    // members each had a better home: `version` at `vta/restore/status/0.1`,
+    // `webvhServers` at `list_webvh_servers()` (a strict superset, same auth),
+    // and `features`/`services` at the DID document, which is authoritative for
+    // what a party speaks. `didCreationModes` had no consumer at all.
+
+    /// Ask which Trust Task types this agent serves — `trust-task-discovery/0.3`.
+    ///
+    /// `patterns` are slug globs matched against the URI's slug (everything
+    /// after `https://trusttasks.org/spec/`): `*` for everything, `vta/acl/*`
+    /// for a family, or an exact slug. An empty list means everything, per the
+    /// spec.
+    ///
+    /// The agent answers from its own dispatch table, so the reply reflects what
+    /// is actually routed rather than what someone remembered to list.
+    ///
+    /// # This is not a wire-compatibility check
+    ///
+    /// It tells you whether both ends know a task **at a version**. It does not
+    /// tell you whether they agree on how that task's payload is spelled — two
+    /// peers can both serve `contexts/create/1.0` and still disagree about
+    /// `basePath` vs `base_path` (#1033). Use it to avoid calling a task that
+    /// isn't there; don't read it as proof the call will decode.
+    #[cfg(feature = "client")]
+    pub async fn supported_trust_tasks(
+        &self,
+        patterns: &[&str],
+    ) -> Result<crate::protocols::discovery::SupportedTasksResponse, VtaError> {
+        self.rpc_tt(
+            crate::trust_tasks::TASK_TRUST_TASK_DISCOVERY_0_3,
+            serde_json::json!({ "patterns": patterns }),
+            30,
+        )
+        .await
+    }
+
+    /// Check whether the current auth token is valid.
+    ///
+    /// Asks `auth/whoami/0.1` — the task whose question this is — rather than
+    /// probing an endpoint and reading its status. (It used to probe
+    /// `GET /health/details`, which is gone: health details are now a public
+    /// task that answers any caller, so it could not tell a live token from
+    /// none.)
+    ///
+    /// Returns `true` if authenticated, `false` if the VTA refuses the caller
+    /// (token invalid or expired, or its authority withdrawn). Returns an error
+    /// only on other failures, such as the network.
+    #[cfg(feature = "client")]
+    pub async fn check_auth(&self) -> Result<bool, VtaError> {
+        match &self.transport {
+            Transport::Rest { .. } => {
+                match self
+                    .rpc_tt::<serde_json::Value>(
+                        crate::trust_tasks::TASK_AUTH_WHOAMI_0_1,
+                        serde_json::json!({}),
+                        30,
+                    )
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(e) if e.is_auth() => Ok(false),
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(feature = "session")]
+            Transport::DIDComm { .. } => {
+                // DIDComm sessions are always authenticated
+                Ok(true)
+            }
+            // Same reasoning: the sender VID is proven by the TSP unpack, so
+            // there is no token that could be invalid or expired.
+            #[cfg(feature = "tsp")]
+            Transport::Tsp { .. } => Ok(true),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::KeyType;
+
+    // ── consent refusals ────────────────────────────────────────────
+
+    /// A `requireConsent` refusal must arrive as something a caller can act
+    /// on, not a flat string.
+    ///
+    /// The fixture is the gate's real shape: `code` is `taskFailed` for every
+    /// gated task and the message is free text, so the machine-readable answer
+    /// lives in `details.reason` — keying on anything else would match the
+    /// wrong rejections or none. Folded into `Protocol(String)`, the digest and
+    /// challenge were discarded, and a CLI could only print the refusal and
+    /// exit; that is why a consent-gated task was unreachable from `pnm`.
+    #[test]
+    fn a_consent_refusal_carries_what_answering_it_needs() {
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "task failed: auth:consent_required",
+            "details": {
+                "reason": "auth:consent_required",
+                "payloadDigest": "A1B2C3",
+                "challenge": "chal-xyz",
+                "approverSet": "webvh-approvers",
+                "minApprovals": 1,
+                "excludeRequester": true,
+                "consentRequests": [],
+            }
+        });
+
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::ConsentRequired {
+                payload_digest,
+                challenge,
+                approver_set,
+                min_approvals,
+                exclude_requester,
+            }) => {
+                assert_eq!(payload_digest, "A1B2C3");
+                assert_eq!(challenge, "chal-xyz");
+                assert_eq!(approver_set, "webvh-approvers");
+                assert_eq!(min_approvals, 1);
+                assert!(exclude_requester, "the two-device posture must be reported");
+            }
+            other => panic!("expected ConsentRequired, got {other:?}"),
+        }
+    }
+
+    /// Against a server that predates `excludeRequester`, assume the
+    /// restrictive answer. Guessing `false` would have the CLI offer a
+    /// self-approval the gate then refuses with `denied:requester_excluded`;
+    /// guessing `true` only tells the operator to use another device, which is
+    /// correct whenever a second device exists.
+    #[test]
+    fn an_absent_exclude_requester_defaults_to_the_restrictive_reading() {
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "task failed: auth:consent_required",
+            "details": { "reason": "auth:consent_required", "challenge": "c" }
+        });
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::ConsentRequired {
+                exclude_requester, ..
+            }) => assert!(exclude_requester),
+            other => panic!("expected ConsentRequired, got {other:?}"),
+        }
+    }
+
+    /// A VTA with no HTTPS address answers the backup descriptor tasks with the
+    /// spec's `transportUnavailable`; the client must surface it as the typed
+    /// transport error rather than a flat protocol string.
+    #[test]
+    fn a_backup_transport_unavailable_is_unsupported_transport() {
+        for code in [
+            "vta/backup/initiate-export:transportUnavailable",
+            "vta/backup/initiate-import:transportUnavailable",
+        ] {
+            let payload = serde_json::json!({
+                "code": code,
+                "message": "this agent publishes no HTTPS address for backup bytes",
+            });
+            assert!(
+                matches!(
+                    VtaClient::trust_task_error(&payload),
+                    Some(VtaError::UnsupportedTransport(_))
+                ),
+                "{code}"
+            );
+        }
+    }
+
+    /// A task's declared `:notFound` is `NotFound`, whichever family sends it.
+    /// The contexts family sending its declared code without the
+    /// `details.reason` marker made `get_context` report a missing context as
+    /// a protocol failure, so "create it if absent" stopped working for every
+    /// Trust-Task caller.
+    #[test]
+    fn a_declared_not_found_code_is_not_found() {
+        for code in [
+            "vta/contexts/get:notFound",
+            "vta/app-state/get:notFound",
+            "persona/profile/get:notFound",
+        ] {
+            let payload = serde_json::json!({
+                "code": code,
+                "message": "no context with that id is reachable by this caller",
+            });
+            assert!(
+                matches!(
+                    VtaClient::trust_task_error(&payload),
+                    Some(VtaError::NotFound(_))
+                ),
+                "{code}"
+            );
+        }
+        // A different local code that merely contains the word is not one.
+        let payload = serde_json::json!({
+            "code": "vta/contexts/create:parentNotFound",
+            "message": "no context with that parent id is reachable by this caller",
+        });
+        assert!(matches!(
+            VtaClient::trust_task_error(&payload),
+            Some(VtaError::Rejected { code, .. }) if code == "vta/contexts/create:parentNotFound"
+        ));
+    }
+
+    /// Every other failure stays a plain rejection — the consent variant must
+    /// not swallow unrelated rejections that merely carry a `details` object,
+    /// and that object reaches the caller as sent.
+    #[test]
+    fn a_non_consent_failure_is_a_plain_rejection() {
+        let payload = serde_json::json!({
+            "code": "malformedRequest",
+            "message": "payload does not conform",
+            "details": { "reason": "schema:invalid" }
+        });
+        let err = VtaClient::trust_task_error(&payload).expect("an error");
+        assert_eq!(err.rejection_code(), Some("malformedRequest"));
+        assert_eq!(
+            err.rejection_details(),
+            Some(&serde_json::json!({ "reason": "schema:invalid" }))
+        );
+    }
+
+    // ── outcome typing across the Trust-Task boundary ───────────────
+
+    /// The regression: an absent resource must arrive as [`VtaError::NotFound`],
+    /// not as an opaque string.
+    ///
+    /// A VTA that has never had an approval rule has no `approvals` policy row —
+    /// the shipping default. Every `pnm approvals` subcommand reads that row and
+    /// is written to treat a missing one as an empty model, but the framework
+    /// defines no `notFound` code, so the outcome rode out under `taskFailed`
+    /// and that arm could never fire. The whole surface failed on a fresh VTA,
+    /// `require` included — which made the *first* rule uncreatable, since
+    /// `require` must read the row before it can write it.
+    ///
+    /// The fixture is the service's real shape: `app_error_to_reject` puts the
+    /// discriminator in `details.reason`, the same channel the consent gate
+    /// uses, because `code` is `taskFailed` for all three of these outcomes.
+    #[test]
+    fn a_missing_resource_arrives_as_not_found() {
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "task failed: not found: policy `approvals` not found",
+            "details": { "reason": "not_found" }
+        });
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::NotFound(m)) => assert!(m.contains("`approvals`")),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// `Conflict` is the variant the CLI switches on to print the command the
+    /// operator should have run instead, so collapsing it costs the guidance as
+    /// well as the type.
+    #[test]
+    fn a_conflict_arrives_as_conflict() {
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "task failed: conflict: context `default` already exists",
+            "details": { "reason": "conflict" }
+        });
+        assert!(matches!(
+            VtaClient::trust_task_error(&payload),
+            Some(VtaError::Conflict(_))
+        ));
+    }
+
+    /// `Gone` is terminal: a consumed single-use resource can never succeed
+    /// again, so a caller must be able to tell it from a retryable failure.
+    #[test]
+    fn a_consumed_resource_arrives_as_gone() {
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "task failed: gone: the bootstrap carve-out is closed",
+            "details": { "reason": "gone" }
+        });
+        assert!(matches!(
+            VtaClient::trust_task_error(&payload),
+            Some(VtaError::Gone(_))
+        ));
+    }
+
+    /// A peer the VTA depends on failing is not the VTA failing. It arrives as
+    /// the same `Server { status: 502 }` a REST caller already gets, so a
+    /// consumer can say "the hosting server did not answer" rather than
+    /// "the VTA had an internal error".
+    #[test]
+    fn an_upstream_failure_arrives_as_a_bad_gateway() {
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "task failed: a service this VTA depends on did not answer",
+            "details": { "reason": "upstream_unavailable" }
+        });
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::Server { status: 502, body }) => {
+                assert!(body.contains("did not answer"), "{body}")
+            }
+            other => panic!("expected Server {{ status: 502 }}, got {other:?}"),
+        }
+    }
+
+    /// A VTA that shares no transport with a peer it had to reach says so as
+    /// `taskFailed` + `no_matching_protocol`, and that comes back as the typed
+    /// variant — both sets intact — rather than `malformedRequest`, which told
+    /// the caller its own document was wrong.
+    #[test]
+    fn no_matching_protocol_arrives_typed_with_both_sets() {
+        use crate::protocol::matching::Protocol;
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "no transport in common with `did:webvh:vtc`",
+            "details": {
+                "reason": "no_matching_protocol",
+                "counterpartyDid": "did:webvh:vtc",
+                "ours": ["rest"],
+                "theirs": ["didcomm", "carrier-pigeon"]
+            }
+        });
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::NoMatchingProtocol {
+                counterparty_did,
+                ours,
+                theirs,
+            }) => {
+                assert_eq!(counterparty_did, "did:webvh:vtc");
+                assert_eq!(ours, vec![Protocol::Rest]);
+                // An unknown name is skipped, not fatal.
+                assert_eq!(theirs, vec![Protocol::Didcomm]);
+            }
+            other => panic!("expected NoMatchingProtocol, got {other:?}"),
+        }
+    }
+
+    /// The REST arm of the same refusal: a 502 whose body names it.
+    #[test]
+    fn no_matching_protocol_over_rest_is_typed_too() {
+        let body = serde_json::json!({
+            "error": "no_matching_protocol",
+            "message": "no transport in common",
+            "counterpartyDid": "did:webvh:vtc",
+            "ours": ["rest"],
+            "theirs": ["tsp"],
+        })
+        .to_string();
+        assert!(matches!(
+            VtaError::from_http(reqwest::StatusCode::BAD_GATEWAY, body),
+            VtaError::NoMatchingProtocol { .. }
+        ));
+        // A 502 that is not this one stays a server error.
+        assert!(matches!(
+            VtaError::from_http(reqwest::StatusCode::BAD_GATEWAY, "{\"error\":\"x\"}".into()),
+            VtaError::Server { status: 502, .. }
+        ));
+    }
+
+    /// A `taskFailed` carrying no `details` is a genuine failure and must stay
+    /// one. That is also the shape an older VTA emits, so this fallback is what
+    /// keeps a new client from misreading every pre-upgrade failure as typed.
+    #[test]
+    fn an_undiscriminated_task_failure_is_a_plain_rejection() {
+        let payload = serde_json::json!({
+            "code": "taskFailed",
+            "message": "task failed: the mediator refused the handshake",
+        });
+        let err = VtaClient::trust_task_error(&payload).expect("an error");
+        assert!(
+            matches!(&err, VtaError::Rejected { code, details: None, .. } if code == "taskFailed"),
+            "{err:?}"
+        );
+    }
+
+    /// #1952: a task's declared error keeps its code and `details` as data —
+    /// `persona/profile/delete:bound` names the personas wearing the face,
+    /// which a client needs before it offers to take the face off them.
+    #[test]
+    fn a_declared_rejection_keeps_its_code_and_details() {
+        let payload = serde_json::json!({
+            "code": "persona/profile/delete:bound",
+            "message": "2 persona(s) are bound to this profile",
+            "details": { "personaDids": ["did:key:z6MkA", "did:key:z6MkB"] }
+        });
+        let err = VtaClient::trust_task_error(&payload).expect("an error");
+        assert_eq!(err.rejection_code(), Some("persona/profile/delete:bound"));
+        assert_eq!(
+            err.rejection_details().and_then(|d| d.get("personaDids")),
+            Some(&serde_json::json!(["did:key:z6MkA", "did:key:z6MkB"]))
+        );
+        // The rendering callers and logs already rely on does not change.
+        assert_eq!(
+            err.to_string(),
+            "trust task failed [persona/profile/delete:bound]: 2 persona(s) are bound to this profile"
+        );
+    }
+
+    // ── unsupportedType / unsupportedVersion ────────────────────────
+
+    /// The rejection that means "upgrade something" keeps its shape.
+    ///
+    /// REGRESSION (2026-08-31): flattened into `Protocol(String)`, all a
+    /// consumer could render was
+    /// `trust task failed [unsupportedType]: unsupported type: …/0.3`. The
+    /// version in that string is the entire diagnosis — 0.2 would mean the
+    /// client is behind, 0.3 means the VTA is — and no consumer could reach it
+    /// without parsing prose.
+    #[test]
+    fn an_unsupported_version_carries_what_the_peer_does_serve() {
+        let payload = serde_json::json!({
+            "code": "unsupportedVersion",
+            "message": "unsupported version: \
+                        https://trusttasks.org/spec/provision/integration/0.3 — \
+                        this VTA serves https://trusttasks.org/spec/provision/integration/0.2",
+            "details": {
+                "requestedType": "https://trusttasks.org/spec/provision/integration/0.3",
+                "servedVersions": ["https://trusttasks.org/spec/provision/integration/0.2"],
+            },
+        });
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::UnsupportedTaskType {
+                type_uri,
+                served_versions,
+            }) => {
+                assert_eq!(
+                    type_uri,
+                    "https://trusttasks.org/spec/provision/integration/0.3"
+                );
+                assert_eq!(
+                    served_versions,
+                    vec!["https://trusttasks.org/spec/provision/integration/0.2"]
+                );
+            }
+            other => panic!("expected UnsupportedTaskType, got {other:?}"),
+        }
+    }
+
+    /// A peer too old to send `details` still yields a usable `type_uri`.
+    ///
+    /// This is the case that matters most, because the peers that produce this
+    /// rejection are by definition the older ones — a mapping that only worked
+    /// against a current VTA would be useless exactly where it is needed.
+    #[test]
+    fn an_older_peers_bare_message_still_yields_the_uri() {
+        let payload = serde_json::json!({
+            "code": "unsupportedType",
+            "message": "unsupported type: https://trusttasks.org/spec/provision/integration/0.3",
+        });
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::UnsupportedTaskType {
+                type_uri,
+                served_versions,
+            }) => {
+                assert_eq!(
+                    type_uri,
+                    "https://trusttasks.org/spec/provision/integration/0.3"
+                );
+                assert!(
+                    served_versions.is_empty(),
+                    "an older peer sends no served list; empty must not be invented"
+                );
+            }
+            other => panic!("expected UnsupportedTaskType, got {other:?}"),
+        }
+    }
+
+    /// `permissionDenied` is the caller's authorization, and has a typed home.
+    /// Left in `Protocol` a consumer had to string-match a sentence to tell
+    /// "you have no grant here" from "this task failed".
+    #[test]
+    fn permission_denied_maps_to_forbidden() {
+        let payload = serde_json::json!({
+            "code": "permissionDenied",
+            "message": "DID not in ACL: did:key:zAlice",
+        });
+        match VtaClient::trust_task_error(&payload) {
+            Some(VtaError::Forbidden(detail)) => assert!(detail.contains("did:key:zAlice")),
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+
+    // ── reply verification ──────────────────────────────────────────
+
+    /// A client with no identity has nothing to verify against — it cannot
+    /// produce a conforming request either, and is refused at the agent for a
+    /// missing `recipient`. Verifying would be checking a signature against an
+    /// expectation nobody holds.
+    #[tokio::test]
+    async fn a_client_with_no_identity_does_not_verify() {
+        let client = VtaClient::new("https://vta.example");
+        let doc = serde_json::json!({ "type": "https://trusttasks.org/spec/vta/contexts/list/1.0#response", "payload": {} });
+        client
+            .verify_reply(&doc)
+            .await
+            .expect("no identity, nothing to bind a signature to");
+    }
+
+    /// An unsigned success reply is refused by default, and the message says why
+    /// an unsigned answer is worthless rather than merely reporting a missing
+    /// field.
+    #[tokio::test]
+    async fn an_unsigned_reply_is_refused_by_default() {
+        let client = signed_reply_client();
+        let doc = serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+            "type": "https://trusttasks.org/spec/vta/contexts/list/1.0#response",
+            "issuer": "did:key:zAgent",
+            "recipient": "did:key:zClient",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": {}
+        });
+        let err = client
+            .verify_reply(&doc)
+            .await
+            .expect_err("an unsigned reply must not be believed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bytes, not evidence"),
+            "the refusal must say why, got: {msg}"
+        );
+    }
+
+    /// The staging control, which exists so an upgrade order can be chosen.
+    #[tokio::test]
+    async fn an_unsigned_reply_is_accepted_when_staging() {
+        let client = signed_reply_client().trusting_unsigned_replies();
+        let doc = serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000001",
+            "type": "https://trusttasks.org/spec/vta/contexts/list/1.0#response",
+            "issuer": "did:key:zAgent",
+            "recipient": "did:key:zClient",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": {}
+        });
+        client
+            .verify_reply(&doc)
+            .await
+            .expect("staging accepts an unsigned reply");
+    }
+
+    /// A refusal is exempt whatever the setting: `trust-task-error` declares its
+    /// proof RECOMMENDED, so requiring one would make every conforming refusal
+    /// unreadable — including the ones carrying the reason a caller needs.
+    #[tokio::test]
+    async fn an_error_document_needs_no_proof() {
+        let client = signed_reply_client();
+        let doc = serde_json::json!({
+            "type": "https://trusttasks.org/spec/trust-task-error/0.6",
+            "payload": { "code": "taskFailed", "message": "no" }
+        });
+        client
+            .verify_reply(&doc)
+            .await
+            .expect("a refusal needs no proof");
+    }
+
+    /// A client whose identity names the agent it talks to, so a reply has
+    /// something to be bound against.
+    fn signed_reply_client() -> VtaClient {
+        VtaClient::new("https://vta.example").with_identity(ClientIdentity {
+            client_did: "did:key:zClient".into(),
+            private_key_multibase: "z0".into(),
+            vta_did: "did:key:zAgent".into(),
+            verification_method: None,
+        })
+    }
+
+    /// As [`signed_reply_client`], but naming `vta_did` and with the reply
+    /// resolver forced to "no resolver configured" — deterministic and
+    /// offline, rather than depending on `PNM_RESOLVER_URL` or reaching the
+    /// network. This is exactly the state a `did:webvh`-only TEE VTA's peer
+    /// is in whenever no DID-cache is configured, which is the case FTL-29595
+    /// is about.
+    fn signed_reply_client_named(vta_did: &str) -> VtaClient {
+        let mut client = VtaClient::new("https://vta.example").with_identity(ClientIdentity {
+            client_did: "did:key:zClient".into(),
+            private_key_multibase: "z0".into(),
+            vta_did: vta_did.to_string(),
+            verification_method: None,
+        });
+        client.reply_resolver = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(None)));
+        client
+    }
+
+    /// The `did:key` and private-key multibase for a one-byte test seed —
+    /// enough to sign a document `vta_sdk::trust_task_sign::build_signed`
+    /// accepts, with no network involved.
+    fn did_key_from_seed(seed_byte: u8) -> (String, String) {
+        use ed25519_dalek::SigningKey;
+        let seed = [seed_byte; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let did = format!(
+            "did:key:{}",
+            crate::did_key::ed25519_multibase_pubkey(&sk.verifying_key().to_bytes())
+        );
+        let mut buf = vec![0x80, 0x26];
+        buf.extend_from_slice(&seed);
+        (did, multibase::encode(multibase::Base::Base58Btc, &buf))
+    }
+
+    // ── reply verification: resolver failure vs. an actual bad proof ─
+
+    /// A reply signed by a `did:webvh` the client has no resolver for must be
+    /// reported as a retrieval failure, not folded into "does not verify" —
+    /// the mutation may well have succeeded server-side; only the client's
+    /// ability to *check* the proof failed. This is the fix-direction-3
+    /// behavior change: before it, this case and an actual bad signature were
+    /// indistinguishable to the caller.
+    #[tokio::test]
+    async fn a_resolver_failure_reports_retrieval_not_invalid_proof() {
+        let vta_did = "did:webvh:QmScid:example.com:glenn";
+        let client = signed_reply_client_named(vta_did);
+        let doc = serde_json::json!({
+            "id": "urn:uuid:00000000-0000-4000-8000-000000000002",
+            "type": "https://trusttasks.org/spec/vta/contexts/list/1.0#response",
+            "issuer": vta_did,
+            "recipient": "did:key:zClient",
+            "issuedAt": "2026-01-01T00:00:00Z",
+            "payload": {},
+            "proof": {
+                "type": "DataIntegrityProof",
+                "cryptosuite": "eddsa-jcs-2022",
+                "proofPurpose": "assertionMethod",
+                "verificationMethod": format!("{vta_did}#key-0"),
+                "created": "2026-01-01T00:00:00Z",
+                "proofValue": "z2aBcD"
+            }
+        });
+
+        let err = client
+            .verify_reply(&doc)
+            .await
+            .expect_err("no resolver is configured for did:webvh");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not retrieve"),
+            "expected a retrieval-failure message, got: {msg}"
+        );
+        assert!(msg.contains("before sending it again"), "got: {msg}");
+        assert!(
+            !msg.contains("does not verify"),
+            "a retrieval failure must not read as an invalid proof: {msg}"
+        );
+    }
+
+    /// The control: an actual bad signature — reached via the same
+    /// `did:key`-resolving path, so resolution itself succeeds — must still
+    /// say "does not verify". The fix must not blur that distinction the
+    /// other way.
+    #[tokio::test]
+    async fn an_actual_bad_signature_still_says_does_not_verify() {
+        let (vta_did, secret_mb) = did_key_from_seed(11);
+        let client = signed_reply_client_named(&vta_did);
+
+        let signed = crate::trust_task_sign::build_signed(
+            "https://trusttasks.org/spec/vta/contexts/list/1.0#response",
+            serde_json::json!({}),
+            &vta_did,
+            &secret_mb,
+            "did:key:zClient",
+        )
+        .await
+        .expect("build a validly-signed reply");
+        let mut doc: serde_json::Value = serde_json::from_str(&signed).expect("signed doc parses");
+
+        // Corrupt the signature — same technique as the DiProofError-level
+        // test in `trust_task_proof::verify`: flip the last character, which
+        // keeps the multibase string decodable so this exercises "does not
+        // verify" rather than "malformed proof".
+        let proof_value = doc["proof"]["proofValue"]
+            .as_str()
+            .expect("proofValue present")
+            .to_string();
+        let mut corrupted = proof_value.clone();
+        let last = corrupted.pop().expect("non-empty proofValue");
+        corrupted.push(if last == '1' { '2' } else { '1' });
+        doc["proof"]["proofValue"] = serde_json::Value::String(corrupted);
+
+        let err = client
+            .verify_reply(&doc)
+            .await
+            .expect_err("a corrupted signature must not verify");
+        let msg = err.to_string();
+        assert!(msg.contains("does not verify"), "got: {msg}");
+        assert!(
+            !msg.contains("could not retrieve"),
+            "a bad signature must not read as a retrieval failure: {msg}"
+        );
+    }
+
+    // ── extract_trust_task_payload ──────────────────────────────────
+
+    /// A successful task returns its payload untouched.
+    #[test]
+    fn extract_returns_a_success_payload() {
+        let doc = serde_json::json!({
+            "id": "urn:uuid:1", "type": "spec/vta/x/1.0",
+            "payload": { "did": "did:webvh:QmScid:example.com", "names": [] },
+        });
+        let got = VtaClient::extract_trust_task_payload(doc).expect("should succeed");
+        assert_eq!(got["did"], "did:webvh:QmScid:example.com");
+    }
+
+    /// The regression: a *failed* task also carries a `payload`, holding the
+    /// error envelope. Returning it as success made callers deserialise an error
+    /// object as a result and report a missing field, hiding the real cause.
+    ///
+    /// Shaped after a rejected `set_agent_name`, where the actionable detail
+    /// lives only in the message — the caller cannot act on `internalError`
+    /// alone, but "that name is taken" tells them exactly what to do next.
+    #[test]
+    fn extract_surfaces_an_error_envelope_inside_the_payload() {
+        let doc = serde_json::json!({
+            "id": "urn:uuid:1", "type": "spec/vta/webvh/agent-name/set/1.0",
+            "payload": {
+                "code": "internalError",
+                "message": "set_agent_name: name_taken: `ops` is already bound on \
+                            webvh.storm.ws",
+                "retryable": false,
+            },
+        });
+        let err = VtaClient::extract_trust_task_payload(doc).expect_err("must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("internalError"), "{msg}");
+        assert!(
+            msg.contains("name_taken"),
+            "the actionable part of the message must survive: {msg}"
+        );
+    }
+
+    /// `code` without `message` is not treated as an error — a result body may
+    /// legitimately carry a `code`, so both are required before failing.
+    #[test]
+    fn extract_does_not_mistake_a_code_field_for_an_error() {
+        let doc = serde_json::json!({
+            "payload": { "code": "GB", "country": "United Kingdom" },
+        });
+        let got = VtaClient::extract_trust_task_payload(doc).expect("code alone is not an error");
+        assert_eq!(got["code"], "GB");
+    }
+
+    /// A rejection with no payload at all still reports its reason.
+    #[test]
+    fn extract_reports_a_rejection_without_a_payload() {
+        let doc = serde_json::json!({ "id": "urn:uuid:1", "reason": "not authorized" });
+        let err = VtaClient::extract_trust_task_payload(doc).expect_err("must be an error");
+        assert!(err.to_string().contains("not authorized"), "{err}");
+    }
+
+    // ── VtaClient::new ──────────────────────────────────────────────
+
+    #[test]
+    fn test_new_strips_trailing_slash() {
+        let client = VtaClient::new("http://localhost:3000/");
+        assert_eq!(client.rest_url(), Some("http://localhost:3000"));
+    }
+
+    #[test]
+    fn test_new_strips_multiple_trailing_slashes() {
+        let client = VtaClient::new("http://localhost:3000///");
+        assert_eq!(client.rest_url(), Some("http://localhost:3000"));
+    }
+
+    #[test]
+    fn test_new_no_trailing_slash_unchanged() {
+        let client = VtaClient::new("http://localhost:3000");
+        assert_eq!(client.rest_url(), Some("http://localhost:3000"));
+    }
+
+    #[tokio::test]
+    async fn test_new_token_initially_none() {
+        let client = VtaClient::new("http://example.com");
+        match &client.transport {
+            Transport::Rest { auth, .. } => assert!(auth.lock().await.token.is_none()),
+            #[cfg(feature = "session")]
+            _ => panic!("expected REST transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_token() {
+        let client = VtaClient::new("http://example.com");
+        client.set_token("my-jwt".to_string());
+        match &client.transport {
+            Transport::Rest { auth, .. } => {
+                assert_eq!(auth.lock().await.token.as_deref(), Some("my-jwt"));
+            }
+            #[cfg(feature = "session")]
+            _ => panic!("expected REST transport"),
+        }
+    }
+
+    // ── Request/Response serialization ──────────────────────────────
+
+    /// The patch carries only the keys the caller named — it is a map, so an
+    /// unmentioned key is simply absent rather than an explicit null that a
+    /// consumer might read as "clear this".
+    #[test]
+    fn test_update_config_sends_only_named_keys() {
+        use crate::protocols::vta_management::update_config::UpdateConfigBody;
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("vta_name".to_string(), serde_json::json!("Test"));
+        let req = UpdateConfigRequest {
+            patch: UpdateConfigBody {
+                overrides,
+                ext: None,
+            },
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["overrides"]["vta_name"], "Test");
+        assert!(
+            !json["overrides"]
+                .as_object()
+                .unwrap()
+                .contains_key("public_url")
+        );
+        assert!(
+            !json["overrides"]
+                .as_object()
+                .unwrap()
+                .contains_key("vta_did")
+        );
+    }
+
+    #[test]
+    fn test_create_key_request_serialization() {
+        let req = CreateKeyRequest {
+            internal: None,
+            key_type: KeyType::Ed25519,
+            derivation_path: None,
+            key_id: None,
+            mnemonic: None,
+            label: Some("test key".into()),
+            context_id: Some("vta".into()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("derivation_path"));
+        assert!(!json.as_object().unwrap().contains_key("key_id"));
+        assert!(!json.as_object().unwrap().contains_key("mnemonic"));
+        assert_eq!(json["label"], "test key");
+        assert_eq!(json["context_id"], "vta");
+    }
+
+    #[test]
+    fn test_create_acl_request_serialization() {
+        let req = CreateAclRequest {
+            did: "did:key:z6Mk123".into(),
+            role: "admin".into(),
+            label: None,
+            allowed_contexts: vec!["vta".into()],
+            expires_at: None,
+            step_up_approver: None,
+            step_up_require: None,
+            approve_all_contexts: false,
+            approve_contexts: vec![],
+            allowed_keys: None,
+            capabilities: Vec::new(),
+            handoff: false,
+            purposes: Default::default(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        // The builder API is unchanged; only what it serialises moved. The wire
+        // is canonical `acl/grant/0.3`: the entry is nested, uses `subject`, and
+        // states every authority axis explicitly.
+        assert_eq!(json["entry"]["subject"], "did:key:z6Mk123");
+        assert_eq!(json["entry"]["role"], "admin");
+        assert_eq!(
+            json["entry"]["act"],
+            serde_json::json!({"scope": "contexts", "contexts": ["vta"]})
+        );
+        assert_eq!(json["entry"]["keys"], serde_json::json!({"scope": "all"}));
+        assert_eq!(
+            json["entry"]["capabilities"],
+            serde_json::json!({"scope": "ceiling"})
+        );
+        // Approve authority is stated as none rather than left to absence.
+        assert_eq!(
+            json["entry"]["approve"],
+            serde_json::json!({"scope": "none"})
+        );
+        assert!(json["entry"].get("approveCapabilities").is_none());
+        assert!(
+            json.get("did").is_none(),
+            "pre-fold flat shape is gone: {json}"
+        );
+        // An omitted approver must not appear at all — an empty `stepUp` object
+        // would read as a configured-but-blank override rather than absence.
+        assert!(json["entry"].get("stepUp").is_none());
+        // An unset label is omitted rather than emitted as null.
+        assert!(!json["entry"].as_object().unwrap().contains_key("label"));
+        // And no 0.1 member is emitted alongside the 0.2 ones.
+        for legacy in ["scopes", "allowedKeys", "allowedContexts"] {
+            assert!(json["entry"].get(legacy).is_none(), "{legacy}: {json}");
+        }
+
+        // The empty-list reading is the role's, stated explicitly: an admin
+        // with no contexts acts everywhere, any other role nowhere.
+        let admin = serde_json::to_value(CreateAclRequest::new("did:key:zA", "admin")).unwrap();
+        assert_eq!(admin["entry"]["act"], serde_json::json!({"scope": "all"}));
+        let reader = serde_json::to_value(CreateAclRequest::new("did:key:zB", "reader")).unwrap();
+        assert_eq!(reader["entry"]["act"], serde_json::json!({"scope": "none"}));
+        // "The whole role plus an additive grant" is the ceiling enumerated.
+        let holder = serde_json::to_value(
+            CreateAclRequest::new("did:key:zC", "reader")
+                .capabilities(vec!["persona-holder".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            holder["entry"]["capabilities"],
+            serde_json::json!({"scope": "listed", "grants": [
+                {"capability": "vault-read"},
+                {"capability": "memory-read"},
+                {"capability": "persona-holder", "additive": true},
+            ]})
+        );
+    }
+
+    #[test]
+    fn test_update_acl_request_all_none() {
+        let req = UpdateAclRequest {
+            label: None,
+            allowed_contexts: None,
+            step_up_approver: None,
+            step_up_require: None,
+            approve_scope: None,
+            allowed_keys: None,
+            capabilities: None,
+            purposes: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(obj.is_empty(), "all-None request should serialize to {{}}");
+    }
+
+    /// The `allowedKeys` member of the update request keeps the three-way
+    /// distinction on the wire (#818): leave-alone emits nothing, clear emits
+    /// an explicit `null`, and the empty list — "no keys at all" — emits `[]`.
+    #[test]
+    fn test_update_acl_request_allowed_keys_three_intentions() {
+        let base = || UpdateAclRequest {
+            label: None,
+            allowed_contexts: None,
+            step_up_approver: None,
+            step_up_require: None,
+            approve_scope: None,
+            allowed_keys: None,
+            capabilities: None,
+            purposes: None,
+        };
+
+        let set = UpdateAclRequest {
+            allowed_keys: Some(Some(vec!["key-1".into()])),
+            ..base()
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["allowedKeys"], serde_json::json!(["key-1"]));
+
+        let clear = UpdateAclRequest {
+            allowed_keys: Some(None),
+            ..base()
+        };
+        let json = serde_json::to_value(&clear).unwrap();
+        assert!(
+            json["allowedKeys"].is_null(),
+            "clear is explicit null: {json}"
+        );
+
+        let none_at_all = UpdateAclRequest {
+            allowed_keys: Some(Some(vec![])),
+            ..base()
+        };
+        let json = serde_json::to_value(&none_at_all).unwrap();
+        assert_eq!(
+            json["allowedKeys"],
+            serde_json::json!([]),
+            "the empty list must be emitted, not skipped: {json}"
+        );
+    }
+
+    #[test]
+    fn test_health_response_deserialization() {
+        let json = r#"{"status":"ok","version":"0.1.0"}"#;
+        let resp: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn test_health_response_minimal() {
+        let json = r#"{"status":"ok"}"#;
+        let resp: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.version, None);
+    }
+
+    #[test]
+    fn test_error_response_deserialization() {
+        let json = r#"{"error":"not found"}"#;
+        let resp: ErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.error, "not found");
+    }
+
+    #[test]
+    fn test_list_keys_response_deserialization() {
+        let json = r#"{"keys":[]}"#;
+        let resp: ListKeysResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.keys.is_empty());
+        assert!(resp.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_acl_list_response_deserialization() {
+        // Canonical wire: `subject`/`scopes`, RFC 3339 timestamps. The Rust
+        // field names stay historical so the CLI and the VTC's ACL routes did
+        // not have to move in the same change.
+        let json = r#"{"entries":[{"subject":"did:key:z6Mk1","role":"admin","label":null,"scopes":[],"createdAt":"2023-11-14T22:13:20Z","createdBy":"setup"}],"truncated":false}"#;
+        let resp: AclListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.entries.len(), 1);
+        assert_eq!(resp.entries[0].did, "did:key:z6Mk1");
+        assert_eq!(resp.entries[0].role, "admin");
+        assert!(resp.entries[0].allowed_contexts.is_empty());
+        assert_eq!(resp.entries[0].created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_context_response_deserialization() {
+        let json = r#"{"id":"vta","name":"Verified Trust Agent","did":null,"description":null,"base_path":"m/26'/2'/0'","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
+        let resp: ContextResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, "vta");
+        assert_eq!(resp.name, "Verified Trust Agent");
+        assert!(resp.did.is_none());
+        assert_eq!(resp.base_path, "m/26'/2'/0'");
+    }
+
+    // ── extract_trust_task_payload (device/vault dispatch) ───────────
+
+    #[test]
+    fn trust_task_payload_extracted_from_success_doc() {
+        // A framework success document carries `payload`; dispatch returns it.
+        let doc = serde_json::json!({
+            "id": "urn:uuid:abc",
+            "type": "https://trusttasks.org/spec/device/list/0.3#response",
+            "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "payload": { "devices": [] }
+        });
+        let out = VtaClient::extract_trust_task_payload(doc).unwrap();
+        assert_eq!(out, serde_json::json!({ "devices": [] }));
+    }
+
+    #[test]
+    fn trust_task_reject_doc_surfaces_reason_as_error() {
+        // A reject document has no `payload`; over DIDComm the HTTP status is
+        // dropped, so a missing payload must become a loud error carrying the
+        // reject reason rather than a silent empty success.
+        let doc = serde_json::json!({
+            "id": "urn:uuid:def",
+            "type": "https://trusttasks.org/spec/vault/get/0.3#reject",
+            "reason": "vault/get:notFound — no such entry"
+        });
+        let err = VtaClient::extract_trust_task_payload(doc).unwrap_err();
+        match err {
+            VtaError::Protocol(msg) => assert!(msg.contains("notFound"), "got: {msg}"),
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    // ── TSP leg selection (#803) ────────────────────────────────────
+
+    /// The reference topology: a VTA advertising the **same** mediator for
+    /// `#tsp` and `#vta-didcomm`. TSP must ride the DIDComm session's existing
+    /// socket — the mediator permits one websocket per DID, so a second one for
+    /// this DID is `duplicate-channel` and duelling reconnect loops.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    #[test]
+    fn same_mediator_multiplexes_rather_than_opening_a_second_socket() {
+        let mediator = "did:webvh:QmTS3a:webvh.storm.ws:mediator";
+        assert_eq!(tsp_leg_kind(mediator, mediator), TspLegKind::Multiplexed);
+    }
+
+    /// Split-mediator deployments are legitimate — `Transport::Tsp` explicitly
+    /// does not assume the two are equal — and there a second socket is fine,
+    /// because the one-websocket-per-DID rule is per mediator.
+    #[cfg(all(feature = "session", feature = "tsp"))]
+    #[test]
+    fn a_separate_tsp_mediator_gets_its_own_session() {
+        assert_eq!(
+            tsp_leg_kind(
+                "did:webvh:QmTS3a:webvh.storm.ws:mediator",
+                "did:web:tsp-mediator.example.com",
+            ),
+            TspLegKind::Separate
+        );
+    }
+
+    // ── Transport reporting ─────────────────────────────────────────
+
+    /// A REST client carries its Trust Tasks over REST.
+    #[test]
+    fn a_rest_client_reports_rest_for_trust_tasks() {
+        let client = VtaClient::new("https://vta.example.com");
+        assert_eq!(client.trust_task_transport(), SurfaceTransport::Rest);
+    }
+
+    #[test]
+    fn surface_transport_renders_the_operator_facing_name() {
+        assert_eq!(SurfaceTransport::Tsp.to_string(), "TSP");
+        assert_eq!(SurfaceTransport::Didcomm.to_string(), "DIDComm");
+        assert_eq!(SurfaceTransport::Rest.to_string(), "REST");
+    }
+}
+
+/// The [`ClientIdentity`] a hosted-DID secrets bundle can sign as.
+///
+/// The holder is the bundle's `did:webvh`, which names its keys in its own DID
+/// document — so the identity carries the verification method verbatim from the
+/// bundle rather than deriving one, which is only possible for a `did:key`.
+///
+/// `None` when the bundle has no Ed25519 key to sign with. That is the honest
+/// answer rather than a placeholder identity: `signed_task_document` then
+/// refuses locally and names the missing piece, instead of building a document
+/// that fails at the far end.
+#[cfg(feature = "session")]
+fn bundle_identity(
+    bundle: &crate::did_secrets::DidSecretsBundle,
+    vta_did: &str,
+) -> Option<ClientIdentity> {
+    let entry = bundle.trust_task_signing_key()?;
+    Some(ClientIdentity {
+        client_did: bundle.did.clone(),
+        private_key_multibase: entry.private_key_multibase.clone(),
+        vta_did: vta_did.to_string(),
+        verification_method: Some(entry.key_id.clone()),
+    })
+}
+
+/// Build the Trust Task document a dispatch sends.
+///
+/// Split out of [`VtaClient::dispatch_trust_task`] so the one interesting thing
+/// it does — deciding whether to attach an idempotency key — is testable without
+/// a transport.
+///
+/// The key is attached only when one is in scope
+/// ([`crate::idempotency::current_key`], set by
+/// [`VtaClient::idempotent`]) **and** the task is one a second execution would
+/// actually harm ([`crate::retry_safety`]). Attaching it to a read or a
+/// convergent mutation would cost the VTA a dedup record and buy nothing.
+///
+/// It goes top-level, beside `id`, for two reasons: the VTA reads it from
+/// `TrustTask::extra`, and a Data-Integrity proof covers every member but
+/// `proof` — so a signed document's key cannot be rewritten in transit to split
+/// one operation into two.
+impl VtaClient {
+    /// Build the document this client puts on the wire, signed when it can be.
+    ///
+    /// Signing is unconditional rather than keyed on whether *this* spec
+    /// declares `proof` REQUIRED: 210 of the 344 request payloads in
+    /// `trust-tasks-rs` 0.17 do, the flag lives in the registry rather than
+    /// here, and a proof on a task that merely RECOMMENDs one is legal and
+    /// strictly more attributable.
+    ///
+    /// `recipient` is the sharper number, and the reason the guard below is a
+    /// hard error rather than a warning: **343 of those 344** declare it
+    /// REQUIRED, so an identity-less client cannot dispatch essentially
+    /// anything to a consumer that enforces SPEC §7.2. The proof split falls
+    /// almost exactly along read-versus-mutate — `contexts/list` needs none,
+    /// `contexts/create` does — which is what let the gap survive: the reads a
+    /// client makes first all worked. The one thing it must not
+    /// do is attach a proof with no in-band `recipient` — §7.2 item 8 refuses
+    /// that on a non-bearer spec — and `build_task_document` sets both from the
+    /// same [`ClientIdentity`], so the two cannot come apart.
+    async fn signed_task_document(
+        &self,
+        type_uri: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, VtaError> {
+        let identity = self.identity.clone();
+        let doc = build_task_document(type_uri, payload, identity.as_deref());
+        let Some(identity) = identity else {
+            // Identity-less on any transport: the document is missing an
+            // in-band `recipient` (SPEC §7.2 item 5b) and a `proof` (item 7a),
+            // and a conforming VTA refuses it. Say so here rather than let the
+            // caller read `malformedRequest: … no in-band recipient` off the
+            // wire and go looking for a payload bug — the fault is in how this
+            // client was built, and this is where that is knowable.
+            //
+            // This check was once gated on carrying a bearer token, which is
+            // REST-only by construction — so it covered the one transport whose
+            // constructor already set the identity, and stayed silent for the
+            // DIDComm and TSP clients that did not.
+            return Err(VtaError::Protocol(format!(
+                "this VtaClient carries no ClientIdentity, so the document it would send for \
+                 `{type_uri}` has no in-band recipient (SPEC §7.2 item 5b) and no proof (item \
+                 7a), and a conforming VTA refuses it as `malformedRequest` — build it with \
+                 `VtaClient::authenticated(url, identity, token)`, `.with_identity(…)`, or a \
+                 `connect_*` constructor that takes the client DID and key"
+            )));
+        };
+        let mut typed: trust_tasks_rs::TrustTask<serde_json::Value> = serde_json::from_value(doc)
+            .map_err(|e| {
+            VtaError::Protocol(format!("could not build a Trust Task document: {e}"))
+        })?;
+        let key = identity
+            .holder_key()
+            .map_err(|e| VtaError::Protocol(format!("this client cannot sign: {e}")))?;
+        crate::trust_task_sign::sign_in_place_with(&mut typed, &key)
+            .await
+            .map_err(|e| {
+                VtaError::Protocol(format!("could not sign the Trust Task document: {e}"))
+            })?;
+        serde_json::to_value(&typed)
+            .map_err(|e| VtaError::Protocol(format!("could not serialise the document: {e}")))
+    }
+}
+
+fn build_task_document(
+    type_uri: &str,
+    payload: serde_json::Value,
+    identity: Option<&ClientIdentity>,
+) -> serde_json::Value {
+    let mut doc = serde_json::json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": type_uri,
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": payload,
+    });
+    // `issuer` and `recipient` are envelope members every dispatched spec
+    // declares REQUIRED (SPEC §7.2 item 5b). They are set here rather than at
+    // each of the ~200 call sites for the same reason `issuedAt` is: a member
+    // the framework requires of every document belongs to the one function that
+    // builds every document.
+    if let Some(id) = identity
+        && let Some(obj) = doc.as_object_mut()
+    {
+        obj.insert("issuer".to_string(), serde_json::json!(id.client_did));
+        obj.insert("recipient".to_string(), serde_json::json!(id.vta_did));
+    }
+    if let Some(key) = crate::idempotency::current_key()
+        && crate::retry_safety::retry_safety(type_uri).is_some_and(|s| s.needs_key())
+        && let Some(obj) = doc.as_object_mut()
+    {
+        obj.insert("idempotencyKey".to_string(), serde_json::json!(key));
+    }
+    doc
+}
+
+#[cfg(test)]
+mod idempotency_document_tests {
+    use super::build_task_document;
+    use crate::idempotency::IDEMPOTENCY_KEY;
+    use crate::trust_tasks;
+
+    fn key_in(doc: &serde_json::Value) -> Option<String> {
+        doc.get("idempotencyKey")?.as_str().map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn a_keyed_task_carries_the_scoped_key() {
+        IDEMPOTENCY_KEY
+            .scope("urn:uuid:k".to_string(), async {
+                let doc = build_task_document(
+                    trust_tasks::TASK_WEBVH_DIDS_CREATE_1_2,
+                    serde_json::json!({}),
+                    None,
+                );
+                assert_eq!(key_in(&doc).as_deref(), Some("urn:uuid:k"));
+            })
+            .await;
+    }
+
+    /// A read costs the VTA a dedup record and buys nothing, so it gets no key
+    /// even inside a scope.
+    #[tokio::test]
+    async fn a_retry_safe_task_carries_no_key_even_in_scope() {
+        IDEMPOTENCY_KEY
+            .scope("urn:uuid:k".to_string(), async {
+                let doc = build_task_document(
+                    trust_tasks::TASK_VTA_DIDS_LIST_0_1,
+                    serde_json::json!({}),
+                    None,
+                );
+                assert_eq!(key_in(&doc), None);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn outside_a_scope_no_document_carries_a_key() {
+        let doc = build_task_document(
+            trust_tasks::TASK_WEBVH_DIDS_CREATE_1_2,
+            serde_json::json!({}),
+            None,
+        );
+        assert_eq!(key_in(&doc), None);
+    }
+
+    /// The whole point: two dispatches inside one scope are the *same*
+    /// operation, so they must carry the same key even though their envelope
+    /// ids differ.
+    #[tokio::test]
+    async fn two_attempts_in_one_scope_share_a_key_but_not_an_envelope_id() {
+        IDEMPOTENCY_KEY
+            .scope("urn:uuid:k".to_string(), async {
+                let a = build_task_document(
+                    trust_tasks::TASK_KEYS_CREATE_0_1,
+                    serde_json::json!({}),
+                    None,
+                );
+                let b = build_task_document(
+                    trust_tasks::TASK_KEYS_CREATE_0_1,
+                    serde_json::json!({}),
+                    None,
+                );
+                assert_eq!(key_in(&a), key_in(&b), "the retry must reuse the key");
+                assert_ne!(
+                    a.get("id"),
+                    b.get("id"),
+                    "envelope ids stay per-attempt — which is exactly why the key is needed"
+                );
+            })
+            .await;
+    }
+}
+
+/// The producer-side invariants of SPEC §7.2 that a `VtaClient` is responsible
+/// for: every dispatched document carries an in-band `issuer`/`recipient`, and
+/// a client that cannot produce one says so locally instead of putting a
+/// document on the wire that the VTA will reject as `malformedRequest`.
+#[cfg(test)]
+mod client_identity_tests {
+    use super::*;
+    use crate::trust_tasks;
+
+    const TYPE: &str = trust_tasks::TASK_WEBVH_DIDS_CREATE_1_2;
+
+    fn did_key_from_seed(seed_byte: u8) -> (String, String) {
+        let seed = [seed_byte; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let did = format!(
+            "did:key:{}",
+            crate::did_key::ed25519_multibase_pubkey(&sk.verifying_key().to_bytes())
+        );
+        let mut buf = vec![0x80, 0x26];
+        buf.extend_from_slice(&seed);
+        (did, multibase::encode(multibase::Base::Base58Btc, &buf))
+    }
+
+    fn identity() -> ClientIdentity {
+        let (client_did, private_key_multibase) = did_key_from_seed(0xc1);
+        ClientIdentity {
+            client_did,
+            private_key_multibase,
+            vta_did: "did:key:z6MkVta".to_string(),
+            verification_method: None,
+        }
+    }
+
+    /// The regression that shipped: an identity-less client used to return an
+    /// unsigned, recipient-less document and let the VTA reject it on the wire.
+    /// The check was gated on carrying a bearer token, which is REST-only by
+    /// construction — so it never fired for the DIDComm and TSP clients that
+    /// were the ones missing an identity.
+    #[tokio::test]
+    async fn an_identity_less_client_refuses_to_build_a_document() {
+        let client = VtaClient::new("http://vta.invalid");
+        let err = client
+            .signed_task_document(TYPE, serde_json::json!({}))
+            .await
+            .expect_err("an identity-less client must not produce a document");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ClientIdentity"),
+            "the error must name the missing piece, got: {msg}"
+        );
+    }
+
+    /// The other half: given an identity, the document carries both envelope
+    /// members SPEC §7.2 item 5b requires, plus the item 7a proof.
+    #[tokio::test]
+    async fn a_client_with_an_identity_addresses_and_signs_the_document() {
+        let id = identity();
+        let client = VtaClient::new("http://vta.invalid").with_identity(id.clone());
+        let doc = client
+            .signed_task_document(TYPE, serde_json::json!({}))
+            .await
+            .expect("a client with an identity produces a document");
+
+        assert_eq!(
+            doc.get("issuer").and_then(|v| v.as_str()),
+            Some(id.client_did.as_str()),
+            "issuer must be the producer DID (item 6)"
+        );
+        assert_eq!(
+            doc.get("recipient").and_then(|v| v.as_str()),
+            Some(id.vta_did.as_str()),
+            "recipient must be the VTA DID (item 5b)"
+        );
+        assert!(
+            doc.get("proof").is_some(),
+            "a signable identity must yield a proof (item 7a)"
+        );
+    }
+
+    /// The check the hand-written assertions above cannot make: run the
+    /// document the SDK actually builds through **its own specification's**
+    /// policy, the same `SpecPolicy::enforce` the VTA's dispatch spine calls.
+    ///
+    /// This is the test that was missing. Both halves of SPEC §7.2 shipped —
+    /// the VTA began enforcing the flags, and the client began signing — but
+    /// nothing compared one against the other, so a constructor that carried no
+    /// identity produced a document no test rejected and every VTA did. Which
+    /// member it was refused for depended on the transport, which is why the
+    /// same defect was reported twice under two different names: over DIDComm
+    /// the document reaches item 5b first and comes back `malformedRequest: …
+    /// no in-band recipient`, while over TSP `address_trust_task` had already
+    /// filled `recipient` in, so it sailed past 5b and landed on item 7a —
+    /// `proofRequired: proof required but not present`.
+    ///
+    /// Asserting against the registry rather than a list of member names is the
+    /// point: when a spec adds a flag, this test starts checking it without
+    /// being edited.
+    #[tokio::test]
+    async fn the_built_document_satisfies_its_own_specification() {
+        // A mutation and a read. The pair matters: the proof flag falls almost
+        // exactly along that line — `contexts/create` requires one and
+        // `contexts/list` does not — which is why the gap survived long enough
+        // to reach an operator. A client that only ever listed saw nothing
+        // wrong.
+        const URIS: [&str; 3] = [
+            trust_tasks::TASK_CONTEXTS_CREATE_1_0,
+            trust_tasks::TASK_ACL_GRANT_0_3,
+            trust_tasks::TASK_CONTEXTS_LIST_1_0,
+        ];
+
+        let id = identity();
+        let client = VtaClient::new("http://vta.invalid").with_identity(id.clone());
+        let mut saw_proof_required = false;
+
+        for uri in URIS {
+            let policy = vti_specs::schema_index::spec_policy_for(uri).unwrap_or_else(|| {
+                panic!("{uri} has no published policy — the registry moved under this test")
+            });
+            saw_proof_required |= policy.is_proof_required;
+
+            let doc = client
+                .signed_task_document(uri, serde_json::json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("{uri}: building the document failed: {e}"));
+            let typed: trust_tasks_rs::TrustTask<serde_json::Value> =
+                serde_json::from_value(doc).expect("the built document is a TrustTask");
+
+            policy
+                .enforce(&typed)
+                .unwrap_or_else(|r| panic!("{uri}: the VTA would refuse this document: {r:?}"));
+        }
+
+        // Without this the set could drift to reads only, and the test would
+        // pass while checking nothing about the member that actually broke.
+        assert!(
+            saw_proof_required,
+            "no URI under test requires a proof — this has stopped covering its own case"
+        );
+    }
+
+    /// A signed document must not be re-addressed on its way onto the wire.
+    ///
+    /// `address_trust_task` assigned `issuer` and `recipient` unconditionally,
+    /// after signing. The proof covers both, so any disagreement between the
+    /// document and the transport silently turned a valid signature into
+    /// `proofInvalid` at the far end — a failure that names the proof and says
+    /// nothing about the rewrite that caused it.
+    #[cfg(feature = "tsp")]
+    #[test]
+    fn addressing_refuses_to_rewrite_what_the_proof_covers() {
+        let doc = serde_json::json!({
+            "id": "urn:uuid:1", "type": TYPE,
+            "issuer": "did:key:zIssuer", "recipient": "did:key:zVta",
+            "payload": {}, "proof": { "type": "DataIntegrityProof" },
+        });
+
+        // Agreement is the ordinary case and passes through untouched.
+        let bytes = VtaClient::address_trust_task(doc.clone(), "did:key:zIssuer", "did:key:zVta")
+            .expect("matching addressing is accepted");
+        let out: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(out["issuer"], "did:key:zIssuer");
+        assert_eq!(out["recipient"], "did:key:zVta");
+
+        // Disagreement is refused, not silently resolved either way.
+        let err = VtaClient::address_trust_task(doc, "did:key:zSomeoneElse", "did:key:zVta")
+            .expect_err("a differing issuer must not be written over a signed document");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("issuer") && msg.contains("proof"),
+            "the error must name the member and why it matters, got: {msg}"
+        );
+    }
+
+    /// `build_task_document` is the single place both envelope members are set,
+    /// so the DIDComm/TSP constructors only have to carry an identity for the
+    /// whole surface to become conforming.
+    #[test]
+    fn the_envelope_members_come_from_the_identity() {
+        let id = identity();
+        let doc = build_task_document(TYPE, serde_json::json!({}), Some(&id));
+        assert_eq!(
+            doc.get("issuer").and_then(|v| v.as_str()),
+            Some(id.client_did.as_str())
+        );
+        assert_eq!(
+            doc.get("recipient").and_then(|v| v.as_str()),
+            Some(id.vta_did.as_str())
+        );
+
+        let without = build_task_document(TYPE, serde_json::json!({}), None);
+        assert!(without.get("issuer").is_none());
+        assert!(without.get("recipient").is_none());
+    }
+}
+
+/// The receive-leg breaker over the §7.2.2 D4 self-repair (2026-10-05: an
+/// OpenVTC admin session that had stopped collecting its inbox re-formed and
+/// resent after every reply timeout, adding two queued VTA replies per call
+/// until the mediator refused the VTA `limits.queue.peer`).
+#[cfg(all(test, feature = "tsp"))]
+mod receive_leg_tests {
+    use super::*;
+    use crate::trust_tasks;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const READ: &str = trust_tasks::TASK_AUTH_WHOAMI_0_1;
+    const KEYED: &str = trust_tasks::TASK_AUTH_REFRESH_0_2;
+
+    fn timeout() -> VtaError {
+        VtaError::TspTransport(format!(
+            "{} after 30s",
+            crate::error::TSP_REPLY_TIMEOUT_PREFIX
+        ))
+    }
+
+    /// One request through the self-repair, with every send answered by
+    /// `answer(n)` (n = send number across the whole test) and the re-form
+    /// succeeding. Counts sends and re-forms.
+    async fn call(
+        client: &VtaClient,
+        type_uri: &str,
+        sends: &AtomicU32,
+        reforms: &AtomicU32,
+        answer: impl Fn(u32) -> Result<&'static str, VtaError>,
+    ) -> Result<&'static str, VtaError> {
+        client
+            .tsp_request_with_self_repair(
+                type_uri,
+                || {
+                    let n = sends.fetch_add(1, Ordering::SeqCst);
+                    let reply = answer(n);
+                    async move { reply }
+                },
+                || async {
+                    reforms.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn d4_still_repairs_one_silent_drop() {
+        let client = VtaClient::new("https://vta.example");
+        let (sends, reforms) = (AtomicU32::new(0), AtomicU32::new(0));
+        let got = call(&client, READ, &sends, &reforms, |n| {
+            if n == 0 { Err(timeout()) } else { Ok("reply") }
+        })
+        .await
+        .expect("the resend after the re-form is answered");
+        assert_eq!(got, "reply");
+        assert_eq!((sends.into_inner(), reforms.into_inner()), (2, 1));
+        assert_eq!(client.receive_health().consecutive_reply_timeouts, 0);
+        assert!(client.receive_health().since_last_reply.is_some());
+    }
+
+    #[tokio::test]
+    async fn replies_not_arriving_stops_the_re_form_and_resend() {
+        let client = VtaClient::new("https://vta.example");
+        let (sends, reforms) = (AtomicU32::new(0), AtomicU32::new(0));
+
+        // First call: D4 has its one attempt, and the resend times out too.
+        let err = call(&client, READ, &sends, &reforms, |_| Err(timeout()))
+            .await
+            .expect_err("nothing answers");
+        assert!(
+            matches!(
+                err,
+                VtaError::RepliesNotArriving {
+                    consecutive_timeouts: 2
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            (sends.load(Ordering::SeqCst), reforms.load(Ordering::SeqCst)),
+            (2, 1)
+        );
+
+        // Every later call: one send, no re-form, no resend — nothing more is
+        // queued for a client that is not collecting.
+        for expected in 3..6 {
+            let err = call(&client, READ, &sends, &reforms, |_| Err(timeout()))
+                .await
+                .expect_err("still nothing");
+            assert!(
+                matches!(err, VtaError::RepliesNotArriving { consecutive_timeouts } if consecutive_timeouts == expected),
+                "{err:?}"
+            );
+        }
+        assert_eq!(sends.into_inner(), 2 + 3, "one send per later call");
+        assert_eq!(
+            reforms.into_inner(),
+            1,
+            "no re-form once the breaker is open"
+        );
+        assert!(client.receive_health().replies_not_arriving());
+    }
+
+    #[tokio::test]
+    async fn a_reply_closes_the_breaker() {
+        let client = VtaClient::new("https://vta.example");
+        let (sends, reforms) = (AtomicU32::new(0), AtomicU32::new(0));
+        let _ = call(&client, READ, &sends, &reforms, |_| Err(timeout())).await;
+        assert!(client.receive_health().replies_not_arriving());
+
+        // The session was rebuilt and replies flow again.
+        call(&client, READ, &sends, &reforms, |_| Ok("reply"))
+            .await
+            .expect("answered");
+        assert!(!client.receive_health().replies_not_arriving());
+
+        // A later single timeout gets D4 again.
+        let before = reforms.load(Ordering::SeqCst);
+        let n0 = sends.load(Ordering::SeqCst);
+        call(&client, READ, &sends, &reforms, move |n| {
+            if n == n0 { Err(timeout()) } else { Ok("reply") }
+        })
+        .await
+        .expect("repaired");
+        assert_eq!(reforms.into_inner(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn a_keyed_task_is_re_formed_but_not_resent() {
+        let client = VtaClient::new("https://vta.example");
+        let (sends, reforms) = (AtomicU32::new(0), AtomicU32::new(0));
+        let err = call(&client, KEYED, &sends, &reforms, |_| Err(timeout()))
+            .await
+            .expect_err("timed out");
+        assert!(err.is_tsp_reply_timeout(), "below the breaker: {err:?}");
+        assert_eq!((sends.into_inner(), reforms.into_inner()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_says_nothing_about_the_receive_leg() {
+        let client = VtaClient::new("https://vta.example");
+        let (sends, reforms) = (AtomicU32::new(0), AtomicU32::new(0));
+        let err = call(&client, READ, &sends, &reforms, |_| {
+            Err(VtaError::TspTransport("TSP send failed: refused".into()))
+        })
+        .await
+        .expect_err("send failed");
+        assert!(matches!(err, VtaError::TspTransport(_)));
+        assert_eq!((sends.into_inner(), reforms.into_inner()), (1, 0));
+        assert_eq!(client.receive_health().consecutive_reply_timeouts, 0);
+    }
+
+    #[tokio::test]
+    async fn the_breaker_is_shared_by_clones() {
+        let client = VtaClient::new("https://vta.example");
+        let clone = client.clone();
+        let (sends, reforms) = (AtomicU32::new(0), AtomicU32::new(0));
+        let _ = call(&client, READ, &sends, &reforms, |_| Err(timeout())).await;
+        assert!(clone.receive_health().replies_not_arriving());
+    }
+
+    #[test]
+    fn replies_not_arriving_is_not_retried_and_says_what_to_do() {
+        let err = VtaError::RepliesNotArriving {
+            consecutive_timeouts: 2,
+        };
+        assert!(!crate::idempotency::is_transient(&err));
+        assert!(err.suggested_fix().is_some_and(|f| f.contains("Reconnect")));
+        assert!(
+            err.to_string()
+                .contains("replies are not reaching this client")
+        );
+    }
+}

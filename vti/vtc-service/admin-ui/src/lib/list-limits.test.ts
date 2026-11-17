@@ -1,0 +1,313 @@
+// Every page size the console asks a signed listing for is within that
+// listing's specification maximum.
+//
+// The admission-criteria page asked `vtc/schemas/accepts/list/0.2` for 200
+// rows against a maximum of 50, and the VTC refused every read (#1921). This
+// is the census that would have caught it: each place a `limit` is put into a
+// signed read, the listing it goes to, and where its value comes from. The
+// values are read from the source, so raising a page-size constant past its
+// listing's maximum fails here; a new `limit` anywhere fails until it is
+// listed. The maxima are `list-limits.json`, which `vtc-service`'s
+// `console_list_limits_match_the_specifications` test holds to the generated
+// schemas.
+
+import { describe, expect, it } from "vitest";
+
+import { assertWithinListLimit, LIST_LIMIT_MAX, ListLimitError } from "./list-limits";
+
+const SOURCES = import.meta.glob<string>("/src/**/*.{ts,tsx}", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+/** Source by path under `src/`, without tests and generated wire types. */
+const FILES: Record<string, string> = Object.fromEntries(
+  Object.entries(SOURCES)
+    .map(([path, text]) => [path.replace(/^\/src\//, ""), text] as const)
+    .filter(
+      ([path]) =>
+        !/\.test\.tsx?$/.test(path) &&
+        !path.startsWith("test/") &&
+        path !== "lib/list-limits.ts" && // the guard itself, which sends nothing
+        path !== "lib/wire.ts" &&
+        path !== "lib/wire-types.ts",
+    ),
+);
+
+const T = "https://trusttasks.org/spec";
+const ACTIONS = `${T}/vtc/admin/actions/list/0.3`;
+const JOINS = `${T}/vtc/join-requests/list/0.2`;
+const MEMBERS = `${T}/vtc/members/list/0.2`;
+const REGISTRY_RECORDS = `${T}/vtc/registry/records/list/0.2`;
+const ENDORSEMENTS = `${T}/vtc/endorsements/list/0.2`;
+const ENDORSEMENT_TYPES = `${T}/vtc/endorsement-types/list/0.2`;
+const ROOMS = `${T}/vtc/rooms/list/0.2`;
+const ROOMS_USAGE = `${T}/vtc/rooms/usage/0.1`;
+const COMMUNITY_ROOMS = `${T}/vtc/rooms/community/list/0.4`;
+const COMMUNITY_ROOM_MEMBERS = `${T}/vtc/rooms/community/members/list/0.2`;
+const STORAGE_CONFIGS = `${T}/vtc/storage/configs/list/0.2`;
+const ACCEPTS = `${T}/vtc/schemas/accepts/list/0.2`;
+const GRANTS = `${T}/vtc/vetting/vetters/grants/list/0.1`;
+const REVOCATIONS = `${T}/vtc/vetting/revocations/list/0.1`;
+const VETTERS = `${T}/vtc/vetting/vetters/list/0.1`;
+const ACTIVITY = `${T}/git-ns/activity/list/0.3`;
+const DIRECTORY_ENTRIES = `${T}/vtc/directory/entries/list/0.2`;
+const DIRECTORY_EXPORT = `${T}/vtc/directory/export/0.2`;
+const GROUPS_LIST = `${T}/vtc/groups/list/0.2`;
+const BOARDS_LIST = `${T}/vtc/boards/list/0.1`;
+const BADGES_LIST = `${T}/vtc/badges/list/0.1`;
+const BADGES_AWARDS = `${T}/vtc/badges/awards/list/0.1`;
+const BADGES_CLAIMS = `${T}/vtc/badges/claims/list/0.1`;
+const BADGES_HOLDERS = `${T}/vtc/badges/holders/list/0.1`;
+const BADGES_KUDOS = `${T}/vtc/badges/kudos/list/0.1`;
+const NETWORKS_LIST = `${T}/vtc/networks/list/0.2`;
+const BOARDS_SHOW = `${T}/vtc/boards/show/0.1`;
+const BOARDS_NOTES = `${T}/vtc/boards/notes/list/0.1`;
+const GROUPS_MEMBERS = `${T}/vtc/groups/members/list/0.2`;
+const GROUPS_REQUESTS = `${T}/vtc/groups/requests/list/0.2`;
+const ELECTIONS = `${T}/vtc/elections/list/0.5`;
+const NOTIFICATIONS = `${T}/vtc/notifications/list/0.1`;
+const AUDIT = `${T}/audit/list/0.2`;
+const POLICIES = `${T}/policy/list/0.3`;
+const ACL_LIST = `${T}/acl/list/0.3`;
+
+interface Site {
+  /** The file, under `src/`. */
+  file: string;
+  /** Text that occurs in it: the `limit` (or the wrapper call) this entry is. */
+  site: string;
+  /** The listing it reaches. */
+  uri: string;
+  /** Where that URI is written, when not in `file`. */
+  uriFile?: string;
+  /** What the limit's value comes from: number literals, or constants. */
+  from: string[];
+  /** Where those constants are declared, when not in `file`. */
+  fromFile?: string;
+}
+
+const SITES: Site[] = [
+  // The audit log, one page at a time (Audit).
+  { file: "plugins/audit.tsx", site: "limit: pageSize", uri: AUDIT, from: ["50"] },
+  // One purpose's policy revisions (Ceremonies).
+  { file: "lib/policies-api.ts", site: "limit: 100", uri: POLICIES, from: ["100"] },
+  { file: "lib/acl.ts", site: "limit: 200", uri: ACL_LIST, from: ["200"] },
+  // The Directory page's entries tab: one page of the largest size.
+  { file: "plugins/directory.tsx", site: "limit: 100", uri: DIRECTORY_ENTRIES, uriFile: "lib/directory.ts", from: ["100"] },
+  // The directory export: the largest page, followed to the end.
+  { file: "lib/directory.ts", site: "limit: 500", uri: DIRECTORY_EXPORT, from: ["500"] },
+  // The Groups page: every group, every member and every pending request, the largest page.
+  { file: "lib/groups.ts", site: "(GROUPS_LIST_TASK, {\n      limit: PAGE", uri: GROUPS_LIST, from: ["PAGE"] },
+  { file: "lib/groups.ts", site: "(GROUPS_MEMBERS_LIST_TASK, {\n      groupId,\n      limit: PAGE", uri: GROUPS_MEMBERS, from: ["PAGE"] },
+  { file: "lib/groups.ts", site: "(GROUPS_REQUESTS_LIST_TASK, {\n    limit: PAGE", uri: GROUPS_REQUESTS, from: ["PAGE"] },
+  // The Networks page: every membership, the largest page.
+  { file: "lib/networks.ts", site: "(NETWORKS_LIST_TASK, {\n      limit: PAGE", uri: NETWORKS_LIST, from: ["PAGE"] },
+  // Boards, as facilitators read them: every board, idea and note, a page at a time.
+  { file: "lib/boards.ts", site: "(LIST, { limit: PAGE", uri: BOARDS_LIST, from: ["PAGE"] },
+  { file: "lib/boards.ts", site: "(SHOW, { boardId, limit: PAGE })", uri: BOARDS_SHOW, from: ["PAGE"] },
+  { file: "lib/boards.ts", site: "(SHOW, { boardId, limit: PAGE, cursor", uri: BOARDS_SHOW, from: ["PAGE"] },
+  { file: "lib/boards.ts", site: 'scope: "all",\n      limit: PAGE', uri: BOARDS_NOTES, from: ["PAGE"] },
+  // The member portal's boards: one page of boards, and a board's ideas and notes to the end.
+  { file: "members/boards-api.ts", site: '{ status: "open", limit: 100 }', uri: BOARDS_LIST, from: ["100"] },
+  { file: "members/boards-api.ts", site: "(BOARDS_LIST_TASK, { limit: 100 })", uri: BOARDS_LIST, from: ["100"] },
+  { file: "members/boards-api.ts", site: "{ boardId, limit: 200 })", uri: BOARDS_SHOW, from: ["200"] },
+  { file: "members/boards-api.ts", site: "{ boardId, limit: 200, cursor", uri: BOARDS_SHOW, from: ["200"] },
+  { file: "members/boards-api.ts", site: "{ boardId, limit: 200, ...(ideaId", uri: BOARDS_NOTES, from: ["200"] },
+  // The member portal's groups: one page of a hundred groups, and of a group's members.
+  { file: "members/groups-api.ts", site: "(GROUPS_LIST_TASK, { limit: 100 })", uri: GROUPS_LIST, from: ["100"] },
+  { file: "members/groups-api.ts", site: "{ groupId, limit: 100 }", uri: GROUPS_MEMBERS, from: ["100"] },
+  // The console's badges: every badge, a badge's awards, holders and kudos givings, to the end.
+  { file: "lib/badges.ts", site: "includeUnlisted: true,\n      limit: PAGE", uri: BADGES_LIST, from: ["PAGE"] },
+  { file: "lib/badges.ts", site: "...(state ? { state } : {}),\n      limit: PAGE", uri: BADGES_AWARDS, from: ["PAGE"] },
+  { file: "lib/badges.ts", site: "(HOLDERS_LIST, {\n      badgeId,\n      limit: PAGE", uri: BADGES_HOLDERS, from: ["PAGE"] },
+  { file: "lib/badges.ts", site: "all: true,\n      limit: PAGE", uri: BADGES_KUDOS, from: ["PAGE"] },
+  { file: "lib/badges.ts", site: "(CLAIMS_LIST, {\n      badgeId,\n      limit: PAGE", uri: BADGES_CLAIMS, from: ["PAGE"] },
+  // The member portal's badges: one page of badges, of a badge's holders, and of the member's kudos.
+  { file: "members/badges-api.ts", site: "(BADGES_LIST_TASK, { limit: 200", uri: BADGES_LIST, from: ["200"] },
+  { file: "members/badges-api.ts", site: "{ badgeId, limit: 200 }", uri: BADGES_HOLDERS, from: ["200"] },
+  { file: "members/badges-api.ts", site: "{ direction, limit: 200 }", uri: BADGES_KUDOS, from: ["200"] },
+  // The badge pages name members through one page of directory entries.
+  { file: "members/Badges.tsx", site: "listEntries({ limit: 100 })", uri: DIRECTORY_ENTRIES, uriFile: "members/directory-api.ts", from: ["100"] },
+  { file: "members/Badges.tsx", site: "listEntries({ limit: 100, ...(query", uri: DIRECTORY_ENTRIES, uriFile: "members/directory-api.ts", from: ["100"] },
+  // The Members list's directory faces: the largest page, followed to the end.
+  { file: "lib/directory.ts", site: "limit: ENTRIES_PAGE", uri: DIRECTORY_ENTRIES, from: ["ENTRIES_PAGE"] },
+  // The member portal's directory: one page of fifty.
+  { file: "members/Directory.tsx", site: "limit: 50", uri: DIRECTORY_ENTRIES, uriFile: "members/directory-api.ts", from: ["50"] },
+  // The action list: the page, and the badge's one-row read.
+  { file: "plugins/actions.tsx", site: "listActions({ view, limit: PAGE_SIZE", uri: ACTIONS, uriFile: "lib/actions-api.ts", from: ["PAGE_SIZE"] },
+  // `listActions` passes its caller's limit through; each call is listed.
+  { file: "lib/actions-api.ts", site: "payload.limit = query.limit", uri: ACTIONS, from: [] },
+  { file: "lib/actions-api.ts", site: 'listActions({ view: "waitingForMe", limit: 1 })', uri: ACTIONS, from: ["1"] },
+  // The dashboard's "Waiting for you": the first few.
+  { file: "plugins/dashboard.tsx", site: 'listActions({ view: "waitingForMe", limit: WAITING_SHOWN })', uri: ACTIONS, uriFile: "lib/actions-api.ts", from: ["WAITING_SHOWN"] },
+  // Trust Registry records, every page (Recognition).
+  { file: "plugins/recognition/records.ts", site: "{ source, limit: REGISTRY_RECORDS_PAGE", uri: REGISTRY_RECORDS, from: ["REGISTRY_RECORDS_PAGE"] },
+  // Join requests.
+  { file: "plugins/joinRequests.tsx", site: "limit: params.limit", uri: JOINS, from: ["limit"] },
+  { file: "plugins/joinRequests.tsx", site: "{ status, cursor, limit }", uri: JOINS, from: ["limit"] },
+  { file: "plugins/vetting/api.ts", site: 'status: "pending",\n    limit: 50,', uri: JOINS, from: ["50"] },
+  { file: "lib/community-counts.ts", site: "limit: COUNT_PAGE_SIZE", uri: JOINS, from: ["COUNT_PAGE_SIZE"] },
+  // Members.
+  { file: "lib/community-counts.ts", site: "limit: COUNT_PAGE_SIZE", uri: MEMBERS, from: ["COUNT_PAGE_SIZE"] },
+  { file: "plugins/members.tsx", site: "limit: params.limit", uri: MEMBERS, from: ["MEMBERS_PAGE"] },
+  { file: "plugins/members.tsx", site: "limit: MEMBERS_PAGE", uri: MEMBERS, from: ["MEMBERS_PAGE"] },
+  { file: "plugins/vetting/api.ts", site: "TASK_MEMBERS_LIST, {\n      limit: 200,", uri: MEMBERS, from: ["200"] },
+  { file: "plugins/repos/api.ts", site: "limit: MEMBERS_PAGE", uri: MEMBERS, from: ["MEMBERS_PAGE"] },
+  { file: "lib/names.ts", site: "(MEMBERS_TASK, { limit: 200 })", uri: MEMBERS, from: ["200"] },
+  // A credential roll's choices: this community's members, any of which may be a member party.
+  { file: "plugins/ElectionBuilder.tsx", site: "MEMBERS_LIST_TASK,\n        { limit: 200 },", uri: MEMBERS, from: ["200"] },
+  // Endorsements and their types.
+  { file: "plugins/members.tsx", site: "{ limit: 200, ...(cursor ? { cursor } : {}) }", uri: ENDORSEMENTS, from: ["200"] },
+  { file: "plugins/vetting/api.ts", site: "{ limit: 200, ...(cursor ? { cursor } : {}) }", uri: ENDORSEMENT_TYPES, from: ["200"] },
+  // Rooms.
+  { file: "plugins/rooms.tsx", site: "{ limit: 100, ...(cursor ? { cursor } : {}) }", uri: ROOMS, from: ["100"] },
+  // Rooms the community owns, and one room's members, every page.
+  { file: "lib/community-rooms-api.ts", site: "CommunityRoomsListPayload = {\n      limit: COMMUNITY_PAGE", uri: COMMUNITY_ROOMS, from: ["COMMUNITY_PAGE"] },
+  { file: "lib/community-rooms-api.ts", site: "roomId,\n      limit: COMMUNITY_PAGE", uri: COMMUNITY_ROOM_MEMBERS, from: ["COMMUNITY_PAGE"] },
+  // The community's elections, every page.
+  { file: "lib/elections-api.ts", site: "{ limit: PAGE, ...(cursor ? { cursor } : {}) }", uri: ELECTIONS, from: ["PAGE"] },
+  // The notifications the community holds, a page at a time.
+  { file: "lib/notifications-api.ts", site: "{ ...payload, limit: PAGE, ...(cursor ? { cursor } : {}) }", uri: NOTIFICATIONS, from: ["PAGE"] },
+  // Room usage, every page (room detail, Room usage).
+  { file: "lib/rooms-api.ts", site: "limit: USAGE_PAGE", uri: ROOMS_USAGE, from: ["USAGE_PAGE"] },
+  // Storage configs, every page (Storage, a room's "other storage").
+  { file: "lib/storage-api.ts", site: "limit: CONFIGS_PAGE", uri: STORAGE_CONFIGS, uriFile: "lib/storage-api.ts", from: ["CONFIGS_PAGE"] },
+  // Git-namespace activity.
+  { file: "plugins/repos/api.ts", site: "{ namespace, limit }", uri: ACTIVITY, from: ["limit"] },
+  // The vetting listings walked by `allItems(task, pageSize)`.
+  { file: "plugins/vetting/api.ts", site: "limit: pageSize", uri: GRANTS, from: ["PAGE_SIZE_100"] },
+  { file: "plugins/vetting/api.ts", site: "allItems<VetterGrantRow>(TASK_GRANTS_LIST)", uri: GRANTS, from: ["PAGE_SIZE_100"] },
+  { file: "plugins/vetting/api.ts", site: "allItems<VettingRevocationRow>(TASK_REVOCATIONS_LIST)", uri: REVOCATIONS, from: ["PAGE_SIZE_100"] },
+  { file: "plugins/vetting/api.ts", site: "allItems<AcceptsCriterion>(TASK_ACCEPTS_LIST, ACCEPTS_PAGE_SIZE)", uri: ACCEPTS, from: ["ACCEPTS_PAGE_SIZE"] },
+  // The registry preview's page-size picker, sent through `fetchListing`.
+  { file: "plugins/vetting/RegistryPreview.tsx", site: "limit: DEFAULT_PAGE_SIZE", uri: VETTERS, uriFile: "plugins/vetting/api.ts", from: ["DEFAULT_PAGE_SIZE", "PAGE_SIZES"] },
+  { file: "plugins/vetting/RegistryPreview.tsx", site: "{ ...body, limit }", uri: VETTERS, uriFile: "plugins/vetting/api.ts", from: ["DEFAULT_PAGE_SIZE", "PAGE_SIZES"] },
+  { file: "plugins/vetting/RegistryPreview.tsx", site: "setApplied({ limit })", uri: VETTERS, uriFile: "plugins/vetting/api.ts", from: ["DEFAULT_PAGE_SIZE", "PAGE_SIZES"] },
+  { file: "plugins/vetting/RegistryPreview.tsx", site: "fetchListing(cursor ? { ...applied, cursor } : applied)", uri: VETTERS, uriFile: "plugins/vetting/api.ts", from: ["DEFAULT_PAGE_SIZE", "PAGE_SIZES"] },
+];
+
+/** Functions that put a caller's page size into a signed listing: every call
+ *  to one is a census entry of its own. */
+const WRAPPERS = ["allItems", "listActions", "fetchListing"];
+
+/** Strip comments, so prose about limits is not counted as one. */
+function code(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+}
+
+/** Lines putting a `limit` into a payload: `limit: x`, `{ limit }`, `.limit =`. */
+function limitLines(text: string): string[] {
+  return code(text)
+    .split("\n")
+    .filter((l) => !/=\{\s*limit\s*\}/.test(l)) // a JSX attribute, not a payload
+    .filter(
+      (l) =>
+        /\blimit\s*:\s*(?!number\b)\S/.test(l) ||
+        /(^|[{,])\s*limit\s*[,}]/.test(l) ||
+        /\.limit\s*=[^=]/.test(l),
+    );
+}
+
+/** Calls to a wrapper (its definition excluded). */
+function wrapperCalls(text: string, name: string): number {
+  const all = code(text).match(new RegExp(`\\b${name}\\s*(<[^>(]*>)?\\(`, "g")) ?? [];
+  const defs = code(text).match(new RegExp(`function\\s+${name}\\b`, "g")) ?? [];
+  return all.length - defs.length;
+}
+
+/** The numbers `token` stands for in `text`. */
+function resolve(text: string, token: string): number[] {
+  if (/^\d+$/.test(token)) return [Number(token)];
+  const scalar = new RegExp(`\\b${token}\\s*(?::\\s*number\\s*)?=\\s*(\\d+)\\b`, "g");
+  const values = [...text.matchAll(scalar)].map((m) => Number(m[1]));
+  const array = new RegExp(`\\bconst\\s+${token}\\s*=\\s*\\[([\\d,\\s]+)\\]`).exec(text);
+  if (array) values.push(...array[1]!.split(",").map((s) => Number(s.trim())));
+  return values;
+}
+
+// A `limit` that is no page size: declared here, with why, so the per-file count still holds.
+const NOT_PAGE_SIZES: { file: string; site: string; why: string }[] = [
+  {
+    file: "lib/badges.ts",
+    site: "limit: admits",
+    why: "a claim code's number of claims (vtc/badges/claims/create), not a listing's page size",
+  },
+];
+
+describe("the list-limit census", () => {
+  it("finds every declared non-page `limit` where it says", () => {
+    for (const n of NOT_PAGE_SIZES) {
+      expect(FILES[n.file]?.includes(n.site), `${n.file} no longer contains \`${n.site}\``).toBe(true);
+    }
+  });
+
+  it("lists every listing it checks in the pinned table", () => {
+    for (const s of SITES) {
+      expect(LIST_LIMIT_MAX[s.uri], `${s.uri} has no pinned maximum`).toBeTypeOf("number");
+    }
+  });
+
+  it.each(SITES)("$file: `$site` → $uri is within its maximum", (s) => {
+    const text = FILES[s.file];
+    expect(text, `${s.file} not found`).toBeTypeOf("string");
+    expect(text!.includes(s.site), `${s.file} no longer contains \`${s.site}\``).toBe(true);
+    const uriText = FILES[s.uriFile ?? s.file]!;
+    expect(uriText.includes(`"${s.uri}"`), `${s.uri} is not named in ${s.uriFile ?? s.file}`).toBe(true);
+    const fromText = FILES[s.fromFile ?? s.file]!;
+    const max = LIST_LIMIT_MAX[s.uri]!;
+    for (const token of s.from) {
+      const values = resolve(fromText, token);
+      expect(values.length, `could not resolve \`${token}\` in ${s.file}`).toBeGreaterThan(0);
+      for (const v of values) {
+        expect(v, `${s.file}: \`${token}\` = ${v} against ${s.uri}`).toBeGreaterThanOrEqual(1);
+        expect(v, `${s.file}: \`${token}\` = ${v} exceeds ${s.uri}'s maximum`).toBeLessThanOrEqual(max);
+      }
+    }
+  });
+
+  it("covers every limit the console sends, file by file", () => {
+    for (const [file, text] of Object.entries(FILES)) {
+      const found = limitLines(text).length;
+      const listed =
+        new Set(SITES.filter((s) => s.file === file && limitLines(s.site).length > 0).map((s) => s.site)).size +
+        NOT_PAGE_SIZES.filter((n) => n.file === file).length;
+      expect(found, `${file} sets ${found} limit(s) but the census lists ${listed}`).toBe(listed);
+    }
+  });
+
+  it("covers every call to a page-size wrapper", () => {
+    for (const [file, text] of Object.entries(FILES)) {
+      for (const name of WRAPPERS) {
+        const calls = wrapperCalls(text, name);
+        const call = new RegExp(`\\b${name}\\s*(<[^>(]*>)?\\(`);
+        const listed = new Set(
+          SITES.filter((s) => s.file === file && call.test(s.site)).map((s) => s.site),
+        ).size;
+        expect(calls, `${file} calls ${name} ${calls} time(s); the census lists ${listed}`).toBe(listed);
+      }
+    }
+  });
+
+  it("reads a page-size constant's value from the source", () => {
+    // The admission-criteria read as it was before #1921 resolves to 200,
+    // which the check above holds against accepts/list's 50.
+    const before = "const ACCEPTS_PAGE_SIZE = 200;";
+    expect(resolve(before, "ACCEPTS_PAGE_SIZE")).toEqual([200]);
+    expect(resolve("const PAGE_SIZES = [10, 25, 500];", "PAGE_SIZES")).toEqual([10, 25, 500]);
+    expect(resolve("(namespace: string, limit = 100) =>", "limit")).toEqual([100]);
+    expect(LIST_LIMIT_MAX[ACCEPTS]).toBe(50);
+  });
+});
+
+describe("assertWithinListLimit", () => {
+  it("refuses a page over the listing's maximum, before anything is signed", () => {
+    expect(() => assertWithinListLimit(ACCEPTS, { limit: 200 })).toThrow(ListLimitError);
+    expect(() => assertWithinListLimit(ACCEPTS, { limit: 50 })).not.toThrow();
+  });
+
+  it("leaves alone a payload with no limit, and a task with no pinned maximum", () => {
+    expect(() => assertWithinListLimit(ACCEPTS, {})).not.toThrow();
+    expect(() => assertWithinListLimit(`${T}/vtc/members/show/0.1`, { limit: 10_000 })).not.toThrow();
+  });
+});

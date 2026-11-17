@@ -1,0 +1,506 @@
+//! Primary persistence for the credential vault (task 1.1).
+//!
+//! Stores [`StoredCredential`] records under the `cred:<id>` key namespace
+//! in the `vault` keyspace and keeps the secondary index ([`super::index`])
+//! in lock-step on every mutation. The whole record value — including the
+//! opaque credential body — is encrypted at rest by the keyspace's
+//! AES-256-GCM wrapper when the deployment supplies a storage key.
+//!
+//! This layer is format-agnostic and does **no** cryptographic work: it
+//! does not verify issuer signatures, check status lists, or disclose
+//! claims. Those are later tasks. It also exposes **no enumeration
+//! primitive** — there is no `list_all`; discovery is index-scan-only
+//! (`vti-credential-architecture.md` §14).
+
+use vti_common::error::AppError;
+use vti_common::store::{Batch, KeyspaceHandle};
+
+use super::index;
+use super::model::{IndexField, StoredCredential};
+
+/// Primary-key prefix for credential records. Disjoint from `idx:` (the
+/// secondary index) and `vault:` (the password-manager `VaultEntry` records
+/// that share this keyspace).
+const RECORD_PREFIX: &str = "cred:";
+
+/// `cred:<id>` — the primary key for one stored credential.
+fn record_key(id: &str) -> Vec<u8> {
+    format!("{RECORD_PREFIX}{id}").into_bytes()
+}
+
+/// How many times [`put`] and [`delete`] re-read a record that another
+/// writer changed between their read and their write before giving up.
+///
+/// An attempt fails only because another writer's batch on the same record
+/// was applied, so a writer loses at most once per concurrent writer to that
+/// one credential. Concurrent writes to one credential are rare (a status
+/// refresh racing an archive); the bound only stops a pathological stream of
+/// them from holding a caller forever.
+const WRITE_ATTEMPTS: usize = 64;
+
+/// Store (create or overwrite) a credential and (re)build its index entries.
+///
+/// The record and its index changes are one store batch: the *previous*
+/// record's index terms are removed (so a changed `status` /
+/// `community_did` / etc. never leaves a stale index row pointing at this
+/// id under its old value) and the new ones written, together with the
+/// record, or none of it. The batch applies only while the record is still
+/// what was read, so two concurrent writers cannot interleave their index
+/// changes; the loser re-reads and tries again. The record value is
+/// encrypted at rest; the index keys carry only routing metadata, never the
+/// body.
+///
+/// The credential `id` must be non-empty (it is the primary key); an empty
+/// id is rejected rather than silently writing to `cred:`.
+pub async fn put(vault: &KeyspaceHandle, cred: &StoredCredential) -> Result<(), AppError> {
+    if cred.id.trim().is_empty() {
+        return Err(AppError::Validation(
+            "StoredCredential.id must be non-empty".to_string(),
+        ));
+    }
+    let key = record_key(&cred.id);
+    for _ in 0..WRITE_ATTEMPTS {
+        let (prev_raw, prev) = read_current(vault, &key).await?;
+        let mut batch = Batch::new();
+        match prev_raw {
+            Some(raw) => batch.require_unchanged(key.clone(), raw),
+            None => batch.require_absent(key.clone()),
+        };
+        batch.insert(key.clone(), cred)?;
+        index::stage_reindex(&mut batch, prev.as_ref(), Some(cred));
+        if vault.apply_batch(batch).await?.is_applied() {
+            return Ok(());
+        }
+    }
+    Err(AppError::Conflict(format!(
+        "credential {} kept changing while it was being stored",
+        cred.id
+    )))
+}
+
+/// Fetch a credential by its local id. Returns `Ok(None)` for an absent id
+/// so callers map to their own not-found / permission-denied policy. The
+/// returned record includes the decrypted opaque body — callers that only
+/// need metadata should still treat the body as opaque.
+pub async fn get(vault: &KeyspaceHandle, id: &str) -> Result<Option<StoredCredential>, AppError> {
+    vault.get(record_key(id)).await
+}
+
+/// Delete a credential by id and tear down all of its index entries, as one
+/// store batch (see [`put`]). Idempotent: deleting an absent id is a no-op
+/// (returns `Ok`).
+pub async fn delete(vault: &KeyspaceHandle, id: &str) -> Result<(), AppError> {
+    let key = record_key(id);
+    for _ in 0..WRITE_ATTEMPTS {
+        let (Some(raw), Some(prev)) = read_current(vault, &key).await? else {
+            return Ok(());
+        };
+        let mut batch = Batch::new();
+        batch
+            .require_unchanged(key.clone(), raw)
+            .remove(key.clone());
+        index::stage_reindex(&mut batch, Some(&prev), None);
+        if vault.apply_batch(batch).await?.is_applied() {
+            return Ok(());
+        }
+    }
+    Err(AppError::Conflict(format!(
+        "credential {id} kept changing while it was being deleted"
+    )))
+}
+
+/// Delete every credential in `context_id`'s custody
+/// ([`StoredCredential::context_id`]), with its index entries, returning how
+/// many went.
+///
+/// For a context deletion only — the one caller entitled to enumerate the
+/// store, since it is removing what it finds rather than disclosing it. A
+/// credential left behind would be presentable from any context created again
+/// under the same id. Unscoped credentials (`context_id: None`) belong to no
+/// context and are untouched.
+pub async fn purge_context(vault: &KeyspaceHandle, context_id: &str) -> Result<usize, AppError> {
+    let mut removed = 0;
+    for (_key, raw) in vault.prefix_iter_raw(RECORD_PREFIX).await? {
+        let Ok(cred) = serde_json::from_slice::<StoredCredential>(&raw) else {
+            continue;
+        };
+        if cred.context_id.as_deref() == Some(context_id) {
+            delete(vault, &cred.id).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// The record at `key` as stored (plaintext bytes, for a `require_unchanged`
+/// precondition) and as parsed.
+async fn read_current(
+    vault: &KeyspaceHandle,
+    key: &[u8],
+) -> Result<(Option<Vec<u8>>, Option<StoredCredential>), AppError> {
+    let Some(raw) = vault.get_raw(key.to_vec()).await? else {
+        return Ok((None, None));
+    };
+    let parsed = serde_json::from_slice(&raw)?;
+    Ok((Some(raw), Some(parsed)))
+}
+
+/// Resolve every credential indexed under `(field, value)` to its full
+/// record. This is the targeted search primitive: it requires an explicit
+/// field **and** value, scans the index for matching ids, then loads only
+/// those records. There is intentionally no variant that returns every
+/// credential — see `vti-credential-architecture.md` §14.
+///
+/// An index row whose primary record has since vanished (a torn write, or a
+/// race) is skipped rather than erroring, so a stale index entry can never
+/// wedge a search.
+pub async fn find_by_index(
+    vault: &KeyspaceHandle,
+    field: IndexField,
+    value: &str,
+) -> Result<Vec<StoredCredential>, AppError> {
+    let ids = index::scan(vault, field, value).await?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(rec) = get(vault, &id).await? {
+            out.push(rec);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CredentialFormat, CredentialPurpose, CredentialStatus};
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    /// A fresh tempdir-backed store plus a `vault` keyspace handle. The
+    /// `TempDir` and `Store` are returned so the caller keeps the fjall
+    /// files (and DB handle) alive for the duration of the test. When `key`
+    /// is `Some`, the returned handle is wrapped in the AES-256-GCM at-rest
+    /// layer; the underlying store is unchanged, so a second *plain* handle
+    /// can be opened on the same keyspace to read the on-disk ciphertext.
+    fn fresh_vault(key: Option<[u8; 32]>) -> (tempfile::TempDir, Store, KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("open store");
+        let ks = store
+            .keyspace(vta_keyspaces::VAULT)
+            .expect("vault keyspace");
+        let ks = match key {
+            Some(k) => ks.with_encryption(k),
+            None => ks,
+        };
+        (dir, store, ks)
+    }
+
+    fn sample(id: &str) -> StoredCredential {
+        StoredCredential {
+            id: id.to_string(),
+            format: CredentialFormat::SdJwtVc,
+            types: vec!["VerifiableCredential".into(), "InvitationCredential".into()],
+            schema_id: Some("schema:invite:1".into()),
+            community_did: Some("did:web:acme".into()),
+            context_id: None,
+            subject_did: Some("did:key:zAlice".into()),
+            issuer_did: Some("did:web:issuer.example".into()),
+            purpose: Some(CredentialPurpose::Invite),
+            status: CredentialStatus::Unknown,
+            valid_from: Some("2026-01-01T00:00:00Z".into()),
+            valid_until: Some("2027-01-01T00:00:00Z".into()),
+            received_at: "2026-06-03T00:00:00Z".into(),
+            source: Some("exchange:thread-42".into()),
+            tags: std::collections::BTreeMap::from([("label".into(), "alice-invite".into())]),
+            body: b"opaque.credential.bytes".to_vec(),
+            lifecycle: vti_common::vault::VaultStatus::Active,
+            archived_at: None,
+            deleted_at: None,
+            grace_until: None,
+        }
+    }
+
+    /// Concurrent overwrites of one credential never leave an index row for a
+    /// value the stored record no longer holds: each put's record and index
+    /// changes apply together, and only over the record it read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_leave_exactly_the_final_records_index() {
+        const WRITERS: usize = 16;
+        let (_dir, _store, vault) = fresh_vault(None);
+        put(&vault, &sample("cred-1")).await.unwrap();
+        let tasks: Vec<_> = (0..WRITERS)
+            .map(|n| {
+                let vault = vault.clone();
+                tokio::spawn(async move {
+                    let mut cred = sample("cred-1");
+                    cred.community_did = Some(format!("did:web:c{n}"));
+                    put(&vault, &cred).await.unwrap();
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let final_community = get(&vault, "cred-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .community_did
+            .unwrap();
+        let mut indexed = Vec::new();
+        for community in std::iter::once("did:web:acme".to_string())
+            .chain((0..WRITERS).map(|n| format!("did:web:c{n}")))
+        {
+            if !find_by_index(&vault, IndexField::CommunityDid, &community)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                indexed.push(community);
+            }
+        }
+        assert_eq!(indexed, vec![final_community], "no stale index rows");
+    }
+
+    #[tokio::test]
+    async fn store_then_get_by_id_round_trips() {
+        let (_dir, _store, vault) = fresh_vault(None);
+        let cred = sample("cred-1");
+        put(&vault, &cred).await.unwrap();
+
+        let got = get(&vault, "cred-1").await.unwrap().expect("present");
+        assert_eq!(got, cred, "full record round-trips byte-for-byte");
+
+        // Absent id → None, never an error (caller maps to not-found).
+        assert!(get(&vault, "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn prefix_scan_index_hits_each_indexed_field() {
+        let (_dir, _store, vault) = fresh_vault(None);
+        put(&vault, &sample("cred-1")).await.unwrap();
+
+        // type (both tags reachable)
+        let by_type = find_by_index(&vault, IndexField::Type, "InvitationCredential")
+            .await
+            .unwrap();
+        assert_eq!(by_type.len(), 1);
+        assert_eq!(by_type[0].id, "cred-1");
+        assert_eq!(
+            find_by_index(&vault, IndexField::Type, "VerifiableCredential")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // community_did
+        assert_eq!(
+            find_by_index(&vault, IndexField::CommunityDid, "did:web:acme")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // issuer_did
+        assert_eq!(
+            find_by_index(&vault, IndexField::IssuerDid, "did:web:issuer.example")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // purpose
+        assert_eq!(
+            find_by_index(&vault, IndexField::Purpose, "invite")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // status (defaults to unknown at store time)
+        assert_eq!(
+            find_by_index(&vault, IndexField::Status, "unknown")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A value that matches nothing returns empty, never an error.
+        assert!(
+            find_by_index(&vault, IndexField::IssuerDid, "did:web:other")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn index_scans_isolate_distinct_credentials() {
+        let (_dir, _store, vault) = fresh_vault(None);
+
+        let mut a = sample("cred-a");
+        a.issuer_did = Some("did:web:issuer-a".into());
+        a.community_did = Some("did:web:acme".into());
+
+        let mut b = sample("cred-b");
+        b.issuer_did = Some("did:web:issuer-b".into());
+        b.community_did = Some("did:web:acme".into());
+
+        put(&vault, &a).await.unwrap();
+        put(&vault, &b).await.unwrap();
+
+        // Shared community → both.
+        let mut shared = find_by_index(&vault, IndexField::CommunityDid, "did:web:acme")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>();
+        shared.sort();
+        assert_eq!(shared, vec!["cred-a", "cred-b"]);
+
+        // Distinct issuer → exactly one each.
+        let only_a = find_by_index(&vault, IndexField::IssuerDid, "did:web:issuer-a")
+            .await
+            .unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].id, "cred-a");
+    }
+
+    #[tokio::test]
+    async fn update_reindexes_and_drops_stale_rows() {
+        let (_dir, _store, vault) = fresh_vault(None);
+        let mut cred = sample("cred-1");
+        put(&vault, &cred).await.unwrap();
+
+        // Initially indexed under status=unknown.
+        assert_eq!(
+            find_by_index(&vault, IndexField::Status, "unknown")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Flip status → revoked and re-store.
+        cred.status = CredentialStatus::Revoked;
+        put(&vault, &cred).await.unwrap();
+
+        // Old status row is gone; new one is present. No double-counting.
+        assert!(
+            find_by_index(&vault, IndexField::Status, "unknown")
+                .await
+                .unwrap()
+                .is_empty(),
+            "stale status=unknown index row must be removed on update"
+        );
+        assert_eq!(
+            find_by_index(&vault, IndexField::Status, "revoked")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_record_and_all_index_rows() {
+        let (_dir, _store, vault) = fresh_vault(None);
+        put(&vault, &sample("cred-1")).await.unwrap();
+
+        delete(&vault, "cred-1").await.unwrap();
+
+        assert!(get(&vault, "cred-1").await.unwrap().is_none());
+        for (field, value) in [
+            (IndexField::Type, "InvitationCredential"),
+            (IndexField::CommunityDid, "did:web:acme"),
+            (IndexField::IssuerDid, "did:web:issuer.example"),
+            (IndexField::Purpose, "invite"),
+            (IndexField::Status, "unknown"),
+        ] {
+            assert!(
+                find_by_index(&vault, field, value)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "index row for {field:?}={value} must be gone after delete"
+            );
+        }
+
+        // Deleting an absent id is a no-op.
+        delete(&vault, "cred-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_id_is_rejected() {
+        let (_dir, _store, vault) = fresh_vault(None);
+        let cred = sample("");
+        let err = put(&vault, &cred).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn body_is_encrypted_at_rest() {
+        // With an at-rest key, the opaque body must not appear in cleartext
+        // anywhere in the keyspace's stored value bytes. Scanning the raw
+        // (still-encrypted) record value proves the AES-GCM wrapper engaged.
+        let key = [7u8; 32];
+        let (_dir, store, vault) = fresh_vault(Some(key));
+        assert!(vault.is_encrypted());
+
+        let cred = sample("cred-secret");
+        put(&vault, &cred).await.unwrap();
+
+        // Read the SAME keyspace through a second handle that has NO
+        // encryption key. `get_raw` only decrypts when its handle carries a
+        // key, so this plain handle returns the actual on-disk ciphertext —
+        // the genuine "at rest" bytes, not a decrypted view.
+        let plain = store
+            .keyspace(vta_keyspaces::VAULT)
+            .expect("plain vault handle");
+        assert!(!plain.is_encrypted());
+        let raw = plain
+            .get_raw(record_key("cred-secret"))
+            .await
+            .unwrap()
+            .expect("raw record present");
+        // Neither the opaque body nor any plaintext metadata (the id, the
+        // issuer DID) may appear in the ciphertext.
+        assert!(
+            !contains_subslice(&raw, b"opaque.credential.bytes"),
+            "credential body must be ciphertext at rest, found cleartext"
+        );
+        assert!(
+            !contains_subslice(&raw, b"cred-secret"),
+            "record metadata must be ciphertext at rest, found cleartext id"
+        );
+        assert!(
+            !contains_subslice(&raw, b"did:web:issuer.example"),
+            "record metadata must be ciphertext at rest, found cleartext issuer DID"
+        );
+
+        // Through the decrypting handle the body round-trips intact.
+        let got = get(&vault, "cred-secret").await.unwrap().expect("present");
+        assert_eq!(got.body, b"opaque.credential.bytes".to_vec());
+
+        // And searches still work over the encrypted store (index keys are
+        // plaintext metadata; only the value is encrypted).
+        assert_eq!(
+            find_by_index(&vault, IndexField::Purpose, "invite")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+}

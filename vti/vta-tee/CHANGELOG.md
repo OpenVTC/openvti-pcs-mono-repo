@@ -1,0 +1,613 @@
+# Changelog
+
+Notable changes to the published crates. Generated from conventional commits by
+[git-cliff](https://git-cliff.org) when a release is cut — do not edit by hand.
+## [0.43.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.42.0...vta-tee-v0.43.0) — 2026-11-15
+
+
+## [0.42.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.41.0...vta-tee-v0.42.0) — 2026-11-14
+
+
+### Build & CI
+
+- **deps**: Enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe ([#2708](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2708))
+
+* build(deps): enforce cargo-deny bans/sources, drop unused deps, hoist shared deps, forbid unsafe
+
+  pgp, openssl only via webauthn-rs 0.5, no wildcards, and
+  multiple-versions = "deny" with a skip list of today's duplicates grouped by
+  cause. The two advisory ignores cargo-deny reports as not detected
+  (RUSTSEC-2026-0381, RUSTSEC-2024-0436) are removed, the stale [graph]
+  comment rewritten, and the yanked crypto-bigint 0.7.6 moved to 0.7.11.
+
+  ring leaves the VTA and VTC graphs; it stays only under attest-verify.
+
+  removed from 19 crates; deliberate ones are listed under
+  [package.metadata.cargo-machete] ignored. A tier-0 "manifest hygiene" CI job
+  runs cargo-machete and the lint check.
+
+  once in [workspace.dependencies]; vta-tee inherits aws-lc-rs. The five
+  crypto crates carry real minimum-patch floors, enforced by
+  check-workspace-version-reqs.py.
+
+  (check-workspace-lints.py); unsafe_code = "forbid" workspace-wide, with
+  the four crates that need unsafe restating the table at "deny" and
+  rewritten safely. The two missing publish = false comments are added.
+
+
+
+## [0.41.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.40.0...vta-tee-v0.41.0) — 2026-11-12
+
+
+### Added
+
+- **vta**: A TEE VTA can take a key-role did:webs as its own DID at first boot ([#2696](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2696))
+
+A TEE operator asks for a key-role did:webs as the enclave's identity with
+  `[tee.kms.vta_did_webs]` (server_did, domain, optional path / server_id), in an
+  image built with vta-enclave's new `webs` feature and `[dids] webs_enabled`.
+  Additive: absent, first boot is unchanged; exclusive with `vta_did_template`.
+
+  First boot mints it inside the enclave from the KMS-bootstrapped seed through
+  `operations::did_webs::create_own_identity` — the one create `vta setup`'s
+  `create_webs` now calls too, on first-boot authority (no claims; refused once
+  the VTA has an identity; no transport reaches it) — records it unpublished and
+  persists the DID as `tee:vta_did`, so later boots restore it store-first. A
+  boot that died before that adopts what it minted. Startup publishes it exactly
+  as for a plain VTA (`publish_own_webs_identity`, self-certifying
+  `did/register/0.1`). A refused mint is fatal on Nitro: never another
+  identifier (VTI-KEY-001, VTI-KEY-009).
+
+  The enclave proxy allowlists the identity's host and domain from the same
+  table; `extract_host_from_did` reads did:webs and honours a `%3A` port for
+  every method (it dropped the port before).
+
+  A restore that replaces another identity now detaches did:webs slots as well
+  as did:webvh ones: the record keeps its slot and loses its server, so nothing
+  is published to the source's host.
+
+
+
+## [0.40.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.39.0...vta-tee-v0.40.0) — 2026-11-10
+
+
+## [0.39.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.38.0...vta-tee-v0.39.0) — 2026-11-09
+
+
+## [0.38.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.37.0...vta-tee-v0.38.0) — 2026-11-05
+
+
+## [0.37.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.36.0...vta-tee-v0.37.0) — 2026-11-05
+
+
+## [0.36.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.33.0...vta-tee-v0.36.0) — 2026-11-04
+
+
+## [0.33.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.32.0...vta-tee-v0.33.0) — 2026-11-04
+
+
+## [0.32.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.31.0...vta-tee-v0.32.0) — 2026-11-03
+
+
+## [0.31.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.30.0...vta-tee-v0.31.0) — 2026-11-03
+
+
+## [0.30.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.29.0...vta-tee-v0.30.0) — 2026-11-02
+
+
+## [0.29.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.27.0...vta-tee-v0.29.0) — 2026-10-30
+
+
+## [0.27.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.26.0...vta-tee-v0.27.0) — 2026-10-28
+
+
+## [0.26.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.25.0...vta-tee-v0.26.0) — 2026-10-27
+
+
+## [0.25.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.24.0...vta-tee-v0.25.0) — 2026-10-26
+
+
+### Added
+
+- **vta**: Did:scid:vh:1 identities, create/1.2, and VTA/VTC presentation config ([#2257](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2257))
+
+* feat(vta-sdk): did:scid:vh:1 identity rules and did:scid secret kids (VTI-KEY-160 to VTI-KEY-164)
+
+- **pnm**: Select the TEE claim key by its DID, not by slug ([#2207](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2207))
+
+* feat(pnm): select the TEE claim key by its DID, not by slug
+
+  The claim DID is minted before the VTA exists, so no slug can be known then.
+  `claim-did create` stores the key under its DID and `bootstrap connect
+  --claim-did` selects it; `--slug` only names the VTA locally (default: the
+  VTA DID's tail). A malformed or unknown claim DID is refused before any
+  network call, and the not-found error no longer suggests minting a new claim
+  DID, which the VTA would not accept.
+
+  Older command lines keep working: without `--claim-did`, connect uses the key
+  stored under the slug, as earlier pnm did; with it, a slug-keyed key is used
+  only if it holds that DID. `claim-did create/show/discard --slug` stay as
+  hidden flags.
+
+  A VTA whose enclave predates vta-service 0.63 cannot parse the v2 claim and
+  answers 422; connect now says so and names the workaround.
+
+- Growth types in published crates are #[non_exhaustive] ([#2196](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/2196))
+
+A new variant on a public enum, or a new field on a public struct a consumer
+  can build with a literal, is a breaking change in a published crate. It kept
+  happening on types that were always going to grow (#1231, #1234, #1244, #1247,
+  #1250); #1262 fixed it for Capability and AuditEvent only.
+
+  This marks the rest once. 143 enums are marked: every error and refusal enum
+  (VtaError, AppError, ...) and the growth vocabularies (kinds, statuses,
+  reasons, codes, transports, SealedPayloadV1). 32 structs are marked: config
+  and response bags that no caller builds with a literal. Adding the attribute
+  is itself breaking, once. After it, additions to these types are minor
+  changes.
+
+  Left exhaustive on purpose, and pinned that way by the census:
+  VerifiedAssertion, AssertionProof, ActScope, ApproveScope, ContextDirection,
+  SigningDomain, TokenStatus and Role. For each of these, every arm must be
+  considered, and a downstream wildcard would be the bug.
+
+  Every downstream match in the workspace gets a `_ =>` arm that takes the most
+  restrictive or most generic reading: an internal error, a hidden or refused
+  entry, a stale attribute. None is unreachable!().
+
+  vta-sdk/tests/non_exhaustive_census.rs fails on a public enum in a published
+  library crate whose name ends in Error, Refusal, Violation, Kind, Event,
+  Status, Capability, Reason or Code and that is not #[non_exhaustive], unless
+  it is listed as deliberately exhaustive with a reason. It also fails when a
+  listed enum gains the attribute or disappears.
+
+
+
+## [0.24.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.22.0...vta-tee-v0.24.0) — 2026-10-18
+
+
+## [0.22.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.21.0...vta-tee-v0.22.0) — 2026-10-16
+
+
+## [0.21.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.20.0...vta-tee-v0.21.0) — 2026-10-15
+
+
+### Added
+
+- **vta**: Gate the TEE first-boot admin claim on a pre-registered c… ([#1987](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1987))
+
+* feat(vta)!: gate the TEE first-boot admin claim on a pre-registered claim DID
+
+  POST /bootstrap/request (Mode B) accepted an anonymous caller: whoever
+  reached a fresh TEE VTA first claimed admin, gated only by the carve-out
+  sentinel, which a hostile host can make vanish by forging its absence or
+  dropping its write.
+
+  - pnm: `bootstrap claim-did create|show|discard` mints an Ed25519 claim
+    DID before the VTA exists; the private key lives only in the OS
+    keyring (file store refused). `bootstrap connect --slug` signs the
+    request with it and drops the key once attestation verifies.
+  - vta-sdk: optional `claim_signature` on the sealed BootstrapRequest,
+    over a domain tag || client pubkey || nonce.
+  - vta-config: `tee.bootstrap_claim_did`, settable only via the tenant
+    overlay (deny_unknown_fields kept; admin_did still forbidden),
+    validated at boot and covered by the attested config digest.
+  - vta-service: verify the signature, require client_did == the
+    configured claim DID (403, nothing written), then the carve-out;
+    burn the claim DID with the sentinel on success.
+
+
+
+## [0.20.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.19.0...vta-tee-v0.20.0) — 2026-10-13
+
+
+## [0.19.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.18.0...vta-tee-v0.19.0) — 2026-10-12
+
+
+## [0.18.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.17.0...vta-tee-v0.18.0) — 2026-10-11
+
+
+## [0.17.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.16.0...vta-tee-v0.17.0) — 2026-10-11
+
+
+## [0.16.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.15.0...vta-tee-v0.16.0) — 2026-10-06
+
+
+## [0.15.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.14.0...vta-tee-v0.15.0) — 2026-10-06
+
+
+## [0.14.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.13.0...vta-tee-v0.14.0) — 2026-10-05
+
+
+## [0.13.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.12.0...vta-tee-v0.13.0) — 2026-10-04
+
+
+## [0.12.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.11.0...vta-tee-v0.12.0) — 2026-10-02
+
+
+## [0.11.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.10.0...vta-tee-v0.11.0) — 2026-10-02
+
+
+## [0.10.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.9.0...vta-tee-v0.10.0) — 2026-10-01
+
+
+## [0.9.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.8.0...vta-tee-v0.9.0) — 2026-10-01
+
+
+## [0.8.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.7.0...vta-tee-v0.8.0) — 2026-09-30
+
+
+## [0.7.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.6.0...vta-tee-v0.7.0) — 2026-09-30
+
+### Changed
+
+- Breaking bump: this release moves the internal `vta-sdk` / `vti-common` requirements to their new compatibility range, which a patch release must not do (a caret dependent would resolve a second copy of either).
+
+
+## [0.6.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.5.1...vta-tee-v0.6.0) — 2026-09-27
+
+
+### Added
+
+- **attestation**: The TEE attestation reads are public Trust Tasks, over any transport ([#1776](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1776))
+
+* feat(attestation)!: the TEE attestation reads are public Trust Tasks, over any transport
+
+  A TEE VTA answered three attestation reads only as unauthenticated REST routes
+  (`GET /attestation/status`, `GET`/`POST /attestation/report`,
+  `POST /attestation/config-report`), plus a bare DIDComm protocol arm that
+  nothing sent to. Under the rule that every remote API is a spec-first,
+  spine-dispatched Trust Task reachable over TSP, DIDComm and HTTPS, they are now
+  `vta/attestation/{status,report,config-report}/0.1` (trustoverip/
+  dtgwg-trust-tasks-tf#654, trust-tasks-rs 0.23.2), dispatched on the spine.
+
+  Public tasks
+  - `vta_sdk::trust_tasks::PUBLIC_URIS` names the tasks a caller may send with no
+    identity: no session, no ACL entry, no request proof. A verifier asks before
+    it trusts the VTA; the nonce bound into the evidence is what makes a report
+    its own, and every response is the VTA's signed operational document.
+  - HTTPS: `/trust-tasks` takes an optional credential. An anonymous caller may
+    send only a public task (anything else is 401), capped at 64 KB, and those
+    requests are charged to the unauthenticated limiter — which charges only
+    requests presenting no credential, decided by the extractor's own rule
+    (`vti_common::auth::extractor::presents_credential`), so a junk header cannot
+    move a request between the two classes.
+  - DIDComm/TSP: a sender the ACL does not know gets a zero-authority claim for a
+    public task, and `bind_document_to_sender` accepts it unsigned — the spec
+    makes the request proof OPTIONAL and HTTPS accepts it unsigned, so refusing it
+    here would make the requirement depend on the transport (VTI-OPS-021). An
+    attached proof is still verified and bound.
+  - A census (`every_public_task_is_proof_optional_and_read_only`) fails if a task
+    whose spec requires a proof, or whose dispatch class changes state, discloses
+    a secret or acts as its subject, is ever added to `PUBLIC_URIS`.
+
+  Behaviour
+  - `report` and `config-report` require a 32-byte verifier nonce; the cached,
+    nonce-less report is not carried over — evidence nobody asked for is evidence
+    anybody can replay.
+  - Failures carry the specs' declared codes: `notAttested` (no provider),
+    `noConfigSnapshot` (only the enclave front-end captures one),
+    `evidenceUnavailable` (the platform refused a quote).
+  - The VTA still requires `issuedAt` on every document (bounding its replay
+    record), stricter than the spec; the deploy README examples send it.
+
+  Removed (breaking)
+  - The REST routes above and the DIDComm `firstperson.network/vta/1.0/
+    attestation/*` arms, with their SDK constants; `TASK_ATTESTATION_{STATUS,
+    REPORT}_1_0` become `TASK_ATTESTATION_{STATUS,REPORT,CONFIG_REPORT}_0_1` and
+    leave `REST_ROUTED_URIS`.
+  - The `TeeAttestation` DID-document service, which pointed at the REST route
+    (user decision: removed, not re-pointed). `tee.embed_in_did` and
+    `VTA_TEE_EMBED_IN_DID` are **refused** at config load as retired, naming the
+    replacement, rather than silently ignored. The shipped Nitro configs drop the
+    key; the deploy scripts' health hints point at `/health`.
+
+
+
+## [0.5.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.5.0...vta-tee-v0.5.1) — 2026-09-26
+
+
+## [0.5.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.4.2...vta-tee-v0.5.0) — 2026-09-26
+
+
+### Fixed
+
+- **vta-service**: Close the key-material follow-ups from the export audit ([#1743](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1743))
+
+* fix(vta-service): apply the key-export and sign capability checks on every transport
+
+  The KeyExport capability was checked only by the keys/export-secret
+  Trust-Task handler, so GET /keys/{id}/secret and DIDComm get-key-secret
+  released private keys to an admin whose entry was narrowed without
+  key-export. Capability::Sign was checked nowhere.
+
+  Both checks now live in the operation layer (VTI-VTA-003, VTI-VTA-007):
+
+  - get_key_secret requires key-export before any lookup, refuses a
+    hop-by-hop channel (keys/export-secret/0.1 requires a channel
+    confidential to the two parties), keeps the internal-key and
+    non-exportable refusals, and writes the key.secret_export audit row
+    durably before releasing the material, refusing if it cannot.
+  - The Trust-Task binding (https, didcomm, tsp) is recorded at the three
+    entry points and named in the export's audit channel.
+  - vta/contexts/secrets and provision-integration use the same gate.
+  - sign_payload requires sign for opaque caller bytes; derive-and-sign
+    and derive-and-sign-document require sign.
+  - The legacy REST and DIDComm key routes now consult the policy gate
+    with the matching Trust-Task URI.
+  - The TEE mnemonic export writes a durable audit row before release.
+
+
+
+### Security
+
+- **workspace**: No type derives Debug over secret material ([#1711](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1711))
+
+A derived `Debug` prints every field, so on a type holding a private key, a
+  seed or mnemonic, a bearer or refresh token or a password it puts the secret
+  into anything that formats the value — a `tracing` field, an `unwrap` or
+  `expect` on an enclosing type, a test failure, a panic message. About 55 types
+  across twelve crates did exactly that. It surfaced when `vtc-client` began
+  holding an operator's key in a `HolderKey`, whose derived `Debug` printed it.
+
+  Each now has a hand-written `Debug` that reports the secret as `<redacted>` —
+  presence kept visible for an `Option` — and prints every other field as
+  before, the idiom the workspace already used where someone had thought of it.
+  Among them: `HolderKey`, `Session`, `ClientIdentity`, `CredentialBundle`,
+  `SecretEntry`, `AgentConfig`, `AgentConnect`, `AuthResult`, the key-import and
+  seed-rotation requests (mnemonic), `SeedRecord`, `MnemonicExportResponse`,
+  `SecretsConfig` (seed, Vault token, AppRole secret id), `VaultSecret`, its
+  `CustomField` values and secure notes, `TotpSeed`, the VTC install flow's
+  ephemeral signing keys, setup tokens and install JWT, the VTC backup's signing
+  bundle and password, mobile-core's X25519 and Ed25519 private keys, auth tokens
+  and push tokens (including the Web Push auth secret), and vta-mcp's
+  `--agent-key`/`--holder-key`/`--agent-secrets`.
+
+  `Zeroizing<T>` is not a redaction — its `Debug` prints the inner value — so the
+  fields wrapped in it were redacted too.
+
+  `vta-sdk/tests/secret_debug_census.rs` keeps the class closed. It parses every
+  workspace crate with `syn` and fails on a `#[derive(Debug)]` struct or enum
+  whose field has a secret-sounding name (`*_key`, `*token*`, `*secret*`,
+  `seed*`, `password`, `mnemonic`, `jwt`, and `secret_id` despite its `_id`)
+  and a raw type (`String`, bytes, `Zeroizing<_>`, optionally in an `Option` or
+  behind a reference). A field whose type is another workspace type inherits that
+  type's `Debug`, which is checked where it is defined. What the name rule
+  catches and is not a secret — a claim-type vocabulary token, a webvh path
+  called `mnemonic`, the name of an entry in a secret store — is on a
+  shrink-only list with what the field holds, and the census also refuses a
+  stale entry and a walk that has stopped finding types.
+
+  Not an API change: every type still implements `Debug`; only what it prints
+  differs, and no test asserted on the old output.
+
+
+
+## [0.4.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.4.1...vta-tee-v0.4.2) — 2026-09-24
+
+
+## [0.4.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.4.0...vta-tee-v0.4.1) — 2026-09-23
+
+
+## [0.4.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.3.2...vta-tee-v0.4.0) — 2026-09-22
+
+
+### Added
+
+- **backup**: A backup is the whole agent, and restores between plain, hardened and TEE VTAs ([#1655](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1655))
+
+A backup now carries every row of every keyspace in vta_keyspaces::BACKED_UP
+  (format vta-backup-v2) and restores into a plain, hardened or Nitro-enclave
+  VTA from any of them. VTI-VTA-001, VTI-VTA-050, VTI-VTA-051, VTI-KEY-033.
+
+
+
+## [0.3.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.3.1...vta-tee-v0.3.2) — 2026-09-22
+
+
+## [0.3.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.3.0...vta-tee-v0.3.1) — 2026-09-21
+
+
+## [0.3.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.10...vta-tee-v0.3.0) — 2026-09-21
+
+
+### Fixed
+
+- **did-webvh**: Serialize versionTime log updates ([#1599](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1599))
+
+* fix(did-webvh): serialize versionTime log updates
+
+  Use one current-time policy for TEE genesis and runtime did:webvh
+  updates. Wait for the next valid whole-second boundary, rechecking
+  after wall-clock rollback, instead of backdating entries.
+
+  Serialize same-DID log appends within a VTA process and add regression
+  coverage for rapid updates, concurrent appends, legacy timestamps, and
+  TEE genesis followed by an immediate validated update.
+
+
+
+## [0.2.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.9...vta-tee-v0.2.10) — 2026-09-20
+
+
+## [0.2.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.8...vta-tee-v0.2.9) — 2026-09-17
+
+
+## [0.2.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.7...vta-tee-v0.2.8) — 2026-09-16
+
+
+## [0.2.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.6...vta-tee-v0.2.7) — 2026-09-16
+
+
+## [0.2.6](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.5...vta-tee-v0.2.6) — 2026-09-14
+
+
+### Fixed
+
+- **pnm-cli**: Anchor TEE bootstrap connect by DID and PCR0 ([#1454](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1454))
+
+* fix(pnm-cli): anchor TEE bootstrap connect by DID and PCR0
+
+  Add mutually exclusive --vta-did and --vta-url targets. Resolve WebVH locally without guessing a URL on failure, preserve the advertised REST endpoint, and reject credentials for a different VTA DID.
+
+  Accept a pinned PCR0 as the online connect trust anchor without requiring the server-generated digest or an opt-out warning. Preserve explicit digest opt-out warnings, conflicting-flag errors, and mandatory offline digest verification.
+
+  Add regression tests for target selection, strict endpoint resolution, credential identity checks, and anchor combinations. Update the PNM quick start and TEE bootstrap guide.
+
+- **webvh**: Clamp versionTime against the previous log entry ([#1456](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1456))
+
+* fix(tee): backdate WebVH genesis versionTime
+
+  The TEE genesis path used the library's current-time default while
+  runtime updates used PR #600's backdated timestamps. This caused the
+  first update to have a lower versionTime than genesis, making the DID
+  unresolvable.
+
+  Apply the shared PR #600 backdating policy to TEE genesis and move the
+  helper into vta-support so both TEE and service paths use one implementation.
+
+
+
+## [0.2.5](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.4...vta-tee-v0.2.5) — 2026-09-12
+
+
+## [0.2.4](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.3...vta-tee-v0.2.4) — 2026-09-07
+
+
+## [0.2.3](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.2...vta-tee-v0.2.3) — 2026-09-06
+
+
+### Fixed
+
+- **tee**: Make allow_kms_reinit explicit authorization for reinit regardless of KMS failure type ([#1249](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1249))
+
+* fix(tee): make allow_kms_reinit explicit authorization for reinit regardless of KMS failure type
+
+
+
+## [0.2.2](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.1...vta-tee-v0.2.2) — 2026-09-01
+
+
+## [0.2.1](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.2.0...vta-tee-v0.2.1) — 2026-08-29
+
+
+## [0.2.0](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.1.10...vta-tee-v0.2.0) — 2026-08-28
+
+
+### Chore
+
+- **deps**: Aes-gcm 0.11, and stop the nonce conversions panicking ([#1173](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1173))
+
+
+## [0.1.10](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.1.9...vta-tee-v0.1.10) — 2026-08-26
+
+
+## [0.1.9](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.1.8...vta-tee-v0.1.9) — 2026-08-20
+
+
+### Fixed
+
+- **tee**: Bootstrap 410 and vsock enotconn ([#1003](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1003))
+
+* fix(tee): retry transient ENOTCONN on first vsock config-overlay read
+
+  tokio-vsock can report a stream connected just before Nitro finishes the
+  nonblocking handshake, so the very first read on a fresh vsock:5800
+  connection to the parent config server can return ENOTCONN even though
+  the parent is listening and ready. Retry only that specific transient
+  error kind with a short delay; any other I/O error still fails closed
+  immediately, and the existing overall READ_TIMEOUT deadline still
+  bounds the whole fetch.
+
+  Adds positive (retries ENOTCONN then succeeds) and negative (does not
+  retry PermissionDenied) unit tests against the inner read loop.
+
+
+
+## [0.1.8](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.1.7...vta-tee-v0.1.8) — 2026-08-16
+
+
+## [0.1.7](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.1.6...vta-tee-v0.1.7) — 2026-08-14
+
+
+### Added
+
+- **nitro**: Un-bake tenant config, deliver to the enclave over vsock ([#939](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/939))
+
+* feat(nitro): un-bake tenant config, deliver to the enclave over vsock
+
+  The Nitro enclave image no longer bakes tenant config.toml into the EIF, so one image (one PCR0) serves every tenant. The entrypoint fetches a versioned config envelope from the parent over vsock:5800 (bounded connect/read timeouts, 1 MB size cap, version check), fails closed unless VTA_ALLOW_DEFAULT_CONFIG=true, and writes /etc/vta/config.toml before start. Adds jq to the runtime; documents the KMS-policy isolation requirement and the tee-mode enforcement floor.
+
+
+
+## [0.1.6](https://github.com/OpenVTC/verifiable-trust-infrastructure/compare/vta-tee-v0.1.5...vta-tee-v0.1.6) — 2026-08-13
+
+
+### Added
+
+- **release**: Publish vta-service and its closure again ([#962](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/962))
+
+* feat(release): publish vta-service and its closure again
+
+  #938 unpublished `vta-service` and the twelve subsystem crates behind it,
+  on the finding that nothing external depended on them. The audit read
+  normal dependencies. `openvtc-core` depends on `vta-service` as a
+  **dev-dependency**, for `test_support::MockVta` — an in-process VTA its
+  end-to-end tests run against. That harness boots the real service, so no
+  client crate can stand in for it.
+
+  Unpublishing did not merely freeze the crate. It broke it.
+
+  `vti-common` re-exports `vta_sdk::acl::{ActScope, ApproveScope,
+  ContextDirection}` as its own public API, so **a re-export makes the
+  re-exported crate's version part of your public API**: any graph
+  combining `vti-common` with another `vta-sdk` consumer must resolve one
+  `vta-sdk`. The frozen `vta-service` 0.14.37 asks for `vta-sdk ^0.21`
+  while `vti-common` has moved to `^0.23`. A downstream `cargo update`
+  resolves both and `vta-service` fails to compile with
+
+    expected `vti_common::acl::ApproveScope`,
+       found `vta_sdk::acl::ApproveScope`
+
+  at ten call sites — which is how this surfaced, in openvtc #213. Nothing
+  downstream can fix that; only a release that moves the requirements
+  together can.
+
+  So the thirteen manifests go back to the workspace default. The cost is
+  the closure — twelve subsystem crates return to crates.io, which is
+  exactly what #938 set out to stop. Taken deliberately over the
+  alternatives: yanking the published copies breaks OpenVTC's tests with no
+  replacement, and leaving them up ships a crate on the registry that
+  cannot be built.
+
+  **On release ordering.** `cargo publish --dry-run -p vta-service` fails
+  today, and will until the closure is on the registry: packaging strips
+  path deps, so `vta-keys = "0.2"` resolves the *published* 0.2.1, which
+  still asks for `vta-sdk ^0.21` — two nodes, same error. That resolves
+  itself in the release, which publishes in dependency order: every
+  subsystem crate in this workspace already requires `vta-sdk = "0.23"`, so
+  once they upload, `vta-service` verifies against them. Crates whose
+  dependencies are all published already dry-run clean (verified on
+  `vta-keyspaces` and `vta-config`).
+
+  Docs updated to match: CLAUDE.md, RELEASING.md and the release-plz.toml
+  header all said 7-of-21. They now say 20-of-26, name the six that stay
+  internal, and record the rule the audit missed — check dev-dependencies,
+  in sibling repos, before unpublishing anything.
+
+
+
+### Build & CI
+
+- **release**: Adopt release-plz, publish 7 crates instead of 21 ([#938](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/938))
+
+Merging and releasing were the same act. publish.yml fired on every push to
+  main and shipped whatever versions were newly present, and a CI guard required
+  the version bump to live in the feature PR — so every PR was a release
+  decision, taken by whoever opened it, days before it merged. Two open PRs
+  touching one crate wrote the same number into the same line of the same
+  Cargo.toml, and the second to merge had to rebase, renumber, and fix a
+  changelog entry that had gone stale. #932/#936/#937 hit it three times in one
+  afternoon.
+
+

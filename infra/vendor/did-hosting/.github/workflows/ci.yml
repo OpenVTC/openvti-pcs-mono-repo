@@ -1,0 +1,786 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+# Least privilege: every job here only reads the repository. Without this
+# block the token would get the repository default, which can be broader.
+permissions:
+  contents: read
+
+# Supersede a PR's in-flight run when new commits land on the same ref — a
+# review push otherwise leaves ~31 minutes of runner time chasing a diff nobody
+# will read.
+#
+# Deliberately NOT cancelled for `push`: a run on main / release/** is the
+# build-of-record for that commit, and cancelling it leaves a commit with no
+# green tick even though it was never actually tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # File and line numbers in backtraces, without full debug info. A full
+  # workspace test build outgrew the hosted runner's disk (PR #304: three jobs
+  # killed mid-compile); affinidi-tdk-rs hit the same wall (#940). Local
+  # builds keep the default.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUSTDOCFLAGS: -D warnings
+  # Pinned MSRV — must equal `rust-version` in the workspace Cargo.toml.
+  # Bumping one without the other causes silent drift.
+  MSRV: "1.95.0"
+
+# Runners: only the four long jobs (clippy, MSRV, default-features tests,
+# did:webs tests) use `vars.CI_RUNNER_LARGE`. Larger runners run few jobs at
+# once, so the short store / method / cloud-secret matrix jobs stay on
+# ubuntu-latest, where they start immediately; PR #307 spent most of its hour
+# queued with every heavy job on the large runner. Every Rust job still runs
+# ./.github/actions/prepare-runner for swap and disk.
+#
+# Timeouts: each job's `timeout-minutes` is roughly 1.5-3x its slowest recent
+# run with a cold cache (MSRV and the macOS keyring job reach ~47 minutes,
+# the default-features and did:webs tests ~23, the other builds ~12), so a
+# hung build or test stops instead of holding a runner for the 6-hour default.
+# Raise a limit when a job's normal duration grows towards it.
+#
+# Caches: `Swatinem/rust-cache` is saved only from runs on main
+# (`save-if`), so a PR restores main's cache but never writes its own — PR
+# caches are scoped to their branch, so saving one only evicted main's entries
+# from the repository's cache quota. Matrix jobs give the action a `key:` per
+# leg: the action's default key is the job id, so legs that compile different
+# feature sets would otherwise race to save, and restore, one shared entry.
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  release-guards:
+    # The changelog the release tooling expects (RELEASES.md): main's
+    # `## Unreleased` holds only the pointer line, and every changelog.d/
+    # fragment is well-formed. Seconds, no build.
+    name: release guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Release guards
+        run: python3 scripts/check-release-guards.py
+      # The changelog.d/ assembler the release scripts call: its ordering,
+      # cut/GA/patch layouts and fragment validation, in a throwaway repo.
+      - name: Changelog fragments self-test
+        run: python3 scripts/changelog_fragments.py --self-test
+
+  docs:
+    # Documentation guards. Every docs/ page carries a status line, current
+    # docs name no retired route/binary/function (scripts/check-docs.py), and
+    # every relative link and #fragment between Markdown files resolves
+    # (lychee, offline: no network, config in lychee.toml). Seconds, no build.
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      LYCHEE_VERSION: "0.24.2"
+      LYCHEE_SHA256: "1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Status lines and retired names
+        run: |
+          python3 scripts/check-docs.py --self-test
+          python3 scripts/check-docs.py
+      - name: Install lychee (pinned release, checksum verified)
+        run: |
+          curl -sSfL -o lychee.tar.gz \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${LYCHEE_SHA256}  lychee.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/lychee"
+          tar -xzf lychee.tar.gz -C "$RUNNER_TEMP/lychee" --strip-components=1
+          rm lychee.tar.gz
+          echo "$RUNNER_TEMP/lychee" >> "$GITHUB_PATH"
+      - name: Relative links (offline)
+        run: lychee --no-progress './**/*.md'
+
+  clippy:
+    name: cargo clippy
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  trust-tasks-lock:
+    # The Trust Task types are generated at build time from the versions
+    # pinned in did-hosting-common/trust-tasks.lock. The build already refuses
+    # a vendored bundle that does not match its locked digest; this also
+    # catches a manifest (trust-tasks.toml) that disagrees with the lock, and
+    # stray bundles nobody pins. Offline.
+    name: trust-tasks check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo install trust-tasks-cli --version 0.1.2 --locked
+      - run: trust-tasks -C did-hosting-common check
+
+  msrv:
+    # NB: the `env` context is NOT available in `jobs.<job_id>.name` (only
+    # github/needs/strategy/matrix/inputs/vars are). Referencing `${{ env.MSRV }}`
+    # here makes GitHub reject the whole workflow at startup — no jobs run. Keep
+    # this name static; the MSRV value is asserted against Cargo.toml below.
+    name: MSRV build
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - name: Verify Cargo.toml `rust-version` matches MSRV env var
+        run: |
+          declared=$(grep '^rust-version' Cargo.toml | head -n1 | sed -E 's/rust-version *= *"([^"]+)"/\1/')
+          if [ "$declared" != "${{ env.MSRV }}" ]; then
+            echo "::error::workspace rust-version ($declared) does not match CI MSRV (${{ env.MSRV }})"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: MSRV — build workspace (default features)
+        run: cargo +${{ env.MSRV }} build --workspace --locked
+      - name: MSRV — build did-hosting-common with every feature combination
+        # Cloud-secret backends and non-default storage backends are gated
+        # behind feature flags. They must also build at MSRV; otherwise a
+        # 1.95-only API in (e.g.) aws-sdk-secretsmanager would slip through
+        # the default-features build and break operator-driven feature
+        # selections at the next minor release.
+        #
+        # `method-webvh`, `method-web` and `method-webs` are also
+        # feature-gated; same MSRV-pass rationale. `method-webs` matters
+        # most of the three — it is off by default, so no other job in this
+        # workflow would notice it losing MSRV compatibility.
+        #
+        # `build`, not `check`, and deliberately so — this loop was briefly
+        # switched to `check` in #124 and got 3.4x SLOWER (108s -> 364s).
+        #
+        # Cargo fingerprints check and build as separate units, so a `check`
+        # here cannot reuse what the `cargo build --workspace` step above just
+        # compiled: it recompiles the whole dependency tree a second time in
+        # check mode. Reusing that step's artifacts is exactly why each feature
+        # combination costs ~8s rather than a full compile.
+        #
+        # `check` only pays off in a job that does no `build` at all. Do not
+        # "optimise" this one without measuring build-then-X in a *single*
+        # target directory — benchmarking the two commands in isolation says
+        # nothing about this job's shape, which is how the regression got in.
+        run: |
+          for feat in keyring aws-secrets gcp-secrets azure-secrets \
+                     vault-secrets k8s-secrets \
+                     store-fjall store-redis store-dynamodb \
+                     store-firestore store-cosmosdb passkey \
+                     setup-wizard metrics \
+                     method-webvh method-web method-webs; do
+            echo "::group::MSRV build did-hosting-common --features server-core,$feat"
+            cargo +${{ env.MSRV }} build -p did-hosting-common --locked \
+              --no-default-features --features "server-core,$feat"
+            echo "::endgroup::"
+          done
+
+  test:
+    name: cargo test (${{ matrix.store }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Storage backends are mutually exclusive at the build-script level, so
+        # each one needs its own job. `method-webvh,method-web` are included so
+        # the method-dependent unit tests (domain::safety host extraction) run.
+        #
+        # Only the embedded fjall backend runs the whole unit suite
+        # (`run_tests: true`): the generic handler/ACL tests assume an
+        # isolated, empty store per test (fjall gives each a fresh temp dir).
+        #
+        # Every other backend runs the shared store conformance suite
+        # (`server::store::conformance`, which opens its keyspaces under a
+        # fresh namespace, so it needs no isolation) against a real server:
+        # Redis and DynamoDB Local as service containers, Cosmos DB against
+        # its SDK's in-memory emulator. Firestore's emulator needs the gcloud
+        # CLI, so it runs on a schedule instead (store-emulators.yml); here it
+        # is build-only.
+        include:
+          - store: store-fjall
+            features: "server-core,store-fjall,keyring,passkey,setup-wizard,method-webvh,method-web"
+            run_tests: true
+          - store: store-redis
+            features: "server-core,store-redis,test-support,method-webvh,method-web"
+            run_tests: false
+            conformance: "--test store_conformance"
+            redis_image: "redis:7-alpine"
+          - store: store-dynamodb
+            features: "server-core,store-dynamodb,test-support,method-webvh,method-web"
+            run_tests: false
+            conformance: "--test store_conformance"
+            dynamodb_image: "amazon/dynamodb-local:3.3.2"
+          - store: store-firestore
+            features: "server-core,store-firestore,method-webvh,method-web"
+            run_tests: false
+          - store: store-cosmosdb
+            features: "server-core,cosmosdb-emulator,method-webvh,method-web"
+            run_tests: false
+            conformance: "--lib store::cosmosdb"
+    # A service whose image is empty is not started, so each entry gets only
+    # the server its conformance run needs.
+    services:
+      redis:
+        image: ${{ matrix.redis_image || '' }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 2s --health-retries 15
+      dynamodb:
+        image: ${{ matrix.dynamodb_image || '' }}
+        ports:
+          - 8000:8000
+    env:
+      # Read by tests/store_conformance.rs; a backend left unset is skipped.
+      WEBVH_TEST_REDIS_URL: ${{ matrix.redis_image && 'redis://127.0.0.1:6379' || '' }}
+      WEBVH_TEST_DYNAMODB: ${{ matrix.dynamodb_image && '1' || '' }}
+      AWS_ENDPOINT_URL: ${{ matrix.dynamodb_image && 'http://127.0.0.1:8000' || '' }}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: conformance
+      AWS_SECRET_ACCESS_KEY: conformance
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.store }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Unconditional. The feature string is not what decides this: every
+      # matrix entry builds `did-hosting-common`, which depends on
+      # `affinidi-tdk-common` non-optionally, and that crate pulls
+      # `dbus-secret-service-keyring-store` as a plain target-specific
+      # dependency on Linux — no `optional = true`, no feature gate. See the
+      # note on `cloud-secrets-build`.
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build did-hosting-common with ${{ matrix.store }}
+        # `build`, not `check` — see the note on the `methods` job below.
+        #
+        # Still skipped where tests run: the `cargo test` step compiles the
+        # same crate with the same features, so building first is work done
+        # twice. That part measured as a real (if small) win and stays.
+        if: ${{ !matrix.run_tests && !matrix.conformance }}
+        run: >
+          cargo build -p did-hosting-common --no-default-features
+          --features "${{ matrix.features }}"
+      - name: Test did-hosting-common with ${{ matrix.store }}
+        # Only embedded fjall runs the unit suite (isolated per-test store).
+        if: matrix.run_tests
+        run: >
+          cargo test -p did-hosting-common --lib --no-default-features
+          --features "${{ matrix.features }}"
+      - name: Store conformance (${{ matrix.store }})
+        if: matrix.conformance
+        run: >
+          cargo test -p did-hosting-common --no-default-features
+          --features "${{ matrix.features }}" ${{ matrix.conformance }}
+          -- --nocapture
+
+  test-default:
+    name: cargo test (default features)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      # `--locked` ensures Cargo.lock matches the workspace manifest exactly,
+      # so a transitive dep bump cannot quietly land via the test job before
+      # being explicitly bumped in Cargo.toml.
+      - run: cargo test --workspace --locked
+      # The setup-recipe example files (`examples/webvh-*-build.toml`) are
+      # the operator-facing contract for non-interactive setup. The smoke
+      # test loads each one, validates it, and fails the build on schema
+      # drift. Gated on `server-core` because the recipe module lives
+      # under `did_hosting_common::server`.
+      - name: setup-recipe examples parse + validate
+        run: >
+          cargo test -p did-hosting-common --locked
+          --features server-core --test recipe_examples
+      # End-to-end smoke test for the offline-prepare (phase 1) recipe
+      # path. Exercises `run_vta_for_recipe` + plaintext-store seed
+      # round-trip; the only piece between this passing and a fully
+      # air-gapped non-interactive install is the operator-ferried
+      # sealed bundle that phase 2 opens.
+      - name: setup-recipe offline phase 1 round-trip
+        run: >
+          cargo test -p did-hosting-common --locked
+          --features server-core --test offline_phase1
+      # The committed OpenAPI spec (docs/openapi.json) is generated from the
+      # `#[utoipa::path]` annotations on the HTTP handlers. This drift-check
+      # fails if the annotations changed without regenerating the snapshot
+      # (UPDATE_OPENAPI=1 cargo test -p did-hosting-server --features openapi
+      # openapi_snapshot).
+      - name: OpenAPI spec in sync
+        run: >
+          cargo test -p did-hosting-server --locked
+          --features openapi openapi_snapshot_in_sync
+
+  keyring-required:
+    name: keyring round-trip (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both targets where the workspace claims first-class keyring
+        # support. macOS has Keychain; Linux gets a session bus + gnome-
+        # keyring spun up explicitly so the test exercises a real Secret
+        # Service implementation rather than silently skipping. Without
+        # the explicit infrastructure the Linux runner has neither, so
+        # the test would skip and a regression would land unnoticed.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    env:
+      KEYRING_TEST_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Linux Secret Service
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus-x11 gnome-keyring libsecret-1-0 libsecret-1-dev \
+            libdbus-1-dev pkg-config
+      - name: Run keyring round-trip on macOS
+        if: matrix.os == 'macos-latest'
+        run: >
+          cargo test -p did-hosting-common --lib
+          --features server-core,store-fjall,keyring
+          server::secret_store::tests::keyring_round_trip_when_backend_available
+          --
+          --nocapture
+      - name: Run keyring round-trip on Linux (under dbus + gnome-keyring)
+        if: matrix.os == 'ubuntu-latest'
+        # `dbus-run-session` spins up a fresh session bus, then
+        # `gnome-keyring-daemon --unlock` boots the keyring and prints the
+        # `DBUS_SESSION_BUS_ADDRESS` and `GNOME_KEYRING_CONTROL` exports
+        # the test process consumes via env. The unlock password is
+        # piped via stdin per gnome-keyring-daemon's `--unlock` contract.
+        run: |
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            echo -n "ci-test-password" | gnome-keyring-daemon --unlock
+            eval "$(echo -n "ci-test-password" | gnome-keyring-daemon --start)"
+            export GNOME_KEYRING_CONTROL DBUS_SESSION_BUS_ADDRESS
+            cargo test -p did-hosting-common --lib \
+              --features server-core,store-fjall,keyring \
+              server::secret_store::tests::keyring_round_trip_when_backend_available \
+              -- --nocapture
+          '
+
+  methods:
+    name: cargo build (DID method ${{ matrix.case }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each enabled-by-default method must build cleanly with
+          # only its own feature on — proves the dispatcher arms are
+          # individually compile-gated, and that the daemon CAN be
+          # built as method-webvh-only or method-web-only.
+          - case: webvh-only
+            features: "method-webvh"
+            expect: ok
+          - case: web-only
+            features: "method-web"
+            expect: ok
+          # did:webs is implemented but off by default, so unlike the
+          # two above it is not covered by any default-feature job —
+          # this is the only thing that compiles it in isolation, and
+          # proves it carries no accidental dependency on webvh or web
+          # being present.
+          - case: webs-only
+            features: "method-webs"
+            expect: ok
+          # Stubs MUST refuse to build with a `compile_error!`. CI
+          # asserts the failure message — a future contributor who
+          # accidentally removes the stub without supplying a real
+          # impl would otherwise see the build "succeed" with the
+          # method absent from `method_by_name`.
+          - case: webplus-stub
+            features: "method-webplus"
+            expect: fail
+            expected_message: "method-webplus is not implemented in this release"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.case }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # libdbus IS in the graph, whatever the feature string says: these cases
+      # build `did-hosting-common`, which depends on `affinidi-tdk-common`
+      # non-optionally, and that crate pulls `dbus-secret-service-keyring-store`
+      # unconditionally on Linux. See the note on `cloud-secrets-build`.
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build did-hosting-common (${{ matrix.case }})
+        # `build`, not `check`, on measurement rather than principle.
+        #
+        # `check` skips codegen and linking, so in isolation it is ~2x faster
+        # on a cold target dir. #124 applied that reasoning here and every one
+        # of these cases got ~2x SLOWER instead (39-55s -> 99-133s), on a run
+        # whose cache already held check artifacts.
+        #
+        # The likely cause is `Swatinem/rust-cache`: the cache these jobs
+        # restore was accumulated over many `build` runs, and check units
+        # cannot be satisfied from build artifacts — so each job paid a larger
+        # restore AND a fresh compile. Whatever the mechanism, the measurement
+        # is what governs.
+        #
+        # Before changing this again, compare a full CI run, not two local
+        # `cargo` invocations.
+        run: |
+          set +e
+          out=$(cargo build -p did-hosting-common \
+            --no-default-features --features "${{ matrix.features }}" 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          if [ "${{ matrix.expect }}" = "ok" ]; then
+            if [ "$status" -ne 0 ]; then
+              echo "::error::expected ${{ matrix.features }} to build, got exit $status"
+              exit 1
+            fi
+          else
+            if [ "$status" -eq 0 ]; then
+              echo "::error::expected ${{ matrix.features }} to FAIL to build, got success"
+              exit 1
+            fi
+            if ! echo "$out" | grep -q "${{ matrix.expected_message }}"; then
+              echo "::error::expected failure to mention '${{ matrix.expected_message }}'"
+              exit 1
+            fi
+          fi
+
+  method-webs:
+    name: cargo test (did:webs)
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    # `method-webs` is off by default, so `test-default` never compiles a
+    # line of it — without this job the whole method ships untested. It also
+    # replaces what the old `webs-stub` case guarded: that case asserted the
+    # feature refused to build, which caught a contributor deleting the stub
+    # without supplying an impl. Now that an impl exists, the equivalent
+    # guarantee is that the impl is registered and works, which the suite
+    # asserts directly (`enabled_methods_contains_webs`, `dispatcher_routes_webs`).
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Test the write, sync and resolve paths with did:webs enabled
+        run: |
+          cargo test --locked \
+            -p did-hosting-common -p did-hosting-server -p did-hosting-control \
+            --features did-hosting-common/method-webs,did-hosting-server/method-webs,did-hosting-control/method-webs
+      # The daemon only wires features through, but it is the deployment most
+      # operators run — a missing passthrough would leave it accepting
+      # did:webs DIDs it cannot serve, or the reverse.
+      - name: Build the daemon with did:webs enabled
+        run: cargo build --locked -p did-hosting-daemon --features method-webs
+      - name: Clippy with did:webs enabled
+        run: |
+          cargo clippy --locked --all-targets \
+            -p did-hosting-common -p did-hosting-server -p did-hosting-control -p did-hosting-daemon \
+            --features did-hosting-common/method-webs,did-hosting-server/method-webs,did-hosting-control/method-webs,did-hosting-daemon/method-webs \
+            -- -D warnings
+
+  cloud-secrets-build:
+    name: cargo build (cloud secret backends)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - aws-secrets
+          - gcp-secrets
+          - azure-secrets
+          - vault-secrets
+          - k8s-secrets
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.backend }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # libdbus IS required here, despite the feature string naming no keyring
+      # backend. `did-hosting-common` depends on `affinidi-tdk-common`
+      # non-optionally, and that crate pulls `dbus-secret-service-keyring-store`
+      # as a plain target-specific dependency on Linux:
+      #
+      #   [target.'cfg(any(target_os = "linux", ...))'.dependencies
+      #     .dbus-secret-service-keyring-store]
+      #
+      # No `optional = true`, no feature gate — so no feature selection on our
+      # side can remove it, and every Linux build of this crate needs
+      # `libdbus-1-dev`.
+      #
+      # This job only ever passed because the cache usually carried a prebuilt
+      # `libdbus-sys`, so its build script never re-ran. A cache-cold run — a
+      # fresh branch, or a lockfile change that shifts the cache key — fails
+      # with "Package dbus-1 was not found in the pkg-config search path".
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: >
+          cargo build -p did-hosting-common --no-default-features
+          --features "server-core,${{ matrix.backend }}"
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+
+  # The admin UI had no CI at all until now: `did-hosting-ui` is TypeScript
+  # that never reached a compiler or a test runner on any push, so a type
+  # error or a broken client-side policy could only be caught by someone
+  # running Expo locally. It ships the trust-task client — envelope shapes,
+  # proof signing, the SPEC §8.4 retry policy — which is wire behaviour the
+  # Rust suite cannot see.
+  ui:
+    name: ui (typecheck + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: did-hosting-ui
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          # Matches the `engines.node` floor in did-hosting-ui/package.json.
+          # 24 is the active LTS (maintained to April 2028) and is the floor
+          # `vitest` 5 requires (`^22.12 || ^24 || >=26` — note it excludes the
+          # odd/non-LTS 25). Node 20 went end-of-life in April 2026; moving off
+          # it is what let the test runner move. Bump this, the `engines.node`
+          # floor and the README prerequisite together.
+          #
+          # Unquoted-major on purpose: this resolves to the LATEST 24.x, and it
+          # has to. React Native 0.86 declares `^24.3.0`, so 24.0–24.2 are
+          # genuinely too old for the tree even though they are "Node 24".
+          # Never pin this to an exact 24.0.x.
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: did-hosting-ui/package-lock.json
+      # `npm ci`, not `npm install` — fails loudly if package-lock.json has
+      # drifted from package.json rather than silently resolving something
+      # else, the same reason the Rust jobs pass `--locked`.
+      - run: npm ci
+      - run: npm run typecheck
+      # ESLint (react-hooks, jsx-a11y) and Prettier. Warnings fail the step.
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test
+      # Build the web bundle the control plane embeds, so a change that
+      # type-checks but does not bundle (a Metro resolution failure, a
+      # native-only import on web) fails here rather than at release time.
+      # Exported to the job's own `dist/`, not `did-hosting-control/ui-dist`.
+      - run: npx expo export --platform web --output-dir dist
+        env:
+          CI: "1"
+
+  # Every binary crate wires its store feature through to did-hosting-common;
+  # the `test` matrix above only ever compiles did-hosting-common itself, so a
+  # broken passthrough (a daemon `store-*` feature that forgets a member, or a
+  # cfg arm that names the wrong feature) would be invisible. The daemon depends
+  # on every other member with `default-features = false`, so building it per
+  # store compiles server, control, witness and watcher on that store too.
+  # `did-methods` keeps the resolve routes in; `ui` and `keyring` stay off, as
+  # an operator building a cloud deployment would leave them.
+  daemon-stores:
+    name: cargo build (daemon, ${{ matrix.store }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        store:
+          - store-fjall
+          - store-redis
+          - store-dynamodb
+          - store-firestore
+          - store-cosmosdb
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.store }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # See the note on `cloud-secrets-build`: libdbus is always in the graph.
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: >
+          cargo build --locked -p did-hosting-daemon --no-default-features
+          --features "${{ matrix.store }},did-methods"
+
+  # `RUSTDOCFLAGS: -D warnings` (top of file) only bites if something runs
+  # rustdoc: a broken intra-doc link or an unclosed HTML tag in a doc comment
+  # fails here rather than on docs.rs after a release is published.
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      # did-hosting-control's build script builds the console with npm when
+      # `ui-dist` is missing; rustdoc needs none of it. A placeholder bundle,
+      # written after checkout so it is newer than every UI source, skips the
+      # npm run (the same trick as upstream-drift.yml).
+      - name: Skip the console bundle build
+        run: |
+          mkdir -p did-hosting-control/ui-dist
+          echo '<!doctype html><title>placeholder</title>' > did-hosting-control/ui-dist/index.html
+      - run: cargo doc --locked --no-deps --workspace
+
+  # The crates ARE published to crates.io (RELEASES.md "Publish"), so a
+  # tarball that does not build — a file the `include` list misses, such as a
+  # vendored Trust Task bundle, or a path dependency without a version — would
+  # first fail on the release tag. `cargo package` builds each crate from its
+  # packaged tarball, against the other members packaged alongside it.
+  #
+  # `--allow-dirty` because the control plane carries its UI bundle from the
+  # gitignored `ui-dist/` (see CLAUDE.md); the placeholder below stands in for
+  # it, as in the `doc` job.
+  package:
+    name: cargo package
+    runs-on: ${{ vars.CI_RUNNER_LARGE || 'ubuntu-latest' }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Placeholder console bundle
+        run: |
+          mkdir -p did-hosting-control/ui-dist
+          echo '<!doctype html><title>placeholder</title>' > did-hosting-control/ui-dist/index.html
+      - run: cargo package --workspace --locked --allow-dirty
+
+  # fuzz/ is a detached workspace with its own Cargo.lock, which records
+  # did-hosting-common's version and dependency requirements. A PR that bumps a
+  # requirement without refreshing that lock passes every job above and only
+  # fails the nightly Fuzz run. Resolving it `--locked` takes seconds and needs
+  # no nightly toolchain.
+  fuzz-lock:
+    name: fuzz lockfile in sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null

@@ -1,0 +1,1046 @@
+//! Step-up (`auth/step-up/start/0.2`, `auth/step-up/approve-response/0.7`),
+//! and passkey login (`auth/passkey/login/{start,finish}/0.2`). Enrolment is
+//! `enrol`.
+//!
+//! The login ceremony reads login credentials only — the `KS_SESSIONS`
+//! store. A login passkey can never satisfy a step-up, and a step-up-only
+//! passkey can never sign anyone in: the two stores are opened by different
+//! code paths, and neither reads the other. `step_up_start`/`approve_response`
+//! below are the ones that open `KS_PASSKEY_STEP_UP` — when the session's
+//! subject holds a step-up passkey, the approve-request's `accepts` offers
+//! `webauthn` in place of `didSigned`, gated on that store; the
+//! login family (`login_start`/`login_finish`) never opens it.
+
+use did_hosting_common::tasks::auth::{
+    passkey::login::{finish as login_finish, start as login_start},
+    revoke_session,
+    step_up::{approve_response, start as step_up_start},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tracing::{info, warn};
+
+use did_hosting_common::server::auth::session::{
+    Session, SessionState, create_authenticated_session, delete_session, get_session, now_epoch,
+    store_session,
+};
+use did_hosting_common::server::didcomm_profile::ObservedTransport;
+use did_hosting_common::server::passkey::invite::Purpose;
+use did_hosting_common::server::passkey::store::{self as passkey_store, cred_id_hex};
+use did_hosting_common::server::store::KS_PASSKEY_STEP_UP;
+
+use super::{Cx, TaskError, at, new_id, typed};
+use crate::server::AppState;
+use did_hosting_common::server::acl::check_acl;
+use did_hosting_common::server::error::AppError;
+
+/// How long a step-up challenge or a passkey ceremony stays open.
+const CEREMONY_TTL_SECS: u64 = 300;
+
+/// The assurance level a step-up grants.
+const STEP_UP_ACR: &str = "aal2";
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn random_hex(bytes: usize) -> String {
+    (0..bytes)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect()
+}
+
+/// The canonical `Session` shape the auth family's responses carry.
+fn wire_session(session: &Session, expires_at: u64) -> Value {
+    json!({
+        "id": session.session_id,
+        "subject": session.did,
+        "issuedAt": at(session.created_at),
+        "expiresAt": at(expires_at),
+        "amr": session.amr,
+        "acr": session.acr,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Step-up
+// ---------------------------------------------------------------------------
+
+/// A step-up challenge bound to one session.
+///
+/// The WebAuthn ceremony (when one was offered) lives inside this record,
+/// not under a key of its own: the one atomic `take` that consumes the
+/// step-up consumes its ceremony with it, so the ceremony can only ever
+/// answer the exact challenge, subject and session it was opened for, and
+/// exactly once.
+#[derive(Serialize, Deserialize)]
+struct PendingStepUp {
+    challenge: String,
+    subject: String,
+    expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    webauthn: Option<webauthn_rs::prelude::PasskeyAuthentication>,
+}
+
+fn step_up_key(session_id: &str) -> String {
+    format!("stepup-task:{session_id}")
+}
+
+/// `auth/revoke-session/0.2`: end one of the caller's own sessions. This is
+/// the console's logout.
+///
+/// The session row goes, and with it its refresh token and any session key
+/// bound at login. The bearer extractor reads that row on every request, so
+/// the access token and the key stop working at once, not at expiry
+/// (`auth/authenticate/0.3`: the binding ends on revoke or logout).
+///
+/// A session key may sign this, since revoking only reduces authority, but
+/// only for its own session: it speaks for its subject in that session and no
+/// other (`auth/authenticate/0.3` Conformance item 12), so a stolen key cannot
+/// sign its subject out of their other devices.
+///
+/// A session that does not exist, was already revoked, belongs to someone
+/// else, or is out of reach of the session key that signed, answers
+/// `revokedCount: 0`, identically. That discloses nothing, and a retried
+/// logout succeeds (`auth/revoke-session/0.2` Conformance item 2, the
+/// RECOMMENDED form). `all` and `subject` are not offered: the console only
+/// ever ends the session it holds.
+pub(crate) async fn revoke_session(
+    cx: &Cx<'_>,
+    p: revoke_session::v0_2::Payload,
+) -> Result<revoke_session::v0_2::Response, TaskError> {
+    let caller = cx.caller()?.to_string();
+    if p.all.is_some() || p.subject.is_some() {
+        return Err(AppError::invalid(
+            "this relying party revokes one session, named by sessionId",
+        )
+        .into());
+    }
+    let session_id = p
+        .session_id
+        .as_ref()
+        .map(|s| s.to_string())
+        .ok_or_else(|| AppError::invalid("sessionId is required"))?;
+    let revoked = |count: u32| typed(json!({ "revokedCount": count }), "revoke-session response");
+
+    // Signed by the bearer session's bound key: that session only.
+    let by_session_key_elsewhere = cx.bearer_session().is_some_and(|b| {
+        b.session_id != session_id
+            && b.session_pubkey_b58btc.as_deref().is_some_and(|pk| {
+                cx.proof_vm.as_deref() == Some(format!("did:key:{pk}#{pk}").as_str())
+            })
+    });
+    if by_session_key_elsewhere {
+        return revoked(0);
+    }
+    let Some(session) = get_session(&cx.state.sessions_ks, &session_id).await? else {
+        return revoked(0);
+    };
+    if session.did != caller {
+        return revoked(0);
+    }
+    delete_session(&cx.state.sessions_ks, &session_id).await?;
+    // The row a proxied `auth/authenticate/0.3` login left (its `actor` and
+    // absolute-lifetime cap) outlives neither the session nor its refresh
+    // token: a direct 0.2 login never wrote one, so this is a no-op there.
+    crate::trust_tasks_auth::delete_auth_proxy_meta(cx.state, &session_id).await?;
+    info!(
+        did = %caller,
+        session_id = %session_id,
+        reason = p.reason.as_deref().map(String::as_str).unwrap_or(""),
+        "session revoked",
+    );
+    revoked(1)
+}
+
+/// `auth/step-up/start/0.2`: bind a fresh challenge to the caller's own
+/// session and answer the signed `approve-request/0.5` the approver will
+/// answer. Elevates nothing: only a verified `approve-response` does.
+///
+/// The session must be live and belong to the proven caller, or the proof must
+/// have been made with the session's recorded key; the three failing cases
+/// (no such session, someone else's, not live) answer alike.
+pub(crate) async fn step_up_start(
+    cx: &Cx<'_>,
+    p: step_up_start::v0_2::Payload,
+) -> Result<step_up_start::v0_2::Response, TaskError> {
+    use step_up_start::v0_2::error_codes;
+
+    let caller = cx.caller()?.to_string();
+    let state = cx.state;
+    let session_id = p.session_id.to_string();
+    let unknown = || {
+        TaskError::Declared(
+            error_codes::SESSION_UNKNOWN,
+            "no live session of yours has that id".into(),
+        )
+    };
+    let session = get_session(&state.sessions_ks, &session_id)
+        .await?
+        .ok_or_else(unknown)?;
+    let key_matches = session
+        .session_pubkey_b58btc
+        .as_deref()
+        .is_some_and(|pk| cx.proof_vm.as_deref() == Some(format!("did:key:{pk}#{pk}").as_str()));
+    if session.state != SessionState::Authenticated || (session.did != caller && !key_matches) {
+        return Err(unknown());
+    }
+    let target = p
+        .target_acr
+        .as_ref()
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| STEP_UP_ACR.to_string());
+    if target != STEP_UP_ACR && target != "aal1" {
+        return Err(AppError::invalid(format!(
+            "this relying party offers step-up to {STEP_UP_ACR} only"
+        ))
+        .into());
+    }
+    if session.acr == STEP_UP_ACR || target == "aal1" {
+        return Err(TaskError::Declared(
+            error_codes::NOT_NEEDED,
+            "the session is already at the requested assurance level".into(),
+        ));
+    }
+
+    let expires_at = now_epoch() + CEREMONY_TTL_SECS;
+
+    // Offer a WebAuthn gate when the session's subject holds a step-up
+    // passkey. Its own challenge — not an independently-generated nonce —
+    // becomes the step-up's `challenge`, so the two are the same value: the
+    // spec requires the assertion's `clientDataJSON` challenge to equal
+    // `payload.challenge`, and webauthn-rs, not this service, is what
+    // chooses a passkey ceremony's challenge.
+    let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
+    let step_up_creds = passkey_store::get_passkey_user_by_did(&step_up_ks, &session.did)
+        .await?
+        .map(|u| u.credentials)
+        .unwrap_or_default();
+    let mut gate = match (&state.webauthn, step_up_creds.is_empty()) {
+        (Some(webauthn), false) => Some(
+            webauthn
+                .start_passkey_authentication(&step_up_creds)
+                .map_err(|e| AppError::Internal(format!("webauthn step-up start failed: {e}")))?,
+        ),
+        _ => None,
+    };
+    let (challenge, accepts, webauthn_options) = match &gate {
+        Some((rcr, _)) => {
+            let options = request_options(rcr)?;
+            let challenge = options
+                .get("challenge")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Internal("webauthn options missing challenge".into()))?
+                .to_string();
+            // Once the subject holds a step-up passkey, only a webauthn
+            // assertion from it may satisfy step-up — `didSigned` (a
+            // self- or wallet/VTA-signed decision made without touching
+            // the passkey) is no longer offered.
+            (challenge, json!(["webauthn"]), Some(options))
+        }
+        None => (random_hex(32), json!(["didSigned"]), None),
+    };
+
+    let my_vid = state
+        .config
+        .server_did
+        .clone()
+        .ok_or_else(|| AppError::Config("server_did not configured".into()))?;
+    let secret = crate::signing::control_signing_secret(state, &my_vid)?;
+    let mut payload = json!({
+        "subject": session.did,
+        "sessionId": session_id,
+        "challenge": challenge,
+        "reason": "Elevate this session to aal2",
+        "targetAcr": STEP_UP_ACR,
+        "accepts": accepts,
+    });
+    if let Some(options) = webauthn_options {
+        payload["webauthn"] = options;
+    }
+    let request: trust_tasks_rs::TrustTask<Value> = serde_json::from_value(json!({
+        "id": new_id(),
+        "type": <did_hosting_common::tasks::auth::step_up::approve_request::v0_5::Payload as trust_tasks_rs::Payload>::TYPE_URI,
+        "issuer": my_vid,
+        "recipient": session.did,
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "expiresAt": at(expires_at).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": payload,
+    }))?;
+    // The approve-request is the approver's to verify on its own terms before
+    // surfacing its reason, so it is checked here against its own schema too.
+    typed::<did_hosting_common::tasks::auth::step_up::approve_request::v0_5::Payload>(
+        request.payload.clone(),
+        "approve-request payload",
+    )?;
+    let signed = did_hosting_common::server::trust_tasks::sign_document(&request, &secret)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Bound only once the request is signed, so a signing failure leaves no
+    // orphaned challenge.
+    let offered_webauthn = gate.is_some();
+    state
+        .sessions_ks
+        .insert(
+            step_up_key(&session_id),
+            &PendingStepUp {
+                challenge,
+                subject: session.did.clone(),
+                expires_at,
+                webauthn: gate.take().map(|(_, auth_state)| auth_state),
+            },
+        )
+        .await?;
+    info!(did = %session.did, session_id = %session_id, webauthn = offered_webauthn, "step-up started");
+    typed(
+        json!({ "approveRequest": serde_json::to_value(&signed)? }),
+        "step-up start response",
+    )
+}
+
+/// `auth/step-up/approve-response/0.7`: the approver's signed decision. The
+/// gate has verified it as an attestation (`assertionMethod`); here it must
+/// answer the challenge bound to its session, be made by that session's
+/// subject, and — approved — it raises the session's assurance level. Tokens
+/// carrying the new level come from `auth/refresh`, which reads the session's
+/// current level.
+///
+/// `evidence.kind: webauthn` additionally requires a user-verified assertion
+/// from the subject's `KS_PASSKEY_STEP_UP` credentials, over the WebAuthn
+/// ceremony `step_up_start` opened for exactly this challenge — a login
+/// passkey can't answer it (it's a different store) and a step-up passkey
+/// can't sign anyone in (this is the only place that verifies one).
+///
+/// **Once the subject holds any step-up passkey, that is the only route.** A
+/// `didSigned` decision (no evidence, or `evidence.kind: didSigned` — a
+/// self- or wallet/VTA-signed approval) is refused with `noGate` for a
+/// subject with at least one `KS_PASSKEY_STEP_UP` credential, checked fresh
+/// here rather than against what `step_up_start` advertised, so enrolling a
+/// passkey between start and this decision still closes the route. A
+/// subject with none keeps `didSigned`.
+pub(crate) async fn approve_response(
+    cx: &Cx<'_>,
+    p: approve_response::v0_7::Payload,
+) -> Result<approve_response::v0_7::Response, TaskError> {
+    use approve_response::v0_7::{Evidence, PayloadDecision, error_codes};
+
+    // `approverSigned` (0.6) is never in the `accepts` this service offers:
+    // it keeps no step-up approvers. Spec step 1 refuses a gate the relying
+    // party did not offer with `noGate`, and it is refused here, before the
+    // pending step-up is looked up, so the document cannot consume it.
+    if matches!(p.evidence, Some(Evidence::ApproverSigned { .. })) {
+        return Err(TaskError::Declared(
+            error_codes::NO_GATE,
+            "this relying party does not accept approverSigned evidence".into(),
+        ));
+    }
+
+    let approver = cx.caller()?.to_string();
+    let state = cx.state;
+    let session_id = p
+        .session_id
+        .as_ref()
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            TaskError::Declared(
+                error_codes::CHALLENGE_UNKNOWN,
+                "this relying party binds every step-up to a session".into(),
+            )
+        })?;
+    let unknown = || {
+        TaskError::Declared(
+            error_codes::CHALLENGE_UNKNOWN,
+            "no pending step-up has that challenge".into(),
+        )
+    };
+    // A wrong challenge is refused before anything is consumed, so it can't
+    // be used to cancel someone's pending step-up.
+    let peeked: PendingStepUp = state
+        .sessions_ks
+        .get(step_up_key(&session_id))
+        .await?
+        .ok_or_else(unknown)?;
+    if !constant_time_eq(peeked.challenge.as_bytes(), p.challenge.as_bytes()) {
+        return Err(unknown());
+    }
+    // Single use: claimed with one atomic `take` — whatever the decision,
+    // and with its WebAuthn ceremony inside it. Of two racing responses
+    // only one gets it back; and the challenge is re-checked on what was
+    // taken, since a fresh `step_up_start` may have replaced the record
+    // between the peek and the take.
+    let pending: PendingStepUp = state
+        .sessions_ks
+        .take(step_up_key(&session_id))
+        .await?
+        .ok_or_else(unknown)?;
+    if !constant_time_eq(pending.challenge.as_bytes(), p.challenge.as_bytes()) {
+        return Err(unknown());
+    }
+    if now_epoch() > pending.expires_at {
+        return Err(TaskError::Declared(
+            error_codes::CHALLENGE_EXPIRED,
+            "the step-up challenge has expired".into(),
+        ));
+    }
+    if p.subject.as_str() != pending.subject {
+        return Err(TaskError::Declared(
+            error_codes::SUBJECT_MISMATCH,
+            "the response names a different subject".into(),
+        ));
+    }
+    // Self step-up: the approver is the subject. No delegate is recognised.
+    if approver != pending.subject {
+        return Err(TaskError::Declared(
+            error_codes::APPROVER_UNAUTHORIZED,
+            "only the session's subject may approve its step-up".into(),
+        ));
+    }
+    // The framework proof already established the approver's DID (verified
+    // as `assertionMethod` before this handler ran) — a self step-up, so
+    // that's the session's own subject, as checked above. `webauthn`
+    // evidence is an *additional* factor on top of that proof, not a
+    // replacement for it: the browser signs with the did:key its session is
+    // already bound to (the same key every other request in the session
+    // uses), and the human-facing action is touching the step-up passkey.
+    // Looked up once, fresh, and reused by both the webauthn-evidence branch
+    // below and the passkey-only gate after it — decided at the subject's
+    // *current* enrolment, not at what `step_up_start` offered, since a
+    // step-up passkey can land between start and this decision.
+    let step_up_ks = state.store.keyspace(KS_PASSKEY_STEP_UP)?;
+    if let Some(Evidence::Webauthn { assertion }) = &p.evidence {
+        let webauthn_state = pending.webauthn.as_ref().ok_or_else(|| {
+            TaskError::Declared(
+                error_codes::NO_GATE,
+                "this step-up was not offered a passkey gate".into(),
+            )
+        })?;
+        let webauthn = state.webauthn.as_deref().ok_or_else(|| {
+            TaskError::Declared(
+                error_codes::NO_GATE,
+                "passkeys are not configured on this service".into(),
+            )
+        })?;
+        let credential: webauthn_rs::prelude::PublicKeyCredential =
+            serde_json::from_value(serde_json::to_value(assertion)?).map_err(|e| {
+                TaskError::Declared(
+                    error_codes::ASSERTION_INVALID,
+                    format!("unreadable assertion: {e}"),
+                )
+            })?;
+        let result = webauthn
+            .finish_passkey_authentication(&credential, webauthn_state)
+            .map_err(|e| {
+                warn!(error = %e, "step-up passkey assertion failed");
+                TaskError::Declared(
+                    error_codes::ASSERTION_INVALID,
+                    "the assertion did not verify".into(),
+                )
+            })?;
+        if !result.user_verified() {
+            return Err(TaskError::Declared(
+                error_codes::ASSERTION_INVALID,
+                "step-up requires a user-verified passkey assertion".into(),
+            ));
+        }
+        // Defence in depth: the assertion must be from one of the pending
+        // step-up's own subject's step-up-only credentials — which is
+        // already everything `webauthn_state` could answer, since it was
+        // built from exactly that subject's `KS_PASSKEY_STEP_UP` passkeys,
+        // never the login store.
+        let _guard = super::passkey::credentials_guard(
+            state,
+            did_hosting_common::server::passkey::invite::Purpose::StepUp,
+            &pending.subject,
+        )
+        .await;
+        let cred_id = cred_id_hex(result.cred_id());
+        let mut step_up_user = passkey_store::get_passkey_user_by_cred(&step_up_ks, &cred_id)
+            .await?
+            .filter(|u| u.did == pending.subject)
+            .ok_or_else(|| {
+                TaskError::Declared(
+                    error_codes::ASSERTION_INVALID,
+                    "the assertion is not from the subject's step-up passkey".into(),
+                )
+            })?;
+        for c in &mut step_up_user.credentials {
+            c.update_credential(&result);
+        }
+        passkey_store::store_passkey_user(&step_up_ks, &step_up_user).await?;
+    }
+
+    match p.decision {
+        PayloadDecision::Denied => {
+            info!(did = %approver, session_id = %session_id, "step-up denied by the approver");
+            return typed(json!({ "status": "recorded" }), "approve-response response");
+        }
+        PayloadDecision::Approved => {}
+        _ => return Err(AppError::invalid("unsupported decision").into()),
+    }
+    // Once this subject holds a step-up passkey, only a webauthn assertion
+    // from it may grant step-up: a wallet/VTA-signed `didSigned` decision
+    // (or one carrying no evidence at all) no longer counts, however
+    // properly it is signed. Evaluated fresh, at this decision, not against
+    // what `step_up_start` offered.
+    if !matches!(p.evidence, Some(Evidence::Webauthn { .. }))
+        && passkey_store::get_passkey_user_by_did(&step_up_ks, &pending.subject)
+            .await?
+            .is_some_and(|u| !u.credentials.is_empty())
+    {
+        return Err(TaskError::Declared(
+            error_codes::NO_GATE,
+            "the subject has a step-up passkey; only a webauthn assertion from it may grant step-up"
+                .into(),
+        ));
+    }
+    if let Some(granted) = p.granted_acr.as_deref()
+        && granted != STEP_UP_ACR
+    {
+        return Err(TaskError::Declared(
+            error_codes::ACR_UNSATISFIED,
+            format!("the approver granted {granted}; the step-up requires {STEP_UP_ACR}"),
+        ));
+    }
+
+    let mut session = get_session(&state.sessions_ks, &session_id)
+        .await?
+        .filter(|s| s.state == SessionState::Authenticated && s.did == pending.subject)
+        .ok_or_else(|| {
+            TaskError::Declared(
+                error_codes::CHALLENGE_UNKNOWN,
+                "the session has ended".into(),
+            )
+        })?;
+    // The ACL still gates: elevation does not outlive an ACL entry.
+    check_acl(&state.acl_ks, &session.did).await?;
+    let factor = if matches!(p.evidence, Some(Evidence::Webauthn { .. })) {
+        "passkey"
+    } else {
+        "did"
+    };
+    if !session.amr.iter().any(|m| m == factor) {
+        session.amr.push(factor.into());
+    }
+    session.acr = STEP_UP_ACR.to_string();
+    session.acr_expires_at = None;
+    store_session(&state.sessions_ks, &session).await?;
+    info!(did = %session.did, session_id = %session_id, "step-up approved: session elevated to aal2");
+    let expires_at = session.refresh_expires_at.unwrap_or(session.created_at);
+    typed(
+        json!({ "status": "elevated", "session": wire_session(&session, expires_at) }),
+        "approve-response response",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Passkey login
+// ---------------------------------------------------------------------------
+
+/// What a passkey ceremony was opened for, with the WebAuthn state it
+/// verifies against: one row, so the one `take` that consumes a ceremony
+/// consumes all of it, and the expiry the sweep reads covers all of it.
+#[derive(Serialize, Deserialize)]
+struct CeremonyMeta {
+    step_up: bool,
+    subject: Option<String>,
+    expires_at: u64,
+    /// `None` only on a row written before the state moved in here, whose
+    /// state is under `pk_auth:` (see [`take_ceremony_state`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ceremony: Option<LoginCeremony>,
+}
+
+/// The WebAuthn half of a login ceremony.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum LoginCeremony {
+    /// The browser picks the credential (no `allowCredentials`); the
+    /// credential it answers with is looked up at finish. Holds only the
+    /// challenge, whatever the number of passkeys enrolled here.
+    Discoverable(webauthn_rs::prelude::DiscoverableAuthentication),
+    /// Over decoy credential ids, for a named subject with no login passkey:
+    /// no assertion can answer it, and finish fails it exactly as a failed
+    /// assertion over a real subject's credentials.
+    Decoy,
+    /// Over the named subject's own credentials.
+    Listed(webauthn_rs::prelude::PasskeyAuthentication),
+}
+
+/// The ceremony state for a row, including one opened before the state moved
+/// into the row (its `pk_auth:` row is taken with it).
+async fn take_ceremony_state(
+    state: &AppState,
+    auth_id: &str,
+    meta: &mut CeremonyMeta,
+) -> Result<Option<LoginCeremony>, TaskError> {
+    if let Some(ceremony) = meta.ceremony.take() {
+        return Ok(Some(ceremony));
+    }
+    Ok(passkey_store::take_auth_state(&state.sessions_ks, auth_id)
+        .await?
+        .map(LoginCeremony::Listed))
+}
+
+fn ceremony_key(auth_id: &str) -> String {
+    format!("pk_task_meta:{auth_id}")
+}
+
+fn require_webauthn(state: &AppState) -> Result<&webauthn_rs::Webauthn, TaskError> {
+    state.webauthn.as_deref().ok_or_else(|| {
+        TaskError::Standard(
+            trust_tasks_rs::StandardCode::Unavailable,
+            "passkeys are not configured on this service".into(),
+        )
+    })
+}
+
+/// The members of a WebAuthn request-options object the shared schema knows.
+/// The library adds hints the schema does not (and the platform API does not
+/// need); they are dropped rather than sent off-schema.
+fn request_options(
+    options: &webauthn_rs::prelude::RequestChallengeResponse,
+) -> Result<Value, TaskError> {
+    let value = serde_json::to_value(options)?;
+    let public_key = value.get("publicKey").cloned().unwrap_or(value);
+    Ok(pick_request_options(&public_key))
+}
+
+fn pick_request_options(public_key: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for k in [
+        "challenge",
+        "timeout",
+        "rpId",
+        "allowCredentials",
+        "userVerification",
+        "extensions",
+    ] {
+        if let Some(v) = public_key.get(k).filter(|v| !v.is_null()) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// Where the key the decoy credential ids are derived with is kept. Never
+/// swept, so a subject's decoys stay the same across restarts.
+const DECOY_KEY: &str = "pk_login_decoy_key";
+
+/// The service's key for decoy credential ids, made on first use.
+async fn decoy_key(state: &AppState) -> Result<Vec<u8>, TaskError> {
+    if let Some(key) = state.sessions_ks.get_raw(DECOY_KEY).await? {
+        return Ok(key);
+    }
+    // Made once: concurrent first uses must agree on one key.
+    let _guard = state.path_locks.guard("::passkey-login-decoy-key").await;
+    if let Some(key) = state.sessions_ks.get_raw(DECOY_KEY).await? {
+        return Ok(key);
+    }
+    let key = rand::random::<[u8; 32]>().to_vec();
+    state.sessions_ks.insert_raw(DECOY_KEY, key.clone()).await?;
+    Ok(key)
+}
+
+/// HMAC-SHA-256 (RFC 2104) of `message` under `key`.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.map(|b| b ^ byte);
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(message)
+        .finalize();
+    let outer = Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer);
+    out
+}
+
+/// The credential descriptors a login start lists for `subject` when no
+/// login passkey is enrolled for it: derived from `key` and the subject, so
+/// they are the same on every start for that subject, and shaped as the
+/// console's own enrolments are (one or two `public-key` ids of a common
+/// length, no transports). Nothing answers them, so finish fails as for a
+/// real subject whose authenticator is absent.
+fn decoy_credentials(key: &[u8], subject: &str) -> Result<Value, TaskError> {
+    const LENGTHS: [usize; 3] = [16, 20, 32];
+    let seed = hmac_sha256(key, format!("login-decoy:{subject}").as_bytes());
+    let count = if seed[0].is_multiple_of(4) { 2 } else { 1 };
+    let mut descriptors = Vec::with_capacity(count);
+    for i in 0..count {
+        let len = LENGTHS[seed[1 + i] as usize % LENGTHS.len()];
+        let id = hmac_sha256(key, format!("login-decoy-id:{i}:{subject}").as_bytes());
+        let id = webauthn_rs::prelude::Base64UrlSafeData::from(id[..len.min(32)].to_vec());
+        descriptors.push(json!({ "type": "public-key", "id": serde_json::to_value(id)? }));
+    }
+    Ok(Value::Array(descriptors))
+}
+
+/// `auth/passkey/login/start/0.2`: open a login (or, `purpose: stepUp`, a
+/// step-up) ceremony. Accepted unsigned — the assertion at finish is the gate.
+///
+/// Opening a ceremony tells an unauthenticated caller nothing about who is
+/// enrolled here:
+///
+/// - **No subject named:** a discoverable-credential ceremony, with no
+///   `allowCredentials`. The authenticator offers the credentials it holds for
+///   this relying party, and finish checks the one it answers with.
+/// - **A subject named:** that subject's credentials as `allowCredentials`,
+///   so a credential enrolled as non-discoverable still signs in. For a
+///   subject with no login passkey the list is decoys derived from a service
+///   key and the subject ([`decoy_credentials`]): stable for the subject and
+///   shaped like a real list, so the answer does not say whether the subject
+///   is enrolled. The subject is enforced at finish.
+/// - Only a request carrying the named subject's own session is told
+///   `subjectNotRecognized` / `noCredentials`.
+///
+/// Each source may open [`crate::rate_limit::LOGIN_START_MAX_PER_WINDOW`] a
+/// minute: the client address on HTTPS, counted by the route; the
+/// authenticated sender on DIDComm and TSP, here. A messaging sender can mint
+/// a fresh `did:key` per request, so that bound is per identity, not per
+/// party; what each start leaves behind is one small row, swept once it
+/// expires.
+pub(crate) async fn login_start(
+    cx: &Cx<'_>,
+    p: login_start::v0_2::Payload,
+) -> Result<login_start::v0_2::Response, TaskError> {
+    use login_start::v0_2::{PayloadPurpose, error_codes};
+
+    let state = cx.state;
+    if cx.via != Some(ObservedTransport::Https) {
+        // On DIDComm and TSP the sender is the source; a start the transport
+        // vouches for no sender of has nothing to be counted against.
+        let sender = cx
+            .caller
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                TaskError::Standard(
+                    trust_tasks_rs::StandardCode::PermissionDenied,
+                    "a passkey login over DIDComm or TSP needs an authenticated sender".into(),
+                )
+            })?;
+        if let Err(e) = state
+            .login_start_rate_limiter
+            .try_consume(format!("vid:{sender}"))
+        {
+            return Err(match e {
+                AppError::RateLimited { .. } => TaskError::Declared(
+                    error_codes::RATE_LIMITED,
+                    "too many passkey logins opened from this source; try again shortly".into(),
+                ),
+                other => other.into(),
+            });
+        }
+    }
+    let webauthn = require_webauthn(state)?;
+    let step_up = matches!(p.purpose, Some(PayloadPurpose::StepUp));
+    let subject = p.subject.as_ref().map(|s| s.to_string());
+    let discoverable = || {
+        webauthn
+            .start_discoverable_authentication()
+            .map_err(|e| TaskError::from(AppError::Internal(format!("webauthn start failed: {e}"))))
+    };
+    let (options, ceremony) = match subject.as_deref() {
+        None => {
+            let (options, auth_state) = discoverable()?;
+            (
+                request_options(&options)?,
+                LoginCeremony::Discoverable(auth_state),
+            )
+        }
+        Some(did) => {
+            let own_session = cx.bearer_session().is_some_and(|b| b.did == did);
+            let user = passkey_store::get_passkey_user_by_did(&state.sessions_ks, did).await?;
+            match user {
+                Some(user) if !user.credentials.is_empty() => {
+                    let (options, auth_state) = webauthn
+                        .start_passkey_authentication(&user.credentials)
+                        .map_err(|e| AppError::Internal(format!("webauthn start failed: {e}")))?;
+                    (
+                        request_options(&options)?,
+                        LoginCeremony::Listed(auth_state),
+                    )
+                }
+                known if own_session => {
+                    return Err(if known.is_some() {
+                        TaskError::Declared(
+                            error_codes::NO_CREDENTIALS,
+                            "the subject has no passkey".into(),
+                        )
+                    } else {
+                        TaskError::Declared(
+                            error_codes::SUBJECT_NOT_RECOGNIZED,
+                            "unknown subject".into(),
+                        )
+                    });
+                }
+                _ => {
+                    // Shaped as the listed ceremony's options: its members,
+                    // with the decoys in place of real descriptors and none of
+                    // the discoverable ceremony's own extensions.
+                    let (options, _) = discoverable()?;
+                    let value = serde_json::to_value(&options)?;
+                    let mut public_key = value.get("publicKey").cloned().unwrap_or(value);
+                    if let Some(obj) = public_key.as_object_mut() {
+                        obj.remove("extensions");
+                        obj.insert(
+                            "allowCredentials".into(),
+                            decoy_credentials(&decoy_key(state).await?, did)?,
+                        );
+                    }
+                    (pick_request_options(&public_key), LoginCeremony::Decoy)
+                }
+            }
+        }
+    };
+    let auth_id = uuid::Uuid::new_v4().to_string();
+    state
+        .sessions_ks
+        .insert(
+            ceremony_key(&auth_id),
+            &CeremonyMeta {
+                step_up,
+                subject,
+                expires_at: now_epoch() + CEREMONY_TTL_SECS,
+                ceremony: Some(ceremony),
+            },
+        )
+        .await?;
+    typed(
+        json!({ "authId": auth_id, "options": options }),
+        "login start response",
+    )
+}
+
+/// Verify `credential` against a discoverable ceremony: the credential it
+/// names must be a login passkey enrolled here, and the user handle the
+/// authenticator returned must be that passkey's user. A discoverable
+/// credential always returns one, so an assertion without a readable user
+/// handle is refused.
+fn finish_discoverable(
+    webauthn: &webauthn_rs::Webauthn,
+    credential: &webauthn_rs::prelude::PublicKeyCredential,
+    auth_state: webauthn_rs::prelude::DiscoverableAuthentication,
+    user: &passkey_store::PasskeyUser,
+) -> Result<webauthn_rs::prelude::AuthenticationResult, webauthn_rs::prelude::WebauthnError> {
+    let (user_uuid, _) = webauthn.identify_discoverable_authentication(credential)?;
+    if user_uuid != user.user_uuid {
+        return Err(webauthn_rs::prelude::WebauthnError::InvalidUserUniqueId);
+    }
+    let keys: Vec<webauthn_rs::prelude::DiscoverableKey> =
+        user.credentials.iter().map(Into::into).collect();
+    webauthn.finish_discoverable_authentication(credential, auth_state, &keys)
+}
+
+/// `auth/passkey/login/finish/0.2`: verify the assertion.
+///
+/// A login mints a session for the credential's subject, bound to the
+/// `did:key` that signed this document — the session key every later request
+/// in the session is signed with. A step-up elevates the bearer session the
+/// request carries, which must belong to the credential's subject, and
+/// issues no tokens (`auth/refresh` reads the new level).
+pub(crate) async fn login_finish(
+    cx: &Cx<'_>,
+    p: login_finish::v0_2::Payload,
+) -> Result<login_finish::v0_2::Response, TaskError> {
+    use login_finish::v0_2::error_codes;
+
+    let state = cx.state;
+    let webauthn = require_webauthn(state)?;
+    let auth_id = p.auth_id.to_string();
+    let not_found = || {
+        TaskError::Declared(
+            error_codes::AUTH_NOT_FOUND,
+            "no open ceremony has that id".into(),
+        )
+    };
+    let mut meta: CeremonyMeta = state
+        .sessions_ks
+        .take(ceremony_key(&auth_id))
+        .await?
+        .ok_or_else(not_found)?;
+    let ceremony = take_ceremony_state(state, &auth_id, &mut meta)
+        .await?
+        .ok_or_else(not_found)?;
+    if now_epoch() > meta.expires_at {
+        return Err(TaskError::Declared(
+            error_codes::AUTH_EXPIRED,
+            "the ceremony has expired".into(),
+        ));
+    }
+    let credential: webauthn_rs::prelude::PublicKeyCredential =
+        serde_json::from_value(serde_json::to_value(&p.credential)?).map_err(|e| {
+            TaskError::Declared(
+                error_codes::ASSERTION_INVALID,
+                format!("unreadable assertion: {e}"),
+            )
+        })?;
+    // A login that named its subject fails in one way, whatever went wrong —
+    // a credential not enrolled, not in the list, another subject's, a decoy
+    // list, an assertion that does not verify — so its outcome says nothing
+    // about whether the subject is enrolled. An unnamed one may say which.
+    let named_subject = meta.subject.is_some();
+    let failed = |unnamed_code, unnamed_message: &str| {
+        if named_subject {
+            TaskError::Declared(
+                error_codes::ASSERTION_INVALID,
+                "the assertion did not verify".into(),
+            )
+        } else {
+            TaskError::Declared(unnamed_code, unnamed_message.into())
+        }
+    };
+    // The credential the assertion names, looked up before verification: a
+    // discoverable ceremony verifies against exactly that credential's user.
+    // The listed ceremony's own credential check still applies to it.
+    let named: String = AsRef::<[u8]>::as_ref(credential.get_credential_id())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let user = passkey_store::get_passkey_user_by_cred(&state.sessions_ks, &named)
+        .await?
+        .ok_or_else(|| failed(error_codes::CREDENTIAL_UNKNOWN, "unknown credential"))?;
+    let result = match ceremony {
+        LoginCeremony::Listed(auth_state) => {
+            webauthn.finish_passkey_authentication(&credential, &auth_state)
+        }
+        LoginCeremony::Discoverable(auth_state) => {
+            finish_discoverable(webauthn, &credential, auth_state, &user)
+        }
+        LoginCeremony::Decoy => Err(webauthn_rs::prelude::WebauthnError::CredentialNotFound),
+    }
+    .map_err(|e| {
+        warn!(error = %e, "passkey assertion failed");
+        failed(
+            error_codes::ASSERTION_INVALID,
+            "the assertion did not verify",
+        )
+    })?;
+    let cred_id: String = AsRef::<[u8]>::as_ref(result.cred_id())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if cred_id != named {
+        return Err(failed(
+            error_codes::ASSERTION_INVALID,
+            "the assertion did not verify",
+        ));
+    }
+    if meta.subject.as_deref().is_some_and(|s| s != user.did) {
+        return Err(failed(
+            error_codes::ASSERTION_INVALID,
+            "the assertion did not verify",
+        ));
+    }
+    // The counter update is a read-modify-write of the subject's credentials:
+    // under the guard enrolment and revocation hold, on a fresh read, so it
+    // neither restores a credential revoked meanwhile nor drops one enrolled
+    // meanwhile. A credential revoked since the lookup no longer signs in.
+    let user = {
+        let _guard = super::passkey::credentials_guard(state, Purpose::Session, &user.did).await;
+        let mut current = passkey_store::get_passkey_user_by_did(&state.sessions_ks, &user.did)
+            .await?
+            .filter(|u| {
+                u.credentials
+                    .iter()
+                    .any(|c| cred_id_hex(c.cred_id()) == named)
+            })
+            .ok_or_else(|| failed(error_codes::CREDENTIAL_UNKNOWN, "unknown credential"))?;
+        for c in &mut current.credentials {
+            c.update_credential(&result);
+        }
+        passkey_store::store_passkey_user(&state.sessions_ks, &current).await?;
+        current
+    };
+    let role = check_acl(&state.acl_ks, &user.did).await?;
+
+    if meta.step_up {
+        let caller = cx.caller()?;
+        let bearer = cx
+            .bearer_session()
+            .filter(|b| b.did == caller && b.did == user.did)
+            .ok_or_else(|| {
+                TaskError::Declared(
+                    error_codes::STEP_UP_SESSION_NOT_FOUND,
+                    "a step-up needs the subject's own session".into(),
+                )
+            })?;
+        let mut session = get_session(&state.sessions_ks, &bearer.session_id)
+            .await?
+            .filter(|s| s.state == SessionState::Authenticated)
+            .ok_or_else(|| {
+                TaskError::Declared(
+                    error_codes::STEP_UP_SESSION_NOT_FOUND,
+                    "no live session".into(),
+                )
+            })?;
+        if !session.amr.iter().any(|a| a == "passkey") {
+            session.amr.push("passkey".into());
+        }
+        session.acr = STEP_UP_ACR.to_string();
+        session.acr_expires_at = None;
+        store_session(&state.sessions_ks, &session).await?;
+        info!(did = %user.did, "passkey step-up complete: session elevated to aal2");
+        let expires_at = session.refresh_expires_at.unwrap_or(session.created_at);
+        return typed(
+            json!({ "purpose": "stepUp", "session": wire_session(&session, expires_at) }),
+            "login finish response",
+        );
+    }
+
+    // A login: the session is bound to the key that signed this document.
+    let session_key = cx
+        .caller()?
+        .strip_prefix("did:key:")
+        .filter(|pk| pk.starts_with("z6Mk"))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            TaskError::Standard(
+                trust_tasks_rs::StandardCode::PermissionDenied,
+                "a login is signed by the Ed25519 did:key its session will be bound to".into(),
+            )
+        })?;
+    let jwt_keys = state
+        .jwt_keys
+        .as_deref()
+        .ok_or_else(|| AppError::Config("auth not configured".into()))?;
+    let tokens = create_authenticated_session(
+        &state.sessions_ks,
+        jwt_keys,
+        &user.did,
+        &role,
+        state.config.auth.access_token_expiry,
+        state.config.auth.refresh_token_expiry,
+        Some(session_key),
+        Some((vec!["passkey".to_string()], STEP_UP_ACR.to_string())),
+    )
+    .await?;
+    info!(did = %user.did, "passkey login complete");
+    let canonical = tokens.into_canonical();
+    let mut tokens = serde_json::to_value(&canonical.tokens)?;
+    if tokens
+        .get("scope")
+        .is_some_and(|s| s.as_array().is_some_and(Vec::is_empty))
+    {
+        tokens.as_object_mut().map(|t| t.remove("scope"));
+    }
+    typed(
+        json!({
+            "purpose": "login",
+            "session": serde_json::to_value(&canonical.session)?,
+            "tokens": tokens,
+        }),
+        "login finish response",
+    )
+}

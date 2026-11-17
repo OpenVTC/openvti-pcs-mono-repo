@@ -1,0 +1,1596 @@
+//! Credential-vault trust-task slice — store / query / fetch the W3C credentials
+//! a holder **holds** (invitations, memberships, roles, …) in the VTA's
+//! credential vault (`docs/05-design-notes/vti-credential-architecture.md` §5).
+//!
+//! Distinct from the password-manager vault ([`super::vault`]): both share the
+//! `vault` keyspace but use disjoint key namespaces (`cred:` here, `vault:`
+//! there). The credential body is a presentable VC (not a raw secret like a
+//! password), so it travels as plain JSON — no sealed envelope.
+//!
+//! - **receive** (`VaultWrite`): verify + store a Data-Integrity VC, resolving
+//!   the issuer key from its DID (the wire layer's job — the data plane takes a
+//!   resolved key). `purpose` is inferred from the VC `type` (e.g.
+//!   `InvitationCredential` → invite) so a stored VIC is findable by purpose.
+//! - **query** (`VaultRead`): DCQL-shaped filtered search → body-free
+//!   descriptors. The data plane refuses an unfiltered query (no-enumeration).
+//! - **get** (`VaultRead`): fetch one credential's full body by id, for
+//!   presentation. Not-found is conflated with permission-denied to deny
+//!   enumeration.
+
+// The wire shapes below are `pub(super)` so the conformance table can build a
+// witness from them. That table is what proves this slice's structs and the
+// published `vault/credentials/*` schemas agree, and it could not reach them
+// while they were private — which is why the family went unchecked for as long
+// as it had no specification to be checked against.
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use trust_tasks_rs::{RejectReason, TrustTask};
+use uuid::Uuid;
+use vti_common::acl::Capability;
+use vti_common::vault::{LifecycleError, VaultStatus};
+use vti_specs::vault::credentials::get::v0_2 as get_0_2;
+
+use crate::auth::AuthClaims;
+use crate::error::AppError;
+use crate::server::AppState;
+use crate::vault::model::{BodyEncoding, CredentialPurpose, CredentialStatus, StoredCredential};
+use crate::vault::query::{CredentialDescriptor, CredentialQuery, search};
+use crate::vault::{receive, storage};
+
+use super::helpers::{
+    TrustTaskOutcome, app_error_to_reject, parse_payload, reject_with, success_response,
+};
+
+/// Capability gate, mirroring [`super::vault::require_capability`] for the
+/// credential-vault surface (kept local so the two vault slices stay
+/// independent).
+async fn require_cap(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: &TrustTask<Value>,
+    cap: Capability,
+    action: &str,
+) -> Result<(), TrustTaskOutcome> {
+    super::helpers::require_capability(state, auth, doc, cap, &format!("credential-vault {action}"))
+        .await
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ReceiveBody {
+    /// The credential to store — a Data-Integrity W3C VC (object form, with its
+    /// own `proof`).
+    ///
+    /// Optional only so a binary format can arrive via [`Self::credential_base64`]
+    /// instead. Exactly one of the two must be present; a body carrying neither,
+    /// or both, is rejected. Existing clients send this field alone and are
+    /// unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) credential: Option<Value>,
+    /// A binary credential, base64url-no-pad. Required when `format` names a
+    /// binary format (today: `mso_mdoc`, CBOR `IssuerSigned`), which cannot be
+    /// carried as JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) credential_base64: Option<String>,
+    /// Wire format tag. Absent means a Data-Integrity W3C VC — the shape every
+    /// existing client sends — so omitting it keeps the current behaviour
+    /// exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) format: Option<String>,
+    /// Optional explicit storage id; defaults to the VC's top-level `id`, else a
+    /// fresh `urn:uuid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) id: Option<String>,
+    /// Optional custody context override — which context owns the credential
+    /// (and whose `ContextPolicy` governs its disclosure). Must be a context the
+    /// caller can access. When omitted, the credential auto-binds to the caller's
+    /// context iff they have exactly one; a super-admin / multi-context caller
+    /// stores it unscoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) context_id: Option<String>,
+    /// The framework's extension point (every payload schema declares it):
+    /// accepted, not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub(super) ext: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReceiveResponse {
+    pub(super) id: String,
+    pub(super) types: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) purpose: Option<CredentialPurpose>,
+    pub(super) status: CredentialStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct QueryResponse {
+    pub(super) credentials: Vec<CredentialDescriptor>,
+}
+
+/// Handler for `spec/vault/credentials/receive/0.1`.
+pub(super) async fn handle_receive(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(r) = require_cap(state, auth, &doc, Capability::VaultWrite, "receive").await {
+        return r;
+    }
+    let req: ReceiveBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // Resolve the custody context (which context owns the credential, governing
+    // its disclosure via ContextPolicy).
+    let custody_context = match resolve_custody_context(auth, req.context_id) {
+        Ok(c) => c,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    let now = Utc::now();
+    let provenance = Some("vault/credentials/receive/0.1".to_string());
+
+    // Two wire shapes, one per credential family. The format tag decides;
+    // absent means Data-Integrity, which is what every existing client sends.
+    let mut stored = match req.format.as_deref() {
+        None | Some("ldp_vc") => {
+            let Some(credential) = req.credential else {
+                return reject_with(
+                    &doc,
+                    RejectReason::MalformedRequest {
+                        reason: "a Data-Integrity credential must be supplied as `credential`"
+                            .to_string(),
+                    },
+                );
+            };
+            if req.credential_base64.is_some() {
+                return reject_with(
+                    &doc,
+                    RejectReason::MalformedRequest {
+                        reason: "supply exactly one of `credential` or `credentialBase64`"
+                            .to_string(),
+                    },
+                );
+            }
+
+            let id = resolve_storage_id(req.id, &credential);
+
+            // The data plane verifies every proof — one, or the proof set a
+            // multi-key issuer emits (VTI-44), ML-DSA included — against keys
+            // resolved from the issuer's DID (did:key locally, did:webvh /
+            // did:web via the cache), each bound to the credential `issuer`.
+            let resolver = state.trust_task_vm_resolver();
+
+            let body = match serde_json::to_vec(&credential) {
+                Ok(b) => b,
+                Err(e) => {
+                    return reject_with(
+                        &doc,
+                        RejectReason::MalformedRequest {
+                            reason: format!("credential serialise: {e}"),
+                        },
+                    );
+                }
+            };
+
+            match receive::receive_di_vc(&state.vault_ks, &id, &body, &resolver, provenance, now)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => return app_error_to_reject(&doc, e),
+            }
+        }
+
+        // ISO 18013-5 mdoc. The issuer is an X.509 Document Signer rather than
+        // a resolvable DID, so the key comes from the configured IACA anchors
+        // instead of the resolver — the one place the two families genuinely
+        // diverge.
+        Some("mso_mdoc") => {
+            let Some(b64) = req.credential_base64 else {
+                return reject_with(
+                    &doc,
+                    RejectReason::MalformedRequest {
+                        reason: "an mdoc must be supplied as `credentialBase64` (CBOR \
+                                 IssuerSigned), not `credential`"
+                            .to_string(),
+                    },
+                );
+            };
+            if req.credential.is_some() {
+                return reject_with(
+                    &doc,
+                    RejectReason::MalformedRequest {
+                        reason: "supply exactly one of `credential` or `credentialBase64`"
+                            .to_string(),
+                    },
+                );
+            }
+
+            let body = match URL_SAFE_NO_PAD.decode(b64.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    return reject_with(
+                        &doc,
+                        RejectReason::MalformedRequest {
+                            reason: format!("`credentialBase64` is not base64url-no-pad: {e}"),
+                        },
+                    );
+                }
+            };
+
+            // Parse before trusting: the x5chain has to be read out of the
+            // credential to find out which issuer key to demand.
+            let issued = match affinidi_mdoc::IssuerSigned::from_cbor_bytes(&body) {
+                Ok(i) => i,
+                Err(e) => {
+                    return reject_with(
+                        &doc,
+                        RejectReason::MalformedRequest {
+                            reason: format!("not a decodable mdoc IssuerSigned: {e}"),
+                        },
+                    );
+                }
+            };
+
+            let issuer_pub = match state
+                .mdoc_trust
+                .resolve_issuer_key(&issued.issuer_auth, now)
+            {
+                Ok(k) => k,
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+
+            // Holder binding. An mdoc is issued to a specific device key, and
+            // only its private half can sign DeviceAuth — so a credential whose
+            // device key this VTA does not hold could be stored but never
+            // presented. Resolve it now and refuse if we cannot, rather than
+            // letting the failure surface at presentation with nothing pointing
+            // at the cause.
+            let device_point = match vta_vault::mdoc_trust::mdoc_device_key_sec1(&issued.mso) {
+                Ok(p) => p,
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+            let device_mb =
+                vta_keys::encode_public_multibase(&vta_sdk::keys::KeyType::P256, &device_point);
+            let device_key = match crate::operations::keys::find_key_by_public_multibase(
+                &state.keys_ks,
+                &device_mb,
+            )
+            .await
+            {
+                Ok(Some(k)) => k,
+                Ok(None) => {
+                    return reject_with(
+                        &doc,
+                        RejectReason::MalformedRequest {
+                            reason: "this VTA does not hold the mdoc's MSO deviceKey, so the \
+                                     credential could never be presented with holder binding"
+                                .to_string(),
+                        },
+                    );
+                }
+                Err(e) => return app_error_to_reject(&doc, e),
+            };
+
+            // Context gate on the *key*, not just the credential: binding an
+            // mdoc to a key in a context the caller cannot act in would let one
+            // tenant park a credential on another tenant's key.
+            // A context-less key is instance-level: only a super-admin may bind
+            // to it, the same rule every key loader applies ("only super admin
+            // can use keys without a context").
+            let key_gate = match device_key.context_id.as_deref() {
+                Some(ctx) => auth.require_context(ctx),
+                None => auth.require_super_admin(),
+            };
+            if let Err(e) = key_gate {
+                return app_error_to_reject(&doc, e);
+            }
+
+            // An mdoc has no `id` of its own to fall back on, so an explicit id
+            // or a fresh urn:uuid it is.
+            let id = req
+                .id
+                .unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()));
+
+            match receive::receive_mdoc(
+                &state.vault_ks,
+                &id,
+                &body,
+                &issuer_pub,
+                &device_key.key_id,
+                provenance,
+                now,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => return app_error_to_reject(&doc, e),
+            }
+        }
+
+        Some(other) => {
+            return reject_with(
+                &doc,
+                RejectReason::MalformedRequest {
+                    reason: format!(
+                        "unsupported credential format `{other}` (expected `ldp_vc` or \
+                         `mso_mdoc`)"
+                    ),
+                },
+            );
+        }
+    };
+    // Persist the custody binding (receive_di_vc stores it unscoped). Only an
+    // extra write when a context was resolved.
+    if custody_context.is_some() {
+        stored.context_id = custody_context;
+        if let Err(e) = storage::put(&state.vault_ks, &stored).await {
+            return app_error_to_reject(&doc, e);
+        }
+    }
+
+    success_response(
+        &doc,
+        ReceiveResponse {
+            id: stored.id,
+            types: stored.types,
+            purpose: stored.purpose,
+            status: stored.status,
+        },
+    )
+}
+
+/// Handler for `spec/vault/credentials/query/0.1`.
+pub(super) async fn handle_query(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(r) = require_cap(state, auth, &doc, Capability::VaultRead, "query").await {
+        return r;
+    }
+    let query: CredentialQuery = match parse_payload(&doc) {
+        Ok(q) => q,
+        Err(resp) => return resp,
+    };
+    // Custody gate: only credentials owned by a context the caller can act in
+    // (plus unscoped/legacy rows). Applied inside `search`, where the full
+    // record is in hand — the descriptor returned to the caller carries no
+    // `context_id` to filter on out here.
+    match search(&state.vault_ks, &query, &auth.act_scope()).await {
+        Ok(credentials) => success_response(&doc, QueryResponse { credentials }),
+        Err(e) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// The storage id for a received credential: an explicit caller-supplied id
+/// wins, else the VC's top-level `id`, else a fresh `urn:uuid`. Kept pure so the
+/// fallback precedence is unit-testable without an `AppState`.
+fn resolve_storage_id(explicit: Option<String>, credential: &Value) -> String {
+    explicit
+        .or_else(|| {
+            credential
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))
+}
+
+/// Resolve the custody context for a received credential — "auto with optional
+/// override": an explicit `override_ctx` must be a context the caller can
+/// access; otherwise auto-bind to the caller's context iff they have exactly one
+/// (a super-admin / multi-context caller stores the credential unscoped). Kept
+/// pure so the policy is unit-testable without an `AppState`.
+fn resolve_custody_context(
+    auth: &AuthClaims,
+    override_ctx: Option<String>,
+) -> Result<Option<String>, AppError> {
+    match override_ctx {
+        Some(ctx) => {
+            if !auth.has_context_access(&ctx) {
+                return Err(AppError::Forbidden(format!(
+                    "caller cannot receive a credential into context {ctx}"
+                )));
+            }
+            Ok(Some(ctx))
+        }
+        None if auth.allowed_contexts.len() == 1 => Ok(Some(auth.allowed_contexts[0].clone())),
+        None => Ok(None),
+    }
+}
+
+/// The stored credential `id` names, if this caller may read it. Every other
+/// outcome is the refusal to send.
+async fn readable_credential(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: &TrustTask<Value>,
+    id: &str,
+) -> Result<StoredCredential, TrustTaskOutcome> {
+    require_cap(state, auth, doc, Capability::VaultRead, "get").await?;
+    match storage::get(&state.vault_ks, id).await {
+        // Custody gate first: a credential owned by another context is
+        // conflated with not-found, exactly like an archived or absent one, so
+        // the caller cannot probe for ids outside their contexts.
+        Ok(Some(stored))
+            if stored.is_active()
+                && crate::vault::query::caller_may_access_custody(
+                    &auth.act_scope(),
+                    stored.context_id.as_deref(),
+                ) =>
+        {
+            Ok(stored)
+        }
+        // Conflate not-found (and not-active) with permission-denied to deny enumeration.
+        Ok(_) => Err(reject_with(
+            doc,
+            RejectReason::TaskFailed {
+                reason: "credential not found".to_string(),
+                details: None,
+            },
+        )),
+        Err(e) => Err(app_error_to_reject(doc, e)),
+    }
+}
+
+/// Handler for `spec/vault/credentials/get/0.2`: the body as stored, in the
+/// member its format calls for — `credential` for a JSON object,
+/// `credentialBase64` for an SD-JWT or an mdoc — with that format named.
+pub(super) async fn handle_get(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let req: get_0_2::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let stored = match readable_credential(state, auth, &doc, &req.id).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match get_0_2_response(&stored) {
+        Ok(response) => success_response(&doc, response),
+        Err(reason) => reject_with(&doc, RejectReason::InternalError { reason }),
+    }
+}
+
+/// The `get` 0.2 answer for a stored credential. The body is carried
+/// verbatim — never re-serialised — because it carries a proof over itself.
+fn get_0_2_response(stored: &StoredCredential) -> Result<get_0_2::Response, String> {
+    let Some((format, encoding)) = stored.format.wire_form() else {
+        return Err(format!(
+            "stored credential has format {:?}, which has no wire form",
+            stored.format
+        ));
+    };
+    let response = match encoding {
+        BodyEncoding::Json => {
+            let credential = serde_json::from_slice::<Value>(&stored.body)
+                .map_err(|e| format!("stored {format} body is not JSON: {e}"))?;
+            serde_json::json!({ "format": format, "credential": credential })
+        }
+        BodyEncoding::Bytes => serde_json::json!({
+            "format": format,
+            "credentialBase64": URL_SAFE_NO_PAD.encode(&stored.body),
+        }),
+    };
+    serde_json::from_value(response)
+        .map_err(|e| format!("stored {format} credential does not fit the response: {e}"))
+}
+
+/// Handler for `spec/vault/credentials/present/0.1`. Auth: `CredentialPresent`,
+/// plus custody of the credential and its subject's key (checked in
+/// [`present_to_audience`]).
+///
+/// [`present_to_audience`]: crate::operations::credential_exchange::present_to_audience
+pub(super) async fn handle_present(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    use crate::operations::credential_exchange::{PresentToError, present_to_audience};
+    use vti_specs::vault::credentials::present::v0_1 as spec;
+    use vti_specs::vault::credentials::present::v0_1::error_codes as code;
+
+    if let Err(r) = require_cap(state, auth, &doc, Capability::CredentialPresent, "present").await {
+        return r;
+    }
+    let req: spec::Payload = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let claims: Vec<String> = req.claims.iter().map(|c| c.to_string()).collect();
+    let refuse = |c: trust_tasks_rs::DeclaredErrorCode, message: &str, details: Option<Value>| {
+        super::helpers::reject_with_code(
+            &doc,
+            trust_tasks_rs::TrustTaskCode::Extended {
+                slug: c.namespace().to_string(),
+                local: c.local().to_string(),
+            },
+            message,
+            details,
+        )
+    };
+    match present_to_audience(
+        state,
+        auth,
+        &req.id,
+        &req.audience,
+        &req.nonce,
+        &claims,
+        req.purpose.as_deref().map(|p| p.as_str()),
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(presented) => {
+            let response = serde_json::json!({
+                "presentation": presented.presentation,
+                "disclosed": presented.disclosed,
+            });
+            match serde_json::from_value::<spec::Response>(response) {
+                Ok(r) => success_response(&doc, r),
+                Err(e) => reject_with(
+                    &doc,
+                    RejectReason::InternalError {
+                        reason: format!("presentation does not fit the response: {e}"),
+                    },
+                ),
+            }
+        }
+        Err(PresentToError::NotFound) => refuse(
+            code::NOT_FOUND,
+            "no credential under this id that you may present, or no key of its subject \
+             that you may use",
+            None,
+        ),
+        Err(PresentToError::NotPresentable) => refuse(
+            code::NOT_PRESENTABLE,
+            "the credential is revoked, suspended, outside its validity period, archived or \
+             deleted",
+            None,
+        ),
+        Err(PresentToError::FormatUnsupported) => refuse(
+            code::FORMAT_UNSUPPORTED,
+            "this agent presents SD-JWT-VC and Data Integrity credentials to a named verifier",
+            None,
+        ),
+        Err(PresentToError::ClaimNotHeld(missing)) => refuse(
+            code::CLAIM_NOT_HELD,
+            "the credential does not carry every claim named",
+            Some(serde_json::json!({ "claims": missing })),
+        ),
+        Err(PresentToError::WouldOverDisclose(undisclosed)) => refuse(
+            code::WOULD_OVER_DISCLOSE,
+            "every presentation of this credential discloses claims the request does not name; \
+             name them too, or present another credential",
+            Some(serde_json::json!({ "undisclosed": undisclosed })),
+        ),
+        Err(PresentToError::App(e)) => app_error_to_reject(&doc, e),
+    }
+}
+
+/// Shared request body for the credential archival lifecycle verbs
+/// (`archive` / `unarchive` / `delete` / `restore` / `purge`). `reason` is
+/// lifted into the audit row's `detail` by the dispatch spine; `force` is
+/// honoured only by `delete` (skip the grace window → immediate hard delete).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CredLifecycleBody {
+    pub(super) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // read generically by the spine for the audit `detail`
+    pub(super) reason: Option<String>,
+    /// The framework's extension point (every payload schema declares it):
+    /// accepted, not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub(super) ext: Option<Value>,
+}
+
+/// `delete`'s body — the one lifecycle verb with a forced form.
+///
+/// Split from [`CredLifecycleBody`] rather than sharing it with a `force` the
+/// other four ignore. Sharing was not merely untidy: `archive`, `unarchive`,
+/// `restore` and `purge` all *accepted* `force` and silently dropped it, so a
+/// caller asking for something stronger than the verb it named got the weaker
+/// thing and a success. Their published schemas declare no such member, and now
+/// neither do their types — the request is refused instead.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CredDeleteBody {
+    pub(super) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)] // read generically by the spine for the audit `detail`
+    pub(super) reason: Option<String>,
+    /// Erase immediately rather than tombstoning. Irrecoverable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) force: bool,
+    /// The framework's extension point (every payload schema declares it):
+    /// accepted, not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub(super) ext: Option<Value>,
+}
+
+/// Post-transition view for archive / unarchive / delete / restore.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CredLifecycleResponse {
+    pub(super) id: String,
+    pub(super) lifecycle: VaultStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) grace_until: Option<String>,
+}
+
+/// `not_found` rejection for a missing credential id on a lifecycle verb.
+fn cred_not_found(doc: &TrustTask<Value>, verb: &str, id: &str) -> TrustTaskOutcome {
+    reject_with(
+        doc,
+        RejectReason::TaskFailed {
+            reason: format!("vault/credentials/{verb}:not_found — no credential at id {id}"),
+            details: None,
+        },
+    )
+}
+
+/// Map a [`LifecycleError`] to a Trust-Task rejection with an operator hint.
+fn cred_lifecycle_reject(
+    doc: &TrustTask<Value>,
+    verb: &str,
+    id: &str,
+    err: LifecycleError,
+) -> TrustTaskOutcome {
+    let hint = match err {
+        LifecycleError::NotActive => "credential is not active (already archived or deleted)",
+        LifecycleError::NotArchived => "credential is not archived",
+        LifecycleError::AlreadyDeleted => {
+            "credential is already in the trash — restore it or purge it"
+        }
+        LifecycleError::NotDeleted => "credential is not in the trash",
+        LifecycleError::GraceExpired => {
+            "the grace window has elapsed — the credential has been (or is about to be) purged"
+        }
+        // `LifecycleError` is `#[non_exhaustive]`.
+        _ => "the credential's lifecycle state does not allow this",
+    };
+    reject_with(
+        doc,
+        RejectReason::TaskFailed {
+            reason: format!("vault/credentials/{verb}:{} — {hint} (id {id})", err.code()),
+            details: None,
+        },
+    )
+}
+
+fn cred_lifecycle_response(cred: &crate::vault::model::StoredCredential) -> CredLifecycleResponse {
+    CredLifecycleResponse {
+        id: cred.id.clone(),
+        lifecycle: cred.lifecycle,
+        grace_until: cred.grace_until.clone(),
+    }
+}
+
+/// Handler for `spec/vault/credentials/archive/0.1`. Auth: CredentialWrite.
+pub(super) async fn handle_archive(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let now = Utc::now().to_rfc3339();
+    cred_transition(state, auth, doc, "archive", move |cred| cred.archive(&now)).await
+}
+
+/// Handler for `spec/vault/credentials/unarchive/0.1`. Auth: CredentialWrite.
+pub(super) async fn handle_unarchive(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    cred_transition(state, auth, doc, "unarchive", |cred| cred.unarchive()).await
+}
+
+/// Handler for `spec/vault/credentials/restore/0.1`. Auth: CredentialWrite.
+pub(super) async fn handle_restore(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let now = Utc::now().to_rfc3339();
+    cred_transition(state, auth, doc, "restore", move |cred| cred.restore(&now)).await
+}
+
+/// Shared load → transition → re-store body for archive / unarchive / restore.
+/// `storage::put` re-indexes, so a status/lifecycle change never orphans an
+/// index row. Credentials carry no optimistic-concurrency version, so (unlike
+/// the password vault) there is no `expectedVersion` gate here.
+async fn cred_transition(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+    verb: &str,
+    transition: impl FnOnce(&mut crate::vault::model::StoredCredential) -> Result<(), LifecycleError>,
+) -> TrustTaskOutcome {
+    if let Err(r) = require_cap(state, auth, &doc, Capability::CredentialWrite, verb).await {
+        return r;
+    }
+    let req: CredLifecycleBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let mut cred = match storage::get(&state.vault_ks, &req.id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return cred_not_found(&doc, verb, &req.id),
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    // Custody gate, same as the read paths: a credential owned by another
+    // context is conflated with not-found. Mutating it would be worse than
+    // reading it — an operator scoped to one context could archive or delete
+    // another's credentials.
+    if !crate::vault::query::caller_may_access_custody(
+        &auth.act_scope(),
+        cred.context_id.as_deref(),
+    ) {
+        return cred_not_found(&doc, verb, &req.id);
+    }
+    if let Err(e) = transition(&mut cred) {
+        return cred_lifecycle_reject(&doc, verb, &req.id, e);
+    }
+    if let Err(e) = storage::put(&state.vault_ks, &cred).await {
+        return app_error_to_reject(&doc, e);
+    }
+    success_response(&doc, cred_lifecycle_response(&cred))
+}
+
+/// Handler for `spec/vault/credentials/delete/0.1`. Default: recoverable soft
+/// delete (tombstone + grace window). `force: true` → immediate hard delete
+/// (tears down the `idx:` index too). Auth: CredentialWrite.
+pub(super) async fn handle_delete(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(r) = require_cap(state, auth, &doc, Capability::CredentialWrite, "delete").await {
+        return r;
+    }
+    let req: CredDeleteBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // Forced hard delete bypasses the grace window entirely (and works even on
+    // an absent id — idempotent, like the storage primitive).
+    //
+    // Custody must still be checked, which means loading the record first: this
+    // path previously deleted by id without reading anything, so a caller
+    // scoped to one context could destroy another context's credential outright.
+    // An absent id stays idempotent-success (nothing to own); a present but
+    // inaccessible one conflates to not-found, the same answer an absent id
+    // gives, so nothing is disclosed.
+    if req.force {
+        match storage::get(&state.vault_ks, &req.id).await {
+            Ok(Some(cred))
+                if !crate::vault::query::caller_may_access_custody(
+                    &auth.act_scope(),
+                    cred.context_id.as_deref(),
+                ) =>
+            {
+                return cred_not_found(&doc, "delete", &req.id);
+            }
+            Err(e) => return app_error_to_reject(&doc, e),
+            _ => {}
+        }
+        if let Err(e) = storage::delete(&state.vault_ks, &req.id).await {
+            return app_error_to_reject(&doc, e);
+        }
+        return success_response(
+            &doc,
+            CredLifecycleResponse {
+                id: req.id,
+                lifecycle: VaultStatus::Deleted,
+                grace_until: None,
+            },
+        );
+    }
+
+    let mut cred = match storage::get(&state.vault_ks, &req.id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return cred_not_found(&doc, "delete", &req.id),
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    if !crate::vault::query::caller_may_access_custody(
+        &auth.act_scope(),
+        cred.context_id.as_deref(),
+    ) {
+        return cred_not_found(&doc, "delete", &req.id);
+    }
+    let now = Utc::now();
+    let grace_days = state.config.read().await.vault.grace_days;
+    let grace_until = (now + chrono::Duration::days(grace_days as i64)).to_rfc3339();
+    if let Err(e) = cred.soft_delete(&now.to_rfc3339(), &grace_until) {
+        return cred_lifecycle_reject(&doc, "delete", &req.id, e);
+    }
+    if let Err(e) = storage::put(&state.vault_ks, &cred).await {
+        return app_error_to_reject(&doc, e);
+    }
+    success_response(&doc, cred_lifecycle_response(&cred))
+}
+
+/// Handler for `spec/vault/credentials/purge/0.1` — irreversible hard delete
+/// (record + all index rows). Auth: CredentialWrite.
+pub(super) async fn handle_purge(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(r) = require_cap(state, auth, &doc, Capability::CredentialWrite, "purge").await {
+        return r;
+    }
+    let req: CredLifecycleBody = match parse_payload(&doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    // `storage::delete` is idempotent (absent id is a no-op); surface a
+    // not_found only when there was genuinely nothing to purge.
+    match storage::get(&state.vault_ks, &req.id).await {
+        Ok(Some(cred)) => {
+            if !crate::vault::query::caller_may_access_custody(
+                &auth.act_scope(),
+                cred.context_id.as_deref(),
+            ) {
+                return cred_not_found(&doc, "purge", &req.id);
+            }
+        }
+        Ok(None) => return cred_not_found(&doc, "purge", &req.id),
+        Err(e) => return app_error_to_reject(&doc, e),
+    }
+    if let Err(e) = storage::delete(&state.vault_ks, &req.id).await {
+        return app_error_to_reject(&doc, e);
+    }
+    success_response(
+        &doc,
+        CredLifecycleResponse {
+            id: req.id,
+            lifecycle: VaultStatus::Deleted,
+            grace_until: None,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::model::CredentialFormat;
+    use serde_json::json;
+    use trust_tasks_rs::validate::ValidatedPayload;
+
+    #[test]
+    fn storage_id_prefers_explicit_then_vc_id_then_uuid() {
+        let vc = json!({ "id": "urn:uuid:from-vc", "type": ["InvitationCredential"] });
+
+        // Explicit id wins.
+        assert_eq!(
+            resolve_storage_id(Some("explicit-id".into()), &vc),
+            "explicit-id"
+        );
+        // Else the VC's own id.
+        assert_eq!(resolve_storage_id(None, &vc), "urn:uuid:from-vc");
+        // Else a generated urn:uuid.
+        let generated = resolve_storage_id(None, &json!({ "type": ["X"] }));
+        assert!(
+            generated.starts_with("urn:uuid:"),
+            "fallback id is a urn:uuid: {generated}"
+        );
+    }
+
+    // ── custody-context enforcement on the read paths ───────────────
+
+    /// Store a credential owned by `context_id`, indexed so `search` can find
+    /// it by purpose.
+    async fn seed_credential(
+        vault_ks: &crate::store::KeyspaceHandle,
+        id: &str,
+        context_id: Option<&str>,
+    ) {
+        let body = serde_json::to_vec(&json!({"id": id})).unwrap();
+        seed_body(
+            vault_ks,
+            id,
+            context_id,
+            CredentialFormat::EddsaJcs2022,
+            body,
+        )
+        .await;
+    }
+
+    async fn seed_body(
+        vault_ks: &crate::store::KeyspaceHandle,
+        id: &str,
+        context_id: Option<&str>,
+        format: CredentialFormat,
+        body: Vec<u8>,
+    ) {
+        use crate::vault::model::{CredentialStatus, StoredCredential};
+        use vti_common::vault::VaultStatus;
+        let cred = StoredCredential {
+            id: id.into(),
+            format,
+            types: vec!["MembershipCredential".into()],
+            schema_id: None,
+            community_did: None,
+            context_id: context_id.map(str::to_string),
+            subject_did: None,
+            issuer_did: Some("did:key:zIssuer".into()),
+            purpose: None,
+            status: CredentialStatus::Unknown,
+            valid_from: None,
+            valid_until: None,
+            received_at: "2026-01-01T00:00:00Z".into(),
+            source: None,
+            tags: Default::default(),
+            body,
+            lifecycle: VaultStatus::Active,
+            archived_at: None,
+            deleted_at: None,
+            grace_until: None,
+        };
+        crate::vault::storage::put(vault_ks, &cred).await.unwrap();
+    }
+
+    fn get_doc(id: &str) -> TrustTask<Value> {
+        let uri: trust_tasks_rs::TypeUri = vta_sdk::trust_tasks::TASK_VAULT_CREDENTIALS_GET_0_2
+            .parse()
+            .expect("get uri");
+        TrustTask::new("urn:uuid:test-get", uri, json!({ "id": id }))
+    }
+
+    fn get_payload(outcome: &TrustTaskOutcome) -> Value {
+        let doc: Value = serde_json::from_slice(&outcome.body).expect("response json");
+        doc["payload"].clone()
+    }
+
+    /// get 0.2 carries a Data Integrity credential as the JSON object it is,
+    /// named `ldp_vc`, and the answer fits the specification's response.
+    #[tokio::test]
+    async fn get_0_2_returns_a_data_integrity_credential_as_an_object() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-di", Some("ctx-a")).await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let payload = get_payload(&handle_get(&state, &auth, get_doc("cred-di")).await);
+        assert_eq!(payload["format"], "ldp_vc");
+        assert_eq!(payload["credential"], json!({ "id": "cred-di" }));
+        assert!(payload.get("credentialBase64").is_none());
+        get_0_2::Response::validate_value(&payload).expect("fits get/0.2's response schema");
+    }
+
+    /// The defect 0.2 exists for: an SD-JWT is a compact string, not an
+    /// object, so 0.1 had no answer for it. 0.2 returns its stored bytes
+    /// verbatim — every disclosure included — as `credentialBase64`.
+    #[tokio::test]
+    async fn get_0_2_returns_an_sd_jwt_as_its_stored_bytes() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        let compact = b"eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJkaWQ6ZXhhbXBsZTpob2xkZXIifQ.c2ln~WyJzYWx0IiwibmFtZSIsIkFsaWNlIl0~";
+        seed_body(
+            &state.vault_ks,
+            "cred-sd",
+            Some("ctx-a"),
+            CredentialFormat::SdJwtVc,
+            compact.to_vec(),
+        )
+        .await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let payload = get_payload(&handle_get(&state, &auth, get_doc("cred-sd")).await);
+        assert_eq!(payload["format"], "dc+sd-jwt");
+        assert!(payload.get("credential").is_none());
+        let carried = URL_SAFE_NO_PAD
+            .decode(
+                payload["credentialBase64"]
+                    .as_str()
+                    .expect("credentialBase64"),
+            )
+            .expect("base64url");
+        assert_eq!(carried, compact, "the body travels byte for byte");
+        get_0_2::Response::validate_value(&payload).expect("fits get/0.2's response schema");
+    }
+
+    fn query_doc() -> TrustTask<Value> {
+        let uri: trust_tasks_rs::TypeUri = vta_sdk::trust_tasks::TASK_VAULT_CREDENTIALS_QUERY_0_1
+            .parse()
+            .expect("query uri");
+        TrustTask::new(
+            "urn:uuid:test-query",
+            uri,
+            json!({ "issuerDid": "did:key:zIssuer" }),
+        )
+    }
+
+    /// `context_id` is documented as the **custody** axis — "which context in
+    /// *this* VTA owns the credential" — and the owning context's policy is
+    /// meant to govern disclosure. A caller scoped to ctx-a must not be able to
+    /// fetch a credential owned by ctx-b.
+    #[tokio::test]
+    async fn get_refuses_a_credential_owned_by_another_context() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-in-ctx-b", Some("ctx-b")).await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let outcome = handle_get(&state, &auth, get_doc("cred-in-ctx-b")).await;
+        let body = String::from_utf8_lossy(&outcome.body).to_string();
+        assert!(
+            !body.contains("cred-in-ctx-b") || body.contains("not found"),
+            "a ctx-a caller must not receive a ctx-b credential body; got {body}"
+        );
+    }
+
+    /// The caller's own context still works — the gate must not deny everything.
+    #[tokio::test]
+    async fn get_allows_a_credential_owned_by_the_callers_context() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-in-ctx-a", Some("ctx-a")).await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let outcome = handle_get(&state, &auth, get_doc("cred-in-ctx-a")).await;
+        let body = String::from_utf8_lossy(&outcome.body).to_string();
+        assert!(
+            body.contains("cred-in-ctx-a"),
+            "the caller's own context must still be readable; got {body}"
+        );
+    }
+
+    /// The query path is the bulk equivalent: a filtered search must not return
+    /// another context's credentials.
+    #[tokio::test]
+    async fn query_excludes_credentials_owned_by_another_context() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-in-ctx-a", Some("ctx-a")).await;
+        seed_credential(&state.vault_ks, "cred-in-ctx-b", Some("ctx-b")).await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let outcome = handle_query(&state, &auth, query_doc()).await;
+        let body = String::from_utf8_lossy(&outcome.body).to_string();
+        assert!(
+            body.contains("cred-in-ctx-a"),
+            "own-context credential must be returned; got {body}"
+        );
+        assert!(
+            !body.contains("cred-in-ctx-b"),
+            "another context's credential must not be returned; got {body}"
+        );
+    }
+
+    /// A super-admin (no context restriction) still sees everything.
+    #[tokio::test]
+    async fn super_admin_still_reads_every_context() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-anywhere", Some("ctx-b")).await;
+
+        let auth = auth_scoped(&[]);
+        let outcome = handle_get(&state, &auth, get_doc("cred-anywhere")).await;
+        let body = String::from_utf8_lossy(&outcome.body).to_string();
+        assert!(
+            body.contains("cred-anywhere"),
+            "super admin must still read any context; got {body}"
+        );
+    }
+
+    fn lifecycle_doc(task: &str, id: &str, force: bool) -> TrustTask<Value> {
+        let uri: trust_tasks_rs::TypeUri = task.parse().expect("uri");
+        TrustTask::new(
+            "urn:uuid:test-lifecycle",
+            uri,
+            json!({ "id": id, "force": force }),
+        )
+    }
+
+    /// Mutating another context's credential is worse than reading it. The
+    /// lifecycle verbs shared the read paths' missing gate.
+    #[tokio::test]
+    async fn archive_refuses_a_credential_owned_by_another_context() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-in-ctx-b", Some("ctx-b")).await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let doc = lifecycle_doc(
+            vta_sdk::trust_tasks::TASK_VAULT_CREDENTIALS_ARCHIVE_0_1,
+            "cred-in-ctx-b",
+            false,
+        );
+        let _ = handle_archive(&state, &auth, doc).await;
+
+        let after = crate::vault::storage::get(&state.vault_ks, "cred-in-ctx-b")
+            .await
+            .unwrap()
+            .expect("credential must survive");
+        assert!(
+            after.is_active(),
+            "a ctx-a caller must not archive a ctx-b credential"
+        );
+    }
+
+    /// `delete --force` hard-deletes by id and previously never loaded the
+    /// record, so custody could not be checked at all — a scoped caller could
+    /// destroy another context's credential outright.
+    #[tokio::test]
+    async fn force_delete_refuses_a_credential_owned_by_another_context() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-in-ctx-b", Some("ctx-b")).await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let doc = lifecycle_doc(
+            vta_sdk::trust_tasks::TASK_VAULT_CREDENTIALS_DELETE_0_1,
+            "cred-in-ctx-b",
+            true,
+        );
+        let _ = handle_delete(&state, &auth, doc).await;
+
+        assert!(
+            crate::vault::storage::get(&state.vault_ks, "cred-in-ctx-b")
+                .await
+                .unwrap()
+                .is_some(),
+            "a ctx-a caller must not hard-delete a ctx-b credential"
+        );
+    }
+
+    /// …and the caller's own context still works, so the gate is not a blanket
+    /// denial.
+    #[tokio::test]
+    async fn force_delete_allows_the_callers_own_context() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+        seed_credential(&state.vault_ks, "cred-in-ctx-a", Some("ctx-a")).await;
+
+        let auth = auth_scoped(&["ctx-a"]);
+        let doc = lifecycle_doc(
+            vta_sdk::trust_tasks::TASK_VAULT_CREDENTIALS_DELETE_0_1,
+            "cred-in-ctx-a",
+            true,
+        );
+        let _ = handle_delete(&state, &auth, doc).await;
+
+        assert!(
+            crate::vault::storage::get(&state.vault_ks, "cred-in-ctx-a")
+                .await
+                .unwrap()
+                .is_none(),
+            "the caller's own credential must still be deletable"
+        );
+    }
+
+    fn auth_scoped(ctxs: &[&str]) -> AuthClaims {
+        AuthClaims {
+            role: crate::acl::Role::Admin,
+            allowed_contexts: ctxs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn custody_auto_binds_to_callers_single_context() {
+        let r = resolve_custody_context(&auth_scoped(&["acme"]), None).unwrap();
+        assert_eq!(r.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn custody_unscoped_for_super_admin_and_multi_context() {
+        // Super-admin (empty contexts) → unscoped.
+        assert_eq!(
+            resolve_custody_context(&auth_scoped(&[]), None).unwrap(),
+            None
+        );
+        // Multiple contexts, no override → unscoped (ambiguous which owns it).
+        assert_eq!(
+            resolve_custody_context(&auth_scoped(&["a", "b"]), None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn custody_override_must_be_accessible() {
+        // Accessible override wins over the auto default.
+        let ok = resolve_custody_context(&auth_scoped(&["acme"]), Some("acme".into())).unwrap();
+        assert_eq!(ok.as_deref(), Some("acme"));
+        // A super-admin may target any context.
+        let sa = resolve_custody_context(&auth_scoped(&[]), Some("acme".into())).unwrap();
+        assert_eq!(sa.as_deref(), Some("acme"));
+        // An override outside the caller's scope is refused.
+        let err = resolve_custody_context(&auth_scoped(&["acme"]), Some("other".into()));
+        assert!(matches!(err, Err(AppError::Forbidden(_))), "{err:?}");
+    }
+
+    #[test]
+    fn receive_body_parses_with_and_without_id() {
+        let with_id: ReceiveBody =
+            serde_json::from_value(json!({ "credential": {"id": "x"}, "id": "y" })).unwrap();
+        assert_eq!(with_id.id.as_deref(), Some("y"));
+        let without: ReceiveBody =
+            serde_json::from_value(json!({ "credential": {"id": "x"} })).unwrap();
+        assert_eq!(without.id, None);
+    }
+}
+
+#[cfg(test)]
+mod receive_body_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The back-compatibility guarantee this change rests on: a body from an
+    /// existing client — `credential` alone, no `format` — must still
+    /// deserialize and still route to the Data-Integrity path. If this breaks,
+    /// every deployed wallet breaks with it.
+    #[test]
+    fn a_pre_existing_body_still_deserializes_and_stays_on_the_di_path() {
+        let body: ReceiveBody = serde_json::from_value(json!({
+            "credential": {"id": "urn:uuid:abc", "type": ["VerifiableCredential"]},
+            "id": "urn:uuid:abc"
+        }))
+        .expect("an existing client body must still parse");
+
+        assert!(body.credential.is_some());
+        assert!(body.credential_base64.is_none());
+        assert!(
+            body.format.is_none(),
+            "absent format must stay absent — it is what selects the DI path"
+        );
+    }
+
+    /// camelCase on the wire, per R3.1. A snake_case `credential_base64` must
+    /// NOT bind, or a client that guesses wrong silently sends nothing.
+    #[test]
+    fn the_binary_field_is_camel_case_on_the_wire() {
+        let ok: ReceiveBody = serde_json::from_value(json!({
+            "credentialBase64": "AAAA",
+            "format": "mso_mdoc"
+        }))
+        .expect("camelCase parses");
+        assert_eq!(ok.credential_base64.as_deref(), Some("AAAA"));
+
+        // A snake_case member is not the wire contract, and is refused rather
+        // than silently dropped (#2621).
+        let wrong = serde_json::from_value::<ReceiveBody>(json!({
+            "credential_base64": "AAAA",
+            "format": "mso_mdoc"
+        }));
+        assert!(
+            wrong.is_err(),
+            "snake_case must not bind — the wire contract is camelCase"
+        );
+    }
+
+    /// `mso_mdoc` is the OpenID4VP spelling and the `CredentialFormat` serde
+    /// tag. Pin it here too: this is the third place it has to agree.
+    #[test]
+    fn the_mdoc_format_tag_matches_the_stored_credential_format() {
+        let body: ReceiveBody =
+            serde_json::from_value(json!({"credentialBase64": "AA", "format": "mso_mdoc"}))
+                .unwrap();
+        let stored = serde_json::to_string(&vta_vault::model::CredentialFormat::MsoMdoc).unwrap();
+        assert_eq!(
+            format!("\"{}\"", body.format.unwrap()),
+            stored,
+            "the wire format tag and the stored format tag must be the same token"
+        );
+    }
+}
+
+/// `vault/credentials/present/0.1`, through the handler.
+#[cfg(test)]
+mod present_tests {
+    use super::*;
+    use crate::test_support::{
+        admin_claims_for_context, build_signing_test_app_state, seed_held_credential,
+        seed_holder_key, super_admin_claims,
+    };
+    use serde_json::json;
+
+    const AUDIENCE: &str = "did:example:community";
+    const NONCE: &str = "urn:uuid:7d1e0c4a-5b2f-4c3d-8e9f-00000000001b";
+
+    fn present_doc(id: &str, claims: &[&str]) -> TrustTask<Value> {
+        let uri: trust_tasks_rs::TypeUri = vta_sdk::trust_tasks::TASK_VAULT_CREDENTIALS_PRESENT_0_1
+            .parse()
+            .expect("present uri");
+        TrustTask::new(
+            "urn:uuid:test-present",
+            uri,
+            json!({ "id": id, "audience": AUDIENCE, "nonce": NONCE, "claims": claims }),
+        )
+    }
+
+    fn body(out: &TrustTaskOutcome) -> Value {
+        serde_json::from_slice(&out.body).expect("a JSON document")
+    }
+
+    fn code(out: &TrustTaskOutcome) -> String {
+        body(out)["payload"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A held SD-JWT-VC for a holder key this VTA derives, outside any context.
+    async fn held_sd_jwt(state: &AppState) -> String {
+        let subject = seed_holder_key(state, "m/44'/0'/9'/0'/7'", None).await;
+        seed_held_credential(
+            &state.vault_ks,
+            "https://example.org/employment",
+            "employer",
+            &subject,
+        )
+        .await
+    }
+
+    /// Items 4 and 5: only the named claim is disclosed, and the key-binding JWT
+    /// carries the audience and nonce the caller named.
+    #[tokio::test]
+    async fn an_sd_jwt_is_presented_to_the_named_audience_disclosing_only_the_named_claim() {
+        let (state, _dir) = build_signing_test_app_state().await;
+        let id = held_sd_jwt(&state).await;
+
+        let out = handle_present(
+            &state,
+            &super_admin_claims(),
+            present_doc(&id, &["employer"]),
+        )
+        .await;
+        let doc = body(&out);
+        assert_eq!(out.status, axum::http::StatusCode::OK, "{doc}");
+        assert_eq!(doc["payload"]["disclosed"], json!(["employer"]));
+        let compact = doc["payload"]["presentation"]
+            .as_str()
+            .expect("a compact SD-JWT");
+        let parsed =
+            affinidi_sd_jwt::SdJwt::parse(compact, &affinidi_sd_jwt::hasher::Sha256Hasher).unwrap();
+        assert_eq!(parsed.disclosures.len(), 1);
+        assert_eq!(
+            parsed.disclosures[0].claim_name.as_deref(),
+            Some("employer")
+        );
+        let kb = parsed.kb_jwt.as_ref().expect("a key-binding JWT");
+        let payload = kb.split('.').nth(1).expect("a JWT payload");
+        let payload: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert_eq!(payload["aud"], AUDIENCE);
+        assert_eq!(payload["nonce"], NONCE);
+    }
+
+    /// Item 3.
+    #[tokio::test]
+    async fn a_claim_the_credential_does_not_carry_is_claim_not_held() {
+        let (state, _dir) = build_signing_test_app_state().await;
+        let id = held_sd_jwt(&state).await;
+
+        let out = handle_present(
+            &state,
+            &super_admin_claims(),
+            present_doc(&id, &["employer", "salary"]),
+        )
+        .await;
+        assert_eq!(code(&out), "vault/credentials/present:claimNotHeld");
+        assert_eq!(
+            body(&out)["payload"]["details"]["claims"],
+            json!(["salary"])
+        );
+    }
+
+    /// Item 4: a Data Integrity credential discloses every subject claim, so a
+    /// request naming fewer is refused, and names what it left out.
+    #[tokio::test]
+    async fn a_data_integrity_credential_is_refused_unless_every_claim_is_named() {
+        use crate::vault::model::{CredentialFormat, CredentialStatus, StoredCredential};
+        let (state, _dir) = build_signing_test_app_state().await;
+        let subject = seed_holder_key(&state, "m/44'/0'/9'/0'/8'", None).await;
+        let vc = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiableCredential", "EmploymentCredential"],
+            "issuer": "did:web:issuer.example",
+            "credentialSubject": { "id": subject, "employer": "Acme", "salary": 1 },
+        });
+        let cred = StoredCredential {
+            id: "di-employment".into(),
+            format: CredentialFormat::EddsaJcs2022,
+            types: vec!["EmploymentCredential".into()],
+            schema_id: None,
+            community_did: None,
+            context_id: None,
+            subject_did: Some(subject.clone()),
+            issuer_did: Some("did:web:issuer.example".into()),
+            purpose: None,
+            status: CredentialStatus::Valid,
+            valid_from: None,
+            valid_until: None,
+            received_at: "2026-01-01T00:00:00Z".into(),
+            source: None,
+            tags: Default::default(),
+            body: serde_json::to_vec(&vc).unwrap(),
+            lifecycle: VaultStatus::Active,
+            archived_at: None,
+            deleted_at: None,
+            grace_until: None,
+        };
+        storage::put(&state.vault_ks, &cred).await.unwrap();
+
+        let out = handle_present(
+            &state,
+            &super_admin_claims(),
+            present_doc("di-employment", &["employer"]),
+        )
+        .await;
+        assert_eq!(code(&out), "vault/credentials/present:wouldOverDisclose");
+        assert_eq!(
+            body(&out)["payload"]["details"]["undisclosed"],
+            json!(["salary"])
+        );
+
+        // Named in full, it is presented as a VP bound to the audience and nonce.
+        let out = handle_present(
+            &state,
+            &super_admin_claims(),
+            present_doc("di-employment", &["employer", "salary"]),
+        )
+        .await;
+        let doc = body(&out);
+        assert_eq!(out.status, axum::http::StatusCode::OK, "{doc}");
+        let vp = &doc["payload"]["presentation"];
+        assert_eq!(vp["holder"], subject);
+        assert_eq!(vp["domain"], AUDIENCE);
+        assert_eq!(vp["nonce"], NONCE);
+        assert!(vp.get("proof").is_some());
+    }
+
+    /// Item 1 and *Custody scope*: a caller who may not use the subject's key gets
+    /// the answer an unknown id gets.
+    #[tokio::test]
+    async fn a_holder_key_outside_the_callers_scope_reads_as_not_found() {
+        let (state, _dir) = build_signing_test_app_state().await;
+        let id = held_sd_jwt(&state).await;
+        let scoped = admin_claims_for_context("elsewhere");
+
+        let out = handle_present(&state, &scoped, present_doc(&id, &["employer"])).await;
+        let unknown = handle_present(
+            &state,
+            &scoped,
+            present_doc("no-such-credential", &["employer"]),
+        )
+        .await;
+        assert_eq!(code(&out), "vault/credentials/present:notFound");
+        assert_eq!(code(&unknown), "vault/credentials/present:notFound");
+        assert_eq!(
+            body(&out)["payload"]["message"],
+            body(&unknown)["payload"]["message"]
+        );
+    }
+
+    /// A stored credential with `format`, `valid_until` and `lifecycle` as given.
+    async fn store_raw(
+        state: &AppState,
+        id: &str,
+        format: crate::vault::model::CredentialFormat,
+        valid_until: Option<&str>,
+    ) {
+        use crate::vault::model::{CredentialStatus, StoredCredential};
+        let subject = seed_holder_key(state, "m/44'/0'/9'/0'/9'", None).await;
+        let vc = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2"],
+            "type": ["VerifiableCredential"],
+            "issuer": "did:web:issuer.example",
+            "credentialSubject": { "id": subject, "employer": "Acme" },
+        });
+        let cred = StoredCredential {
+            id: id.into(),
+            format,
+            types: vec!["VerifiableCredential".into()],
+            schema_id: None,
+            community_did: None,
+            context_id: None,
+            subject_did: Some(subject),
+            issuer_did: Some("did:web:issuer.example".into()),
+            purpose: None,
+            status: CredentialStatus::Valid,
+            valid_from: None,
+            valid_until: valid_until.map(str::to_string),
+            received_at: "2026-01-01T00:00:00Z".into(),
+            source: None,
+            tags: Default::default(),
+            body: serde_json::to_vec(&vc).unwrap(),
+            lifecycle: VaultStatus::Active,
+            archived_at: None,
+            deleted_at: None,
+            grace_until: None,
+        };
+        storage::put(&state.vault_ks, &cred).await.unwrap();
+    }
+
+    /// Item 2: a credential past its validity period is not presented, and
+    /// nothing is recorded for it.
+    #[tokio::test]
+    async fn an_expired_credential_is_not_presentable() {
+        use crate::vault::model::CredentialFormat;
+        let (state, _dir) = build_signing_test_app_state().await;
+        store_raw(
+            &state,
+            "expired",
+            CredentialFormat::EddsaJcs2022,
+            Some("2020-01-01T00:00:00Z"),
+        )
+        .await;
+
+        let out = handle_present(
+            &state,
+            &super_admin_claims(),
+            present_doc("expired", &["employer"]),
+        )
+        .await;
+        assert_eq!(code(&out), "vault/credentials/present:notPresentable");
+    }
+
+    /// A format this agent presents only inside an OpenID4VP exchange.
+    #[tokio::test]
+    async fn an_mdoc_is_format_unsupported() {
+        use crate::vault::model::CredentialFormat;
+        let (state, _dir) = build_signing_test_app_state().await;
+        store_raw(&state, "an-mdoc", CredentialFormat::MsoMdoc, None).await;
+
+        let out = handle_present(
+            &state,
+            &super_admin_claims(),
+            present_doc("an-mdoc", &["employer"]),
+        )
+        .await;
+        assert_eq!(code(&out), "vault/credentials/present:formatUnsupported");
+    }
+
+    /// `credential-present` is not `sign`: a role that signs anything but does not
+    /// act as the principal may not present.
+    #[tokio::test]
+    async fn an_application_may_not_present() {
+        let (state, _dir) = build_signing_test_app_state().await;
+        let id = held_sd_jwt(&state).await;
+        // Its own DID and entry: the capability gate reads the stored entry, not the token.
+        let app = AuthClaims {
+            did: "did:key:z6MkApplication".into(),
+            role: crate::acl::Role::Application,
+            ..super_admin_claims()
+        };
+        crate::test_support::seed_acl_entry(&state.acl_ks, &app.did, app.role.clone(), Vec::new())
+            .await;
+
+        let out = handle_present(&state, &app, present_doc(&id, &["employer"])).await;
+        assert_eq!(code(&out), "permissionDenied");
+    }
+}
+
+/// #2621: the hand-written bodies refuse what their schema does not define,
+/// and read everything it does.
+#[cfg(test)]
+mod issue_2621_tests {
+    use super::super::helpers::assert_reads_exactly_the_schema_members as check;
+    use super::*;
+    use vta_sdk::trust_tasks as t;
+
+    #[test]
+    fn credential_bodies_read_exactly_their_schema_members() {
+        check::<ReceiveBody>(t::TASK_VAULT_CREDENTIALS_RECEIVE_0_1);
+        check::<CredDeleteBody>(t::TASK_VAULT_CREDENTIALS_DELETE_0_1);
+        for uri in [
+            t::TASK_VAULT_CREDENTIALS_ARCHIVE_0_1,
+            t::TASK_VAULT_CREDENTIALS_UNARCHIVE_0_1,
+            t::TASK_VAULT_CREDENTIALS_RESTORE_0_1,
+            t::TASK_VAULT_CREDENTIALS_PURGE_0_1,
+        ] {
+            check::<CredLifecycleBody>(uri);
+        }
+    }
+}

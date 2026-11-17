@@ -1,0 +1,311 @@
+// Community profile plugin — read as a signed `vtc/community/profile/show/0.1`
+// document, edited as a signed `vtc/community/profile/update/0.1` document.
+//
+// Read-only fields (community_did, created_at) render as plain
+// text. Editable fields (name, description, language, contact
+// email, public url, logo url) are inputs in a single form. The
+// form tracks "dirty" state and only sends fields that changed. The Logo URL
+// field warns when these pages will not draw the address (`logoUrlWarning`);
+// the Logo card below stores a logo they always draw.
+
+import { useEffect, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+
+import { Field } from "@/components/Field";
+import { PageHeader } from "@/components/PageHeader";
+import { postSignedRead, postSignedTrustTask } from "@/lib/api";
+import { CommunityBrandingCard } from "@/plugins/vetting/BrandingCard";
+import { JoinDiscoveryCard } from "@/plugins/community/JoinDiscoveryCard";
+import { CommunityLogoCard } from "@/plugins/community/LogoCard";
+import { CommunityThemeCard } from "@/plugins/community/ThemeCard";
+import { logoUrlWarning } from "@/lib/display-logo";
+
+const TRUST_TASK =
+  "https://trusttasks.org/spec/vtc/community/profile/show/0.1";
+// The edit is a signed document; the profile has no REST write.
+const TRUST_TASK_UPDATE =
+  "https://trusttasks.org/spec/vtc/community/profile/update/0.1";
+
+// GET /v1/community/profile wire shape: `{profile: {…}}`, with the live
+// `registryStatus` inside the profile object — the shape
+// `vtc/community/profile/show/0.1` requires. The fields were flattened to
+// the top level until #1094, where the response schema permitted none of
+// them.
+interface Profile {
+  communityDid: string;
+  name: string;
+  description: string;
+  logoUrl: string | null;
+  publicUrl: string | null;
+  contactEmail: string | null;
+  language: string;
+  createdAt: string;
+  extensions: unknown;
+  registryStatus: string;
+}
+
+interface ProfileUpdateRequest {
+  name?: string;
+  description?: string;
+  logoUrl?: string | null;
+  publicUrl?: string | null;
+  contactEmail?: string | null;
+  language?: string;
+}
+
+interface ProfileResponse {
+  profile: Profile;
+}
+
+async function getProfile(): Promise<Profile> {
+  const body = await postSignedRead<ProfileResponse>(TRUST_TASK, {});
+  return body.profile;
+}
+
+async function putProfile(body: ProfileUpdateRequest): Promise<unknown> {
+  // The response is `{ profile, fieldsChanged }`. We don't read it —
+  // `onSuccess` invalidates the query, which refetches via `getProfile` and
+  // seeds the form from the unwrapped profile.
+  return postSignedTrustTask<unknown>(TRUST_TASK_UPDATE, body);
+}
+
+export function Profile() {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: ["profile"],
+    queryFn: getProfile,
+  });
+
+  // Form state is a separate copy of the profile so editing
+  // doesn't mutate the cached query result.
+  const [draft, setDraft] = useState<EditableFields | null>(null);
+
+  // When the query result first loads (or changes from outside),
+  // seed the draft. We don't overwrite an in-flight edit.
+  useEffect(() => {
+    if (!query.data) return;
+    if (draft !== null) return;
+    setDraft({
+      name: query.data.name,
+      description: query.data.description,
+      logoUrl: query.data.logoUrl ?? "",
+      publicUrl: query.data.publicUrl ?? "",
+      contactEmail: query.data.contactEmail ?? "",
+      language: query.data.language,
+    });
+  }, [query.data, draft]);
+
+  const mutation = useMutation({
+    mutationFn: putProfile,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["profile"] });
+      setDraft(null);
+    },
+  });
+
+  if (query.isPending) {
+    return (
+      <section className="page">
+        <PageHeader />
+        <p>Loading…</p>
+      </section>
+    );
+  }
+
+  if (query.error) {
+    return (
+      <section className="page">
+        <PageHeader />
+        <section className="card error">
+          <h3>Failed to load profile</h3>
+          <p>{(query.error as Error).message}</p>
+        </section>
+      </section>
+    );
+  }
+
+  if (!query.data || !draft) {
+    return null;
+  }
+
+  const original = query.data;
+  const dirty = isDirty(original, draft);
+
+  const onSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!dirty) return;
+    mutation.mutate(buildPatch(original, draft));
+  };
+
+  const onCancel = () => {
+    setDraft(null);
+    mutation.reset();
+  };
+
+  return (
+    <section className="page">
+      <PageHeader />
+
+      <form onSubmit={onSubmit} className="form-stack">
+        <section className="card">
+          <h3>Identity</h3>
+          <dl>
+            <dt>Community DID</dt>
+            <dd>
+              <code>{original.communityDid}</code>
+            </dd>
+            <dt>Created</dt>
+            <dd>
+              <code>{original.createdAt}</code>
+            </dd>
+          </dl>
+        </section>
+
+        <section className="card">
+          <h3>Editable</h3>
+          <Field label="Name">
+            <input
+              type="text"
+              value={draft.name}
+              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              required
+            />
+          </Field>
+          <Field label="Description">
+            <textarea
+              value={draft.description}
+              onChange={(e) =>
+                setDraft({ ...draft, description: e.target.value })
+              }
+              rows={3}
+            />
+          </Field>
+          <Field label="Public URL">
+            <input
+              type="url"
+              placeholder="https://community.example.com"
+              value={draft.publicUrl}
+              onChange={(e) =>
+                setDraft({ ...draft, publicUrl: e.target.value })
+              }
+            />
+          </Field>
+          <Field
+            label="Logo URL"
+            hint={
+              logoUrlWarning(draft.logoUrl) ??
+              "Published in the community's public profile. A logo uploaded in the Logo card takes its place on these pages."
+            }
+          >
+            <input
+              type="url"
+              placeholder="https://community.example.com/logo.svg"
+              value={draft.logoUrl}
+              onChange={(e) => setDraft({ ...draft, logoUrl: e.target.value })}
+            />
+          </Field>
+          <Field label="Contact email">
+            <input
+              type="email"
+              placeholder="ops@community.example.com"
+              value={draft.contactEmail}
+              onChange={(e) =>
+                setDraft({ ...draft, contactEmail: e.target.value })
+              }
+            />
+          </Field>
+          <Field label="Language (BCP 47)">
+            <input
+              type="text"
+              placeholder="en"
+              value={draft.language}
+              onChange={(e) =>
+                setDraft({ ...draft, language: e.target.value })
+              }
+              required
+            />
+          </Field>
+        </section>
+
+        {mutation.error && (
+          <section className="card error">
+            <h3>Save failed</h3>
+            <p>{(mutation.error as Error).message}</p>
+          </section>
+        )}
+
+        <div className="form-actions">
+          <button
+            type="submit"
+            className="primary"
+            disabled={!dirty || mutation.isPending}
+          >
+            {mutation.isPending ? "Saving…" : "Save changes"}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={onCancel}
+            disabled={!dirty || mutation.isPending}
+          >
+            Discard changes
+          </button>
+        </div>
+      </form>
+
+      <JoinDiscoveryCard />
+      <CommunityBrandingCard />
+      <CommunityLogoCard />
+      <CommunityThemeCard />
+    </section>
+  );
+}
+
+interface EditableFields {
+  name: string;
+  description: string;
+  logoUrl: string;
+  publicUrl: string;
+  contactEmail: string;
+  language: string;
+}
+
+function isDirty(
+  original: Profile,
+  draft: EditableFields,
+): boolean {
+  if (original.name !== draft.name) return true;
+  if (original.description !== draft.description) return true;
+  if ((original.logoUrl ?? "") !== draft.logoUrl) return true;
+  if ((original.publicUrl ?? "") !== draft.publicUrl) return true;
+  if ((original.contactEmail ?? "") !== draft.contactEmail) return true;
+  if (original.language !== draft.language) return true;
+  return false;
+}
+
+function buildPatch(
+  original: Profile,
+  draft: EditableFields,
+): ProfileUpdateRequest {
+  const patch: ProfileUpdateRequest = {};
+  if (original.name !== draft.name) patch.name = draft.name;
+  if (original.description !== draft.description) {
+    patch.description = draft.description;
+  }
+  // Empty string in the form means "clear the field" → send null.
+  const norm = (s: string) => (s.trim() === "" ? null : s);
+  if ((original.logoUrl ?? "") !== draft.logoUrl) {
+    patch.logoUrl = norm(draft.logoUrl);
+  }
+  if ((original.publicUrl ?? "") !== draft.publicUrl) {
+    patch.publicUrl = norm(draft.publicUrl);
+  }
+  if ((original.contactEmail ?? "") !== draft.contactEmail) {
+    patch.contactEmail = norm(draft.contactEmail);
+  }
+  if (original.language !== draft.language) {
+    patch.language = draft.language;
+  }
+  return patch;
+}
+

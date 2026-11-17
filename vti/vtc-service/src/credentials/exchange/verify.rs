@@ -1,0 +1,907 @@
+//! OID4VP / SD-JWT-VC / W3C-DI / bbs-2023 presentation verifier stack
+//! + the DID-VM key resolver (split out of `exchange.rs`, P2.3).
+
+use super::jwt::{check_temporal, check_w3c_temporal};
+use affinidi_sd_jwt::SdJwt;
+use affinidi_sd_jwt::error::SdJwtError;
+use affinidi_sd_jwt::hasher::Sha256Hasher;
+use affinidi_sd_jwt::signer::JwtVerifier;
+use affinidi_sd_jwt::verifier::{
+    KbFreshness, KeyBindingCheck, VerificationOptions, verify as verify_sd_jwt,
+};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use vta_sdk::jws::{JwsKey, sd_jwt_issuer_method};
+use vta_sdk::x509_issuer::X509TrustAnchors;
+use vti_common::auth::PurposeVmResolver;
+use vti_common::error::AppError;
+
+use crate::credentials::vm_resolver::{DidVmResolver, check_issuer_binding};
+
+// ── Verifier side: verify a presented vp_token (Phase 3, task 3.4) ──
+//
+// The VTC verifier emits a `credential-exchange/query` and receives a
+// `credential-exchange/present` carrying a `vp_token`. This verifies that token:
+// the issuer signature, the holder key-binding (bound to our nonce + identity),
+// and temporal validity — so a holder can prove it holds a credential we (or a
+// trusted issuer) issued, without us re-reading the wire bytes by hand.
+
+/// The SD-JWT [`JwtVerifier`] over one key — Ed25519 (`EdDSA`), P-256
+/// (`ES256`) or secp256k1 (`ES256K`), the issuer's resolved key or the holder's
+/// `cnf.jwk` (#1988). The header's `alg` must be the key's own; the signature is
+/// checked by [`JwsKey::verify_compact`] (Ed25519 with `verify_strict`).
+struct KeyJwtVerifier {
+    key: JwsKey,
+}
+
+impl JwtVerifier for KeyJwtVerifier {
+    fn verify_jwt(&self, jws: &str) -> Result<Value, SdJwtError> {
+        self.key
+            .verify_compact(jws)
+            .map_err(|e| SdJwtError::Verification(e.to_string()))
+    }
+}
+
+/// A cryptographically-verified SD-JWT-VC presentation.
+///
+/// Typestate: only constructable via [`verify_presentation`], so any code that
+/// takes a `VerifiedPresentation` is guaranteed to be looking at a presentation
+/// whose issuer signature, holder binding, and freshness all checked out.
+#[derive(Debug, Clone)]
+pub struct VerifiedPresentation {
+    /// The issuer DID (`iss`) whose signature verified.
+    pub issuer_did: String,
+    /// The proven holder DID — the `did:key` of the `cnf.jwk` key whose kb-jwt
+    /// signature verified against `expected_aud` + `expected_nonce`. An
+    /// Ed25519, P-256 (`did:key:zDn…`) or secp256k1 (`did:key:zQ3s…`) key.
+    pub holder_did: String,
+    /// The credential type (`vct`), if present.
+    pub vct: Option<String>,
+    /// The disclosed claims (issuer-protected claims + the revealed subset).
+    pub claims: Value,
+    /// Whether the presenter **cryptographically proved control of the holder
+    /// key** (so the presenter *is* the subject), versus mere possession of the
+    /// credential. True for SD-JWT-VC (`kb-jwt`), DI VP (holder proof), and
+    /// holder-bound **bbs-2023 pseudonym** proofs; **false** for a basic
+    /// (possession-based) bbs-2023 derived proof. A join policy can require this
+    /// (see the `holder_bound` fact) for sensitive communities.
+    pub holder_bound: bool,
+    /// The raw `credentialStatus` entry (W3C `BitstringStatusListEntry`) or
+    /// SD-JWT-VC IETF `status` object, captured at verify time so the join
+    /// verifier can resolve revocation. `None` when the credential opted into no
+    /// status list (treated as "not revocable"). Captured here rather than read
+    /// from [`Self::claims`] because the DI path stores only `credentialSubject`
+    /// in `claims`, while `credentialStatus` is a sibling top-level VC field.
+    pub credential_status: Option<Value>,
+    /// The credential's `taskContext` — the `threadId` of the trust task
+    /// exchange it was issued in (DTG Credentials §Trust Task Context Binding),
+    /// or `None` when it asserts none.
+    ///
+    /// Captured here for the same reason [`Self::credential_status`] is: it is a
+    /// **top-level** credential property, and the DI and bbs paths keep only
+    /// `credentialSubject` in [`Self::claims`], so a `taskContext` read from
+    /// `claims` downstream would be unconditionally `None` on those paths — a
+    /// verifier that could never see the binding it is required to enforce.
+    /// Resolved into a verdict by [`crate::credentials::task_context`].
+    pub task_context: Option<String>,
+    /// For an issuer known by an `x5c` chain, the key identifiers of the
+    /// authorities certifying it, base64url — what a DCQL
+    /// `trusted_authorities` entry of type `aki` is matched against. Empty for
+    /// a DID issuer.
+    pub issuer_authority_key_ids: Vec<String>,
+    /// Every `type` the credential carries — the SD-JWT `vct`, or a DI / bbs
+    /// VC's `type` array — so a check for one type is not limited to the
+    /// concrete one [`Self::vct`] names.
+    pub types: Vec<String>,
+    /// When the credential stops being valid, where it says (`exp`, or
+    /// `validUntil` / `expirationDate`). A top-level property, read before
+    /// [`Self::claims`] narrows to the subject.
+    pub valid_until: Option<DateTime<Utc>>,
+}
+
+/// Every `type` of a DI / bbs credential.
+fn credential_types(vc: &Value) -> Vec<String> {
+    match vc.get("type") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(t)) => vec![t.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// A DI / bbs credential's stated end, either spelling.
+fn w3c_valid_until(vc: &Value) -> Option<DateTime<Utc>> {
+    crate::credentials::ingress::validity_window(vc, "credential")
+        .ok()
+        .and_then(|w| w.valid_until)
+}
+
+/// Read a credential's top-level `taskContext`.
+///
+/// `source` is the whole credential — the SD-JWT-VC payload, or the DI / bbs VC
+/// object — never `credentialSubject`. DTG Credentials places `taskContext`
+/// beside `issuer`, not inside the subject, so looking for it in the subject as
+/// well would accept a shape the issuing catalog cannot produce and the
+/// signature-covered position would stop being the one that counts.
+fn extract_task_context(source: &Value) -> Option<String> {
+    source
+        .get("taskContext")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Extract a credential's status entry from a verified SD-JWT-VC payload or a DI
+/// VC object: the W3C `credentialStatus` (a sibling of `credentialSubject`), or
+/// the SD-JWT-VC IETF `status` object (`{ status_list: { uri, idx } }`) as a
+/// fallback. `None` when neither is present (the credential is not revocable).
+fn extract_credential_status(source: &Value) -> Option<Value> {
+    source
+        .get("credentialStatus")
+        .or_else(|| source.get("status"))
+        .cloned()
+}
+
+/// The structural, IO-free projection of an SD-JWT-VC presentation that
+/// [`parse_sd_jwt_presentation`] extracts *before* any signature check or DID
+/// resolution: the parsed SD-JWT, the holder-binding presence check, the
+/// `iss` / JWS-`kid` binding, and the `cnf.jwk` holder key decode.
+///
+/// [`verify_presentation`] resolves the issuer key and runs the cryptographic
+/// verification on top of this. Splitting the parse out keeps it synchronous,
+/// runtime-free, and resolver-free — a libFuzzer target that drives the exact
+/// parser production uses, with no tokio or network.
+#[derive(Debug)]
+pub struct ParsedSdJwtPresentation {
+    /// The parsed SD-JWT-VC (issuer JWS + disclosures + holder `kb-jwt`).
+    pub sd: SdJwt,
+    /// The credential issuer DID, from the SD-JWT payload `iss`.
+    pub issuer_did: String,
+    /// The issuer verification method — the JWS `kid`, checked to sit under
+    /// `issuer_did`, or a `did:key` issuer's own key
+    /// ([`sd_jwt_issuer_method`]). `None` for an issuer that is not a DID and
+    /// names its key by an `x5c` chain instead ([`Self::issuer_header`]).
+    pub issuer_vm: Option<String>,
+    /// The issuer JWS header — where an `x5c` chain is read from.
+    pub issuer_header: Value,
+    /// The holder binding key, decoded from `cnf.jwk` (RFC 9901 §8.3):
+    /// Ed25519, P-256 or secp256k1.
+    pub holder_key: JwsKey,
+    /// The proven holder DID — the `did:key` of `holder_key`.
+    pub holder_did: String,
+}
+
+/// Structurally parse an SD-JWT-VC presentation without verifying any
+/// signature or resolving any DID.
+///
+/// Checks, in order: the token is a parseable SD-JWT-VC; it carries a holder
+/// `kb-jwt` (an unbound presentation is refused); it has an `iss`; the issuer
+/// JWS `kid` names a method of `iss` (a `did:key` issuer may omit it); and it
+/// carries a decodable `cnf.jwk` holder key — Ed25519, P-256 or secp256k1. Returns the [`ParsedSdJwtPresentation`]
+/// projection the cryptographic verifier builds on.
+///
+/// Pure and IO-free — the high-value SD-JWT-VC parser fuzz target. The
+/// signature checks and issuer-key resolution live in [`verify_presentation`].
+pub fn parse_sd_jwt_presentation(compact: &str) -> Result<ParsedSdJwtPresentation, AppError> {
+    let hasher = Sha256Hasher;
+    let sd = SdJwt::parse(compact, &hasher)
+        .map_err(|e| AppError::Validation(format!("vp_token is not a parseable SD-JWT-VC: {e}")))?;
+    if sd.kb_jwt.is_none() {
+        return Err(AppError::Validation(
+            "presentation carries no holder kb-jwt (unbound presentation refused)".into(),
+        ));
+    }
+
+    let payload = sd
+        .payload()
+        .map_err(|e| AppError::Validation(format!("presentation payload: {e}")))?;
+
+    let issuer_did = payload
+        .get("iss")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Validation("presentation has no `iss`".into()))?
+        .to_string();
+    // The signing key is named by the issuer JWS `kid`, bound to `iss` — a key
+    // under some *other* DID must not sign a credential claiming this issuer. A
+    // did:key issuer's one key needs no `kid`; any other DID must name it.
+    let header = sd
+        .header()
+        .map_err(|e| AppError::Validation(format!("presentation header: {e}")))?;
+    // An issuer that is not a DID may be known by an X.509 chain (`x5c`) to a
+    // trust anchor instead — an EUDI PID or Rulebook issuer, whose `iss` is an
+    // `https` URL. Its key is checked against the anchors at verification.
+    let issuer_vm =
+        if !issuer_did.starts_with("did:") && vta_sdk::x509_issuer::names_key_by_x5c(&header) {
+            None
+        } else {
+            Some(
+                sd_jwt_issuer_method(&header, &issuer_did)
+                    .map_err(|e| AppError::Validation(format!("SD-JWT issuer: {e}")))?,
+            )
+        };
+
+    let cnf_jwk = payload
+        .get("cnf")
+        .and_then(|c| c.get("jwk"))
+        .ok_or_else(|| {
+            AppError::Validation("presentation has no `cnf.jwk` (holder binding)".into())
+        })?;
+    let holder_key =
+        JwsKey::from_jwk(cnf_jwk).map_err(|e| AppError::Validation(format!("cnf.jwk: {e}")))?;
+    // The proven holder DID is the did:key of the cnf binding key.
+    let holder_did = holder_key.did_key();
+
+    Ok(ParsedSdJwtPresentation {
+        sd,
+        issuer_did,
+        issuer_vm,
+        issuer_header: header,
+        holder_key,
+        holder_did,
+    })
+}
+
+/// How old a holder's kb-jwt `iat` may be when it reaches us (RFC 9901 §7.3
+/// step 5: the verifier checks the creation time is within an acceptable
+/// window). The kb-jwt is made for this presentation, bound to our nonce, so
+/// ten minutes covers a wallet's clock and a slow hand-off; 60 s of forward
+/// skew is the library's default.
+const KB_JWT_MAX_AGE_SECS: i64 = 600;
+
+/// Verify an SD-JWT-VC `vp_token` received on `credential-exchange/present`.
+///
+/// Checks, in order: the token parses and carries a holder `kb-jwt`; the issuer
+/// JWS signature (issuer key resolved from the JWS `kid` for `assertionMethod`,
+/// bound to `iss` — a `did:key` issuer resolves locally, a `did:webvh` /
+/// `did:web` issuer through `did_resolver`, a `publicKeyJwk` method included);
+/// the holder key-binding JWT — bound to `expected_aud` + `expected_nonce`,
+/// signed by the `cnf.jwk` key the issuer committed to (RFC 9901 §8.3); and
+/// temporal validity (`nbf` / `exp`). Issuer and holder each sign with EdDSA,
+/// ES256 or ES256K, the algorithm fixed by their key (#1988).
+///
+/// The IO-free structural parse is [`parse_sd_jwt_presentation`]; this adds the
+/// issuer-key resolution and signature checks. Deferred to follow-up slices:
+/// status-list revocation, issuer-trust (TRQP), and re-checking DCQL
+/// satisfaction.
+pub async fn verify_presentation(
+    vp_token: &Value,
+    expected_aud: &str,
+    expected_nonce: &str,
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    now: DateTime<Utc>,
+) -> Result<VerifiedPresentation, AppError> {
+    verify_presentation_with_anchors(
+        vp_token,
+        expected_aud,
+        expected_nonce,
+        did_resolver,
+        &X509TrustAnchors::new(),
+        now,
+    )
+    .await
+}
+
+/// [`verify_presentation`], also accepting an issuer known by an `x5c` chain to
+/// one of `anchors` instead of a DID ([`vta_sdk::x509_issuer::x5c_issuer_key`]:
+/// valid now, each certificate signed by the next, the leaf naming `iss`).
+pub async fn verify_presentation_with_anchors(
+    vp_token: &Value,
+    expected_aud: &str,
+    expected_nonce: &str,
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    anchors: &X509TrustAnchors,
+    now: DateTime<Utc>,
+) -> Result<VerifiedPresentation, AppError> {
+    let compact = vp_token.as_str().ok_or_else(|| {
+        AppError::Validation("vp_token must be a compact SD-JWT-VC string".into())
+    })?;
+
+    let ParsedSdJwtPresentation {
+        sd,
+        issuer_did,
+        issuer_vm,
+        issuer_header,
+        holder_key,
+        holder_did,
+    } = parse_sd_jwt_presentation(compact)?;
+
+    let hasher = Sha256Hasher;
+    let mut issuer_authority_key_ids = Vec::new();
+    let key = match issuer_vm {
+        Some(issuer_vm) => {
+            let resolver = DidVmResolver::new(did_resolver.cloned());
+            let issuer_key = resolver
+                .resolve_vm_for_purpose(&issuer_vm, vti_common::auth::ProofPurpose::AssertionMethod)
+                .await
+                .map_err(|e| AppError::Validation(format!("verification method refused: {e}")))?;
+            JwsKey::from_resolved(&issuer_key)
+                .map_err(|e| AppError::Validation(format!("issuer key: {e}")))?
+        }
+        None => {
+            let issuer = vta_sdk::x509_issuer::x5c_issuer(
+                &issuer_header,
+                &issuer_did,
+                anchors,
+                now.timestamp(),
+            )
+            .map_err(|e| AppError::Validation(format!("issuer certificate: {e}")))?;
+            issuer_authority_key_ids = issuer
+                .authority_key_ids
+                .iter()
+                .map(|id| URL_SAFE_NO_PAD.encode(id))
+                .collect();
+            issuer.key
+        }
+    };
+    let issuer_verifier = KeyJwtVerifier { key };
+
+    // The kb-jwt verifier is built from the `cnf.jwk` of the signature-verified
+    // issuer payload (affinidi-sd-jwt 0.2), never a key the caller picks — the
+    // same key `parse_sd_jwt_presentation` derived `holder_did` from, and
+    // `JwsKey::from_jwk` fixes the algorithm by it (#1988).
+    let holder_key_verifier = |jwk: &Value| -> Result<Box<dyn JwtVerifier>, SdJwtError> {
+        let key = JwsKey::from_jwk(jwk).map_err(|e| SdJwtError::KeyBinding(e.to_string()))?;
+        debug_assert_eq!(key.did_key(), holder_key.did_key());
+        Ok(Box::new(KeyJwtVerifier { key }))
+    };
+    let options = VerificationOptions::with_key_binding(KeyBindingCheck::new(
+        expected_aud,
+        expected_nonce,
+        KbFreshness::new(now.timestamp(), KB_JWT_MAX_AGE_SECS),
+        &holder_key_verifier,
+    ));
+    let result = verify_sd_jwt(&sd, &issuer_verifier, &hasher, &options)
+        .map_err(|e| AppError::Validation(format!("presentation verification failed: {e}")))?;
+    if !result.is_verified() {
+        return Err(AppError::Validation(
+            "holder key-binding (kb-jwt) did not verify".into(),
+        ));
+    }
+
+    check_temporal(&result.claims, now)?;
+
+    let vct = result
+        .claims
+        .get("vct")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let credential_status = extract_credential_status(&result.claims);
+    let task_context = extract_task_context(&result.claims);
+    let types = vct.iter().cloned().collect();
+    let valid_until = result
+        .claims
+        .get("exp")
+        .and_then(Value::as_i64)
+        .and_then(|t| DateTime::<Utc>::from_timestamp(t, 0));
+    Ok(VerifiedPresentation {
+        issuer_did,
+        holder_did,
+        vct,
+        // SD-JWT-VC carries a mandatory holder `kb-jwt` — the presenter proved
+        // control of the holder key.
+        holder_bound: true,
+        claims: result.claims,
+        credential_status,
+        task_context,
+        issuer_authority_key_ids,
+        types,
+        valid_until,
+    })
+}
+
+/// A cryptographically-verified set of presentations — the verified projection
+/// of an OID4VP DCQL `vp_token`.
+///
+/// Typestate: only constructable via [`verify_vp_token`], so any code that takes
+/// a `VerifiedPresentationSet` is guaranteed every presentation's issuer
+/// signature, holder binding, and freshness checked out, **and** that every
+/// presentation is bound to the same holder.
+#[derive(Debug, Clone)]
+pub struct VerifiedPresentationSet {
+    /// The single proven holder DID — every presentation in the set is bound to
+    /// it (a multi-credential `vp_token` whose entries disagree on the holder is
+    /// refused; a join is one applicant).
+    pub holder: String,
+    /// Each verified presentation, in DCQL `credential_query_id` order.
+    pub presentations: Vec<VerifiedPresentation>,
+}
+
+/// Flatten an OID4VP DCQL `vp_token` into the individual presentation values to
+/// verify, without verifying or resolving anything.
+///
+/// Accepts the same shapes [`verify_vp_token`] does:
+/// - a JSON **object** (the canonical DCQL `vp_token`): each value is one
+///   presentation, or an **array** of presentations under one query id;
+/// - a bare **string** (a single SD-JWT-VC presentation — the pre-map form).
+///
+/// Pure and IO-free — the OID4VP DCQL envelope-shape fuzz target. The per-entry
+/// signature verification is [`verify_vp_token`].
+pub fn flatten_vp_token(vp_token: &Value) -> Result<Vec<&Value>, AppError> {
+    match vp_token {
+        Value::String(_) => Ok(vec![vp_token]),
+        Value::Object(map) => {
+            if map.is_empty() {
+                return Err(AppError::Validation(
+                    "vp_token is an empty object (no presentations)".into(),
+                ));
+            }
+            let mut out = Vec::new();
+            for value in map.values() {
+                match value {
+                    Value::Array(items) => out.extend(items.iter()),
+                    other => out.push(other),
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(AppError::Validation(
+            "vp_token must be a DCQL object or a compact SD-JWT-VC string".into(),
+        )),
+    }
+}
+
+/// Verify an OID4VP DCQL `vp_token` — the map the VTA holder produces, keyed by
+/// DCQL `credential_query_id`. Each entry is verified against `expected_aud` +
+/// `expected_nonce`; every entry must bind the **same holder** (a join is one
+/// applicant). Returns the verified set.
+///
+/// Accepts three shapes for forward/backward compatibility:
+/// - a JSON **object** (the canonical DCQL `vp_token`): each value is one
+///   presentation, or an **array** of presentations under one query id;
+/// - a bare **string** (a single SD-JWT-VC presentation — the pre-map form).
+///
+/// **SD-JWT-VC** entries (compact strings) and **W3C Data-Integrity VP** entries
+/// (JSON objects) are both verified. A `did:webvh` / `did:web` issuer or holder
+/// is resolved through `did_resolver` (a `did:key` resolves locally). The
+/// IO-free envelope flatten is [`flatten_vp_token`].
+pub async fn verify_vp_token(
+    vp_token: &Value,
+    expected_aud: &str,
+    expected_nonce: &str,
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    now: DateTime<Utc>,
+) -> Result<VerifiedPresentationSet, AppError> {
+    verify_vp_token_with_anchors(
+        vp_token,
+        expected_aud,
+        expected_nonce,
+        did_resolver,
+        &X509TrustAnchors::new(),
+        now,
+    )
+    .await
+}
+
+/// [`verify_vp_token`], also accepting SD-JWT VCs whose issuer is known by an
+/// `x5c` chain to one of `anchors` ([`verify_presentation_with_anchors`]).
+pub async fn verify_vp_token_with_anchors(
+    vp_token: &Value,
+    expected_aud: &str,
+    expected_nonce: &str,
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    anchors: &X509TrustAnchors,
+    now: DateTime<Utc>,
+) -> Result<VerifiedPresentationSet, AppError> {
+    // Flatten the vp_token into the individual presentation values to verify.
+    let entries = flatten_vp_token(vp_token)?;
+
+    let mut presentations = Vec::with_capacity(entries.len());
+    let mut holder: Option<String> = None;
+    for entry in entries {
+        // A JSON **object** is a W3C Data-Integrity VP (eddsa-jcs-2022 holder
+        // proof, may carry several VCs) **or** a bbs-2023 derived-proof VC; a
+        // **string** is one SD-JWT-VC presentation.
+        let verified: Vec<VerifiedPresentation> = if entry.is_object() {
+            if is_bbs_2023_presentation(entry) {
+                verify_bbs_dispatch(entry, expected_aud, expected_nonce, did_resolver, now).await?
+            } else {
+                verify_di_vp(entry, expected_aud, expected_nonce, did_resolver, now).await?
+            }
+        } else {
+            vec![
+                verify_presentation_with_anchors(
+                    entry,
+                    expected_aud,
+                    expected_nonce,
+                    did_resolver,
+                    anchors,
+                    now,
+                )
+                .await?,
+            ]
+        };
+        for v in verified {
+            match &holder {
+                None => holder = Some(v.holder_did.clone()),
+                Some(h) if h != &v.holder_did => {
+                    return Err(AppError::Validation(format!(
+                        "vp_token presentations disagree on the holder (`{h}` vs \
+                         `{}`) — a single presentation must bind one holder",
+                        v.holder_did
+                    )));
+                }
+                Some(_) => {}
+            }
+            presentations.push(v);
+        }
+    }
+
+    let holder = holder.ok_or_else(|| {
+        AppError::Validation("vp_token carried no presentations to verify".into())
+    })?;
+    Ok(VerifiedPresentationSet {
+        holder,
+        presentations,
+    })
+}
+
+/// Verify a **W3C Data-Integrity VP** (the JSON object the VTA's `present_di_vc`
+/// produces) and project each contained VC into a [`VerifiedPresentation`].
+///
+/// Checks, in order: the holder `eddsa-jcs-2022` proof over the VP (minus its
+/// proof), with `proofPurpose` `authentication`; the `nonce` + `domain` bind
+/// `expected_nonce` + `expected_aud`; then, for each `verifiableCredential`, the
+/// issuer's `eddsa-jcs-2022` proof (verification method **bound to the VC
+/// `issuer`**) and W3C temporal validity (`validFrom` / `validUntil`). Issuer
+/// and holder keys resolve through `did_resolver` (`did:key` locally).
+async fn verify_di_vp(
+    vp: &Value,
+    expected_aud: &str,
+    expected_nonce: &str,
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    now: DateTime<Utc>,
+) -> Result<Vec<VerifiedPresentation>, AppError> {
+    use affinidi_data_integrity::DataIntegrityProof;
+
+    let resolver = DidVmResolver::new(did_resolver.cloned());
+
+    // 1. Holder proof over the VP (minus its proof).
+    let proof_val = vp
+        .get("proof")
+        .ok_or_else(|| AppError::Validation("DI VP has no `proof` (holder binding)".into()))?;
+    // A proof SET: a holder with both a classical and a post-quantum key signs
+    // the presentation with each.
+    let proofs = crate::credentials::proof_set::proof_set(proof_val).map_err(|e| {
+        AppError::Validation(format!("DI VP proof is not a Data-Integrity proof: {e}"))
+    })?;
+    // Purpose is checked on EVERY proof. A presentation carrying one
+    // `authentication` proof beside an `assertionMethod` one is not a holder
+    // binding with something extra attached — it is ambiguous about what the
+    // holder was attesting, and the permissive reading is the dangerous one.
+    for proof in &proofs {
+        if proof.proof_purpose != "authentication" {
+            return Err(AppError::Validation(format!(
+                "DI VP holder proof purpose is `{}`, expected `authentication`",
+                proof.proof_purpose
+            )));
+        }
+    }
+
+    let mut vp_unsigned = vp.clone();
+    if let Some(obj) = vp_unsigned.as_object_mut() {
+        obj.remove("proof");
+    }
+
+    let mut outcomes: Vec<(String, Result<(), String>)> = Vec::with_capacity(proofs.len());
+    for proof in &proofs {
+        let did = crate::credentials::proof_set::proof_signer_did(proof).to_string();
+        let r = crate::credentials::proof_set::verify_one(
+            proof,
+            &vp_unsigned,
+            &resolver,
+            vti_common::auth::ProofPurpose::Authentication,
+        )
+        .await;
+        outcomes.push((did, r));
+    }
+
+    // The holder DID comes from the acceptance rule rather than from whichever
+    // proof happened to be first: `accept_all` has already refused a set whose
+    // verifying proofs disagree about who signed, so there is exactly one
+    // answer to return here.
+    let holder_did = crate::credentials::proof_set::accept_all(&outcomes)
+        .map_err(|e| AppError::Validation(format!("DI VP holder proof did not verify: {e}")))?;
+
+    // 2. Freshness + audience binding (both are top-level VP fields, signed).
+    if vp.get("nonce").and_then(Value::as_str) != Some(expected_nonce) {
+        return Err(AppError::Validation(
+            "DI VP `nonce` does not match the verifier's challenge".into(),
+        ));
+    }
+    if vp.get("domain").and_then(Value::as_str) != Some(expected_aud) {
+        return Err(AppError::Validation(
+            "DI VP `domain` does not name this verifier".into(),
+        ));
+    }
+
+    // 3. Each contained credential: issuer proof (bound to `issuer`) + temporal.
+    let vcs = vp
+        .get("verifiableCredential")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| {
+            AppError::Validation("DI VP has no `verifiableCredential` to verify".into())
+        })?;
+
+    let mut out = Vec::with_capacity(vcs.len());
+    for vc in vcs {
+        let issuer_did = vc
+            .get("issuer")
+            .and_then(|i| match i {
+                Value::String(s) => Some(s.clone()),
+                Value::Object(o) => o.get("id").and_then(Value::as_str).map(str::to_string),
+                _ => None,
+            })
+            .ok_or_else(|| AppError::Validation("DI VC has no `issuer`".into()))?;
+
+        let vc_proof_val = vc
+            .get("proof")
+            .ok_or_else(|| AppError::Validation("DI VC has no issuer `proof`".into()))?;
+        let vc_proof: DataIntegrityProof =
+            serde_json::from_value(vc_proof_val.clone()).map_err(|e| {
+                AppError::Validation(format!("DI VC proof is not a Data-Integrity proof: {e}"))
+            })?;
+        // Bind the signing key to the VC issuer.
+        check_issuer_binding(&vc_proof.verification_method, &issuer_did)?;
+        let mut vc_unsigned = vc.clone();
+        if let Some(obj) = vc_unsigned.as_object_mut() {
+            obj.remove("proof");
+        }
+        crate::credentials::proof_set::verify_one(
+            &vc_proof,
+            &vc_unsigned,
+            &resolver,
+            vti_common::auth::ProofPurpose::AssertionMethod,
+        )
+        .await
+        .map_err(|e| AppError::Validation(format!("DI VC issuer proof did not verify: {e}")))?;
+
+        check_w3c_temporal(vc, now)?;
+        // Also the VC 1.1 names, and a credential stating both refused.
+        crate::credentials::ingress::check_validity_window(vc, now, "DI VC")?;
+
+        // The concrete type — for a DTG credential its subtype, not the
+        // `DTGCredential` base type every one of them carries.
+        let vct = crate::credentials::ingress::concrete_type(vc);
+        // The W3C `credentialStatus` is a top-level VC field (sibling of
+        // `credentialSubject`); capture it from the full VC, not the subject.
+        let credential_status = extract_credential_status(vc);
+        // Same reasoning as `credentialStatus` directly above: a top-level VC
+        // field, so it has to be taken from the full credential before `claims`
+        // narrows to `credentialSubject`.
+        let task_context = extract_task_context(vc);
+        out.push(VerifiedPresentation {
+            issuer_did,
+            holder_did: holder_did.clone(),
+            vct,
+            // A DI VP carries a holder `DataIntegrityProof` — the presenter proved
+            // control of the holder key.
+            holder_bound: true,
+            claims: vc.get("credentialSubject").cloned().unwrap_or(Value::Null),
+            credential_status,
+            task_context,
+            issuer_authority_key_ids: Vec::new(),
+            types: credential_types(vc),
+            valid_until: w3c_valid_until(vc),
+        });
+    }
+    Ok(out)
+}
+
+/// True iff `entry` is a `bbs-2023` derived-proof presentation — a JSON VC whose
+/// `proof.cryptosuite` is `bbs-2023`. Used to route a vp_token entry to the BBS
+/// verifier rather than the eddsa-jcs Data-Integrity VP path. Pure JSON
+/// inspection, so it works (to produce a clean error) even without the `bbs`
+/// feature.
+fn is_bbs_2023_presentation(entry: &Value) -> bool {
+    entry
+        .get("proof")
+        .and_then(|p| p.get("cryptosuite"))
+        .and_then(Value::as_str)
+        == Some("bbs-2023")
+}
+
+/// Dispatch a detected bbs-2023 presentation to the verifier, or fail cleanly
+/// when the crate was built without the `bbs` feature.
+async fn verify_bbs_dispatch(
+    entry: &Value,
+    expected_aud: &str,
+    expected_nonce: &str,
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    now: DateTime<Utc>,
+) -> Result<Vec<VerifiedPresentation>, AppError> {
+    #[cfg(feature = "bbs")]
+    {
+        Ok(vec![
+            verify_bbs_presentation(entry, expected_aud, expected_nonce, did_resolver, now).await?,
+        ])
+    }
+    #[cfg(not(feature = "bbs"))]
+    {
+        let _ = (entry, expected_aud, expected_nonce, did_resolver, now);
+        Err(AppError::Validation(
+            "a bbs-2023 presentation was received but this VTC was built without the `bbs` \
+             feature"
+                .into(),
+        ))
+    }
+}
+
+/// Inspect a `bbs-2023` **derived** proofValue: returns its embedded
+/// `presentationHeader` and whether it is a **pseudonym** (holder-bound) proof.
+///
+/// The standards-track `verify_derived_proof` / `verify_pseudonym_derived_proof`
+/// authenticate against the header carried *inside* the proof rather than a
+/// verifier-supplied one, so the verifier must extract it to bind freshness. The
+/// derived proofValue is `multibase-base64url("u" || 0xd95d0{3,9} ||
+/// CBOR([...]))`; `0xd95d03` is a basic derived proof and `0xd95d09` a pseudonym
+/// (holder-bound) one. The presentation header is element index 4 of the CBOR
+/// array in both forms.
+#[cfg(feature = "bbs")]
+fn bbs_inspect_derived_proof(vc: &Value) -> Result<(Vec<u8>, bool), AppError> {
+    let pv = vc
+        .get("proof")
+        .and_then(|p| p.get("proofValue"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Validation("bbs-2023 presentation has no `proofValue`".into()))?;
+    let (_base, bytes) = multibase::decode(pv).map_err(|e| {
+        AppError::Validation(format!("bbs-2023 `proofValue` is not multibase: {e}"))
+    })?;
+    // 0xd95d03 = basic derived, 0xd95d09 = pseudonym derived. Reject base proofs
+    // (0xd95d02 / 0xd95d08) and anything else — only a *disclosure* proof is a
+    // presentation.
+    if bytes.len() < 3 || bytes[0] != 0xd9 || bytes[1] != 0x5d {
+        return Err(AppError::Validation(
+            "bbs-2023 `proofValue` is not a derived (disclosure) proof".into(),
+        ));
+    }
+    let is_pseudonym = match bytes[2] {
+        0x03 => false,
+        0x09 => true,
+        _ => {
+            return Err(AppError::Validation(
+                "bbs-2023 `proofValue` is not a derived (disclosure) proof".into(),
+            ));
+        }
+    };
+    let value: ciborium::value::Value = ciborium::from_reader(&bytes[3..]).map_err(|e| {
+        AppError::Validation(format!("bbs-2023 `proofValue` CBOR is malformed: {e}"))
+    })?;
+    let header = value
+        .as_array()
+        .and_then(|arr| arr.get(4))
+        .and_then(ciborium::value::Value::as_bytes)
+        .ok_or_else(|| {
+            AppError::Validation("bbs-2023 derived `proofValue` has no presentationHeader".into())
+        })?;
+    Ok((header.clone(), is_pseudonym))
+}
+
+/// Verify a **bbs-2023 derived-proof** presentation and project it into a
+/// [`VerifiedPresentation`].
+///
+/// Requires `affinidi-data-integrity` ≥ 0.7.5 (the vc-di-bbs disclosed-value
+/// soundness fix, affinidi-tdk-rs#381): every claim term in a presented VC must
+/// be defined by its `@context` (JSON-LD safe mode), else verification refuses
+/// it. BBS issuer *signing* remains separately audit-gated (#294).
+///
+/// The derived proof (the disclosed VC's `proof`) proves the holder possesses a
+/// credential validly issued by the VC `issuer` and discloses only the revealed
+/// claims, bound to the verifier's `expected_nonce` (the presentation header).
+/// The issuer's BLS12-381 G2 key resolves from its DID (the proof's
+/// `verificationMethod`, bound to `issuer`).
+///
+/// **Holder semantics — two modes, by proof kind:**
+/// - A **basic** derived proof (`0xd95d03`) carries **no holder-key binding** —
+///   it is unlinkable and possession-based. The applicant (`holder_did`) is taken
+///   to be the **disclosed `credentialSubject.id`** (a mandatory-disclosed claim),
+///   and [`VerifiedPresentation::holder_bound`] is `false`.
+/// - A **pseudonym** derived proof (`0xd95d09`) is holder-bound: the holder proves
+///   knowledge of the link secret committed at issuance, bound to a per-verifier
+///   context. We verify it against `expected_aud` as the `verifier_id` (so the
+///   pseudonym is stable per verifier, unlinkable across verifiers), and
+///   `holder_bound` is `true`. The join policy can require this for sensitive
+///   communities (see the `holder_bound` fact).
+#[cfg(feature = "bbs")]
+async fn verify_bbs_presentation(
+    vc: &Value,
+    expected_aud: &str,
+    expected_nonce: &str,
+    did_resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    now: DateTime<Utc>,
+) -> Result<VerifiedPresentation, AppError> {
+    use affinidi_bbs::PublicKey;
+    use affinidi_data_integrity::bbs_2023_transform;
+
+    let issuer_did = vc
+        .get("issuer")
+        .and_then(|i| match i {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) => o.get("id").and_then(Value::as_str).map(str::to_string),
+            _ => None,
+        })
+        .ok_or_else(|| AppError::Validation("bbs-2023 VC has no `issuer`".into()))?;
+
+    // Bind the signing key to the issuer, then resolve its G2 key.
+    let vm = vc
+        .get("proof")
+        .and_then(|p| p.get("verificationMethod"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Validation("bbs-2023 proof has no `verificationMethod`".into()))?;
+    check_issuer_binding(vm, &issuer_did)?;
+    let g2 = DidVmResolver::new(did_resolver.cloned())
+        .resolve_bbs_g2(vm, vti_common::auth::ProofPurpose::AssertionMethod)
+        .await?;
+    let pk = PublicKey::from_bytes(&g2)
+        .map_err(|e| AppError::Validation(format!("bbs-2023 issuer key is invalid: {e}")))?;
+
+    // Freshness / anti-replay: the standards-track verify authenticates the
+    // presentation header *embedded* in the derived proof, not a verifier-supplied
+    // one — so we read that header back out and bind it to the challenge this
+    // verifier issued. Without this check a proof minted for any other challenge
+    // would verify cryptographically. The same inspection tells us whether this is
+    // a holder-bound *pseudonym* proof (`0xd95d09`) or a basic one (`0xd95d03`).
+    let (header, holder_bound) = bbs_inspect_derived_proof(vc)?;
+    if header != expected_nonce.as_bytes() {
+        return Err(AppError::Validation(
+            "bbs-2023 presentation header does not match the expected challenge".into(),
+        ));
+    }
+    // The header is checked by the library too (affinidi-data-integrity 0.8.7),
+    // before any BBS work.
+    let options = bbs_2023_transform::DerivedProofVerifyOptions::new()
+        .with_expected_presentation_header(expected_nonce.as_bytes());
+    let verified = if holder_bound {
+        // Pseudonym proof: verify the per-verifier holder binding against `aud`.
+        bbs_2023_transform::verify_pseudonym_derived_proof_with(vc, &pk, expected_aud, &options)
+    } else {
+        bbs_2023_transform::verify_derived_proof_with(vc, &pk, &options)
+    }
+    .map_err(|e| AppError::Validation(format!("bbs-2023 presentation did not verify: {e}")))?;
+    if !verified {
+        return Err(AppError::Validation(
+            "bbs-2023 presentation proof did not verify".into(),
+        ));
+    }
+    check_w3c_temporal(vc, now)?;
+
+    let holder_did = vc
+        .get("credentialSubject")
+        .and_then(|s| s.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            AppError::Validation(
+                "bbs-2023 presentation discloses no `credentialSubject.id` (the applicant); \
+                 the subject id must be a mandatory-disclosed claim"
+                    .into(),
+            )
+        })?;
+    let vct = crate::credentials::ingress::concrete_type(vc);
+    let credential_status = extract_credential_status(vc);
+    // A derived proof reveals only what the issuer made mandatory-disclosed plus
+    // what the holder chose to disclose. An issuer that leaves `taskContext`
+    // selectively disclosable therefore mints a VWC that a verifier is *unable*
+    // to bind to its exchange, and the receipt gate refuses it — correctly, and
+    // the fix belongs on the issuing side.
+    let task_context = extract_task_context(vc);
+
+    Ok(VerifiedPresentation {
+        issuer_did,
+        holder_did,
+        vct,
+        // `true` only for a pseudonym (holder-bound) proof; a basic derived proof
+        // is possession-based.
+        holder_bound,
+        claims: vc.get("credentialSubject").cloned().unwrap_or(Value::Null),
+        credential_status,
+        task_context,
+        issuer_authority_key_ids: Vec::new(),
+        types: credential_types(vc),
+        valid_until: w3c_valid_until(vc),
+    })
+}

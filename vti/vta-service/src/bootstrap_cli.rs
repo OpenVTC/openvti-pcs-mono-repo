@@ -1,0 +1,1639 @@
+//! `vta bootstrap` — sealed-transfer subcommands.
+//!
+//! Producer-side commands (`seal`, `provision-integration`) live alongside
+//! consumer-side commands (`request`, `open`) so the same `vta` binary can
+//! drive both ends of an offline round-trip in cold-start scenarios where
+//! `pnm` is not yet available (e.g. the mediator or webvh hosting service
+//! the integration would normally rely on does not exist yet).
+//!
+//! Consumer commands delegate to `vta_cli_common::sealed_consumer`, which
+//! is the same shared layer `pnm` and `cnm` use — the only per-CLI concern
+//! is which seed directory to default to.
+
+use std::path::PathBuf;
+
+use vta_sdk::provision_integration::http::AdminScope;
+use vta_sdk::sealed_transfer::{
+    AssertionProof, BootstrapRequest, ProducerAssertion, SealedPayloadV1, armor, bundle_digest,
+    generate_ed25519_keypair, seal_payload,
+};
+
+use crate::cli_store::CliStore;
+use crate::config::AppConfig;
+use crate::sealed_nonce_store::PersistentNonceStore;
+
+/// Default per-user seed cache for `vta bootstrap request` / `open`.
+///
+/// Mirrors the `~/.config/pnm/bootstrap-secrets/` convention used by `pnm`,
+/// but lives under `vta/` so the two tools can coexist on the same host
+/// without colliding. `--seed-dir` overrides this for portable / sandboxed
+/// use (CI, sealed images with no `$HOME`).
+fn default_seed_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = dirs::config_dir()
+        .ok_or("could not determine config directory (set --seed-dir to override)")?
+        .join("vta");
+    Ok(dir)
+}
+
+fn resolve_seed_dir(override_dir: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    match override_dir {
+        Some(d) => Ok(d),
+        None => default_seed_dir(),
+    }
+}
+
+/// Seal a payload to a consumer's BootstrapRequest (Mode C, offline).
+pub async fn run_seal(
+    config_path: Option<PathBuf>,
+    request_path: PathBuf,
+    payload_path: PathBuf,
+    out_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_json = std::fs::read_to_string(&request_path)
+        .map_err(|e| format!("read {}: {e}", request_path.display()))?;
+    let request: BootstrapRequest =
+        serde_json::from_str(&request_json).map_err(|e| format!("parse BootstrapRequest: {e}"))?;
+    if request.version != 1 {
+        return Err(format!("unsupported request version: {}", request.version).into());
+    }
+
+    let recipient_pk = request.decode_client_x25519_pub()?;
+    let bundle_id = request.decode_nonce()?;
+
+    let payload_json = std::fs::read_to_string(&payload_path)
+        .map_err(|e| format!("read {}: {e}", payload_path.display()))?;
+    let payload: SealedPayloadV1 =
+        serde_json::from_str(&payload_json).map_err(|e| format!("parse SealedPayloadV1: {e}"))?;
+
+    // Fresh per-seal producer identity. In Mode C the consumer pins this
+    // did:key out-of-band — it is not tied to the VTA's long-lived DID.
+    let (_producer_seed, producer_ed_pub) = generate_ed25519_keypair();
+    let producer_did = affinidi_crypto::did_key::ed25519_pub_to_did_key(&producer_ed_pub);
+    let producer = ProducerAssertion {
+        producer_did: producer_did.clone(),
+        proof: AssertionProof::PinnedOnly,
+    };
+
+    // Persistent nonce store — re-running `vta bootstrap seal` against the
+    // same BootstrapRequest (e.g. after a network glitch) is rejected and
+    // forces the consumer to regenerate their request.
+    let config_store = AppConfig::load(config_path)?;
+    let cs_seal = CliStore::open(&config_store).await?;
+    let nonce_ks = cs_seal.keyspace(crate::keyspaces::SEALED_NONCES)?;
+    let nonce_store = PersistentNonceStore::new(nonce_ks);
+    let bundle = seal_payload(&recipient_pk, bundle_id, producer, &payload, &nonce_store).await?;
+    cs_seal.persist().await?;
+
+    let armored = armor::encode(&bundle);
+    std::fs::write(&out_path, armored.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+
+    let digest = bundle_digest(&bundle);
+    eprintln!("Sealed bundle written to {}", out_path.display());
+    eprintln!();
+    eprintln!("  Bundle-Id:       {}", hex_lower(&bundle.bundle_id));
+    eprintln!("  Chunks:          {}", bundle.chunks.len());
+    eprintln!("  Producer DID:    {producer_did}");
+    eprintln!("  SHA-256 digest:  {digest}");
+    eprintln!();
+    eprintln!(
+        "Communicate the digest to the consumer out-of-band so they can run\n  \
+         vta bootstrap open --bundle <file> --expect-digest {digest}\n  \
+         (or `pnm bootstrap open` if the consumer has pnm installed)"
+    );
+    Ok(())
+}
+
+/// `vta bootstrap request` — consumer-side. Generate an ephemeral Ed25519
+/// keypair, persist the seed under `<seed-dir>/bootstrap-secrets/<bundle_id>.key`,
+/// and write a `BootstrapRequest` JSON the producer can hand to
+/// `vta bootstrap seal` or `vta bootstrap provision-integration`.
+///
+/// Used in cold-start scenarios where `pnm bootstrap request` isn't
+/// available — same wire shape, same on-disk format, different binary.
+pub async fn run_request(
+    out_path: PathBuf,
+    label: Option<String>,
+    seed_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let seed_dir = resolve_seed_dir(seed_dir)?;
+    let created = vta_cli_common::sealed_consumer::create_bootstrap_request(&seed_dir, label)?;
+
+    let json = serde_json::to_string_pretty(&created.request)?;
+    std::fs::write(&out_path, json.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+
+    eprintln!("Bootstrap request written to {}", out_path.display());
+    eprintln!();
+    eprintln!("  Bundle-Id:  {}", created.bundle_id_hex);
+    eprintln!("  Client DID: {}", created.request.client_did);
+    eprintln!("  Seed saved: {}", created.secret_path.display());
+    eprintln!();
+    eprintln!("Hand the request to the VTA operator. They will return an armored bundle.");
+    eprintln!("Verify the SHA-256 digest they print to you out-of-band, then run:");
+    eprintln!("  vta bootstrap open --bundle <file> --expect-digest <hex>");
+    Ok(())
+}
+
+/// `vta bootstrap provision-request` — consumer-side. Generate a
+/// VP-framed `BootstrapRequest` for the provision-integration flow.
+///
+/// Mints an ephemeral Ed25519 keypair, persists the seed under
+/// `<seed-dir>/bootstrap-secrets/<bundle_id>.key`, and writes a signed
+/// VP naming the target DID template (e.g. `didcomm-mediator`,
+/// `did-host-http`, `did-host-http-didcomm`) + variables. Hand
+/// the JSON to the VTA
+/// operator; they run `vta bootstrap provision-integration --request
+/// <file>` and return an armored sealed bundle + SHA-256 digest.
+/// Decrypt with `vta bootstrap open` on this host.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_provision_request(
+    template: String,
+    vars: Vec<String>,
+    context_hint: Option<String>,
+    admin_template: Option<String>,
+    validity_hours: f64,
+    label: Option<String>,
+    seed_dir: Option<PathBuf>,
+    out_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use vta_sdk::provision_integration::ProvisionRequestBuilder;
+
+    if !validity_hours.is_finite() || validity_hours <= 0.0 {
+        return Err(format!(
+            "--validity-hours must be a positive finite number, got {validity_hours}"
+        )
+        .into());
+    }
+    let validity = chrono::Duration::seconds((validity_hours * 3600.0) as i64);
+
+    let mut builder = ProvisionRequestBuilder::new(template).validity(validity);
+    for raw in &vars {
+        let (k, v) = parse_var(raw)?;
+        builder = builder.var(k, v);
+    }
+    if let Some(ctx) = context_hint {
+        builder = builder.context_hint(ctx);
+    }
+    if let Some(admin) = admin_template {
+        builder = builder.admin_template(admin);
+    }
+    if let Some(l) = label {
+        builder = builder.label(l);
+    }
+
+    let seed_dir = resolve_seed_dir(seed_dir)?;
+    let created =
+        vta_cli_common::sealed_consumer::create_provision_request(&seed_dir, builder).await?;
+
+    let json = serde_json::to_string_pretty(&created.request)?;
+    std::fs::write(&out_path, json.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+
+    eprintln!(
+        "Provision bootstrap request written to {}",
+        out_path.display()
+    );
+    eprintln!();
+    eprintln!("  Bundle-Id:  {}", created.bundle_id_hex);
+    eprintln!("  Client DID: {}", created.client_did);
+    eprintln!("  Seed saved: {}", created.secret_path.display());
+    eprintln!();
+    eprintln!("Hand the request to the VTA operator. They will run:");
+    eprintln!("  vta bootstrap provision-integration --request <file> --out <bundle>");
+    eprintln!("and return an armored sealed bundle + SHA-256 digest.");
+    eprintln!();
+    eprintln!("Verify the digest out-of-band, then:");
+    eprintln!("  vta bootstrap open --bundle <file> --expect-digest <hex>");
+    Ok(())
+}
+
+/// Parse a single `--var KEY=VALUE` argument. Value is tried as JSON
+/// first (handles numbers, booleans, null, arrays, objects, quoted
+/// strings); falls back to a plain string for unquoted values like
+/// `URL=https://mediator.example.com`.
+fn parse_var(raw: &str) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --var '{raw}': expected KEY=VALUE"))?;
+    if key.is_empty() {
+        return Err(format!("invalid --var '{raw}': empty key").into());
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(value)
+        .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+    Ok((key.to_string(), parsed))
+}
+
+/// `vta bootstrap open` — consumer-side. Read an armored sealed bundle,
+/// look up the matching seed under `<seed-dir>/bootstrap-secrets/`, derive
+/// the X25519 HPKE secret, decrypt, verify the digest, and print the
+/// payload contents.
+///
+/// `--expect-digest` is required by default; `--no-verify-digest` is an
+/// opt-out that prints a warning. There is no silent TOFU.
+///
+/// When `expect_vta_did` is `Some(..)` and the payload is a
+/// `TemplateBootstrap`, the VC + DidSigned producer assertion are
+/// verified end-to-end against the pinned DID.
+pub async fn run_open(
+    bundle_path: PathBuf,
+    expect_digest: Option<String>,
+    no_verify_digest: bool,
+    expect_vta_did: Option<String>,
+    seed_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if no_verify_digest {
+        eprintln!(
+            "WARNING: --no-verify-digest disables out-of-band integrity verification.\n\
+             You are trusting the producer pubkey embedded in the bundle without\n\
+             any external anchor. Use only for testing."
+        );
+    }
+
+    let seed_dir = resolve_seed_dir(seed_dir)?;
+    // `open` shows the bundle and installs nothing, so the request seed stays
+    // for whatever does install it (VTI-53).
+    let (opened, secret) = vta_cli_common::sealed_consumer::open_armored_bundle_keeping_secret(
+        &bundle_path,
+        &seed_dir,
+        expect_digest.as_deref(),
+        no_verify_digest,
+    )?;
+
+    print_opened(&opened, expect_vta_did.as_deref())?;
+    println!();
+    println!(
+        "The request seed was kept at {} so the bundle can still be installed.",
+        secret.display()
+    );
+    Ok(())
+}
+
+fn print_opened(
+    opened: &vta_cli_common::sealed_consumer::OpenedArmored,
+    expect_vta_did: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Sealed bundle opened.");
+    println!();
+    println!("  Bundle-Id:       {}", opened.bundle_id_hex);
+    println!("  Digest (sha256): {}", opened.digest);
+    println!("  Producer DID:    {}", opened.producer.producer_did);
+    println!("  Producer proof:  {:?}", opened.producer.proof);
+    println!();
+    match &opened.payload {
+        SealedPayloadV1::AdminCredential(c) => {
+            println!("Payload: AdminCredential");
+            println!("  DID:     {}", c.did);
+            println!("  VTA DID: {}", c.vta_did);
+            if let Some(ref u) = c.vta_url {
+                println!("  VTA URL: {u}");
+            }
+        }
+        SealedPayloadV1::ContextProvision(p) => {
+            println!("Payload: ContextProvision");
+            println!("  Context:   {} ({})", p.context_id, p.context_name);
+            println!("  Admin DID: {}", p.admin_did);
+        }
+        SealedPayloadV1::DidSecrets(s) => {
+            println!("Payload: DidSecrets");
+            println!("  DID:     {}", s.did);
+            println!("  Secrets: {}", s.secrets.len());
+        }
+        SealedPayloadV1::AdminKeySet(keys) => {
+            println!("Payload: AdminKeySet ({} keys)", keys.len());
+            for k in keys {
+                println!("  - {}", k.label);
+            }
+        }
+        SealedPayloadV1::RawPrivateKey(k) => {
+            println!("Payload: RawPrivateKey ({})", k.key_type);
+        }
+        SealedPayloadV1::TemplateBootstrapV2(p) => {
+            println!("Payload: TemplateBootstrapV2");
+            println!("  Template:     {}", p.config.template_name);
+            println!("  Kind:         {}", p.config.template_kind);
+            println!("  Secrets for:  {} DID(s)", p.secrets.len());
+            println!("  Outputs:      {}", p.config.outputs.len());
+            // Name every key held, because the extra one is the whole reason
+            // this variant exists — an operator should see it before
+            // installing, not infer it from its absence.
+            for (did, material) in &p.secrets {
+                println!("  {did}");
+                println!(
+                    "    {} (signing, {:?})",
+                    material.signing_key.slot, material.signing_key.key_type
+                );
+                for extra in &material.additional_signing_keys {
+                    println!("    {} (signing, {:?})", extra.slot, extra.key_type);
+                }
+                println!(
+                    "    {} (key agreement, {:?})",
+                    material.ka_key.slot, material.ka_key.key_type
+                );
+            }
+            if let Some(ref u) = p.config.vta_url {
+                println!("  VTA URL:      {u}");
+            }
+        }
+        SealedPayloadV1::TemplateBootstrap(p) => {
+            println!("Payload: TemplateBootstrap");
+            println!("  Template:     {}", p.config.template_name);
+            println!("  Kind:         {}", p.config.template_kind);
+            println!("  Secrets for:  {} DID(s)", p.secrets.len());
+            println!("  Outputs:      {}", p.config.outputs.len());
+            if let Some(ref u) = p.config.vta_url {
+                println!("  VTA URL:      {u}");
+            }
+            // End-to-end verification when the operator pinned a DID.
+            match expect_vta_did {
+                Some(pinned) => {
+                    verify_template_bundle(opened, p.as_ref(), pinned)?;
+                    println!();
+                    println!("  \x1b[1;32m✓ VC verified against pinned VTA DID\x1b[0m");
+                }
+                None => {
+                    println!();
+                    println!("  \x1b[1;33m⚠ VC NOT verified — digest-only trust anchor.\x1b[0m");
+                    println!("    Re-run with --expect-vta-did <did> to verify the authorization");
+                    println!("    VC + DidSigned producer assertion end-to-end.");
+                }
+            }
+        }
+        SealedPayloadV1::AdminRotation(p) => {
+            println!("Payload: AdminRotation");
+            println!("  Admin DID:    {}", p.admin.did);
+            println!("  VTA DID:      {}", p.vta_trust.vta_did);
+            if let Some(ref u) = p.vta_url {
+                println!("  VTA URL:      {u}");
+            }
+            // End-to-end verification of the AdminRotation VC parallels
+            // the TemplateBootstrap path. Plumbing it through is left to
+            // a future patch — the digest-pinning anchor still applies
+            // by default.
+            println!();
+            println!(
+                "  \x1b[1;33m⚠ VC verification not yet wired for AdminRotation — relying on digest pinning.\x1b[0m"
+            );
+        }
+        SealedPayloadV1::IssuedCredential(c) => {
+            println!("Payload: IssuedCredential");
+            println!("  Issuer DID: {}", c.issuer_did);
+            if let Some(ref label) = c.label {
+                println!("  Label:      {label}");
+            }
+            let kind = if c.credential.is_string() {
+                "SD-JWT-VC (compact)"
+            } else {
+                "W3C Data-Integrity VC"
+            };
+            println!("  Format:     {kind}");
+        }
+        SealedPayloadV1::MessagingBridgeCredentials(b) => {
+            println!("Payload: MessagingBridgeCredentials");
+            println!("  Platform:   {}", b.platform);
+            println!("  Fields:     {}", b.fields.len());
+        }
+        SealedPayloadV1::SeedMnemonic(m) => {
+            println!("Payload: SeedMnemonic");
+            if let Some(ref did) = m.vta_did {
+                println!("  VTA DID:    {did}");
+            }
+            println!("  Words:      {}", m.mnemonic.split_whitespace().count());
+            println!(
+                "  Open with `pnm bootstrap open` on the offline machine that will hold the backup."
+            );
+        }
+        // Never print the secret or the credential, here or anywhere.
+        SealedPayloadV1::ExternalSecret(b) => {
+            println!("Payload: ExternalSecret");
+            println!("  Account:    {}/{}", b.context, b.account);
+        }
+        SealedPayloadV1::ExternalCredential(c) => {
+            println!("Payload: ExternalCredential");
+            println!("  Expires at: {}", c.expires_at());
+        }
+        // `SealedPayloadV1` is `#[non_exhaustive]`: a payload kind newer than
+        // this binary is opened but not described.
+        _ => println!("Payload: a kind this version of vta does not describe"),
+    }
+    Ok(())
+}
+
+/// End-to-end verify a TemplateBootstrap bundle against a pinned VTA DID.
+///
+/// Two checks, both fail-closed:
+///
+/// 1. **VC verification** — the `VtaAuthorizationCredential` inside the
+///    payload is verified against the pinned VTA DID: bundle
+///    `vta_trust.vta_did == pinned == claim.admin_of.vta`, issuer
+///    pubkey extracted from the bundled DID doc's
+///    `verificationMethod[]`, Data Integrity proof verified, validity
+///    window fresh.
+/// 2. **Producer assertion verification** — when the chunk-0 producer
+///    assertion is `DidSigned`, we confirm the signature was produced
+///    by the key bound to `{vta_did}#key-0` in the bundled DID doc.
+///    This defends against bundle re-sealing (an attacker with the
+///    recipient's pubkey can HPKE-seal arbitrary content; the
+///    DidSigned layer over `client_x25519_pub || bundle_id` proves the
+///    VTA was the sealer). `PinnedOnly` short-circuits (caller is
+///    trusting OOB digest by design); `Attested` defers to the
+///    `attest-verify` feature path.
+///
+/// Both verifications use the same issuer pubkey derived from the
+/// verified trust bundle, so they share cryptographic grounding.
+fn verify_template_bundle(
+    opened: &vta_cli_common::sealed_consumer::OpenedArmored,
+    payload: &vta_sdk::sealed_transfer::TemplateBootstrapPayload,
+    pinned_vta_did: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use vta_sdk::provision_integration::template_verify::verify_template_bootstrap;
+    use vta_sdk::sealed_transfer::AssertionProof;
+    use vta_sdk::sealed_transfer::verify::{
+        VerifiedAssertion, verify_producer_assertion_with_pubkey,
+    };
+
+    // VC + claim verification against pinned DID. Runs first so the
+    // trust anchor is established before we authenticate the producer
+    // assertion with a key extracted from the same doc.
+    let _verified = verify_template_bootstrap(
+        payload.clone(),
+        pinned_vta_did,
+        chrono::Duration::minutes(5),
+    )?;
+
+    // Producer assertion verification. Extract the producer's Ed25519
+    // pubkey from its did:key form (VTA default; for did:webvh
+    // producers a resolver-threading follow-up is tracked).
+    let producer_pubkey = if let AssertionProof::DidSigned(_) = opened.producer.proof {
+        match affinidi_crypto::did_key::did_key_to_ed25519_pub(&opened.producer.producer_did) {
+            Ok(pk) => Some(pk),
+            Err(e) => {
+                return Err(format!(
+                    "cannot decode producer DID '{}' as did:key for assertion verification: {e}. \
+                     did:webvh producers need resolver threading (follow-up).",
+                    opened.producer.producer_did
+                )
+                .into());
+            }
+        }
+    } else {
+        None
+    };
+
+    let verdict = verify_producer_assertion_with_pubkey(
+        &opened.producer,
+        &opened.client_x25519_pub,
+        &opened.bundle_id,
+        producer_pubkey.as_ref(),
+    )?;
+
+    // Exhaustively match so that a future variant addition forces this
+    // code site to make an explicit decision rather than silently
+    // accept the bundle.
+    match verdict {
+        VerifiedAssertion::DidSignedVerified(_) => {
+            // Signature check succeeded — producer is cryptographically bound.
+        }
+        VerifiedAssertion::PinnedOnlyAcknowledged(_) => {
+            // The digest-pinning check in `vta_cli_common::sealed_consumer::open_bundle`
+            // is the sole integrity anchor for this variant. `--expect-digest` is
+            // required by default at the CLI surface; if the caller opted out, they
+            // accept the trust tradeoff.
+        }
+        VerifiedAssertion::AttestedNeedsNitroCheck(_) => {
+            // `vta bootstrap provision-integration` does not currently accept
+            // Attested producer assertions from the offline CLI. Refuse rather
+            // than silently treat this as verified.
+            return Err(
+                "Attested producer assertion is not supported in the offline provision \
+                 path — use the TEE Mode B bootstrap (`pnm bootstrap connect`) for \
+                 attested-quote flows."
+                    .into(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+use vta_sdk::hex::lower as hex_lower;
+
+/// `vta bootstrap provision-integration` — offline provisioning from
+/// the VTA host.
+///
+/// Reads the consumer's VP-framed `BootstrapRequest` JSON, verifies the
+/// proof + freshness, calls the shared
+/// [`crate::operations::provision_integration`] library fn, and writes
+/// the resulting armored sealed bundle.
+///
+/// Produces all persistent state atomically (integration DID + log,
+/// minted keys, admin ACL row) as part of the library-fn execution; the
+/// returned bundle is derived from that state.
+#[cfg(feature = "webvh")]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_provision_integration(
+    config_path: Option<PathBuf>,
+    request_path: PathBuf,
+    context: Option<String>,
+    create_context: bool,
+    assertion: AssertionModeFlag,
+    vc_validity_hours: Option<f64>,
+    out_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::AuthClaims;
+    use crate::operations::provision_integration::{
+        AssertionMode, ProvisionIntegrationParams, provision_integration,
+    };
+    use crate::server::build_app_state;
+    use tokio::sync::watch;
+    use vta_sdk::provision_integration::BootstrapRequest;
+
+    // 1. Parse + verify the request file (VP shape).
+    //
+    // Verify over the JSON **exactly as it arrived in the file**, never a
+    // re-serialisation of the typed struct: the holder's proof covers the
+    // bytes it signed, and this crate's serde output need not reproduce
+    // them. `ask.type` is the live example — a holder on vta-sdk < 0.21.11
+    // signed the 0.1 `TemplateBootstrap` tag, which `verify()` would
+    // re-emit as 0.2's `templateBootstrap` and then fail to verify against
+    // its own signature. `verify_value` is what the DIDComm and Trust-Task
+    // handlers already use, and what its own docs require of any surface
+    // receiving a request from elsewhere.
+    let request_json = std::fs::read_to_string(&request_path)
+        .map_err(|e| format!("read {}: {e}", request_path.display()))?;
+    let request_value: serde_json::Value = serde_json::from_str(&request_json)
+        .map_err(|e| format!("parse BootstrapRequest (VP): {e}"))?;
+    let verified = BootstrapRequest::verify_value(request_value)
+        .map_err(|e| format!("verify BootstrapRequest: {e}"))?;
+
+    // 2. Resolve target context: explicit --context overrides the
+    //    request's contextHint; otherwise take the hint; otherwise fail.
+    let target_context = resolve_target_context(&verified, context)?;
+
+    // 3. Build AppState from the VTA config the same way `vta` itself
+    //    does. Storage-encryption key + TEE context are None here —
+    //    offline CLI use, no enclave involvement — and the restart
+    //    channel is a fresh local pair the CLI never signals on.
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let enc_key = cs.enc_key();
+    let seed_store = crate::keys::seed_store::create_seed_store(&app_config)
+        .map_err(|e| format!("create seed store: {e}"))?;
+    let (restart_tx, _restart_rx) = watch::channel(false);
+    let state = build_app_state(
+        app_config,
+        &cs,
+        seed_store.into(),
+        enc_key,
+        None,
+        restart_tx,
+        crate::server::AppStateParts::default(),
+    )
+    .await
+    .map_err(|e| format!("build app state: {e}"))?;
+
+    // 4. Synthesize a super-admin AuthClaims. The operator running
+    //    `vta bootstrap provision-integration` on the VTA host has root
+    //    access to the keyspace; there is no over-the-wire authn to
+    //    delegate through. Production-grade gating happens on the HTTP
+    //    endpoint which extracts a real session-backed claim.
+    let auth = AuthClaims::unsafe_local_cli_super_admin("provision-integration");
+
+    // 4a. Validate the target context exists, or create it inline when
+    //     the operator opted in via --create-context. Same helper
+    //     drives the REST + DIDComm transport handlers — the
+    //     super-admin gate inside `operations::contexts::
+    //     create_context` is the authoritative auth check.
+    let context_created =
+        crate::operations::provision_integration::ensure_target_context_or_create(
+            &state.contexts_ks,
+            &state.acl_ks,
+            &auth,
+            &target_context,
+            create_context,
+        )
+        .await
+        .map_err(|e| format!("ensure context '{target_context}': {e}"))?;
+    if context_created {
+        eprintln!("Created context '{target_context}' (--create-context).");
+    }
+
+    // 5. Call the shared library fn.
+    let vc_validity = vc_validity_hours.map(|hrs| {
+        // chrono::Duration::seconds takes i64; hours * 3600 fits for any
+        // reasonable operator input.
+        chrono::Duration::seconds((hrs * 3600.0) as i64)
+    });
+    let assertion_mode = match assertion {
+        AssertionModeFlag::DidSigned => AssertionMode::DidSigned,
+        AssertionModeFlag::PinnedOnly => AssertionMode::PinnedOnly,
+    };
+
+    let deps = crate::operations::provision_integration::ProvisionIntegrationDeps::from(&state);
+    let output = provision_integration(
+        &deps,
+        &auth,
+        ProvisionIntegrationParams {
+            request: verified,
+            context: target_context,
+            // The offline path provisions an integration into a context the
+            // operator named on the command line, which is the context-scoped
+            // shape. An unrestricted admin is an online ask — it has to be
+            // conferred by a super-admin, and this path runs with the
+            // synthesized local authority instead of one.
+            admin_scope: AdminScope::Context,
+            assertion_mode,
+            vc_validity,
+        },
+    )
+    .await
+    .map_err(|e| format!("provision-integration: {e}"))?;
+    // Its holder collects for the integration's DID, never this VTA
+    // (VTI-NTF-080 item 2).
+    if let Some(did) = output.summary.integration_did.as_deref() {
+        crate::operations::collection::mark_provisioned(&state.collection_ks, did)
+            .await
+            .map_err(|e| format!("record the integration as provisioned: {e}"))?;
+    }
+
+    // 6. Persist nonce-store writes + any other fjall flushes. The
+    //    shared fn already committed its rows via the keyspaces; this
+    //    call just forces any buffered-writes to disk before the CLI
+    //    exits.
+    cs.persist().await?;
+
+    // 7. Write the armored bundle.
+    std::fs::write(&out_path, output.armored.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+
+    // 8. Print the operator summary.
+    eprintln!(
+        "Integration provisioned — sealed bundle written to {}",
+        out_path.display()
+    );
+    eprintln!();
+    eprintln!("  Bundle-Id:       {}", output.summary.bundle_id_hex);
+    eprintln!("  Client DID:      {}", output.summary.client_did);
+    if output.summary.admin_rolled_over {
+        eprintln!(
+            "  Admin DID:       {} (VTA-minted, rolled over from client)",
+            output.summary.admin_did
+        );
+        if let Some(ref admin_tpl) = output.summary.admin_template_name {
+            eprintln!("  Admin template:  {admin_tpl}");
+        }
+    } else {
+        eprintln!(
+            "  Admin DID:       {} (== client)",
+            output.summary.admin_did
+        );
+    }
+    if let Some(ref integration_did) = output.summary.integration_did {
+        eprintln!("  Integration DID: {integration_did}");
+    } else {
+        eprintln!("  Integration DID: (none — admin-rotation only)");
+    }
+    if let (Some(name), Some(kind)) = (
+        output.summary.template_name.as_deref(),
+        output.summary.template_kind.as_deref(),
+    ) {
+        eprintln!("  Template:        {name} ({kind})");
+    }
+    eprintln!("  Secrets:         {}", output.summary.secret_count);
+    eprintln!("  Outputs:         {}", output.summary.output_count);
+    eprintln!("  SHA-256 digest:  {}", output.digest);
+    eprintln!();
+    eprintln!(
+        "Communicate the digest to the integration's operator out-of-band so they can\n  \
+         verify the bundle on first boot:\n  \
+         pnm bootstrap open --bundle <file> --expect-digest {}",
+        output.digest
+    );
+
+    Ok(())
+}
+
+/// Resolve which context the operator wants to provision into.
+///
+/// Rules:
+/// - If `--context` was passed, it must either match the request's
+///   `contextHint` or the request must have no hint.
+/// - If `--context` was omitted, the request's hint is authoritative.
+/// - If neither is present, fail with a clear error.
+///
+/// Silent normalization hides operator bugs — the brief is explicit on
+/// this. Mismatches are rejected, not reconciled.
+#[cfg(feature = "webvh")]
+fn resolve_target_context(
+    request: &vta_sdk::provision_integration::VerifiedBootstrapRequest,
+    explicit: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use vta_sdk::provision_integration::BootstrapAsk;
+    let hint = match request.ask() {
+        BootstrapAsk::TemplateBootstrap(ask) => ask.context_hint.clone(),
+        BootstrapAsk::AdminRotation(ask) => ask.context_hint.clone(),
+    };
+    match (explicit, hint) {
+        (Some(explicit), Some(hint)) if explicit != hint => Err(format!(
+            "--context '{explicit}' does not match request contextHint '{hint}' — \
+             operator and integration must agree on the context before provisioning"
+        )
+        .into()),
+        (Some(explicit), _) => Ok(explicit),
+        (None, Some(hint)) => Ok(hint),
+        (None, None) => Err(
+            "no context specified — pass --context <id> or have the integration's \
+             BootstrapRequest include a contextHint"
+                .into(),
+        ),
+    }
+}
+
+/// CLI-friendly enum for `--assertion` flag values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AssertionModeFlag {
+    #[default]
+    DidSigned,
+    PinnedOnly,
+}
+
+impl std::str::FromStr for AssertionModeFlag {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "did-signed" | "didsigned" | "did_signed" => Ok(Self::DidSigned),
+            "pinned-only" | "pinnedonly" | "pinned_only" | "pinned" => Ok(Self::PinnedOnly),
+            other => Err(format!(
+                "invalid --assertion value '{other}' — use 'did-signed' or 'pinned-only'"
+            )),
+        }
+    }
+}
+
+/// `vta keys bundle` — offline equivalent of `pnm keys bundle`.
+///
+/// Reads the local VTA store directly (no HTTP, no running service),
+/// builds a [`vta_sdk::did_secrets::DidSecretsBundle`] for the named
+/// context, and seals it to the consumer's BootstrapRequest. Shared
+/// emit surface with the PNM version so bundle shape + armored output
+/// + banner are byte-identical.
+pub async fn run_keys_bundle(
+    config_path: Option<PathBuf>,
+    context: String,
+    recipient: Option<PathBuf>,
+    recipient_did: Option<String>,
+    recipient_nonce: Option<String>,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::AuthClaims;
+    use crate::operations::export::{ExportDeps, build_did_secrets_bundle};
+    use crate::server::build_app_state;
+    use tokio::sync::watch;
+
+    let recipient = vta_cli_common::sealed_producer::resolve_recipient(
+        recipient.as_deref(),
+        recipient_did.as_deref(),
+        recipient_nonce.as_deref(),
+    )?;
+
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let enc_key = cs.enc_key();
+    let seed_store = crate::keys::seed_store::create_seed_store(&app_config)
+        .map_err(|e| format!("create seed store: {e}"))?;
+    let (restart_tx, _restart_rx) = watch::channel(false);
+    let state = build_app_state(
+        app_config,
+        &cs,
+        seed_store.into(),
+        enc_key,
+        None,
+        restart_tx,
+        crate::server::AppStateParts::default(),
+    )
+    .await
+    .map_err(|e| format!("build app state: {e}"))?;
+
+    let auth = AuthClaims::unsafe_local_cli_super_admin("keys-bundle");
+
+    let deps = ExportDeps {
+        keys_ks: &state.keys_ks,
+        contexts_ks: &state.contexts_ks,
+        imported_ks: &state.imported_ks,
+        audit: &state.audit_sink,
+        acl_ks: &state.acl_ks,
+        #[cfg(feature = "webvh")]
+        webvh_ks: &state.webvh_ks,
+        webs_ks: &state.webs_ks,
+        seed_store: &state.seed_store,
+    };
+    let bundle = build_did_secrets_bundle(
+        &deps,
+        &auth,
+        &context,
+        crate::operations::keys::ExportChannel::Local("vta-keys-bundle"),
+    )
+    .await?;
+
+    vta_cli_common::sealed_producer::emit_did_secrets_bundle(
+        bundle,
+        &recipient,
+        &context,
+        out.as_deref(),
+    )
+    .await
+}
+
+// The `to_context_response` adapter that used to sit here is gone (#1035).
+//
+// It copied a `CreateContextResultBody` field-by-field into the client's
+// separate `ContextResponse`, and its comment said the two were "identical on
+// the wire". They were not: the client struct had no `parent`, so this silently
+// dropped it and `vta contexts create --parent x` rendered the new context with
+// no parent shown. Both are now one type, so the render helpers take the record
+// directly and the member cannot go missing.
+
+/// `vta contexts create` — offline equivalent of `POST /contexts`
+/// (and `pnm contexts create`).
+///
+/// Allocates the next BIP-32 context index and writes the context
+/// record directly to the local keystore. When `--admin-did` is set,
+/// also writes an admin ACL entry scoped to the new context, mirroring
+/// the online `pnm contexts create --admin-did` shorthand.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_context_create(
+    config_path: Option<PathBuf>,
+    id: String,
+    name: Option<String>,
+    description: Option<String>,
+    parent: Option<String>,
+    admin_did: Option<String>,
+    admin_label: Option<String>,
+    admin_expires: Option<String>,
+    admin_handoff: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::AuthClaims;
+    use vta_cli_common::commands::contexts::render_context_record;
+
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config).await?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+    let acl_ks = cs.keyspace(crate::keyspaces::ACL)?;
+
+    let auth = AuthClaims::unsafe_local_cli_super_admin("context-create");
+    let display_name = name.unwrap_or_else(|| id.clone());
+
+    // Everything the admin grant needs is checked before anything is written,
+    // so a bad flag refuses the command rather than leaving a context created
+    // and the grant half done.
+    if let Some(did) = &admin_did
+        && !did.starts_with("did:")
+    {
+        return Err(format!("--admin-did must start with `did:` (got {did:?})").into());
+    }
+    let admin_expires_at = match admin_expires.as_deref() {
+        Some(raw) => Some(vta_cli_common::duration::duration_to_expires_at(raw)?),
+        None => None,
+    };
+    if admin_handoff && admin_expires_at.is_none() {
+        return Err("--admin-handoff requires --admin-expires (VTI-ACL-054)".into());
+    }
+
+    let record = crate::operations::contexts::create_context(
+        &contexts_ks,
+        &acl_ks,
+        &auth,
+        &id,
+        display_name,
+        description,
+        parent,
+        "vta-context-create",
+    )
+    .await?;
+    // The context's derivation index stays allocated if this is undone: an
+    // index is never handed out twice.
+    cs.audit_or_undo("context.create", &record.id, Some(&record.id), || {
+        crate::contexts::delete_context(&contexts_ks, &record.id)
+    })
+    .await?;
+
+    // Optionally grant admin access to the supplied DID, scoped to the
+    // new context. Mirrors `pnm contexts create --admin-did ...` so the
+    // offline path can also do "create context + grant first admin" in
+    // one shot.
+    if let Some(did) = admin_did {
+        let entry = crate::acl::AclEntry::new(
+            did.clone(),
+            crate::acl::Role::Admin,
+            format!("vta-context-create:{}", auth.did),
+        )
+        .with_label(admin_label)
+        // Scope to the full path the operation assigned (`<parent>/<id>` nested).
+        .with_contexts(vec![record.id.clone()])
+        .with_expires_at(admin_expires_at);
+        // The granter here is the local operator acting as super-admin, so
+        // the bound is unrestricted and permanent (VTI-ACL-054).
+        let entry = if admin_handoff {
+            entry.with_handoff(Some(crate::acl::HandOff {
+                granted_by: auth.did.clone(),
+                granted_at: crate::auth::session::now_epoch(),
+                bound: crate::acl::HandOffBound {
+                    role: crate::acl::Role::Admin,
+                    allowed_contexts: Vec::new(),
+                    capabilities: Vec::new(),
+                    approve_scope: crate::acl::ApproveScope::None,
+                    allowed_keys: None,
+                    expires_at: None,
+                },
+            }))
+        } else {
+            entry
+        };
+        crate::acl::store_acl_entry(&acl_ks, &entry).await?;
+        cs.audit_or_undo("acl.create", &did, Some(&record.id), || {
+            crate::acl::delete_acl_entry(&acl_ks, &did)
+        })
+        .await?;
+        eprintln!(
+            "Admin ACL entry created for {did} (context: {}).",
+            record.id
+        );
+    }
+    cs.persist().await?;
+
+    println!("Context created:");
+    render_context_record(&record);
+    Ok(())
+}
+
+/// `vta contexts list` — offline equivalent of `GET /contexts`
+/// (and `pnm contexts list`).
+pub async fn run_context_list(
+    config_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::AuthClaims;
+    use vta_cli_common::commands::contexts::render_context_list;
+
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config).await?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+
+    let auth = AuthClaims::unsafe_local_cli_super_admin("context-list");
+    let resp = crate::operations::contexts::list_contexts(&contexts_ks, &auth, "vta-contexts-list")
+        .await?;
+
+    let contexts = resp.contexts;
+    render_context_list(&contexts);
+    Ok(())
+}
+
+/// `vta contexts get` — offline equivalent of `GET /contexts/{id}`
+/// (and `pnm contexts get`).
+pub async fn run_context_get(
+    config_path: Option<PathBuf>,
+    id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::AuthClaims;
+    use vta_cli_common::commands::contexts::render_context_record;
+
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config).await?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+
+    let auth = AuthClaims::unsafe_local_cli_super_admin("context-get");
+    let record =
+        crate::operations::contexts::get_context_op(&contexts_ks, &auth, &id, "vta-contexts-get")
+            .await?;
+
+    render_context_record(&record);
+    Ok(())
+}
+
+/// `vta contexts update` — offline equivalent of `PUT /contexts/{id}`
+/// (and `pnm contexts update`).
+pub async fn run_context_update(
+    config_path: Option<PathBuf>,
+    id: String,
+    name: Option<String>,
+    did: Option<String>,
+    clear_did: bool,
+    description: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::AuthClaims;
+    use crate::operations::contexts::UpdateContextParams;
+    use vta_cli_common::commands::contexts::render_context_record;
+
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config).await?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+
+    let auth = AuthClaims::unsafe_local_cli_super_admin("context-update");
+    let params = UpdateContextParams {
+        name,
+        did,
+        description,
+        context_policy: None,
+    };
+    let mut record = crate::operations::contexts::update_context(
+        &contexts_ks,
+        &auth,
+        &id,
+        params,
+        "vta-contexts-update",
+    )
+    .await?;
+    // `update_context` only ever sets a DID; clearing is update-did's job, as
+    // it is for `pnm contexts update --clear-did`.
+    if clear_did {
+        record = crate::operations::contexts::update_context_did(
+            &contexts_ks,
+            &cs.keyspace(crate::keyspaces::KEYS)?,
+            &cs.keyspace(crate::keyspaces::ACL)?,
+            &auth,
+            &id,
+            None,
+            "vta-contexts-update",
+        )
+        .await?;
+    }
+
+    cs.persist().await?;
+    println!("Context updated:");
+    render_context_record(&record);
+    Ok(())
+}
+
+/// `vta contexts delete` — offline equivalent of `DELETE /contexts/{id}`
+/// (and `pnm contexts delete`).
+pub async fn run_context_delete(
+    config_path: Option<PathBuf>,
+    id: String,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::AuthClaims;
+    use crate::operations::Keyspaces;
+    use vta_cli_common::commands::contexts::{confirm_destructive, render_delete_context_preview};
+    use vta_cli_common::display::{NameBook, NameSource};
+
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config).await?;
+    let contexts_ks = cs.keyspace(crate::keyspaces::CONTEXTS)?;
+    let keys_ks = cs.keyspace(crate::keyspaces::KEYS)?;
+    let acl_ks = cs.keyspace(crate::keyspaces::ACL)?;
+    let did_templates_ks = cs.keyspace(crate::keyspaces::DID_TEMPLATES)?;
+    // Keyspace, not sink: this path hands the bundle to `Keyspaces`, which
+    // carries the audit keyspace so backup export can dump it.
+    let audit_ks = cs.keyspace(crate::keyspaces::AUDIT)?;
+    let imported_ks = cs.keyspace(crate::keyspaces::IMPORTED_SECRETS)?;
+    let memory_ks = cs.keyspace(crate::keyspaces::MEMORY)?;
+    let app_state_ks = cs.keyspace(crate::keyspaces::APP_STATE)?;
+    let internal_ks = cs.keyspace(crate::keyspaces::INTERNAL_KEYS)?;
+    let vault_ks = cs.keyspace(crate::keyspaces::VAULT)?;
+    let consent_ks = cs.keyspace(crate::keyspaces::CONSENT)?;
+    let consent_approvers_ks = cs.keyspace(crate::keyspaces::CONSENT_APPROVERS)?;
+    let persona_ks = cs.keyspace(crate::keyspaces::PERSONA)?;
+    let pcs_engine_ks = cs.keyspace(crate::keyspaces::PCS_ENGINE)?;
+    let notifications_ks = cs.keyspace(crate::keyspaces::NOTIFICATIONS)?;
+    let external_accounts_ks = cs.keyspace(crate::keyspaces::EXTERNAL_ACCOUNTS)?;
+    let external_secrets_ks = cs.keyspace(crate::keyspaces::EXTERNAL_SECRETS)?;
+    let collection_ks = cs.keyspace(crate::keyspaces::COLLECTION)?;
+    #[cfg(feature = "webvh")]
+    let webvh_ks = cs.keyspace(crate::keyspaces::WEBVH)?;
+    let webs_ks = cs.keyspace(crate::keyspaces::WEBS)?;
+
+    let auth = AuthClaims::unsafe_local_cli_super_admin("context-delete");
+
+    let preview = crate::operations::contexts::preview_delete_context(
+        &contexts_ks,
+        &keys_ks,
+        &acl_ks,
+        &did_templates_ks,
+        #[cfg(feature = "webvh")]
+        &webvh_ks,
+        &webs_ks,
+        &auth,
+        &id,
+        "vta-contexts-delete",
+    )
+    .await?;
+
+    // Name the DIDs in the confirmation prompt from the local ACL rows. The
+    // offline path is exactly as destructive as the online one, so it gets
+    // the same help deciding. Best-effort — a read failure degrades to bare
+    // DIDs rather than blocking the delete.
+    let mut book = NameBook::new();
+    if let Ok(entries) = vti_common::acl::list_acl_entries(&acl_ks).await {
+        for entry in &entries {
+            book.insert_opt(&entry.did, entry.label.as_deref(), NameSource::AclLabel);
+        }
+    }
+
+    let has_resources = render_delete_context_preview(&id, &preview, &book);
+    if has_resources && !force && !confirm_destructive("Proceed with deletion?")? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    let ks = Keyspaces {
+        contexts: &contexts_ks,
+        keys: &keys_ks,
+        acl: &acl_ks,
+        did_templates: &did_templates_ks,
+        audit: &audit_ks,
+        imported: &imported_ks,
+        memory: &memory_ks,
+        app_state: &app_state_ks,
+        internal: &internal_ks,
+        vault: &vault_ks,
+        consent: &consent_ks,
+        consent_approvers: &consent_approvers_ks,
+        persona: &persona_ks,
+        pcs_engine: &pcs_engine_ks,
+        notifications: &notifications_ks,
+        external_accounts: &external_accounts_ks,
+        external_secrets: &external_secrets_ks,
+        collection: &collection_ks,
+        #[cfg(feature = "webvh")]
+        webvh: &webvh_ks,
+        webs: &webs_ks,
+    };
+
+    // Assigned by whichever arm below compiles, so neither build carries a
+    // dead initialiser (CI runs clippy with `-D warnings`).
+    let orphans: Vec<String>;
+
+    // The offline delete takes the subtree's DIDs off their hosting servers
+    // exactly as the online one does. An operator reaching for the break-glass
+    // CLI is the last person who should be left with DIDs that still resolve
+    // for a context that no longer exists — the same reasoning, in the same
+    // words, as the offline `webvh_cli` delete.
+    #[cfg(feature = "webvh")]
+    {
+        use std::sync::Arc;
+
+        let sessions_ks = cs.keyspace(crate::keyspaces::SESSIONS)?;
+        let issued_credentials_ks = cs.keyspace(crate::keyspaces::ISSUED_CREDENTIALS)?;
+        let audit_sink: vta_audit::SharedAuditSink =
+            vta_audit::shared_keyspace_sink(audit_ks.clone());
+        let seed_store: Arc<dyn crate::keys::seed_store::SeedStore> =
+            Arc::from(crate::keys::seed_store::create_seed_store(&app_config)?);
+        let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await?;
+        let no_bridge: Arc<crate::didcomm_bridge::DIDCommBridge> =
+            Arc::new(crate::didcomm_bridge::DIDCommBridge::placeholder());
+        let deps = crate::operations::did_webvh::WebvhDeps {
+            delete_cascade: Some(crate::operations::did_webvh::DeleteCascadeDeps {
+                acl_ks: &acl_ks,
+                sessions_ks: &sessions_ks,
+                issued_credentials_ks: &issued_credentials_ks,
+            }),
+            keys_ks: &keys_ks,
+            imported_ks: &imported_ks,
+            contexts_ks: &contexts_ks,
+            webvh_ks: &webvh_ks,
+            webs_ks: Some(&webs_ks),
+            audit: &audit_sink,
+            seed_store: &*seed_store,
+            did_resolver: &did_resolver,
+            didcomm_bridge: &no_bridge,
+            // Offline: no mediator session at all, so the seam is left with
+            // REST. Same as `webvh_cli`.
+            #[cfg(feature = "tsp")]
+            tsp: None,
+        };
+        let cleanup = crate::operations::contexts::ContextDidCleanup {
+            deps: &deps,
+            vta_did: app_config.vta_did.as_deref(),
+            // The break-glass path keeps the 1.0 contract it always had, and
+            // prints every orphan below.
+            host_copies: crate::operations::contexts::HostCopies::ReportAfter,
+            // Offline: no hosting client, so a did:webs in the subtree is an
+            // unconfirmed host copy, reported rather than dropped unseen.
+            #[cfg(feature = "webs")]
+            webs: None,
+        };
+        let result = crate::operations::contexts::delete_context(
+            &ks,
+            &auth,
+            &id,
+            true,
+            "vta-contexts-delete",
+            Some(&cleanup),
+        )
+        .await?;
+        orphans = result.daemon_cleanup_errors;
+    }
+    #[cfg(not(feature = "webvh"))]
+    {
+        crate::operations::contexts::delete_context(&ks, &auth, &id, true, "vta-contexts-delete")
+            .await?;
+        // No webvh in this build, so no host copy could have been left behind.
+        orphans = Vec::new();
+    }
+
+    cs.persist().await?;
+    println!("Context deleted: {id}");
+    // The break-glass path reports the partial success the online one does.
+    // An operator who reached for the offline CLI is the least likely to have
+    // another channel telling them a DID is still being served.
+    if !orphans.is_empty() {
+        eprintln!(
+            "\nwarning: {} DID(s) may still resolve — their hosting server did not confirm \
+             removal of the published log. Clean these up out-of-band:",
+            orphans.len()
+        );
+        for line in &orphans {
+            eprintln!("  - {line}");
+        }
+    }
+    Ok(())
+}
+
+/// `vta context reprovision` — offline equivalent of
+/// `pnm contexts reprovision`.
+///
+/// The DID's operational keys (signing, KA, any pre-rotation) are
+/// auto-included — the operator does not need to enumerate them.
+/// `--admin-key` picks which existing keystore entry's seed backs the
+/// **admin credential** (a separate `did:key` identity the mediator
+/// operator uses to authenticate to the VTA afterwards). When omitted,
+/// a fresh Ed25519 admin key is minted in the context and the derived
+/// `did:key` is granted admin access automatically.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_context_reprovision(
+    config_path: Option<PathBuf>,
+    id: String,
+    admin_key: Option<String>,
+    admin_label: Option<String>,
+    recipient: Option<PathBuf>,
+    recipient_did: Option<String>,
+    recipient_nonce: Option<String>,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::acl::Role;
+    use crate::auth::AuthClaims;
+    use crate::keys::KeyType;
+    use crate::operations::export::{
+        ContextReprovisionInputs, ExportDeps, build_context_provision_bundle,
+    };
+    use crate::operations::keys::{CreateKeyParams, create_key};
+    use crate::server::build_app_state;
+    use tokio::sync::watch;
+
+    let recipient = vta_cli_common::sealed_producer::resolve_recipient(
+        recipient.as_deref(),
+        recipient_did.as_deref(),
+        recipient_nonce.as_deref(),
+    )?;
+
+    let app_config = AppConfig::load(config_path)?;
+    let cs = CliStore::open(&app_config)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let enc_key = cs.enc_key();
+    let vta_did = app_config
+        .vta_did
+        .clone()
+        .ok_or("VTA DID not configured — run `vta setup` or set vta_did in config")?;
+    let vta_url = app_config.public_url.clone();
+    let seed_store = crate::keys::seed_store::create_seed_store(&app_config)
+        .map_err(|e| format!("create seed store: {e}"))?;
+    let (restart_tx, _restart_rx) = watch::channel(false);
+    let state = build_app_state(
+        app_config,
+        &cs,
+        seed_store.into(),
+        enc_key,
+        None,
+        restart_tx,
+        crate::server::AppStateParts::default(),
+    )
+    .await
+    .map_err(|e| format!("build app state: {e}"))?;
+
+    let auth = AuthClaims::unsafe_local_cli_super_admin("context-reprovision");
+
+    // Resolve the admin key: reuse an existing keystore entry when
+    // `--admin-key` was passed, otherwise mint a fresh one scoped to
+    // this context. The derived `did:key` gets an ACL row written
+    // further down if one doesn't already exist.
+    let key_id = match admin_key {
+        Some(kid) => kid,
+        None => {
+            let label = admin_label
+                .clone()
+                .unwrap_or_else(|| "admin-reprovision".to_string());
+            let result = create_key(
+                &state.keys_ks,
+                &state.internal_ks,
+                &state.contexts_ks,
+                &state.seed_store,
+                &state.audit_sink,
+                &state.acl_ks,
+                &auth,
+                CreateKeyParams {
+                    internal: false,
+                    key_type: KeyType::Ed25519,
+                    derivation_path: None,
+                    key_id: None,
+                    mnemonic: None,
+                    label: Some(label),
+                    context_id: Some(id.clone()),
+                },
+                "vta-context-reprovision",
+            )
+            .await?;
+            eprintln!(
+                "Minted fresh admin key '{}' in context '{id}'",
+                result.key_id
+            );
+            result.key_id
+        }
+    };
+
+    let deps = ExportDeps {
+        keys_ks: &state.keys_ks,
+        contexts_ks: &state.contexts_ks,
+        imported_ks: &state.imported_ks,
+        audit: &state.audit_sink,
+        acl_ks: &state.acl_ks,
+        #[cfg(feature = "webvh")]
+        webvh_ks: &state.webvh_ks,
+        webs_ks: &state.webs_ks,
+        seed_store: &state.seed_store,
+    };
+
+    let bundle = build_context_provision_bundle(
+        &deps,
+        &auth,
+        ContextReprovisionInputs {
+            context_id: id.clone(),
+            key_id,
+        },
+        &vta_did,
+        vta_url.as_deref(),
+        "vta-context-reprovision",
+    )
+    .await?;
+
+    // Ensure the derived admin DID has an ACL entry for this context.
+    // Mirrors the online cmd_context_reprovision behaviour — if the
+    // consumer is a new admin, this is the write that makes their
+    // future REST auth succeed.
+    let admin_did = bundle.admin_did.clone();
+    let existing = crate::acl::get_acl_entry(&state.acl_ks, &admin_did).await?;
+    if existing.is_none() {
+        use crate::acl::AclEntry;
+        use chrono::Utc;
+        let entry = AclEntry::new(admin_did.clone(), Role::Admin, auth.did.clone())
+            .with_contexts(vec![id.clone()])
+            .with_created_at(Utc::now().timestamp() as u64);
+        crate::acl::store_acl_entry(&state.acl_ks, &entry).await?;
+        // The state's own sink, not the CLI store's: `create_key` above wrote
+        // through it, and a second chained sink would start from a stale head.
+        if let Err(audit) = vta_audit::record(
+            &state.audit_sink,
+            "acl.create",
+            crate::cli_store::BREAK_GLASS_ACTOR,
+            Some(&admin_did),
+            "success",
+            Some(crate::cli_store::BREAK_GLASS_CHANNEL),
+            Some(&id),
+        )
+        .await
+        {
+            crate::acl::delete_acl_entry(&state.acl_ks, &admin_did)
+                .await
+                .map_err(|undo| {
+                    format!(
+                        "acl.create on {admin_did}: its audit row could not be written ({audit}), \
+                         and undoing the write failed ({undo}). The change is in the store \
+                         without a row; inspect it before starting the VTA."
+                    )
+                })?;
+            cs.persist().await?;
+            return Err(format!(
+                "acl.create on {admin_did} was undone: its audit row could not be written \
+                 ({audit}). Nothing changed; no bundle was produced."
+            )
+            .into());
+        }
+        cs.persist().await?;
+        eprintln!("Created ACL entry for {admin_did} in context '{id}'");
+    }
+
+    vta_cli_common::sealed_producer::emit_context_provision_bundle(
+        bundle,
+        &recipient,
+        out.as_deref(),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_var;
+    use serde_json::Value;
+
+    #[cfg(feature = "webvh")]
+    use crate::auth::AuthClaims;
+    #[cfg(feature = "webvh")]
+    use crate::contexts::get_context;
+    #[cfg(feature = "webvh")]
+    use crate::operations::provision_integration::ensure_target_context_or_create;
+    #[cfg(feature = "webvh")]
+    use crate::store::Store;
+    #[cfg(feature = "webvh")]
+    use vti_common::config::StoreConfig;
+
+    /// Open a tempdir-backed `Store` and return the `contexts` keyspace
+    /// handle. The tempdir is held in the returned guard so it lives as
+    /// long as the test needs the store.
+    #[cfg(feature = "webvh")]
+    fn open_test_contexts_keyspace() -> (tempfile::TempDir, Store, crate::store::KeyspaceHandle) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .expect("open store");
+        let ks = store
+            .keyspace(crate::keyspaces::CONTEXTS)
+            .expect("contexts keyspace");
+        (dir, store, ks)
+    }
+
+    #[test]
+    fn parse_var_plain_string() {
+        let (k, v) = parse_var("URL=https://mediator.example.com").unwrap();
+        assert_eq!(k, "URL");
+        assert_eq!(v, Value::String("https://mediator.example.com".into()));
+    }
+
+    #[test]
+    fn parse_var_quoted_string_is_json() {
+        let (k, v) = parse_var(r#"LABEL="hello world""#).unwrap();
+        assert_eq!(k, "LABEL");
+        assert_eq!(v, Value::String("hello world".into()));
+    }
+
+    #[test]
+    fn parse_var_number_is_json() {
+        let (k, v) = parse_var("COUNT=42").unwrap();
+        assert_eq!(k, "COUNT");
+        assert_eq!(v, Value::Number(42.into()));
+    }
+
+    #[test]
+    fn parse_var_bool_is_json() {
+        let (_, v) = parse_var("ENABLED=true").unwrap();
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    #[test]
+    fn parse_var_array_is_json() {
+        let (_, v) = parse_var(r#"ROUTING_KEYS=["did:key:z1"]"#).unwrap();
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_var_value_may_contain_equals() {
+        // URLs with query strings include '=' — the first '=' is the
+        // delimiter, rest of the string is the value.
+        let (k, v) = parse_var("URL=https://m.example.com?x=1&y=2").unwrap();
+        assert_eq!(k, "URL");
+        assert_eq!(v, Value::String("https://m.example.com?x=1&y=2".into()));
+    }
+
+    #[test]
+    fn parse_var_missing_equals_errors() {
+        let err = parse_var("LONELY").unwrap_err();
+        assert!(err.to_string().contains("KEY=VALUE"));
+    }
+
+    #[test]
+    fn parse_var_empty_key_errors() {
+        let err = parse_var("=value").unwrap_err();
+        assert!(err.to_string().contains("empty key"));
+    }
+
+    /// Negative case for the operator UX fix: when the operator pastes a
+    /// generated `vta bootstrap provision-integration` command without
+    /// `--create-context` and the target context doesn't exist yet, the
+    /// CLI must fail with an error that names the missing flag (so the
+    /// fix is "obvious paste-and-go", not "search the docs"). Reproduces
+    /// the failure mode reported by an operator who ran a wizard-
+    /// generated command against a fresh VTA.
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn ensure_target_context_or_create_returns_actionable_error_when_missing() {
+        let (_dir, _store, contexts_ks) = open_test_contexts_keyspace();
+        let auth = AuthClaims::unsafe_local_cli_super_admin("test");
+
+        let err = ensure_target_context_or_create(
+            &contexts_ks,
+            &_store.keyspace(crate::keyspaces::ACL).unwrap(),
+            &auth,
+            "missing-ctx",
+            false,
+        )
+        .await
+        .expect_err("missing context with create_context=false must error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--create-context"),
+            "error must name --create-context flag, got: {msg}"
+        );
+        assert!(
+            msg.contains("missing-ctx"),
+            "error must name the missing context, got: {msg}"
+        );
+        // Belt-and-suspenders: the context is still absent — the helper
+        // must not have created anything as a side effect of the failure.
+        assert!(
+            get_context(&contexts_ks, "missing-ctx")
+                .await
+                .unwrap()
+                .is_none(),
+            "context must remain absent after the negative path"
+        );
+    }
+
+    /// Positive case for the same fix: when `--create-context` is set,
+    /// the helper creates the missing context inline and returns Ok.
+    /// The context exists in the keyspace afterwards, ready for the
+    /// downstream `provision_integration` library call.
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn ensure_target_context_or_create_creates_context_when_flag_set() {
+        let (_dir, _store, contexts_ks) = open_test_contexts_keyspace();
+        let auth = AuthClaims::unsafe_local_cli_super_admin("test");
+
+        ensure_target_context_or_create(
+            &contexts_ks,
+            &_store.keyspace(crate::keyspaces::ACL).unwrap(),
+            &auth,
+            "fresh-ctx",
+            true,
+        )
+        .await
+        .expect("create_context=true must succeed against a missing context");
+
+        let record = get_context(&contexts_ks, "fresh-ctx")
+            .await
+            .unwrap()
+            .expect("context must exist after create_context=true");
+        assert_eq!(record.id, "fresh-ctx");
+    }
+
+    /// Idempotence: when the context already exists, the helper is a
+    /// no-op regardless of the `create_context` flag — provisioning
+    /// proceeds normally.
+    #[cfg(feature = "webvh")]
+    #[tokio::test]
+    async fn ensure_target_context_or_create_is_idempotent_when_context_exists() {
+        let (_dir, _store, contexts_ks) = open_test_contexts_keyspace();
+        let auth = AuthClaims::unsafe_local_cli_super_admin("test");
+
+        crate::operations::contexts::create_context(
+            &contexts_ks,
+            &_store.keyspace(crate::keyspaces::ACL).unwrap(),
+            &auth,
+            "existing-ctx",
+            "existing-ctx".into(),
+            None,
+            None,
+            "test-setup",
+        )
+        .await
+        .expect("seed existing context");
+
+        // create_context=false should still succeed because the context
+        // is already there.
+        ensure_target_context_or_create(
+            &contexts_ks,
+            &_store.keyspace(crate::keyspaces::ACL).unwrap(),
+            &auth,
+            "existing-ctx",
+            false,
+        )
+        .await
+        .expect("existing context with create_context=false must be a no-op");
+
+        // create_context=true must also succeed — it doesn't try to
+        // re-create when the row is already present.
+        ensure_target_context_or_create(
+            &contexts_ks,
+            &_store.keyspace(crate::keyspaces::ACL).unwrap(),
+            &auth,
+            "existing-ctx",
+            true,
+        )
+        .await
+        .expect("existing context with create_context=true must be a no-op");
+    }
+}

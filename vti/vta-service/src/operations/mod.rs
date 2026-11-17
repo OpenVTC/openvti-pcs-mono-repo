@@ -1,0 +1,168 @@
+pub mod acl;
+pub mod acl_v0_3;
+/// Versioned, namespaced application state. Backs the
+/// `vta/app-state/{get,put,list,delete,get-many,put-many}/1.0` Trust Tasks.
+/// Records are keyed `app:<contextId>:<namespace>:<key>` in the
+/// [`APP_STATE`](crate::keyspaces::APP_STATE) keyspace, alongside an `appv:`
+/// version index and an `appc:` per-namespace write counter. Deliberately not
+/// [`memory`] — clearing an agent's memory must stay safe, which it cannot be
+/// if account state lives there.
+pub mod app_state;
+#[cfg(feature = "tee")]
+pub mod attestation;
+pub mod audit;
+/// Backup/restore export/import operations, extracted to the `vta-backup`
+/// crate and re-exported so every `crate::operations::backup::…` path is
+/// unchanged. The `AppState`-borrowing constructor stays here (see
+/// `descriptor_deps_from_app_state` below), and the deployment glue — how a
+/// restored seed is committed — in `crate::restore`.
+pub use vta_backup::ops as backup;
+/// Collection for the principal's identifiers (`vta/collection/*`,
+/// VTI-NTF-080 – 093): who holds each persona DID's mediator connection.
+pub mod collection;
+pub mod config;
+pub mod contexts;
+pub mod credential_exchange;
+pub mod credentials;
+pub mod device;
+pub mod did_peer;
+pub mod did_templates;
+/// `did:webs` persona, relationship and integration DIDs
+/// (`docs/05-design-notes/did-webs-in-the-vta.md`).
+#[cfg(feature = "webs")]
+pub mod did_webs;
+#[cfg(feature = "webvh")]
+pub mod did_webvh;
+/// Method-neutral DID questions: which identities, in which context, under
+/// one record (`docs/05-design-notes/did-management.md`).
+pub mod dids;
+/// Offline state-assembly helpers: read the VTA's local store and
+/// produce the same wire-shape bundles (`DidSecretsBundle`,
+/// `ContextProvisionBundle`) that the equivalent `VtaClient` flows
+/// build over REST. Used by the on-host `vta context reprovision` /
+/// `vta keys bundle` CLIs for cold-start environments where PNM can't
+/// reach the VTA over the network.
+pub mod export;
+/// ACL-gated holder-key resolution for credential presentation — derive the
+/// VTA-managed subject key (kb-jwt signer + consent secret), refusing keys
+/// outside the caller's authorised context.
+pub mod holder_keys;
+pub mod internal_authority;
+pub mod key_custody;
+pub mod keys;
+/// Per-context key/value store for AI-agent memory. Backs the
+/// `vta/memory/{put,list,delete}/0.1` Trust Tasks. Entries are keyed
+/// `mem:<contextId>:<key>` in the [`MEMORY`](crate::keyspaces::MEMORY) keyspace;
+/// `list` is a `mem:<contextId>:` prefix scan.
+pub mod memory;
+/// Runtime Policy Decision Point management (`policy/*`).
+/// The notifications this VTA holds for its principal (`notifications/*`,
+/// `vta/notifications/*`, VTI-NTF-022 – 053).
+pub mod notifications;
+pub mod outbound;
+/// Passkey login — DID-VM-resolved WebAuthn assertion verification.
+/// Drives `vta/auth/passkey-login-{start,finish}/1.0` trust-tasks.
+/// Distinct from [`passkey_vms`] which handles VM *enrolment*.
+pub mod passkey_login;
+/// Passkey-as-verificationMethod enrolment. Lets a browser wallet
+/// (`pnm-browser-plugin`) add a WebAuthn passkey as a Multikey VM
+/// (purpose `authentication`) on a VTA-managed webvh DID. See
+/// `docs/02-vta/passkey-verification-methods.md`.
+#[cfg(feature = "webvh")]
+pub mod passkey_vms;
+pub mod pcs;
+pub mod pcs_trustee;
+pub mod pcs_voter;
+/// Personas: the DIDs this agent holds for a person, and the key it signs with as each.
+pub mod persona;
+pub mod policy;
+/// DIDComm protocol management: enable/disable/migrate operations that
+/// patch the VTA's own DID document service array. See
+/// `docs/05-design-notes/didcomm-protocol-management.md`.
+#[cfg(feature = "webvh")]
+pub mod protocol;
+/// Generic template-driven integration bootstrap. See
+/// `docs/02-vta/provision-integration.md`. Feature-gated on `webvh`
+/// because the phase-1 implementation delegates minting to
+/// `create_did_webvh`.
+#[cfg(feature = "webvh")]
+pub mod provision_integration;
+pub mod room_act;
+pub mod room_anchor;
+pub mod room_groups;
+pub mod room_host;
+pub mod room_invitation;
+pub mod room_issuance;
+/// The watches this VTA holds for its principal's clients (`rooms/keys/watch/0.1`): the
+/// minimal record, the bounds, and the per-watch addresses.
+pub mod room_key_watch;
+pub mod room_member;
+pub mod room_oracle;
+/// A room's own profile (`rooms/keys/profile/{read,write}`): the statement a member holding
+/// `curate` or `admin` signs, and every check a reader applies before showing one.
+pub mod room_profile;
+pub mod room_revocation;
+pub mod seeds;
+#[cfg(test)]
+mod sign_characterization_tests;
+/// The byte strings `keys/sign-jws` and `keys/sign-csr` sign: a JWS signing
+/// input and a PKCS#10 `CertificationRequestInfo`, built here and nowhere else.
+pub mod sign_formats;
+pub mod step_up_approval;
+/// The guess limit behind a `vtaPin` user-verification key.
+pub mod uv_pin;
+pub mod vault;
+/// The VTA as its principal's witnessed party (`vta/witness/*`): it builds and signs every
+/// document of a `witness/session` as the relationship DID, and the client carries them.
+pub mod witness;
+
+/// Shared keyspace handles passed to operations that need multiple keyspaces.
+/// The struct itself lives in `vta-keyspaces` (a pure field bundle with no
+/// `vta-service` dependency); the `AppState` / `VtaState` constructors stay
+/// here as free functions because they know those concrete state types.
+pub use vta_keyspaces::Keyspaces;
+
+/// Borrow keyspaces from an `AppState`.
+pub fn keyspaces_from_app_state(s: &crate::server::AppState) -> Keyspaces<'_> {
+    Keyspaces {
+        keys: &s.keys_ks,
+        acl: &s.acl_ks,
+        contexts: &s.contexts_ks,
+        did_templates: &s.did_templates_ks,
+        audit: &s.audit_ks,
+        imported: &s.imported_ks,
+        memory: &s.memory_ks,
+        app_state: &s.app_state_ks,
+        internal: &s.internal_ks,
+        vault: &s.vault_ks,
+        consent: &s.consent_ks,
+        consent_approvers: &s.consent_approvers_ks,
+        persona: &s.persona_ks,
+        pcs_engine: &s.pcs_engine_ks,
+        notifications: &s.notifications_ks,
+        external_accounts: &s.external_accounts_ks,
+        external_secrets: &s.external_secrets_ks,
+        collection: &s.collection_ks,
+        #[cfg(feature = "webvh")]
+        webvh: &s.webvh_ks,
+        webs: &s.webs_ks,
+    }
+}
+
+/// Borrow a backup `DescriptorDeps` (the two-phase export/import flow) from an
+/// `AppState`. The struct lives in `vta-backup`; this constructor stays here
+/// because it knows `AppState`. `committer` is how this deployment adopts a
+/// restored seed — `state.backup_access().committer()`.
+pub fn descriptor_deps_from_app_state<'a>(
+    s: &'a crate::server::AppState,
+    committer: &'a dyn vta_backup::RestoreCommitter,
+) -> backup::descriptors::DescriptorDeps<'a> {
+    backup::descriptors::DescriptorDeps {
+        bundles_ks: &s.backup_bundles_ks,
+        blob_dir: &s.backup_blob_dir,
+        target: s.backup_access().target(),
+        seed_store: &s.seed_store,
+        config: &s.config,
+        committer,
+    }
+}

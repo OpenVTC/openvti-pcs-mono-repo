@@ -1,0 +1,167 @@
+//! Server-side infrastructure trust tasks: health ping, register ack, stats ack.
+//!
+//! The mirror of `did-hosting-control`'s `trust_tasks_infra`. Both sides speak
+//! the same Type URIs — the `MSG_*` constants, which are already canonical
+//! Trust-Task URIs with `#response` fragments for their replies — so an op has
+//! one identity whether it arrives inside a trust-task envelope or as a raw
+//! TSP frame.
+//!
+//! This is what makes a **TSP-only server** work. Before it existed the server
+//! had no trust-task dispatcher at all: its TSP handler parsed the payload as a
+//! DIDComm `Message`, and health lived only on the DIDComm router. A node that
+//! advertised `TSPTransport` and disabled DIDComm could never answer a ping and
+//! sat in the dashboard as `Unreachable` forever.
+//!
+//! The reply is *returned*, not sent: each transport routes it back over the
+//! same connection the request arrived on (`TspResponse` for TSP,
+//! `DIDCommResponse` for the envelope). So a ping delivered over TSP is ponged
+//! over TSP without either side re-resolving anything.
+
+use serde_json::Value;
+use tracing::{debug, info, warn};
+
+use did_hosting_common::didcomm_types::{MSG_HEALTH_PING, MSG_SERVER_REGISTER_ACK, MSG_STATS_ACK};
+
+use crate::server::AppState;
+
+/// Does this Type URI belong to the infrastructure ops handled here?
+pub fn owns(type_uri: &str) -> bool {
+    matches!(
+        type_uri,
+        MSG_HEALTH_PING | MSG_SERVER_REGISTER_ACK | MSG_STATS_ACK
+    )
+}
+
+/// Handle an infrastructure trust task, returning the (unsigned) reply document,
+/// `None` when the op is terminal (an ack is an answer, not a question), or
+/// the [`crate::messaging::Deferred`] of a ping that could not be checked just
+/// now.
+///
+/// A health ping is answered only when the control plane signed it (see
+/// [`crate::messaging::verify_control_plane`]); any other ping gets no reply
+/// at all. The pong discloses the DID count, and answering an unauthenticated
+/// ping — even with a refusal — would make this server a reflector for anyone
+/// who can reach its mediator. The two acks are advisory
+/// — logged and nothing else — so they need no authority.
+pub async fn dispatch(
+    state: &AppState,
+    sender: Option<&str>,
+    doc: trust_tasks_rs::TrustTask<Value>,
+) -> Result<Option<trust_tasks_rs::TrustTask<Value>>, crate::messaging::Deferred> {
+    match doc.type_uri.to_string().as_str() {
+        MSG_HEALTH_PING => {
+            let Some(verifier) = crate::messaging::state_verifier(state) else {
+                return Ok(None);
+            };
+            // A ping that is not the control plane's gets no answer — not even
+            // a (signed) refusal, which would make this server answer
+            // strangers. `verify_control_plane` has logged why. One that could
+            // not be checked just now is reported as worth re-sending.
+            if let Err(refusal) =
+                crate::messaging::verify_control_plane(state, sender, &doc, &verifier).await
+            {
+                return match refusal.deferred() {
+                    Some(deferred) => Err(deferred),
+                    None => Ok(None),
+                };
+            }
+            let Some(pong) = do_health_ping(state, &doc.payload).await else {
+                return Ok(None);
+            };
+            debug!(sender, "health ping answered (trust task)");
+            Ok(Some(
+                doc.respond_with(uuid::Uuid::new_v4().to_string(), pong),
+            ))
+        }
+        MSG_SERVER_REGISTER_ACK => {
+            // Advisory, so a failed check changes nothing but the log line:
+            // an acknowledgement is reported at `info` only when the control
+            // plane signed it. Anyone can post one to the HTTPS listener.
+            let verified = match crate::messaging::state_verifier(state) {
+                Some(verifier) => {
+                    crate::messaging::verify_control_plane(state, sender, &doc, &verifier)
+                        .await
+                        .is_ok()
+                }
+                None => false,
+            };
+            do_register_ack(&doc.payload, verified);
+            Ok(None)
+        }
+        // Advisory: stats are fire-and-forget. Owned so the ack isn't warned
+        // about as an unimplemented type on every sync tick.
+        MSG_STATS_ACK => Ok(None),
+        other => {
+            warn!(type_uri = other, "trust_tasks_infra: unowned type URI");
+            Ok(None)
+        }
+    }
+}
+
+/// Transport-agnostic core of the health ping: the `server/health/0.1`
+/// response — this edge's `instanceId`, `ok`, `observedAt`, and its version
+/// and DID count under our `ext` namespace.
+///
+/// `None` — no answer — for a ping this edge does not read (closed, R3.2), or
+/// one probing an instance other than this one: answering it would report
+/// this edge's health as another's. The legacy empty ping (a control plane
+/// before #449) is answered.
+///
+/// Shared by every transport's trust-task dispatch.
+pub(crate) async fn do_health_ping(state: &AppState, ping: &Value) -> Option<Value> {
+    use did_hosting_common::server::trust_tasks::infra;
+
+    let server_did = state.config.server_did.as_deref()?;
+    let own = infra::instance_id_for(server_did);
+    match infra::read_health_ping(ping) {
+        Ok(None) => {}
+        Ok(Some(probed)) if probed == own => {}
+        Ok(Some(probed)) => {
+            warn!(
+                probed,
+                own, "health ping for another instance; not answered"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(error = %e, "health ping not read; not answered");
+            return None;
+        }
+    }
+
+    // The collector's count: seeded at boot and recounted hourly from the
+    // keys, so a ping (every few minutes, per edge) reads nothing.
+    let did_count = match state.stats_collector.as_ref() {
+        Some(collector) => collector.get_aggregate().total_dids,
+        None => state.dids_ks.prefix_count("did:").await.unwrap_or(0) as u64,
+    };
+
+    match infra::health_pong_body(
+        &own,
+        chrono::Utc::now(),
+        env!("CARGO_PKG_VERSION"),
+        did_count,
+    ) {
+        Ok(pong) => Some(pong),
+        Err(e) => {
+            warn!(error = %e, "health response not built");
+            None
+        }
+    }
+}
+
+/// Transport-agnostic core of the registration ack — informational only.
+/// `verified`: the document is the control plane's (`verify_control_plane`);
+/// an unverified one is logged at `debug` and its `instanceId` is not.
+pub(crate) fn do_register_ack(body: &Value, verified: bool) {
+    if !verified {
+        debug!("registration acknowledgement not verified as the control plane's; ignored");
+        return;
+    }
+    // `server/register/0.2`'s response.
+    let instance_id = body
+        .get("instanceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    info!(instance_id, "registration acknowledged by control plane");
+}

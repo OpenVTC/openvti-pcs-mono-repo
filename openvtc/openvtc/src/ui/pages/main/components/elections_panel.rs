@@ -1,0 +1,903 @@
+//! Elections panel — a community's elections, opened from the Communities panel with `e`.
+//!
+//! Six screens: the list (what can be done first), the choice to present a membership before an
+//! election put to a party's members is read, one election's detail and disclosure, the ballot,
+//! its confirmation, and the result. What the member is told before taking a ticket or voting
+//! is the disclosure the community publishes (VTI-VOT-090): who runs the ballot box, whether
+//! that is the community itself, who can read the board, whether a later vote replaces an
+//! earlier one, that a vote can be proven to someone who demands it, whose membership
+//! credential admits a voter and that claiming a ticket shows it, and — where written answers
+//! are released after fewer than 10 ballots — that one may identify its author (VTI-VOT-065).
+//!
+//! The list carries the elections the community's list shows and those a held notification
+//! tells the member of (VTI-NTF-063); a notified one is shown only as notified — who holds it,
+//! its identifier, whom it is put to and its period — until it is opened.
+
+use crossterm::event::{KeyCode, KeyEvent};
+use std::time::Instant;
+
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+
+use crate::colors::{
+    COLOR_DARK_GRAY, COLOR_ORANGE, COLOR_SUCCESS, COLOR_TEXT_DEFAULT, COLOR_WARNING_ACCESSIBLE_RED,
+};
+use crate::state_handler::main_page::content::ContentPanelState;
+use crate::state_handler::main_page::elections::{
+    BallotForm, ElectionsPhase, ElectionsView, NotifiedPhase, Screen, Severity, Status, VoteResult,
+};
+use crate::state_handler::main_page::shorten_did;
+use crate::state_handler::state::ConnectionState;
+use openvtc_core::elections::{
+    self, AnswerDraft, Kept, Question, ShownElection, Standing, option_label, question_options,
+    question_text,
+};
+
+use super::panel::Panel;
+use crate::ui::pages::main::keymap::{self, k};
+
+pub struct ElectionsPanel;
+
+fn dim(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(COLOR_DARK_GRAY))
+}
+
+fn text(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(COLOR_TEXT_DEFAULT))
+}
+
+fn warn(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(COLOR_ORANGE))
+}
+
+fn wrap(lines: &mut Vec<Line<'static>>, body: &str, indent: usize, style: Style) {
+    let pad = " ".repeat(indent);
+    for part in super::status::wrap_text(
+        body,
+        super::status::content_width()
+            .saturating_sub(indent + 2)
+            .max(20),
+    ) {
+        lines.push(Line::from(Span::styled(format!("{pad}{part}"), style)));
+    }
+}
+
+fn push_status(lines: &mut Vec<Line<'static>>, status: &Status) {
+    let style = super::status::severity_style(status.severity);
+    wrap(lines, &status.text, 4, style);
+}
+
+fn standing_style(s: Standing) -> Style {
+    Style::default().fg(match s {
+        Standing::VotingOpen => COLOR_SUCCESS,
+        Standing::TicketsOpen => COLOR_ORANGE,
+        Standing::Upcoming => COLOR_TEXT_DEFAULT,
+        Standing::Over => COLOR_DARK_GRAY,
+    })
+}
+
+fn keys(lines: &mut Vec<Line<'static>>, keys: &[keymap::Binding]) {
+    lines.push(Line::from(""));
+    keymap::footer(lines, "    ", keys);
+}
+
+/// A `y`-only question: its own words, and only `y` goes ahead.
+fn ask(lines: &mut Vec<Line<'static>>, what: &str, otherwise: &str) {
+    keymap::confirming();
+    lines.push(Line::from(""));
+    lines.push(Line::from(dim(format!(
+        "    y: {what} · any other key: {otherwise}"
+    ))));
+}
+
+impl Panel for ElectionsPanel {
+    fn render(
+        &self,
+        state: &ContentPanelState,
+        _connection: &ConnectionState,
+    ) -> Vec<Line<'static>> {
+        let Some(view) = &state.elections.view else {
+            return vec![Line::from("no elections view open")];
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                format!("  Elections — {}", view.community),
+                Style::default().fg(COLOR_TEXT_DEFAULT).bold(),
+            ),
+            dim(format!("    as {}", shorten_did(&view.me, 40))),
+        ])];
+        match view.screen {
+            Screen::List => render_list(view, &mut lines),
+            Screen::Disclose => render_disclose(view, &mut lines),
+            Screen::Detail => render_detail(view, &mut lines),
+            Screen::Ballot => {
+                let recent = view.shown.as_ref().is_some_and(|s| {
+                    state.elections.ticket_taken_recently(
+                        &view.target,
+                        s.election_id(),
+                        Instant::now(),
+                    )
+                });
+                render_ballot(view, recent, &mut lines);
+            }
+            Screen::Confirm => render_confirm(view, &mut lines),
+            Screen::Result => render_result(view, &mut lines),
+        }
+        lines
+    }
+}
+
+fn render_list(view: &ElectionsView, lines: &mut Vec<Line<'static>>) {
+    match &view.phase {
+        ElectionsPhase::Loading => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(dim(
+                "    asking the community which elections you may take part in…",
+            )));
+            // Why it is not asking yet (a busy lane), when it is not.
+            if let Some(status) = &view.status {
+                lines.push(Line::from(""));
+                push_status(lines, status);
+            }
+            keys(lines, &[k("r", "retry"), k("Esc", "back")]);
+            return;
+        }
+        ElectionsPhase::Failed(detail) => {
+            lines.push(Line::from(""));
+            push_status(
+                lines,
+                &Status {
+                    text: detail.clone(),
+                    severity: Severity::Error,
+                },
+            );
+            keys(lines, &[k("r", "retry"), k("Esc", "back")]);
+            return;
+        }
+        ElectionsPhase::Loaded => {}
+    }
+    lines.push(Line::from(""));
+    let notified = view.notified_rows();
+    if view.elections.is_empty() && notified.is_empty() {
+        lines.push(Line::from(dim(
+            "    The community has no elections you may take part in.",
+        )));
+    } else if view.elections.is_empty() {
+        lines.push(Line::from(dim(
+            "    The community's own list shows you no elections.",
+        )));
+    } else {
+        lines.push(Line::from(dim(format!(
+            "      {:<34}{:<15}{:<24}{}",
+            "ELECTION", "STATE", "VOTING CLOSES", "TICKET"
+        ))));
+        for (i, e) in view.elections.iter().enumerate() {
+            let selected = i == view.selected;
+            let standing = Standing::of(&e.state);
+            let name_style = if selected {
+                Style::default().fg(COLOR_SUCCESS).bold()
+            } else {
+                Style::default().fg(COLOR_TEXT_DEFAULT)
+            };
+            let title: String = elections::display_title(e).chars().take(32).collect();
+            lines.push(Line::from(vec![
+                Span::raw(if selected { "    ▸ " } else { "      " }),
+                Span::styled(format!("{title:<34}"), name_style),
+                Span::styled(
+                    format!("{:<15}", elections::state_label(&e.state.to_string())),
+                    standing_style(standing),
+                ),
+                text(format!(
+                    "{:<24}",
+                    e.voting_closes_at.format("%Y-%m-%d %H:%M UTC")
+                )),
+                if e.ticket_held {
+                    Span::styled("held", Style::default().fg(COLOR_SUCCESS))
+                } else {
+                    dim("—")
+                },
+            ]));
+        }
+    }
+    render_notified(view, &notified, lines);
+    if let Some(status) = &view.status {
+        lines.push(Line::from(""));
+        push_status(lines, status);
+    }
+    let mut k_ = Vec::new();
+    if !view.rows().is_empty() {
+        k_.push(k("↑/↓ or j/k", "move"));
+        k_.push(k("Enter", "open"));
+    }
+    k_.extend([k("r", "refresh"), k("Esc", "back")]);
+    keys(lines, &k_);
+}
+
+/// The elections held notifications tell the member of, shown only as notified (VTI-NTF-063):
+/// who holds each, its identifier, whom it is put to, and its period. A notification is no
+/// evidence the member may vote (VTI-NTF-004), and says so.
+fn render_notified(
+    view: &ElectionsView,
+    notified: &[&openvtc_core::notifications::NotifiedElection],
+    lines: &mut Vec<Line<'static>>,
+) {
+    match &view.notified_phase {
+        NotifiedPhase::Loading => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(dim(
+                "    asking your VTA which elections you have been told of…",
+            )));
+            return;
+        }
+        NotifiedPhase::Unavailable(why) => {
+            lines.push(Line::from(""));
+            wrap(
+                lines,
+                &format!("Elections you have been told of could not be read from your VTA: {why}"),
+                4,
+                Style::default().fg(COLOR_DARK_GRAY),
+            );
+            return;
+        }
+        NotifiedPhase::Loaded => {}
+    }
+    if notified.is_empty() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(dim(
+        "    Told of — a notification says these exist; opening one reads it from its community",
+    )));
+    let first = view.elections.len();
+    for (i, n) in notified.iter().enumerate() {
+        let selected = first + i == view.selected;
+        let name_style = if selected {
+            Style::default().fg(COLOR_SUCCESS).bold()
+        } else {
+            Style::default().fg(COLOR_TEXT_DEFAULT)
+        };
+        let id: String = n.election_id.chars().take(32).collect();
+        let period = match (&n.valid_from, &n.valid_until) {
+            (Some(from), Some(until)) => format!("{} → {}", day(from), day(until)),
+            (None, Some(until)) => format!("until {}", day(until)),
+            (Some(from), None) => format!("from {}", day(from)),
+            (None, None) => "no period stated".to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::raw(if selected { "    ▸ " } else { "      " }),
+            Span::styled(format!("{id:<34}"), name_style),
+            text(period),
+        ]));
+        lines.push(Line::from(dim(format!(
+            "        held by {}   put to {}",
+            shorten_did(&n.held_by, 40),
+            shorten_did(&n.audience, 40)
+        ))));
+    }
+}
+
+/// The date part of an RFC 3339 instant.
+fn day(t: &str) -> String {
+    t.chars().take(10).collect()
+}
+
+/// Before an election put to a party's members is read presenting that membership: what the
+/// read shows the community, and the member's choice (VTI-VOT-015, VTI-VOT-016).
+fn render_disclose(view: &ElectionsView, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::from(""));
+    let Some(d) = &view.disclose else {
+        keys(lines, &[k("Esc", "back")]);
+        return;
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "    Open {} presenting your membership?",
+            crate::state_handler::main_page::sanitize_display(&d.election, 128)
+        ),
+        Style::default().fg(COLOR_TEXT_DEFAULT).bold(),
+    )));
+    lines.push(Line::from(""));
+    wrap(
+        lines,
+        &elections::presenting_read_warning(&d.held_by, &d.member_of),
+        4,
+        Style::default().fg(COLOR_ORANGE).bold(),
+    );
+    lines.push(Line::from(""));
+    wrap(
+        lines,
+        "Your VTA presents only a membership credential that party itself issued you. A \
+         notification is not proof that you may vote: the community decides that when you \
+         claim a ticket.",
+        4,
+        Style::default().fg(COLOR_DARK_GRAY),
+    );
+    if let Some(status) = &view.status {
+        lines.push(Line::from(""));
+        push_status(lines, status);
+    }
+    ask(lines, "present and open", "back");
+}
+
+/// The warning an election whose written answers are released after fewer than 10 ballots
+/// carries, wherever the member is about to take a ticket or vote (VTI-VOT-065, VTI-VOT-090).
+fn push_text_release_warning(shown: &ShownElection, lines: &mut Vec<Line<'static>>) {
+    if let Some(warning) = shown.text_release_warning() {
+        lines.push(Line::from(""));
+        wrap(
+            lines,
+            &format!("⚠ {warning}"),
+            4,
+            Style::default().fg(COLOR_ORANGE).bold(),
+        );
+    }
+}
+
+/// What a member is told about an election before taking a ticket or voting (VTI-VOT-090).
+fn render_disclosure(shown: &ShownElection, lines: &mut Vec<Line<'static>>) {
+    let m = shown.manifest();
+    let d = &shown.typed.disclosure;
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("    {}", shown.title()),
+            Style::default().fg(COLOR_TEXT_DEFAULT).bold(),
+        ),
+        dim(format!("   {}", shown.state_label())),
+    ]));
+    if let Some(desc) = &m.description {
+        wrap(
+            lines,
+            &crate::state_handler::main_page::sanitize_display(desc.as_str(), 1200),
+            6,
+            Style::default().fg(COLOR_DARK_GRAY),
+        );
+    }
+    lines.push(Line::from(""));
+    let fmt = |t: &chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%d %H:%M UTC").to_string();
+    lines.push(Line::from(vec![
+        dim("    tickets from  "),
+        text(fmt(&m.registration_opens_at)),
+    ]));
+    lines.push(Line::from(vec![
+        dim("    voting        "),
+        text(format!(
+            "{} → {}",
+            fmt(&m.voting_opens_at),
+            fmt(&m.voting_closes_at)
+        )),
+    ]));
+    lines.push(Line::from(vec![
+        dim("    ballot box    "),
+        text(format!(
+            "run by {}",
+            crate::state_handler::main_page::sanitize_display(d.ballot_box_operator.as_str(), 120)
+        )),
+        dim(format!("  {}", shorten_did(d.ballot_box.as_str(), 40))),
+    ]));
+    if d.same_operator {
+        lines.push(Line::from(""));
+        wrap(
+            lines,
+            "⚠ The same operator runs this community and its ballot box: together they could \
+             link your ticket to your ballot, and so learn how you voted.",
+            4,
+            Style::default().fg(COLOR_ORANGE).bold(),
+        );
+    }
+    push_text_release_warning(shown, lines);
+    if let Some(roll) = shown.roll_credential_words() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(dim("    who votes")));
+        wrap(lines, &roll, 6, Style::default().fg(COLOR_TEXT_DEFAULT));
+    }
+    if let Some(warning) = shown.roll_credential_warning() {
+        wrap(
+            lines,
+            &format!("⚠ {warning}"),
+            4,
+            Style::default().fg(COLOR_ORANGE).bold(),
+        );
+    }
+    lines.push(Line::from(vec![
+        dim("    the board     "),
+        text(match d.board_visibility.to_string().as_str() {
+            "public" => "public: anyone can read every cast ballot's entry".to_string(),
+            _ => "private: only the community and its auditors can read it".to_string(),
+        }),
+    ]));
+    lines.push(Line::from(vec![
+        dim("    voting again  "),
+        text(match d.revote.to_string().as_str() {
+            "replace" => "a later vote replaces your earlier one",
+            _ => "refused: your first vote is final",
+        }),
+    ]));
+    lines.push(Line::from(vec![
+        dim("    secrecy       "),
+        text(match m.secrecy.to_string().as_str() {
+            "open" => "open: ballots are counted as cast",
+            "sealed" => "sealed: ballots are opened by the trustees after the close",
+            _ => "encrypted: only the totals are ever decrypted",
+        }),
+    ]));
+    wrap(
+        lines,
+        "You can prove how you voted, so this election cannot protect you against being made \
+         to vote a certain way.",
+        4,
+        Style::default().fg(COLOR_DARK_GRAY),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(dim("    Questions")));
+    for q in &m.questions {
+        let kind = match q {
+            Question::Choice {
+                min_selections,
+                max_selections,
+                ..
+            } => {
+                if max_selections.get() == 1 {
+                    "choose one".to_string()
+                } else {
+                    format!("choose {min_selections}–{}", max_selections.get())
+                }
+            }
+            Question::Ranking { partial, .. } => if *partial {
+                "rank as many as you like"
+            } else {
+                "rank every option"
+            }
+            .to_string(),
+            Question::Score { min, max, .. } => format!("score each {min}–{max}"),
+            Question::Text { max_length, .. } => format!("up to {} characters", max_length.get()),
+            _ => "a kind this version cannot answer".to_string(),
+        };
+        let optional = if elections::question_optional(q) {
+            ", optional"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            text(format!("      • {}", question_text(q))),
+            dim(format!("  ({kind}{optional})")),
+        ]));
+        let opts: Vec<String> = question_options(q).iter().map(option_label).collect();
+        if !opts.is_empty() {
+            wrap(
+                lines,
+                &opts.join(" · "),
+                10,
+                Style::default().fg(COLOR_DARK_GRAY),
+            );
+        }
+    }
+}
+
+fn render_detail(view: &ElectionsView, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::from(""));
+    let Some(shown) = view.shown.as_ref() else {
+        if let Some(status) = &view.status {
+            push_status(lines, status);
+        }
+        keys(lines, &[k("r", "retry"), k("Esc", "back")]);
+        return;
+    };
+    if !vta_sdk::did_scid::same_reference(&view.target, &view.vtc_did) {
+        lines.push(Line::from(vec![
+            dim("    held by       "),
+            text(shorten_did(&view.target, 60)),
+        ]));
+    }
+    if let Some(member_of) = &view.presenting {
+        lines.push(Line::from(vec![
+            dim("    read showing  "),
+            text(format!("your membership of {}", shorten_did(member_of, 60))),
+        ]));
+    }
+    render_disclosure(shown, lines);
+    if let Some(flow) = &view.flow {
+        lines.push(Line::from(""));
+        lines.push(Line::from(dim(format!("    {}…", flow.step.words()))));
+    }
+    if let Some(status) = &view.status {
+        lines.push(Line::from(""));
+        push_status(lines, status);
+    }
+    let mut k_ = Vec::new();
+    if view.flow.is_none() && shown.tickets_open() {
+        k_.push(k("t", "take ticket"));
+    }
+    if view.flow.is_none() && shown.voting_open() {
+        k_.push(k("v", "vote"));
+    }
+    k_.extend([k("r", "refresh"), k("Esc", "back")]);
+    keys(lines, &k_);
+}
+
+/// One question's rows on the ballot.
+fn render_question(
+    q: &Question,
+    draft: &AnswerDraft,
+    abstain: bool,
+    focused: Option<usize>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let head_style = if focused.is_some() {
+        Style::default().fg(COLOR_SUCCESS).bold()
+    } else {
+        Style::default().fg(COLOR_TEXT_DEFAULT).bold()
+    };
+    lines.push(Line::from(vec![
+        Span::raw(if focused.is_some() {
+            "    ▸ "
+        } else {
+            "      "
+        }),
+        Span::styled(question_text(q), head_style),
+        if abstain {
+            warn("   left blank")
+        } else {
+            dim("")
+        },
+    ]));
+    let cursor = |i: usize| if focused == Some(i) { "›" } else { " " };
+    match draft {
+        AnswerDraft::Choice(chosen) => {
+            let single =
+                matches!(q, Question::Choice { max_selections, .. } if max_selections.get() == 1);
+            for (i, o) in question_options(q).iter().enumerate() {
+                let on = chosen.iter().any(|k| k.as_str() == o.key.as_str());
+                let mark = match (single, on) {
+                    (true, true) => "(•)",
+                    (true, false) => "( )",
+                    (false, true) => "[x]",
+                    (false, false) => "[ ]",
+                };
+                lines.push(Line::from(text(format!(
+                    "        {} {mark} {}",
+                    cursor(i),
+                    option_label(o)
+                ))));
+            }
+        }
+        AnswerDraft::Ranking(order) => {
+            for (i, o) in question_options(q).iter().enumerate() {
+                let rank = order
+                    .iter()
+                    .position(|k| k.as_str() == o.key.as_str())
+                    .map_or_else(|| "  ".to_string(), |p| format!("{:>2}", p + 1));
+                lines.push(Line::from(text(format!(
+                    "        {} [{rank}] {}",
+                    cursor(i),
+                    option_label(o)
+                ))));
+            }
+        }
+        AnswerDraft::Scores(scores) => {
+            for (i, o) in question_options(q).iter().enumerate() {
+                let value = scores
+                    .get(i)
+                    .and_then(|(_, v)| *v)
+                    .map_or_else(|| "–".to_string(), |v| v.to_string());
+                lines.push(Line::from(text(format!(
+                    "        {} {value:>3}  {}",
+                    cursor(i),
+                    option_label(o)
+                ))));
+            }
+        }
+        AnswerDraft::Text(t) => {
+            let shown = crate::state_handler::main_page::sanitize_display(t, 4096);
+            lines.push(Line::from(
+                [Span::raw("        › ")]
+                    .into_iter()
+                    .chain(crate::ui::pages::main::text_input::cursor_spans(
+                        &shown,
+                        focused.is_some(),
+                        text(String::new()).style,
+                    ))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+}
+
+fn render_ballot(view: &ElectionsView, recent_ticket: bool, lines: &mut Vec<Line<'static>>) {
+    let (Some(form), Some(shown)) = (view.form.as_ref(), view.shown.as_ref()) else {
+        return;
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        format!("    Ballot — {}", shown.title()),
+        Style::default().fg(COLOR_TEXT_DEFAULT).bold(),
+    )]));
+    if recent_ticket {
+        wrap(
+            lines,
+            "⚠ You took this election's ticket less than an hour ago. Voting now lets the \
+             community and the ballot box pair the two by when each arrived; voting later \
+             keeps them apart.",
+            4,
+            Style::default().fg(COLOR_ORANGE).bold(),
+        );
+    }
+    push_text_release_warning(shown, lines);
+    lines.push(Line::from(""));
+    render_form(form, shown, lines);
+    if let Some(e) = &form.error {
+        lines.push(Line::from(""));
+        wrap(
+            lines,
+            e,
+            4,
+            Style::default().fg(COLOR_WARNING_ACCESSIBLE_RED).bold(),
+        );
+    }
+    if let Some(status) = &view.status {
+        lines.push(Line::from(""));
+        push_status(lines, status);
+    }
+    let typing = form.typing(shown.manifest());
+    let mut k_ = vec![k("Tab/Shift+Tab", "question")];
+    if typing {
+        k_.push(k("↑/↓", "option"));
+        k_.push(k(keymap::TYPE, "answer"));
+        k_.push(k("Ctrl+A", "blank"));
+    } else {
+        k_.push(k("↑/↓ or j/k", "option"));
+        k_.push(k("Space", "choose/rank"));
+        k_.push(k("+/=/-/←/→", "score"));
+        k_.push(k("a/Ctrl+A", "blank"));
+    }
+    k_.extend([k("Enter", "review"), k("Esc", "back")]);
+    keys(lines, &k_);
+}
+
+fn render_form(form: &BallotForm, shown: &ShownElection, lines: &mut Vec<Line<'static>>) {
+    for (i, (key, draft, abstain)) in form.draft.answers.iter().enumerate() {
+        let Some(q) = shown
+            .manifest()
+            .questions
+            .iter()
+            .find(|q| elections::question_key(q) == Some(key.as_str()))
+        else {
+            continue;
+        };
+        let focused = (i == form.question).then_some(form.option);
+        render_question(q, draft, *abstain, focused, lines);
+    }
+}
+
+fn render_confirm(view: &ElectionsView, lines: &mut Vec<Line<'static>>) {
+    let (Some(form), Some(shown)) = (view.form.as_ref(), view.shown.as_ref()) else {
+        return;
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("    Cast this ballot in {}?", shown.title()),
+        Style::default().fg(COLOR_TEXT_DEFAULT).bold(),
+    )));
+    lines.push(Line::from(""));
+    for (key, draft, abstain) in &form.draft.answers {
+        let Some(q) = shown
+            .manifest()
+            .questions
+            .iter()
+            .find(|q| elections::question_key(q) == Some(key.as_str()))
+        else {
+            continue;
+        };
+        let label = |k: &str| {
+            question_options(q)
+                .iter()
+                .find(|o| o.key.as_str() == k)
+                .map_or_else(|| k.to_string(), option_label)
+        };
+        let answer = if *abstain {
+            "left blank".to_string()
+        } else {
+            match draft {
+                AnswerDraft::Choice(c) => c.iter().map(|k| label(k)).collect::<Vec<_>>().join(", "),
+                AnswerDraft::Ranking(r) => r
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| format!("{}. {}", i + 1, label(k)))
+                    .collect::<Vec<_>>()
+                    .join("  "),
+                AnswerDraft::Scores(s) => s
+                    .iter()
+                    .map(|(k, v)| format!("{} {}", label(k), v.unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                AnswerDraft::Text(t) => crate::state_handler::main_page::sanitize_display(t, 4096),
+            }
+        };
+        lines.push(Line::from(vec![text(format!(
+            "      {}",
+            question_text(q)
+        ))]));
+        wrap(lines, &answer, 10, Style::default().fg(COLOR_SUCCESS));
+    }
+    push_text_release_warning(shown, lines);
+    lines.push(Line::from(""));
+    wrap(
+        lines,
+        "Your VTA seals this ballot under a key made for this vote alone, and this app sends it \
+         to the ballot box itself after a short random pause. The community never sees it.",
+        4,
+        Style::default().fg(COLOR_DARK_GRAY),
+    );
+    if let Some(status) = &view.status {
+        lines.push(Line::from(""));
+        push_status(lines, status);
+    }
+    ask(lines, "cast", "back to the ballot");
+}
+
+fn render_result(view: &ElectionsView, lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::from(""));
+    if let Some(flow) = &view.flow {
+        lines.push(Line::from(dim(format!("    {}…", flow.step.words()))));
+    }
+    match &view.result {
+        Some(VoteResult::Counted {
+            outcome,
+            leaf_index,
+            kept,
+            keep_error,
+        }) => {
+            lines.push(Line::from(Span::styled(
+                format!("    ✓ Voted — {}", outcome.words()),
+                Style::default().fg(COLOR_SUCCESS).bold(),
+            )));
+            lines.push(Line::from(vec![
+                dim("    board entry   "),
+                text(leaf_index.to_string()),
+            ]));
+            match (kept, keep_error) {
+                (Some(Kept::Included), _) => lines.push(Line::from(dim(
+                    "    Your VTA kept the receipt and found your vote on the board.",
+                ))),
+                (Some(Kept::NotIncluded), _) => wrap(
+                    lines,
+                    "Your VTA kept the receipt, but the board the community holds does not \
+                     include your vote. Keep the receipt: it is your evidence.",
+                    4,
+                    Style::default().fg(COLOR_WARNING_ACCESSIBLE_RED).bold(),
+                ),
+                (Some(Kept::Kept), _) => lines.push(Line::from(dim(
+                    "    Your VTA kept the receipt; it checks it against the board later.",
+                ))),
+                (None, Some(e)) => wrap(
+                    lines,
+                    &format!("Your vote was counted, but your VTA did not keep the receipt: {e}"),
+                    4,
+                    Style::default().fg(COLOR_ORANGE),
+                ),
+                (None, None) => {}
+            }
+        }
+        Some(VoteResult::Failed { why, resend }) => {
+            lines.push(Line::from(Span::styled(
+                "    ✗ Not voted",
+                Style::default().fg(COLOR_WARNING_ACCESSIBLE_RED).bold(),
+            )));
+            wrap(
+                lines,
+                why,
+                4,
+                Style::default().fg(COLOR_WARNING_ACCESSIBLE_RED),
+            );
+            if *resend {
+                lines.push(Line::from(dim(
+                    "    r sends the same cast again — it is never counted twice.",
+                )));
+            }
+        }
+        None => {}
+    }
+    if let Some(status) = &view.status
+        && view.flow.is_none()
+    {
+        lines.push(Line::from(""));
+        push_status(lines, status);
+    }
+    let resendable = matches!(view.result, Some(VoteResult::Failed { resend: true, .. }));
+    if resendable && view.flow.is_none() {
+        keys(lines, &[k("r", "resend"), k("Esc", "back")]);
+    } else {
+        keys(lines, &[k("Esc", "back")]);
+    }
+}
+
+/// The Elections panel's keys, by screen. `None` when the key means nothing here.
+///
+/// On the ballot, a text question takes printable keys as its answer, so its blank toggle is
+/// `Ctrl-a`; elsewhere on the ballot `a` leaves the focused question blank. On the
+/// confirmation only `y` casts — anything else goes back to the ballot, so a key held a
+/// moment too long after `⏎` never casts.
+pub(super) fn elections_key(
+    key: KeyEvent,
+    view: &crate::state_handler::main_page::elections::ElectionsView,
+) -> Option<crate::state_handler::actions::ElectionsAction> {
+    use crate::state_handler::actions::ElectionsAction as E;
+    use crate::state_handler::main_page::elections::Screen;
+    let ctrl = key
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL);
+    Some(match view.screen {
+        Screen::List => {
+            let last = view.rows().len().saturating_sub(1);
+            let listed = matches!(view.phase, ElectionsPhase::Loaded) && !view.rows().is_empty();
+            match key.code {
+                KeyCode::Esc => E::Back,
+                KeyCode::Char('r') => E::Refresh,
+                KeyCode::Up | KeyCode::Char('k') if listed => {
+                    E::Select(view.selected.saturating_sub(1))
+                }
+                KeyCode::Down | KeyCode::Char('j') if listed => {
+                    E::Select((view.selected + 1).min(last))
+                }
+                KeyCode::Enter if listed => E::Show,
+                _ => return None,
+            }
+        }
+        // Only `y` presents; anything else goes back without presenting (VTI-VOT-016).
+        Screen::Disclose => match key.code {
+            KeyCode::Char('y') => E::Present,
+            _ => E::Back,
+        },
+        Screen::Detail => {
+            let idle = view.flow.is_none();
+            let shown = view.shown.as_ref();
+            match key.code {
+                KeyCode::Esc => E::Back,
+                KeyCode::Char('r') => E::Refresh,
+                KeyCode::Char('t') if idle && shown.is_some_and(|s| s.tickets_open()) => {
+                    E::TakeTicket
+                }
+                KeyCode::Char('v') if idle && shown.is_some_and(|s| s.voting_open()) => E::Vote,
+                _ => return None,
+            }
+        }
+        Screen::Ballot => {
+            let typing = view
+                .form
+                .as_ref()
+                .zip(view.shown.as_ref())
+                .is_some_and(|(f, s)| f.typing(s.manifest()));
+            match key.code {
+                KeyCode::Esc => E::Back,
+                KeyCode::Tab => E::BallotQuestion(1),
+                KeyCode::BackTab => E::BallotQuestion(-1),
+                KeyCode::Up => E::BallotOption(-1),
+                KeyCode::Down => E::BallotOption(1),
+                KeyCode::Enter => E::Review,
+                KeyCode::Char('a') if ctrl => E::BallotAbstain,
+                KeyCode::Backspace if typing => E::BallotBackspace,
+                KeyCode::Char(c) if typing && !ctrl => E::BallotChar(c),
+                KeyCode::Char(' ') => E::BallotToggle,
+                KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => E::BallotAdjust(1),
+                KeyCode::Char('-') | KeyCode::Left => E::BallotAdjust(-1),
+                KeyCode::Char('a') => E::BallotAbstain,
+                KeyCode::Char('k') => E::BallotOption(-1),
+                KeyCode::Char('j') => E::BallotOption(1),
+                _ => return None,
+            }
+        }
+        Screen::Confirm => match key.code {
+            KeyCode::Char('y') => E::Cast,
+            _ => E::Back,
+        },
+        Screen::Result => match key.code {
+            KeyCode::Esc => E::Back,
+            KeyCode::Char('r')
+                if view.flow.is_none()
+                    && matches!(view.result, Some(VoteResult::Failed { resend: true, .. })) =>
+            {
+                E::Resend
+            }
+            _ => return None,
+        },
+    })
+}

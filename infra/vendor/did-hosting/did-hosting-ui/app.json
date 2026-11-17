@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "DID Hosting Manager",
+    "slug": "did-hosting-ui",
+    "version": "1.0.0",
+    "platforms": ["web"],
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "webvh",
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#040823"
+        }
+      ],
+      "expo-status-bar"
+    ]
+  }
+}

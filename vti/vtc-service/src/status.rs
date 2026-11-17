@@ -1,0 +1,461 @@
+use crate::store::keyspaces;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use affinidi_tdk::common::TDKSharedState;
+use affinidi_tdk::common::config::TDKConfig;
+use affinidi_tdk::messaging::ATM;
+use affinidi_tdk::messaging::config::ATMConfig;
+use affinidi_tdk::messaging::profiles::ATMProfile;
+use affinidi_tdk::messaging::protocols::trust_ping::TrustPing;
+use affinidi_tdk::secrets_resolver::SecretsResolver;
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+
+use crate::acl::{self, VtcRole};
+use crate::auth::session::{self, SessionState};
+use crate::config::AppConfig;
+use crate::keys::seed_store::create_secret_store;
+
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
+const RESET: &str = "\x1b[0m";
+
+fn section(title: &str) {
+    let pad = 46usize.saturating_sub(title.len());
+    eprintln!(
+        "\n{DIM}──{RESET} {BOLD}{title}{RESET} {DIM}{}{RESET}",
+        "─".repeat(pad)
+    );
+}
+
+pub async fn run_status(config_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Check setup completion
+    let config = match AppConfig::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            section("VTC Status");
+            eprintln!("  {CYAN}{:<13}{RESET} {RED}✗{RESET} not complete", "Setup");
+            eprintln!("  {CYAN}{:<13}{RESET} {e}", "Error");
+            eprintln!();
+            eprintln!("Run `vtc setup` to configure this instance.");
+            return Ok(());
+        }
+    };
+
+    section("VTC Status");
+    let name = config.vtc_name.as_deref().unwrap_or("(not set)");
+    let desc = config.vtc_description.as_deref().unwrap_or("(not set)");
+    eprintln!(
+        "  {CYAN}{:<13}{RESET} {}",
+        "Name",
+        if name == "(not set)" {
+            format!("{DIM}{name}{RESET}")
+        } else {
+            name.to_string()
+        }
+    );
+    eprintln!(
+        "  {CYAN}{:<13}{RESET} {}",
+        "Description",
+        if desc == "(not set)" {
+            format!("{DIM}{desc}{RESET}")
+        } else {
+            desc.to_string()
+        }
+    );
+    eprintln!("  {CYAN}{:<13}{RESET} {GREEN}✓{RESET} complete", "Setup");
+    eprintln!(
+        "  {CYAN}{:<13}{RESET} {}",
+        "Config",
+        config.config_path.display()
+    );
+
+    // 2. DID resolver for resolution checks
+    let did_resolver = vta_sdk::resolver::shared_did_resolver_from_env().await.ok();
+
+    // 3. VTC DID + resolution check → extract mediator DID from DIDCommMessaging
+    let mut discovered_mediator: Option<String> = None;
+    // Captured from the same resolution so the transport section below can
+    // report without resolving twice.
+    let mut resolved_caps: Option<vta_sdk::protocol::matching::ServiceCapabilities> = None;
+    if let Some(ref did) = config.vtc_did {
+        eprintln!("  {CYAN}{:<13}{RESET} {did}", "VTC DID");
+        if let Some(ref resolver) = did_resolver {
+            match resolver.resolve(did).await {
+                Ok(resolved) => {
+                    let method = did
+                        .strip_prefix("did:")
+                        .and_then(|s| s.split(':').next())
+                        .unwrap_or("?");
+                    eprintln!("                {GREEN}✓{RESET} resolves ({method})");
+                    print_claimed_names(&resolved.doc.also_known_as);
+
+                    resolved_caps = serde_json::to_value(&resolved.doc).ok().map(|doc| {
+                        vta_sdk::protocol::matching::ServiceCapabilities::from_did_document(&doc)
+                    });
+
+                    // Wallet sign-in needs a `SignInPortal` service naming
+                    // this portal (contract C4, VTI-LNK-102).
+                    if let (Some(url), Ok(doc)) = (
+                        config.public_url.as_deref(),
+                        serde_json::to_value(&resolved.doc),
+                    ) {
+                        match crate::member_portal::oob::check_sign_in_portal(&doc, did, url) {
+                            Ok(()) => eprintln!(
+                                "                {GREEN}✓{RESET} lists the member portal (SignInPortal)"
+                            ),
+                            Err(why) => eprintln!("                {YELLOW}!{RESET} {why}"),
+                        }
+                        match crate::member_portal::oob::check_trust_task_https(&doc, did, url) {
+                            Ok(()) => eprintln!(
+                                "                {GREEN}✓{RESET} lists its trust-task door (TrustTaskHTTPS)"
+                            ),
+                            Err(why) => eprintln!("                {YELLOW}!{RESET} {why}"),
+                        }
+                    }
+
+                    // Look for mediator DID in DIDCommMessaging service
+                    for svc in &resolved.doc.service {
+                        if svc.type_.iter().any(|t| t == "DIDCommMessaging")
+                            && discovered_mediator.is_none()
+                        {
+                            discovered_mediator = svc
+                                .service_endpoint
+                                .get_uris()
+                                .into_iter()
+                                .map(|u| u.trim_matches('"').to_string())
+                                .find(|u| u.starts_with("did:"));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("                {RED}✗ resolution failed: {e}{RESET}"),
+            }
+        }
+    } else {
+        eprintln!("  {CYAN}{:<13}{RESET} {DIM}(not set){RESET}", "VTC DID");
+    }
+
+    // 4. URL + Store path
+    let url = config.public_url.as_deref().unwrap_or("(not set)");
+    eprintln!(
+        "  {CYAN}{:<13}{RESET} {}",
+        "URL",
+        if url == "(not set)" {
+            format!("{DIM}{url}{RESET}")
+        } else {
+            url.to_string()
+        }
+    );
+    eprintln!(
+        "  {CYAN}{:<13}{RESET} {}",
+        "Store",
+        config.store.data_dir.display()
+    );
+
+    // 4b. Transports — what the document promises vs what this binary serves.
+    //
+    // Here as well as at boot because the two questions an operator has are
+    // "why did it refuse to start" and "will it refuse if I restart", and the
+    // second must be answerable *without* restarting. Renders the same
+    // `transport_capability::findings_*` the daemon logs, so the two never
+    // disagree.
+    print_transport_section(resolved_caps.as_ref());
+
+    // 5. Mediator section
+    section("Mediator");
+    let mediator_did = discovered_mediator
+        .as_deref()
+        .or(config.messaging.as_ref().map(|m| m.mediator_did.as_str()));
+
+    if let Some(ref msg) = config.messaging {
+        eprintln!("  {CYAN}{:<13}{RESET} {}", "URL", msg.mediator_url);
+        eprintln!(
+            "  {CYAN}{:<13}{RESET} {}",
+            "DID",
+            mediator_did.unwrap_or("(unknown)")
+        );
+        if let Some(ref resolver) = did_resolver
+            && let Some(did) = mediator_did
+        {
+            match resolver.resolve(did).await {
+                Ok(resolved) => {
+                    let method = did
+                        .strip_prefix("did:")
+                        .and_then(|s| s.split(':').next())
+                        .unwrap_or("?");
+                    eprintln!("                {GREEN}✓{RESET} resolves ({method})");
+                    print_claimed_names(&resolved.doc.also_known_as);
+                }
+                Err(e) => eprintln!("                {RED}✗ resolution failed: {e}{RESET}"),
+            }
+        }
+    } else {
+        eprintln!("  {DIM}Not configured{RESET}");
+    }
+
+    // 6. Open store (may fail if VTC is already running)
+    // `open_offline` distinguishes a held store from every other failure, so
+    // this no longer has to guess: a permissions error or a damaged directory
+    // used to be reported as "is VTC already running?" too.
+    let store = match crate::store::offline::open_offline(&config.store) {
+        Ok(s) => s,
+        Err(crate::store::offline::OfflineStoreError::DaemonRunning { .. }) => {
+            eprintln!();
+            eprintln!("  {YELLOW}Note:{RESET} The VTC daemon is running and holds the data store.");
+            eprintln!("        Stop the VTC service and re-run `vtc status` for full diagnostics.");
+            eprintln!();
+            return Ok(());
+        }
+        Err(crate::store::offline::OfflineStoreError::Other(e)) => {
+            eprintln!();
+            eprintln!("  {YELLOW}Note:{RESET} Could not open the data store: {e}");
+            eprintln!();
+            return Ok(());
+        }
+    };
+
+    // 7. Trust-ping to mediator
+    if let (Some(vtc_did), Some(mediator)) = (&config.vtc_did, mediator_did) {
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            send_trust_ping(&config, vtc_did, mediator),
+        )
+        .await
+        {
+            Ok(Ok(latency)) => {
+                eprintln!("                {GREEN}✓{RESET} pong ({latency}ms)");
+            }
+            Ok(Err(e)) => {
+                eprintln!("                {RED}✗{RESET} trust-ping failed: {e}");
+            }
+            Err(_) => {
+                eprintln!("                {RED}✗{RESET} trust-ping timed out");
+            }
+        }
+    }
+
+    // 8. Gather stats from store
+    let acl_ks = store.keyspace(keyspaces::ACL)?;
+    let sessions_ks = store.keyspace(keyspaces::SESSIONS)?;
+
+    // --- ACL ---
+    let acl_entries = acl::list_acl_entries(&acl_ks).await?;
+    // Administrators of any role — the community role `admin` alone confers
+    // nothing (vtc-admin-roles.md §6).
+    let admin_count = acl_entries
+        .iter()
+        .filter(|e| e.admin.is_administrator())
+        .count();
+    let moderator_count = acl_entries
+        .iter()
+        .filter(|e| e.role == VtcRole::Moderator)
+        .count();
+    let issuer_count = acl_entries
+        .iter()
+        .filter(|e| e.role == VtcRole::Issuer)
+        .count();
+    let member_count = acl_entries
+        .iter()
+        .filter(|e| e.role == VtcRole::Member)
+        .count();
+    let custom_count = acl_entries
+        .iter()
+        .filter(|e| matches!(e.role, VtcRole::Custom(_)))
+        .count();
+
+    section(&format!("ACL ({})", acl_entries.len()));
+    eprintln!("  {CYAN}{:<13}{RESET} {admin_count}", "Administrators");
+    eprintln!("  {CYAN}{:<13}{RESET} {moderator_count}", "Moderator");
+    eprintln!("  {CYAN}{:<13}{RESET} {issuer_count}", "Issuer");
+    eprintln!("  {CYAN}{:<13}{RESET} {member_count}", "Member");
+    if custom_count > 0 {
+        eprintln!("  {CYAN}{:<13}{RESET} {custom_count}", "Custom");
+    }
+
+    // --- Sessions ---
+    let sessions = session::list_sessions(&sessions_ks).await?;
+    let authenticated = sessions
+        .iter()
+        .filter(|s| s.state == SessionState::Authenticated)
+        .count();
+    let challenge_sent = sessions
+        .iter()
+        .filter(|s| s.state == SessionState::ChallengeSent)
+        .count();
+
+    section(&format!("Sessions ({})", sessions.len()));
+    eprintln!("  {CYAN}{:<13}{RESET} {authenticated}", "Authenticated");
+    eprintln!("  {CYAN}{:<13}{RESET} {challenge_sent}", "ChallengeSent");
+    eprintln!();
+
+    Ok(())
+}
+
+/// Send a DIDComm trust-ping to the mediator and return latency in milliseconds.
+///
+/// Loads key material from the secret store directly (no BIP-32 derivation).
+async fn send_trust_ping(
+    config: &AppConfig,
+    vtc_did: &str,
+    mediator_did: &str,
+) -> Result<u128, Box<dyn std::error::Error>> {
+    let secret_store = create_secret_store(config)?;
+    let key_material = secret_store
+        .get()
+        .await?
+        .ok_or("no key material available")?;
+
+    // Accept both on-disk shapes: the JSON `VtcKeyBundle` every real
+    // deployment writes since the VTA-driven-keys rework, and the legacy
+    // 64-raw-byte fixture shape. The old `len() == 64` guard here rejected
+    // the bundle shape, so the trust-ping failed on every production VTC
+    // with a baffling byte-count error (P0.19).
+    let own = crate::setup::bundle::own_key_material(vtc_did, &key_material)?;
+
+    let tdk = TDKSharedState::new(TDKConfig::builder().build()?).await?;
+
+    // Under the ids the VTC's own document gives its keys, by role
+    // (VTI-KEY-150; `#key-0` / `#key-1` on the VTC's own did:webvh).
+    let resolver = affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
+        vta_sdk::resolver::build_verifier_did_cache_config(
+            None,
+            config.did_cache.ttl_secs,
+            config.did_cache.capacity,
+        ),
+    )
+    .await
+    .ok();
+    let (signing_id, ka_id) =
+        crate::messaging::vtc_key_ids(resolver.as_ref(), vtc_did, own.key_role_ids.as_ref()).await;
+
+    // The authenticating key: a key-role identity's operational key, else the
+    // Ed25519 key that serves both relationships.
+    let mut signing_secret = match own.authentication.clone() {
+        Some(operational) => operational,
+        None => Secret::generate_ed25519(None, Some(&*own.ed25519)),
+    };
+    signing_secret.id = signing_id;
+    tdk.secrets_resolver().insert(signing_secret).await;
+
+    let mut ka_secret = Secret::generate_x25519(None, Some(&*own.x25519))?;
+    ka_secret.id = ka_id.unwrap_or_else(|| format!("{vtc_did}#key-1"));
+    tdk.secrets_resolver().insert(ka_secret).await;
+
+    let atm = Arc::new(ATM::new(ATMConfig::builder().build()?, Arc::new(tdk)).await?);
+
+    // Mirrors `vta-service::status`: everything past the ATM runs inside the
+    // block so ONE path tears it down (both `?`s below used to return past the
+    // shutdown), and the profile is registered so that shutdown can reach the
+    // websocket at all — it stops sockets by iterating the ATM's profile map
+    // (vta-sdk #830). Stringified first: a boxed error is not `Send`.
+    let outcome = async {
+        let profile = ATMProfile::new(
+            &atm,
+            None,
+            vtc_did.to_string(),
+            Some(mediator_did.to_string()),
+        )
+        .await?;
+        let profile = atm.profile_add(&profile, false).await?;
+
+        // The mediator may only expose a wss:// endpoint (no REST/https).
+        atm.profile_enable_websocket(&profile).await?;
+
+        let start = Instant::now();
+        TrustPing::default()
+            .send_ping(&atm, &profile, mediator_did, true, true, true)
+            .await?;
+        Ok::<u128, Box<dyn std::error::Error>>(start.elapsed().as_millis())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    atm.graceful_shutdown().await;
+    outcome.map_err(Into::into)
+}
+
+/// Report the agent names a resolved DID Document claims via `alsoKnownAs`.
+///
+/// Free — the document is already in hand — and genuinely diagnostic here:
+/// `vtc status` is where an operator checks what their community's DID
+/// actually advertises.
+///
+/// Reported as *claims*, never as the DID's name. That half of the
+/// agent-name binding is self-asserted; confirming one means resolving the
+/// name forward and checking it leads back to this same DID, which is what
+/// `vta_sdk::display_name::agent_name` does.
+fn print_claimed_names(also_known_as: &[String]) {
+    for claim in also_known_as {
+        eprintln!("                {DIM}claims (unverified): {claim}{RESET}");
+    }
+}
+
+/// Print what the VTC's document advertises, what this binary serves, and
+/// every disagreement between them.
+///
+/// The operator-facing half of [`crate::transport_capability`]. The daemon
+/// applies these findings at boot — refusing to start on an `Error`, disabling
+/// messaging when nothing advertised is servable — and this asks the same
+/// question without a restart, off the same functions, so the answers cannot
+/// drift.
+///
+/// `None` means the DID did not resolve (or none is configured). Reported as
+/// unknown rather than as agreement: a document nobody could read is not a
+/// document that matched.
+fn print_transport_section(caps: Option<&vta_sdk::protocol::matching::ServiceCapabilities>) {
+    use crate::transport_capability::{Severity, findings_for_build, served_transports};
+
+    section("Transports");
+
+    let served = served_transports()
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("  {CYAN}{:<13}{RESET} {served}", "This build");
+
+    let Some(caps) = caps else {
+        eprintln!(
+            "  {CYAN}{:<13}{RESET} {DIM}(DID not resolved — cannot compare){RESET}",
+            "Advertised"
+        );
+        return;
+    };
+
+    let advertised = caps.advertised();
+    if advertised.is_empty() {
+        eprintln!("  {CYAN}{:<13}{RESET} {DIM}(none){RESET}", "Advertised");
+    } else {
+        // Preference order, which is also the order a conforming client tries
+        // them in — so the first entry is the one that actually gets used.
+        let list = advertised
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("  {CYAN}{:<13}{RESET} {list}", "Advertised");
+    }
+
+    let findings = findings_for_build(caps);
+    if findings.is_empty() {
+        eprintln!("  {GREEN}✓{RESET} document and binary agree");
+        return;
+    }
+    // Headline then remediation, rather than one long paragraph per finding.
+    // The operator running this is usually scanning for *which* thing is
+    // wrong; the fix is what they read second, once they have found it.
+    for f in findings {
+        let (mark, colour) = match f.severity {
+            Severity::Error => ("✗", RED),
+            Severity::Warn => ("!", YELLOW),
+            Severity::Info => ("·", DIM),
+        };
+        eprintln!("  {colour}{mark}{RESET} {}", f.summary);
+        eprintln!("    {DIM}{}{RESET}", f.message);
+    }
+}

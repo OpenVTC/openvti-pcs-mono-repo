@@ -1,0 +1,1204 @@
+//! The watcher's Trust Task listener, driven through each of its three
+//! transport entry points — the TSP frame handler, the DIDComm envelope
+//! handler and `POST /api/trust-tasks` — with documents signed as a control
+//! plane's outbox signs them.
+//!
+//! Every sync task (`webvh/sync/update/0.2`, `delete/0.2`, `batch/0.1`) is
+//! applied on every transport from a configured source; every one refuses an
+//! unsigned document, a foreign signer and a proof of the wrong purpose; the
+//! log is verified exactly as an edge verifies it; and a replay is not applied
+//! twice.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use affinidi_data_integrity::DidKeyResolver;
+use affinidi_messaging_didcomm::Message;
+use affinidi_secrets_resolver::secrets::Secret;
+use did_hosting_common::did::{DidDocumentOptions, build_did_document};
+use did_hosting_common::didcomm_types::{MSG_SYNC_BATCH, MSG_SYNC_DELETE, MSG_SYNC_UPDATE};
+use did_hosting_common::server::config::StoreConfig;
+use did_hosting_common::server::identity::ServiceIdentity;
+use did_hosting_common::server::store::Store;
+use did_hosting_common::server::trust_tasks::send::build_request;
+use did_hosting_common::server::trust_tasks::{TransportBoundVerifier, sign_document};
+use serde_json::{Value, json};
+use webvh_watcher::config::{AppConfig, SyncConfig};
+use webvh_watcher::server::AppState;
+use webvh_watcher::watcher_ops;
+
+fn signer(seed: u8) -> (String, Secret) {
+    let secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+    let pk = secret.get_public_keymultibase().unwrap();
+    let did = format!("did:key:{pk}");
+    let mut s = secret;
+    s.id = format!("{did}#{pk}");
+    (did, s)
+}
+
+fn watcher() -> (String, Secret) {
+    signer(80)
+}
+
+fn source() -> (String, Secret) {
+    signer(81)
+}
+
+fn stranger() -> (String, Secret) {
+    signer(82)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Via {
+    Tsp,
+    Didcomm,
+    Https,
+}
+
+const VIAS: [Via; 3] = [Via::Tsp, Via::Didcomm, Via::Https];
+
+/// A watcher with its own signing identity, mirroring `source()` only.
+async fn watcher_state() -> (AppState, tempfile::TempDir) {
+    let (my_did, my_key) = watcher();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store_config = StoreConfig {
+        data_dir: PathBuf::from(dir.path()),
+        ..StoreConfig::default()
+    };
+    let store = Store::open(&store_config).await.expect("open store");
+    let config = AppConfig {
+        server_did: Some(my_did.clone()),
+        store: store_config,
+        sync: SyncConfig {
+            source_dids: vec![source().0],
+            sources: Vec::new(),
+        },
+        ..AppConfig::default()
+    };
+    let identity = ServiceIdentity::from_signing_secret(&my_did, my_key)
+        .await
+        .unwrap();
+    let mut state = AppState::new(store, config, Some(identity)).unwrap();
+    state.trust_tasks_verifier = Some(Arc::new(TransportBoundVerifier::with_resolver(Arc::new(
+        DidKeyResolver,
+    ))));
+    (state, dir)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Proof {
+    Authentication,
+    AssertionMethod,
+    None,
+}
+
+async fn document(type_uri: &str, from: &(String, Secret), payload: Value, proof: Proof) -> Value {
+    let doc = build_request(type_uri, &from.0, &watcher().0, payload).unwrap();
+    match proof {
+        Proof::Authentication => {
+            serde_json::to_value(sign_document(&doc, &from.1).await.unwrap()).unwrap()
+        }
+        Proof::AssertionMethod => {
+            use trust_tasks_proof::affinidi::{CryptoSuite, SignOptions, sign_trust_task};
+            sign_trust_task(
+                &serde_json::to_value(&doc).unwrap(),
+                &from.1,
+                SignOptions::new()
+                    .with_proof_purpose("assertionMethod")
+                    .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+            )
+            .await
+            .unwrap()
+        }
+        Proof::None => serde_json::to_value(doc).unwrap(),
+    }
+}
+
+async fn signed(type_uri: &str, from: &(String, Secret), payload: Value) -> Value {
+    document(type_uri, from, payload, Proof::Authentication).await
+}
+
+async fn deliver(state: &AppState, via: Via, sender: &str, doc: Value) -> Option<Value> {
+    match via {
+        Via::Tsp => webvh_watcher::tsp::run_tsp_trust_task(
+            state,
+            sender,
+            &serde_json::to_vec(&doc).unwrap(),
+        )
+        .await
+        .expect("TSP entry point")
+        .map(|frame| serde_json::from_slice(&frame).expect("TSP reply is JSON")),
+        Via::Didcomm => {
+            let message = Message::build(
+                uuid::Uuid::new_v4().to_string(),
+                trust_tasks_didcomm::ENVELOPE_TYPE.to_string(),
+                doc,
+            )
+            .finalize();
+            webvh_watcher::messaging::run_trust_tasks_envelope(state, Some(sender), &message)
+                .await
+                .map(|(typ, body)| {
+                    assert_eq!(typ, trust_tasks_didcomm::ENVELOPE_TYPE);
+                    body
+                })
+        }
+        Via::Https => {
+            use axum::response::IntoResponse;
+            use http_body_util::BodyExt;
+            let response = webvh_watcher::routes::trust_tasks::receive(
+                axum::extract::State(state.clone()),
+                axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+                axum::http::HeaderMap::new(),
+                axum::body::Body::from(serde_json::to_vec(&doc).unwrap()),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).expect("HTTPS reply is JSON");
+            if status == axum::http::StatusCode::FORBIDDEN {
+                assert!(body.get("proof").is_none(), "{body}");
+                None
+            } else {
+                assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+                Some(body)
+            }
+        }
+    }
+}
+
+fn signed_by_the_watcher(reply: &Value, to: &str) {
+    assert!(reply.get("proof").is_some(), "the reply is signed: {reply}");
+    assert_eq!(reply["issuer"], watcher().0, "{reply}");
+    assert_eq!(reply["recipient"], to, "{reply}");
+}
+
+fn answered(reply: &Value, type_uri: &str) -> Value {
+    answered_to(reply, type_uri, &source().0)
+}
+
+fn answered_to(reply: &Value, type_uri: &str, to: &str) -> Value {
+    assert_eq!(reply["type"], format!("{type_uri}#response"), "{reply}");
+    signed_by_the_watcher(reply, to);
+    let schema = did_hosting_common::tasks::payload_schema(&format!("{type_uri}#response"))
+        .unwrap_or_else(|| panic!("no schema is known for {type_uri}#response"));
+    if let Err(e) = trust_tasks_rs::validate::against_schema(schema, &reply["payload"]) {
+        panic!("{type_uri} reply does not match its schema: {e:?}\n{reply}");
+    }
+    reply["payload"].clone()
+}
+
+fn refused(reply: &Value, to: &str) -> String {
+    assert!(
+        reply["type"]
+            .as_str()
+            .is_some_and(|t| t.contains("/trust-task-error/")),
+        "expected an error, got {reply}"
+    );
+    signed_by_the_watcher(reply, to);
+    reply["payload"]["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A did:webvh log for `mnemonic` on `origin.example.com`: one entry, or two
+/// with the second deactivating it.
+/// The genesis `versionTime` of every test log: fixed, because the SCID — and
+/// so the DID — hashes it. Taken from the wall clock, two `did_log` calls for
+/// one identity a second boundary apart produced two different DIDs, and
+/// `logs_are_verified_before_they_are_mirrored` failed (intermittently) as
+/// `invalidLog` on a log that was valid. In the past, so a later entry (the
+/// deactivation, stamped now) is always later.
+fn genesis_time() -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").expect("a fixed instant")
+}
+
+async fn did_log(mnemonic: &str, entries: usize) -> (String, String) {
+    let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().unwrap();
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(
+        "origin.example.com",
+        mnemonic,
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(Some(genesis_time()), &doc, &params, &signing)
+        .await
+        .expect("create webvh log entry");
+    if entries > 1 {
+        state.deactivate(&signing).await.expect("deactivate");
+    }
+    let log = state
+        .log_entries()
+        .iter()
+        .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let did = did_hosting_common::did_ops::extract_did_id(&log).unwrap();
+    (did, log)
+}
+
+fn update_body(mnemonic: &str, did: &str, log: &str) -> Value {
+    json!({
+        "mnemonic": mnemonic,
+        "didId": did,
+        "logContent": log,
+        "versionCount": log.lines().filter(|l| !l.trim().is_empty()).count(),
+        "disabled": false,
+    })
+}
+
+async fn held(state: &AppState, mnemonic: &str) -> Option<watcher_ops::WatcherRecord> {
+    watcher_ops::get_record(&state.dids_ks, mnemonic)
+        .await
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Every task, on every transport
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_sync_task_is_applied_on_every_transport() {
+    for via in VIAS {
+        let (state, _dir) = watcher_state().await;
+        let s = source();
+        let (did, log) = did_log("alice", 1).await;
+
+        // sync/update
+        let reply = deliver(
+            &state,
+            via,
+            &s.0,
+            signed(MSG_SYNC_UPDATE, &s, update_body("alice", &did, &log)).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            answered(&reply, MSG_SYNC_UPDATE),
+            json!({ "mnemonic": "alice", "status": "applied" }),
+            "{via:?}"
+        );
+        let record = held(&state, "alice").await.expect("mirrored");
+        assert_eq!(record.did_id, did);
+        assert_eq!(record.source_did, s.0);
+
+        // The same state again is `unchanged`.
+        let reply = deliver(
+            &state,
+            via,
+            &s.0,
+            signed(MSG_SYNC_UPDATE, &s, update_body("alice", &did, &log)).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "unchanged");
+
+        // sync/batch
+        let (bob_did, bob_log) = did_log("bob", 1).await;
+        let reply = deliver(
+            &state,
+            via,
+            &s.0,
+            signed(
+                MSG_SYNC_BATCH,
+                &s,
+                json!({ "updates": [update_body("bob", &bob_did, &bob_log)] }),
+            )
+            .await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            answered(&reply, MSG_SYNC_BATCH)["results"][0],
+            json!({ "mnemonic": "bob", "status": "applied" })
+        );
+        assert!(held(&state, "bob").await.is_some());
+
+        // sync/delete
+        let reply = deliver(
+            &state,
+            via,
+            &s.0,
+            signed(MSG_SYNC_DELETE, &s, json!({ "mnemonic": "alice" })).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            answered(&reply, MSG_SYNC_DELETE),
+            json!({ "mnemonic": "alice", "status": "deleted" })
+        );
+        assert!(held(&state, "alice").await.is_none());
+        let reply = deliver(
+            &state,
+            via,
+            &s.0,
+            signed(MSG_SYNC_DELETE, &s, json!({ "mnemonic": "alice" })).await,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "absent");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Refusals, for every task on every transport
+// ---------------------------------------------------------------------------
+
+async fn payloads() -> Vec<(&'static str, Value)> {
+    let (did, log) = did_log("carol", 1).await;
+    vec![
+        (MSG_SYNC_UPDATE, update_body("carol", &did, &log)),
+        (
+            MSG_SYNC_BATCH,
+            json!({ "updates": [update_body("carol", &did, &log)] }),
+        ),
+        (MSG_SYNC_DELETE, json!({ "mnemonic": "carol" })),
+    ]
+}
+
+/// A document that does not verify — unsigned, or signed for the wrong
+/// purpose — gets no reply and applies nothing.
+#[tokio::test]
+async fn unverified_documents_get_no_reply() {
+    for via in VIAS {
+        let (state, _dir) = watcher_state().await;
+        let s = source();
+        for (type_uri, payload) in payloads().await {
+            for proof in [Proof::None, Proof::AssertionMethod] {
+                let doc = document(type_uri, &s, payload.clone(), proof).await;
+                assert_eq!(
+                    deliver(&state, via, &s.0, doc).await,
+                    None,
+                    "{via:?} {type_uri} {proof:?}"
+                );
+            }
+        }
+        assert!(held(&state, "carol").await.is_none(), "{via:?}");
+    }
+}
+
+/// The source-DID allowlist: a claimed issuer that is not a configured
+/// source is refused before its proof is ever checked — no reply at all,
+/// exactly like a document that never verified (the pre-check in
+/// `dispatch_inbound_document` compares the claimed issuer against
+/// `source_dids` before any DID resolution). Applies nothing, and takes no
+/// room in the replay cache — the same document resent is refused again, not
+/// dropped as a replay.
+#[tokio::test]
+async fn only_configured_sources_are_applied() {
+    for via in VIAS {
+        let (state, _dir) = watcher_state().await;
+        let x = stranger();
+        for (type_uri, payload) in payloads().await {
+            let doc = signed(type_uri, &x, payload).await;
+            for _ in 0..2 {
+                assert_eq!(
+                    deliver(&state, via, &x.0, doc.clone()).await,
+                    None,
+                    "{via:?} {type_uri}: a claimed issuer outside the source allowlist must not be answered"
+                );
+            }
+        }
+        assert!(held(&state, "carol").await.is_none(), "{via:?}");
+    }
+}
+
+/// With no configured source, nothing is ever applied — and, per the
+/// pre-check above, nothing is even resolved: every claimed issuer fails the
+/// (empty) allowlist before its proof is checked.
+#[tokio::test]
+async fn an_empty_allowlist_applies_nothing() {
+    let (mut state, _dir) = watcher_state().await;
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.clear();
+    state.config = Arc::new(config);
+    let s = source();
+    let (did, log) = did_log("dave", 1).await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &s.0,
+        signed(MSG_SYNC_UPDATE, &s, update_body("dave", &did, &log)).await,
+    )
+    .await;
+    assert_eq!(reply, None);
+    assert!(held(&state, "dave").await.is_none());
+}
+
+#[tokio::test]
+async fn a_sender_that_disagrees_with_the_proof_is_not_answered() {
+    let (state, _dir) = watcher_state().await;
+    let s = source();
+    for via in [Via::Tsp, Via::Didcomm] {
+        let doc = signed(MSG_SYNC_DELETE, &s, json!({ "mnemonic": "x" })).await;
+        assert_eq!(deliver(&state, via, &stranger().0, doc).await, None);
+    }
+}
+
+#[tokio::test]
+async fn a_replay_is_refused() {
+    for via in VIAS {
+        let (state, _dir) = watcher_state().await;
+        let s = source();
+        let doc = signed(MSG_SYNC_DELETE, &s, json!({ "mnemonic": "x" })).await;
+        assert!(deliver(&state, via, &s.0, doc.clone()).await.is_some());
+        assert_eq!(deliver(&state, via, &s.0, doc).await, None, "{via:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The log is verified as an edge verifies it
+// ---------------------------------------------------------------------------
+
+async fn update_refusal(state: &AppState, body: Value) -> String {
+    let s = source();
+    let reply = deliver(
+        state,
+        Via::Https,
+        &s.0,
+        signed(MSG_SYNC_UPDATE, &s, body).await,
+    )
+    .await
+    .expect("answered");
+    refused(&reply, &s.0)
+}
+
+#[tokio::test]
+async fn logs_are_verified_before_they_are_mirrored() {
+    let (state, _dir) = watcher_state().await;
+    let (did, log) = did_log("erin", 1).await;
+
+    // A tampered log.
+    let tampered = log.replacen("origin.example.com", "evil.example.com", 1);
+    assert_eq!(
+        update_refusal(&state, update_body("erin", &did, &tampered)).await,
+        "webvh/sync/update:invalidLog"
+    );
+    // Filed under another slot.
+    assert_eq!(
+        update_refusal(&state, update_body("mallory", &did, &log)).await,
+        "webvh/sync/update:invalidLog"
+    );
+    // A versionCount that is not the log's.
+    let mut body = update_body("erin", &did, &log);
+    body["versionCount"] = json!(2);
+    assert_eq!(
+        update_refusal(&state, body).await,
+        "webvh/sync/update:invalidLog"
+    );
+    assert!(held(&state, "erin").await.is_none());
+
+    // Once the two-entry (deactivated) log is mirrored, the one-entry log is
+    // a history rewrite…
+    let (_, deactivated) = did_log("erin", 2).await;
+    let s = source();
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &s.0,
+        signed(MSG_SYNC_UPDATE, &s, update_body("erin", &did, &deactivated)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+    assert_eq!(
+        update_refusal(&state, update_body("erin", &did, &log)).await,
+        "webvh/sync/update:historyRewrite"
+    );
+
+    // …even after a delete: the high-water mark stays.
+    deliver(
+        &state,
+        Via::Https,
+        &s.0,
+        signed(MSG_SYNC_DELETE, &s, json!({ "mnemonic": "erin" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        update_refusal(&state, update_body("erin", &did, &log)).await,
+        "webvh/sync/update:historyRewrite"
+    );
+}
+
+/// 0.1's snake_case members are refused, not ignored.
+#[tokio::test]
+async fn a_snake_case_payload_is_refused() {
+    let (state, _dir) = watcher_state().await;
+    let (did, log) = did_log("frank", 1).await;
+    let code = update_refusal(
+        &state,
+        json!({
+            "mnemonic": "frank", "did_id": did, "log_content": log,
+            "version_count": 1, "disabled": false,
+        }),
+    )
+    .await;
+    assert_eq!(code, "malformedRequest");
+    assert!(held(&state, "frank").await.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// One source cannot take over or delete another source's slot
+// ---------------------------------------------------------------------------
+
+/// A one-entry did:webvh log for `mnemonic` on `host`.
+async fn did_log_on(host: &str, mnemonic: &str) -> (String, String) {
+    let secret = Secret::generate_ed25519(None, Some(&[11u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().unwrap();
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(host, mnemonic, &pk_mb, &DidDocumentOptions::default());
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(Some(genesis_time()), &doc, &params, &signing)
+        .await
+        .expect("create webvh log entry");
+    let log = state
+        .log_entries()
+        .iter()
+        .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let did = did_hosting_common::did_ops::extract_did_id(&log).unwrap();
+    (did, log)
+}
+
+#[tokio::test]
+async fn a_source_cannot_take_over_or_delete_another_sources_slot() {
+    let (mut state, _dir) = watcher_state().await;
+    let (a, b) = (source(), signer(83));
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.push(b.0.clone());
+    state.config = Arc::new(config);
+
+    let (did_a, log_a) = did_log_on("origin.example.com", "frank").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("frank", &did_a, &log_a)).await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE);
+
+    // Another source's DID at the same slot is refused.
+    let (did_b, log_b) = did_log_on("other.example.com", "frank").await;
+    assert_ne!(did_a, did_b);
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("frank", &did_b, &log_b)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    assert_eq!(held(&state, "frank").await.unwrap().did_id, did_a);
+
+    // Its delete leaves the slot alone, and says nothing of it.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_DELETE, &b, json!({ "mnemonic": "frank" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        reply["type"],
+        format!("{MSG_SYNC_DELETE}#response"),
+        "{reply}"
+    );
+    signed_by_the_watcher(&reply, &b.0);
+    assert_eq!(reply["payload"]["status"], "absent");
+    assert!(held(&state, "frank").await.is_some());
+
+    // The slot's own source can delete it.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_DELETE, &a, json!({ "mnemonic": "frank" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+    assert!(held(&state, "frank").await.is_none());
+}
+
+/// A watcher configured with two sources: the default one and a second.
+async fn two_source_watcher() -> (
+    AppState,
+    tempfile::TempDir,
+    (String, Secret),
+    (String, Secret),
+) {
+    let (mut state, dir) = watcher_state().await;
+    let (a, b) = (source(), signer(84));
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.push(b.0.clone());
+    state.config = Arc::new(config);
+    (state, dir, a, b)
+}
+
+#[tokio::test]
+async fn a_source_cannot_resend_disable_or_delete_another_sources_did() {
+    let (state, _dir, a, b) = two_source_watcher().await;
+    let (did, log) = did_log("grace", 1).await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("grace", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE);
+
+    // The same log, with `disabled` flipped, from the other source.
+    let mut disable = update_body("grace", &did, &log);
+    disable["disabled"] = json!(true);
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, disable.clone()).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+
+    // The same log, unchanged, from the other source.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("grace", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+
+    // In a batch, the entry is refused with the same code.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_BATCH, &b, json!({ "updates": [disable] })).await,
+    )
+    .await
+    .expect("answered");
+    let results = answered_to(&reply, MSG_SYNC_BATCH, &b.0)["results"].clone();
+    assert_eq!(results[0]["status"], "refused", "{results}");
+    assert_eq!(results[0]["code"], "webvh/sync/update:notAuthorized");
+
+    // Its delete leaves the slot alone.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_DELETE, &b, json!({ "mnemonic": "grace" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_DELETE, &b.0)["status"],
+        "absent"
+    );
+
+    let record = held(&state, "grace").await.expect("still mirrored");
+    assert_eq!(record.source_did, a.0);
+    assert!(!record.disabled);
+
+    // The holding source can still disable it.
+    let mut disable = update_body("grace", &did, &log);
+    disable["disabled"] = json!(true);
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, disable).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+    let record = held(&state, "grace").await.unwrap();
+    assert!(record.disabled);
+    assert_eq!(record.source_did, a.0);
+}
+
+/// A slot stays bound to the source that holds it, including a record stored
+/// before this rule; once that source deletes it, the slot is free again.
+#[tokio::test]
+async fn a_stored_slot_stays_bound_to_its_source_until_that_source_deletes_it() {
+    let (state, _dir, a, b) = two_source_watcher().await;
+    let (did, log) = did_log("heidi", 1).await;
+    // Write the slot directly, as an earlier release stored it.
+    let record = watcher_ops::WatcherRecord {
+        mnemonic: "heidi".into(),
+        did_id: did.clone(),
+        source_did: a.0.clone(),
+        version_count: 1,
+        updated_at: 1,
+        disabled: false,
+    };
+    let mut batch = state.store.batch();
+    batch
+        .insert(&state.dids_ks, watcher_ops::did_key("heidi"), &record)
+        .unwrap();
+    batch.insert_raw(
+        &state.dids_ks,
+        watcher_ops::content_log_key("heidi"),
+        log.as_bytes().to_vec(),
+    );
+    batch.commit().await.unwrap();
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("heidi", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    assert_eq!(held(&state, "heidi").await.unwrap().source_did, a.0);
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_DELETE, &a, json!({ "mnemonic": "heidi" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_DELETE)["status"], "deleted");
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("heidi", &did, &log)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_UPDATE, &b.0)["status"],
+        "applied"
+    );
+    assert_eq!(held(&state, "heidi").await.unwrap().source_did, b.0);
+}
+
+/// The one-entry log [`did_log`] builds for `mnemonic`, and a two-entry log
+/// that extends it with an ordinary update (not a deactivation).
+async fn did_log_and_extension(mnemonic: &str) -> (String, String, String) {
+    let secret = Secret::generate_ed25519(None, Some(&[7u8; 32]));
+    let pk_mb = secret.get_public_keymultibase().unwrap();
+    let mut signing = secret.clone();
+    signing.id = format!("did:key:{pk_mb}#{pk_mb}");
+    let doc = build_did_document(
+        "origin.example.com",
+        mnemonic,
+        &pk_mb,
+        &DidDocumentOptions::default(),
+    );
+    let params = didwebvh_rs::parameters::Parameters {
+        update_keys: Some(Arc::new(vec![pk_mb.clone().into()])),
+        ..Default::default()
+    };
+    let mut state = didwebvh_rs::DIDWebVHState::default();
+    state
+        .create_log_entry(Some(genesis_time()), &doc, &params, &signing)
+        .await
+        .expect("create webvh log entry");
+    let render = |state: &didwebvh_rs::DIDWebVHState| {
+        state
+            .log_entries()
+            .iter()
+            .map(|e| serde_json::to_string(&e.log_entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let v1 = render(&state);
+    let mut doc = serde_json::to_value(&state.log_entries()[0].log_entry).unwrap()["state"].clone();
+    doc["alsoKnownAs"] = json!(["https://example.org/v2"]);
+    state
+        .create_log_entry(None, &doc, &params, &signing)
+        .await
+        .expect("second webvh log entry");
+    let v2 = render(&state);
+    let did = did_hosting_common::did_ops::extract_did_id(&v1).unwrap();
+    (did, v1, v2)
+}
+
+#[tokio::test]
+async fn a_source_cannot_extend_another_sources_did() {
+    let (state, _dir, a, b) = two_source_watcher().await;
+    let (did, v1, v2) = did_log_and_extension("ivan").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("ivan", &did, &v1)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("ivan", &did, &v2)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    let record = held(&state, "ivan").await.unwrap();
+    assert_eq!(
+        (record.source_did.as_str(), record.version_count),
+        (a.0.as_str(), 1)
+    );
+
+    // The holder's own extension applies.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("ivan", &did, &v2)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+    assert_eq!(held(&state, "ivan").await.unwrap().version_count, 2);
+}
+
+/// A slot whose holder is removed from the configuration is released: another
+/// configured source may sync it (still held to the high-water log) or
+/// delete it.
+#[tokio::test]
+async fn a_slot_is_released_when_its_holder_is_no_longer_a_source() {
+    let (mut state, _dir, a, b) = two_source_watcher().await;
+    let (did, v1, v2) = did_log_and_extension("judy").await;
+    let (did_k, log_k) = did_log_on("origin.example.com", "karl").await;
+    for (m, d, l) in [("judy", &did, &v2), ("karl", &did_k, &log_k)] {
+        let reply = deliver(
+            &state,
+            Via::Https,
+            &a.0,
+            signed(MSG_SYNC_UPDATE, &a, update_body(m, d, l)).await,
+        )
+        .await
+        .expect("answered");
+        answered(&reply, MSG_SYNC_UPDATE);
+    }
+
+    // The operator removes A.
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.retain(|s| *s != a.0);
+    state.config = Arc::new(config);
+
+    // B may not roll the released DID back...
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("judy", &did, &v1)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:historyRewrite");
+
+    // ...but may take it over at the high-water log.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("judy", &did, &v2)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_UPDATE, &b.0)["status"],
+        "applied"
+    );
+    assert_eq!(held(&state, "judy").await.unwrap().source_did, b.0);
+
+    // And may delete a released slot.
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_DELETE, &b, json!({ "mnemonic": "karl" })).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_DELETE, &b.0)["status"],
+        "deleted"
+    );
+    assert!(held(&state, "karl").await.is_none());
+}
+
+/// A source configured with `domains` may sync only DIDs on those hosts; a
+/// source without them is unaffected.
+#[tokio::test]
+async fn a_source_with_domains_syncs_only_dids_on_them() {
+    let (mut state, _dir, a, b) = two_source_watcher().await;
+    let mut config = (*state.config).clone();
+    config.sync.source_dids.retain(|s| *s != b.0);
+    config
+        .sync
+        .sources
+        .push(webvh_watcher::config::SourceConfig {
+            did: b.0.clone(),
+            domains: vec!["Other.Example.com".into()],
+        });
+    state.config = Arc::new(config);
+
+    let (did_o, log_o) = did_log_on("origin.example.com", "liam").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("liam", &did_o, &log_o)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(refused(&reply, &b.0), "webvh/sync/update:notAuthorized");
+    assert!(held(&state, "liam").await.is_none());
+
+    let (did_x, log_x) = did_log_on("other.example.com", "liam").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &b.0,
+        signed(MSG_SYNC_UPDATE, &b, update_body("liam", &did_x, &log_x)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(
+        answered_to(&reply, MSG_SYNC_UPDATE, &b.0)["status"],
+        "applied"
+    );
+
+    // A has no domains configured: any host.
+    let (did_m, log_m) = did_log_on("origin.example.com", "mia").await;
+    let reply = deliver(
+        &state,
+        Via::Https,
+        &a.0,
+        signed(MSG_SYNC_UPDATE, &a, update_body("mia", &did_m, &log_m)).await,
+    )
+    .await
+    .expect("answered");
+    assert_eq!(answered(&reply, MSG_SYNC_UPDATE)["status"], "applied");
+}
+
+// ---------------------------------------------------------------------------
+// The high-water mark, and resolution
+// ---------------------------------------------------------------------------
+
+fn scid_of(did: &str) -> String {
+    did.strip_prefix("did:webvh:")
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+async fn apply(state: &AppState, body: Value) -> String {
+    let s = source();
+    let reply = deliver(
+        state,
+        Via::Https,
+        &s.0,
+        signed(MSG_SYNC_UPDATE, &s, body).await,
+    )
+    .await
+    .expect("answered");
+    answered(&reply, MSG_SYNC_UPDATE)["status"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The mark is a few fields, not a second copy of the log; a full-log row an
+/// earlier release stored is rewritten compact and keeps refusing rollbacks.
+#[tokio::test]
+async fn the_high_water_mark_is_compact_and_legacy_rows_migrate() {
+    let (state, _dir) = watcher_state().await;
+    let (did, log) = did_log("erin", 2).await;
+    assert_eq!(
+        apply(&state, update_body("erin", &did, &log)).await,
+        "applied"
+    );
+    let raw = state
+        .dids_ks
+        .get_raw(watcher_ops::high_water_key(&scid_of(&did)))
+        .await
+        .unwrap()
+        .expect("a mark is kept");
+    let mark: watcher_ops::HighWaterMark = serde_json::from_slice(&raw).expect("compact form");
+    assert_eq!(mark, watcher_ops::HighWaterMark::of(&log));
+    assert_eq!(mark.entries, 2);
+    assert!(mark.deactivated);
+    assert!(raw.len() < log.len(), "smaller than the log it marks");
+
+    // A legacy row: the full log, under another DID's SCID.
+    let (did_f, log_f) = did_log("frank", 2).await;
+    let key = watcher_ops::high_water_key(&scid_of(&did_f));
+    state
+        .dids_ks
+        .insert_raw(key.clone(), log_f.as_bytes().to_vec())
+        .await
+        .unwrap();
+    // Read as its mark before the migration…
+    let (_, one) = did_log("frank", 1).await;
+    assert_eq!(
+        update_refusal(&state, update_body("frank", &did_f, &one)).await,
+        "webvh/sync/update:historyRewrite"
+    );
+    // …and rewritten by it, once.
+    assert_eq!(
+        watcher_ops::migrate_high_water_marks(&state.dids_ks)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        watcher_ops::migrate_high_water_marks(&state.dids_ks)
+            .await
+            .unwrap(),
+        0
+    );
+    let migrated: watcher_ops::HighWaterMark =
+        serde_json::from_slice(&state.dids_ks.get_raw(key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(migrated, watcher_ops::HighWaterMark::of(&log_f));
+    assert_eq!(
+        update_refusal(&state, update_body("frank", &did_f, &one)).await,
+        "webvh/sync/update:historyRewrite"
+    );
+    // The full log itself still extends the mark.
+    assert_eq!(
+        apply(&state, update_body("frank", &did_f, &log_f)).await,
+        "applied"
+    );
+}
+
+/// A mark admits exactly the logs that extend the one it marks.
+#[tokio::test]
+async fn a_mark_admits_only_extensions() {
+    let (_, one) = did_log("gina", 1).await;
+    let (_, two) = did_log("gina", 2).await;
+    let mark = watcher_ops::HighWaterMark::of(&one);
+    assert!(mark.admits(&one).is_ok(), "the same log");
+    assert!(mark.admits(&two).is_ok(), "an extension");
+    assert!(
+        mark.admits(&format!("{one}\n")).is_ok(),
+        "blank lines are not entries"
+    );
+    let forked = one.replacen("origin.example.com", "fork.example.com", 1);
+    assert!(mark.admits(&forked).is_err(), "a fork");
+    let deactivated = watcher_ops::HighWaterMark::of(&two);
+    assert!(deactivated.admits(&one).is_err(), "a rollback");
+    assert!(deactivated.admits(&two).is_ok());
+}
+
+async fn get(
+    state: &AppState,
+    path: &str,
+    if_none_match: Option<&str>,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+    let mut request = axum::http::Request::get(path);
+    if let Some(tag) = if_none_match {
+        request = request.header("if-none-match", tag);
+    }
+    webvh_watcher::routes::router_public_only()
+        .with_state(state.clone())
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// A mirrored log carries a strong ETag and answers a matching
+/// `If-None-Match` with 304; a disabled slot is hidden from the in-memory
+/// set, loaded at boot and kept current by every sync.
+#[tokio::test]
+async fn resolution_answers_conditional_requests_and_hides_disabled_slots() {
+    use http_body_util::BodyExt;
+    let (state, _dir) = watcher_state().await;
+    let (did, log) = did_log("hana", 1).await;
+    assert_eq!(
+        apply(&state, update_body("hana", &did, &log)).await,
+        "applied"
+    );
+    state.prepare_mirror().await.unwrap();
+
+    let ok = get(&state, "/hana/did.jsonl", None).await;
+    assert_eq!(ok.status(), 200);
+    let etag = ok.headers()["etag"].to_str().unwrap().to_string();
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"'),
+        "strong: {etag}"
+    );
+    let body = ok.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, log.as_bytes());
+
+    let not_modified = get(&state, "/hana/did.jsonl", Some(&etag)).await;
+    assert_eq!(not_modified.status(), 304);
+    assert_eq!(not_modified.headers()["etag"], etag.as_str());
+    assert!(
+        not_modified
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    let other = get(&state, "/hana/did.jsonl", Some("\"other\"")).await;
+    assert_eq!(other.status(), 200);
+
+    // Disabled, then enabled again, through syncs.
+    let mut body = update_body("hana", &did, &log);
+    body["disabled"] = json!(true);
+    assert_eq!(apply(&state, body).await, "applied");
+    assert_eq!(get(&state, "/hana/did.jsonl", None).await.status(), 404);
+    assert_eq!(
+        apply(&state, update_body("hana", &did, &log)).await,
+        "applied"
+    );
+    assert_eq!(get(&state, "/hana/did.jsonl", None).await.status(), 200);
+
+    // A disabled slot already stored is hidden by a freshly loaded set.
+    let mut body = update_body("hana", &did, &log);
+    body["disabled"] = json!(true);
+    assert_eq!(apply(&state, body).await, "applied");
+    let restarted = AppState::new(
+        state.store.clone(),
+        (*state.config).clone(),
+        state.identity.clone(),
+    )
+    .unwrap();
+    restarted.prepare_mirror().await.unwrap();
+    assert_eq!(get(&restarted, "/hana/did.jsonl", None).await.status(), 404);
+}

@@ -1,0 +1,422 @@
+//! `VtcRole` — the VTC-specific role taxonomy.
+//!
+//! Spec §5.3:
+//! ```text
+//! enum VtcRole { Admin, Moderator, Issuer, Member, Custom(String) }
+//! ```
+//!
+//! ## Why a new enum
+//!
+//! `vti_common::acl::Role` carries the VTA's role taxonomy
+//! (`Admin`, `Initiator`, `Application`, `Reader`, `Monitor`) and is
+//! shared between VTA + VTC. Adding the VTC variants
+//! (`Moderator`, `Issuer`, `Member`, `Custom`) to the shared enum
+//! would force every VTA-side code path to handle roles it has no
+//! semantics for. Phase-1 plan §D1 keeps the role taxonomy
+//! service-owned — VTC ships its own enum, VTA stays untouched.
+//!
+//! ## Wire shape (and why not `#[serde(tag)]`)
+//!
+//! The plan originally proposed
+//! `#[serde(tag = "type", content = "value")]`, which would
+//! serialise `VtcRole::Admin` as `{"type":"admin"}`. That breaks
+//! backwards-compatibility with the existing `acl:<did>` rows
+//! written by Phase 0's bootstrap path, which store the role as a
+//! plain lowercase string (`"admin"`) via
+//! `vti_common::acl::Role`'s `#[serde(rename_all = "lowercase")]`.
+//!
+//! Instead, every variant is a single string. The `Custom`
+//! variant uses a `custom:` prefix to distinguish from the named
+//! variants:
+//!
+//! | Variant | Wire |
+//! |---|---|
+//! | `Admin` | `"admin"` |
+//! | `Moderator` | `"moderator"` |
+//! | `Issuer` | `"issuer"` |
+//! | `Member` | `"member"` |
+//! | `Custom("editor")` | `"custom:editor"` |
+//!
+//! The `custom:` prefix makes the encoding unambiguous: a string
+//! that doesn't start with `custom:` can only be one of the four
+//! named variants. Custom names are validated against a
+//! conservative charset (lowercase alphanumeric + `-` + `_`,
+//! 1..=64 chars) so a malicious `custom:admin` value cannot
+//! decode to the `Admin` variant via the colon-strip.
+//!
+//! **Phase-1 outcome note**: the on-disk wire shape diverges from
+//! the plan's proposal for the backwards-compat reason above.
+//! Captured here so the deviation is findable from the plan doc.
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use vti_common::error::AppError;
+
+/// The VTC's role taxonomy. See module docs for the wire shape.
+///
+/// `ToSchema` is implemented by hand below, not derived: `Serialize` is written
+/// by hand too, and a derive cannot see that.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VtcRole {
+    /// Full management access. Spec §5.3 default permission matrix.
+    Admin,
+    /// Approves / rejects join requests; policy-gated removal of
+    /// other members.
+    Moderator,
+    /// Issues community statements (VSCs, `vtc/endorsements/issue/0.1`) on
+    /// behalf of the community.
+    ///
+    /// The relationship card is not on this list: it is a verifiable data
+    /// structure, to be defined by the planned DTG VDS specification, not a
+    /// DTG credential an Issuer mints.
+    Issuer,
+    /// Standard member. Default role on join.
+    Member,
+    /// **Not a membership.** A subject the community holds an entry for only
+    /// so that the resource grants it holds have a live entry to sit on
+    /// (**VTI-ACL-037**): the bridge serving a namespace, holding
+    /// `git.commit.sign` there, or an external signer a repository's owners
+    /// chose to trust. It never signs in, never counts as a member, never
+    /// holds an administrative role or an elevated right, and is removed with
+    /// its last grant (`vtc-admin-roles.md` §9).
+    Application,
+    /// Community-defined custom role. Receives **no implicit
+    /// grants** from the standard permission matrix; the only
+    /// authoritative source of `Custom` permissions is
+    /// `role_definitions.rego` (spec §5.3, Phase 2+).
+    Custom(String),
+}
+
+const CUSTOM_PREFIX: &str = "custom:";
+const CUSTOM_NAME_MAX: usize = 64;
+
+impl VtcRole {
+    /// Returns the wire-shape representation as borrowed-or-owned
+    /// `String`. Used by `Display` + `Serialize`.
+    fn as_wire(&self) -> String {
+        match self {
+            VtcRole::Admin => "admin".into(),
+            VtcRole::Moderator => "moderator".into(),
+            VtcRole::Issuer => "issuer".into(),
+            VtcRole::Member => "member".into(),
+            VtcRole::Application => "application".into(),
+            VtcRole::Custom(name) => format!("{CUSTOM_PREFIX}{name}"),
+        }
+    }
+
+    /// Construct a `VtcRole::Custom(name)` after validating the
+    /// charset. Returns `AppError::Validation` on invalid input.
+    /// Use this rather than the bare enum variant when the input
+    /// comes from outside the daemon (REST body, DIDComm message).
+    pub fn custom(name: impl Into<String>) -> Result<Self, AppError> {
+        let name = name.into();
+        validate_custom_name(&name)?;
+        Ok(VtcRole::Custom(name))
+    }
+
+    /// Returns `true` for the four named variants, `false` for
+    /// `Custom`. Used by `validate_role_assignment` in the
+    /// permission-matrix check to short-circuit Custom-role
+    /// lookups against the (Phase-2) `role_definitions.rego`
+    /// output.
+    pub fn is_standard(&self) -> bool {
+        !matches!(self, VtcRole::Custom(_))
+    }
+
+    /// The administrative role this community role implies under the
+    /// `acl/*/0.1` convention, and in a backup brought across from before
+    /// role-based administration (`vtc-admin-roles.md` §9).
+    ///
+    /// 0.1 has no member for administrative authority, so a VTC serving it
+    /// reads the role alone (`acl/_shared/0.2` CONVENTIONS §8, "the role set it
+    /// applies rule 2 to"): `admin` is a `community-admin` with the full
+    /// ceiling, and `moderator` and `issuer` hold the matching administrative
+    /// role, because the permission matrix before roles gave them exactly those
+    /// powers. `member` and `custom:*` imply none.
+    pub fn implied_admin_role(&self) -> Option<super::AdminRole> {
+        match self {
+            VtcRole::Admin => Some(super::AdminRole::CommunityAdmin),
+            VtcRole::Moderator => Some(super::AdminRole::Moderator),
+            VtcRole::Issuer => Some(super::AdminRole::CredentialOfficer),
+            VtcRole::Member | VtcRole::Application | VtcRole::Custom(_) => None,
+        }
+    }
+
+    /// Whether a caller may assign this community role — every role except
+    /// [`VtcRole::Application`], which only the git-namespace store writes,
+    /// for a subject that holds resource grants and no membership.
+    pub fn is_assignable(&self) -> bool {
+        !matches!(self, VtcRole::Application)
+    }
+
+    /// The refusal for an [`Self::is_assignable`] failure.
+    pub fn refuse_unassignable(&self) -> Result<(), AppError> {
+        if self.is_assignable() {
+            Ok(())
+        } else {
+            Err(AppError::Validation(
+                "`application` is not a role anyone assigns: the community writes it only for a \
+                 subject that holds git rights without being a member (the bridge, an external \
+                 signer). Grant git rights with git-ns/right/grant, and admit a member with the \
+                 join or invitation flow"
+                    .into(),
+            ))
+        }
+    }
+
+    /// [`Self::implied_admin_role`] at its full ceiling, or no authority.
+    pub fn implied_authority(&self) -> super::AdminAuthority {
+        self.implied_admin_role()
+            .map(super::AdminAuthority::for_role)
+            .unwrap_or_else(super::AdminAuthority::none)
+    }
+
+    /// The community role an administrative role implies when a 0.2 grant
+    /// names none (`ext["org.openvtc"].communityRole` absent): the inverse of
+    /// [`Self::implied_admin_role`], `member` for everything else.
+    pub fn implied_by(admin: Option<&super::AdminRole>) -> VtcRole {
+        match admin {
+            Some(super::AdminRole::CommunityAdmin) => VtcRole::Admin,
+            Some(super::AdminRole::Moderator) => VtcRole::Moderator,
+            Some(super::AdminRole::CredentialOfficer) => VtcRole::Issuer,
+            _ => VtcRole::Member,
+        }
+    }
+}
+
+impl fmt::Display for VtcRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.as_wire())
+    }
+}
+
+impl FromStr for VtcRole {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, AppError> {
+        match s {
+            "admin" => Ok(VtcRole::Admin),
+            "moderator" => Ok(VtcRole::Moderator),
+            "issuer" => Ok(VtcRole::Issuer),
+            "member" => Ok(VtcRole::Member),
+            "application" => Ok(VtcRole::Application),
+            other => {
+                if let Some(name) = other.strip_prefix(CUSTOM_PREFIX) {
+                    validate_custom_name(name)?;
+                    Ok(VtcRole::Custom(name.to_string()))
+                } else {
+                    Err(AppError::Validation(format!(
+                        "unknown VTC role '{other}'. Expected one of admin, moderator, issuer, \
+                         member, application, or custom:<name>."
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Describe the role to OpenAPI as what it actually is on the wire: one string.
+///
+/// This is written out because deriving it is **wrong here**, quietly. A derived
+/// `ToSchema` describes the enum's Rust shape — `"Admin" | "Moderator" | … |
+/// {"Custom": "…"}` — while the hand-written `Serialize` above sends
+/// `"admin"` / `"custom:editor"`. Nothing reconciles the two: the derive cannot
+/// see a manual `Serialize`, and no test compared them, so the document
+/// described every ACL entry's `role` as a capitalised variant or a tagged
+/// object for as long as both have existed.
+///
+/// That is not a cosmetic error. `role` decides what an operator may do, the
+/// console compares it against `"admin"`, and `admin-ui/src/lib/wire.ts` is
+/// generated from this schema — so a generated client would have been told the
+/// comparison the console actually makes can never be true. It surfaced when
+/// that generation was first attempted, as a type error on the promote-to-admin
+/// guard.
+///
+/// The rule this stands for: a type with a hand-written `Serialize` must have a
+/// hand-written `ToSchema`. Deriving one half is how the halves diverge.
+impl utoipa::PartialSchema for VtcRole {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::SchemaType::Type(
+                utoipa::openapi::Type::String,
+            ))
+            .description(Some(
+                "One of `admin`, `moderator`, `issuer`, `member`, `application`, or                  `custom:<name>` where `<name>` is 1..=64 lowercase                  alphanumerics, `-`, or `_`.",
+            ))
+            .examples([serde_json::json!("admin")])
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for VtcRole {}
+
+impl Serialize for VtcRole {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for VtcRole {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        VtcRole::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_custom_name(name: &str) -> Result<(), AppError> {
+    if name.is_empty() {
+        return Err(AppError::Validation(
+            "custom role name cannot be empty".into(),
+        ));
+    }
+    if name.len() > CUSTOM_NAME_MAX {
+        return Err(AppError::Validation(format!(
+            "custom role name too long (max {CUSTOM_NAME_MAX} chars)"
+        )));
+    }
+    if !name.chars().all(is_valid_name_char) {
+        return Err(AppError::Validation(format!(
+            "custom role name '{name}' contains disallowed characters \
+             (allowed: lowercase a–z, digits, `-`, `_`)"
+        )));
+    }
+    Ok(())
+}
+
+fn is_valid_name_char(c: char) -> bool {
+    matches!(c, 'a'..='z' | '0'..='9' | '-' | '_')
+}
+
+/// Map a [`VtcRole`] onto the shared [`vti_common::acl::Role`] that the common
+/// ACL predicates reason over. Only `Admin` is privilege-bearing in those
+/// predicates; every other community role collapses to `Reader`.
+///
+/// Lives here rather than in the route layer because the offline break-glass
+/// CLI needs it too, and both surfaces must decode an entry's scope the same
+/// way.
+pub fn as_vti_role(role: &VtcRole) -> vti_common::acl::Role {
+    match role {
+        VtcRole::Admin => vti_common::acl::Role::Admin,
+        _ => vti_common::acl::Role::Reader,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_variants_round_trip_through_wire() {
+        for (variant, wire) in [
+            (VtcRole::Admin, "admin"),
+            (VtcRole::Moderator, "moderator"),
+            (VtcRole::Issuer, "issuer"),
+            (VtcRole::Member, "member"),
+            (VtcRole::Application, "application"),
+        ] {
+            let serialised = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialised, format!("\"{wire}\""));
+            let deserialised: VtcRole = serde_json::from_str(&serialised).unwrap();
+            assert_eq!(deserialised, variant);
+            assert_eq!(variant.to_string(), wire);
+        }
+    }
+
+    /// `application` marks a non-member holding git rights (phase C3): it
+    /// reads back from a stored entry, implies no authority, and no caller
+    /// may assign it.
+    #[test]
+    fn the_application_role_is_stored_but_never_assigned() {
+        let r: VtcRole = serde_json::from_str("\"application\"").unwrap();
+        assert_eq!(r, VtcRole::Application);
+        assert!(r.implied_admin_role().is_none());
+        assert!(!r.is_assignable());
+        assert!(r.refuse_unassignable().is_err());
+        assert!(VtcRole::Member.refuse_unassignable().is_ok());
+    }
+
+    #[test]
+    fn custom_variant_round_trips() {
+        let r = VtcRole::custom("editor").unwrap();
+        let serialised = serde_json::to_string(&r).unwrap();
+        assert_eq!(serialised, "\"custom:editor\"");
+        let deserialised: VtcRole = serde_json::from_str(&serialised).unwrap();
+        assert_eq!(deserialised, r);
+    }
+
+    #[test]
+    fn custom_constructor_validates_charset() {
+        assert!(VtcRole::custom("editor").is_ok());
+        assert!(VtcRole::custom("trust-anchor").is_ok());
+        assert!(VtcRole::custom("badge_holder_42").is_ok());
+
+        for bad in ["", "EDITOR", "with spaces", "colon:bad", "../../etc"] {
+            let err = VtcRole::custom(bad).expect_err(&format!("expected reject: {bad}"));
+            assert!(matches!(err, AppError::Validation(_)));
+        }
+    }
+
+    #[test]
+    fn deserialise_rejects_unknown_string() {
+        let err = serde_json::from_str::<VtcRole>("\"unknown\"").unwrap_err();
+        assert!(err.to_string().contains("unknown VTC role"));
+    }
+
+    #[test]
+    fn deserialise_rejects_custom_with_bad_charset() {
+        // Decoder must run the same validation as the constructor —
+        // otherwise a malicious peer could write
+        // `"custom:UPPER"` to disk and bypass the charset rule.
+        let err = serde_json::from_str::<VtcRole>("\"custom:UPPER\"").unwrap_err();
+        assert!(err.to_string().contains("disallowed characters"));
+    }
+
+    #[test]
+    fn deserialise_rejects_custom_with_empty_name() {
+        let err = serde_json::from_str::<VtcRole>("\"custom:\"").unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn deserialise_rejects_custom_with_name_too_long() {
+        let name = "a".repeat(CUSTOM_NAME_MAX + 1);
+        let err = serde_json::from_str::<VtcRole>(&format!("\"custom:{name}\"")).unwrap_err();
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn custom_name_with_colon_does_not_smuggle_admin() {
+        // The colon-strip in from_str only fires for the *first*
+        // colon-after-`custom:`. A `custom:admin` value would
+        // still decode as `Custom("admin")`, *not* `Admin`.
+        // Confirmed here so the encoding stays unambiguous.
+        let r: VtcRole = serde_json::from_str("\"custom:admin\"").unwrap();
+        assert_eq!(r, VtcRole::Custom("admin".into()));
+        assert_ne!(r, VtcRole::Admin);
+    }
+
+    #[test]
+    fn is_standard_returns_true_only_for_named_variants() {
+        assert!(VtcRole::Admin.is_standard());
+        assert!(VtcRole::Moderator.is_standard());
+        assert!(VtcRole::Issuer.is_standard());
+        assert!(VtcRole::Member.is_standard());
+        assert!(!VtcRole::Custom("x".into()).is_standard());
+    }
+
+    #[test]
+    fn from_str_handles_vti_common_admin_wire_shape() {
+        // The existing `vti_common::acl::Role::Admin` serialises
+        // as `"admin"`. Phase-0 `acl:<did>` rows written via that
+        // path must decode to `VtcRole::Admin` without
+        // re-serialisation. This pins that path.
+        let role = VtcRole::from_str("admin").unwrap();
+        assert_eq!(role, VtcRole::Admin);
+    }
+}

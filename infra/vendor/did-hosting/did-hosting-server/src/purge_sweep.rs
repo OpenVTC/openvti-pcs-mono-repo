@@ -1,0 +1,568 @@
+//! Background grace-expired purge sweep (T30 pass 3).
+//!
+//! Runs on a 60-second tick. Each tick:
+//! 1. Lists every `PendingPurge` in `KS_PENDING_PURGES`.
+//! 2. For each entry whose grace window has elapsed
+//!    ([`did_hosting_common::server::pending_purge::PendingPurge::is_ripe`]),
+//!    calls [`did_hosting_common::server::domain_purge::purge_domain_dids`]
+//!    to delete the matching DID records and removes the pending
+//!    entry afterwards.
+//!
+//! Not-ripe entries are left for a future tick. The 60s cadence is
+//! a config-fixed compromise — fast enough that the deviation
+//! between configured grace and observed-purge time stays under a
+//! minute, slow enough that an idle deployment doesn't churn on
+//! empty keyspace scans.
+//!
+//! ## Restart safety
+//!
+//! `KS_PENDING_PURGES` is persisted. A crash or restart between
+//! `unassign` and the eventual sweep doesn't lose the schedule —
+//! the next sweep tick picks up the same ripe set. Conversely,
+//! `purge_domain_dids` + `pending_purge::cancel` aren't atomic
+//! across a restart: a crash after the purge succeeds but before
+//! the pending entry is removed leaves a stale pending entry, and
+//! the next sweep will harmlessly call `purge_domain_dids` again
+//! (it's a no-op on already-empty records) and then remove the
+//! pending entry on this second pass.
+
+use std::time::Duration;
+
+use did_hosting_common::server::domain::{self, DISABLE_PURGE_REASON};
+use did_hosting_common::server::domain_purge::purge_domain_dids_locked;
+use did_hosting_common::server::pending_purge::{self, PurgeCheck};
+use did_hosting_common::server::stats_collector::StatsCollector;
+use did_hosting_common::server::store::Store;
+use tracing::{debug, info, warn};
+
+use did_hosting_common::server::auth::session::now_epoch;
+
+/// Default tick cadence. Public so the daemon can override it for
+/// integration tests (fast loop) if needed.
+pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What one sweep cycle did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Pending entries that were ripe and purged.
+    pub entries: u64,
+    /// DID records those purges deleted.
+    pub dids_deleted: u64,
+    /// Their mnemonics, so a caller holding their statistics (the daemon)
+    /// can delete those too.
+    pub purged_dids: Vec<String>,
+}
+
+/// Run one sweep cycle synchronously. Used both by the background
+/// loop and by tests that want to observe one tick's effect without
+/// waiting for the timer.
+pub async fn run_sweep_once(store: &Store) -> SweepReport {
+    run_sweep_once_locked(store, None).await
+}
+
+/// [`run_sweep_once`] for a store the control plane also writes (the
+/// daemon): each purged slot and its agent names are deleted under
+/// `locks`, the control plane's path locks.
+pub async fn run_sweep_once_locked(
+    store: &Store,
+    locks: Option<&did_hosting_common::server::path_locks::PathLocks>,
+) -> SweepReport {
+    let pending = match pending_purge::list(store).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "purge sweep: failed to list pending entries; skipping tick");
+            return SweepReport::default();
+        }
+    };
+    if pending.is_empty() {
+        debug!("purge sweep: no pending entries");
+        return SweepReport::default();
+    }
+
+    let now = now_epoch();
+    let mut sweep = SweepReport::default();
+    for entry in pending {
+        if !entry.is_ripe(now) {
+            continue;
+        }
+        if !still_due(store, &entry).await {
+            continue;
+        }
+        match purge_domain_dids_locked(store, &entry.domain, &entry.reason, locks).await {
+            Ok(report) => {
+                info!(
+                    domain = %entry.domain,
+                    reason = %entry.reason,
+                    deleted = report.deleted,
+                    "purge sweep: ripe entry processed"
+                );
+                sweep.dids_deleted += report.deleted;
+                sweep.purged_dids.extend(report.purged);
+
+                // Soft-delete-with-grace path: the DomainEntry itself
+                // must be removed too. Unassign-grace (the other
+                // reason) keeps the DomainEntry so the operator can
+                // re-assign the domain to a different server later.
+                if entry.reason == DISABLE_PURGE_REASON {
+                    // Re-checked: the DID purge above takes time, and a
+                    // re-enable landing meanwhile must keep its record.
+                    if !still_due(store, &entry).await {
+                        continue;
+                    }
+                    match domain::delete_domain_record(store, &entry.domain).await {
+                        Ok(()) => {
+                            info!(
+                                domain = %entry.domain,
+                                "purge sweep: disabled-domain record deleted"
+                            );
+                        }
+                        Err(e) => {
+                            // The pending entry stays — next tick
+                            // will retry. DIDs are already gone;
+                            // worst case we leave a 'Disabled' shell
+                            // entry until the operator intervenes.
+                            warn!(
+                                domain = %entry.domain,
+                                error = %e,
+                                "purge sweep: failed to delete domain record; entry retained for next tick"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                if let Err(e) = pending_purge::cancel(store, &entry.domain).await {
+                    // Stale entry will be re-tried on the next tick;
+                    // the second `purge_domain_dids` call is harmless
+                    // (no records remain to delete).
+                    warn!(
+                        domain = %entry.domain,
+                        error = %e,
+                        "purge sweep: failed to clear pending entry; will retry next tick"
+                    );
+                }
+                sweep.entries += 1;
+            }
+            Err(e) => {
+                warn!(
+                    domain = %entry.domain,
+                    error = %e,
+                    "purge sweep: purge failed; entry retained for next tick"
+                );
+            }
+        }
+    }
+    sweep
+}
+
+/// Re-check a listed ripe row immediately before deleting anything (see
+/// [`pending_purge::check_still_due`]). A row left behind for a domain that
+/// is live again is cleared rather than acted on; one rescheduled or
+/// cancelled since the listing is left alone. Any doubt — a failed lookup —
+/// skips the row until the next tick: deleting is the one irreversible step.
+async fn still_due(store: &Store, entry: &pending_purge::PendingPurge) -> bool {
+    match pending_purge::check_still_due(store, entry).await {
+        Ok(PurgeCheck::Due) => true,
+        Ok(PurgeCheck::Superseded) => {
+            debug!(domain = %entry.domain, "purge sweep: entry changed since listing; skipped");
+            false
+        }
+        Ok(PurgeCheck::Stale(why)) => {
+            warn!(
+                domain = %entry.domain,
+                reason = %entry.reason,
+                why,
+                "purge sweep: ripe entry for a live domain — NOT purging; clearing the leftover"
+            );
+            if let Err(e) = pending_purge::cancel_if_unchanged(store, entry).await {
+                warn!(domain = %entry.domain, error = %e, "purge sweep: failed to clear stale entry");
+            }
+            false
+        }
+        Err(e) => {
+            warn!(domain = %entry.domain, error = %e, "purge sweep: re-check failed; retrying next tick");
+            false
+        }
+    }
+}
+
+/// One purge tick: the `purge-sweep` task of an edge's storage thread and of
+/// the daemon's storage task, every [`DEFAULT_SWEEP_INTERVAL`].
+///
+/// `locks` are the path locks of a control plane writing the same store (the
+/// daemon), taken for each purged slot; an edge writes DID records only from
+/// its control plane's directives, which take no path lock, so it passes
+/// `None`. A purge deletes DIDs
+/// (and, for a disabled domain, its record) behind the resolver's back, so
+/// when anything was purged the caches are dropped whole; otherwise the
+/// content cache just loses what has outlived its TTL. The edge's DID count
+/// is adjusted by what was deleted.
+pub async fn run_edge_sweep_tick(
+    store: &Store,
+    locks: Option<&did_hosting_common::server::path_locks::PathLocks>,
+    did_cache: &crate::cache::ContentCache,
+    gate_cache: Option<&crate::cache::GateCache>,
+    collector: Option<&StatsCollector>,
+) -> SweepReport {
+    let sweep = run_sweep_once_locked(store, locks).await;
+    if sweep.entries > 0 {
+        info!(count = sweep.entries, "purge sweep tick completed");
+    }
+    if sweep.entries > 0 || sweep.dids_deleted > 0 {
+        did_cache.clear();
+        if let Some(gate) = gate_cache {
+            gate.clear();
+        }
+    } else {
+        did_cache.evict_expired();
+        if let Some(gate) = gate_cache {
+            gate.evict_expired();
+        }
+    }
+    if let Some(collector) = collector {
+        collector.subtract_total_dids(sweep.dids_deleted);
+    }
+    sweep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use did_hosting_common::did_ops::{DidRecord, content_log_key, did_key};
+    use did_hosting_common::server::config::StoreConfig;
+    use did_hosting_common::server::pending_purge::schedule;
+    use did_hosting_common::server::store::KS_DIDS;
+
+    async fn fjall_store() -> Store {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..StoreConfig::default()
+        };
+        std::mem::forget(dir);
+        Store::open(&cfg).await.expect("open fjall")
+    }
+
+    fn record(mnemonic: &str, domain: &str) -> DidRecord {
+        DidRecord {
+            owner: format!("did:example:owner-{mnemonic}"),
+            mnemonic: mnemonic.into(),
+            created_at: 1,
+            updated_at: 1,
+            version_count: 1,
+            did_id: Some(format!("did:webvh:Q1:{domain}:{mnemonic}")),
+            content_size: 0,
+            disabled: false,
+            disabled_by_admin: false,
+            deleted_at: None,
+            method: "webvh".into(),
+            domain: domain.into(),
+            services: None,
+            agent_names: Vec::new(),
+        }
+    }
+
+    async fn seed(store: &Store, mnemonic: &str, domain: &str) {
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        let r = record(mnemonic, domain);
+        ks.insert(did_key(mnemonic), &r).await.unwrap();
+        ks.insert_raw(content_log_key(mnemonic), b"log".to_vec())
+            .await
+            .unwrap();
+    }
+
+    /// A pending entry scheduled in the past with a 1-second grace
+    /// is ripe by now and must be processed. An entry scheduled now
+    /// with a 1-hour grace is not ripe and must be retained.
+    #[tokio::test]
+    async fn sweep_processes_ripe_only() {
+        let store = fjall_store().await;
+        seed(&store, "alice", "ripe.example").await;
+        seed(&store, "bob", "fresh.example").await;
+
+        // ripe.example: scheduled long ago, 1s grace → ripe.
+        schedule(&store, "ripe.example", 0, 1, "grace-expired", "did:c")
+            .await
+            .unwrap();
+        // fresh.example: scheduled at current time, 1h grace → not ripe.
+        let now = now_epoch();
+        schedule(&store, "fresh.example", now, 3600, "grace-expired", "did:c")
+            .await
+            .unwrap();
+
+        let sweep = run_sweep_once(&store).await;
+        assert_eq!(
+            sweep,
+            SweepReport {
+                entries: 1,
+                dids_deleted: 1,
+                purged_dids: vec!["alice".into()],
+            },
+            "only the ripe entry should be processed"
+        );
+
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        // alice (ripe.example) was deleted; bob (fresh.example) survives.
+        assert!(
+            ks.get::<DidRecord>(did_key("alice"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(ks.get::<DidRecord>(did_key("bob")).await.unwrap().is_some());
+
+        // Pending entry for ripe.example was cleared; fresh.example
+        // is retained for the next tick.
+        assert!(
+            pending_purge::get(&store, "ripe.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pending_purge::get(&store, "fresh.example")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_with_no_pending_entries_is_noop() {
+        let store = fjall_store().await;
+        let purged = run_sweep_once(&store).await.entries;
+        assert_eq!(purged, 0);
+    }
+
+    /// Stale pending entry (purge previously ran but the cancellation
+    /// crashed) is harmless on the next tick — no records left to
+    /// delete, but the entry is still cleared.
+    #[tokio::test]
+    async fn sweep_retried_on_already_empty_records_clears_entry() {
+        let store = fjall_store().await;
+        // No records seeded — just a ripe pending entry.
+        schedule(&store, "stale.example", 0, 1, "grace-expired", "did:c")
+            .await
+            .unwrap();
+
+        let purged = run_sweep_once(&store).await.entries;
+        assert_eq!(purged, 1, "stale entry still processed and cleared");
+        assert!(
+            pending_purge::get(&store, "stale.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `disable-grace` ripe entry → DIDs purged AND domain record
+    /// itself removed. Distinguishes the soft-delete path from the
+    /// unassignment path (which retains the DomainEntry).
+    #[tokio::test]
+    async fn sweep_deletes_domain_record_for_disable_grace() {
+        use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+        use did_hosting_common::server::store::KS_DOMAINS;
+
+        let store = fjall_store().await;
+        seed(&store, "alice", "soft-delete.example").await;
+
+        // Seed the DomainEntry directly (skip the disable_domain
+        // helper to avoid the default-domain conflict check; this
+        // test just needs the row present so we can verify the
+        // sweeper deletes it).
+        let domains_ks = store.keyspace(KS_DOMAINS).unwrap();
+        let entry = DomainEntry {
+            name: "soft-delete.example".into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Disabled,
+            created_at: 1,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: Some(0),
+            purge_at: Some(1),
+        };
+        domains_ks
+            .insert(b"soft-delete.example".to_vec(), &entry)
+            .await
+            .unwrap();
+
+        // Ripe disable-grace pending row.
+        schedule(
+            &store,
+            "soft-delete.example",
+            0,
+            1,
+            DISABLE_PURGE_REASON,
+            "did:example:admin",
+        )
+        .await
+        .unwrap();
+
+        let purged = run_sweep_once(&store).await.entries;
+        assert_eq!(purged, 1);
+
+        // DIDs gone.
+        let dids_ks = store.keyspace(KS_DIDS).unwrap();
+        assert!(
+            dids_ks
+                .get::<DidRecord>(did_key("alice"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Domain record gone.
+        assert!(
+            domain::get_domain(&store, "soft-delete.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Pending entry cleared.
+        assert!(
+            pending_purge::get(&store, "soft-delete.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Existing unassign sweep path still retains the DomainEntry —
+    /// regression guard for the new branch above.
+    #[tokio::test]
+    async fn sweep_unassign_grace_preserves_domain_record() {
+        use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+        use did_hosting_common::server::store::KS_DOMAINS;
+
+        let store = fjall_store().await;
+        seed(&store, "carol", "unassign.example").await;
+
+        let domains_ks = store.keyspace(KS_DOMAINS).unwrap();
+        let entry = DomainEntry {
+            name: "unassign.example".into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Active,
+            created_at: 1,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        };
+        domains_ks
+            .insert(b"unassign.example".to_vec(), &entry)
+            .await
+            .unwrap();
+
+        schedule(&store, "unassign.example", 0, 1, "grace-expired", "did:c")
+            .await
+            .unwrap();
+
+        let purged = run_sweep_once(&store).await.entries;
+        assert_eq!(purged, 1);
+
+        // DomainEntry retained.
+        assert!(
+            domain::get_domain(&store, "unassign.example")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn active_entry(name: &str) -> did_hosting_common::server::domain::DomainEntry {
+        use did_hosting_common::server::domain::{DomainEntry, DomainStatus, DomainUrlScheme};
+        DomainEntry {
+            name: name.into(),
+            label: None,
+            scheme: DomainUrlScheme::Https,
+            status: DomainStatus::Active,
+            created_at: 1,
+            default_domain: false,
+            branding: None,
+            witnesses: None,
+            watchers: None,
+            quota: None,
+            well_known_enabled: false,
+            disabled_at: None,
+            purge_at: None,
+        }
+    }
+
+    /// The state a crash between a re-enable and its purge cancel used to
+    /// leave: the domain Active, a ripe `disable-grace` row still queued.
+    /// The sweep must not wipe the live domain; it clears the leftover.
+    #[tokio::test]
+    async fn sweep_never_purges_a_re_enabled_domain() {
+        let store = fjall_store().await;
+        seed(&store, "alice", "live.example").await;
+        domain::create_domain(&store, &active_entry("live.example"))
+            .await
+            .unwrap();
+        schedule(&store, "live.example", 0, 1, DISABLE_PURGE_REASON, "did:c")
+            .await
+            .unwrap();
+
+        assert_eq!(run_sweep_once(&store).await.entries, 0);
+
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        assert!(
+            ks.get::<DidRecord>(did_key("alice"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            domain::get_domain(&store, "live.example")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            pending_purge::get(&store, "live.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "the stale leftover is cleared, not left to fire later"
+        );
+    }
+
+    /// The state a crash between a re-assignment and its purge cancel used
+    /// to leave: assigned to this server, a ripe `grace-expired` row still
+    /// queued. The sweep must not delete the domain's DIDs.
+    #[tokio::test]
+    async fn sweep_never_purges_a_re_assigned_domain() {
+        let store = fjall_store().await;
+        seed(&store, "bob", "assigned.example").await;
+        did_hosting_common::server::assignment::record_assignment(
+            &store,
+            "assigned.example",
+            "did:c",
+            5,
+        )
+        .await
+        .unwrap();
+        schedule(&store, "assigned.example", 0, 1, "grace-expired", "did:c")
+            .await
+            .unwrap();
+
+        assert_eq!(run_sweep_once(&store).await.entries, 0);
+
+        let ks = store.keyspace(KS_DIDS).unwrap();
+        assert!(ks.get::<DidRecord>(did_key("bob")).await.unwrap().is_some());
+        assert!(
+            pending_purge::get(&store, "assigned.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}

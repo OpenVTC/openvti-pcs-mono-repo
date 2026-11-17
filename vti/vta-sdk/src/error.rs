@@ -1,0 +1,1328 @@
+//! Structured error type for VTA SDK operations.
+
+pub use crate::rate_limit::RateLimitSource;
+
+/// Errors returned by VTA SDK client operations.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum VtaError {
+    /// Network-level error (connection refused, timeout, DNS failure).
+    #[cfg(feature = "client")]
+    #[error("network error: {0}")]
+    Network(#[from] reqwest::Error),
+
+    /// Authentication failed (401) or token expired.
+    #[error("authentication failed: {0}")]
+    Auth(String),
+
+    /// Resource not found (404).
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// Request validation error (400).
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    /// Permission denied (403).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
+    /// Conflict (409) — e.g. duplicate key ID.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
+    /// Gone (410) — the resource existed but is now permanently unavailable.
+    /// Most often emitted by the bootstrap carve-out endpoint after it has
+    /// been consumed; the CLI surfaces this with a "did you mean to run
+    /// `… provision-request`" hint instead of a flat string.
+    #[error("gone: {0}")]
+    Gone(String),
+
+    /// Server error (5xx).
+    #[error("server error ({status}): {body}")]
+    Server { status: u16, body: String },
+
+    /// The operation does not support the transport the client is
+    /// configured for (e.g. calling a REST-only helper on a client built
+    /// with DIDComm-only transport, or vice versa).
+    #[error("unsupported transport: {0}")]
+    UnsupportedTransport(String),
+
+    /// DIDComm transport failure (pack/send/pickup). Network-ish —
+    /// caller may want to retry. Distinct from [`Self::Network`] which
+    /// is REST-specific and carries a `reqwest::Error`.
+    #[error("didcomm transport error: {0}")]
+    DidcommTransport(String),
+
+    /// TSP transport failure (seal/route/websocket). Network-ish — caller may
+    /// want to retry. Kept distinct from [`Self::DidcommTransport`] rather than
+    /// folded into it: the two transports fail for different reasons and have
+    /// different recovery flags, and one shared message is what R6.4 exists to
+    /// prevent.
+    #[error("tsp transport error: {0}")]
+    TspTransport(String),
+
+    /// Requests are being sent, but their replies are not reaching this client.
+    ///
+    /// Raised once [`crate::client::REPLY_TIMEOUT_BREAKER`] reply timeouts have
+    /// happened in a row on one client — each request was accepted by the
+    /// mediator, and nothing came back. That is a receive leg that has stopped:
+    /// the replies are queueing in this client's mediator inbox, and once the
+    /// mediator's per-peer cap (`limits.queue.peer`) of them are waiting, the
+    /// VTA's further replies are refused outright.
+    ///
+    /// Kept apart from [`Self::TspTransport`] because the remedy is different
+    /// (R6.4): the VTA is reachable and answering, so retrying the request or
+    /// re-forming the TSP relationship only queues more replies. The client's
+    /// session has to be rebuilt — reconnected, so its inbox is collected — and
+    /// [`crate::idempotency::is_transient`] does not retry it.
+    #[error(
+        "the request was sent, but replies are not reaching this client \
+         ({consecutive_timeouts} reply timeouts in a row): its mediator inbox is not being \
+         collected — reconnect the session"
+    )]
+    RepliesNotArriving {
+        /// Reply timeouts in a row, this one included.
+        consecutive_timeouts: u32,
+    },
+
+    /// Remote endpoint returned a DIDComm problem-report whose `code`
+    /// did not match any of the standard `e.p.msg.*` taxonomy variants
+    /// (which map to the typed REST-aligned variants above). Inspect
+    /// `code` to handle it; a typed [`Self::Conflict`] / [`Self::NotFound`]
+    /// / [`Self::Auth`] / [`Self::Validation`] / [`Self::Server`] will
+    /// already have been emitted for the standard codes.
+    #[error("didcomm remote error ({code}): {comment}")]
+    DidcommRemote { code: String, comment: String },
+
+    /// Programmer-level protocol error (response shape did not match
+    /// what the SDK expected — version mismatch or bug). Distinct from
+    /// remote-error: a peer that returned a problem-report becomes a
+    /// typed variant via [`Self::from_problem_report`], not this one.
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
+    /// The peer refused a Trust Task with a code no more specific variant
+    /// covers — a task's own declared error (`persona/profile/delete:bound`,
+    /// `…:versionConflict`) or a framework code such as `taskFailed` with no
+    /// recognised `details.reason`.
+    ///
+    /// Kept as data rather than folded into [`Self::Protocol`]: `code` is
+    /// what a caller matches on, and `details` is what the peer sent with it
+    /// (the DIDs wearing a bound face, the current version of a record), which
+    /// a caller may need to act on and could not recover from a sentence.
+    /// `Display` is the text this case rendered as when it was a `Protocol`,
+    /// so logs and CLI output are unchanged.
+    #[error("trust task failed [{code}]: {message}")]
+    Rejected {
+        /// The rejection's `code`, as sent.
+        code: String,
+        /// The rejection's `message`, as sent.
+        message: String,
+        /// The rejection's `details`, as sent; `None` when it carried none.
+        details: Option<serde_json::Value>,
+    },
+
+    /// The task needs a human approval that has not been given yet.
+    ///
+    /// Structured rather than folded into [`Self::Protocol`] because a caller
+    /// has to *act* on it: show the operator `payload_digest` so they can
+    /// compare it against the code on the approving device, then re-submit the
+    /// byte-identical request once approved. A flat string cannot carry that,
+    /// and the CLI's only option was to print the refusal and exit — which is
+    /// why a consent-gated task was unreachable from `pnm` entirely.
+    ///
+    /// The re-submit is safe to repeat *while the request is pending*: the
+    /// server returns the same `challenge` and deliberately does not re-notify
+    /// (the push follows the question, not the submit). It is NOT safe to
+    /// repeat blindly after a decision — a denial deletes the pending request,
+    /// so the next submit raises a new one and pushes again. Callers must stop
+    /// when `challenge` changes; see `vta_cli_common::consent`.
+    #[error(
+        "consent required: {min_approvals} approval(s) from `{approver_set}` — \
+         approve code {payload_digest} on an approving device"
+    )]
+    ConsentRequired {
+        /// The salted digest the approver signs and both screens compare.
+        payload_digest: String,
+        /// Nonce binding the decision to this request. Changes when the
+        /// request is resolved and a new one is raised.
+        challenge: String,
+        /// Named approver set the policy requires.
+        approver_set: String,
+        /// Distinct approvals needed.
+        min_approvals: u32,
+        /// Whether the requesting device is barred from counting toward the
+        /// threshold. `true` means this caller cannot self-approve however it
+        /// is enrolled, and must wait for another device; `false` means it may
+        /// approve its own request if it is a member of the set.
+        exclude_requester: bool,
+    },
+
+    /// Serialization/deserialization error.
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    // ── Runtime service-management variants (spec §4) ──────────────
+    //
+    // These are emitted by the post-setup service-management surface
+    // (`services {rest,didcomm} {enable,update,disable,rollback}`).
+    // Structured data for the variants that carry numeric fields
+    // round-trips lossless via [`TypedErrorPayload`] across both
+    // REST response bodies and DIDComm problem-report args.
+    /// The operation would leave the VTA's DID document with no
+    /// advertised transport services. Per spec §3.2, this is rejected
+    /// without a `--force` escape hatch — enable the other transport
+    /// first if a swap is intended.
+    #[error("refusing operation: would leave the VTA with no advertised services")]
+    LastServiceRefused,
+
+    /// `update`, `disable`, or a kind-specific drain action was
+    /// invoked for a service kind that isn't currently enabled.
+    #[error("service is not present (not currently enabled)")]
+    ServiceNotPresent,
+
+    /// `enable` was invoked for a service kind that's already
+    /// enabled. Use `update` to change its configuration.
+    #[error("service is already enabled")]
+    ServiceAlreadyEnabled,
+
+    /// DIDComm handshake against the candidate mediator failed
+    /// (trust-ping refused, timed out, or peer was unreachable).
+    #[error("mediator handshake failed: {reason}")]
+    MediatorHandshakeFailed { reason: String },
+
+    /// Drain TTL is outside the valid range. Bounds are
+    /// `MIN_DRAIN_TTL_OVER_DIDCOMM` (3600s, when the disable command
+    /// is itself delivered over DIDComm) and `MAX_DRAIN_TTL`
+    /// (30 days). All three fields are in seconds.
+    #[error("drain ttl {requested}s outside allowed range [{min}s, {max}s]")]
+    DrainTtlOutOfBounds { min: u64, max: u64, requested: u64 },
+
+    /// `rollback` was invoked for a service kind that has no prior
+    /// mutation in its snapshot store to fail-forward from.
+    #[error("no prior mutation to roll back from")]
+    NoPriorMutation,
+
+    /// Catch-all for other errors.
+    /// No transport protocol is advertised by **both** this party and the
+    /// counterparty, so there is no way to communicate. Carries each side's
+    /// advertised set (in preference order) so the CLI can show the operator
+    /// what each offers and which transport to enable. Determined locally by
+    /// [`crate::protocol::matching::select_protocol`] after resolving the
+    /// peer's DID document — or returned by a VTA that could not reach a peer
+    /// of its own on the client's behalf (`details.reason`
+    /// `no_matching_protocol`, or a REST 502 carrying it), in which case
+    /// `ours` is what that VTA can initiate and `counterparty_did` its peer.
+    #[error(
+        "no transport protocol in common with {counterparty_did}: \
+         we advertise {ours:?}, they advertise {theirs:?}"
+    )]
+    NoMatchingProtocol {
+        counterparty_did: String,
+        ours: Vec<crate::protocol::matching::Protocol>,
+        theirs: Vec<crate::protocol::matching::Protocol>,
+    },
+
+    /// The peer refused the document because relying on it needs an
+    /// identifier of a method the peer does not resolve (VTI-KEY-009,
+    /// `details.reason` `unsupportedDidMethod`).
+    #[error("the peer does not resolve did:{method}, so it refused the document (VTI-KEY-009)")]
+    UnsupportedDidMethod { method: String },
+
+    /// The peer does not serve this Trust Task type — the standard
+    /// `unsupportedType` / `unsupportedVersion` rejections.
+    ///
+    /// Typed rather than folded into [`Self::Protocol`] because it is the one
+    /// rejection whose fix is **upgrade something**, and a caller can only say
+    /// which thing if it can read the two facts apart: what we asked for, and
+    /// what the peer serves instead.
+    ///
+    /// A live incident (2026-08-31) is why this exists. #1147 cut
+    /// `provision/integration` 0.2 → 0.3 with no dual-accept window — the two
+    /// response schemas are mutually exclusive, so there could not be one — and
+    /// an operator on a current client hit a VTA still serving 0.2. All the
+    /// wizard could render was the flat string
+    ///
+    /// ```text
+    /// trust task failed [unsupportedType]: unsupported type:
+    ///   https://trusttasks.org/spec/provision/integration/0.3
+    /// ```
+    ///
+    /// which reads as "this VTA cannot provision" rather than "this VTA is
+    /// older than your client", and sends the reader to the wrong half of the
+    /// system. The version in that message is the whole diagnosis — 0.2 means
+    /// the *client* is behind, 0.3 means the *VTA* is — and nothing said so.
+    ///
+    /// `served_versions` is the peer's own answer, from the rejection's
+    /// `details.servedVersions`. Empty means the peer does not know the family
+    /// at all **or** is old enough not to send the field, so a consumer must
+    /// not read empty as "the family does not exist".
+    #[error("{}", match .served_versions.is_empty() {
+        true => format!("peer does not serve {}", .type_uri),
+        false => format!(
+            "peer does not serve {} — it serves {}{}",
+            .type_uri,
+            .served_versions.join(", "),
+            version_age_hint(.type_uri, .served_versions),
+        ),
+    })]
+    UnsupportedTaskType {
+        /// The Type URI this client dispatched.
+        type_uri: String,
+        /// Versions of the same family the peer reported serving.
+        served_versions: Vec<String>,
+    },
+
+    /// The VTA is temporarily unable to process this task — the standard
+    /// `unavailable` rejection (HTTP 503).
+    ///
+    /// Typed rather than folded into [`VtaError::Protocol`] because it is the
+    /// one wire rejection that means **"ask again"** rather than "this failed".
+    /// The idempotency layer returns it when a first attempt on the same key is
+    /// still running, so a retry loop that reads it as a terminal error gives up
+    /// on the one answer it was supposed to wait for.
+    ///
+    /// `retry_after` carries the server's hint verbatim when it supplied one. A
+    /// client should honour it and cap it — an unbounded wait on a
+    /// server-controlled value is a denial of service the server can trigger.
+    #[error("temporarily unavailable{}", match .retry_after {
+        Some(t) => format!(" (retry after {t})"),
+        None => String::new(),
+    })]
+    Unavailable {
+        retry_after: Option<chrono::DateTime<chrono::Utc>>,
+    },
+
+    /// A rate limiter refused the request (HTTP 429). Not a server fault, and
+    /// not necessarily the VTA's doing.
+    ///
+    /// Typed rather than folded into [`Self::Other`] because the two questions
+    /// an operator has — *who* refused, and *how long* to wait — have different
+    /// answers per refusing service, and a flat `"429: Too Many Requests"`
+    /// answers neither. It was indistinguishable from a fault, and the wait
+    /// hint the server sent was thrown away before the error was built.
+    ///
+    /// - `limited_by`: which service's limiter it was, read from the
+    ///   `x-rate-limit-source` response header
+    ///   ([`crate::rate_limit::SOURCE_HEADER`]). Absent means
+    ///   [`RateLimitSource::Upstream`]: a proxy / load balancer, or a VTA older
+    ///   than the header. (Not named `source`: `thiserror` treats a field of
+    ///   that name as the underlying error.)
+    /// - `retry_after`: the server's `Retry-After` hint as an instant, when it
+    ///   sent one — the same shape as [`Self::Unavailable`]. Cap it before
+    ///   sleeping on it.
+    /// - `limiter`: which of the service's limiters tripped, when it said.
+    /// - `url`: the refused request's URL, when known — the quickest way to
+    ///   tell the VTA apart from a DID host or a proxy on another hostname.
+    #[error("rate limited by {limited_by}{}{}", match .retry_after {
+        Some(t) => format!(" (retry after {t})"),
+        None => String::new(),
+    }, match .url {
+        Some(u) => format!(" at {u}"),
+        None => String::new(),
+    })]
+    RateLimited {
+        limited_by: RateLimitSource,
+        retry_after: Option<chrono::DateTime<chrono::Utc>>,
+        limiter: Option<String>,
+        url: Option<String>,
+    },
+
+    /// A record body uses a member the room's profile does not list in `recordMembers` —
+    /// `kind`, `inReplyTo`, `writtenAt`, `editedAt`, or a file's `width`, `height` or
+    /// `preview` — so the writer must not write it (`SealedRecordBody`, *When a writer may
+    /// use these members*). Refused here, before anything was sealed or sent.
+    ///
+    /// Typed so a CLI can print the fix: a curator lists the members with
+    /// `pnm rooms profile set --record-members …`, or the writer leaves them out.
+    /// `unresolved` is set when the profile could not be read at all, which permits none.
+    #[error(
+        "{} may not be written to room {room_id}: its profile lists {}{}",
+        refused.join(", "),
+        match listed.is_empty() {
+            true => "no record members".to_string(),
+            false => format!("only {}", listed.join(", ")),
+        },
+        match unresolved {
+            Some(why) => format!(" (its profile could not be read: {why})"),
+            None => String::new(),
+        }
+    )]
+    RecordMembersNotPermitted {
+        /// The room.
+        room_id: String,
+        /// The members the body uses that the profile does not list.
+        refused: Vec<String>,
+        /// What the profile lists; empty for none.
+        listed: Vec<String>,
+        /// Why the profile could not be read, where it could not.
+        unresolved: Option<String>,
+    },
+
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Wire-format companion to the typed [`VtaError`] variants emitted
+/// by the runtime service-management surface.
+///
+/// The free-form `comment` string carried by DIDComm problem-reports
+/// (and the `body` string of REST error responses) is fine for the
+/// variants whose only data is a human-readable message
+/// ([`VtaError::Conflict`], [`VtaError::NotFound`], …) but lossy for
+/// variants like [`VtaError::DrainTtlOutOfBounds`] that carry three
+/// numeric fields the CLI needs to switch on.
+///
+/// Servers serialize a `TypedErrorPayload` into the response body
+/// (REST) or problem-report `args` (DIDComm); clients deserialize
+/// it back via [`VtaError::from_typed_payload`]. The discriminator
+/// is the kebab-cased variant name in the `code` field.
+///
+/// Variants line up 1:1 with the §4 spec list — the existing
+/// [`VtaError::UnsupportedTransport`] is included so the same
+/// channel carries every typed-error wire form.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "code", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum TypedErrorPayload {
+    LastServiceRefused,
+    ServiceNotPresent,
+    ServiceAlreadyEnabled,
+    MediatorHandshakeFailed { reason: String },
+    DrainTtlOutOfBounds { min: u64, max: u64, requested: u64 },
+    NoPriorMutation,
+    UnsupportedTransport { detail: String },
+}
+
+/// The message prefix every TSP reply-timeout carries. Shared between the
+/// producers (`DIDCommSession::await_tsp_reply` / `TspSession::await_reply`) and
+/// [`VtaError::is_tsp_reply_timeout`], so the self-repair path recognises a
+/// §7.2.2 silent drop without a brittle literal repeated in three places.
+// Only the client and session transports produce or read it; `tsp` alone
+// (the binding envelope, which `vti-common` uses) has neither.
+#[cfg(all(feature = "tsp", feature = "client"))]
+pub(crate) const TSP_REPLY_TIMEOUT_PREFIX: &str = "timed out waiting for the TSP reply";
+
+impl VtaError {
+    /// [`Self::NoMatchingProtocol`] from the members a VTA puts beside
+    /// `no_matching_protocol` — a Trust Task rejection's `details`, or a REST
+    /// 502 body: `counterpartyDid`, `ours`, `theirs`.
+    ///
+    /// `None` when `counterpartyDid` is absent. An unknown protocol name is
+    /// skipped rather than refusing the whole: a newer peer naming a transport
+    /// this SDK does not know still tells the operator about the ones it does.
+    pub fn no_matching_protocol_from(fields: &serde_json::Value) -> Option<Self> {
+        let counterparty_did = fields.get("counterpartyDid")?.as_str()?.to_string();
+        let set = |k: &str| -> Vec<crate::protocol::matching::Protocol> {
+            fields
+                .get(k)
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|p| serde_json::from_value(p.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Some(Self::NoMatchingProtocol {
+            counterparty_did,
+            ours: set("ours"),
+            theirs: set("theirs"),
+        })
+    }
+
+    /// [`Self::UnsupportedDidMethod`] from a rejection's `details` (or a REST
+    /// error body) whose `reason` (or `error`) is the VTI-KEY-009
+    /// discriminator. `None` for any other, or
+    /// when `method` is absent.
+    pub fn method_refusal_from(fields: &serde_json::Value) -> Option<Self> {
+        use crate::protocols::trust_task_reject_reasons as r;
+        let marker = fields
+            .get("reason")
+            .or_else(|| fields.get("error"))
+            .and_then(|v| v.as_str())?;
+        let method = fields.get("method")?.as_str()?.to_string();
+        (marker == r::UNSUPPORTED_DID_METHOD).then_some(Self::UnsupportedDidMethod { method })
+    }
+
+    /// True for a TSP request that timed out waiting for its reply — the
+    /// signature of a §7.2.2 silent drop (the peer dropped our frame because it
+    /// holds no relationship with us). The self-repair path in
+    /// `dispatch_trust_task` keys on this to re-form the relationship and retry.
+    #[cfg(all(feature = "tsp", feature = "client"))]
+    pub(crate) fn is_tsp_reply_timeout(&self) -> bool {
+        matches!(self, VtaError::TspTransport(msg) if msg.starts_with(TSP_REPLY_TIMEOUT_PREFIX))
+    }
+
+    /// Create from an HTTP response status and error body.
+    ///
+    /// Public so a downstream SDK consumer wiring its own HTTP transport
+    /// (e.g. a wasm `gloo-net` client) can produce typed `VtaError`s
+    /// from status codes without re-implementing the mapping.
+    ///
+    /// A `429` becomes [`Self::RateLimited`] with
+    /// [`RateLimitSource::Upstream`]: without the response headers it can be
+    /// neither attributed nor given a wait. A consumer that has the headers
+    /// should call [`Self::from_http_with_headers`].
+    #[cfg(feature = "client")]
+    pub fn from_http(status: reqwest::StatusCode, body: String) -> Self {
+        // A VTA that could not reach a peer on any shared transport answers
+        // 502 with the two sets in the body; the status alone would read as
+        // "the VTA broke".
+        if status == reqwest::StatusCode::BAD_GATEWAY
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body)
+            && parsed.get("error").and_then(|e| e.as_str())
+                == Some(crate::protocols::trust_task_reject_reasons::NO_MATCHING_PROTOCOL)
+            && let Some(e) = Self::no_matching_protocol_from(&parsed)
+        {
+            return e;
+        }
+        // The VTI-KEY-009 refusal carries its discriminator and method in the
+        // body whatever the status.
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(e) = Self::method_refusal_from(&parsed)
+        {
+            return e;
+        }
+        match status.as_u16() {
+            429 => Self::RateLimited {
+                limited_by: RateLimitSource::Upstream,
+                retry_after: None,
+                limiter: None,
+                url: None,
+            },
+            401 => Self::Auth(body),
+            403 => Self::Forbidden(body),
+            404 => Self::NotFound(body),
+            400 | 422 => Self::Validation(body),
+            409 => Self::Conflict(body),
+            410 => Self::Gone(body),
+            s if s >= 500 => Self::Server { status: s, body },
+            s => Self::Other(format!("{s}: {body}")),
+        }
+    }
+
+    /// [`Self::from_http`], plus what only the response headers and the request
+    /// URL can say.
+    ///
+    /// Identical to `from_http` for every status except `429`, where it reads
+    /// the attribution header ([`crate::rate_limit::SOURCE_HEADER`]) and the
+    /// wait hint (`Retry-After`, else the legacy `x-ratelimit-after`) into
+    /// [`Self::RateLimited`]. `url` is the refused request's URL.
+    ///
+    /// Public, like `from_http`, for consumers wiring their own HTTP transport.
+    #[cfg(feature = "client")]
+    pub fn from_http_with_headers(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        body: String,
+        url: Option<&str>,
+    ) -> Self {
+        if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Self::from_http(status, body);
+        }
+        use crate::rate_limit as rl;
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let limited_by = RateLimitSource::from_source_header(header(rl::SOURCE_HEADER));
+        let now = chrono::Utc::now();
+        let retry_after = header(rl::RETRY_AFTER_HEADER)
+            .and_then(|v| rl::parse_retry_after(v, now))
+            .or_else(|| {
+                header(rl::LEGACY_RETRY_AFTER_HEADER).and_then(|v| rl::parse_retry_after(v, now))
+            });
+        Self::RateLimited {
+            limited_by,
+            retry_after,
+            limiter: limiter_from_body(limited_by, &body),
+            url: url.map(str::to_string),
+        }
+    }
+
+    /// Consume a failed `reqwest::Response` into a typed error, keeping the
+    /// headers and URL that [`Self::from_http_with_headers`] needs. The body is
+    /// passed through verbatim.
+    #[cfg(feature = "client")]
+    pub async fn from_response(resp: reqwest::Response) -> Self {
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let url = resp.url().to_string();
+        let body = resp.text().await.unwrap_or_default();
+        Self::from_http_with_headers(status, &headers, body, Some(&url))
+    }
+
+    /// `Some` iff `status` is `429`: the typed [`Self::RateLimited`] for it.
+    ///
+    /// For the auth helpers that return a boxed error and otherwise format the
+    /// status into a string. A rate limit is the refusal that must stay typed
+    /// there, because the string form reads as "authentication failed" and
+    /// sends the operator to re-authenticate.
+    #[cfg(feature = "client")]
+    pub fn rate_limited_from_http(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        body: &str,
+        url: &str,
+    ) -> Option<Self> {
+        (status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+            .then(|| Self::from_http_with_headers(status, headers, body.to_string(), Some(url)))
+    }
+
+    /// Create from a DIDComm problem-report `code` + `comment`. Mirrors
+    /// the REST [`Self::from_http`] mapping so callers can `match` on the
+    /// same variants regardless of transport.
+    ///
+    /// Standard codes (`e.p.msg.unauthorized` / `bad-request` / `not-found`
+    /// / `conflict` / `internal-error`) become typed variants. Anything
+    /// else lands in [`Self::DidcommRemote`] preserving the original code.
+    pub fn from_problem_report(code: &str, comment: impl Into<String>) -> Self {
+        use crate::protocols::problem_report_codes as c;
+        let comment = comment.into();
+        match code {
+            c::CONFLICT => Self::Conflict(comment),
+            c::NOT_FOUND => Self::NotFound(comment),
+            c::UNAUTHORIZED => Self::Auth(comment),
+            c::FORBIDDEN => Self::Forbidden(comment),
+            c::BAD_REQUEST => Self::Validation(comment),
+            c::INTERNAL => Self::Server {
+                status: 500,
+                body: comment,
+            },
+            other => Self::DidcommRemote {
+                code: other.to_string(),
+                comment,
+            },
+        }
+    }
+
+    /// Reconstruct the typed [`VtaError`] variant from a wire-format
+    /// [`TypedErrorPayload`]. Used by the client when decoding REST
+    /// response bodies / DIDComm problem-report args for the runtime
+    /// service-management surface (spec §4).
+    pub fn from_typed_payload(payload: TypedErrorPayload) -> Self {
+        match payload {
+            TypedErrorPayload::LastServiceRefused => Self::LastServiceRefused,
+            TypedErrorPayload::ServiceNotPresent => Self::ServiceNotPresent,
+            TypedErrorPayload::ServiceAlreadyEnabled => Self::ServiceAlreadyEnabled,
+            TypedErrorPayload::MediatorHandshakeFailed { reason } => {
+                Self::MediatorHandshakeFailed { reason }
+            }
+            TypedErrorPayload::DrainTtlOutOfBounds {
+                min,
+                max,
+                requested,
+            } => Self::DrainTtlOutOfBounds {
+                min,
+                max,
+                requested,
+            },
+            TypedErrorPayload::NoPriorMutation => Self::NoPriorMutation,
+            TypedErrorPayload::UnsupportedTransport { detail } => {
+                Self::UnsupportedTransport(detail)
+            }
+        }
+    }
+
+    /// Project this error onto the wire-format [`TypedErrorPayload`]
+    /// when the variant is one of the runtime service-management
+    /// errors. Returns `None` for variants that don't have a
+    /// structured wire form (network errors, generic conflicts,
+    /// programmer-level protocol errors, …).
+    #[must_use]
+    pub fn to_typed_payload(&self) -> Option<TypedErrorPayload> {
+        match self {
+            Self::LastServiceRefused => Some(TypedErrorPayload::LastServiceRefused),
+            Self::ServiceNotPresent => Some(TypedErrorPayload::ServiceNotPresent),
+            Self::ServiceAlreadyEnabled => Some(TypedErrorPayload::ServiceAlreadyEnabled),
+            Self::MediatorHandshakeFailed { reason } => {
+                Some(TypedErrorPayload::MediatorHandshakeFailed {
+                    reason: reason.clone(),
+                })
+            }
+            Self::DrainTtlOutOfBounds {
+                min,
+                max,
+                requested,
+            } => Some(TypedErrorPayload::DrainTtlOutOfBounds {
+                min: *min,
+                max: *max,
+                requested: *requested,
+            }),
+            Self::NoPriorMutation => Some(TypedErrorPayload::NoPriorMutation),
+            Self::UnsupportedTransport(detail) => Some(TypedErrorPayload::UnsupportedTransport {
+                detail: detail.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Returns true if a rate limiter refused the request (429).
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::RateLimited { .. })
+    }
+
+    /// Returns true if the resource was permanently consumed/gone (410).
+    pub fn is_gone(&self) -> bool {
+        matches!(self, Self::Gone(_))
+    }
+
+    /// Returns true if a create/insert collided with an existing entry (409).
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(_))
+    }
+
+    /// Returns true if this is an authentication/authorization error.
+    pub fn is_auth(&self) -> bool {
+        matches!(self, Self::Auth(_) | Self::Forbidden(_))
+    }
+
+    /// Returns true if this is a network-level error (retryable).
+    pub fn is_network(&self) -> bool {
+        #[cfg(feature = "client")]
+        {
+            matches!(self, Self::Network(_))
+        }
+        #[cfg(not(feature = "client"))]
+        {
+            false
+        }
+    }
+
+    /// Returns true if the resource was not found.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+
+    /// The code of a Trust Task rejection ([`Self::Rejected`]), as sent.
+    #[must_use]
+    pub fn rejection_code(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// The `details` of a Trust Task rejection ([`Self::Rejected`]), as sent.
+    #[must_use]
+    pub fn rejection_details(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Rejected { details, .. } => details.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Operator-actionable hint matching this error variant.
+    ///
+    /// `None` for variants where no generic guidance applies (the message
+    /// itself is the hint, or the failure is a programmer error). The
+    /// CLI layer (`vta-cli-common::render::print_cli_error`) already
+    /// implements bin-aware suggestions ("`pnm acl create …`"); this
+    /// method gives **non-CLI consumers** — web UIs, GUIs, custom
+    /// dashboards — the same hint surface without needing to fork the
+    /// dispatch logic.
+    ///
+    /// Returns a `&'static str` so callers can compose it into their
+    /// own UI without lifetime juggling. The bin-specific substitution
+    /// (`pnm` vs `cnm`) is left to the CLI layer because only it
+    /// knows which binary the operator is running.
+    #[must_use]
+    pub fn suggested_fix(&self) -> Option<&'static str> {
+        match self {
+            Self::Auth(_) => Some(
+                "Token may be expired. Re-authenticate against the VTA, or check that \
+                 the `/auth` endpoint is reachable.",
+            ),
+            Self::Forbidden(_) => Some(
+                "Your role or context access doesn't permit this operation. Inspect \
+                 the ACL entry for your DID against the target context.",
+            ),
+            Self::Gone(_) => Some(
+                "The resource was single-use or time-limited and has been consumed or has \
+                 expired — retrying will not succeed. If this was the bootstrap carve-out, \
+                 ask an existing admin to provision-integration a new operator instead.",
+            ),
+            Self::Conflict(_) => Some(
+                "The resource already exists. Use the corresponding `update` or \
+                 `delete-then-create` flow rather than `create`.",
+            ),
+            Self::Unavailable { .. } => Some(
+                "The VTA is temporarily busy — this is a wait, not a failure: the request \
+                 did not run. Over DIDComm or TSP the VTA may be at its operation budget \
+                 (`[server] operation_rate_limit_*`); retry after the wait. If the request \
+                 carried an idempotency key, an earlier attempt on that key may still be \
+                 running: retry with the same key and the original result will be returned \
+                 rather than the operation repeated.",
+            ),
+            Self::RateLimited { limited_by, .. } => {
+                Some(crate::rate_limit::suggested_fix(*limited_by))
+            }
+            Self::RecordMembersNotPermitted { .. } => Some(
+                "The room's profile does not list these record members, so a writer must not \
+                 use them. A curator lists them with `rooms profile set --record-members …`; \
+                 otherwise write the record without them.",
+            ),
+            Self::Validation(_) => Some(
+                "The request body or parameters were rejected by the VTA's schema. \
+                 Inspect the response body for the specific field that failed.",
+            ),
+            Self::Server { .. } => {
+                Some("VTA-side failure. Check the VTA's server logs or contact the operator.")
+            }
+            Self::UnsupportedTransport(_) => Some(
+                "The operation requires a specific transport (REST or DIDComm). \
+                 Check which mode the client is in and whether the endpoint supports it.",
+            ),
+            Self::DidcommTransport(_) => {
+                Some("Mediator or peer unreachable. Retry after checking mediator connectivity.")
+            }
+            Self::TspTransport(_) => Some(
+                "The VTA's TSP mediator is unreachable or rejected the frame. Retry, or \
+                 reach the VTA over another transport: `--transport didcomm` / \
+                 `--transport rest`.",
+            ),
+            Self::RepliesNotArriving { .. } => Some(
+                "Requests reach the VTA but its replies do not reach this client: the \
+                 client's mediator inbox is not being collected. Reconnect the session \
+                 (rebuild the client) rather than retrying — a retry only queues another \
+                 reply. If it persists, check that no other process holds this DID's \
+                 mediator connection.",
+            ),
+            #[cfg(feature = "client")]
+            Self::Network(_) => Some(
+                "Network error reaching the VTA. Confirm the URL is correct and the \
+                 host is reachable.",
+            ),
+            // Runtime service-management variants (spec §4). The CLI
+            // layer enriches these with the specific kind/command
+            // it just ran; this is the generic fallback hint for
+            // non-CLI consumers.
+            Self::LastServiceRefused => Some(
+                "This operation would leave the VTA with no advertised transport \
+                 services. Enable the other transport first (REST or DIDComm) \
+                 before disabling this one.",
+            ),
+            Self::ServiceNotPresent => Some(
+                "The service kind isn't currently enabled. Use \
+                 `services <kind> enable …` to bring it online before \
+                 updating, disabling, or rolling it back.",
+            ),
+            Self::ServiceAlreadyEnabled => Some(
+                "The service kind is already enabled. Use \
+                 `services <kind> update …` to change its configuration, \
+                 or `disable` to remove it.",
+            ),
+            Self::MediatorHandshakeFailed { .. } => Some(
+                "DIDComm handshake against the candidate mediator failed. \
+                 Confirm the mediator DID is correct and the mediator is \
+                 reachable; check the inner reason for the specific cause.",
+            ),
+            Self::DrainTtlOutOfBounds { .. } => Some(
+                "The supplied drain TTL is outside the allowed range. Pick a \
+                 value within the [min, max] interval shown in the error message.",
+            ),
+            Self::NoPriorMutation => Some(
+                "No prior mutation for this service kind to roll back from. Use \
+                 the direct `enable`/`update`/`disable` command instead.",
+            ),
+            Self::UnsupportedTaskType { .. } => Some(
+                "The peer does not serve this Trust Task at the version this client \
+                 dispatches. When the error names a version the peer does serve, the \
+                 two are different ages and one of them needs upgrading; when it names \
+                 none, check you are pointed at the agent you meant.",
+            ),
+            Self::NoMatchingProtocol { .. } => Some(
+                "The two parties share no transport protocol. Enable a common \
+                 transport (TSP, DIDComm, or REST) on both sides — compare each \
+                 DID document's advertised `service` entries and add the missing one.",
+            ),
+            Self::UnsupportedDidMethod { .. } => Some(
+                "The peer cannot resolve this identity's DID method. Use a did:webvh, \
+                 did:scid or did:key identity toward it, or a peer that resolves the method.",
+            ),
+            // No generic hint for these — the message itself is the
+            // hint, or the failure is a protocol/programmer error
+            // surface that an automated suggestion would only confuse.
+            // The hint depends on policy the message already reports — whether
+            // another device must approve, or this one may. A static string
+            // would have to guess, and guessing wrong sends the operator to the
+            // wrong screen. The CLI's consent loop says it precisely instead.
+            Self::ConsentRequired { .. } => None,
+            Self::NotFound(_)
+            | Self::DidcommRemote { .. }
+            | Self::Protocol(_)
+            | Self::Rejected { .. }
+            | Self::Serialization(_)
+            | Self::Other(_) => None,
+        }
+    }
+}
+
+/// Which limiter tripped, when the refusing service said.
+///
+/// A JSON body's `limiter` field wins. Failing that, a plain-text body from a
+/// *labelled* source is taken as its description of the limiter — the VTA's
+/// contract is that the body names it. An unlabelled `429`'s body is whatever a
+/// proxy or an older VTA wrote (`"Too Many Requests! Wait for 4s"`), which names
+/// no limiter, so it is not promoted to one.
+#[cfg(feature = "client")]
+fn limiter_from_body(limited_by: RateLimitSource, body: &str) -> Option<String> {
+    const MAX_LIMITER_LEN: usize = 128;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        return v
+            .get("limiter")
+            .and_then(|l| l.as_str())
+            .map(|l| l.chars().take(MAX_LIMITER_LEN).collect());
+    }
+    let text = body.trim();
+    (limited_by != RateLimitSource::Upstream && !text.is_empty())
+        .then(|| text.chars().take(MAX_LIMITER_LEN).collect())
+}
+
+impl From<crate::did_key::DidKeyError> for VtaError {
+    fn from(e: crate::did_key::DidKeyError) -> Self {
+        Self::Validation(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn from_http_410_maps_to_gone() {
+        let err = VtaError::from_http(reqwest::StatusCode::GONE, "carve-out closed".into());
+        assert!(err.is_gone(), "410 must map to VtaError::Gone, got {err:?}");
+    }
+
+    #[cfg(feature = "client")]
+    fn headers(pairs: &[(&'static str, &str)]) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn a_labelled_429_is_attributed_to_the_vta_with_its_wait() {
+        let before = chrono::Utc::now();
+        let err = VtaError::from_http_with_headers(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers(&[("x-rate-limit-source", "vta"), ("retry-after", "4")]),
+            r#"{"error":"rate limited","limiter":"auth"}"#.into(),
+            Some("https://vta.example.com/auth/challenge"),
+        );
+        let VtaError::RateLimited {
+            limited_by,
+            retry_after,
+            limiter,
+            url,
+        } = &err
+        else {
+            panic!("429 must map to RateLimited, got {err:?}");
+        };
+        assert_eq!(*limited_by, RateLimitSource::Vta);
+        let wait = retry_after.expect("Retry-After must be kept") - before;
+        assert!(
+            (3..=5).contains(&wait.num_seconds()),
+            "retry_after should be ~4s out, was {wait}"
+        );
+        assert_eq!(limiter.as_deref(), Some("auth"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://vta.example.com/auth/challenge")
+        );
+        assert!(err.is_rate_limited());
+        assert!(
+            err.suggested_fix()
+                .unwrap()
+                .contains("rate_limit_interval_secs"),
+            "a VTA refusal must point at the VTA's knobs"
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn a_plain_text_body_from_a_labelled_vta_names_the_limiter() {
+        let err = VtaError::from_http_with_headers(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers(&[("x-rate-limit-source", "vta")]),
+            "did-log".into(),
+            None,
+        );
+        assert!(
+            matches!(&err, VtaError::RateLimited { limiter: Some(l), .. } if l == "did-log"),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn an_unlabelled_429_is_upstream_and_keeps_the_legacy_wait_hint() {
+        let err = VtaError::from_http_with_headers(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            // What tower-governor sends from a VTA older than the source header.
+            &headers(&[("x-ratelimit-after", "4")]),
+            "Too Many Requests! Wait for 4s".into(),
+            Some("https://vta.example.com/auth/challenge"),
+        );
+        let VtaError::RateLimited {
+            limited_by,
+            retry_after,
+            limiter,
+            ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(*limited_by, RateLimitSource::Upstream);
+        assert!(retry_after.is_some(), "the legacy header is still a hint");
+        assert_eq!(
+            *limiter, None,
+            "a proxy's body names no limiter and must not be promoted to one"
+        );
+        assert!(
+            err.suggested_fix().unwrap().contains("proxy"),
+            "an unattributable 429 must send the operator to the proxy, not only the VTA"
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn retry_after_http_date_is_read() {
+        let err = VtaError::from_http_with_headers(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers(&[
+                ("x-rate-limit-source", "vta"),
+                ("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ]),
+            String::new(),
+            None,
+        );
+        let VtaError::RateLimited { retry_after, .. } = err else {
+            panic!("got {err:?}")
+        };
+        assert_eq!(
+            retry_after.map(|t| t.to_rfc3339()),
+            Some("2015-10-21T07:28:00+00:00".to_string())
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn from_http_without_headers_still_types_a_429() {
+        let err = VtaError::from_http(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "Too Many Requests! Wait for 4s".into(),
+        );
+        assert!(
+            matches!(
+                err,
+                VtaError::RateLimited {
+                    limited_by: RateLimitSource::Upstream,
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn other_statuses_are_unchanged_by_the_header_aware_constructor() {
+        let err = VtaError::from_http_with_headers(
+            reqwest::StatusCode::GONE,
+            &headers(&[("x-rate-limit-source", "vta")]),
+            "carve-out closed".into(),
+            None,
+        );
+        assert!(err.is_gone(), "got {err:?}");
+        assert!(
+            VtaError::rate_limited_from_http(
+                reqwest::StatusCode::UNAUTHORIZED,
+                &headers(&[]),
+                "",
+                "https://vta.example.com/auth/"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn problem_report_conflict_maps_to_typed_conflict() {
+        let err = VtaError::from_problem_report(
+            crate::protocols::problem_report_codes::CONFLICT,
+            "key id already exists",
+        );
+        assert!(matches!(err, VtaError::Conflict(_)), "got {err:?}");
+        assert!(err.is_conflict());
+    }
+
+    #[test]
+    fn problem_report_unknown_code_lands_in_didcomm_remote() {
+        let err = VtaError::from_problem_report("e.custom.xyz", "weird thing");
+        match err {
+            VtaError::DidcommRemote { code, comment } => {
+                assert_eq!(code, "e.custom.xyz");
+                assert_eq!(comment, "weird thing");
+            }
+            other => panic!("expected DidcommRemote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suggested_fix_present_for_actionable_variants() {
+        // Each "operator can do something about this" variant must have
+        // a hint string; the message-is-the-hint / programmer-error
+        // variants return None.
+        assert!(VtaError::Auth("expired".into()).suggested_fix().is_some());
+        assert!(VtaError::Forbidden("nope".into()).suggested_fix().is_some());
+        assert!(VtaError::Gone("used".into()).suggested_fix().is_some());
+        assert!(VtaError::Conflict("dup".into()).suggested_fix().is_some());
+        assert!(VtaError::Validation("bad".into()).suggested_fix().is_some());
+        assert!(
+            VtaError::Server {
+                status: 500,
+                body: "boom".into(),
+            }
+            .suggested_fix()
+            .is_some()
+        );
+        assert!(
+            VtaError::UnsupportedTransport("rest only".into())
+                .suggested_fix()
+                .is_some()
+        );
+        assert!(
+            VtaError::DidcommTransport("offline".into())
+                .suggested_fix()
+                .is_some()
+        );
+
+        // Runtime service-management variants (spec §4) all have hints.
+        assert!(VtaError::LastServiceRefused.suggested_fix().is_some());
+        assert!(VtaError::ServiceNotPresent.suggested_fix().is_some());
+        assert!(VtaError::ServiceAlreadyEnabled.suggested_fix().is_some());
+        assert!(
+            VtaError::MediatorHandshakeFailed {
+                reason: "trust-ping timeout".into()
+            }
+            .suggested_fix()
+            .is_some()
+        );
+        assert!(
+            VtaError::DrainTtlOutOfBounds {
+                min: 3600,
+                max: 2_592_000,
+                requested: 30,
+            }
+            .suggested_fix()
+            .is_some()
+        );
+        assert!(VtaError::NoPriorMutation.suggested_fix().is_some());
+
+        // Self-explanatory / programmer-error: no canned hint.
+        assert!(VtaError::NotFound("x".into()).suggested_fix().is_none());
+        assert!(VtaError::Protocol("shape".into()).suggested_fix().is_none());
+        assert!(
+            VtaError::DidcommRemote {
+                code: "e.unknown".into(),
+                comment: "x".into()
+            }
+            .suggested_fix()
+            .is_none()
+        );
+    }
+
+    /// Every typed runtime service-management variant must round-trip
+    /// through [`TypedErrorPayload`] without losing structured data.
+    /// The test cases line up 1:1 with the spec §4 list.
+    #[test]
+    fn typed_payload_round_trips_every_runtime_service_variant() {
+        let cases: Vec<VtaError> = vec![
+            VtaError::LastServiceRefused,
+            VtaError::ServiceNotPresent,
+            VtaError::ServiceAlreadyEnabled,
+            VtaError::MediatorHandshakeFailed {
+                reason: "trust-ping timeout after 10s".into(),
+            },
+            VtaError::DrainTtlOutOfBounds {
+                min: 3600,
+                max: 2_592_000,
+                requested: 30,
+            },
+            VtaError::NoPriorMutation,
+            VtaError::UnsupportedTransport("services didcomm enable is REST-only".into()),
+        ];
+
+        for original in cases {
+            let payload = original.to_typed_payload().unwrap_or_else(|| {
+                panic!("variant must project to TypedErrorPayload: {original:?}")
+            });
+
+            // Round-trip through JSON to mirror what REST and DIDComm
+            // transports actually do on the wire.
+            let json = serde_json::to_string(&payload)
+                .unwrap_or_else(|e| panic!("payload must serialize: {e}"));
+            let restored: TypedErrorPayload = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("payload must deserialize: {e}; raw={json}"));
+
+            assert_eq!(
+                payload, restored,
+                "TypedErrorPayload must round-trip through JSON",
+            );
+
+            // Reconstructing back to VtaError preserves the variant
+            // discriminant and any structured data.
+            let reconstructed = VtaError::from_typed_payload(restored);
+            match (&original, &reconstructed) {
+                (VtaError::LastServiceRefused, VtaError::LastServiceRefused)
+                | (VtaError::ServiceNotPresent, VtaError::ServiceNotPresent)
+                | (VtaError::ServiceAlreadyEnabled, VtaError::ServiceAlreadyEnabled)
+                | (VtaError::NoPriorMutation, VtaError::NoPriorMutation) => {}
+                (
+                    VtaError::MediatorHandshakeFailed { reason: a },
+                    VtaError::MediatorHandshakeFailed { reason: b },
+                ) => assert_eq!(a, b),
+                (
+                    VtaError::DrainTtlOutOfBounds {
+                        min: m1,
+                        max: x1,
+                        requested: r1,
+                    },
+                    VtaError::DrainTtlOutOfBounds {
+                        min: m2,
+                        max: x2,
+                        requested: r2,
+                    },
+                ) => {
+                    assert_eq!(m1, m2);
+                    assert_eq!(x1, x2);
+                    assert_eq!(r1, r2);
+                }
+                (VtaError::UnsupportedTransport(a), VtaError::UnsupportedTransport(b)) => {
+                    assert_eq!(a, b)
+                }
+                (a, b) => panic!("variant changed across round-trip: {a:?} → {b:?}"),
+            }
+        }
+    }
+
+    /// The kebab-case `code` discriminator on the wire JSON is part of
+    /// the contract for both REST and DIDComm transports — pin it
+    /// explicitly so a `serde(rename)` change doesn't silently break
+    /// existing peers.
+    #[test]
+    fn typed_payload_wire_discriminator_is_kebab_case() {
+        let payload = TypedErrorPayload::DrainTtlOutOfBounds {
+            min: 3600,
+            max: 2_592_000,
+            requested: 30,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["code"], "drain-ttl-out-of-bounds");
+        assert_eq!(json["min"], 3600);
+        assert_eq!(json["max"], 2_592_000);
+        assert_eq!(json["requested"], 30);
+    }
+
+    /// `to_typed_payload` returns `None` for variants outside the
+    /// runtime service-management surface — the wire-format channel
+    /// is reserved for those typed variants and shouldn't blanket
+    /// every error.
+    #[test]
+    fn typed_payload_is_none_for_non_service_management_variants() {
+        assert!(VtaError::Auth("x".into()).to_typed_payload().is_none());
+        assert!(VtaError::NotFound("x".into()).to_typed_payload().is_none());
+        assert!(VtaError::Conflict("x".into()).to_typed_payload().is_none());
+        assert!(
+            VtaError::Server {
+                status: 500,
+                body: "x".into(),
+            }
+            .to_typed_payload()
+            .is_none()
+        );
+        assert!(VtaError::Protocol("x".into()).to_typed_payload().is_none());
+        assert!(
+            VtaError::DidcommRemote {
+                code: "e.x".into(),
+                comment: "x".into()
+            }
+            .to_typed_payload()
+            .is_none()
+        );
+        assert!(VtaError::Other("x".into()).to_typed_payload().is_none());
+    }
+}
+
+/// Which side of an `unsupportedVersion` is behind, where the versions say so: a requested version older
+/// than every one served means this client is older than the peer, newer than
+/// every one served means the peer is older than this client. Empty where the
+/// versions do not order (one is unreadable, or the request falls between).
+pub fn version_age_hint(type_uri: &str, served: &[String]) -> &'static str {
+    fn version(uri: &str) -> Option<(u32, u32)> {
+        let (major, minor) = uri.rsplit('/').next()?.split_once('.')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    }
+    let Some(asked) = version(type_uri) else {
+        return "";
+    };
+    let Some(served) = served
+        .iter()
+        .map(|s| version(s))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return "";
+    };
+    if served.iter().all(|v| asked < *v) {
+        " (this client is older than the peer: upgrade the client)"
+    } else if served.iter().all(|v| asked > *v) {
+        " (the peer is older than this client: upgrade the peer)"
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod version_age_hint_tests {
+    use super::version_age_hint;
+
+    fn served(v: &[&str]) -> Vec<String> {
+        v.iter()
+            .map(|v| format!("https://trusttasks.org/spec/acl/list/{v}"))
+            .collect()
+    }
+
+    #[test]
+    fn an_older_client_is_told_to_upgrade_itself() {
+        let hint = version_age_hint(
+            "https://trusttasks.org/spec/acl/list/0.3",
+            &served(&["0.4"]),
+        );
+        assert!(hint.contains("upgrade the client"), "{hint}");
+    }
+
+    #[test]
+    fn an_older_peer_is_named_as_the_one_behind() {
+        let hint = version_age_hint(
+            "https://trusttasks.org/spec/acl/list/0.4",
+            &served(&["0.2", "0.3"]),
+        );
+        assert!(hint.contains("upgrade the peer"), "{hint}");
+    }
+
+    #[test]
+    fn versions_that_do_not_order_say_nothing() {
+        let between = version_age_hint(
+            "https://trusttasks.org/spec/acl/list/0.3",
+            &served(&["0.2", "0.4"]),
+        );
+        assert_eq!(between, "");
+        assert_eq!(version_age_hint("not-a-uri", &served(&["0.2"])), "");
+    }
+}

@@ -1,0 +1,2119 @@
+//! Hidden vetting's community half, over the wire it actually serves.
+//!
+//! Four Trust Tasks, posted as signed documents to `/v1/trust-tasks` exactly as a vetter's or
+//! an applicant's agent would post them, and answered by the same dispatcher every other task
+//! goes through:
+//!
+//! 1. a vetter enrols (`vtc/vetting/vetters/pcs-root/0.1`) and unblinds what comes back;
+//! 2. the same vetter draws a tick of the drip (`.../pcs-tokens/0.1`) and the tokens verify;
+//! 3. a vetter asks to vet at an event (`.../event-mode/0.1`);
+//! 4. an applicant asks for a challenge (`vtc/vetting/pcs-challenge/0.1`).
+//!
+//! Then the refusals that make each of them a rule rather than an intention: a stranger
+//! enrolling, the same vetter enrolling twice under one label, a second draw for one tick, a
+//! batch over the published rate, and — for event mode — the four conditions that stand between
+//! an event being configured and its label being drawn under.
+//!
+//! Everything here runs against `vti-vetting-pcs` on the client side too, because the vetter
+//! half of the crate is what an agent runs — so a mismatch between what this service signs and
+//! what a vetter can use shows up as a failure here rather than in a deployment.
+
+#![cfg(feature = "vetting-pcs")]
+
+use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use chrono::{Duration, Utc};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+use predicate_credential_system::pcs::PredicateCredentialSystem;
+use vtc_service::test_support::TestVtc;
+use vtc_service::vetting::pcs_tasks;
+use vti_vetting_pcs::{
+    rand::{SeedableRng, rngs::StdRng},
+    scheme::{point_text, vetter_predicate},
+    token::TokenWallet,
+};
+
+const COMMUNITY: &str = "did:key:z6MkfMhiddenVettingTasks";
+const PERIOD: &str = "2026-09";
+const TOKEN_LABEL: &str = "token/2026-09";
+const DRIP: usize = 3;
+
+/// A `did:key` identity from a fixed seed.
+fn identity(seed: u8) -> (String, Secret) {
+    let mut secret = Secret::generate_ed25519(None, Some(&[seed; 32]));
+    let public = secret.get_public_keymultibase().unwrap();
+    secret.id = format!("did:key:{public}#{public}");
+    let did = secret.id.split('#').next().unwrap().to_string();
+    (did, secret)
+}
+
+/// A community run in single-administrator mode (VTI-APV-022), so the tasks that change a join
+/// criterion — `vtc/vetting/hidden/{publish,withdraw}` among them (VTI-APV-023) — go through
+/// their gate here: [`Harness::post`] answers the bound step-up each asks for with the signer's
+/// passkey and re-sends the same document, and the change applies on that gesture. Parking for a
+/// second administrator is `vti_apv_023_*` below.
+struct Harness {
+    tv: TestVtc,
+    community: String,
+    gesturer: tokio::sync::Mutex<crate::common::second_party::Gesturer>,
+    enrolled: tokio::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl Harness {
+    async fn start() -> Self {
+        let tv = TestVtc::builder()
+            .vtc_did(COMMUNITY)
+            .with_signers(true)
+            .with_audit(true)
+            .with_public_url("https://vtc.example.com")
+            .build()
+            .await;
+        tv.state.config.write().await.acl.single_admin_mode = true;
+        let community = COMMUNITY.to_string();
+        Self {
+            tv,
+            community,
+            gesturer: tokio::sync::Mutex::new(crate::common::second_party::Gesturer::new()),
+            enrolled: Default::default(),
+        }
+    }
+
+    /// Publish this community's hidden-vetting parameters on a criterion, the way an operator
+    /// does: from the keys the service will actually mint under.
+    async fn publish(&self) -> vtc_service::vetting::pcs::HiddenVettingConfig {
+        let config = vtc_service::vetting::pcs_issue::publish(
+            &self.tv.state,
+            &self.community,
+            vec![PERIOD.to_string()],
+            vec![TOKEN_LABEL.to_string()],
+            DRIP,
+        )
+        .expect("the community publishes the keys it mints under");
+        // A criterion needs a DCQL query naming a registered evidence type; what this test is
+        // about hangs off it rather than being it.
+        const VCT: &str = "https://openvtc.org/credentials/MembershipCredential";
+        vtc_service::schemas::store_schema(
+            &self.tv.state.schemas_ks,
+            &vtc_service::schemas::SchemaEntry {
+                type_uri: VCT.into(),
+                dtg_type: Some("MembershipCredential".into()),
+                credential_schema: None,
+                kind: vtc_service::schemas::SchemaKind::Accepts,
+                description: None,
+                created_at: Utc::now(),
+                created_by_did: "did:key:zAdmin".into(),
+            },
+        )
+        .await
+        .expect("register the evidence type");
+        let criterion = vtc_service::schemas::accepts::AcceptsCriterion {
+            id: "hidden-criterion".into(),
+            admission: vtc_service::schemas::Admission::Automatic,
+            credential_issuers: Some(vtc_service::schemas::CredentialIssuers::Any),
+            invitation_required: false,
+            position: 0,
+            query: Some(json!({
+                "credentials": [{
+                    "id": "membership",
+                    "format": "dc+sd-jwt",
+                    "meta": { "vct_values": [VCT] },
+                    "claims": [{ "path": ["givenName"] }]
+                }]
+            })),
+            description: None,
+            vetting: None,
+            hidden_vetting: Some(serde_json::to_value(&config).unwrap()),
+            created_at: Utc::now(),
+            created_by_did: "did:key:zAdmin".into(),
+        };
+        vtc_service::schemas::accepts::store_accepts(&self.tv.state.schemas_ks, &criterion)
+            .await
+            .expect("store the criterion");
+        config
+    }
+
+    /// Re-store this community's criterion with `config`.
+    ///
+    /// This is how an admin approves an event: by editing the criterion that publishes it. There
+    /// is deliberately no Trust Task for it — a task the vetter could send is a task a vetter
+    /// could be made to send — so the test does what an admin does.
+    async fn store_config(&self, config: &vtc_service::vetting::pcs::HiddenVettingConfig) {
+        let mut criterion = vtc_service::schemas::accepts::get_accepts(
+            &self.tv.state.schemas_ks,
+            "hidden-criterion",
+        )
+        .await
+        .expect("read the criterion")
+        .expect("the criterion exists");
+        criterion.hidden_vetting = Some(serde_json::to_value(config).unwrap());
+        vtc_service::schemas::accepts::store_accepts(&self.tv.state.schemas_ks, &criterion)
+            .await
+            .expect("store the criterion");
+    }
+
+    /// A member of this community holding a live vetter grant — the community's own records,
+    /// which is what the minting half reads. Written directly rather than through the grant
+    /// task, because what is under test here is what happens *after* a grant exists.
+    async fn grant_vetter(&self, did: &str) {
+        let mut member = vtc_service::members::Member::fresh(did);
+        member.joined_at = Utc::now() - Duration::days(1);
+        vtc_service::members::store_member(&self.tv.state.members_ks, &member)
+            .await
+            .unwrap();
+        let row = vtc_service::endorsements::Endorsement {
+            id: Uuid::new_v4(),
+            endorsement_type: vtc_service::endorsements::VETTER_GRANT_ROW_TYPE.to_string(),
+            issuer_did: self.community.clone(),
+            subject_did: did.to_string(),
+            claim: json!({ "role": "vetter" }),
+            status_list_index: 0,
+            credential_id: format!("urn:uuid:{}", Uuid::new_v4()),
+            created_at: Utc::now() - Duration::hours(1),
+            revoked_at: None,
+            valid_until: None,
+            auto_granted: false,
+            credential: None,
+        };
+        vtc_service::endorsements::store_endorsement(&self.tv.state.endorsements_ks, &row)
+            .await
+            .unwrap();
+    }
+
+    /// Post a signed Trust Task document, as an agent would.
+    /// `payload` as a `typ` document signed by `secret`, sent; a step-up the gate asks for is
+    /// answered with the signer's passkey and the same document sent again.
+    async fn post(&self, secret: &Secret, typ: &str, payload: Value) -> (StatusCode, Value) {
+        let did = secret.id.split('#').next().unwrap().to_string();
+        if self.enrolled.lock().await.insert(did.clone()) {
+            self.gesturer.lock().await.enrol(&self.tv, &did).await;
+        }
+        let doc = self.sign(secret, typ, payload).await;
+        let (status, body) = self.send(&doc).await;
+        if crate::common::second_party::step_up_request(&body).is_none() {
+            return (status, body);
+        }
+        let approval = self.gesturer.lock().await.approval(&self.tv, &body).await;
+        let answer = self
+            .sign(
+                secret,
+                crate::common::second_party::APPROVE_RESPONSE_TYPE,
+                approval,
+            )
+            .await;
+        let (status, ack) = self.send(&answer).await;
+        assert_eq!(status, StatusCode::OK, "the gesture is recorded: {ack}");
+        self.send(&doc).await
+    }
+
+    async fn sign(&self, secret: &Secret, typ: &str, payload: Value) -> Value {
+        let did = secret.id.split('#').next().unwrap().to_string();
+        let now = Utc::now();
+        let stamp = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let mut doc = json!({
+            "type": typ,
+            "id": format!("urn:uuid:{}", Uuid::new_v4()),
+            "issuer": did,
+            "recipient": self.community,
+            "issuedAt": stamp(now),
+            "expiresAt": stamp(now + Duration::hours(1)),
+            "payload": payload,
+        });
+        let proof = DataIntegrityProof::sign(&doc, secret, SignOptions::new())
+            .await
+            .expect("sign");
+        doc["proof"] = serde_json::to_value(proof).unwrap();
+        doc
+    }
+
+    async fn send(&self, doc: &Value) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/trust-tasks")
+            .header("content-type", "application/json")
+            .body(Body::from(doc.to_string()))
+            .unwrap();
+        let response = self.tv.router.clone().oneshot(req).await.expect("oneshot");
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+}
+
+/// The code a refusal carries, from the framework's error document.
+fn tt_error_code(body: &Value) -> String {
+    body.pointer("/payload/code")
+        .or_else(|| body.pointer("/payload/error/code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
+    let h = Harness::start().await;
+    let config = h.publish().await;
+    // The same issuer the service mints with — derived from the same master secret, which is
+    // what makes this a test of the wire rather than of two unrelated key pairs.
+    let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community)
+        .expect("the service's own issuer");
+    let mut rng = StdRng::seed_from_u64(0x2026_0926);
+
+    let (vetter_did, vetter_key) = identity(0xA7);
+    h.grant_vetter(&vetter_did).await;
+
+    // --- 1. enrol ---------------------------------------------------------------------------
+    let (id, usk) = issuer.open().user_keygen(&mut rng).unwrap();
+    let f = vetter_predicate(PERIOD);
+    let (request, blinding) = issuer
+        .open()
+        .root_request(issuer.hvk(), &f, &id, &usk, &mut rng)
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            json!({
+                "label": format!("vetter/{PERIOD}"),
+                "id": point_text(&id).unwrap(),
+                "request": serde_json::to_value(&request).unwrap(),
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pre = body
+        .pointer("/payload/preCredential")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("no pre-credential in {body}"));
+    // What comes back unblinds into a credential the community has never seen.
+    issuer
+        .open()
+        .unblind(
+            issuer.hvk(),
+            &usk,
+            &f,
+            &vti_vetting_pcs::scheme::dec(pre).unwrap(),
+            &blinding,
+        )
+        .expect("the answer unblinds under the published key");
+
+    // Asking again under the label, with the same identifier and fresh blinding, is a client
+    // that lost the answer: it is re-issued, in the same shape as the first answer.
+    let (again, again_blinding) = issuer
+        .open()
+        .root_request(issuer.hvk(), &f, &id, &usk, &mut rng)
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            json!({
+                "label": format!("vetter/{PERIOD}"),
+                "id": point_text(&id).unwrap(),
+                "request": serde_json::to_value(&again).unwrap(),
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "a lost answer is re-issued: {body}");
+    let pre = body
+        .pointer("/payload/preCredential")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("no pre-credential in {body}"));
+    issuer
+        .open()
+        .unblind(
+            issuer.hvk(),
+            &usk,
+            &f,
+            &vti_vetting_pcs::scheme::dec(pre).unwrap(),
+            &again_blinding,
+        )
+        .expect("the re-issued answer unblinds");
+
+    // Another identifier under the same label is a second key, and is refused: a member
+    // holding two would count twice in one proof.
+    let (other_id, other_usk) = issuer.open().user_keygen(&mut rng).unwrap();
+    let (other, _) = issuer
+        .open()
+        .root_request(issuer.hvk(), &f, &other_id, &other_usk, &mut rng)
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            json!({
+                "label": format!("vetter/{PERIOD}"),
+                "id": point_text(&other_id).unwrap(),
+                "request": serde_json::to_value(&other).unwrap(),
+            }),
+        )
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a second identifier must be refused"
+    );
+    assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_IDENTIFIER_REBOUND);
+
+    // Re-issues are bounded; past the bound the answer is `alreadyEnrolled`, as it always was.
+    // The unit tests walk the bound one re-issue at a time; here the row is brought to it
+    // directly, because every post spends the unauthenticated limiter's burst.
+    {
+        use vtc_service::vetting::pcs_issue::{
+            EnrolmentRecord, MAX_REISSUES_PER_LABEL, ReissueRecord,
+        };
+        let key = format!("pcs-enrol:{vetter_did}").into_bytes();
+        let ks = &h.tv.state.vetting_pcs_issue_ks;
+        let mut record: EnrolmentRecord = ks.get(key.clone()).await.unwrap().unwrap();
+        assert_eq!(record.reissued(&format!("vetter/{PERIOD}")), 1);
+        record.reissues = vec![ReissueRecord {
+            label: format!("vetter/{PERIOD}"),
+            count: MAX_REISSUES_PER_LABEL,
+            last_at: Utc::now(),
+        }];
+        ks.insert(key, &record).await.unwrap();
+    }
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            json!({
+                "label": format!("vetter/{PERIOD}"),
+                "id": point_text(&id).unwrap(),
+                "request": serde_json::to_value(&request).unwrap(),
+            }),
+        )
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "re-issues past the bound must be refused"
+    );
+    assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_ALREADY_ENROLLED);
+
+    // A member with no grant is refused before any crypto happens.
+    let (stranger_did, stranger_key) = identity(0xB7);
+    let _ = stranger_did;
+    let (status, body) = h
+        .post(
+            &stranger_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            json!({
+                "label": format!("vetter/{PERIOD}"),
+                "id": point_text(&id).unwrap(),
+                "request": serde_json::to_value(&request).unwrap(),
+            }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_NOT_A_VETTER);
+
+    // --- 2. draw ----------------------------------------------------------------------------
+    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let requests = wallet
+        .prepare(issuer.tvk(), TOKEN_LABEL, &vetter_did, 1, DRIP, &mut rng)
+        .unwrap();
+    let batch = json!({
+        "label": TOKEN_LABEL,
+        "tick": 1,
+        "requests": requests
+            .iter()
+            .map(|r| json!({
+                "commitment": vti_vetting_pcs::scheme::enc(&r.commitment).unwrap(),
+                "openingProof": vti_vetting_pcs::scheme::enc(&r.opening_proof).unwrap(),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let (status, body) = h
+        .post(&vetter_key, pcs_tasks::PCS_TOKENS_TYPE, batch.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pres: Vec<_> = body
+        .pointer("/payload/preCredentials")
+        .and_then(Value::as_array)
+        .expect("tokens")
+        .iter()
+        .map(|p| vti_vetting_pcs::scheme::dec(p.as_str().unwrap()).unwrap())
+        .collect();
+    wallet
+        .receive(issuer.tvk(), TOKEN_LABEL, 1, &pres)
+        .expect("the tokens verify under the published token key");
+    assert_eq!(wallet.free(), DRIP);
+
+    // The same tick again is refused — the store says so, not a memory.
+    let (status, body) = h.post(&vetter_key, pcs_tasks::PCS_TOKENS_TYPE, batch).await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::TOKENS_ERR_ALREADY_SERVED);
+
+    // And more than the published rate is refused whatever the vetter asks for.
+    let greedy = wallet
+        .prepare(
+            issuer.tvk(),
+            TOKEN_LABEL,
+            &vetter_did,
+            2,
+            DRIP + 5,
+            &mut rng,
+        )
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_TOKENS_TYPE,
+            json!({
+                "label": TOKEN_LABEL,
+                "tick": 2,
+                "requests": greedy
+                    .iter()
+                    .map(|r| json!({
+                        "commitment": vti_vetting_pcs::scheme::enc(&r.commitment).unwrap(),
+                        "openingProof": vti_vetting_pcs::scheme::enc(&r.opening_proof).unwrap(),
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::TOKENS_ERR_OVER_QUOTA);
+
+    // --- 3. the applicant's challenge -------------------------------------------------------
+    let (_applicant_did, applicant_key) = identity(0xC7);
+    let (status, body) = h
+        .post(
+            &applicant_key,
+            pcs_tasks::PCS_CHALLENGE_TYPE,
+            json!({ "criterionId": "hidden-criterion" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let challenge = body
+        .pointer("/payload/challenge")
+        .and_then(Value::as_str)
+        .expect("a challenge");
+    // 16 bytes of lowercase hex, as the specification says — not "a random string".
+    assert_eq!(challenge.len(), 32, "{challenge}");
+    assert!(
+        challenge
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "{challenge}"
+    );
+    assert!(body.pointer("/payload/expiresAt").is_some(), "{body}");
+
+    let _ = config;
+}
+
+/// A community that publishes no hidden-vetting criterion has no challenge to issue, and says
+/// so with the declared code rather than minting one nobody can spend.
+#[tokio::test]
+async fn a_community_that_runs_no_hidden_criterion_refuses_a_challenge() {
+    let h = Harness::start().await;
+    let (_did, key) = identity(0xD7);
+    let (status, body) = h.post(&key, pcs_tasks::PCS_CHALLENGE_TYPE, json!({})).await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::CHALLENGE_ERR_NOT_HIDDEN);
+}
+
+// --- event mode ---------------------------------------------------------------------------------
+
+const EVENT: &str = "kernel-summit-2026";
+const EVENT_LABEL: &str = "token/event/kernel-summit-2026";
+const EVENT_DRIP: usize = 20;
+
+/// The event as an admin configures it: a three-day summit, one tier, the floor §5.1 names.
+fn summit(approved_by: Option<&str>) -> vtc_service::vetting::pcs::HiddenVettingEvent {
+    vtc_service::vetting::pcs::HiddenVettingEvent {
+        event_id: EVENT.into(),
+        start_date: Utc::now().date_naive(),
+        end_date: Utc::now().date_naive() + Duration::days(2),
+        grace_days: 14,
+        group_floor: 3,
+        tiers: vec![vtc_service::vetting::pcs::HiddenVettingTier {
+            name: "desk".into(),
+            drip_per_tick: EVENT_DRIP,
+        }],
+        approved_by: approved_by.map(str::to_string),
+    }
+}
+
+/// The window a vetter asks for: the whole event.
+fn window() -> Value {
+    json!({
+        "startDate": Utc::now().date_naive().to_string(),
+        "endDate": (Utc::now().date_naive() + Duration::days(2)).to_string(),
+    })
+}
+
+/// Publish the summit on the criterion, with its label live, and grant `n` vetters.
+async fn summit_harness(approved_by: Option<&str>, n: u8) -> (Harness, Vec<(String, Secret)>) {
+    let h = Harness::start().await;
+    let mut config = h.publish().await;
+    config.live_token_labels.push(EVENT_LABEL.to_string());
+    config.events.push(summit(approved_by));
+    h.store_config(&config).await;
+
+    let mut vetters = Vec::new();
+    for i in 0..n {
+        let (did, key) = identity(0xE0 + i);
+        h.grant_vetter(&did).await;
+        vetters.push((did, key));
+    }
+    (h, vetters)
+}
+
+/// A request is a request. It is recorded, it counts towards the floor, and it grants nothing —
+/// and until the floor is met the event's label cannot be drawn under at all.
+#[tokio::test]
+async fn an_event_stays_shut_until_enough_vetters_have_asked() {
+    let (h, vetters) = summit_harness(Some("did:key:zAdminApprover"), 2).await;
+
+    let (status, body) = h
+        .post(
+            &vetters[0].1,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({ "eventId": EVENT, "tier": "desk", "window": window() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.pointer("/payload/state").unwrap(), "pending");
+    assert_eq!(body.pointer("/payload/groupSize").unwrap(), 1);
+    assert_eq!(body.pointer("/payload/groupFloor").unwrap(), 3);
+    // The three members that would read as permission to draw are absent while it is pending.
+    assert!(body.pointer("/payload/label").is_none(), "{body}");
+    assert!(body.pointer("/payload/dripPerTick").is_none(), "{body}");
+    assert!(body.pointer("/payload/closesAfter").is_none(), "{body}");
+
+    // Asking again does not make the group bigger.
+    let (status, body) = h
+        .post(
+            &vetters[0].1,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({ "eventId": EVENT, "tier": "desk", "window": window() }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::EVENT_ERR_ALREADY_REQUESTED);
+
+    // And the label it would unlock is shut, with the code the drip declares for exactly this.
+    let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community).unwrap();
+    let mut rng = StdRng::seed_from_u64(0x2026_1012);
+    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let requests = wallet
+        .prepare(
+            issuer.tvk(),
+            EVENT_LABEL,
+            &vetters[0].0,
+            1,
+            EVENT_DRIP,
+            &mut rng,
+        )
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetters[0].1,
+            pcs_tasks::PCS_TOKENS_TYPE,
+            json!({
+                "label": EVENT_LABEL,
+                "tick": 1,
+                "requests": requests
+                    .iter()
+                    .map(|r| json!({
+                        "commitment": vti_vetting_pcs::scheme::enc(&r.commitment).unwrap(),
+                        "openingProof": vti_vetting_pcs::scheme::enc(&r.opening_proof).unwrap(),
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(tt_error_code(&body), pcs_tasks::TOKENS_ERR_EVENT_REFUSED);
+}
+
+/// With an approver and the floor met, the label opens — at the tier's rate, which is the whole
+/// point of it, and still capped by the community rather than by what the vetter asks for.
+#[tokio::test]
+async fn an_approved_event_opens_its_label_at_the_tier_rate() {
+    let (h, vetters) = summit_harness(Some("did:key:zAdminApprover"), 3).await;
+    let ask = json!({ "eventId": EVENT, "tier": "desk", "window": window() });
+
+    for (n, (_, key)) in vetters.iter().enumerate() {
+        let (status, body) = h.post(key, pcs_tasks::EVENT_MODE_TYPE, ask.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = if n + 1 >= 3 { "approved" } else { "pending" };
+        assert_eq!(
+            body.pointer("/payload/state").unwrap(),
+            expected,
+            "vetter {n} of 3: {body}"
+        );
+        if n + 1 >= 3 {
+            assert_eq!(body.pointer("/payload/label").unwrap(), EVENT_LABEL);
+            assert_eq!(body.pointer("/payload/dripPerTick").unwrap(), EVENT_DRIP);
+            assert_eq!(
+                body.pointer("/payload/closesAfter").unwrap(),
+                &json!((Utc::now().date_naive() + Duration::days(16)).to_string()),
+                "the window plus this community's grace"
+            );
+        }
+    }
+
+    let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community).unwrap();
+    let mut rng = StdRng::seed_from_u64(0x2026_1013);
+    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let batch = |reqs: &[vti_vetting_pcs::token::TokenRequest], tick: u32| {
+        json!({
+            "label": EVENT_LABEL,
+            "tick": tick,
+            "requests": reqs
+                .iter()
+                .map(|r| json!({
+                    "commitment": vti_vetting_pcs::scheme::enc(&r.commitment).unwrap(),
+                    "openingProof": vti_vetting_pcs::scheme::enc(&r.opening_proof).unwrap(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    };
+
+    // The tier is the cap. A vetter asking for more than it is refused the batch, exactly as
+    // under the monthly label — and nothing is recorded, so the tick is still theirs to draw.
+    let greedy = wallet
+        .prepare(
+            issuer.tvk(),
+            EVENT_LABEL,
+            &vetters[0].0,
+            0,
+            EVENT_DRIP + 1,
+            &mut rng,
+        )
+        .unwrap();
+    let (status, body) = h
+        .post(&vetters[0].1, pcs_tasks::PCS_TOKENS_TYPE, batch(&greedy, 0))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(tt_error_code(&body), pcs_tasks::TOKENS_ERR_OVER_QUOTA);
+
+    // A tick is a window of time (pcs-tokens/0.1): the event began today and ticks last three
+    // days, so tick 1 has not begun and cannot be drawn ahead.
+    let ahead = wallet
+        .prepare(
+            issuer.tvk(),
+            EVENT_LABEL,
+            &vetters[0].0,
+            1,
+            EVENT_DRIP,
+            &mut rng,
+        )
+        .unwrap();
+    let (status, body) = h
+        .post(&vetters[0].1, pcs_tasks::PCS_TOKENS_TYPE, batch(&ahead, 1))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::TOKENS_ERR_TICK_NOT_YET,
+        "{body}"
+    );
+
+    let requests = wallet
+        .prepare(
+            issuer.tvk(),
+            EVENT_LABEL,
+            &vetters[0].0,
+            0,
+            EVENT_DRIP,
+            &mut rng,
+        )
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetters[0].1,
+            pcs_tasks::PCS_TOKENS_TYPE,
+            batch(&requests, 0),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pres: Vec<_> = body
+        .pointer("/payload/preCredentials")
+        .and_then(Value::as_array)
+        .expect("tokens")
+        .iter()
+        .map(|p| vti_vetting_pcs::scheme::dec(p.as_str().unwrap()).unwrap())
+        .collect();
+    wallet
+        .receive(issuer.tvk(), EVENT_LABEL, 0, &pres)
+        .expect("event tokens verify under the same published key");
+    assert_eq!(wallet.free(), EVENT_DRIP, "the tier's rate, not the drip's");
+}
+
+/// The rule that makes the approval mean something: an approver who is in the group has approved
+/// their own cap, and the label stays shut for everyone — not just for them.
+#[tokio::test]
+async fn an_event_approved_by_one_of_its_own_vetters_opens_nothing() {
+    let (h, vetters) = summit_harness(None, 3).await;
+    let ask = json!({ "eventId": EVENT, "tier": "desk", "window": window() });
+    for (_, key) in &vetters {
+        let (status, body) = h.post(key, pcs_tasks::EVENT_MODE_TYPE, ask.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.pointer("/payload/state").unwrap(), "pending");
+    }
+
+    // The admin now approves — naming a vetter who asked to be in the group. The floor is met,
+    // the window is open, everybody asked, and it still opens nothing.
+    let mut config = h.publish().await;
+    config.live_token_labels.push(EVENT_LABEL.to_string());
+    config.events.push(summit(Some(&vetters[1].0)));
+    h.store_config(&config).await;
+
+    let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community).unwrap();
+    let mut rng = StdRng::seed_from_u64(0x2026_1014);
+    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    // The one who did not approve, so that what is refused is the event and not the approver.
+    let requests = wallet
+        .prepare(
+            issuer.tvk(),
+            EVENT_LABEL,
+            &vetters[0].0,
+            1,
+            EVENT_DRIP,
+            &mut rng,
+        )
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetters[0].1,
+            pcs_tasks::PCS_TOKENS_TYPE,
+            json!({
+                "label": EVENT_LABEL,
+                "tick": 1,
+                "requests": requests
+                    .iter()
+                    .map(|r| json!({
+                        "commitment": vti_vetting_pcs::scheme::enc(&r.commitment).unwrap(),
+                        "openingProof": vti_vetting_pcs::scheme::enc(&r.opening_proof).unwrap(),
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(tt_error_code(&body), pcs_tasks::TOKENS_ERR_EVENT_REFUSED);
+}
+
+/// Every refusal the request itself declares, each with the code a client switches on.
+#[tokio::test]
+async fn an_event_request_refuses_with_the_codes_it_declares() {
+    let (h, vetters) = summit_harness(Some("did:key:zAdminApprover"), 1).await;
+    let (_, vetter) = &vetters[0];
+
+    let (status, body) = h
+        .post(
+            vetter,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({ "eventId": "some-other-summit", "tier": "desk", "window": window() }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::EVENT_ERR_UNKNOWN_EVENT);
+
+    let (status, body) = h
+        .post(
+            vetter,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({ "eventId": EVENT, "tier": "all-day-every-day", "window": window() }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::EVENT_ERR_UNKNOWN_TIER);
+
+    // A window wider than the event's own: the extra days would be tokens at the event's rate
+    // for days that are not the event.
+    let (status, body) = h
+        .post(
+            vetter,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({
+                "eventId": EVENT,
+                "tier": "desk",
+                "window": {
+                    "startDate": Utc::now().date_naive().to_string(),
+                    "endDate": (Utc::now().date_naive() + Duration::days(30)).to_string(),
+                },
+            }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::EVENT_ERR_BAD_WINDOW);
+
+    // An event whose label has already closed. Its window is still the event's own, so what
+    // refuses this is the grace period running out and not the dates being wrong.
+    let mut config = h.publish().await;
+    let past = vtc_service::vetting::pcs::HiddenVettingEvent {
+        event_id: "last-years-summit".into(),
+        start_date: Utc::now().date_naive() - Duration::days(30),
+        end_date: Utc::now().date_naive() - Duration::days(28),
+        grace_days: 14,
+        group_floor: 3,
+        tiers: vec![vtc_service::vetting::pcs::HiddenVettingTier {
+            name: "desk".into(),
+            drip_per_tick: EVENT_DRIP,
+        }],
+        approved_by: Some("did:key:zAdminApprover".into()),
+    };
+    config.live_token_labels.push(EVENT_LABEL.to_string());
+    config.events.push(summit(Some("did:key:zAdminApprover")));
+    config.events.push(past.clone());
+    h.store_config(&config).await;
+    let (status, body) = h
+        .post(
+            vetter,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({
+                "eventId": past.event_id,
+                "tier": "desk",
+                "window": {
+                    "startDate": past.start_date.to_string(),
+                    "endDate": past.end_date.to_string(),
+                },
+            }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(tt_error_code(&body), pcs_tasks::EVENT_ERR_EVENT_CLOSED);
+
+    // A member with no vetter grant is refused before anything is recorded.
+    let (_, stranger) = identity(0xEF);
+    let (status, body) = h
+        .post(
+            &stranger,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({ "eventId": EVENT, "tier": "desk", "window": window() }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::EVENT_ERR_NOT_A_VETTER);
+}
+
+/// The enrolment and drip refusals nothing above reaches, each with its declared code: a label
+/// the community is not issuing, a request that does not verify, a second identifier after the
+/// label rotates, a token label that is not live, an opening proof made for someone else, and a
+/// draw by someone who is not a vetter.
+#[tokio::test]
+async fn the_enrolment_and_the_drip_refuse_with_the_codes_they_declare() {
+    const NEXT: &str = "2026-10";
+    let h = Harness::start().await;
+    h.publish().await;
+    let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community)
+        .expect("the service's own issuer");
+    let mut rng = StdRng::seed_from_u64(0x2026_0927);
+    let (vetter_did, vetter_key) = identity(0xC7);
+    h.grant_vetter(&vetter_did).await;
+
+    let (id, usk) = issuer.open().user_keygen(&mut rng).unwrap();
+    let root = |label: &str, id: &vti_vetting_pcs::scheme::G1, request: &Value| json!({ "label": label, "id": point_text(id).unwrap(), "request": request });
+    let request_for = |period: &str, rng: &mut StdRng| {
+        let (request, _) = issuer
+            .open()
+            .root_request(issuer.hvk(), &vetter_predicate(period), &id, &usk, rng)
+            .unwrap();
+        serde_json::to_value(&request).unwrap()
+    };
+
+    // A label this community is not issuing under.
+    let good = request_for(PERIOD, &mut rng);
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            root("vetter/1999-01", &id, &good),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_WRONG_LABEL);
+
+    // The right label, but a request proved for another period's predicate: it does not verify.
+    let stale = request_for("1999-01", &mut rng);
+    let label = format!("vetter/{PERIOD}");
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            root(&label, &id, &stale),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_BAD_REQUEST);
+
+    // Enrol, then rotate the label: the member is bound to the identifier they enrolled with,
+    // and a second one is refused rather than counted as a second vetter.
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            root(&label, &id, &good),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rotated = vtc_service::vetting::pcs_issue::publish(
+        &h.tv.state,
+        &h.community,
+        vec![NEXT.to_string(), PERIOD.to_string()],
+        vec![TOKEN_LABEL.to_string()],
+        DRIP,
+    )
+    .expect("the community rotates its vetter label");
+    h.store_config(&rotated).await;
+    let (other_id, _) = issuer.open().user_keygen(&mut rng).unwrap();
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_ROOT_TYPE,
+            root(&format!("vetter/{NEXT}"), &other_id, &good),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_IDENTIFIER_REBOUND);
+
+    // The drip: a token label that is not live.
+    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let batch = |label: &str, requests: &[vti_vetting_pcs::token::TokenRequest]| {
+        json!({
+            "label": label,
+            "tick": 1,
+            "requests": requests
+                .iter()
+                .map(|r| json!({
+                    "commitment": vti_vetting_pcs::scheme::enc(&r.commitment).unwrap(),
+                    "openingProof": vti_vetting_pcs::scheme::enc(&r.opening_proof).unwrap(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let requests = wallet
+        .prepare(issuer.tvk(), TOKEN_LABEL, &vetter_did, 1, 1, &mut rng)
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_TOKENS_TYPE,
+            batch("token/1999-01", &requests),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::TOKENS_ERR_LABEL_NOT_LIVE);
+
+    // Opening proofs bind who asks: ones made for another member do not verify for this one.
+    let borrowed = wallet
+        .prepare(
+            issuer.tvk(),
+            TOKEN_LABEL,
+            "did:key:z6MkSomeoneElse",
+            1,
+            1,
+            &mut rng,
+        )
+        .unwrap();
+    let (status, body) = h
+        .post(
+            &vetter_key,
+            pcs_tasks::PCS_TOKENS_TYPE,
+            batch(TOKEN_LABEL, &borrowed),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::TOKENS_ERR_BAD_OPENING_PROOF
+    );
+
+    // And a member with no grant draws nothing, whatever it sends.
+    let (_, stranger_key) = identity(0xD7);
+    let (status, body) = h
+        .post(
+            &stranger_key,
+            pcs_tasks::PCS_TOKENS_TYPE,
+            batch(TOKEN_LABEL, &requests),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(tt_error_code(&body), pcs_tasks::TOKENS_ERR_NOT_A_VETTER);
+}
+
+/// `vtc/vetting/hidden/publish/0.1`, refused for the two reasons its specification declares: a
+/// criterion that does not exist, and one asking for no vetting for the parameters to qualify.
+#[tokio::test]
+async fn publishing_hidden_vetting_refuses_with_the_codes_it_declares() {
+    let h = Harness::start().await;
+    let (admin_did, admin) = identity(0x70);
+    crate::common::signed::seed_role(&h.tv, &admin_did, vtc_service::acl::VtcRole::Admin, &[])
+        .await;
+
+    let (status, body) = h
+        .post(
+            &admin,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            json!({ "criterionId": "no-such-criterion" }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_PUBLISH_ERR_NO_SUCH_CRITERION,
+        "{body}"
+    );
+
+    // The harness's criterion carries hidden-vetting parameters but no `vetting` requirements.
+    h.publish().await;
+    let (status, body) = h
+        .post(
+            &admin,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            json!({ "criterionId": "hidden-criterion" }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_PUBLISH_ERR_NO_VETTING,
+        "{body}"
+    );
+}
+
+/// Saving a criterion keeps its hidden vetting on. `vtc/schemas/accepts/register/0.2` carries no
+/// member for the parameters, so a replacement built from it always arrives without them, and
+/// every edit an administrator made in the console used to turn hidden vetting off unannounced.
+/// Dropped only when the replacement asks for no vetting at all, which publish refuses anyway.
+///
+/// Each save is a change to a join criterion, so it takes the requester's gesture and a second
+/// administrator's approval (VTI-APV-023) and runs on that approval: what is kept is kept by the
+/// write the approval executes.
+#[tokio::test]
+async fn saving_a_criterion_keeps_its_hidden_vetting_until_it_stops_asking_for_vetting() {
+    use crate::common::second_party::Gesturer;
+    use crate::common::signed::{admin, post, signed};
+    use vti_rooms_dtg::test_support::Party;
+    const ACCEPTS_REGISTER: &str = "https://trusttasks.org/spec/vtc/schemas/accepts/register/0.2";
+    const MANIFEST: &str = "https://trusttasks.org/spec/vtc/join-requests/manifest/0.4";
+    let tv = TestVtc::builder()
+        .with_signers(true)
+        .with_audit(true)
+        .with_public_url("https://vtc.example.com")
+        .build()
+        .await;
+    vtc_service::endorsement_types::seed_defaults(&tv.state.endorsement_types_ks)
+        .await
+        .expect("seed the default predicates");
+    let a = admin(&tv).await;
+    let b = admin(&tv).await;
+    let mut gesturer = Gesturer::new();
+    gesturer.enrol(&tv, &a.did).await;
+    async fn register(
+        tv: &TestVtc,
+        g: &mut Gesturer,
+        a: &Party,
+        b: &Party,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        g.send_through(tv, a, &[b], &signed(a, ACCEPTS_REGISTER, body).await)
+            .await
+    }
+
+    let criterion = |min: u32| {
+        json!({
+            "id": "vetted-member",
+            "admission": "automatic",
+            "vetting": {
+                "version": "0.1",
+                "statementType": "https://registry.trustoverip.org/dtg/vsc/vetted/1",
+                "minStatements": min,
+                "acceptedMethods": ["inPerson", "video"],
+                "eligibleVetters": { "role": "vetter" },
+            },
+        })
+    };
+    let hidden_in_manifest = |manifest: &Value| {
+        manifest["payload"]["criteria"]
+            .as_array()
+            .and_then(|cs| cs.iter().find(|c| c["id"] == "vetted-member"))
+            .map(|c| c["vetting"]["ext"]["org.openvtc.hidden-vetting"].is_object())
+            .unwrap_or(false)
+    };
+
+    let (status, body) = register(&tv, &mut gesturer, &a, &b, criterion(1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Turning hidden vetting on is a change to the criterion too (VTI-APV-023).
+    let (status, body) = gesturer
+        .send_through(
+            &tv,
+            &a,
+            &[&b],
+            &signed(
+                &a,
+                pcs_tasks::HIDDEN_PUBLISH_TYPE,
+                json!({ "criterionId": "vetted-member" }),
+            )
+            .await,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An ordinary edit: the requirements change, hidden vetting stays on.
+    let (status, body) = register(&tv, &mut gesturer, &a, &b, criterion(2)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, manifest) = post(&tv, &signed(&a, MANIFEST, json!({})).await).await;
+    assert!(
+        hidden_in_manifest(&manifest),
+        "an edit kept hidden vetting: {manifest}"
+    );
+
+    // The criterion stops asking for vetting: nothing left for the parameters to qualify.
+    let (status, body) = register(
+        &tv,
+        &mut gesturer,
+        &a,
+        &b,
+        json!({ "id": "vetted-member", "admission": "review" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = vtc_service::schemas::accepts::get_accepts(&tv.state.schemas_ks, "vetted-member")
+        .await
+        .unwrap()
+        .expect("the criterion");
+    assert!(stored.hidden_vetting.is_none());
+}
+
+// --- the challenge a submission is bound to ----------------------------------------------------
+
+/// The submission the openvtc client produced (`vti-vetting-pcs`'s cross-repo fixture). Its proof
+/// does not verify under this harness's keys, and does not need to: the challenge is spent before
+/// the proof is read, so every refusal below is reached by a well-formed submission whatever its
+/// proof says.
+const SUBMISSION_FIXTURE: &str =
+    include_str!("../../../vti-vetting-pcs/tests/fixtures/submission.json");
+
+/// A join submission carrying the fixture's hidden-vetting proof, from `secret`'s holder.
+async fn submit_hidden(h: &Harness, secret: &Secret) -> (StatusCode, Value) {
+    let f: Value = serde_json::from_str(SUBMISSION_FIXTURE).unwrap();
+    h.post(
+        secret,
+        vta_sdk::protocols::join_requests::JOIN_REQUEST_SUBMIT_TYPE,
+        json!({
+            "vp": { "type": "VerifiablePresentation" },
+            "registryConsent": false,
+            "extensions": f["extensions"],
+        }),
+    )
+    .await
+}
+
+/// Every way the community can refuse the challenge a hidden-vetting proof is bound to reaches the
+/// applicant as a code of its own, with the generic marker beside it — rather than the single
+/// `malformedRequest` all four used to be, which left a client unable to say whether the
+/// applicant had taken too long or was sending a proof built over the wrong challenge.
+#[tokio::test]
+async fn a_refused_challenge_says_which_way() {
+    use vta_sdk::protocols::join_requests::{
+        JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_ALREADY_USED, JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_EXPIRED,
+        JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_MISMATCH, JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_NOT_ISSUED,
+    };
+    use vta_sdk::protocols::trust_task_reject_reasons as reasons;
+
+    let h = Harness::start().await;
+    h.publish().await;
+    // The criterion counts vetting, so a submission's proof is read at all.
+    let f: Value = serde_json::from_str(SUBMISSION_FIXTURE).unwrap();
+    let mut criterion =
+        vtc_service::schemas::accepts::get_accepts(&h.tv.state.schemas_ks, "hidden-criterion")
+            .await
+            .unwrap()
+            .unwrap();
+    criterion.vetting = Some(serde_json::from_value(f["requirements"].clone()).unwrap());
+    vtc_service::schemas::accepts::store_accepts(&h.tv.state.schemas_ks, &criterion)
+        .await
+        .unwrap();
+    // And it is the only one, so the submission is decided under it rather than under a seeded
+    // default it happens to meet first.
+    for other in vtc_service::schemas::accepts::list_accepts(&h.tv.state.schemas_ks)
+        .await
+        .unwrap()
+    {
+        if other.id != "hidden-criterion" {
+            vtc_service::schemas::accepts::delete_accepts(&h.tv.state.schemas_ks, &other.id)
+                .await
+                .unwrap();
+        }
+    }
+    let reason = |body: &Value| {
+        body.pointer("/payload/details/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // 1. Nothing asked for.
+    let (applicant, key) = identity(0xD1);
+    let (status, body) = submit_hidden(&h, &key).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_NOT_ISSUED,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::NOT_FOUND, "{body}");
+
+    // 2. A challenge asked for, and a proof built over another — the fixture's.
+    let (status, body) = h
+        .post(
+            &key,
+            pcs_tasks::PCS_CHALLENGE_TYPE,
+            json!({ "criterionId": "hidden-criterion" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let issued = body["payload"]["challenge"].as_str().unwrap().to_string();
+    let (_, body) = submit_hidden(&h, &key).await;
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_MISMATCH,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::CONFLICT, "{body}");
+    // The message says what to do and never echoes the challenge.
+    let message = body.to_string();
+    assert!(message.contains("vtc/vetting/pcs-challenge/0.1"), "{body}");
+    assert!(!message.contains(&issued), "{body}");
+
+    // 3. The attempt spent it: the next is told so, not that nothing was issued.
+    let (_, body) = submit_hidden(&h, &key).await;
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_ALREADY_USED,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::GONE, "{body}");
+
+    // 4. A challenge whose window has closed, with when.
+    let issued_at = Utc::now() - Duration::hours(1);
+    vtc_service::vetting::pcs_challenge::record(
+        &h.tv.state.join_requests_ks,
+        &applicant,
+        f["extensions"]["hiddenVetting"]["challenge"]
+            .as_str()
+            .unwrap(),
+        Duration::minutes(15),
+        issued_at,
+    )
+    .await
+    .unwrap();
+    let (_, body) = submit_hidden(&h, &key).await;
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUBMIT_ERR_CHALLENGE_EXPIRED,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::GONE, "{body}");
+    let expired_at: chrono::DateTime<Utc> = body
+        .pointer("/payload/details/expiredAt")
+        .and_then(Value::as_str)
+        .expect("an expired challenge says when")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        expired_at.timestamp(),
+        (issued_at + Duration::minutes(15)).timestamp()
+    );
+}
+
+/// The same four refusals on `vtc/join-requests/supplement/0.1`, each under the supplement's own
+/// namespace: a deferred applicant handing in a hidden-vetting proof meets the challenge check a
+/// submission does.
+#[tokio::test]
+async fn a_refused_supplement_challenge_says_which_way() {
+    use vta_sdk::protocols::join_requests::{
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_ALREADY_USED,
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_EXPIRED,
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_MISMATCH,
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_NOT_ISSUED, JOIN_REQUEST_SUPPLEMENT_TYPE,
+    };
+    use vta_sdk::protocols::trust_task_reject_reasons as reasons;
+
+    let h = Harness::start().await;
+    h.publish().await;
+    let f: Value = serde_json::from_str(SUBMISSION_FIXTURE).unwrap();
+    let mut criterion =
+        vtc_service::schemas::accepts::get_accepts(&h.tv.state.schemas_ks, "hidden-criterion")
+            .await
+            .unwrap()
+            .unwrap();
+    criterion.vetting = Some(serde_json::from_value(f["requirements"].clone()).unwrap());
+    vtc_service::schemas::accepts::store_accepts(&h.tv.state.schemas_ks, &criterion)
+        .await
+        .unwrap();
+    for other in vtc_service::schemas::accepts::list_accepts(&h.tv.state.schemas_ks)
+        .await
+        .unwrap()
+    {
+        if other.id != "hidden-criterion" {
+            vtc_service::schemas::accepts::delete_accepts(&h.tv.state.schemas_ks, &other.id)
+                .await
+                .unwrap();
+        }
+    }
+    let reason = |body: &Value| {
+        body.pointer("/payload/details/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // A request the community deferred, waiting on this applicant.
+    let (applicant, key) = identity(0xD2);
+    let mut request = vtc_service::join::JoinRequest::new(applicant.clone(), json!({ "vp": "x" }));
+    request.status = vtc_service::join::JoinStatus::Deferred;
+    vtc_service::join::store_join_request(&h.tv.state.join_requests_ks, &request)
+        .await
+        .unwrap();
+    let supplement = || {
+        h.post(
+            &key,
+            JOIN_REQUEST_SUPPLEMENT_TYPE,
+            json!({
+                "requestId": request.id.to_string(),
+                "vp": { "type": "VerifiablePresentation" },
+                "extensions": f["extensions"],
+            }),
+        )
+    };
+
+    // 1. Nothing asked for.
+    let (status, body) = supplement().await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_NOT_ISSUED,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::NOT_FOUND, "{body}");
+
+    // 2. A challenge asked for, and a proof built over another — the fixture's.
+    let (status, body) = h
+        .post(
+            &key,
+            pcs_tasks::PCS_CHALLENGE_TYPE,
+            json!({ "criterionId": "hidden-criterion" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = supplement().await;
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_MISMATCH,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::CONFLICT, "{body}");
+
+    // 3. The attempt spent it.
+    let (_, body) = supplement().await;
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_ALREADY_USED,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::GONE, "{body}");
+
+    // 4. A challenge whose window has closed.
+    vtc_service::vetting::pcs_challenge::record(
+        &h.tv.state.join_requests_ks,
+        &applicant,
+        f["extensions"]["hiddenVetting"]["challenge"]
+            .as_str()
+            .unwrap(),
+        Duration::minutes(15),
+        Utc::now() - Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let (_, body) = supplement().await;
+    assert_eq!(
+        tt_error_code(&body),
+        JOIN_REQUEST_SUPPLEMENT_ERR_CHALLENGE_EXPIRED,
+        "{body}"
+    );
+    assert_eq!(reason(&body), reasons::GONE, "{body}");
+}
+
+/// An administrator, and a criterion `vetted-member` that asks for vetting. Stored directly:
+/// registering it through `vtc/schemas/accepts/register` takes a second administrator's consent
+/// (VTI-APV-023), which `join_criteria_consent` holds.
+async fn vetted_criterion(h: &Harness, seed: u8) -> (String, Secret) {
+    vtc_service::endorsement_types::seed_defaults(&h.tv.state.endorsement_types_ks)
+        .await
+        .expect("seed the default predicates");
+    let (did, key) = identity(seed);
+    crate::common::signed::seed_role(&h.tv, &did, vtc_service::acl::VtcRole::Admin, &[]).await;
+    crate::common::signed::seed_criterion(
+        &h.tv,
+        json!({
+                "id": "vetted-member",
+                "admission": "automatic",
+                "vetting": {
+                    "version": "0.1",
+                    "statementType": "https://registry.trustoverip.org/dtg/vsc/vetted/1",
+                    "minStatements": 1,
+                    "acceptedMethods": ["inPerson", "video"],
+                    "eligibleVetters": { "role": "vetter" },
+                },
+        }),
+    )
+    .await;
+    (did, key)
+}
+
+/// The summit as publish/0.1 carries it, approved by `approved_by`.
+fn summit_json(approved_by: Option<&str>) -> Value {
+    let mut event = serde_json::to_value(summit(approved_by)).unwrap();
+    if approved_by.is_none() {
+        event.as_object_mut().unwrap().remove("approvedBy");
+    }
+    event
+}
+
+fn publish_with_summit(approved_by: Option<&str>) -> Value {
+    json!({
+        "criterionId": "vetted-member",
+        "liveTokenLabels": [format!("token/{}", Utc::now().format("%Y-%m")), EVENT_LABEL],
+        "events": [summit_json(approved_by)],
+    })
+}
+
+/// publish/0.1 items 9 and 10: an approver names themselves, so an approval naming anyone but
+/// the publishing administrator is refused — and an administrator who has asked to vet at the
+/// event cannot approve it. An approval already stored survives a re-publish by somebody else,
+/// which is what lets a console edit the event list without un-approving it.
+#[tokio::test]
+async fn an_event_approval_names_its_approver_and_never_one_of_its_vetters() {
+    let h = Harness::start().await;
+    let (a_did, a) = vetted_criterion(&h, 0x72).await;
+    let (b_did, b) = identity(0x73);
+    crate::common::signed::seed_role(&h.tv, &b_did, vtc_service::acl::VtcRole::Admin, &[]).await;
+
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            publish_with_summit(None),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A approving in B's name.
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            publish_with_summit(Some(&b_did)),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_PUBLISH_ERR_APPROVER_NOT_SIGNER,
+        "{body}"
+    );
+
+    // A vetter who is also an administrator asks to vet at the summit, then tries to approve it.
+    let (v_did, v) = identity(0x74);
+    h.grant_vetter(&v_did).await;
+    crate::common::signed::seed_role(&h.tv, &v_did, vtc_service::acl::VtcRole::Admin, &[]).await;
+    let (status, body) = h
+        .post(
+            &v,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({ "eventId": EVENT, "tier": "desk", "window": window() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .post(
+            &v,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            publish_with_summit(Some(&v_did)),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_PUBLISH_ERR_APPROVER_IN_EVENT,
+        "{body}"
+    );
+
+    // A approves in their own name; B re-publishes the same events and the approval stands.
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            publish_with_summit(Some(&a_did)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .post(
+            &b,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            publish_with_summit(Some(&a_did)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/payload/stored/events/0/approvedBy"),
+        Some(&json!(a_did)),
+        "{body}"
+    );
+}
+
+/// `vtc/vetting/hidden/{withdraw,show}/0.1`: what is stored can be read back, approvals and
+/// counts included, and hidden vetting can be turned off and on again. Each change is audited.
+#[tokio::test]
+async fn hidden_vetting_turns_off_and_shows_what_it_stores() {
+    let h = Harness::start().await;
+    let (a_did, a) = vetted_criterion(&h, 0x75).await;
+
+    let missing = json!({ "criterionId": "no-such-criterion" });
+    let (_, body) = h
+        .post(&a, pcs_tasks::HIDDEN_SHOW_TYPE, missing.clone())
+        .await;
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_SHOW_ERR_NO_SUCH_CRITERION,
+        "{body}"
+    );
+    let (_, body) = h.post(&a, pcs_tasks::HIDDEN_WITHDRAW_TYPE, missing).await;
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_WITHDRAW_ERR_NO_SUCH_CRITERION,
+        "{body}"
+    );
+
+    let criterion = json!({ "criterionId": "vetted-member" });
+    let (status, body) = h
+        .post(&a, pcs_tasks::HIDDEN_SHOW_TYPE, criterion.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/payload/enabled"),
+        Some(&json!(false)),
+        "{body}"
+    );
+
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            publish_with_summit(Some(&a_did)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (v_did, v) = identity(0x76);
+    h.grant_vetter(&v_did).await;
+    let (status, body) = h
+        .post(
+            &v,
+            pcs_tasks::EVENT_MODE_TYPE,
+            json!({ "eventId": EVENT, "tier": "desk", "window": window() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = h
+        .post(&a, pcs_tasks::HIDDEN_SHOW_TYPE, criterion.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let p = &body["payload"];
+    assert_eq!(p["enabled"], json!(true), "{body}");
+    // The stored configuration carries the approval the manifest leaves out.
+    assert_eq!(
+        p["stored"]["events"][0]["approvedBy"],
+        json!(a_did),
+        "{body}"
+    );
+    assert!(
+        p["published"]["events"][0].get("approvedBy").is_none(),
+        "{body}"
+    );
+    let label = format!("vetter/{}", Utc::now().format("%Y-%m"));
+    assert_eq!(p["enrolledVetters"][&label], json!(0), "{body}");
+    // One vetter has asked; the floor is three. Counts only — no DID of theirs anywhere.
+    assert_eq!(
+        p["eventStatus"][0],
+        json!({ "eventId": EVENT, "groupFloor": 3, "groupSize": 1, "approved": true, "live": false }),
+        "{body}"
+    );
+    assert!(!body.to_string().contains(&v_did), "{body}");
+
+    let (status, body) = h
+        .post(&a, pcs_tasks::HIDDEN_WITHDRAW_TYPE, criterion.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/payload/withdrawn"),
+        Some(&json!(true)),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(&a, pcs_tasks::HIDDEN_WITHDRAW_TYPE, criterion.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/payload/withdrawn"),
+        Some(&json!(false)),
+        "{body}"
+    );
+    let (_, body) = h.post(&a, pcs_tasks::HIDDEN_SHOW_TYPE, criterion).await;
+    assert_eq!(
+        body.pointer("/payload/enabled"),
+        Some(&json!(false)),
+        "{body}"
+    );
+
+    // Both changes reached the audit log.
+    let rows =
+        h.tv.state
+            .audit_ks
+            .prefix_iter_raw(Vec::new())
+            .await
+            .unwrap();
+    let changes = rows
+        .iter()
+        .filter(|(_, v)| String::from_utf8_lossy(v).contains("HiddenVettingChanged"))
+        .count();
+    assert_eq!(changes, 2, "one publish and one withdrawal are audited");
+}
+
+/// publish/0.1 `otherCriterion` and `signerChanged`: hidden vetting runs on one criterion, and a
+/// configuration whose keys the community's signer no longer derives is never re-keyed by a
+/// publish — withdrawing it is how an administrator starts over.
+#[tokio::test]
+async fn publish_refuses_a_second_criterion_and_keys_its_signer_no_longer_derives() {
+    let h = Harness::start().await;
+    let (_, a) = vetted_criterion(&h, 0x77).await;
+    crate::common::signed::seed_criterion(
+        &h.tv,
+        json!({
+            "id": "second-route",
+            "admission": "review",
+            "vetting": {
+                "version": "0.1",
+                "statementType": "https://registry.trustoverip.org/dtg/vsc/vetted/1",
+                "minStatements": 2,
+                "acceptedMethods": ["inPerson"],
+                "eligibleVetters": { "role": "vetter" },
+            },
+        }),
+    )
+    .await;
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            json!({ "criterionId": "vetted-member", "tickLength": "P1D" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.pointer("/payload/published/tickLength"),
+        Some(&json!("P1D")),
+        "{body}"
+    );
+
+    let (_, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            json!({ "criterionId": "second-route" }),
+        )
+        .await;
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_PUBLISH_ERR_OTHER_CRITERION,
+        "{body}"
+    );
+
+    // The stored keys stop matching what the signer derives, as after a signer rotation.
+    let mut criterion =
+        vtc_service::schemas::accepts::get_accepts(&h.tv.state.schemas_ks, "vetted-member")
+            .await
+            .unwrap()
+            .unwrap();
+    criterion.hidden_vetting.as_mut().unwrap()["hvk"] = json!("zSomeOtherHelperKey");
+    vtc_service::schemas::accepts::store_accepts(&h.tv.state.schemas_ks, &criterion)
+        .await
+        .unwrap();
+    let (_, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            json!({ "criterionId": "vetted-member" }),
+        )
+        .await;
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_PUBLISH_ERR_SIGNER_CHANGED,
+        "{body}"
+    );
+
+    // Withdrawing is the way out: a publish after it derives fresh keys.
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_WITHDRAW_TYPE,
+            json!({ "criterionId": "vetted-member" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            json!({ "criterionId": "vetted-member" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+// ─── VTI-APV-023: hidden vetting is a change to the join criteria ───────────────────────────
+
+/// Two administrators, the first holding a passkey for the gesture, and a criterion that asks
+/// for vetting. Not single-administrator mode: a change parks for the second.
+async fn two_admins() -> (
+    TestVtc,
+    crate::common::second_party::Gesturer,
+    vti_rooms_dtg::test_support::Party,
+    vti_rooms_dtg::test_support::Party,
+) {
+    let tv = TestVtc::builder()
+        .with_signers(true)
+        .with_audit(true)
+        .with_public_url("https://vtc.example.com")
+        .build()
+        .await;
+    vtc_service::endorsement_types::seed_defaults(&tv.state.endorsement_types_ks)
+        .await
+        .expect("seed the default predicates");
+    crate::common::signed::seed_criterion(
+        &tv,
+        json!({
+            "id": "vetted-member",
+            "admission": "automatic",
+            "vetting": {
+                "version": "0.1",
+                "statementType": "https://registry.trustoverip.org/dtg/vsc/vetted/1",
+                "minStatements": 1,
+                "acceptedMethods": ["inPerson", "video"],
+                "eligibleVetters": { "role": "vetter" },
+            },
+        }),
+    )
+    .await;
+    let a = crate::common::signed::admin(&tv).await;
+    let b = crate::common::signed::admin(&tv).await;
+    let mut gesturer = crate::common::second_party::Gesturer::new();
+    gesturer.enrol(&tv, &a.did).await;
+    (tv, gesturer, a, b)
+}
+
+async fn hidden_on(tv: &TestVtc) -> bool {
+    vtc_service::schemas::accepts::get_accepts(&tv.state.schemas_ks, "vetted-member")
+        .await
+        .unwrap()
+        .expect("the criterion")
+        .hidden_vetting
+        .is_some()
+}
+
+/// Publish the requester's document, answer the gesture, and return the id it parked as.
+async fn park_as(
+    tv: &TestVtc,
+    g: &mut crate::common::second_party::Gesturer,
+    a: &vti_rooms_dtg::test_support::Party,
+    typ: &str,
+    payload: Value,
+) -> String {
+    use crate::common::second_party::{parked_action, step_up_request};
+    use crate::common::signed::{post, signed};
+    let doc = signed(a, typ, payload).await;
+    let (status, reply) = post(tv, &doc).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the gesture first: {reply}");
+    assert!(step_up_request(&reply).is_some(), "{reply}");
+    g.gesture(tv, a, &reply).await;
+    let (status, reply) = post(tv, &doc).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+    parked_action(&reply).unwrap_or_else(|| panic!("parked: {reply}"))
+}
+
+/// VTI-APV-023: turning hidden vetting on parks as `join.criteria.hiddenVetting` for the other
+/// holders of `vtc.vetting.manage`, and is applied by the approval; publishing exactly what is
+/// stored again asks nothing.
+#[tokio::test]
+async fn vti_apv_023_publishing_hidden_vetting_parks_and_completes() {
+    use crate::common::second_party::{decide, show_action};
+    use crate::common::signed::{post, signed};
+    let (tv, mut g, a, b) = two_admins().await;
+    let body = json!({ "criterionId": "vetted-member", "livePeriods": [PERIOD], "liveTokenLabels": [TOKEN_LABEL] });
+    let id = park_as(
+        &tv,
+        &mut g,
+        &a,
+        pcs_tasks::HIDDEN_PUBLISH_TYPE,
+        body.clone(),
+    )
+    .await;
+    assert!(!hidden_on(&tv).await, "parked, not published");
+
+    let (_, shown) = show_action(&tv, &b, &id).await;
+    let action = &shown["payload"]["action"];
+    assert_eq!(action["kind"], "join.criteria.hiddenVetting", "{shown}");
+    assert_eq!(
+        action["summary"]["fields"]["criterionId"]["value"],
+        "vetted-member"
+    );
+    let (status, ack) = decide(&tv, &b, &id, "approve").await;
+    assert_eq!(status, StatusCode::OK, "{ack}");
+    assert_eq!(ack["payload"]["status"], "granted", "{ack}");
+    assert!(hidden_on(&tv).await, "published on the approval");
+
+    // The same parameters again: no change, nothing asked.
+    let (status, reply) = post(&tv, &signed(&a, pcs_tasks::HIDDEN_PUBLISH_TYPE, body).await).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unchanged publish applies at once: {reply}"
+    );
+}
+
+/// VTI-APV-023: turning it off parks too, and one decline keeps it on. A criterion with nothing
+/// to withdraw asks nothing.
+#[tokio::test]
+async fn vti_apv_023_withdrawing_hidden_vetting_parks_and_a_decline_keeps_it() {
+    use crate::common::second_party::decide;
+    use crate::common::signed::{post, signed};
+    let (tv, mut g, a, b) = two_admins().await;
+    let withdraw = json!({ "criterionId": "vetted-member" });
+    let (status, reply) = post(
+        &tv,
+        &signed(&a, pcs_tasks::HIDDEN_WITHDRAW_TYPE, withdraw.clone()).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "nothing to withdraw: {reply}");
+    assert_eq!(reply["payload"]["withdrawn"], false, "{reply}");
+
+    let id = park_as(
+        &tv,
+        &mut g,
+        &a,
+        pcs_tasks::HIDDEN_PUBLISH_TYPE,
+        json!({ "criterionId": "vetted-member" }),
+    )
+    .await;
+    decide(&tv, &b, &id, "approve").await;
+    assert!(hidden_on(&tv).await);
+
+    let id = park_as(&tv, &mut g, &a, pcs_tasks::HIDDEN_WITHDRAW_TYPE, withdraw).await;
+    assert!(hidden_on(&tv).await, "still on while it waits");
+    let (_, ack) = decide(&tv, &b, &id, "deny").await;
+    assert_eq!(ack["payload"]["status"], "denied", "{ack}");
+    assert!(hidden_on(&tv).await, "a decline withdraws nothing");
+}
+
+/// VTI-APV-022 / VTI-APV-023: in single-administrator mode the publish applies on the
+/// requester's gesture, and the waiver is audited at `Critical` naming VTI-APV-023.
+#[tokio::test]
+async fn vti_apv_022_a_sole_admin_publishes_hidden_vetting_on_the_gesture() {
+    let h = Harness::start().await;
+    let (_, a) = vetted_criterion(&h, 0x7a).await;
+    let (status, body) = h
+        .post(
+            &a,
+            pcs_tasks::HIDDEN_PUBLISH_TYPE,
+            json!({ "criterionId": "vetted-member" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let waived: Vec<_> =
+        h.tv.state
+            .audit_ks
+            .prefix_iter_raw(Vec::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, v)| serde_json::from_slice::<vtc_audit::AuditEnvelope>(&v).ok())
+            .filter_map(|env| match env.event {
+                vtc_audit::AuditEvent::SingleAdminMode(d) if d.event == "consentWaived" => Some(d),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(waived.len(), 1, "{waived:?}");
+    assert_eq!(waived[0].requirement.as_deref(), Some("VTI-APV-023"));
+}
+
+/// pcs-binding/show/0.1 and pcs-binding/reset/0.1 over the wire, and what they change about
+/// enrolment: a member reads their own binding (a stranger is `notAMember`), an administrator's
+/// reset needs a binding (`notBound`) and repeats as itself, a new identifier is bound once the
+/// old one's labels have left the live set, and those labels are never published live again.
+#[tokio::test]
+async fn a_lost_key_is_shown_reset_and_rebound_over_the_wire() {
+    const SEP: &str = "2026-09";
+    const OCT: &str = "2026-10";
+    let h = Harness::start().await;
+    let (_admin_did, admin) = vetted_criterion(&h, 0x81).await;
+    let publish = |periods: &[&str]| {
+        json!({
+            "criterionId": "vetted-member",
+            "livePeriods": periods,
+            "liveTokenLabels": [TOKEN_LABEL],
+        })
+    };
+    let (status, body) = h
+        .post(&admin, pcs_tasks::HIDDEN_PUBLISH_TYPE, publish(&[SEP]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community)
+        .expect("the service's own issuer");
+    let mut rng = StdRng::seed_from_u64(0x2026_1103);
+    let (vetter_did, vetter) = identity(0x82);
+    h.grant_vetter(&vetter_did).await;
+    let enrol = |period: &str, rng: &mut StdRng| {
+        let (id, usk) = issuer.open().user_keygen(rng).unwrap();
+        let (request, _) = issuer
+            .open()
+            .root_request(issuer.hvk(), &vetter_predicate(period), &id, &usk, rng)
+            .unwrap();
+        json!({
+            "label": format!("vetter/{period}"),
+            "id": point_text(&id).unwrap(),
+            "request": serde_json::to_value(&request).unwrap(),
+        })
+    };
+
+    // Not a member: refused, whoever they are.
+    let (_, stranger) = identity(0x83);
+    let (status, body) = h
+        .post(&stranger, pcs_tasks::BINDING_SHOW_TYPE, json!({}))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::BINDING_SHOW_ERR_NOT_A_MEMBER,
+        "{body}"
+    );
+
+    // A member who never enrolled: nothing bound, and nothing to reset.
+    let (status, body) = h
+        .post(&vetter, pcs_tasks::BINDING_SHOW_TYPE, json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["payload"],
+        json!({ "bound": false, "enrolledLabels": [] })
+    );
+    let reset = json!({ "memberDid": vetter_did, "reason": "Rebuilt their VTA." });
+    let (status, body) = h
+        .post(&admin, pcs_tasks::BINDING_RESET_TYPE, reset.clone())
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::BINDING_RESET_ERR_NOT_BOUND,
+        "{body}"
+    );
+
+    // Enrolled: the member reads the identifier back.
+    let first = enrol(SEP, &mut rng);
+    let (status, body) = h
+        .post(&vetter, pcs_tasks::PCS_ROOT_TYPE, first.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = h
+        .post(&vetter, pcs_tasks::BINDING_SHOW_TYPE, json!({}))
+        .await;
+    assert_eq!(body["payload"]["bound"], json!(true), "{body}");
+    assert_eq!(body["payload"]["id"], first["id"], "{body}");
+    assert_eq!(
+        body["payload"]["enrolledLabels"],
+        json!([format!("vetter/{SEP}")])
+    );
+
+    // A vetter cannot reset themselves; an administrator can, and a repeat is the first.
+    let (status, body) = h
+        .post(&vetter, pcs_tasks::BINDING_RESET_TYPE, reset.clone())
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .post(&admin, pcs_tasks::BINDING_RESET_TYPE, reset.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["payload"]["waitingOn"],
+        json!([format!("vetter/{SEP}")])
+    );
+    assert_eq!(body["payload"]["open"], json!(false));
+    let reset_at = body["payload"]["resetAt"].clone();
+    let (status, body) = h
+        .post(&admin, pcs_tasks::BINDING_RESET_TYPE, reset.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payload"]["resetAt"], reset_at, "{body}");
+
+    // A new key while September is live: refused.
+    let (status, body) = h
+        .post(&vetter, pcs_tasks::PCS_ROOT_TYPE, enrol(SEP, &mut rng))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::ROOT_ERR_IDENTIFIER_REBOUND,
+        "{body}"
+    );
+
+    // October alone: the reset is open, and the new key is bound.
+    let (status, body) = h
+        .post(&admin, pcs_tasks::HIDDEN_PUBLISH_TYPE, publish(&[OCT]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = h
+        .post(&vetter, pcs_tasks::BINDING_SHOW_TYPE, json!({}))
+        .await;
+    assert_eq!(body["payload"]["reset"]["open"], json!(true), "{body}");
+    assert_eq!(body["payload"]["reset"]["waitingOn"], json!([]), "{body}");
+    let second = enrol(OCT, &mut rng);
+    let (status, body) = h
+        .post(&vetter, pcs_tasks::PCS_ROOT_TYPE, second.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = h
+        .post(&vetter, pcs_tasks::BINDING_SHOW_TYPE, json!({}))
+        .await;
+    assert_eq!(body["payload"]["id"], second["id"], "{body}");
+    assert_eq!(
+        body["payload"]["enrolledLabels"],
+        json!([format!("vetter/{OCT}")])
+    );
+    assert!(body["payload"].get("reset").is_none(), "{body}");
+
+    // September never comes back.
+    let (status, body) = h
+        .post(&admin, pcs_tasks::HIDDEN_PUBLISH_TYPE, publish(&[OCT, SEP]))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        tt_error_code(&body),
+        pcs_tasks::HIDDEN_PUBLISH_ERR_LABEL_RETIRED,
+        "{body}"
+    );
+    assert!(body.to_string().contains("cannot be live again"), "{body}");
+}

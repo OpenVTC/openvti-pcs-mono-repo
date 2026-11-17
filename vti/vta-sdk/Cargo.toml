@@ -1,0 +1,470 @@
+[package]
+name = "vta-sdk"
+description = "SDK for Verifiable Trust Agents operating in Verifiable Trust Communities"
+readme = "README.md"
+version = "0.90.0"
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# In-process Trust-Task transport for tests (`client::loopback`). Lets a test
+# drive the real client methods and observe the payloads they build without a
+# VTA, a mediator, or a socket — the producer side was otherwise unreachable
+# without the whole stack, which is why #895 and #919 were both found in
+# production rather than in CI. Carries no dependencies and no production code
+# path; `vta-sdk`'s own test suite turns it on.
+test-loopback = []
+# Verifying the Data-Integrity proof on a Trust-Task document. Moved down from
+# `vti-common` so a *client* can verify the responses it receives, not just a
+# service its requests — see `src/trust_task_proof/mod.rs`.
+#
+# Carries the DID resolver because verification is only as good as the party it
+# resolves: a `did:key` signer needs no I/O, and a `did:webvh` one — which is
+# what a real agent is — cannot be verified without resolving its document.
+proof-verify = [
+  "dep:async-trait",
+  "dep:affinidi-data-integrity",
+  "dep:affinidi-did-resolver-cache-sdk",
+  # `resolver::shared_did_resolver` keys its per-process resolver on the tokio
+  # runtime that built it.
+  "dep:tokio",
+  "dep:affinidi-did-resolver-traits",
+  "dep:affinidi-did-common",
+  "dep:affinidi-secrets-resolver",
+  # `jws` — compact-JWS verification over a resolved key: EdDSA, ES256
+  # (P-256) and ES256K (secp256k1), the signature algorithms SD-JWT-VC issuers
+  # and holders use (#1988).
+  "dep:affinidi-crypto",
+  "dep:ed25519-dalek",
+  # `token_status_list` — the IETF Token Status List (`statuslist+jwt`) those
+  # credentials reference, verified against the credential's issuer.
+  "dep:affinidi-status-list",
+]
+# `x509_issuer` — credential issuers known by an X.509 `x5c` chain to a
+# configured trust anchor instead of a DID (EUDI PID and Rulebook credentials,
+# #1988), and their Token Status Lists.
+x509-issuers = ["proof-verify", "dep:x509-parser"]
+didcomm = [
+  "dep:affinidi-tdk",
+  "dep:affinidi-did-resolver-cache-sdk",
+  "dep:affinidi-did-resolver-traits",
+  "dep:affinidi-did-common",
+  "dep:tracing",
+  "dep:uuid",
+  "dep:tokio",
+  # The reliable-messaging delivery layer (D2-F5): `DIDCommSession` routes
+  # inbound through `MessagingService` over a `DidCommTransport` instead of
+  # raw ATM live-stream polling, so the dispatcher demuxes replies by `thid`.
+  "dep:affinidi-messaging-delivery",
+  "dep:affinidi-messaging-core",
+  # `StreamExt`/`BoxStream` for the persistent `subscribe()` stream.
+  "dep:futures-util",
+]
+# Trust Spanning Protocol (TSP) support. Pulls the TSP agent + DID-backed VID
+# resolver — `affinidi_tdk::tsp` re-exports the `affinidi-tsp` crate when the
+# TDK's `tsp` feature is on. Mirrors the `didcomm` dep set (TDK runtime +
+# resolver cache + tracing/uuid/tokio). Additive and OFF by default — DIDComm is
+# unaffected. Later PRs gate the TSP modules + transport selection on this
+# feature. NB: the messaging-SDK's own `tsp` ops (`atm.tsp()`) are a separate
+# upstream toggle the outbound-seam PR must enable. See
+# docs/05-design-notes/tsp-enablement.md.
+tsp = [
+  "dep:trust-tasks-tsp",
+  "dep:affinidi-tdk",
+  "affinidi-tdk/tsp",
+  # `atm.tsp()` + `TspWebSocket` are gated on the messaging SDK's own `tsp`
+  # feature, which `affinidi-tdk/tsp` does not enable — flip it directly.
+  "dep:affinidi-messaging-sdk",
+  "affinidi-messaging-sdk/tsp",
+  "dep:affinidi-did-resolver-cache-sdk",
+  "dep:affinidi-did-resolver-traits",
+  "dep:affinidi-did-common",
+  "dep:tracing",
+  "dep:uuid",
+  "dep:tokio",
+]
+# Verified agent names in `display_name`. Reads the `alsoKnownAs` entries a
+# resolved DID Document claims and round-trips each one — resolving the name
+# forward and requiring it to lead back to the same DID — before any of them
+# is shown unqualified. `alsoKnownAs` on its own is self-asserted: the
+# agent-name specification's two-sided binding protects the name→DID
+# direction, not the reverse, so a document claiming
+# `mybank.com/@treasury` proves nothing without the round trip.
+#
+# Off by default because each lookup costs a DID resolution plus an outbound
+# HTTPS fetch per claimed name. Turn it on (and pass `--resolve-agent-names`)
+# once DIDs in this workspace actually publish names.
+agent-names = [
+  "dep:agent-names",
+  "dep:affinidi-did-common",
+  "dep:affinidi-did-resolver-cache-sdk",
+  "dep:affinidi-did-resolver-traits",
+  "dep:affinidi-did-common",
+  "affinidi-did-resolver-cache-sdk/agent-names",
+  # `fill_book` resolves through `resolver::shared_did_resolver`.
+  "dep:tokio",
+]
+# `vta_sdk::http` alone: the hardened foreign-fetch client, the public-address
+# guards and the capped body reader, without the rest of `client` (the TDK,
+# DIDComm). For a crate that fetches attacker-named URLs and nothing else of
+# this SDK's client — `vti-vtn`'s status-list checker (#2662).
+http = ["dep:reqwest", "dep:tokio"]
+client = [
+  "http",
+  # A client verifies the responses it receives; see `trust_task_proof`.
+  "proof-verify",
+  "dep:reqwest",
+  "dep:tracing",
+  "dep:uuid",
+  "dep:affinidi-tdk",
+  "dep:affinidi-messaging-didcomm",
+  # `auth_di` — the canonical REST auth transport. The VTA requires an
+  # *authenticated* sender on `/auth/*` (VTI #771), so the client signs an
+  # `auth/authenticate/0.3` Trust Task with the holder key: the DI suite
+  # signs, `Secret` carries the key.
+  "dep:affinidi-data-integrity",
+  "dep:affinidi-secrets-resolver",
+  # didcomm 0.15 moved `PublicKeyAgreement` out of
+  # `affinidi_messaging_didcomm::crypto` into `affinidi_crypto::jose`.
+  # `didcomm_light::pack_anoncrypt` (gated on `client`) names that type,
+  # so `client` must pull `affinidi-crypto` in its own right.
+  "dep:affinidi-crypto",
+  "dep:tokio",
+  "dep:ed25519-dalek",
+  "dep:curve25519-dalek",
+  "dep:sha2",
+]
+session = [
+  "client",
+  "didcomm",
+  # `default_sessions_dir` must agree with where `pnm` actually writes, which
+  # is `dirs::config_dir()` — not the XDG path on macOS or Windows.
+  "dep:dirs",
+  "dep:affinidi-did-resolver-cache-sdk",
+  "dep:affinidi-did-resolver-traits",
+  "dep:affinidi-did-common",
+  "dep:tokio",
+  # Rotation of a temp-provisioned did:key on first successful auth needs
+  # a CSPRNG seed for the replacement Ed25519 key.
+  "dep:getrandom",
+  # `agent_session::InboundMessage::verify` — the only sender an inbound
+  # DIDComm message vouches for is its document's verified proof signer.
+  "proof-verify",
+]
+integration = ["client", "session"]
+# OS keyring backend for session storage. Pulls in `keyring-core` plus
+# the per-target platform store. Each binary that enables this feature
+# must call `vta_sdk::keyring_init::install_default_store()` once at startup
+# before any `Entry::new` call.
+keyring = [
+  "dep:keyring-core",
+  "dep:apple-native-keyring-store",
+  "dep:windows-native-keyring-store",
+  "dep:dbus-secret-service-keyring-store",
+]
+# Install the rustls `aws-lc-rs` `CryptoProvider` as the process default.
+# Required by every *binary* that performs TLS: `tonic 0.12.x` (via
+# `affinidi-did-resolver-cache-sdk`) forces the `ring` backend on
+# `rustls 0.23`, so with `aws_lc_rs` also compiled in rustls cannot
+# auto-select and panics. Each binary that enables this feature must call
+# `vta_sdk::crypto_init::install_default_crypto_provider()` once at startup,
+# before any TLS object is built. Off by default and zero-cost when off, so
+# library/mobile consumers that pick their own rustls backend skip it.
+crypto-provider = ["dep:rustls"]
+config-session = []
+azure-secrets = [
+  "dep:azure_security_keyvault_secrets",
+  "dep:azure_identity",
+  "dep:tokio",
+]
+sealed-transfer = [
+  "dep:hpke",
+  "dep:ciborium",
+  "dep:getrandom",
+  "dep:sha2",
+  "dep:ed25519-dalek",
+  "dep:zeroize",
+  # did:key + ed25519↔x25519 conversion helpers. `affinidi-crypto::did_key`
+  # gives us raw-bytes entry points (vs. the multikey-string shape in
+  # `affinidi-crypto::ed25519`) that fit the HPKE key shapes directly.
+  "dep:affinidi-crypto",
+]
+# Provision-integration: VP-framed bootstrap requests + VC-issued admin
+# authorization + TemplateBootstrap payload. Pulls in `sealed-transfer` so
+# everything the flow needs (HPKE, did:key helpers, ed25519↔x25519) is
+# available to a single feature.
+provision-integration = [
+  "sealed-transfer",
+  "dep:affinidi-vc",
+  "dep:affinidi-data-integrity",
+  "dep:affinidi-secrets-resolver",
+  "dep:uuid",
+  "dep:tokio",
+]
+# Full AWS Nitro attestation verification (COSE_Sign1 + certificate chain
+# against the AWS Nitro root). Consumers of sealed-bootstrap Mode B enable
+# this to validate the `Attested` producer assertion end-to-end. The COSE/CBOR
+# decode + cert-chain walk is done locally (see `attestation::{parse,verify}`)
+# so we can expose a parse-only fuzz target and inject a trust anchor + clock
+# for deterministic tests (#449); `nitro_attest` is a dev-dependency that the
+# parity tests cross-check the local verifier against.
+attest-verify = [
+  "sealed-transfer",
+  "dep:time",
+  "dep:affinidi-crypto",
+  "dep:sha2",
+  "dep:coset",
+  "dep:aws-nitro-enclaves-nsm-api",
+  "dep:x509-parser",
+  "dep:ring",
+]
+# Integration-side provisioning workflow: the orchestration layer above
+# `provision-integration` that drives setup-key minting, transport selection,
+# connection testing, and sealed-bundle opening. Used by setup tools that
+# onboard an integration (mediator, webvh, future apps) against a running
+# VTA. TUI-agnostic — emits events on a consumer-owned channel.
+provision-client = [
+  "provision-integration",
+  "session",
+  "dep:tracing",
+]
+# Per-DID mediator ACL configuration on DIDComm connect.
+# Requires a live ATM (`session`).
+# Used by both VTA (after listener connects) and PNM (after DIDComm session opens).
+acl-setup = [
+  "session",
+  "dep:sha2",
+  "dep:tracing",
+  "dep:tokio",
+  # The TSP arm mints a document id. Declared here rather than relied on from
+  # another feature: `cargo publish` verifies each crate in isolation, where
+  # nothing else supplies it, so unification hiding a missing `dep:` is a
+  # publish-time failure that no workspace build can reveal.
+  "dep:uuid",
+]
+# DCQL credential selection + holder-bound OID4VP `vp_token` assembly
+# (`vp` module). `select_credentials` wraps the always-compiled
+# `affinidi-openid4vp` DCQL matcher; `build_vp_token` signs each presentation
+# with the holder's `eddsa-jcs-2022` Data-Integrity key, so it pulls the DI
+# suite + the `Secret` signing type. The natural client-side counterpart to the
+# `join-requests` / `credential-exchange` protocol types.
+vp = ["dep:affinidi-data-integrity", "dep:affinidi-secrets-resolver"]
+# Peer identity vetting (`vetting` module): sign and verify the Vetting Card (an
+# r-card VDS) and the Vetting Statement (a DTG `StatementCredential` under the
+# `vetted/1` predicate), and
+# count statements against a community's requirements. Verification resolves the
+# signer's DID, so it builds on `proof-verify`; the statement is built with the
+# DTG credentials SDK rather than by hand; the match code hashes with SHA-256;
+# the commitment salt needs a CSPRNG.
+vetting = [
+  "vp",
+  "proof-verify",
+  "dep:dtg-credentials",
+  "dep:sha2",
+  "dep:getrandom",
+  # `vetting::status` decodes a community's status list with the same crate the
+  # VTC encodes it with, so the two cannot disagree on bit order or compression.
+  "dep:affinidi-status-list",
+]
+# Expose in-memory test fixtures for downstream integration tests.
+# Currently gates: `SessionBackend` mocks (always); `provision_client::test_helpers`
+# (when `provision-client` is also on). Additive, zero-cost when off.
+test-support = ["session"]
+# Structure-aware fuzzing support: derives `arbitrary::Arbitrary` on the
+# sealed-transfer wire structs (`SealedBundle`, `ArmoredChunk`, the producer
+# assertion family) so a libFuzzer harness can generate well-typed bundles
+# directly instead of mutating armor-decode output. Off by default and
+# zero-cost when off — only a downstream `fuzz/` workspace turns it on.
+arbitrary = ["dep:arbitrary", "sealed-transfer"]
+# OpenAPI schema generation: derives `utoipa::ToSchema` on the protocol body
+# types (`protocols::*`, request/response/query shapes) the VTA + VTC services
+# expose, so their `OpenApiRouter` can emit a `/openapi.json` referencing them.
+# Off by default and zero-cost when off — only the services turn it on.
+openapi = ["dep:utoipa"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# OID4VP (+ DCQL) and OID4VCI — the body formats wrapped by the
+# `protocols::credential_exchange` Trust Task family (Phase 3, always compiled).
+affinidi-openid4vp = { workspace = true }
+affinidi-openid4vci = { workspace = true }
+# The signing core: the framing, SSHSIG statement and header rules a producer and
+# the signer must agree on, defined once.
+vta-signing = { path = "../vta-signing", version = "0.1" }
+base64 = { workspace = true }
+multibase = { workspace = true }
+dirs = { workspace = true, optional = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+affinidi-tdk = { workspace = true, optional = true }
+# D2-F5 delivery layer: `DIDCommSession` sends/awaits over `MessagingService`
+# (demux by `thid`) instead of raw ATM live-stream polling. Gated on `didcomm`.
+affinidi-messaging-delivery = { workspace = true, optional = true }
+affinidi-messaging-core = { workspace = true, optional = true }
+# `StreamExt` + `BoxStream` for the persistent delivery-layer `subscribe()` stream.
+futures-util = { workspace = true, optional = true }
+# Feature-only dep: `affinidi-tdk/tsp` pulls the `affinidi-tsp` crate but does
+# NOT flip `affinidi-messaging-sdk/tsp`, which gates the `atm.tsp()` ops the
+# `TspPingSession` needs. Depend on the same crate directly (Cargo unifies to
+# one instance, the one `affinidi_tdk::messaging` re-exports) so the `tsp`
+# feature can turn its `tsp` on — mirrors what `vta-service` does.
+affinidi-messaging-sdk = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+# Only for `crypto_init` (the aws-lc-rs CryptoProvider installer).
+rustls = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+affinidi-did-resolver-cache-sdk = { workspace = true, optional = true }
+affinidi-did-resolver-traits = { workspace = true, optional = true }
+# `VerificationMethodResolver` is an async trait object; the resolver impl in
+# `trust_task_proof::vm_resolver` implements it.
+async-trait = { workspace = true, optional = true }
+# `display_name::agent_name` only — see the `agent-names` feature.
+agent-names = { workspace = true, optional = true }
+affinidi-did-common = { workspace = true, optional = true }
+keyring-core = { workspace = true, optional = true }
+azure_security_keyvault_secrets = { workspace = true, optional = true }
+azure_identity = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+curve25519-dalek = { workspace = true, features = ["default"], optional = true }
+sha2 = { workspace = true, optional = true }
+# Used by `client` (didcomm_light::pack_anoncrypt) to produce JWEs the
+# workspace's pinned DIDComm decrypt path will accept (ECDH-ES+A256KW +
+# A256CBC-HS512). Same pinned version as `vta-service`.
+affinidi-messaging-didcomm = { workspace = true, optional = true }
+hpke = { workspace = true, optional = true }
+# `jose` carries the ECDSA verifiers (`verify_p256`, `verify_secp256k1`) the
+# `jws` module uses; the TDK keeps the curve code in one place.
+affinidi-crypto = { workspace = true, optional = true, features = ["jose"] }
+affinidi-vc = { workspace = true, optional = true }
+affinidi-data-integrity = { workspace = true, optional = true }
+affinidi-secrets-resolver = { workspace = true, optional = true }
+# The Trust Task framework (the workspace dependency enables `validate`) and
+# the wire types generated at the versions VTI pins (`trust-tasks-build`).
+# Required, not feature-gated: the always-compiled `protocols` modules re-export
+# the generated payload and response types as this crate's wire layer, and check
+# values against the schemas those types embed. `vti-specs` is re-exported as
+# `vta_sdk::specs`, so a consumer's imports move from `trust_tasks_rs::specs` by
+# find-and-replace.
+trust-tasks-rs = { workspace = true }
+vti-specs = { path = "../vti-specs", version = "0.15" }
+# The TSP binding (`tsp` feature). Carries `ENVELOPE_TYPE` — the payload wrapper
+# every Trust-Task TSP frame must use — so `tsp_binding` takes the URI from the
+# crate that defines the binding rather than writing it out locally. A binding
+# URI written locally is a private dialect the moment the binding moves, which
+# is precisely what this workspace had been speaking over TSP.
+trust-tasks-tsp = { workspace = true, optional = true }
+# DTG credential construction for the Vetting Statement (`vetting` feature).
+dtg-credentials = { workspace = true, optional = true }
+# Bitstring status-list decoding for `vetting::status` (`vetting` feature).
+affinidi-status-list = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
+# Direct OS-CSPRNG access for seed/nonce/bundle-id generation. (hpke 0.14
+# sources its own randomness internally, so this is no longer the bridge
+# into hpke's rand_core trait surface that it was under 0.13.)
+getrandom = { workspace = true, optional = true }
+# Local AWS Nitro attestation decode + verify (`attest-verify`). The crates the
+# upstream `nitro_attest` verifier uses internally — we depend on them directly
+# so the parse step is a standalone, fuzzable entry point and the cert-chain
+# walk takes an injectable trust anchor + clock (#449); the parity tests hold
+# the two verifiers together. `x509-parser` checks certificate signatures with
+# the workspace's `verify-aws` backend, not `verify` (ring), so `x509-issuers`
+# brings no ring into a VTA or VTC (#2655); `ring` itself is only the COSE_Sign1
+# check under `attest-verify`. `ring` is a crypto dep, so pin a minimum patch.
+coset = { workspace = true, features = ["std"], optional = true }
+aws-nitro-enclaves-nsm-api = { version = "0.5", optional = true, default-features = false }
+x509-parser = { workspace = true, features = ["validate"], optional = true }
+ring = { version = "0.17.14", optional = true }
+time = { workspace = true, features = ["macros"], optional = true }
+# Scrub secret byte buffers on drop (sealed-transfer, key derivation).
+zeroize = { workspace = true, optional = true }
+# Structure-aware fuzzing: `#[derive(Arbitrary)]` on the sealed-transfer wire
+# structs. Optional + gated on the `arbitrary` feature so the published
+# artifact stays slim for non-fuzzing consumers.
+arbitrary = { version = "1", optional = true, features = ["derive"] }
+# OpenAPI: `#[derive(ToSchema)]` on protocol body types. Optional + gated on the
+# `openapi` feature so the published artifact stays slim for non-service consumers.
+utoipa = { workspace = true, optional = true }
+
+# Per-target platform credential stores for keyring-core. Only one is
+# active per build; the install helper picks the matching one via cfg.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store = { workspace = true, optional = true }
+
+[[example]]
+name = "sealed_transfer_round_trip"
+required-features = ["sealed-transfer"]
+
+[[example]]
+name = "bootstrap_request"
+required-features = ["sealed-transfer", "provision-integration"]
+
+[[example]]
+name = "gen_fuzz_seeds"
+required-features = ["sealed-transfer", "provision-integration"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+# tests/shared_did_resolver.rs mints a real `did:webvh` log to serve, so the
+# count of `did.jsonl` fetches it asserts is the count a VTA would see.
+didwebvh-rs = { workspace = true }
+# Examples need direct access to crypto primitives the SDK normally
+# encapsulates — pulled into dev-deps only so the published artifact
+# stays slim.
+ed25519-dalek = { workspace = true }
+affinidi-crypto = { workspace = true }
+# `jws` tests sign ES256K tokens; affinidi-crypto verifies secp256k1 but has
+# no signer. Same release affinidi-crypto already builds.
+k256 = { workspace = true, features = ["ecdsa"] }
+getrandom = { workspace = true }
+base64 = { workspace = true }
+# Credential-format smoke test (tests/sd_jwt_vc_smoke.rs): exercises the
+# adopted TDK SD-JWT-VC issue/verify path end-to-end as part of wiring the
+# credential crates into the workspace (vti-credential-architecture §0.2).
+# Dev-only — the published SDK does not depend on these yet.
+affinidi-sd-jwt-vc = { workspace = true }
+affinidi-sd-jwt = { workspace = true }
+# The remaining adopted credential crates. Referenced from
+# tests/cred_formats_build.rs purely so `cargo test -p vta-sdk` compiles and
+# link-checks them as part of §0.2 ("the new deps build cleanly"), including
+# the BBS+ Data Integrity cryptosuite behind the `bbs-2023` feature. Functional
+# BBS / OID4VP-DCQL integration is later-phase work.
+affinidi-bbs = { workspace = true }
+affinidi-data-integrity = { workspace = true, features = ["bbs-2023"] }
+# Upstream AWS Nitro verifier — kept as a dev-dependency so the attestation
+# parity tests (#449) can cross-check the local `NitroVerifier` against it and
+# assemble synthetic quote chains via its `builder` feature. Production no
+# longer calls into it.
+nitro_attest = { version = "0.2", features = ["builder"] }
+# `x509_issuer` tests build a CA and the issuer certificates it signs.
+rcgen = { workspace = true, features = ["default"] }
+# The null-member census (tests/payload_null_census.rs) parses this crate's own
+# `protocols/` source and asserts no wire member can serialize as `null`. Parsed
+# rather than grepped: the attribute it looks for is routinely written across
+# several lines, which a regex reads wrong in exactly the direction that lets a
+# violation through.
+#
+# `visit` is for the decode census (tests/trust_task_decode_census.rs), which
+# has to find `rpc_tt` *call sites* inside method bodies — nested in `match`
+# arms, behind `?`, sometimes built across statements. A visitor finds the real
+# method call; searching the body's tokens would also match a mention in a
+# comment or a doc link.
+syn = { workspace = true, features = ["full", "parsing", "extra-traits", "visit"] }
+
+[lints]
+workspace = true

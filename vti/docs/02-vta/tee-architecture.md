@@ -1,0 +1,1034 @@
+# VTA TEE Enclave Security Design
+
+## Problem Statement
+
+When the VTA runs inside a Trusted Execution Environment (Nitro Enclave or SEV-SNP),
+we need to guarantee that:
+
+1. **Secrets never leave the TEE in plaintext** — the master seed, JWT signing key,
+   and all derived private keys exist only inside the enclave's isolated memory
+2. **The VTA proves it's in a TEE before receiving secrets** — AWS KMS only releases
+   secrets to an enclave that passes attestation with the correct PCR measurements
+3. **Persistent storage is encrypted** — since enclaves are ephemeral, all data
+   written to disk is encrypted inside the TEE and stored externally in ciphertext
+4. **The design works identically outside a TEE** — non-TEE deployments continue
+   to work with the existing storage and seed backends
+
+## Architecture Overview
+
+```
+                         ┌─────────────────────────────────────────────────┐
+                         │            Nitro Enclave (TEE)                  │
+                         │                                                │
+ ┌──────────┐  vsock     │  ┌─────────────────────────────────────────┐   │
+ │ AWS KMS  │◄───────────┤  │           VTA Service                  │   │
+ │          │────────────►│  │                                        │   │
+ │ Key Policy:           │  │  1. Generate ephemeral RSA-2048 key    │   │
+ │  PCR0 = <image hash>  │  │  2. Request NSM attestation doc with   │   │
+ │  PCR3 = <iam role>    │  │     RSA public key embedded            │   │
+ │  PCR8 = <signing cert>│  │  3. Call KMS Decrypt with Recipient =  │   │
+ └──────────┘            │  │     { AttestationDocument, RSAES_OAEP }│   │
+                         │  │  4. KMS verifies PCRs → re-encrypts    │   │
+                         │  │     secrets to enclave's RSA pub key   │   │
+                         │  │  5. Enclave decrypts with RSA priv key │   │
+                         │  │  6. Seed + JWT key now in TEE memory   │   │
+                         │  │     ┌─────────────────────┐            │   │
+                         │  │     │ In-memory only:      │            │   │
+                         │  │     │ • Master seed        │            │   │
+                         │  │     │ • BIP-32 root key    │            │   │
+                         │  │     │ • JWT signing key    │            │   │
+                         │  │     │ • Derived privkeys   │            │   │
+                         │  │     │ • Ephemeral RSA key  │            │   │
+                         │  │     │ • AES storage key    │            │   │
+                         │  │     └─────────────────────┘            │   │
+                         │  │                                        │   │
+                         │  │  Encrypted I/O:                        │   │
+                         │  │  ┌──────────┐     ┌──────────────────┐ │   │
+                         │  │  │ fjall API │ ──► │ EncryptedStore   │ │   │
+                         │  │  │ (clear)   │ ◄── │ AES-256-GCM     │ │   │
+                         │  │  └──────────┘     │ encrypt/decrypt  │ │   │
+                         │  │                   └────────┬─────────┘ │   │
+                         │  └────────────────────────────┼───────────┘   │
+                         │                               │ vsock         │
+                         └───────────────────────────────┼───────────────┘
+                                                         ▼
+                                                 ┌───────────────┐
+                                                 │ Parent EC2    │
+                                                 │ EBS Volume    │
+                                                 │ (ciphertext)  │
+                                                 └───────────────┘
+```
+
+## Design Principles
+
+### 1. Zero-Trust Secret Bootstrapping
+
+The VTA never receives plaintext secrets over any network channel. Both the
+encrypt path (first boot) and decrypt path (subsequent boots) require Nitro
+attestation, preventing an attacker with IAM role access from either reading
+or overwriting secrets.
+
+**First boot** (seed generation):
+
+1. The VTA generates a master seed and JWT signing key inside the enclave
+2. It generates an **ephemeral RSA-2048 key pair** and embeds the public key
+   in an NSM attestation document
+3. **KMS GenerateDataKey** with the `Recipient` parameter: KMS generates a
+   random AES-256 data key, verifies the attestation (PCR0/PCR8), and returns
+   the data key encrypted to the enclave's ephemeral RSA key (CMS envelope)
+   plus a KMS-encrypted copy (CiphertextBlob) for storage
+4. The enclave unwraps the CMS envelope, AES-GCM encrypts the seed and JWT
+   key with the data key, and stores three items: the KMS-encrypted data key,
+   and the two AES-GCM ciphertexts
+
+**Subsequent boots** (seed recovery):
+
+1. The VTA generates a fresh ephemeral RSA-2048 key pair and attestation document
+2. **KMS Decrypt** with the `Recipient` parameter on the stored data key
+   ciphertext: KMS verifies the attestation, decrypts the data key, and
+   re-encrypts it to the ephemeral RSA key (CMS envelope)
+3. The enclave unwraps the CMS envelope and AES-GCM decrypts the seed and
+   JWT key using the recovered data key
+
+**Key property**: Even if the parent EC2 instance is compromised, the attacker
+cannot read KMS responses (encrypted to an ephemeral key inside the enclave)
+and cannot encrypt rogue data (GenerateDataKey also requires attestation).
+
+### 2. Secrets Never Leave the TEE
+
+| Secret | Created | Stored | Exported |
+|--------|---------|--------|----------|
+| Master seed (32 bytes) | Generated in TEE | TEE memory only | Only in a password-encrypted backup (super-admin), or the first-boot mnemonic window |
+| BIP-32 root key | Derived from seed | TEE memory only | Never |
+| JWT signing key (32 bytes) | Generated in TEE | TEE memory only | Only in a password-encrypted backup (super-admin) |
+| VTA identity keys (Ed25519/X25519) | Derived from root | TEE memory only | Public keys only |
+| Ephemeral RSA key pair | Generated in TEE | TEE memory only | Public key in attestation doc |
+| Storage encryption key (AES-256) | Derived from seed | TEE memory only | Never |
+| Derived context private keys | Derived on demand | TEE memory (brief) | Only via encrypted export for context provisioning |
+
+The only private key material that leaves the enclave is:
+- **Public keys**: Always safe to export
+- **Backups** (`pnm backup export`, super-admin): the seed, the JWT key and the
+  whole state, encrypted to an operator password (VTI-VTA-001 permits root
+  material to leave only this way). A backup restores into another enclave or a
+  non-TEE VTA — see [backup-restore.md](backup-restore.md). Internal keys are
+  never in one.
+- **Context provisioning bundles**: Encrypted with the recipient's public key
+  (DIDComm envelope encryption — the enclave never sends plaintext private keys)
+- **Key secrets endpoint** (`GET /keys/{id}/secret`): Returns private key material
+  for authorized contexts. In TEE mode this should be further encrypted to the
+  requesting DID's public key, or disabled entirely depending on security policy.
+
+### 3. Encrypted External Storage
+
+Since Nitro Enclaves are ephemeral, all fjall data must survive enclave restarts.
+We encrypt all data inside the TEE before writing to disk:
+
+```
+VTA code → KeyspaceHandle.insert(key, value)
+  → serde_json::to_vec(value)        # serialize
+  → AES-256-GCM encrypt(plaintext)   # encrypt in TEE
+  → write ciphertext to fjall        # persisted to parent EBS via vsock mount
+
+Parent EBS has: { key: <plaintext>, value: <AES-256-GCM ciphertext + nonce + tag> }
+```
+
+The AES-256 storage key is **derived from the master seed** using HKDF:
+```
+storage_key = HKDF-SHA256(
+    ikm = master_seed,
+    salt = "vta-tee-storage-v1",
+    info = "aes-256-gcm",
+    len = 32
+)
+```
+
+This means:
+- The storage key is deterministic: same seed → same storage key → can decrypt
+  data from previous enclave runs
+- The storage key never leaves the TEE
+- If the seed is rotated, the VTA must re-encrypt all existing data with the new
+  storage key (as part of the seed rotation operation)
+
+### 4. Dual-Mode Operation
+
+The design must work both inside and outside a TEE:
+
+| Concern | Non-TEE Mode | TEE Mode |
+|---------|-------------|----------|
+| Seed loading | SeedStore backends (keyring, config, cloud) | KMS attestation-based decrypt |
+| JWT key loading | Config file / env var | KMS attestation-based decrypt |
+| Storage | fjall plaintext JSON | fjall with AES-256-GCM encryption layer |
+| Attestation | Not available | /attestation/* endpoints active |
+| JWT claims | `tee_attested: false` | `tee_attested: true` |
+| Key export | Direct plaintext | Encrypted to recipient's DID public key |
+
+The implementation uses the existing `#[cfg(feature = "tee")]` gating plus
+runtime checks (`tee_state.is_some()`) to switch behavior.
+
+## Implementation Components
+
+### Component 1: KMS Secret Bootstrap (`tee/kms_bootstrap.rs`)
+
+```rust
+/// Bootstrap secrets from KMS.
+///
+/// First boot: generate seed + JWT key, encrypt via KMS GenerateDataKey
+/// Subsequent boots: decrypt via KMS Decrypt
+/// Both paths use Nitro attestation when /dev/nsm is available.
+pub async fn bootstrap_secrets(
+    kms_config: &TeeKmsConfig,
+    storage_key_salt: &str,
+    store: &Store,
+) -> Result<BootstrappedSecrets, AppError>;
+
+pub struct TeeKmsConfig {
+    pub region: String,
+    pub key_arn: String,
+    pub vta_did_template: Option<String>,
+}
+
+pub struct BootstrappedSecrets {
+    pub seed: Vec<u8>,              // 32 bytes, plaintext in TEE memory
+    pub jwt_signing_key: [u8; 32],  // plaintext in TEE memory
+    pub storage_key: [u8; 32],      // derived from seed via HKDF
+    pub entropy: Option<[u8; 32]>,  // only on first boot (for mnemonic export)
+    pub is_first_boot: bool,
+}
+```
+
+**Storage format** — three entries in the `bootstrap` keyspace:
+
+| Key | Value |
+|-----|-------|
+| `bootstrap:data_key_ciphertext` | KMS-encrypted AES-256 data key (from `GenerateDataKey`) |
+| `bootstrap:seed_ciphertext` | `[12-byte nonce][AES-256-GCM ciphertext]` — seed encrypted with data key |
+| `bootstrap:jwt_ciphertext` | `[12-byte nonce][AES-256-GCM ciphertext]` — JWT key encrypted with data key |
+| `bootstrap:jwt_fingerprint` | SHA-256 of JWT key (tamper detection) |
+
+**Attested operations** use a shared helper that generates an ephemeral
+RSA-2048 key pair, obtains an NSM attestation document binding the public
+key, and builds a KMS `RecipientInfo`:
+
+```rust
+// Shared setup for attested KMS calls (decrypt and generate_data_key)
+let (private_key, recipient) = nsm_attested_recipient()?;
+let client = kms_client(config).await;
+
+// First boot: GenerateDataKey with attestation
+let resp = client.generate_data_key()
+    .key_id(&config.key_arn)
+    .key_spec(DataKeySpec::Aes256)
+    .recipient(recipient)
+    .send().await?;
+
+let kms_ciphertext = resp.ciphertext_blob();         // store this
+let data_key = unwrap_cms_response(                   // decrypt CMS envelope
+    resp.ciphertext_for_recipient(), &private_key)?;
+
+// AES-GCM encrypt both secrets with the data key
+let seed_ct = aes_gcm_encrypt(&data_key, &seed)?;
+let jwt_ct = aes_gcm_encrypt(&data_key, &jwt_key)?;
+```
+
+### Component 2: Encrypted Store Layer (`tee/encrypted_store.rs`)
+
+A transparent encryption layer that wraps `KeyspaceHandle`:
+
+```rust
+/// Wraps a KeyspaceHandle to encrypt all values with AES-256-GCM.
+///
+/// In TEE mode, all data written to fjall passes through this layer.
+/// In non-TEE mode, this layer is bypassed (identity transform)
+/// unless hardened configuration is enabled (`[hardened] enabled = true`),
+/// in which case the storage key is HKDF-derived from the master seed and
+/// the same VAE1 encryption activates. See `hardened_bootstrap.rs`.
+pub struct EncryptedKeyspaceHandle {
+    inner: KeyspaceHandle,
+    /// AES-256-GCM key derived from master seed via HKDF
+    key: Option<[u8; 32]>,
+}
+
+impl EncryptedKeyspaceHandle {
+    /// Insert with encryption (TEE mode) or passthrough (non-TEE)
+    pub async fn insert<V: Serialize>(&self, key: impl Into<Vec<u8>>, value: &V) -> Result<(), AppError> {
+        let plaintext = serde_json::to_vec(value)?;
+        if let Some(ref aes_key) = self.key {
+            let ciphertext = aes_256_gcm_encrypt(aes_key, &plaintext)?;
+            self.inner.insert_raw(key, ciphertext).await
+        } else {
+            self.inner.insert(key, value).await
+        }
+    }
+
+    /// Get with decryption (TEE mode) or passthrough (non-TEE)
+    pub async fn get<V: DeserializeOwned>(&self, key: impl AsRef<[u8]>) -> Result<Option<V>, AppError> {
+        if let Some(ref aes_key) = self.key {
+            let ciphertext = self.inner.get_raw(key).await?;
+            match ciphertext {
+                Some(ct) => {
+                    let plaintext = aes_256_gcm_decrypt(aes_key, &ct)?;
+                    Ok(Some(serde_json::from_slice(&plaintext)?))
+                }
+                None => Ok(None),
+            }
+        } else {
+            self.inner.get(key).await
+        }
+    }
+}
+```
+
+Each encrypted value has the structure:
+```
+[12-byte nonce][ciphertext][16-byte GCM auth tag]
+```
+
+The nonce is randomly generated per write using NSM-sourced entropy.
+
+### Component 3: KMS Key Policy
+
+The KMS key policy restricts both decrypt and data key generation to enclaves
+with matching PCR measurements. There is no unconditional `kms:Encrypt`
+statement — all data operations require attestation:
+
+```json
+{
+    "Sid": "AllowEnclaveAttestationOperations",
+    "Effect": "Allow",
+    "Principal": {
+        "AWS": "arn:aws:iam::ACCOUNT_ID:role/vta-enclave-role"
+    },
+    "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+    ],
+    "Resource": "*",
+    "Condition": {
+        "StringEqualsIgnoreCase": {
+            "kms:RecipientAttestation:PCR0": "<enclave-image-hash>",
+            "kms:RecipientAttestation:PCR3": "<iam-role-hash>",
+            "kms:RecipientAttestation:PCR8": "<signing-cert-hash>"
+        }
+    }
+}
+```
+
+| PCR | What it measures | Why |
+|-----|-----------------|-----|
+| PCR0 | Enclave image hash | Ensures only this exact VTA build can decrypt |
+| PCR3 | IAM role ARN hash | Ensures the parent EC2 instance has the correct role |
+| PCR8 | Signing certificate hash | Ensures the EIF was signed by a trusted build pipeline |
+
+**PCR0 changes** when the Docker image changes (any code update, dependency update,
+or config change baked into the EIF). After each build, update the KMS key policy
+with the new PCR0 value from `nitro-cli build-enclave` output.
+
+**Client-side PCR pinning (P3.4).** The KMS key policy pins the image *server-side*
+(KMS won't release secrets to the wrong PCR0/PCR8). Operators can additionally pin
+it *client-side* at first-boot bootstrap:
+
+```bash
+pnm bootstrap connect \
+    --vta-did "$VTA_DID" \
+    --claim-did "$CLAIM_DID" \
+    --expect-pcr0 "$EXPECTED_PCR0"
+```
+
+**Only the pre-registered claim DID can claim.** Before the VTA exists, run
+`pnm bootstrap claim-did create` on the machine that will claim it.
+It mints an Ed25519 `did:key`, keeps the private key in the OS keyring (it refuses
+`VTI_SECURE_STORE=file` or a build without the keyring), and prints the DID; `connect` takes it as `--claim-did`.
+Supply that DID as `[tee] bootstrap_claim_did` in a baked config, or as
+`--bootstrap-claim-did` to `render-tenant-overlay.sh` for a fleet image. The
+enclave verifies the claim's signature by that key, and that the claim names
+**its own VTA DID**, and refuses anything else with `403` **before** looking at
+the carve-out; with no claim DID configured it accepts no claim at all.
+
+**The enclave mints no key for you (#2066).** On a verified claim it enrols the
+claim DID *itself* as the bootstrap administrator — unrestricted, but expiring
+after 24 hours and marked as a hand-off (VTI-CLT-014, VTI-ACL-054) — closes the
+carve-out, and answers with an attested acknowledgement that carries no key
+material (VTI-CLT-002). `connect` then mints the long-term admin `did:key` on
+this machine, stores it in the keyring, authenticates as the claim DID and
+exercises the hand-off onto the new key (an `acl/grant` carrying
+`ext["org.openvtc"].handoffRollover`), confirms by authenticating as the new
+key, and only then removes the claim key (VTI-CLT-034). The long-term entry is
+permanent: it is bounded by the first-boot authority recorded with the marker,
+not by the claim DID's expiry. It is a hand-off rather than an `acl/swap-key`
+rotation because a rotation preserves the expiry exactly (VTI-CLT-029), which
+would leave the VTA's only administrator expiring with the claim DID.
+
+If `connect` is interrupted after the acknowledgement, run the same command
+again before the bootstrap entry expires: the VTA answers `410` (the carve-out
+is spent), and `pnm` — which registered the VTA only after a verified, pinned
+acknowledgement — resumes the hand-over with the claim key it still holds.
+After the expiry the VTA has no administrator and must be redeployed.
+(`claim-did discard --claim-did <did>` removes the claim key otherwise.)
+
+Claims are wire version 2: the signature covers
+`vti/bootstrap-claim/v2\0 ‖ claim pubkey ‖ nonce ‖ VTA DID`. A VTA refuses a
+version-1 claim with `400` and an upgrade hint, and a version-1 `pnm` cannot
+read a version-2 VTA's answer — upgrade both together.
+
+In a fleet build the parent delivers the claim DID, so a hostile parent could
+deliver its own. It is part of the attested effective-config digest — verify it
+there as you verify `key_arn` — and if `connect` with your own claim DID gets a
+`403`, the VTA was not configured with your DID: do not trust it.
+
+The attestation is always cryptographically verified; `--expect-pcr0` is what
+makes it mean anything — a genuine-but-*wrong* enclave build produces a valid
+quote with a different PCR0, and the pin makes `pnm` refuse to use the
+acknowledgement (typed `PcrMismatch`). The acknowledgement carries no bundle and
+no digest, so `--expect-pcr0` is required; `--no-verify-pcr0` is the explicit,
+warned opt-out for testing. (The `--expect-digest` / `--no-verify-digest` flags
+`connect` used to take are gone with the sealed bundle.) Use the **same**
+`nitro-cli build-enclave` hashes you put in the KMS policy; when PCR0 rotates
+on a rebuild, update both. PCR8 is an optional additional pin, not a
+standalone image anchor.
+
+Get both hashes right the first time. The carve-out closes server-side
+*before* the acknowledgement is returned, so a pin that only fails at comparison time
+fails after this VTA's one and only bootstrap has been spent — there is no
+second attempt, and `PcrMismatch` is then a permanent condition rather than a
+retryable one. `pnm` checks both pins for well-formedness before it sends
+anything, which catches a truncated or mistyped hash; it cannot catch a
+well-formed hash from the wrong build.
+
+Set `VTA_DID` to the deployed VTA's DID and `EXPECTED_PCR0` to the trusted
+build's full 96-character hex measurement. The DID must already resolve:
+bootstrap verifies the WebVH log locally and uses its advertised REST URL,
+not a URL guessed from the DID host. The claim is signed for that DID, and the
+acknowledgement must name it. If the log is not yet available, `--vta-url
+<base-url>` is an explicit alternative to `--vta-did`, not an additional flag;
+it gives up DID identity pinning. With `--vta-url`, `pnm` asks the VTA which DID
+to sign for (`GET /bootstrap/request`). That answer is the server's word, but a
+pinned enclave image refuses a claim naming a DID other than its own, so a
+host that lies about it gets a claim no genuine enclave accepts; what
+`--vta-url` cannot tell you is *which* VTA you reached.
+
+On first boot, configure `services.rest = true` and the top-level `public_url`
+to the externally reachable REST base URL. TEE identity generation includes
+that URL as a signed `VTARest` service. (The `TeeAttestation` service that
+`tee.embed_in_did` used to add is gone, and a config that still sets the key
+is refused: attestation is the public `vta/attestation/*` Trust Tasks, reached
+over the transports the document advertises.)
+The host, port, and path are preserved; the DID log's hosting URL is not used
+as an API URL. Disabled REST or an absent public URL does not advertise REST.
+
+#### Existing TEE identities missing `VTARest`
+
+A rebuild restores the stored identity and does **not** rewrite its genesis
+or automatically re-enable services. An identity generated by an older build
+without `VTARest` needs an authenticated **signed log update**:
+
+1. Upgrade to a build with the serverless WebVH startup backfill. Keep the
+   existing seed, encrypted store, and DID; do not reset bootstrap state.
+2. Use the existing super-admin credential. If first-admin bootstrap has not
+   yet been consumed, configure a `bootstrap_claim_did` (see above — an
+   unconsumed VTA without one accepts no claim) and claim it once with the
+   explicit URL alternative:
+   `pnm bootstrap connect --slug <slug> --vta-url "$VTA_URL" --claim-did "$CLAIM_DID" --expect-pcr0 "$EXPECTED_PCR0"`.
+   This recovery step pins the enclave image but gives up DID identity pinning.
+   Do not repeat bootstrap for an already-claimed VTA.
+3. Select that VTA's PNM profile (`--vta <slug>` if it is not the default), then
+   explicitly target REST while its advertisement is missing:
+
+   ```bash
+   pnm --url "$VTA_URL" --transport rest services rest enable --url "$VTA_URL"
+   pnm --url "$VTA_URL" --transport rest did-mgmt dids get-log "$VTA_DID" --out did.jsonl
+   ```
+
+4. Publish the **complete updated log** to the existing DID's hosting location
+   if it is hosted externally. The service's WebVH log is authoritative after
+   an update; do not republish the original bootstrap copy from
+   `/attestation/did-log` or the bootstrap keyspace. Confirm the published log
+   resolves with the new `VTARest` service before using DID-based discovery.
+
+The update appends a signed entry, retaining the original genesis, SCID, DID,
+and document verification keys. Normal WebVH update-key/pre-rotation handling
+still applies. See [runtime service management](runtime-service-management.md)
+for subsequent URL changes and serverless publication instructions.
+
+With PCR0 pinned, online connect requires no digest flag and emits no TOFU
+warning. Its digest is generated server-side during the call. Offline
+`bootstrap open` and provision flows still require the out-of-band digest
+or the explicit warning-bearing opt-out.
+
+### Component 4: Config Changes
+
+```toml
+[tee]
+mode = "required"
+attestation_cache_ttl = 300
+# Storage key derivation salt (change to invalidate all stored data)
+storage_key_salt = "vta-tee-storage-v1"
+
+# KMS-based secret bootstrap (TEE mode)
+# On first boot, the VTA generates a seed and JWT key inside the enclave
+# and encrypts them via KMS GenerateDataKey. No pre-encrypted ciphertexts needed.
+[tee.kms]
+region = "us-east-1"
+key_arn = "arn:aws:kms:us-east-1:123456789012:key/abc-def-123"
+# Optional: auto-generate a did:webvh identity on first boot
+vta_did_template = "did:webvh:{SCID}:example.com:vta"
+```
+
+### Component 5: Startup Sequence (TEE Mode)
+
+#### TEE Bootstrap Sequence
+
+```mermaid
+sequenceDiagram
+    participant E as Enclave
+    participant KMS as AWS KMS
+    participant S as Parent Store
+
+    Note over E: First Boot
+    E->>E: Generate BIP-39 seed + JWT key
+    E->>KMS: GenerateDataKey (with Nitro attestation)
+    KMS-->>E: KMS-encrypted data key + plaintext
+    E->>E: AES-GCM encrypt seed + JWT key
+    E->>S: Store ciphertexts via vsock
+
+    Note over E: Subsequent Boot
+    E->>S: Load ciphertexts via vsock
+    E->>KMS: Decrypt data key (with Nitro attestation)
+    KMS-->>E: Plaintext data key
+    E->>E: AES-GCM decrypt seed + JWT key
+    E->>E: Derive storage encryption key (HKDF)
+```
+
+```
+main()
+  ↓
+Load config
+  ↓
+init_tee()
+  ├─ Detect /dev/nsm → NitroProvider
+  ├─ mode == "required" → fail if no TEE
+  ↓
+bootstrap_secrets()
+  ├─ First boot:
+  │   ├─ Generate seed + JWT key inside TEE
+  │   ├─ GenerateDataKey(Recipient=attestation_doc) → data key
+  │   ├─ AES-GCM encrypt seed + JWT key with data key
+  │   └─ Store: data_key_ciphertext + seed_ct + jwt_ct
+  ├─ Subsequent boot:
+  │   ├─ KMS Decrypt(data_key_ciphertext, Recipient=attestation_doc)
+  │   ├─ AES-GCM decrypt seed + JWT key with recovered data key
+  │   └─ Verify JWT fingerprint (tamper detection)
+  ├─ Derive storage AES key = HKDF(seed, salt, "aes-256-gcm-storage")
+  └─ Return BootstrappedSecrets { seed, jwt_key, storage_key }
+  ↓
+Open fjall Store
+  └─ In TEE: wrap all keyspaces with EncryptedKeyspaceHandle
+  ↓
+init_auth()
+  ├─ Use bootstrapped seed (not SeedStore backend)
+  ├─ Use bootstrapped JWT key (not config file)
+  └─ Derive VTA identity keys → secrets_resolver
+  ↓
+maybe_generate_vta_did()        [only if vta_did_template is set]
+  ├─ First boot: derive a did:webvh from the enclave seed and build did.jsonl
+  ├─ Persist the DID + log under the KEYS keyspace (key-material side)
+  └─ Backfill the DID *record* + *log* into the WEBVH keyspace
+        └─ idempotent; makes the self-DID resolvable by GET /services,
+           the resolver preload, and GET /.well-known/did.jsonl
+  ↓
+maybe_generate_webs_vta_did()   [only if vta_did_webs is set; `webs` feature]
+  ├─ First boot: mint a key-role did:webs from the enclave seed (the create
+  │   `vta setup` runs), recorded unpublished in the WEBS keyspace
+  └─ Persist the DID under the KEYS keyspace (`tee:vta_did`)
+  ↓
+Start REST/DIDComm/Storage threads (normal flow)
+  └─ A did:webs not yet published is registered at its host, on its own
+     authority, before messaging starts (`publish_own_webs_identity`)
+```
+
+In non-TEE mode, the startup sequence is unchanged — `bootstrap_secrets_from_kms()`
+is skipped, and the existing SeedStore/config-based key loading is used.
+When **hardened configuration** is enabled (`[hardened] enabled = true`),
+`hardened_bootstrap::load_boot_secrets()` runs instead: it loads the master
+seed from the external secret store, HKDF-derives the storage-encryption key,
+and loads (or generates) the JWT signing key from the `bootstrap` keyspace.
+See [hardened configuration](non-interactive-setup.md#hardened-configuration) for details.
+
+> **Hardened configuration and TEE are mutually exclusive.** Setting
+> `[hardened] enabled = true` in an enclave `config.toml` has no effect —
+> `vta-enclave` derives all secrets from the TEE KMS bootstrap and never
+> enters the hardened code path. The enclave logs a warning and ignores the
+> field. Use `[hardened]` only with the local `vta` binary on non-TEE hosts.
+
+### Self-issued did:webvh identity and resolution
+
+When `[tee.kms].vta_did_template` is set, a TEE VTA is *serverless* with respect to
+its own DID: it mints a `did:webvh` from the enclave seed on first boot and never
+publishes a `did.jsonl` to an external hosting endpoint. Two consequences follow,
+and both are load-bearing for a fresh enclave to accept traffic:
+
+- **The DID must be persisted to the `webvh` keyspace, not only the key-material
+  store.** Auto-generation writes the DID and its `did.jsonl` under the `KEYS`
+  keyspace so signing works, but three read paths resolve the VTA's *own* DID from
+  the `webvh` keyspace: `GET /services` (needs the DID **record** and **log**), the
+  self-DID resolver preload at startup (needs the log), and `GET
+  /.well-known/did.jsonl` (needs the log). Startup therefore backfills the record +
+  log into the `webvh` keyspace after generation. The backfill is idempotent — a
+  no-op once the entries exist — so it also repairs an already-generated identity
+  after an enclave image rebuild + state restore, without rotating the DID.
+
+- **A serverless `did:webvh` is resolvable only from the local resolver cache.**
+  There is no hosting endpoint to fetch the log from, and the enclave has no direct
+  network egress in any case: all DID resolution (the VTA's own DID and remote DIDs
+  such as a mediator's) is routed through the parent-side network-mode resolver
+  sidecar over vsock. Because cached `did:webvh` entries expire after the resolver
+  cache TTL, transient operations that must resolve the self-DID — notably the
+  first-enable handshake that trust-pings a newly configured mediator — re-seed the
+  self-DID into the resolver cache immediately before running, rather than assuming
+  it is still cached from preload.
+
+
+### A did:webs identity (alpha)
+
+Instead of a template, a TEE VTA can ask for a key-role `did:webs` as its own
+DID (VTI-KEY-001; design note `did-webs-in-the-vta.md` §4, S8):
+
+```toml
+[dids]
+webs_enabled = true
+
+[tee.kms.vta_did_webs]
+server_did = "did:webvh:QmHostScid:hosting.example.com"  # the did-hosting server
+domain = "did.example.com"                           # `host:port` for another port
+path = "nodes"                                       # optional slot path
+# server_id = "vta-host"                             # optional
+```
+
+The enclave image must be built with `vta-enclave`'s `webs` feature, and the
+setting is exclusive with `vta_did_template`; asking for it in an image
+without the feature, with did:webs off, or beside a template refuses to boot
+on Nitro rather than come up as another identifier (VTI-KEY-009). It is not
+in the fleet tenant overlay: it must be baked.
+
+First boot mints the identity inside the enclave from the bootstrapped seed —
+`operations::did_webs::create_own_identity`, the create `vta setup`'s
+`create_webs` runs — and persists the DID as `tee:vta_did`, after which every
+boot restores it from the store like any other enclave identity. A boot that
+died between the mint and that write adopts the identity it minted. The
+`webs` keyspace row is the record; there is no `did.jsonl`, so nothing is
+written to `tee:did_log` and `GET /attestation/did-log` has nothing to serve.
+The anti-rollback anchor and the attestation reports key on the DID string,
+whatever its method.
+
+Publication is the non-TEE path unchanged: at startup, before messaging,
+`publish_own_webs_identity` registers the key event log at its host by a
+self-certifying `did/register/0.1` over the host's Trust-Task HTTPS endpoint,
+until the host has it. The host must allow self-registration on the domain
+(`[[hosting.webs_self_register]]`).
+The enclave proxy reads the same `[tee.kms.vta_did_webs]` and allowlists the
+host (from `server_did`) and `domain`; a host whose Trust-Task endpoint is on
+another host needs it in `ALLOWLIST_HOSTS`. The VTA still has no inbound
+surface: this is egress only.
+
+## Secret Lifecycle Summary
+
+```
+┌─────────── Build Time ───────────┐
+│                                  │
+│  1. Build EIF with config.toml   │
+│  2. Sign EIF → PCR8              │
+│  3. Set KMS policy: PCR0 + PCR8  │
+│  (No pre-encrypted secrets —     │
+│   seed generated inside TEE)     │
+│                                  │
+└──────────────────────────────────┘
+              │
+              ▼
+┌─────────── First Boot ───────────┐
+│                                  │
+│  4. VTA starts in Nitro Enclave  │
+│  5. Generate seed + JWT key      │
+│  6. GenerateDataKey (attested)   │
+│     → data key + KMS ciphertext  │
+│  7. AES-GCM encrypt secrets      │
+│  8. Store: dk_ct + seed_ct +     │
+│     jwt_ct + jwt_fingerprint     │
+│  9. Derive storage AES key       │
+│ 10. Auto-generate did:webvh      │
+│                                  │
+└──────────────────────────────────┘
+              │
+              ▼
+┌─────────── Subsequent Boots ─────┐
+│                                  │
+│ 11. Decrypt data key (attested)  │
+│ 12. AES-GCM decrypt seed + JWT   │
+│ 13. Verify JWT fingerprint       │
+│ 14. Derive same storage key      │
+│ 15. Restore DID from store       │
+│                                  │
+│  Secrets in memory:              │
+│  ✓ Seed, root key, JWT key      │
+│  ✓ VTA signing + KA keys        │
+│  ✓ Storage AES key              │
+│  ✗ Nothing on disk unencrypted   │
+│  ✗ Nothing sent over network     │
+│                                  │
+└──────────────────────────────────┘
+              │
+              ▼
+┌─────────── Runtime ──────────────┐
+│                                  │
+│ 13. REST/DIDComm serve requests  │
+│ 14. Key derivation on demand     │
+│     (private keys ephemeral)     │
+│ 15. fjall writes encrypted to    │
+│     parent EBS via vsock         │
+│ 16. Attestation endpoint serves  │
+│     hardware-backed proofs       │
+│                                  │
+└──────────────────────────────────┘
+              │
+              ▼
+┌─────────── Shutdown/Restart ─────┐
+│                                  │
+│ 17. TEE memory wiped (hardware)  │
+│ 18. EBS has only ciphertext      │
+│ 19. On restart: repeat 5-12      │
+│     Same seed → same storage key │
+│     → can decrypt previous data  │
+│                                  │
+└──────────────────────────────────┘
+```
+
+## Threat Model
+
+| Threat | Mitigation |
+|--------|-----------|
+| Parent EC2 host compromise | Enclave memory isolated by Nitro hypervisor; KMS responses encrypted to ephemeral key; disk data encrypted with AES-256-GCM |
+| Attacker builds malicious enclave | KMS policy checks PCR0 (image hash) — different image = KMS refuses to decrypt. PCR8 (signing cert) — unsigned image = KMS refuses. Signing key not on EC2. |
+| Attacker modifies KMS policy | EC2 role only has `kms:Decrypt`/`kms:GenerateDataKey` (both attestation-gated), not `kms:PutKeyPolicy`. Admin role requires MFA + separate account. CloudTrail logs all policy changes. |
+| Network MITM on vsock | KMS re-encrypts to enclave's ephemeral RSA key (even if TLS broken, attacker can't read response); DIDComm messages E2E encrypted |
+| Disk theft / EBS snapshot | All fjall data AES-256-GCM encrypted; key derived from seed via HKDF; seed exists only in TEE memory |
+| Cold boot attack | Nitro Enclaves use dedicated memory that's hardware-isolated; not accessible to parent; no DMA path |
+| Attacker replays a **stale-but-valid** ciphertext snapshot (rollback) | Confidentiality alone does **not** stop this — KMS faithfully decrypts any ciphertext that was ever validly produced under the key, including a stale one. Mitigated by the **anti-rollback anchor** (P0.2, see below): a MAC'd integrity manifest pins the protected singletons, and an external attestation-gated monotonic counter pins "the latest version." A replayed snapshot has `version < authoritative` ⇒ boot **fails closed**. |
+| Parent rolls back carve-out / ACL to a **consistent** past snapshot (e.g. reopen the single-use Mode-B carve-out, resurrect a revoked admin, force BIP-32 counter reuse) | Detected at boot via the version pin (anti-rollback anchor, P0.2); fail closed. AAD (P0.1) stops *relocation* but not *rollback*; the anchor is what enforces freshness. |
+| **Root-on-parent** rolls back the external counter too (it shares the enclave's instance-role credentials) | The counter table denies `UpdateItem` to the instance role; the only permitted writer (`vta-anchor-writer`) is reachable solely via a credential KMS-sealed under the PCR0/PCR8 attestation conditions, which a compromised parent cannot decrypt or forge (P0.2c). So a root-on-parent attacker can roll the *local* store back but **not** the counter ⇒ boot fails closed. Holds within the operator's AWS-account trust root (IAM/KMS/DynamoDB control-plane intact) — the same root the seed already relies on; cross-account isolation is the deferred Option C (P0.2e). Without the sealed writer credential configured the deployment is P0.2b (instance-role writes) and this row does **not** hold. |
+| Parent denies egress to the anchor | DoS only — the parent can already DoS by not starting the enclave. Enclave fails closed (refuses boot / security-relevant ops). Documented break-glass `tee.kms.allow_unanchored` for incident recovery, off by default. |
+| Mnemonic exfiltration | Never displayed on console. Export requires: super admin auth + time-limited window + env var at boot. One-time use, entropy zeroed after export. |
+| Signing key theft | Key stored in CI/CD or HSM, never on EC2. If stolen: revoke, generate new key, rebuild + re-sign, update PCR8 in KMS policy. |
+| KMS key deletion | Restore the last `pnm backup export` into a fresh enclave under a new KMS key (`pnm backup import --replace-identity`); the restore seals the seed under the new key. Internal keys are lost. |
+| Enclave restart | Deterministic storage key (derived from seed via HKDF) — new enclave instance can decrypt previous data |
+
+### PCR Measurements Used in KMS Key Policy
+
+| PCR | What it measures | Changes when | Purpose |
+|-----|-----------------|-------------|---------|
+| PCR0 | SHA-384 of entire enclave image | Any code, dependency, or config change | Pins the exact VTA binary |
+| PCR3 | SHA-384 of IAM role ARN | IAM role changes | Prevents use of a different role |
+| PCR8 | SHA-384 of EIF signing certificate | Signing key regeneration | Only your build pipeline can produce valid images |
+
+### EIF Signing
+
+Enclave images are signed with an EC P-384 key. The signing key lives in
+the CI/CD pipeline (GitHub Actions secret, GitLab CI variable, or HSM) and
+never touches the EC2 instance. The signing certificate's hash becomes PCR8,
+which is checked by the KMS key policy.
+
+Even if an attacker has the exact source code and Dockerfile, they cannot
+produce a signed image without the signing private key — so PCR8 won't
+match and KMS refuses to decrypt.
+
+```bash
+# Generate signing key (one-time, on secure build machine):
+./deploy/nitro/generate-signing-key.sh ./signing
+
+# Sign enclave image (in CI/CD):
+nitro-cli build-enclave --docker-uri vta-nitro --output-file vta.eif \
+    --signing-certificate ./signing/signing-cert.pem \
+    --private-key ./signing/signing-key.pem
+
+# Set up KMS policy with PCR0 + PCR8:
+./deploy/nitro/setup-kms-policy.sh --pcr0 <hash> --pcr8 <hash> --role <arn>
+```
+
+## Anti-rollback anchor (P0.2)
+
+> **Status:** P0.2a (local MAC'd manifest), P0.2b (external DynamoDB counter),
+> and P0.2c (the KMS-attestation-gated `vta-anchor-writer` + instance-role deny
+> that resists root-on-parent) are all **implemented**. Provision the DynamoDB
+> table, seal the writer credential, and apply the `vta-anchor-writer` policy +
+> instance-role deny below for full protection. Omitting the writer credential
+> falls back to instance-role writes (P0.2b — resists storage/backup rollback
+> but not root-on-parent); omitting the whole `[tee.kms.anchor]` block is
+> manifest-only (P0.2a). Option C (a cross-account anchor service) remains
+> deferred (P0.2e). The whole feature is **TEE-only** — non-TEE VTAs are
+> unaffected and need none of this.
+
+### Why it exists
+
+KMS attestation gives **confidentiality**, and P0.1 AAD gives **location
+integrity**, but neither gives **freshness**: KMS will decrypt any
+stale-but-valid ciphertext, and the enclave keeps no durable state of its own,
+so the parent can present any internally-consistent **past snapshot** of the
+fjall DB and the enclave cannot tell it from the present. That enables rollback
+attacks — reopen the single-use carve-out, resurrect a revoked admin, roll back
+key counters to force BIP-32 reuse.
+
+Detecting rollback requires a reference that is **monotonic** and **outside the
+parent's control**. Nitro has no on-box monotonic counter (no TPM NV, no SGX
+MC, no NSM sealed state), so the anchor must be **external**. The enclave
+terminates its own TLS, so it can reach an AWS-managed linearizable store the
+parent proxies but cannot read or forge. The design is a local **MAC'd
+integrity manifest** (pins the protected singletons) plus an **external
+monotonic counter** (pins "the latest version"); a boot whose local manifest
+version is behind the counter fails closed.
+
+### Infrastructure to provision
+
+Three pieces, all in the operator's own AWS account (same trust root as the
+seed KMS key):
+
+1. a **DynamoDB single-item counter table** (the external version anchor);
+2. a **KMS key** that gates the counter-writer credential behind PCR
+   attestation (so a root-on-parent attacker, who holds the instance-role
+   credentials, still cannot bump or roll back the counter — P0.2c);
+3. **IAM** that makes a dedicated `vta-anchor-writer` principal the *only*
+   writer and **explicitly denies the instance role** write access.
+
+#### 1. DynamoDB counter table
+
+```bash
+# Single item per VTA DID. PAY_PER_REQUEST — writes happen only on
+# security-tightening ops (carve-out close, ACL revoke, counter allocation),
+# so throughput is negligible.
+aws dynamodb create-table \
+  --table-name vta-rollback-anchor \
+  --attribute-definitions AttributeName=vta_did,AttributeType=S \
+  --key-schema AttributeName=vta_did,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-east-1
+```
+
+The enclave maintains one item per VTA DID with attributes `version` (N),
+`manifest_digest`, and `updated_at`. Bumps use a conditional write
+(`UpdateItem … ConditionExpression: version = :expected`) so concurrent
+replicas and torn writes fail safely (compare-and-set linearization point).
+
+> **Point-in-time recovery is a rollback vector.** PITR restore (or a manual
+> table restore) can reset `version` to an old value — that is exactly the
+> rollback the anchor prevents. Restrict `dynamodb:RestoreTableToPointInTime`
+> and `dynamodb:UpdateContinuousBackups` to a break-glass admin role (MFA,
+> separate account), the same posture as `kms:PutKeyPolicy`.
+
+#### 2. Seal the writer credential under the PCR-gated KMS key (P0.2c)
+
+The `vta-anchor-writer` credential is **KMS-sealed under the enclave's existing
+seed KMS key** (`tee.kms.key_arn`, Component 3) — that key's policy already
+releases `kms:Decrypt` *only* under the PCR0/PCR8 attestation conditions, so
+only the genuine enclave image can open the ciphertext; the parent cannot,
+because it can't produce a valid attestation. (A separate key with the same
+conditions works too, but reusing the seed key keeps one PCR policy to manage.)
+
+Create the IAM user, then seal its access key as JSON under the seed key and
+paste the base64 ciphertext into config:
+
+```bash
+# 1. Create the writer principal and an access key.
+aws iam create-user --user-name vta-anchor-writer
+aws iam create-access-key --user-name vta-anchor-writer   # capture AccessKeyId + SecretAccessKey
+
+# 2. Seal {access_key_id, secret_access_key} under the seed KMS key.
+printf '{"access_key_id":"AKIA…","secret_access_key":"…"}' \
+  | aws kms encrypt --key-id "$SEED_KEY_ARN" --plaintext fileb:///dev/stdin \
+        --query CiphertextBlob --output text   # → base64 ciphertext
+```
+
+```toml
+# 3. Paste the ciphertext into the EIF-baked config.
+[tee.kms.anchor]
+table_name                  = "vta-rollback-anchor"
+writer_credential_ciphertext = "AQIDAH…"   # base64 KMS ciphertext from step 2
+```
+
+At boot the enclave `kms:Decrypt`s this (attestation-gated, same path as the
+seed) and uses the resulting static credentials for the counter's reads and
+writes. The parent stores the ciphertext but can't open it, and the plaintext
+key never leaves the enclave. **A configured-but-unsealable credential is fatal
+at boot** — falling back to the instance role would silently downgrade to
+P0.2b. Rotate by issuing a new access key, re-sealing, and updating config (the
+old key can then be deleted from IAM).
+
+#### 3. IAM — writer principal + instance-role deny
+
+The fence has two halves. First, a dedicated writer principal is the only one
+allowed to mutate the counter:
+
+```json
+// Policy on the vta-anchor-writer principal (whose credential is KMS-sealed above).
+// The enclave uses these credentials for the counter's read, init, and bump.
+{
+    "Effect": "Allow",
+    "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem"
+    ],
+    "Resource": "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/vta-rollback-anchor"
+}
+```
+
+Second — the load-bearing part — the **EC2 instance role explicitly denies**
+counter writes, so a root-on-parent attacker holding those credentials cannot
+bump or roll the counter back. The instance-role read allow below is optional
+(the enclave reads with the writer credential too), but harmless to keep:
+
+```json
+// Statements on the vta-enclave-role (parent instance role)
+[
+  {
+    "Sid": "AnchorReadOnly",
+    "Effect": "Allow",
+    "Action": "dynamodb:GetItem",
+    "Resource": "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/vta-rollback-anchor"
+  },
+  {
+    "Sid": "DenyAnchorWritesFromParent",
+    "Effect": "Deny",
+    "Action": [
+      "dynamodb:UpdateItem",
+      "dynamodb:PutItem",
+      "dynamodb:DeleteItem"
+    ],
+    "Resource": "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/vta-rollback-anchor"
+  }
+]
+```
+
+The deny is what upgrades the counter from "resists storage/backup rollback"
+(P0.2b, instance-role writes) to "resists root-on-parent" (P0.2c). Without it,
+the very credentials a compromised parent holds could roll the counter back.
+
+### Config surface
+
+Additions to `[tee.kms]`, all `Option`/defaulted so existing TEE and non-TEE
+configs are unaffected:
+
+```toml
+[tee.kms]
+# One-shot baselines (mirror allow_fingerprint_init): establish the manifest
+# AND initialize the external counter on first boot / migration, then set false.
+allow_anchor_init = false
+# BREAK-GLASS: boot manifest-only when the counter is unreachable, or re-anchor
+# the counter to the local manifest when they diverge (incident recovery only).
+allow_unanchored  = false
+
+# Present this block to enable the external counter (P0.2b); omit it for
+# manifest-only (P0.2a). Region is reused from [tee.kms].region.
+[tee.kms.anchor]
+table_name                   = "vta-rollback-anchor"   # DynamoDB single-item table
+# P0.2c: base64 KMS ciphertext of the vta-anchor-writer access key (see above).
+# Present → counter written with the attestation-gated writer (resists
+# root-on-parent). Absent → written with the instance role (P0.2b).
+writer_credential_ciphertext = "AQIDAH…"
+```
+
+### First boot, recovery, and break-glass
+
+- **First boot / migration.** An existing TEE deployment has no manifest and no
+  counter. Set `allow_anchor_init = true` for one boot to establish version 0
+  (the enclave does a conditional `PutItem` if-not-exists and writes the MAC'd
+  manifest), then set it back to `false`. With the flag `false` and no
+  manifest/counter present, the enclave **refuses** rather than silently
+  baseline — a silent baseline is exactly the rollback the feature prevents.
+- **Fail-closed is by design.** If the parent denies anchor egress the enclave
+  cannot verify freshness and refuses to boot. That is a DoS, not an integrity
+  breach (the parent can already DoS by not launching the enclave).
+- **Break-glass.** `allow_unanchored = true` lets the enclave boot without the
+  anchor, loudly warned, for incident recovery only. This is safe to expose as
+  a config flag because TEE config is **baked into the measured EIF** and the
+  KMS-lock gate blocks env overrides when KMS is active — the parent cannot flip
+  it at runtime, since doing so needs an EIF rebuild that changes PCR0, after
+  which KMS refuses to decrypt anyway.
+
+### Coverage
+
+The manifest pins four singletons (see design note §5.1): the **carve-out
+sentinel**, the **ACL keyspace root** (canonical hash over all `acl:{did}`
+rows), the **JWT fingerprint**, and the **path/context counters**. The
+KMS-protected bootstrap ciphertexts are *not* covered directly, because the two
+ways they can go away are each already caught:
+
+- A **failed decrypt** clears them only under the explicit `allow_kms_reinit`
+  reset flag — no KMS error class, `ACCESS_DENIED` included, authorizes a reset
+  implicitly.
+- A **parent-host deletion** of them consults no flag at all: the rows are simply
+  absent, so boot takes the first-boot path. What stops that from silently
+  re-issuing an identity is the manifest itself — a new seed means a new storage
+  key, hence a new MAC key, so the surviving manifest fails verification and the
+  boot fails closed. (An *authorized* reinit therefore clears the manifest along
+  with the ciphertexts, so the reset the operator asked for isn't reported back
+  to them as tampering.)
+
+The JWT-fingerprint check is a separate control, against substituting the JWT
+signing key.
+
+## Implementation Phases
+
+### Phase A: KMS Bootstrap
+- New `tee/kms_bootstrap.rs` module
+- Ephemeral RSA key generation using NSM
+- KMS Decrypt with Recipient/AttestationDocument
+- CMS envelope decryption (RFC 5652)
+- New `KmsBootstrapConfig` in config
+- Integration into `server.rs` startup sequence
+- New `SeedStore` implementation: `KmsSeedStore` that wraps the bootstrapped seed
+
+### Phase B: Encrypted Store
+- New `tee/encrypted_store.rs` module
+- `EncryptedKeyspaceHandle` wrapper
+- AES-256-GCM encryption/decryption
+- HKDF storage key derivation from seed
+- Integration into `server.rs` (wrap keyspace handles in TEE mode)
+- `insert_raw` / `get_raw` methods on `KeyspaceHandle` for byte-level access
+
+### Phase C: External Storage
+- vsock-mounted data directory for fjall
+- fjall data_dir points to parent-mounted path
+- Parent EBS volume holds encrypted data
+- Backup/restore via S3 (data is already encrypted)
+
+### Phase D: Key Export Protection
+- In TEE mode, `GET /keys/{id}/secret` encrypts private key material
+  to the requesting DID's public key before returning
+- DIDComm `get-key-secret` handler applies same protection
+- Context provisioning bundles already encrypt to recipient — verify this path
+
+### Phase E: Operational Tooling
+- `vta tee prepare-secrets` CLI command to encrypt seed + JWT key with KMS
+- Script to update KMS key policy with new PCR0 after each build
+- Health endpoint shows KMS bootstrap status
+- Monitoring for attestation failures
+
+## Dependencies
+
+| Crate | Purpose | Feature-gated |
+|-------|---------|---------------|
+| `aws-sdk-kms` | KMS Decrypt/GenerateDataKey API | `tee` |
+| `aws-nitro-enclaves-nsm-api` | NSM device: attestation docs, random | `tee` |
+| `rsa` | Ephemeral RSA-2048 key generation | `tee` |
+| `aes-gcm` | AES-256-GCM storage encryption | `tee` |
+| `hkdf` + `sha2` | Storage key derivation | `tee` (sha2 already in workspace) |
+| `cms` or manual ASN.1 | Parse CiphertextForRecipient (RFC 5652) | `tee` |
+
+## References
+
+- [AWS KMS Cryptographic Attestation for Nitro Enclaves](https://docs.aws.amazon.com/enclaves/latest/user/kms.html)
+- [KMS Condition Keys for Nitro Enclaves](https://docs.aws.amazon.com/kms/latest/developerguide/conditions-nitro-enclaves.html)
+- [AWS Nitro Enclaves NSM API](https://github.com/aws/aws-nitro-enclaves-nsm-api)
+- [Nitro Enclaves CiphertextForRecipient Deep Dive](https://5blockchains.com/posts/nitro-enclaves/)
+- [AWS Nitro Enclaves SDK (C)](https://github.com/aws/aws-nitro-enclaves-sdk-c)
+- [How to Use AWS Nitro Enclaves Attestation Document](https://dev.to/aws-builders/how-to-use-aws-nitro-enclaves-attestation-document-2376)
+- [NSM Attestation Process](https://github.com/aws/aws-nitro-enclaves-nsm-api/blob/main/docs/attestation_process.md)
+- [Nitro Enclaves Persistent Storage (Anjuna)](https://docs.anjuna.io/latest/nitro/latest/getting_started/persistent_storage.html)
+- [TEE Survey: Hardware-Supported Trusted Execution Environments (arXiv)](https://arxiv.org/pdf/2205.12742)

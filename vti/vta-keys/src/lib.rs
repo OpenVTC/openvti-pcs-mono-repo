@@ -1,0 +1,1078 @@
+pub mod custody;
+pub mod derivation;
+pub mod imported;
+pub mod internal;
+pub mod paths;
+pub mod seed_store;
+pub mod seeds;
+pub mod wrapping;
+
+use affinidi_tdk::secrets_resolver::secrets::Secret;
+use chrono::Utc;
+use ed25519_dalek::SigningKey;
+use multibase::Base;
+use vti_common::slip10::{DerivationPath, ExtendedSigningKey};
+
+use vti_common::store::KeyspaceHandle;
+
+pub use vta_sdk::keys::{KeyOrigin, KeyRecord, KeyStatus, KeyType};
+
+/// Encode raw private key bytes as multibase (Base58BTC) with multicodec prefix.
+/// This makes private key material self-describing and compatible with
+/// `Secret::from_multibase()` in the SSI ecosystem.
+pub fn encode_private_multibase(key_type: &KeyType, raw_bytes: &[u8]) -> String {
+    let codec = key_type.multicodec_private();
+    let mut buf = Vec::with_capacity(codec.len() + raw_bytes.len());
+    buf.extend_from_slice(codec);
+    buf.extend_from_slice(raw_bytes);
+    multibase::encode(Base::Base58Btc, &buf)
+}
+
+/// Encode raw public key bytes as multibase (Base58BTC) with multicodec prefix.
+pub fn encode_public_multibase(key_type: &KeyType, raw_bytes: &[u8]) -> String {
+    let codec = key_type.multicodec_public();
+    let mut buf = Vec::with_capacity(codec.len() + raw_bytes.len());
+    buf.extend_from_slice(codec);
+    buf.extend_from_slice(raw_bytes);
+    multibase::encode(Base::Base58Btc, &buf)
+}
+
+pub fn store_key(key_id: &str) -> String {
+    format!("key:{key_id}")
+}
+
+pub use vta_sdk::did_key::ed25519_multibase_pubkey;
+
+/// Persist a key as a [`KeyRecord`] in the `"keys"` keyspace.
+#[allow(clippy::too_many_arguments)]
+pub async fn save_key_record(
+    keys_ks: &KeyspaceHandle,
+    key_id: &str,
+    derivation_path: &str,
+    key_type: KeyType,
+    public_key: &str,
+    label: &str,
+    context_id: Option<&str>,
+    seed_id: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let now = Utc::now();
+    let record = KeyRecord {
+        key_id: key_id.to_string(),
+        derivation_path: derivation_path.to_string(),
+        key_type,
+        status: KeyStatus::Active,
+        public_key: public_key.to_string(),
+        label: Some(label.to_string()),
+        context_id: context_id.map(String::from),
+        seed_id,
+        // Absent, not `Some(true)`: a newly created key has never been asked
+        // about, and recording an explicit "allowed" would be a claim nobody
+        // made. See `KeyRecord::exportable`.
+        exportable: None,
+        origin: KeyOrigin::Derived,
+        created_at: now,
+        updated_at: now,
+    };
+    keys_ks.insert(store_key(key_id), &record).await?;
+    Ok(())
+}
+
+/// Derive an Ed25519 did:key from the BIP-32 seed using a counter-allocated
+/// path under `base`, store it as a [`KeyRecord`], and return
+/// `(did, private_key_multibase)`.
+///
+/// The key_id uses the standard did:key fragment format: `{did}#{multibase_pubkey}`.
+pub async fn derive_and_store_did_key(
+    seed: &[u8],
+    base: &str,
+    context_id: &str,
+    label: &str,
+    keys_ks: &KeyspaceHandle,
+    seed_id: Option<u32>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let dk_path = paths::allocate_path(keys_ks, base)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let root = ExtendedSigningKey::from_seed(seed)
+        .map_err(|e| format!("Failed to create BIP-32 root key: {e}"))?;
+    let derivation_path: DerivationPath = dk_path
+        .parse()
+        .map_err(|e| format!("Invalid derivation path: {e}"))?;
+    let dk_derived = root
+        .derive(&derivation_path)
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
+    let signing_key = SigningKey::from_bytes(dk_derived.signing_key.as_bytes());
+    let public_key = signing_key.verifying_key().to_bytes();
+
+    let multibase_pubkey = ed25519_multibase_pubkey(&public_key);
+    let did = format!("did:key:{multibase_pubkey}");
+    let key_id = format!("{did}#{multibase_pubkey}");
+    let private_key_multibase =
+        encode_private_multibase(&KeyType::Ed25519, dk_derived.signing_key.as_bytes());
+
+    save_key_record(
+        keys_ks,
+        &key_id,
+        &dk_path,
+        KeyType::Ed25519,
+        &multibase_pubkey,
+        label,
+        Some(context_id),
+        seed_id,
+    )
+    .await?;
+
+    Ok((did, private_key_multibase))
+}
+
+/// Derived signing + key-agreement key data, before DID creation.
+///
+/// # Why two named slots rather than a map
+///
+/// The Phase 2 plan called for a slot map. Counting the call sites changed the
+/// answer: the two slots are used in 53 places, and a map would turn every one
+/// into a lookup that can fail — while *removing* a property that is actually
+/// true and worth holding in the type, namely that a DID document always has
+/// exactly one signing key and at most one key-agreement key. A
+/// `slots["signing"]` that can be `None` is a worse description of reality than
+/// a field that cannot.
+///
+/// What the plan was really asking for is that a slot's **algorithm** stop
+/// being implied, and that is what `signing_key_type` / `ka_key_type` do. A
+/// third slot — two signing keys at once, for hybrid credentials — has no
+/// consumer until Phase 3, and adding an empty map now would be a mechanism
+/// with no users, which is the thing this plan criticises elsewhere.
+#[allow(dead_code)]
+pub struct DerivedEntityKeys {
+    pub signing_secret: Secret,
+    pub signing_path: String,
+    pub signing_pub: String,
+    pub signing_priv: String,
+    pub signing_label: String,
+    /// The algorithm actually minted for the signing slot.
+    ///
+    /// Carried rather than assumed. Every `save_key_record` call for a signing
+    /// key used to pass `KeyType::Ed25519` as a literal, which was correct only
+    /// because nothing else could be minted — the moment a template can ask for
+    /// ML-DSA, a record claiming Ed25519 sends a later signing operation to the
+    /// wrong algorithm with a key that cannot work in it.
+    pub signing_key_type: KeyType,
+    pub ka_secret: Secret,
+    pub ka_path: String,
+    pub ka_pub: String,
+    pub ka_priv: String,
+    pub ka_label: String,
+    /// The algorithm actually minted for the key-agreement slot.
+    pub ka_key_type: KeyType,
+    /// Signing keys beyond the primary, one per extra slot the template
+    /// declared.
+    ///
+    /// Empty for every v1 template, which is all of them today — so this costs
+    /// nothing until something asks for it, and the two fixed slots keep saying
+    /// what they always said.
+    ///
+    /// **This is the third slot Phase 2 deferred**, and the reason for deferring
+    /// it was that no consumer existed. Hybrid credentials are that consumer: an
+    /// issuer signs with *every* key it holds, one proof per cryptosuite, so a
+    /// classical verifier and a post-quantum one each check the suite they
+    /// understand. That needs the classical key and the post-quantum one at
+    /// once, which no arity of two can express.
+    ///
+    /// Not a slot map, for the reason Phase 2 gave: the arity of the first two
+    /// is a true property worth keeping in the type, and a map would make all 53
+    /// readers of them a lookup that can fail. This is additive to that arity,
+    /// not a replacement for it.
+    pub additional_signing: Vec<DerivedSlotKey>,
+}
+
+/// One signing key minted for a named template slot beyond the primary.
+///
+/// Carries its slot name because that is the join back to what was asked for:
+/// the template declares `pq-signing`, the renderer substitutes
+/// `{PQ_SIGNING_KEY_MB}`, and the bundle handed to the integration says which
+/// slot each key came from. Losing the name means the consumer has to infer
+/// intent from the algorithm, which is the same "asserted rather than carried"
+/// mistake one level up.
+#[derive(Debug, Clone)]
+pub struct DerivedSlotKey {
+    /// The template slot this key was minted for, e.g. `pq-signing`.
+    pub slot: String,
+    pub secret: Secret,
+    pub path: String,
+    pub public_multibase: String,
+    pub private_multibase: String,
+    pub label: String,
+    /// The algorithm actually minted. Carried, never assumed.
+    pub key_type: KeyType,
+}
+
+/// Pre-rotation key data returned from derivation (stored after DID creation).
+pub struct PreRotationKeyData {
+    pub path: String,
+    pub public_key: String,
+    pub label: String,
+}
+
+/// Derived VTA sealed-transfer key material, stored as `{vta_did}#sealed-transfer-0`.
+///
+/// The VTA mints this as a third key at DID creation (alongside `#key-0`
+/// signing and `#key-1` key-agreement). Its sole job is signing the
+/// sealed-transfer producer assertion (domain-tagged
+/// `b"vta-sealed-transfer/v1\0" || client_x25519_pub || bundle_id`).
+/// Keeping it separate from `#key-0` (which signs VC Data-Integrity
+/// proofs) means:
+///   - a compromise of one key does not void the other
+///   - each can rotate on its own cadence
+///   - audit records carry distinct `verification_method` IDs
+///
+/// Cryptographic reuse is already blocked by the domain tag, so this is
+/// a blast-radius / operational-hygiene win rather than a correctness fix.
+pub struct DerivedSealedTransferKey {
+    pub path: String,
+    pub public_key: String,
+    pub private_key: String,
+    pub label: String,
+}
+
+/// Derive the VTA's sealed-transfer key (`{vta_did}#sealed-transfer-0`)
+/// from the BIP-32 seed using a counter-allocated path under `base`.
+///
+/// Allocates a derivation-path counter but does **not** store a key record —
+/// callers must call [`save_sealed_transfer_key_record`] after the DID is known.
+pub async fn derive_sealed_transfer_key(
+    seed: &[u8],
+    base: &str,
+    label: &str,
+    keys_ks: &KeyspaceHandle,
+) -> Result<DerivedSealedTransferKey, Box<dyn std::error::Error>> {
+    let path = paths::allocate_path(keys_ks, base)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let root = ExtendedSigningKey::from_seed(seed)
+        .map_err(|e| format!("Failed to create BIP-32 root key: {e}"))?;
+    let derived = root
+        .derive(
+            &path
+                .parse::<DerivationPath>()
+                .map_err(|e| format!("Invalid derivation path: {e}"))?,
+        )
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
+
+    let secret = Secret::generate_ed25519(None, Some(derived.signing_key.as_bytes()));
+    let public_key = secret
+        .get_public_keymultibase()
+        .map_err(|e| format!("{e}"))?;
+    let private_key = encode_private_multibase(&KeyType::Ed25519, derived.signing_key.as_bytes());
+
+    Ok(DerivedSealedTransferKey {
+        path,
+        public_key,
+        private_key,
+        label: label.to_string(),
+    })
+}
+
+/// Persist the VTA's sealed-transfer key as a `KeyRecord` at
+/// `{did}#sealed-transfer-0`.
+pub async fn save_sealed_transfer_key_record(
+    did: &str,
+    derived: &DerivedSealedTransferKey,
+    keys_ks: &KeyspaceHandle,
+    context_id: Option<&str>,
+    seed_id: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_key_record(
+        keys_ks,
+        &format!("{did}#sealed-transfer-0"),
+        &derived.path,
+        KeyType::Ed25519,
+        &derived.public_key,
+        &derived.label,
+        context_id,
+        seed_id,
+    )
+    .await
+}
+
+/// Derive a signing key (Ed25519) and key-agreement key (X25519) from the
+/// BIP-32 seed using counter-allocated paths under `base`.
+///
+/// Allocates derivation-path counters but does **not** store key records —
+/// callers must call [`save_entity_key_records`] after the DID is known.
+/// Derive an entity's keys, choosing the signing algorithm from a template's
+/// declared preference list.
+///
+/// `signing_preference` is most-preferred first, as a `keys` block declares it
+/// (`["mldsa44", "ed25519"]` means *ML-DSA-44 if this build can, otherwise
+/// Ed25519*). The first algorithm this build can mint wins.
+///
+/// # Why a preference list is honoured rather than just taking the first
+///
+/// A fleet does not migrate atomically, and the whole point of the list is that
+/// one template serves a VTA that has post-quantum support and one that does
+/// not. Refusing outright when the first choice is unavailable would make the
+/// fallback pointless; silently ignoring the list would make the preference
+/// pointless. So an unavailable algorithm is skipped, the chosen one is
+/// recorded on the result, and running out is an error naming what was asked
+/// for — never a quiet downgrade to Ed25519, which is how a deployment meant to
+/// be post-quantum ships classical keys.
+///
+/// The key-agreement slot takes no preference: X25519 is the only algorithm
+/// that can serve it here, and ML-KEM key agreement is TSP's hybrid KEM rather
+/// than a DID-document verification method.
+pub async fn derive_entity_keys_with_preference(
+    seed: &[u8],
+    base: &str,
+    signing_label: &str,
+    ka_label: &str,
+    keys_ks: &KeyspaceHandle,
+    signing_preference: &[KeyType],
+) -> Result<DerivedEntityKeys, Box<dyn std::error::Error>> {
+    // Everything but the signing key is unchanged, so the common path stays in
+    // one place rather than being duplicated for the PQC case.
+    let mut derived = derive_entity_keys(seed, base, signing_label, ka_label, keys_ks).await?;
+
+    for candidate in signing_preference {
+        match candidate {
+            // Already minted by the call above.
+            KeyType::Ed25519 => return Ok(derived),
+            KeyType::MlDsa44 | KeyType::MlDsa65 => {
+                use crate::derivation::Bip32Extension;
+                let root = ExtendedSigningKey::from_seed(seed)
+                    .map_err(|e| format!("Failed to create BIP-32 root key: {e}"))?;
+                let secret = match candidate {
+                    KeyType::MlDsa44 => root.derive_ml_dsa_44(&derived.signing_path),
+                    _ => root.derive_ml_dsa_65(&derived.signing_path),
+                }
+                .map_err(|e| format!("{candidate:?} derivation failed: {e}"))?;
+
+                derived.signing_pub = secret
+                    .get_public_keymultibase()
+                    .map_err(|e| format!("{e}"))?;
+                derived.signing_priv = secret
+                    .get_private_keymultibase()
+                    .map_err(|e| format!("{e}"))?;
+                derived.signing_secret = secret;
+                derived.signing_key_type = candidate.clone();
+                return Ok(derived);
+            }
+            // Not a signing algorithm, or one this build cannot mint. Skipped
+            // rather than refused: the next entry is exactly what a fallback is
+            // for.
+            _ => continue,
+        }
+    }
+
+    Err(format!(
+        "no signing algorithm in {signing_preference:?} can be minted by this build; the \
+         template's preference list must name at least one supported algorithm"
+    )
+    .into())
+}
+
+pub async fn derive_entity_keys(
+    seed: &[u8],
+    base: &str,
+    signing_label: &str,
+    ka_label: &str,
+    keys_ks: &KeyspaceHandle,
+) -> Result<DerivedEntityKeys, Box<dyn std::error::Error>> {
+    let signing_path = paths::allocate_path(keys_ks, base)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let ka_path = paths::allocate_path(keys_ks, base)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let root = ExtendedSigningKey::from_seed(seed)
+        .map_err(|e| format!("Failed to create BIP-32 root key: {e}"))?;
+
+    // Signing key (Ed25519)
+    let signing_derived = root
+        .derive(
+            &signing_path
+                .parse::<DerivationPath>()
+                .map_err(|e| format!("Invalid derivation path: {e}"))?,
+        )
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
+    let signing_priv =
+        encode_private_multibase(&KeyType::Ed25519, signing_derived.signing_key.as_bytes());
+    let signing_secret =
+        Secret::generate_ed25519(None, Some(signing_derived.signing_key.as_bytes()));
+    let signing_pub = signing_secret
+        .get_public_keymultibase()
+        .map_err(|e| format!("{e}"))?;
+
+    // Key-agreement key (X25519)
+    let ka_derived = root
+        .derive(
+            &ka_path
+                .parse::<DerivationPath>()
+                .map_err(|e| format!("Invalid derivation path: {e}"))?,
+        )
+        .map_err(|e| format!("Key derivation failed: {e}"))?;
+    // Encode as Ed25519 seed — consumers derive X25519 via Secret::to_x25519()
+    let ka_priv = encode_private_multibase(&KeyType::Ed25519, ka_derived.signing_key.as_bytes());
+    let ka_secret = Secret::generate_ed25519(None, Some(ka_derived.signing_key.as_bytes()));
+    let ka_secret = ka_secret
+        .to_x25519()
+        .map_err(|e| format!("X25519 conversion failed: {e}"))?;
+    let ka_pub = ka_secret
+        .get_public_keymultibase()
+        .map_err(|e| format!("{e}"))?;
+
+    Ok(DerivedEntityKeys {
+        signing_secret,
+        signing_path,
+        signing_pub,
+        signing_priv,
+        signing_label: signing_label.to_string(),
+        signing_key_type: KeyType::Ed25519,
+        ka_secret,
+        ka_path,
+        ka_pub,
+        ka_priv,
+        ka_label: ka_label.to_string(),
+        ka_key_type: KeyType::X25519,
+        additional_signing: Vec::new(),
+    })
+}
+
+/// Mint one signing key for a template slot beyond the primary, at its own
+/// BIP-32 path.
+///
+/// `preference` is most-preferred first, exactly as the slot declares it, and is
+/// resolved by the same rule [`derive_entity_keys_with_preference`] uses: the
+/// first algorithm this build can mint wins, an unavailable one is skipped, and
+/// running out is an error naming what was asked for. An extra slot that
+/// silently fell back would be worse than one that failed, because the whole
+/// reason to declare a second signing key is that the first one is not
+/// post-quantum.
+///
+/// A fresh path per slot is the point. Sharing the primary's path would make the
+/// second key a deterministic function of the first at the same index — which is
+/// precisely the cross-algorithm reuse `derive_ml_dsa_44`'s domain separation
+/// exists to prevent, reintroduced one layer up.
+pub async fn derive_additional_signing_key(
+    seed: &[u8],
+    base: &str,
+    slot: &str,
+    label: &str,
+    keys_ks: &KeyspaceHandle,
+    preference: &[KeyType],
+) -> Result<DerivedSlotKey, Box<dyn std::error::Error>> {
+    use crate::derivation::Bip32Extension;
+
+    let path = paths::allocate_path(keys_ks, base)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let root = ExtendedSigningKey::from_seed(seed)
+        .map_err(|e| format!("Failed to create BIP-32 root key: {e}"))?;
+
+    for candidate in preference {
+        let secret = match candidate {
+            KeyType::Ed25519 => root.derive_ed25519(&path),
+            KeyType::MlDsa44 => root.derive_ml_dsa_44(&path),
+            KeyType::MlDsa65 => root.derive_ml_dsa_65(&path),
+            // A foreign-protocol identity's key — an OpenID4VP verifier's JAR
+            // key, which swiyu and EUDI wallets require to be ES256. Derived
+            // with `derive_p256`'s domain separation, so it is independent of
+            // the Ed25519 key a path would otherwise yield.
+            KeyType::P256 => root.derive_p256(&path).and_then(|k| {
+                Secret::generate_p256(None, Some(&k.secret_key.to_bytes())).map_err(|e| {
+                    vti_common::error::AppError::Internal(format!("P-256 secret: {e}"))
+                })
+            }),
+            // Not a signing algorithm, or one this build cannot mint. Skipped
+            // rather than refused — the next entry is what a fallback is for.
+            _ => continue,
+        }
+        .map_err(|e| format!("slot '{slot}': {candidate:?} derivation failed: {e}"))?;
+
+        return Ok(DerivedSlotKey {
+            slot: slot.to_string(),
+            public_multibase: secret
+                .get_public_keymultibase()
+                .map_err(|e| format!("{e}"))?,
+            private_multibase: secret
+                .get_private_keymultibase()
+                .map_err(|e| format!("{e}"))?,
+            secret,
+            path,
+            label: label.to_string(),
+            key_type: candidate.clone(),
+        });
+    }
+
+    Err(format!(
+        "key slot '{slot}' names no signing algorithm this build can mint (asked for \
+         {preference:?}); the template's preference list must include at least one \
+         supported algorithm"
+    )
+    .into())
+}
+
+/// Store entity key records under the default verification-method ids.
+///
+/// Signing key → `{did}#key-0`, key-agreement key → `{did}#key-1` — which is
+/// only correct for a document this crate's builder produced. A DID minted from
+/// a template publishes whatever the template says, so
+/// [`save_entity_key_records_with_ids`] takes the ids the document actually
+/// carries and this is the convenience over it. The
+/// `label` field is also stored as the VM id rather than the freeform
+/// description carried in `derived.{signing,ka}_label`: belt-and-braces
+/// for downstream code that historically adopted the label as the kid
+/// (see [`vta_sdk::did_secrets::select_secret_kid`] rule #2). A reader
+/// that confuses label and id can no longer break decryption — both
+/// agree.
+pub async fn save_entity_key_records(
+    did: &str,
+    derived: &DerivedEntityKeys,
+    keys_ks: &KeyspaceHandle,
+    context_id: Option<&str>,
+    seed_id: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_entity_key_records_with_ids(
+        &format!("{did}#key-0"),
+        &format!("{did}#key-1"),
+        derived,
+        keys_ks,
+        context_id,
+        seed_id,
+    )
+    .await
+}
+
+/// As [`save_entity_key_records`], under verification-method ids the caller
+/// read off the document it just published.
+///
+/// The ids are the caller's because only the caller knows what the document
+/// says: a template decides its own method ids, and a record stored under a
+/// name the document does not publish is a key nothing can address —
+/// [`vta_sdk::did_secrets::select_secret_kid`] publishes the record id as the
+/// JWE kid, so a mismatch surfaces at a mediator as `No local secret matches
+/// any JWE recipient` and nowhere earlier.
+pub async fn save_entity_key_records_with_ids(
+    signing_vm_id: &str,
+    ka_vm_id: &str,
+    derived: &DerivedEntityKeys,
+    keys_ks: &KeyspaceHandle,
+    context_id: Option<&str>,
+    seed_id: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_key_record(
+        keys_ks,
+        signing_vm_id,
+        &derived.signing_path,
+        // Carried from the derivation, not asserted here. The literal
+        // `KeyType::Ed25519` that stood here was correct only while nothing
+        // else could be minted — and this is the **VTA-derived** branch, the
+        // one a template's `keys` block steers, so it is exactly where a
+        // post-quantum key arrives. A record naming Ed25519 for an ML-DSA key
+        // sends a later signing operation to a suite the key cannot work in,
+        // and that failure surfaces far from here. `DerivedEntityKeys` grew
+        // `signing_key_type` for this; the caller-supplied-keys branch already
+        // reads it, and this one was missed.
+        derived.signing_key_type.clone(),
+        &derived.signing_pub,
+        signing_vm_id,
+        context_id,
+        seed_id,
+    )
+    .await?;
+    save_key_record(
+        keys_ks,
+        ka_vm_id,
+        &derived.ka_path,
+        derived.ka_key_type.clone(),
+        &derived.ka_pub,
+        ka_vm_id,
+        context_id,
+        seed_id,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Store the key record for one additional signing slot, under the
+/// verification-method id the published document gives it.
+///
+/// Separate from [`save_entity_key_records_with_ids`] for the same reason
+/// `save_sealed_transfer_key_record` is: the id comes from reading the document
+/// back, and only the caller has it.
+pub async fn save_additional_signing_key_record(
+    vm_id: &str,
+    key: &DerivedSlotKey,
+    keys_ks: &KeyspaceHandle,
+    context_id: Option<&str>,
+    seed_id: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_key_record(
+        keys_ks,
+        vm_id,
+        &key.path,
+        key.key_type.clone(),
+        &key.public_multibase,
+        vm_id,
+        context_id,
+        seed_id,
+    )
+    .await
+}
+
+// ===========================================================================
+// Integration tests: full create → store → recover cycle
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derivation::Bip32Extension;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    fn test_seed() -> Vec<u8> {
+        vec![
+            7, 26, 142, 230, 65, 85, 188, 182, 29, 129, 52, 229, 217, 159, 243, 182, 73, 89, 196,
+            246, 58, 28, 100, 144, 187, 21, 157, 39, 4, 188, 154, 180,
+        ]
+    }
+
+    fn temp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let config = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = Store::open(&config).expect("failed to open store");
+        (store, dir)
+    }
+
+    /// A preference list picks its first minitable algorithm, and the result
+    /// says which one it was.
+    ///
+    /// The `signing_key_type` is the point. Every `save_key_record` call for a
+    /// signing key used to pass `Ed25519` as a literal — correct only while
+    /// nothing else could be minted. A record naming the wrong algorithm sends
+    /// a later signing operation to a suite the key cannot work in, and that
+    /// failure surfaces far from here.
+    #[tokio::test]
+    async fn a_preference_list_mints_its_first_choice_and_says_so() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace(vta_keyspaces::KEYS).expect("keyspace");
+
+        let pq = derive_entity_keys_with_preference(
+            &seed,
+            "m/26'/1'/0'",
+            "signing",
+            "ka",
+            &ks,
+            &[KeyType::MlDsa44, KeyType::Ed25519],
+        )
+        .await
+        .expect("ML-DSA-44 is the first choice and this build can mint it");
+
+        assert_eq!(pq.signing_key_type, KeyType::MlDsa44);
+        assert_eq!(
+            pq.ka_key_type,
+            KeyType::X25519,
+            "the key-agreement slot takes no preference — X25519 is the only \
+             algorithm that can serve it in a DID document"
+        );
+
+        // The public key must actually be the post-quantum one, not an Ed25519
+        // key wearing the label. ML-DSA-44 public keys are 1312 bytes, so the
+        // multibase is far longer than Ed25519's 32.
+        let (_b, bytes) = multibase::decode(&pq.signing_pub).expect("valid multibase");
+        assert!(
+            bytes.len() > 1000,
+            "signing_key_type says ML-DSA-44 but the key is {} bytes — the label \
+             and the key have come apart, which is the exact defect this carries \
+             the type to prevent",
+            bytes.len(),
+        );
+    }
+
+    /// A fallback is taken when the preferred algorithm cannot be minted — that
+    /// is what the list is for.
+    #[tokio::test]
+    async fn a_preference_list_falls_back_and_records_what_it_took() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace(vta_keyspaces::KEYS).expect("keyspace");
+
+        // X25519 cannot sign, so it is skipped rather than refused.
+        let classical = derive_entity_keys_with_preference(
+            &seed,
+            "m/26'/1'/1'",
+            "signing",
+            "ka",
+            &ks,
+            &[KeyType::X25519, KeyType::Ed25519],
+        )
+        .await
+        .expect("an unusable first choice falls through to the next");
+
+        assert_eq!(classical.signing_key_type, KeyType::Ed25519);
+    }
+
+    /// Running out of candidates is an error naming what was asked for, never a
+    /// quiet downgrade to Ed25519.
+    ///
+    /// The quiet downgrade is the whole hazard: a deployment meant to be
+    /// post-quantum would ship classical keys and nothing would say so.
+    #[tokio::test]
+    async fn an_unsatisfiable_preference_is_an_error_not_a_downgrade() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace(vta_keyspaces::KEYS).expect("keyspace");
+
+        let err = derive_entity_keys_with_preference(
+            &seed,
+            "m/26'/1'/2'",
+            "signing",
+            "ka",
+            &ks,
+            &[KeyType::X25519],
+        )
+        .await
+        .err()
+        .expect("a list naming no signing algorithm cannot be satisfied");
+
+        assert!(
+            err.to_string().contains("no signing algorithm"),
+            "the error must say the list could not be satisfied: {err}"
+        );
+    }
+
+    /// An extra slot is minted at its **own** path, with its own algorithm.
+    ///
+    /// The separate path is the security property. Deriving it at the primary's
+    /// index would make the second key a deterministic function of the first —
+    /// the cross-algorithm reuse `derive_ml_dsa_44`'s domain separation exists
+    /// to prevent, reintroduced a layer up where that separation cannot see it.
+    #[tokio::test]
+    async fn an_additional_slot_is_minted_at_its_own_path() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace(vta_keyspaces::KEYS).expect("keyspace");
+
+        let primary = derive_entity_keys(&seed, "m/26'/3'/0'", "signing", "ka", &ks)
+            .await
+            .expect("primary");
+        let extra = derive_additional_signing_key(
+            &seed,
+            "m/26'/3'/0'",
+            "pq-signing",
+            "post-quantum signing",
+            &ks,
+            &[KeyType::MlDsa44, KeyType::Ed25519],
+        )
+        .await
+        .expect("ML-DSA-44 is mintable in this build");
+
+        assert_eq!(extra.slot, "pq-signing");
+        assert_eq!(extra.key_type, KeyType::MlDsa44);
+        assert_ne!(
+            extra.path, primary.signing_path,
+            "an extra slot must not share the primary's derivation path"
+        );
+
+        let (_b, bytes) = multibase::decode(&extra.public_multibase).expect("valid multibase");
+        assert!(
+            bytes.len() > 1000,
+            "key_type says ML-DSA-44 but the key is {} bytes",
+            bytes.len()
+        );
+    }
+
+    /// The fallback rule is the same one the primary slot follows, so one
+    /// template serves a fleet where not every VTA can mint every algorithm.
+    #[tokio::test]
+    async fn an_additional_slot_falls_back_and_refuses_an_empty_list() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace(vta_keyspaces::KEYS).expect("keyspace");
+
+        let fell_back = derive_additional_signing_key(
+            &seed,
+            "m/26'/3'/1'",
+            "extra",
+            "extra",
+            &ks,
+            // X25519 cannot sign, so it is skipped rather than refused.
+            &[KeyType::X25519, KeyType::Ed25519],
+        )
+        .await
+        .expect("an unusable first choice falls through");
+        assert_eq!(fell_back.key_type, KeyType::Ed25519);
+
+        let err = derive_additional_signing_key(
+            &seed,
+            "m/26'/3'/2'",
+            "extra",
+            "extra",
+            &ks,
+            &[KeyType::X25519],
+        )
+        .await
+        .expect_err("a list naming no signing algorithm cannot be satisfied");
+        assert!(
+            err.to_string().contains("extra"),
+            "the error must name the slot that could not be satisfied: {err}"
+        );
+    }
+
+    /// **A stored record must name the algorithm the key actually is.**
+    ///
+    /// `save_entity_key_records_with_ids` passed `KeyType::Ed25519` as a
+    /// literal for the signing key, even though `DerivedEntityKeys` grew
+    /// `signing_key_type` (#1532) to stop exactly that. It is the VTA-derived
+    /// branch, which is the one a template's `keys` block steers — so it is
+    /// where a post-quantum key would arrive.
+    ///
+    /// Nothing mislabels a key *today*: a `did:webvh` primary signing key must
+    /// be Ed25519, because the log entry is signed with it and didwebvh 1.0
+    /// mandates `eddsa-jcs-2022`. So this is a latent defect, not a live one,
+    /// and this test is what keeps it that way — the first DID method that can
+    /// carry a post-quantum primary key would otherwise store a record saying
+    /// Ed25519 and send every later signing operation to a suite the key cannot
+    /// work in, far from here.
+    #[tokio::test]
+    async fn a_saved_record_names_the_algorithm_the_key_is() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace(vta_keyspaces::KEYS).expect("keyspace");
+        let did = "did:example:pq";
+
+        let derived = derive_entity_keys_with_preference(
+            &seed,
+            "m/26'/4'/0'",
+            "signing",
+            "ka",
+            &ks,
+            &[KeyType::MlDsa44],
+        )
+        .await
+        .expect("derive");
+
+        save_entity_key_records(did, &derived, &ks, Some("vta"), Some(0))
+            .await
+            .expect("save");
+
+        let record: KeyRecord = ks
+            .get(format!("key:{did}#key-0"))
+            .await
+            .expect("read")
+            .expect("a record was stored for #key-0");
+        assert_eq!(
+            record.key_type,
+            KeyType::MlDsa44,
+            "the record must carry the minted algorithm, not a literal"
+        );
+    }
+
+    /// Full lifecycle test: derive_entity_keys → save_entity_key_records →
+    /// load key records → re-derive from stored paths → verify public keys match.
+    ///
+    /// This simulates first-boot DID creation followed by a VTA restart.
+    #[tokio::test]
+    async fn test_create_store_recover_cycle() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let keys_ks = store.keyspace(vta_keyspaces::KEYS).unwrap();
+        let did = "did:webvh:abc123:example.com:vta";
+
+        // === CREATION (first boot — derive_entity_keys + save) ===
+        let derived = derive_entity_keys(&seed, "m/44'/0'", "signing", "key-agreement", &keys_ks)
+            .await
+            .unwrap();
+
+        save_entity_key_records(did, &derived, &keys_ks, Some("vta"), Some(0))
+            .await
+            .unwrap();
+
+        let created_signing_pub = derived.signing_pub.clone();
+        let created_ka_pub = derived.ka_pub.clone();
+
+        // === RECOVERY (restart — load key records, re-derive from seed + path) ===
+        // This mirrors what init_auth() does in server.rs
+
+        let signing_record: KeyRecord = keys_ks
+            .get(store_key(&format!("{did}#key-0")))
+            .await
+            .unwrap()
+            .expect("signing key record not found");
+        let ka_record: KeyRecord = keys_ks
+            .get(store_key(&format!("{did}#key-1")))
+            .await
+            .unwrap()
+            .expect("KA key record not found");
+
+        assert_eq!(signing_record.key_type, KeyType::Ed25519);
+        assert_eq!(ka_record.key_type, KeyType::X25519);
+        assert_eq!(signing_record.seed_id, Some(0));
+
+        let root = ExtendedSigningKey::from_seed(&seed).unwrap();
+
+        let recovered_signing = root
+            .derive_ed25519(&signing_record.derivation_path)
+            .unwrap();
+        let recovered_ka = root.derive_x25519(&ka_record.derivation_path).unwrap();
+
+        let recovered_signing_pub = recovered_signing.get_public_keymultibase().unwrap();
+        let recovered_ka_pub = recovered_ka.get_public_keymultibase().unwrap();
+
+        // === ASSERTIONS ===
+
+        // Public keys from recovery must match what was stored in the key records
+        assert_eq!(
+            signing_record.public_key, recovered_signing_pub,
+            "stored signing public key does not match recovered key"
+        );
+        assert_eq!(
+            ka_record.public_key, recovered_ka_pub,
+            "stored KA public key does not match recovered key"
+        );
+
+        // Public keys from recovery must match what DID creation produced
+        assert_eq!(
+            created_signing_pub, recovered_signing_pub,
+            "created signing public key does not match recovered key — \
+             DID document would have wrong signing key"
+        );
+        assert_eq!(
+            created_ka_pub, recovered_ka_pub,
+            "created KA public key does not match recovered key — \
+             DID document would have wrong key-agreement key, \
+             DIDComm encryption/decryption will fail"
+        );
+    }
+
+    /// Test that key records survive store persistence (write → close → reopen → read).
+    #[tokio::test]
+    async fn test_key_records_survive_store_reopen() {
+        let seed = test_seed();
+        let dir = tempfile::tempdir().unwrap();
+        let did = "did:webvh:abc123:example.com:vta";
+
+        // Create and save
+        {
+            let config = StoreConfig {
+                data_dir: dir.path().to_path_buf(),
+            };
+            let store = Store::open(&config).unwrap();
+            let keys_ks = store.keyspace(vta_keyspaces::KEYS).unwrap();
+
+            let derived = derive_entity_keys(&seed, "m/44'/0'", "signing", "ka", &keys_ks)
+                .await
+                .unwrap();
+
+            save_entity_key_records(did, &derived, &keys_ks, Some("vta"), Some(0))
+                .await
+                .unwrap();
+
+            store.persist().await.unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let config = StoreConfig {
+                data_dir: dir.path().to_path_buf(),
+            };
+            let store = Store::open(&config).unwrap();
+            let keys_ks = store.keyspace(vta_keyspaces::KEYS).unwrap();
+
+            let signing: KeyRecord = keys_ks
+                .get(store_key(&format!("{did}#key-0")))
+                .await
+                .unwrap()
+                .expect("signing key not found after reopen");
+            let ka: KeyRecord = keys_ks
+                .get(store_key(&format!("{did}#key-1")))
+                .await
+                .unwrap()
+                .expect("KA key not found after reopen");
+
+            // Re-derive and compare
+            let root = ExtendedSigningKey::from_seed(&seed).unwrap();
+            let recovered_sign_pub = root
+                .derive_ed25519(&signing.derivation_path)
+                .unwrap()
+                .get_public_keymultibase()
+                .unwrap();
+            let recovered_ka_pub = root
+                .derive_x25519(&ka.derivation_path)
+                .unwrap()
+                .get_public_keymultibase()
+                .unwrap();
+
+            assert_eq!(signing.public_key, recovered_sign_pub);
+            assert_eq!(ka.public_key, recovered_ka_pub);
+        }
+    }
+
+    /// Test that the derivation path counter allocates unique paths and
+    /// each path produces a different key.
+    #[tokio::test]
+    async fn test_path_allocation_produces_unique_keys() {
+        let seed = test_seed();
+        let (store, _dir) = temp_store();
+        let keys_ks = store.keyspace(vta_keyspaces::KEYS).unwrap();
+
+        let base = "m/44'/0'";
+        let mut pub_keys = Vec::new();
+
+        for _ in 0..5 {
+            let path = paths::allocate_path(&keys_ks, base).await.unwrap();
+            let root = ExtendedSigningKey::from_seed(&seed).unwrap();
+            let secret = root.derive_ed25519(&path).unwrap();
+            pub_keys.push(secret.get_public_keymultibase().unwrap());
+        }
+
+        // All keys must be distinct
+        for i in 0..pub_keys.len() {
+            for j in (i + 1)..pub_keys.len() {
+                assert_ne!(
+                    pub_keys[i], pub_keys[j],
+                    "path allocation produced duplicate keys at indices {i} and {j}"
+                );
+            }
+        }
+    }
+
+    /// Seed stored as hex (retired seed archival) must produce identical keys
+    /// when decoded and used for re-derivation.
+    #[tokio::test]
+    async fn test_hex_seed_roundtrip() {
+        let seed = test_seed();
+        let path = "m/44'/0'/0'";
+
+        // Simulate archival: hex-encode and decode
+        let hex_seed = hex::encode(&seed);
+        let recovered_seed = hex::decode(&hex_seed).unwrap();
+
+        let root_original = ExtendedSigningKey::from_seed(&seed).unwrap();
+        let root_recovered = ExtendedSigningKey::from_seed(&recovered_seed).unwrap();
+
+        let sign_orig = root_original.derive_ed25519(path).unwrap();
+        let sign_recv = root_recovered.derive_ed25519(path).unwrap();
+
+        assert_eq!(
+            sign_orig.get_public_keymultibase().unwrap(),
+            sign_recv.get_public_keymultibase().unwrap(),
+            "hex-encoded seed round-trip produced different keys"
+        );
+
+        let ka_orig = root_original.derive_x25519(path).unwrap();
+        let ka_recv = root_recovered.derive_x25519(path).unwrap();
+
+        assert_eq!(
+            ka_orig.get_public_keymultibase().unwrap(),
+            ka_recv.get_public_keymultibase().unwrap(),
+            "hex-encoded seed round-trip produced different X25519 keys"
+        );
+    }
+}

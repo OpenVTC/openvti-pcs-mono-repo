@@ -1,0 +1,128 @@
+//! Combined public-DID fallback that walks each compiled-in method's
+//! resolver in priority order (T25).
+//!
+//! At compile time any subset of `method-webvh`, `method-webs` and
+//! `method-web` may be on. Each enabled method's
+//! `dispatch(state, parts)` is called in turn; the first method that
+//! recognises the URL returns its response, and we stop there. If no
+//! method matches, the fallback returns 404 (or, in the daemon's
+//! combined router, hands off to the SPA static handler).
+//!
+//! ## Priority
+//!
+//! 1. **did:webvh** (when `method-webvh` is on). Webvh's URLs end in
+//!    `/did.jsonl` or `/did-witness.json`; both are method-exclusive,
+//!    so registering webvh first doesn't shadow other methods.
+//! 2. **did:webs** (when `method-webs` is on). `/keri.cesr` is
+//!    method-exclusive, but `/did.json` is **not** — did:web serves it
+//!    too. So webs must come before web, and it claims a `did.json`
+//!    only when the stored record is actually a did:webs record,
+//!    returning `None` otherwise. Ordering them the other way round
+//!    would let did:web's bridge answer for a did:webs slot: it would
+//!    look for a webvh log where a CESR stream is stored, and 404 a
+//!    DID that is hosted perfectly well.
+//! 3. **did:web** (when `method-web` is on). Web's URL ends in
+//!    `/did.json`. Last, so it acts as the fall-through for that
+//!    suffix — which is what its did:webvh bridge has always been.
+//!
+//! ## Why a fallback rather than `Router::route("/{*x}/did.jsonl", ...)`
+//!
+//! Axum's nested catch-alls (`/{*path}`) don't compose with sibling
+//! catch-alls at the same level — you get a "match" conflict at
+//! router-build time. The fallback path is the only way to do
+//! suffix-based dispatch in a single router. Each method's
+//! `dispatch` does its own suffix check and returns `None` when the
+//! URL isn't its problem, which is structurally equivalent to "this
+//! route didn't match, try the next one".
+
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+
+#[cfg(feature = "method-web")]
+use super::resolve_web;
+#[cfg(feature = "method-webs")]
+use super::resolve_webs;
+#[cfg(feature = "method-webvh")]
+use super::resolve_webvh;
+use crate::server::AppState;
+
+/// Combined fallback handler: walks each enabled method's dispatcher
+/// in priority order, returning the first match.
+///
+/// 404 when no method recognises the URL. Callers expecting an SPA
+/// (daemon mode) check for 404 and then call the static handler.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/{mnemonic}/did.jsonl",
+    tag = "resolve",
+    params(("mnemonic" = String, Path, description = "Slot path; the published did:webvh resolves at <base>/{mnemonic}/did.jsonl")),
+    responses(
+        (status = 200, description = "did:webvh log (JSONL) or did:web document for the slot", content_type = "application/jsonl+json"),
+        (status = 304, description = "The `If-None-Match` tag is current"),
+        (status = 404, description = "No DID hosted at this path"),
+        (status = 405, description = "A method other than GET or HEAD"),
+        (status = 429, description = "This address's resolution rate exceeds `[server.resolve_rate_limit]`; see `Retry-After`", content_type = "application/json"),
+    ),
+))]
+pub async fn serve_public(State(state): State<AppState>, request: Request) -> Response {
+    // Resolution is read-only: anything but GET or HEAD is refused before a
+    // lookup, so it neither returns the content nor counts as a resolve.
+    if let Some(refused) = refuse_method(request.method()) {
+        return refused;
+    }
+    let (parts, _) = request.into_parts();
+    // The request host, `If-None-Match` and the slot's record are read once
+    // here and shared by every dispatcher below.
+    let lookup = super::resolve_shared::Lookup::new(&state, &parts);
+
+    // Order matters: did:webs and did:web both serve `/did.json` (see the
+    // module docs), so the iteration is encoded explicitly and the
+    // priority is visible at the call site rather than buried in router
+    // config.
+
+    #[cfg(feature = "method-webvh")]
+    {
+        if let Some(response) = resolve_webvh::dispatch(&lookup, &parts).await {
+            return response;
+        }
+    }
+
+    // Before did:web — both serve `/did.json`, and only this one can
+    // tell whether the slot behind it is a did:webs record.
+    #[cfg(feature = "method-webs")]
+    {
+        if let Some(response) = resolve_webs::dispatch(&lookup, &parts).await {
+            return response;
+        }
+    }
+
+    #[cfg(feature = "method-web")]
+    {
+        if let Some(response) = resolve_web::dispatch(&lookup, &parts).await {
+            return response;
+        }
+    }
+
+    // Silence the unused-binding warning when no method feature is on
+    // (every URL then falls through to the 404 below).
+    let _ = &lookup;
+    let _ = &parts;
+
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// `405 Method Not Allowed` (with `Allow: GET, HEAD`) for any method but
+/// `GET` and `HEAD`.
+pub fn refuse_method(method: &Method) -> Option<Response> {
+    if method == Method::GET || method == Method::HEAD {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],
+        )
+            .into_response(),
+    )
+}

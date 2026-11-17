@@ -1,0 +1,3420 @@
+use std::collections::BTreeSet;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::auth::extractor::AuthClaims;
+use crate::auth::step_up::StepUpMode;
+use crate::error::AppError;
+use crate::store::{Batch, KeyspaceHandle};
+
+/// Roles that determine endpoint access permissions.
+///
+/// Hierarchy (most to least privileged):
+/// - **Admin** — full management access, can assign any role
+/// - **Initiator** — can manage ACL entries and application contexts
+/// - **Application** — standard API access (sign, cache write) within allowed contexts
+/// - **Reader** — read-only access to keys, contexts, DIDs within allowed contexts
+/// - **Monitor** — infrastructure-only: metrics and health endpoints
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Admin,
+    Initiator,
+    Application,
+    Reader,
+    /// `Monitor` is the least-privileged role and the natural default
+    /// for a `Default::default()` `AuthClaims` (typically used in tests
+    /// or pre-authentication scaffolding). A test fixture that leaks
+    /// past its expected reach now lands on the most-restricted role
+    /// rather than the most-privileged.
+    #[default]
+    Monitor,
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Role::Admin => write!(f, "admin"),
+            Role::Initiator => write!(f, "initiator"),
+            Role::Application => write!(f, "application"),
+            Role::Reader => write!(f, "reader"),
+            Role::Monitor => write!(f, "monitor"),
+        }
+    }
+}
+
+impl Role {
+    /// Parse a role from its string representation.
+    pub fn parse(s: &str) -> Result<Self, AppError> {
+        match s {
+            "admin" => Ok(Role::Admin),
+            "initiator" => Ok(Role::Initiator),
+            "application" => Ok(Role::Application),
+            "reader" => Ok(Role::Reader),
+            "monitor" => Ok(Role::Monitor),
+            _ => Err(AppError::Internal(format!("unknown role: {s}"))),
+        }
+    }
+}
+
+/// Consumer-kind discriminator distinguishing user-driven Companions
+/// (browser plugin, mobile app, desktop app) from headless Services
+/// (mediator, AI agent, daemon). Companion vs Service drives UX
+/// affordances and default policy posture; the variant payload narrows
+/// the form factor / service role for finer-grained policy hooks.
+///
+/// Wire form (kebab-case discriminator) matches the canonical Trust
+/// Task shared schema `device/_shared/0.1/device-binding#/$defs/ConsumerKind`.
+///
+/// `#[serde(default)]` on the AclEntry field returns `Service { Daemon }`
+/// for legacy rows that pre-date the field — a safe fallback for any
+/// existing operator-deployed mediator or daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ConsumerKind {
+    #[serde(rename_all = "kebab-case")]
+    Companion { form_factor: CompanionFormFactor },
+    #[serde(rename_all = "camelCase")]
+    Service {
+        #[serde(rename = "serviceKind")]
+        service_kind: ServiceKind,
+    },
+}
+
+impl Default for ConsumerKind {
+    fn default() -> Self {
+        ConsumerKind::Service {
+            service_kind: ServiceKind::Daemon,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompanionFormFactor {
+    Browser,
+    Mobile,
+    Desktop,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ServiceKind {
+    Mediator,
+    AiAgent,
+    Daemon,
+}
+
+/// Fine-grained capability flags scoped to the ACL entry's allowed
+/// contexts. Used by route handlers to gate access at finer resolution
+/// than the [`Role`] hierarchy — for example, an AI-agent Service might
+/// be granted `VaultRead` against a specific context but never
+/// `VaultWrite` or `Sign`. Wire form (kebab-case) matches the canonical
+/// `Capability` shared schema.
+///
+/// For legacy rows with no capability set, [`derived_capabilities_for_role`]
+/// produces a sensible default from the existing role (Admin gets
+/// everything, Reader gets only `vault-read`, etc.) so existing ACL
+/// behaviour is preserved bit-for-bit.
+/// **Non-exhaustive on purpose.** This list grows every time the agent gains a
+/// power worth gating separately, and each addition used to be a breaking change
+/// for anyone matching on it — which is exactly what happened: `MemoryRead`,
+/// `MemoryWrite`, `RoomPresent` and `RoomOpen` went out in `vti-common` 0.16.2, a
+/// patch release, and any downstream exhaustive `match` stopped compiling on a
+/// routine `cargo update`.
+///
+/// Downstream code must carry a `_ =>` arm. That is the point: a capability this
+/// consumer has never heard of is precisely the one it must not silently treat as
+/// granted, and a wildcard arm forces that decision to be written down.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Capability {
+    VaultRead,
+    VaultWrite,
+    ProxyLogin,
+    FillRelease,
+    PolicyAdmin,
+    DeviceAdmin,
+    Sign,
+    KeyMint,
+    /// Taking a key's private material **out** of the VTA —
+    /// `keys/export-secret/0.1`.
+    ///
+    /// Distinct from [`Capability::Sign`] because VTI-VTA-003 requires it: an
+    /// export "MUST be gated by a capability distinct from the capability to
+    /// use the key". The two are not degrees of one power. `Sign` asks the VTA
+    /// to act and loses that ability the moment the entry changes; an exported
+    /// key stays with whoever holds it after their authority is withdrawn,
+    /// which is why VTI-VTA-002 makes performing the operation the norm.
+    ///
+    /// Derived by [`Role::Admin`] alone, so every admin keeps what the role
+    /// check used to give them. What changes is that it is now a capability:
+    /// an operator can narrow it away from a particular admin, which a role
+    /// floor could not express. It is deliberately **not** derived by
+    /// [`Role::Initiator`] — an initiator that needs to act as a key does so
+    /// through `Sign`, and the key never leaves.
+    KeyExport,
+    /// Per-envelope Trust Task signing via `vault/sign-trust-task/0.1` —
+    /// distinct from `ProxyLogin` (which mints a session credential) and
+    /// from `Sign` (the generic signing oracle). Keeping it separate lets
+    /// operators grant proxy-login without sign-trust-task to limit
+    /// blast radius on Service consumers (AI agents, etc.).
+    SignTrustTask,
+    /// SSHSIG signing — `keys/sign-sshsig/0.1`, the format git uses for SSH
+    /// commit and tag signing (`gpg.format = ssh`).
+    ///
+    /// Registered upstream as `signSshsig`. Deliberately **not**
+    /// [`Capability::Sign`]: the VTA builds the SSHSIG signed data itself, so a
+    /// holder of this capability can obtain a signature that verifies as an
+    /// SSHSIG statement and as nothing else — never one over bytes of its own
+    /// choosing. That is what lets a commit signer (`did-git-sign`) be narrowed
+    /// to it, instead of exporting the key or holding the general oracle.
+    ///
+    /// Derived by every role that derives `Sign`, which already confers strictly
+    /// more; the gate accepts either.
+    SignSshsig,
+    /// JWS signing — `keys/sign-jws/0.1`: a compact JWS (an OpenID4VP request
+    /// object, a proof-of-possession JWT) from a key that never leaves the VTA.
+    ///
+    /// Registered upstream as `signJws`. The VTA writes the header's `alg`
+    /// and builds the JWS signing input itself, so a holder obtains a JWS and
+    /// nothing else. Unlike [`Capability::SignSshsig`], the gate does **not**
+    /// accept [`Capability::Sign`] in its place: this VTA frames `keys/sign`
+    /// payloads under its own signing domain, so `sign` is a grant that cannot
+    /// yield a JWS, and the specification says such a custodian SHOULD NOT
+    /// widen it into one.
+    ///
+    /// Derived by every role that derives `Sign`.
+    SignJws,
+    /// Certificate-request signing — `keys/sign-csr/0.1`: a PKCS#10 request for
+    /// a key that never leaves the VTA, so a CA can certify it (an EUDI access
+    /// certificate). Registered upstream as `signCsr`; `sign` is not accepted
+    /// for it, for the reason given on [`Capability::SignJws`].
+    ///
+    /// Derived by every role that derives `Sign`.
+    SignCsr,
+    /// Data Integrity document signing — `keys/sign-document/0.1`: an
+    /// `eddsa-jcs-2022` proof over a JSON document that names its signer (a
+    /// credential, a member's external directory card), from a key that never
+    /// leaves the VTA and only as the DID the document names. Registered
+    /// upstream as `signDocument` (`sign-document`). The VTA builds the proof
+    /// itself, so a holder obtains a Data Integrity proof and nothing else;
+    /// `sign` is not accepted in its place, for the reason given on
+    /// [`Capability::SignJws`] and because a `sign` grant was never given with
+    /// the issuer binding this task adds.
+    ///
+    /// Derived by every role that derives `Sign`.
+    SignDocument,
+    /// Mutating the **archival lifecycle** of a stored credential — the
+    /// `vault/credentials/{archive,unarchive,delete,restore,purge}/0.1`
+    /// tasks. Distinct from `VaultWrite` (which gates `vault/credentials/
+    /// receive` and the password-vault writes) so an operator can grant a
+    /// consumer the ability to *receive* credentials without the ability to
+    /// *remove* them — removal of a holder's credentials is a higher-trust
+    /// action. Granted to the same roles that hold `VaultWrite`.
+    CredentialWrite,
+    /// Reading agent memory — `vta/memory/list/0.1`. Split from
+    /// [`Capability::MemoryWrite`] because the published specification already
+    /// assumes the split exists: `vta/memory/delete/0.1` reasons about "a VTA
+    /// whose write capability is granted more freely than its read capability".
+    /// Until this pair, there was no read capability and no write capability —
+    /// only the context gate, which is binary, so any DID that could reach a
+    /// context could also rewrite every memory in it.
+    MemoryRead,
+    /// Writing or deleting agent memory — `vta/memory/{put,delete}/0.1`.
+    /// Deliberately withheld from [`Role::Reader`]: a read-only consumer of a
+    /// context should not be able to rewrite the memories in it.
+    MemoryWrite,
+    /// Asking this VTA to mint a scoped room presentation —
+    /// `rooms/keys/present/0.1`.
+    ///
+    /// Registered upstream as `roomPresent` (`trustoverip/dtgwg-trust-tasks-tf`
+    /// #351). Deliberately **not** [`Capability::Sign`]: an agent that may ask
+    /// for a scoped, audience-bound presentation is not thereby an agent that
+    /// may sign anything at all with its principal's key, and gating this on
+    /// the generic signing oracle would grant strictly more than the task
+    /// needs — the opposite of what an oracle is for.
+    ///
+    /// Withheld from [`Role::Reader`]: minting a credential on a principal's
+    /// behalf is not a read.
+    RoomPresent,
+    /// Asking this VTA to open a sealed room record — `rooms/keys/open/{0.1,0.2}`.
+    ///
+    /// Registered upstream as `roomOpen` alongside `roomPresent`
+    /// (`trustoverip/dtgwg-trust-tasks-tf` #351), and separate from it on
+    /// purpose: producing a presentation and decrypting a record are different
+    /// powers. An agent that indexes a room — walking the listing and building
+    /// a searchable view — should not thereby be able to read it.
+    ///
+    /// Also gates `rooms/keys/seal` and `rooms/keys/file-key`: a sealing key is a file key
+    /// like any other, and opens the file it seals.
+    RoomOpen,
+    /// Acting for the **holder** over their own identity: the ten holder-scoped
+    /// `persona/*` tasks — the attribute pool, the profiles built over it,
+    /// correlation analysis, and cross-context disclosure history.
+    ///
+    /// # The one capability no role implies
+    ///
+    /// Every other member of this enum is a subset of what some role already
+    /// carries, and an entry's list can only narrow that. This one is additive
+    /// (see [`ADDITIVE_CAPABILITIES`]): no role derives it, so it is held only
+    /// where an operator granted it by name.
+    ///
+    /// It has to work that way, because what it gates is not *within* what a
+    /// role allows. The pool sits above every trust context, and until now the
+    /// only credential that could reach it was an admin with unrestricted scope
+    /// — which is to say, to manage your own identity from a client you had to
+    /// give that client authority over every context on the agent. Deriving it
+    /// from [`Role::Admin`] instead would have handed the pool to every
+    /// context-scoped administrator that already exists, silently, on upgrade:
+    /// the exact boundary breach the persona gate was written to prevent.
+    ///
+    /// Granting it is super-admin-only — see `validate_persona_holder_grant` on
+    /// the ACL create/update paths. An administrator scoped to one context
+    /// cannot mint holder authority, for themselves or for anyone else.
+    PersonaHolder,
+    /// Managing **external accounts** — the `external/accounts/*` Trust Tasks:
+    /// creating an account a VTA holds at a cloud or third-party provider,
+    /// changing its settings, setting its secret, binding consumers to it, and
+    /// its lifecycle.
+    ///
+    /// Distinct from [`Capability::ExternalAuthUse`] because managing an
+    /// account and consuming one are different powers: the integration that
+    /// mints storage credentials for itself must not thereby be able to widen
+    /// its own binding. Derived by [`Role::Admin`] alone. The consent rules in
+    /// the approvals defaults sit on top of it, so holding this capability lets
+    /// a caller *ask* for a change; other administrators decide it.
+    ExternalAccountsManage,
+    /// Consuming an external account — `external/credentials/issue`.
+    ///
+    /// Necessary and not sufficient: the account must also carry a binding
+    /// naming the caller, which fixes which account, how far, how long and how
+    /// often. Derived by the roles that already hold [`Capability::Sign`],
+    /// because the binding, not the role, is what bounds the grant.
+    ExternalAuthUse,
+    /// Acting as the principal's **vetter** under hidden vetting — the vetter
+    /// tasks of `vta/pcs/*` (enrolment, the token drip, attesting): the VTA runs
+    /// the PCS engine and the caller carries its messages.
+    ///
+    /// Registered upstream as `pcsVetter`. Deliberately **not**
+    /// [`Capability::Sign`] and not conferred by it (VTI-VTA-007): these tasks
+    /// produce PCS artefacts and nothing else, so a caller that may drive a
+    /// vetter's drip is not thereby a caller that may sign as the vetter. An
+    /// attestation is the vetter's word that a person was checked, so it is
+    /// derived only by the roles that act as the principal — [`Role::Admin`]
+    /// and [`Role::Initiator`] — and never by [`Role::Application`]: an agent
+    /// vets on the principal's behalf only where it is granted this by name.
+    PcsVetter,
+    /// Acting as the principal's **applicant** under hidden vetting — the
+    /// applicant tasks of `vta/pcs/*` (an application's key, taking in
+    /// attestations, the proof a join submission carries).
+    ///
+    /// Registered upstream as `pcsApplicant`. Not [`Capability::Sign`], for the
+    /// same reason as [`Capability::PcsVetter`], and derived by the same roles.
+    PcsApplicant,
+    /// Being the principal's **witnessed party** — `vta/witness/{open,present,accept}`:
+    /// the VTA builds and signs, as the principal's relationship DID (and, under the member
+    /// link, its member DID), every document of a `witness/session`, verifies the witness's
+    /// answers, and stores the Verifiable Witness Credential; the caller carries the
+    /// documents (`vta/_shared/0.6/CONVENTIONS.md` §4).
+    ///
+    /// Registered upstream as `witnessRequest`. Deliberately **not** [`Capability::Sign`]
+    /// and not conferred by it: these tasks sign only documents and presentations the VTA
+    /// builds itself, bound to one session with one witness, and they read and write the
+    /// credential vault, which `sign` does not confer. Witnessing discloses the principal's
+    /// credentials to a third party, so it is derived only by the roles that act as the
+    /// principal — [`Role::Admin`] and [`Role::Initiator`] — and never by
+    /// [`Role::Application`], as for [`Capability::PcsVetter`].
+    WitnessRequest,
+    /// Acting as the principal's **voter** in a community's elections — the
+    /// voter tasks `vta/pcs/voter/{register,accept,receipt}` and `vta/pcs/vote`:
+    /// a key per election, the blinded ticket request, the cast, and checking
+    /// receipts (VTI-VOT-020 – 033, VTI-VOT-053).
+    ///
+    /// Registered upstream as `pcsVoter`. Not [`Capability::Sign`], for the same
+    /// reason as [`Capability::PcsVetter`]: a vote is the principal's, so it is
+    /// derived by the roles that act as the principal and never by
+    /// [`Role::Application`] — an agent votes for the principal only where it is
+    /// granted this by name.
+    ///
+    PcsVoter,
+    /// Acting as the principal's **trustee** in a community's sealed or
+    /// tallied-encrypted elections — `vta/pcs/trustee/{enrol,deal,keys,justify,decrypt}`:
+    /// a transport key and a share of the election key per election, kept here,
+    /// and the documents a trustee publishes, signed as the trustee persona
+    /// (VTI-VOT-062, VTI-VOT-063).
+    ///
+    /// Registered upstream as `pcsTrustee`. Not [`Capability::Sign`]: the VTA
+    /// signs only the trustee documents it builds. A trustee's share decides an
+    /// election's secrecy, so it is derived by the roles that act as the
+    /// principal and never by [`Role::Application`].
+    ///
+    /// Last on purpose: a variant inserted before another shifts its implicit
+    /// discriminant, which is a breaking change to a published enum.
+    PcsTrustee,
+    /// Presenting a held credential to a verifier the caller names —
+    /// `vault/credentials/present/0.1`: the VTA builds a presentation of a
+    /// credential it holds, bound to one audience and nonce, disclosing only
+    /// the named claims, and signs it as the credential's subject.
+    ///
+    /// Registered upstream as `credentialPresent`. Not [`Capability::Sign`] and
+    /// not conferred by it, for the reason given on [`Capability::RoomPresent`];
+    /// not [`Capability::VaultRead`] either, because reading a credential is not
+    /// disclosing it to a third party under its subject's signature. A
+    /// presentation is the principal's word, so it is derived only by the roles
+    /// that act as the principal — [`Role::Admin`] and [`Role::Initiator`] —
+    /// and never by [`Role::Application`], as for [`Capability::WitnessRequest`].
+    CredentialPresent,
+    /// Creating a **sub-context** — `vta/contexts/create/1.0` with a `parent`.
+    ///
+    /// Registered as `context-create` *(additive)* in the specification's
+    /// capability registry (Appendix C.2); creation itself is VTI-CTX-020, and
+    /// granting it requires unrestricted act authority (VTI-ACL-033). Its holder
+    /// may also set the first DID of a context **it created**, to the `did:key`
+    /// of a key that context holds — never change, clear, or set one elsewhere.
+    ///
+    /// Necessary and not sufficient: the caller must also reach the parent
+    /// (`require_context`), so a holder can only create beneath contexts it
+    /// already acts in, and **top-level** creation stays super-admin-only.
+    /// The power this confers is therefore "branch under what I already have",
+    /// not "create anywhere".
+    ///
+    /// # Why this is not just `Role::Admin`
+    ///
+    /// Creating a sub-context already works for an admin of the parent, and
+    /// that remains true — this takes nothing away. What it adds is a way to
+    /// confer *only* that, because the alternative was making the caller an
+    /// admin of the context, which confers strictly more: re-pointing its keys,
+    /// rewriting its ACL, and administering everything already in it.
+    ///
+    /// The caller that needs this is an automated one. An agent gateway
+    /// provisions a context per managed agent, continuously, and cannot be
+    /// given super-admin or even context-admin for it — it is internet-facing,
+    /// and the whole point of its least-privilege grant is that a compromise
+    /// cannot rewrite the agent. Before this, provisioning therefore required a
+    /// separate always-on service holding super-admin: a new deployment unit
+    /// whose only purpose was to hold the most dangerous credential in the
+    /// system. This is the smaller answer to the same need.
+    ///
+    /// # Why additive
+    ///
+    /// Like [`Capability::PersonaHolder`] it is in [`ADDITIVE_CAPABILITIES`]:
+    /// no role derives it, so it is held only where an operator granted it by
+    /// name. It has to be, because the callers that need it are deliberately
+    /// *not* admins — an entry's capability list only ever narrows its role's
+    /// set, so a capability that must reach a non-admin cannot be role-derived.
+    /// Granting it is super-admin-only (`validate_additive_capability_grant`),
+    /// which is the same one-time consent step pairing already is.
+    ///
+    /// Appended last for the reason [`Capability::PcsTrustee`] gives: a variant
+    /// inserted before another shifts its implicit discriminant, which is a
+    /// breaking change to a published enum.
+    ContextCreate,
+}
+
+/// Capabilities that no role derives, and that an entry therefore holds only
+/// where one was granted by name.
+///
+/// Deliberately tiny and deliberately a `const`: every member is an exception to
+/// "a role is an upper bound on its entries", so each has to be argued for
+/// individually and be visible in one place to a reviewer asking what can exceed
+/// a role.
+pub const ADDITIVE_CAPABILITIES: &[Capability] =
+    &[Capability::PersonaHolder, Capability::ContextCreate];
+
+/// Whether `cap` is granted on its own rather than derived from a role.
+#[must_use]
+pub fn is_additive(cap: Capability) -> bool {
+    ADDITIVE_CAPABILITIES.contains(&cap)
+}
+
+/// Returns true if `role` is granted `cap` by the default capability mapping.
+///
+/// The role's set is the **ceiling**, and this answers about the ceiling alone.
+/// A gate wants [`effective_capabilities`] (or, on the request path,
+/// `AuthClaims::has_capability`), which also honours an entry's own narrowing.
+pub fn role_has_capability(role: &Role, cap: Capability) -> bool {
+    derived_capabilities_for_role(role).contains(&cap)
+}
+
+/// What an entry may actually do: its own set, bounded by its role's, plus any
+/// additive capability granted to it by name.
+///
+/// **A role-derived capability only ever narrows.** Empty means "whatever the
+/// role implies" — the shape every entry written before this had — and a
+/// non-empty one is intersected with the role's, never unioned. So `role` stays
+/// a true upper bound *for everything a role carries*: an operator reading
+/// `role: reader` knows the entry holds no more than a reader, and a capability
+/// removed from a role's derived set is removed from every entry at once rather
+/// than surviving in the rows that happened to name it.
+///
+/// The alternative — letting the list replace the role's — was considered and
+/// declined. It buys targeted grants ("this one agent may present, nothing
+/// else") at the price of making the role no longer describe the entry, which is
+/// the property the ACL's own display, audit trail and role-assignment checks
+/// all lean on.
+///
+/// # The additive members, and why they do not break that
+///
+/// [`ADDITIVE_CAPABILITIES`] are held only where they were granted by name, and
+/// **no role derives any of them**. So they cannot be narrowed into existence,
+/// and no upgrade can quietly confer one on an entry that never named it: an
+/// entry with an empty list still resolves to exactly its role's set, which is
+/// what every row written before this field existed means.
+///
+/// The narrowing is computed from the **non-additive** members alone. Without
+/// that, granting an entry holder authority and nothing else — a list of one
+/// additive name — would intersect its role's set with a list containing none
+/// of them and silently strip every capability it had. A grant that removes
+/// unrelated authority is not a grant anybody asked for.
+pub fn effective_capabilities(role: &Role, explicit: &[Capability]) -> Vec<Capability> {
+    let derived = derived_capabilities_for_role(role);
+
+    // Only the role-derived names narrow. An empty narrowing keeps the whole
+    // role, exactly as before.
+    let narrowing: Vec<Capability> = explicit
+        .iter()
+        .copied()
+        .filter(|c| !is_additive(*c))
+        .collect();
+    let mut effective: Vec<Capability> = if narrowing.is_empty() {
+        derived
+    } else {
+        derived
+            .into_iter()
+            .filter(|c| narrowing.contains(c))
+            .collect()
+    };
+
+    // Then the additive grants, which no role could have contributed.
+    effective.extend(explicit.iter().copied().filter(|c| is_additive(*c)));
+    effective
+}
+
+/// Whether `entry` may exercise `cap`, honouring both its role and its own
+/// narrowing. The storage-side counterpart of `AuthClaims::has_capability`.
+pub fn entry_has_capability(entry: &AclEntry, cap: Capability) -> bool {
+    effective_capabilities(&entry.role, &entry.capabilities).contains(&cap)
+}
+
+/// Capabilities named in `requested` that `role` does not carry **and** that no
+/// role could carry on its own behalf.
+///
+/// A grant path calls this to refuse loudly rather than silently dropping what
+/// it cannot honour. Silently intersecting at write time would store a set the
+/// operator did not ask for and report success; the operator would then read the
+/// entry back and find a capability they granted simply absent.
+///
+/// [`ADDITIVE_CAPABILITIES`] are excluded: they are *never* in a role's derived
+/// set, so measuring them against one would refuse every grant of them. What
+/// stands in for the role check there is a privilege check on the granter —
+/// `validate_persona_holder_grant` — because the question for an additive
+/// capability is not "does this role carry it" but "may this caller confer it".
+pub fn capabilities_beyond_role(role: &Role, requested: &[Capability]) -> Vec<Capability> {
+    let derived = derived_capabilities_for_role(role);
+    requested
+        .iter()
+        .filter(|c| !is_additive(**c) && !derived.contains(c))
+        .copied()
+        .collect()
+}
+
+/// Default capability set inferred from a role for entries that pre-date
+/// the explicit `capabilities` field. Keeps existing behaviour byte-identical
+/// — a pre-Phase-3 Admin still has every capability without any data
+/// migration required.
+pub fn derived_capabilities_for_role(role: &Role) -> Vec<Capability> {
+    match role {
+        Role::Admin => vec![
+            Capability::VaultRead,
+            Capability::VaultWrite,
+            Capability::CredentialWrite,
+            Capability::MemoryRead,
+            Capability::MemoryWrite,
+            Capability::RoomPresent,
+            Capability::RoomOpen,
+            Capability::ProxyLogin,
+            Capability::FillRelease,
+            Capability::PolicyAdmin,
+            Capability::DeviceAdmin,
+            Capability::Sign,
+            Capability::SignSshsig,
+            Capability::SignJws,
+            Capability::SignCsr,
+            Capability::SignDocument,
+            Capability::SignTrustTask,
+            Capability::KeyMint,
+            Capability::KeyExport,
+            Capability::ExternalAccountsManage,
+            Capability::ExternalAuthUse,
+            Capability::PcsVetter,
+            Capability::PcsApplicant,
+            Capability::PcsVoter,
+            Capability::PcsTrustee,
+            Capability::WitnessRequest,
+            Capability::CredentialPresent,
+        ],
+        Role::Initiator => vec![
+            Capability::VaultRead,
+            Capability::VaultWrite,
+            Capability::CredentialWrite,
+            Capability::MemoryRead,
+            Capability::MemoryWrite,
+            Capability::RoomPresent,
+            Capability::RoomOpen,
+            Capability::ProxyLogin,
+            Capability::FillRelease,
+            Capability::DeviceAdmin,
+            Capability::Sign,
+            Capability::SignSshsig,
+            Capability::SignJws,
+            Capability::SignCsr,
+            Capability::SignDocument,
+            Capability::SignTrustTask,
+            Capability::KeyMint,
+            Capability::ExternalAuthUse,
+            Capability::PcsVetter,
+            Capability::PcsApplicant,
+            Capability::PcsVoter,
+            Capability::PcsTrustee,
+            Capability::WitnessRequest,
+            Capability::CredentialPresent,
+        ],
+        // `application` is the role a memory agent runs as — `vta-agent-memory`
+        // grants exactly it, deliberately, so the memory service is not the
+        // user. It must keep both memory capabilities or every existing
+        // deployment of that plugin stops working.
+        //
+        // The two room capabilities are here for the same reason, and their
+        // absence was a defect rather than a restraint: the room oracle exists
+        // *for* this role — an agent holding strictly less than its human, asking
+        // the VTA to mint a scoped presentation and to open what it cannot
+        // decrypt — and without them the one consumer the oracle was built for
+        // could not call it. The workaround an operator reaches for is worse than
+        // the grant: running the agent as `initiator`, which carries `KeyMint` and
+        // `DeviceAdmin` besides.
+        //
+        // Neither widens what this role can do. `RoomPresent` mints a leaf
+        // attenuated from the principal's own room authority — one action, one
+        // room, four hours, bound to the caller — and this role already holds
+        // `Sign`, which is the principal's key for arbitrary bytes and therefore
+        // strictly more. `RoomOpen` decrypts a room record with a group key this
+        // VTA holds; the same role can already read the credential vault.
+        Role::Application => vec![
+            Capability::VaultRead,
+            Capability::ProxyLogin,
+            Capability::FillRelease,
+            Capability::Sign,
+            Capability::SignSshsig,
+            Capability::SignJws,
+            Capability::SignCsr,
+            Capability::SignDocument,
+            Capability::SignTrustTask,
+            Capability::MemoryRead,
+            Capability::MemoryWrite,
+            Capability::RoomPresent,
+            Capability::RoomOpen,
+            // A storage-hosting integration (a VTC) runs as this role and
+            // consumes the accounts it is bound to. The binding bounds it.
+            Capability::ExternalAuthUse,
+        ],
+        Role::Reader => vec![Capability::VaultRead, Capability::MemoryRead],
+        Role::Monitor => vec![],
+    }
+}
+
+/// A device's push **wake channel** — the opaque gateway handle plus the
+/// VTA-owned trigger allowlist. Set via `device/set-wake/0.1`. Mirrors the push
+/// wake-up binding (<https://trusttasks.org/binding/push/0.1>) `WakeHandle` +
+/// `WakeTriggerPolicy`.
+///
+/// The raw platform push token is **never** stored here — it lives at the push
+/// gateway alone, behind the opaque `handle`. The VTA holds only the handle and
+/// the allowlist it provisions to the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeChannel {
+    /// The push gateway that issued the handle (a DID or an https URL) — where
+    /// the VTA and other triggers send a contentless wake.
+    pub gateway: String,
+    /// Opaque gateway-issued handle for this device's push channel. Reveals no
+    /// platform token; rotates when the device re-registers with the gateway.
+    pub handle: String,
+    /// DIDs the VTA has authorized to trigger a wake for this handle (the
+    /// allowlist it provisions to the gateway). Typically the device's mediator
+    /// and/or the VTA's own DID. Empty means no party may wake the device.
+    #[serde(default)]
+    pub allowed_triggers: Vec<String>,
+}
+
+/// Metadata for a registered Companion/Service device. M1 stores the field
+/// shape so the ACL row can carry it forward; the registration flow that
+/// populates it lands in M4 (`device/register/0.1`).
+///
+/// Wire form mirrors the canonical Trust Task shared schema
+/// `device/_shared/0.1/device-binding#/$defs/DeviceBinding`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceBinding {
+    pub device_id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// RFC 3339 — when the device claimed its binding via `device/register/0.1`.
+    pub registered_at: String,
+    /// RFC 3339 — refreshed on every heartbeat / successful auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiped_at: Option<String>,
+    /// X25519 public key (`did:key` form) the maintainer HPKE-seals payloads to
+    /// (sealed secrets, session blobs, sync events). Supplied by the device at
+    /// `device/register/0.1`. `None` on legacy rows and pure ACL entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hpke_public_key: Option<String>,
+    /// Push wake channel (opaque gateway handle + VTA-owned trigger allowlist).
+    /// `None` until the device conveys a handle via `device/set-wake/0.1`;
+    /// absent on legacy rows. The push token is never stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeChannel>,
+    /// The device's user-verification key: the one key the platform uses only
+    /// after a biometric (or a passkey's own user verification). Enrolled on
+    /// `device/register` and replaced on `device/heartbeat`, both under the
+    /// `org.openvtc.uv-key` extension, and so only ever written by the device's
+    /// own transport key. `None` means the device cannot approve an
+    /// `auth/oob/grant` (base design §5 and §11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv_key: Option<UvKey>,
+}
+
+/// A device's enrolled user-verification key and when it was enrolled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UvKey {
+    /// What the device sent, as it sent it.
+    pub enrolment: vta_sdk::protocols::device_management::UvKeyEnrolment,
+    /// RFC 3339 — when this key was enrolled (or last replaced).
+    pub enrolled_at: String,
+}
+
+impl DeviceBinding {
+    /// The non-secret `pushCapable` visibility flag (push binding §2): the
+    /// device has a usable wake channel — a handle is set and the device is
+    /// neither disabled nor wiped.
+    pub fn push_capable(&self) -> bool {
+        self.wake.is_some() && self.disabled_at.is_none() && self.wiped_at.is_none()
+    }
+}
+
+/// A DID's authority to **confer** access through an approval, re-exported
+/// from the SDK.
+///
+/// The type lives in `vta-sdk` because the DIDComm and Trust Task update
+/// bodies carry it and must be constructible by clients that never link the
+/// server crates. Only the *shape* is shared — every authorization rule over
+/// it ([`validate_approve_scope_grant`] below) stays here. Same arrangement as
+/// [`crate::context_path`].
+pub use vta_sdk::acl::{
+    ActScope, ApproveScope, ContextDirection, PurposeDecision, PurposeScope, PurposeScopeError,
+};
+
+/// Decode the stored `(role, allowed_contexts)` pair into an explicit
+/// [`ActScope`].
+///
+/// This is the one and only interpretation of an empty `allowed_contexts`:
+///
+/// | role | `allowed_contexts` | scope |
+/// |---|---|---|
+/// | [`Role::Admin`] | `[]` | [`ActScope::All`] — super-admin |
+/// | any other | `[]` | [`ActScope::None`] — authorized nowhere |
+/// | any | non-empty | [`ActScope::Contexts`] |
+///
+/// Server-side rather than an inherent method on [`ActScope`], because the
+/// decode needs [`Role`], which lives here — `vta-sdk` shares the shape and the
+/// `covers` predicate, not the authorization policy over them.
+///
+/// **Call this (or one of the accessors built on it) instead of testing
+/// `allowed_contexts.is_empty()`.** That test is only correct when paired with
+/// the role, and every place that forgot the pairing has been a bug.
+pub fn act_scope_for(role: &Role, allowed_contexts: &[String]) -> ActScope {
+    match (role, allowed_contexts) {
+        (_, cs) if !cs.is_empty() => ActScope::Contexts(cs.to_vec()),
+        (Role::Admin, _) => ActScope::All,
+        _ => ActScope::None,
+    }
+}
+
+/// An entry's authority over **signing-oracle key ids** — the effective
+/// decision decoded from the stored `allowed_keys` member (#818).
+///
+/// This is the actor-scoped complement of `ContextPolicy.signable_keys`
+/// (which is resource-bound and constrains every actor uniformly): it narrows
+/// which keys *this caller* may invoke the signing oracle on, and it only
+/// ever **intersects** with the context scope — a key named in the filter
+/// that lies outside the entry's contexts stays unreachable.
+///
+/// Exists for the same reason [`ActScope`] does: `Option<BTreeSet<String>>`
+/// has an empty-vs-absent distinction that a bare `is_empty()` gets
+/// backwards (see `docs/05-design-notes/acl-scope-semantics.md`). Decode once
+/// through [`key_scope_for`] / [`AclEntry::key_scope`], then ask
+/// [`KeyScope::allows`] — never test emptiness at a call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyScope {
+    /// No per-key filter: every key the entry's context scope reaches.
+    /// This is the decode of an **absent** (`None`) `allowed_keys` — the
+    /// behaviour of every entry that pre-dates the member.
+    AllInScope,
+    /// Exactly these key ids (still intersected with the context scope).
+    /// The decode of a **present** `allowed_keys`, *including the empty
+    /// set*: `Some([])` authorizes **no** keys — the narrowest grant, the
+    /// opposite of absent, and deliberately not a wildcard.
+    Keys(BTreeSet<String>),
+}
+
+impl KeyScope {
+    /// May this scope invoke the signing oracle on `key_id`?
+    ///
+    /// `AllInScope` defers entirely to the context gates that ran before it;
+    /// `Keys` is exact membership. `Keys(∅)` therefore allows nothing, which
+    /// is the point — the empty filter can never read as unrestricted.
+    pub fn allows(&self, key_id: &str) -> bool {
+        match self {
+            KeyScope::AllInScope => true,
+            KeyScope::Keys(keys) => keys.contains(key_id),
+        }
+    }
+}
+
+/// Decode a stored `allowed_keys` member into an explicit [`KeyScope`].
+///
+/// This is the one and only interpretation of the member:
+///
+/// | `allowed_keys` | scope |
+/// |---|---|
+/// | `None` | [`KeyScope::AllInScope`] — every key in the entry's contexts |
+/// | `Some(keys)` (even empty) | [`KeyScope::Keys`] — exactly those ids |
+///
+/// **Call this (or [`AclEntry::key_scope`]) instead of testing
+/// `allowed_keys` emptiness.** `Some(∅)` means *authorized on no keys*, not
+/// "unrestricted"; a call site that collapses the two re-creates the
+/// empty-means-unrestricted defect class (#746, #769, #770).
+pub fn key_scope_for(allowed_keys: Option<&BTreeSet<String>>) -> KeyScope {
+    match allowed_keys {
+        None => KeyScope::AllInScope,
+        Some(keys) => KeyScope::Keys(keys.clone()),
+    }
+}
+
+/// Validate that `caller` may grant `scope` on an ACL entry.
+///
+/// Mirrors [`validate_acl_modification`]'s context rule: `All` is a
+/// cross-context authorizer, so only a super-admin may confer it; a scoped
+/// `Contexts` grant requires the caller to administer every listed context.
+/// `None` is always allowed.
+/// Refuse an attempt to confer an additive capability by a caller who may not.
+///
+/// Every additive capability is super-admin-only to grant, and that check is
+/// the whole of what stands between the boundary and a context-scoped
+/// administrator.
+///
+/// For [`Capability::PersonaHolder`] the escalation is one command long: an
+/// admin of one context creates an ACL entry — for a DID they control, or for
+/// their own — naming `persona-holder`, and reads the holder's entire
+/// cross-context identity through a credential that was never supposed to reach
+/// above its context. For [`Capability::ContextCreate`] it is the same shape:
+/// an admin could otherwise mint provisioning authority for a DID it controls,
+/// turning a grant over one context into the ability to grow a subtree under it
+/// without anyone consenting again.
+///
+/// [`capabilities_beyond_role`] cannot catch this. Additive capabilities are
+/// excluded there by construction, because no role carries them; the question
+/// for one is not "does this role have it" but "may this caller confer it", and
+/// this is where that is answered.
+pub fn validate_additive_capability_grant(
+    caller: &AuthClaims,
+    requested: &[Capability],
+) -> Result<(), AppError> {
+    let additive: Vec<Capability> = requested
+        .iter()
+        .copied()
+        .filter(|c| is_additive(*c))
+        .collect();
+    if additive.is_empty() || caller.is_super_admin() {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(format!(
+        "only an unscoped holder credential can grant {additive:?}: it confers authority over \
+         the holder's own identity, which sits above every trust context, and an administrator \
+         scoped to one context cannot confer what it does not itself hold"
+    )))
+}
+
+pub fn validate_approve_scope_grant(
+    caller: &AuthClaims,
+    scope: &ApproveScope,
+) -> Result<(), AppError> {
+    match scope {
+        ApproveScope::None => Ok(()),
+        ApproveScope::All => {
+            if caller.is_super_admin() {
+                Ok(())
+            } else {
+                Err(AppError::Forbidden(
+                    "only super admin can grant approve-all authority".into(),
+                ))
+            }
+        }
+        ApproveScope::Contexts(cs) => {
+            if cs.is_empty() {
+                return Err(AppError::Forbidden(
+                    "approve scope must name at least one context (or use 'all')".into(),
+                ));
+            }
+            // `--approve-contexts ''` parses to `[""]`, which is not empty and
+            // so cleared the check above while naming no context at all.
+            for c in cs {
+                crate::context_path::validate_context_path(c)?;
+            }
+            for c in cs {
+                caller.require_context(c)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// An entry in the Access Control List.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclEntry {
+    pub did: String,
+    pub role: Role,
+    pub label: Option<String>,
+    #[serde(default)]
+    pub allowed_contexts: Vec<String>,
+    pub created_at: u64,
+    pub created_by: String,
+    /// Unix-epoch seconds at which this entry expires and should be pruned by
+    /// the background sweeper. `None` is permanent (existing pre-Phase-2
+    /// behavior; entries serialized before this field existed deserialize with
+    /// this default).
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// Consumer kind: Companion (user-driven) vs Service (headless). New in
+    /// M1 (vault-credential-manager design). `#[serde(default)]` ⇒ pre-M1
+    /// rows deserialise as `Service { Daemon }`.
+    #[serde(default)]
+    pub kind: ConsumerKind,
+    /// Fine-grained capability set — what this entry may do **within** what its
+    /// role allows. Empty means "everything the role implies", which is what
+    /// every entry written before this field meant.
+    ///
+    /// Enforced through [`effective_capabilities`]: the set is intersected with
+    /// the role's, never unioned, so it can only narrow. A grant naming a
+    /// capability the role does not carry is refused at the ACL surface rather
+    /// than quietly dropped ([`capabilities_beyond_role`]), because storing less
+    /// than the operator asked for and reporting success is how an entry ends up
+    /// holding something nobody believes it holds.
+    ///
+    /// The set travels in the access token, so a change takes effect at the
+    /// subject's next token mint — the same latency a role change already has.
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    /// Optional Companion/Service device-binding metadata. Populated by
+    /// the M4 `device/register/0.1` flow; absent on legacy rows and on
+    /// pure ACL entries that don't represent a registered device.
+    #[serde(default)]
+    pub device: Option<DeviceBinding>,
+    /// Optimistic-concurrency version. Incremented on every
+    /// successful update; the route layer's `If-Match` header
+    /// compares against this and returns 409 Conflict on a
+    /// stale write. Closes M6 from the May 2026 security review
+    /// — two admins editing the same DID concurrently no longer
+    /// silently lose one update.
+    ///
+    /// `#[serde(default)]` so pre-versioning rows deserialise
+    /// with `version=0`. The first update bumps it to 1.
+    #[serde(default)]
+    pub version: u32,
+    /// VID authorized to ratify an AAL2 step-up for this subject — the
+    /// `recipient` the VTA addresses an `auth/step-up/approve-request/0.5` to
+    /// when a gated operation resolves to `delegated` mode (the holder's
+    /// mobile authenticator or browser companion). `None` means no delegated
+    /// approver is configured: under a `delegated` floor the operation
+    /// fail-closes (the subject can't self-approve a delegated requirement).
+    /// Mirrors the spec's `AclEntry.stepUp.approver`.
+    ///
+    /// `#[serde(default)]` so pre-existing rows deserialise as `None`.
+    #[serde(default)]
+    pub step_up_approver: Option<String>,
+    /// Per-entry step-up override raising the system floor for *this* subject —
+    /// the spec's `AclEntry.stepUp.require`. ADDITIVE-ONLY: the effective mode
+    /// is the strictest of (system floor, this override), so an override weaker
+    /// than the floor is ignored (see [`StepUpMode::strictest`]). Restricted to
+    /// `self` / `delegated` (a per-subject override never relaxes to
+    /// `delegated-any`); the ACL op layer rejects other values.
+    ///
+    /// `#[serde(default)]` so pre-existing rows deserialise as `None` (no
+    /// override; the system floor applies unchanged).
+    #[serde(default)]
+    pub step_up_require: Option<StepUpMode>,
+    /// Authority to **confer** access via an approval, decoupled from the
+    /// authority to act. Read only by the two conferral paths
+    /// (`compute_delegated_contexts`, [`delegated_any_approver_covers`]); it
+    /// never feeds `require_admin`/`has_context_access`. Lets an approver be
+    /// least-privilege (act nowhere, authorize across contexts). `#[serde(default)]`
+    /// ⇒ pre-existing rows deserialise as [`ApproveScope::None`].
+    #[serde(default)]
+    pub approve_scope: ApproveScope,
+    /// Key ids this entry may invoke the signing oracle on (#818). `None` =
+    /// every key in `allowed_contexts` (today's behaviour; pre-existing rows
+    /// deserialise here). **`Some(∅)` = authorized on no keys** — the
+    /// narrowest grant, never a wildcard. Intersects with the context scope;
+    /// it can only narrow, never widen, so an entry naming a key outside its
+    /// contexts still cannot use it. Read through [`AclEntry::key_scope`],
+    /// never by testing emptiness — see [`KeyScope`]. Mirrors the canonical
+    /// `acl/_shared/0.1/acl-entry#allowedKeys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_keys: Option<BTreeSet<String>>,
+    /// One-time hand-off marker (VTI-ACL-054). `Some` lets this entry's
+    /// subject roll over, once and while the entry is live, to a successor
+    /// bounded by [`HandOff::bound`] instead of by this entry's own expiry.
+    ///
+    /// Set only by the granter at creation; no update or rotation writes or
+    /// carries it. Rows written before this field existed have no marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandOff>,
+    /// What this entry's subject may use the content it reads **for**
+    /// (VTI-ACL-100 – 110): `any`, or a non-empty list. Checked on every
+    /// purpose-bound operation (VTI-ACL-102), through [`PurposeScope::admit`].
+    ///
+    /// Every entry states it. A row written before this member existed reads
+    /// as `any` — the authority it already held — and
+    /// [`state_purposes_on_every_entry`] writes that down at boot, before the
+    /// node serves anything (VTI-ACL-101), so the row then says so itself.
+    #[serde(default)]
+    pub purposes: PurposeScope,
+}
+
+/// A granter's one-time hand-off decision, recorded on the entry it marks
+/// (VTI-ACL-054).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandOff {
+    /// The granter that set the marker.
+    pub granted_by: String,
+    /// Unix-epoch seconds at which the marker was set.
+    pub granted_at: u64,
+    /// The granter's authority when the marker was set. A successor may not
+    /// exceed it on any axis (VTI-ACL-055).
+    pub bound: HandOffBound,
+}
+
+/// The granter's authority as it stood when a hand-off was marked: the role and
+/// act scope it acted with, and its stored entry's narrowing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandOffBound {
+    pub role: Role,
+    /// Read like [`AclEntry::allowed_contexts`]: empty is unrestricted for an
+    /// admin.
+    #[serde(default)]
+    pub allowed_contexts: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub approve_scope: ApproveScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_keys: Option<BTreeSet<String>>,
+    /// The granter's expiry. `None` only when the granter's entry was
+    /// permanent.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+impl AclEntry {
+    /// Create an entry with the required identity fields. Optional metadata
+    /// takes sensible defaults: no `label`, no `allowed_contexts`, never
+    /// expires, default [`ConsumerKind`], no `capabilities`, no `device`
+    /// binding, `version = 0`, and `created_at = now`. Layer non-defaults on
+    /// with the `with_*` builder methods.
+    ///
+    /// This is the single construction entry point — adding a new optional
+    /// field here defaults it everywhere, so callers don't churn.
+    pub fn new(did: impl Into<String>, role: Role, created_by: impl Into<String>) -> Self {
+        Self {
+            did: did.into(),
+            role,
+            label: None,
+            allowed_contexts: Vec::new(),
+            created_at: crate::auth::session::now_epoch(),
+            created_by: created_by.into(),
+            expires_at: None,
+            kind: ConsumerKind::default(),
+            capabilities: Vec::new(),
+            device: None,
+            version: 0,
+            step_up_approver: None,
+            step_up_require: None,
+            approve_scope: ApproveScope::None,
+            allowed_keys: None,
+            handoff: None,
+            purposes: PurposeScope::Any,
+        }
+    }
+
+    /// Set the purposes (VTI-ACL-100). Defaults to `any`.
+    pub fn with_purposes(mut self, purposes: PurposeScope) -> Self {
+        self.purposes = purposes;
+        self
+    }
+
+    /// Override `created_at` (defaults to now). Use when replaying a known
+    /// timestamp — bootstrap import, tests, migration.
+    pub fn with_created_at(mut self, created_at: u64) -> Self {
+        self.created_at = created_at;
+        self
+    }
+
+    /// Set the optional human-readable label.
+    pub fn with_label(mut self, label: Option<String>) -> Self {
+        self.label = label;
+        self
+    }
+
+    /// Set the allowed-contexts (scope) list.
+    pub fn with_contexts(mut self, allowed_contexts: Vec<String>) -> Self {
+        self.allowed_contexts = allowed_contexts;
+        self
+    }
+
+    /// Set the one-time hand-off marker (VTI-ACL-054).
+    pub fn with_handoff(mut self, handoff: Option<HandOff>) -> Self {
+        self.handoff = handoff;
+        self
+    }
+
+    /// Set the optional expiry (unix seconds). `None` is permanent.
+    pub fn with_expires_at(mut self, expires_at: Option<u64>) -> Self {
+        self.expires_at = expires_at;
+        self
+    }
+
+    /// Set the consumer kind (Companion vs Service).
+    pub fn with_kind(mut self, kind: ConsumerKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Set the fine-grained capability set.
+    pub fn with_capabilities(mut self, capabilities: Vec<Capability>) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Attach optional Companion/Service device-binding metadata.
+    pub fn with_device(mut self, device: Option<DeviceBinding>) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Set the delegated step-up approver VID (`stepUp.approver`).
+    pub fn with_step_up_approver(mut self, approver: Option<String>) -> Self {
+        self.step_up_approver = approver;
+        self
+    }
+
+    /// Set the per-entry step-up override (`stepUp.require`).
+    pub fn with_step_up_require(mut self, require: Option<StepUpMode>) -> Self {
+        self.step_up_require = require;
+        self
+    }
+
+    /// Set the approve-authority scope (what this DID may confer via approval,
+    /// without any authority to act).
+    pub fn with_approve_scope(mut self, approve_scope: ApproveScope) -> Self {
+        self.approve_scope = approve_scope;
+        self
+    }
+
+    /// Set the signing-oracle key filter. `None` = no filter (every key in
+    /// the entry's contexts); `Some(∅)` = **no** keys at all.
+    pub fn with_allowed_keys(mut self, allowed_keys: Option<BTreeSet<String>>) -> Self {
+        self.allowed_keys = allowed_keys;
+        self
+    }
+
+    /// This entry's authority over signing-oracle key ids, decoded from
+    /// `allowed_keys`. Use this rather than reading the `Option` directly —
+    /// see [`KeyScope`] for why (`Some(∅)` and `None` are opposite grants,
+    /// and a bare emptiness test collapses them).
+    pub fn key_scope(&self) -> KeyScope {
+        key_scope_for(self.allowed_keys.as_ref())
+    }
+
+    /// Whether this entry is an admin (`Role::Admin`).
+    pub fn is_admin(&self) -> bool {
+        matches!(self.role, Role::Admin)
+    }
+
+    /// This entry's authority to **act**, decoded from `(role,
+    /// allowed_contexts)`. Use this rather than reading `allowed_contexts`
+    /// directly — see [`ActScope`] for why.
+    pub fn act_scope(&self) -> ActScope {
+        act_scope_for(&self.role, &self.allowed_contexts)
+    }
+
+    /// Whether this entry may act in `context_id`, honouring context ancestry.
+    pub fn can_act_in(&self, context_id: &str) -> bool {
+        self.act_scope().covers(context_id)
+    }
+
+    /// Whether this entry is a **super-admin**: an admin whose [`ActScope`] is
+    /// unrestricted, mirroring [`AuthClaims::is_super_admin`].
+    pub fn is_super_admin(&self) -> bool {
+        self.is_admin() && self.act_scope().is_unrestricted()
+    }
+
+    /// Set the optimistic-concurrency version (defaults to 0).
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Returns true if this entry has passed its configured `expires_at`.
+    /// Permanent entries (no `expires_at`) never expire.
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        match self.expires_at {
+            Some(deadline) => now_unix >= deadline,
+            None => false,
+        }
+    }
+
+    /// Strong validator string suitable for the `ETag` response
+    /// header and the `If-Match` precondition on subsequent
+    /// updates. Combines the DID and the version so a moving
+    /// version increment can never accidentally validate against
+    /// the wrong row.
+    ///
+    /// Format: `W/"<did_hash>:<version>"` — `W/` because the
+    /// underlying ACL entry isn't byte-identical between writes
+    /// (timestamps, label edits don't change semantic content
+    /// but do change bytes); the `did_hash` is a 64-bit FxHash
+    /// to keep the header short.
+    pub fn etag(&self) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.did.hash(&mut h);
+        format!("W/\"{:016x}:{}\"", h.finish(), self.version)
+    }
+}
+
+fn acl_key(did: &str) -> String {
+    format!("acl:{did}")
+}
+
+/// Retrieve an ACL entry by DID.
+pub async fn get_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<Option<AclEntry>, AppError> {
+    acl.get(acl_key(did)).await
+}
+
+/// Retrieve an ACL entry together with the plaintext bytes it is stored as,
+/// for a later [`move_acl_entry_if_unchanged`].
+pub async fn get_acl_entry_with_bytes(
+    acl: &KeyspaceHandle,
+    did: &str,
+) -> Result<Option<(AclEntry, Vec<u8>)>, AppError> {
+    match acl.get_raw(acl_key(did)).await? {
+        Some(bytes) => Ok(Some((serde_json::from_slice(&bytes)?, bytes))),
+        None => Ok(None),
+    }
+}
+
+/// Replace the entry for `old_did` with `successor` in one atomic step, only if
+/// `old_did`'s row still holds exactly `expected` and `successor.did` has no
+/// entry. See [`crate::store::KeyspaceHandle::move_if_unchanged`].
+pub async fn move_acl_entry_if_unchanged(
+    acl: &KeyspaceHandle,
+    old_did: &str,
+    expected: Vec<u8>,
+    successor: &AclEntry,
+) -> Result<crate::store::MoveOutcome, AppError> {
+    let outcome = acl
+        .move_if_unchanged(
+            acl_key(old_did),
+            expected,
+            acl_key(&successor.did),
+            successor,
+        )
+        .await?;
+    if outcome == crate::store::MoveOutcome::Moved {
+        crate::integrity::reseal_if_active().await?;
+    }
+    Ok(outcome)
+}
+
+/// Store (create or overwrite) an ACL entry.
+///
+/// Unconditional write — no version check. Use
+/// [`update_acl_entry_versioned`] in route handlers that accept
+/// an `If-Match` precondition; this raw store is for bootstrap
+/// paths (admin import, initial seed, sweeper) where there's no
+/// concurrent-edit risk.
+pub async fn store_acl_entry(acl: &KeyspaceHandle, entry: &AclEntry) -> Result<(), AppError> {
+    // A batch rather than a plain insert, so it is ordered against
+    // `update_acl_entry_versioned`'s conditional write: a plain insert could
+    // land between that write's check and its commit and be overwritten.
+    let mut batch = Batch::new();
+    batch.insert(acl_key(&entry.did), entry)?;
+    acl.apply_batch(batch).await?;
+    // Re-seal the TEE integrity manifest so this ACL change is reflected in the
+    // sealed snapshot (P0.2a). No-op unless running in a TEE.
+    crate::integrity::reseal_if_active().await
+}
+
+/// Optimistic-concurrency-checked write.
+///
+/// `expected_version` is the version the caller observed on
+/// their read; the function refuses to overwrite if the stored
+/// row has moved ahead. On success the stored row's version is
+/// bumped to `expected_version + 1`.
+///
+/// Returns `Ok(new_version)` on success, `Err(AppError::Conflict)`
+/// on a stale write (the caller should re-read, re-apply their
+/// edits to the fresh row, and retry).
+///
+/// Atomicity: the check and the write are one conditional store batch — the
+/// write applies only while the row is still exactly the one whose version was
+/// checked (or still absent, for version 0) — so of concurrent writers that
+/// observed the same version exactly one succeeds and every other gets
+/// `Conflict`. A plain read-check-write let two of them both pass the check,
+/// and the later write silently discarded the earlier one's edits.
+pub async fn update_acl_entry_versioned(
+    acl: &KeyspaceHandle,
+    mut new_entry: AclEntry,
+    expected_version: u32,
+) -> Result<u32, AppError> {
+    let key = acl_key(&new_entry.did);
+    let current_raw = acl.get_raw(key.clone()).await?;
+    let current: Option<AclEntry> = current_raw
+        .as_deref()
+        .map(serde_json::from_slice)
+        .transpose()?;
+    let stored_version = current.as_ref().map(|e| e.version).unwrap_or(0);
+    let conflict = || {
+        AppError::Conflict(format!(
+            "ACL entry for {} has moved ahead (expected v{}, found v{}); re-read and retry",
+            new_entry.did, expected_version, stored_version,
+        ))
+    };
+    if stored_version != expected_version {
+        return Err(conflict());
+    }
+    let mut batch = Batch::new();
+    match current_raw {
+        Some(raw) => batch.require_unchanged(key.clone(), raw),
+        None => batch.require_absent(key.clone()),
+    };
+    let new_version = expected_version + 1;
+    new_entry.version = new_version;
+    batch.insert(key, &new_entry)?;
+    if !acl.apply_batch(batch).await?.is_applied() {
+        return Err(conflict());
+    }
+    crate::integrity::reseal_if_active().await?; // P0.2a
+    Ok(new_version)
+}
+
+/// Write `purposes: any` on every stored entry that does not state it
+/// (VTI-ACL-101), returning how many were rewritten.
+///
+/// An entry written before purposes existed had no purpose narrowing, so `any`
+/// is the authority it already held; this makes the stored row say so, rather
+/// than leaving it to every reader's default. Run at boot, before the node
+/// serves a purpose-bound operation. Idempotent: a row that states its
+/// purposes, whatever they are, is left alone.
+pub async fn state_purposes_on_every_entry(acl: &KeyspaceHandle) -> Result<usize, AppError> {
+    let mut rewritten = 0;
+    for (key, raw) in acl.prefix_iter_raw("acl:").await? {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue; // `list_acl_entries` warns about an unreadable row
+        };
+        if value.get("purposes").is_some() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_value::<AclEntry>(value) else {
+            continue;
+        };
+        // Conditional on the row being exactly what was read, so an entry
+        // changed meanwhile is not overwritten with the older one.
+        let mut batch = Batch::new();
+        batch.require_unchanged(key.clone(), raw);
+        batch.insert(key, &entry)?;
+        if acl.apply_batch(batch).await?.is_applied() {
+            rewritten += 1;
+        }
+    }
+    if rewritten > 0 {
+        crate::integrity::reseal_if_active().await?;
+    }
+    Ok(rewritten)
+}
+
+/// Delete an ACL entry by DID.
+pub async fn delete_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<(), AppError> {
+    // A batch, for the same ordering as `store_acl_entry`: a versioned update
+    // racing this delete either lands first (and is deleted) or finds no row.
+    let mut batch = Batch::new();
+    batch.remove(acl_key(did));
+    acl.apply_batch(batch).await?;
+    // Re-seal so the deletion is reflected in the manifest (P0.2a). No-op
+    // outside a TEE.
+    crate::integrity::reseal_if_active().await
+}
+
+/// List all ACL entries.
+///
+/// A row that fails to deserialize is **skipped with a warning**, not
+/// propagated: one corrupt entry must not take down ACL management or
+/// the auth paths that enumerate entries (a `?` here would abort the
+/// whole listing). Backup export deliberately takes the opposite stance
+/// and fails loudly — an incomplete *backup* is worse than a degraded
+/// *list*.
+pub async fn list_acl_entries(acl: &KeyspaceHandle) -> Result<Vec<AclEntry>, AppError> {
+    let raw = acl.prefix_iter_raw("acl:").await?;
+    let mut entries = Vec::with_capacity(raw.len());
+    let mut skipped = 0usize;
+    for (key, value) in raw {
+        match serde_json::from_slice::<AclEntry>(&value) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(
+                    key = %String::from_utf8_lossy(&key),
+                    error = %e,
+                    "skipping undeserializable ACL row in list_acl_entries"
+                );
+            }
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "list_acl_entries skipped corrupt rows");
+    }
+    Ok(entries)
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Check whether a DID is in the ACL and return its role.
+///
+/// Returns `Forbidden` if the DID is not found or if its entry has expired.
+pub async fn check_acl(acl: &KeyspaceHandle, did: &str) -> Result<Role, AppError> {
+    match get_acl_entry(acl, did).await? {
+        Some(entry) if entry.is_expired(now_epoch()) => {
+            Err(AppError::Forbidden(format!("ACL entry expired: {did}")))
+        }
+        Some(entry) => Ok(entry.role),
+        None => Err(AppError::Forbidden(format!("DID not in ACL: {did}"))),
+    }
+}
+
+/// Check whether a DID is in the ACL and return its role and allowed contexts.
+///
+/// Returns `Forbidden` under the same conditions as [`check_acl`].
+pub async fn check_acl_full(
+    acl: &KeyspaceHandle,
+    did: &str,
+) -> Result<(Role, Vec<String>), AppError> {
+    let entry = check_acl_entry(acl, did).await?;
+    Ok((entry.role, entry.allowed_contexts))
+}
+
+/// The whole live entry, under the same expiry and membership rules as
+/// [`check_acl_full`].
+///
+/// [`check_acl_full`] reads the entry and returns two of its members. A caller
+/// wanting a third — `whoami` wants the capabilities, to answer "what may I do"
+/// — would otherwise read the same row a second time, and the two reads could
+/// disagree across a concurrent ACL edit: a caller could be told a role from
+/// before an update and a capability set from after it. One read, one answer.
+pub async fn check_acl_entry(acl: &KeyspaceHandle, did: &str) -> Result<AclEntry, AppError> {
+    match get_acl_entry(acl, did).await? {
+        Some(entry) if entry.is_expired(now_epoch()) => {
+            Err(AppError::Forbidden(format!("ACL entry expired: {did}")))
+        }
+        Some(entry) => Ok(entry),
+        None => Err(AppError::Forbidden(format!("DID not in ACL: {did}"))),
+    }
+}
+
+/// Validate that the caller is allowed to assign the given role.
+///
+/// - Only Admins can assign the Admin role.
+/// - Reader, Application, and Monitor roles cannot assign any role.
+pub fn validate_role_assignment(caller: &AuthClaims, target_role: &Role) -> Result<(), AppError> {
+    if matches!(
+        caller.role,
+        Role::Monitor | Role::Reader | Role::Application
+    ) {
+        return Err(AppError::Forbidden(
+            "insufficient role to assign roles".into(),
+        ));
+    }
+    if *target_role == Role::Admin && caller.role != Role::Admin {
+        return Err(AppError::Forbidden(
+            "only admins can assign the admin role".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that the caller is allowed to create or modify an ACL entry
+/// with the given `target_contexts`.
+///
+/// - Super admins can do anything.
+/// - Context admins cannot create entries with empty `allowed_contexts`
+///   (that would grant super admin access) and can only assign contexts
+///   they themselves have access to.
+pub fn validate_acl_modification(
+    caller: &AuthClaims,
+    target_role: &Role,
+    target_contexts: &[String],
+) -> Result<(), AppError> {
+    // Shape first, for every caller. `validate_context_path` existed all along
+    // but was never called on the ACL write path, so a malformed id — most
+    // reachably `""`, which is what `--contexts ''` actually parses to — was
+    // storable. Super admins reached it most easily, since their check below
+    // returns before any per-context work happens. An empty id is not an
+    // identifier and matches nothing in `covers`, so an entry holding one is
+    // inert while looking scoped.
+    for ctx in target_contexts {
+        crate::context_path::validate_context_path(ctx)?;
+    }
+    if caller.is_super_admin() {
+        return Ok(());
+    }
+    // The target's authority to *act*, decoded from its own role and contexts —
+    // which is why the role is required. Previously this function saw only the
+    // context list and refused *any* empty target, unable to tell an
+    // unrestricted grant from an acts-nowhere one. That barred a context admin
+    // from creating a least-privilege approver (acts nowhere, confers via
+    // `approve_scope`) — the very shape the CLI recommends — for no reason
+    // beyond the ambiguity.
+    match act_scope_for(target_role, target_contexts) {
+        // Unrestricted (admin + no contexts): a super-admin grant, and only a
+        // super-admin may confer it.
+        ActScope::All => Err(AppError::Forbidden(
+            "only super admin can create an unrestricted (super-admin) account".into(),
+        )),
+        // Acts nowhere (any other role + no contexts): grants no authority to
+        // act at all, so anyone who may manage the ACL may create it. Whatever
+        // *conferral* such an entry carries is a separate grant, gated
+        // independently by `validate_approve_scope_grant`, so a context admin
+        // still cannot confer a context it does not hold.
+        ActScope::None => Ok(()),
+        // Scoped: the caller must administer every named context.
+        ActScope::Contexts(cs) => {
+            for ctx in &cs {
+                caller.require_context(ctx)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Authorization predicate for **`delegated-any`** step-up: may `approver`
+/// ratify an AAL2 step-up for `subject`?
+///
+/// The criterion is **context-scoped admin**:
+/// - a **super-admin** approver (admin, no context restriction) may ratify for
+///   any subject — including cross-context and global subjects;
+/// - a **context-admin** approver may ratify only for a context-scoped subject
+///   **all** of whose contexts it administers (`subject.allowed_contexts ⊆
+///   approver.allowed_contexts`). A context admin can never ratify for a global
+///   (super-admin-equivalent, empty-context) subject — only a super-admin can.
+///
+/// Non-admins never qualify. Expiry is the caller's responsibility (it should
+/// skip an expired approver entry before calling this).
+pub fn delegated_any_approver_covers(approver: &AclEntry, subject: &AclEntry) -> bool {
+    // Explicit approve authority (a least-privilege approver): covers by scope,
+    // independent of role or `allowed_contexts`. `All` covers any subject; a
+    // scoped grant covers a context-scoped subject all of whose contexts fall
+    // within the scope. A global (empty-context) subject is never covered by a
+    // scoped grant — only by `All` or a super-admin.
+    match &approver.approve_scope {
+        ApproveScope::All => return true,
+        ApproveScope::Contexts(_) => {
+            // A scoped grant covers a context-scoped subject all of whose
+            // contexts fall within the scope. A global (unrestricted) or
+            // acts-nowhere subject has no `Contexts` scope to match here.
+            if let ActScope::Contexts(subject_ctxs) = subject.act_scope()
+                && subject_ctxs
+                    .iter()
+                    .all(|c| approver.approve_scope.covers(c))
+            {
+                return true;
+            }
+            // Fall through: the approver may still qualify via the admin path.
+        }
+        ApproveScope::None => {}
+    }
+
+    // Backward-compatible admin path: an admin confers what it holds.
+    if !approver.is_admin() {
+        return false;
+    }
+    match approver.act_scope() {
+        // Super-admin: covers all contexts.
+        ActScope::All => true,
+        // Context admin: the subject must itself be context-scoped, and every
+        // one of its contexts must fall within the approver's. A global subject
+        // needs a super-admin approver (handled above).
+        //
+        // Ancestry-aware, via the same `covers` the approve-scope path above
+        // uses. This was an exact `contains` until now, which made a context
+        // admin's conferral *narrower* than an equivalent explicit
+        // `ApproveScope` grant and contradicted the stated ACL-gate rule —
+        // "any `allowed_contexts` entry `is_ancestor_or_self` of the target"
+        // (`docs/05-design-notes/hierarchical-contexts.md`). The helper landed
+        // five days before this function was written and simply was not reached
+        // for. While contexts stay flat the two are identical; they diverge
+        // only once sub-contexts exist, which is exactly the case the hierarchy
+        // work intended to cover.
+        approver_scope @ ActScope::Contexts(_) => match subject.act_scope() {
+            ActScope::Contexts(subject_ctxs) => {
+                subject_ctxs.iter().all(|c| approver_scope.covers(c))
+            }
+            _ => false,
+        },
+        // Unreachable: an admin is never acts-nowhere. Fail closed regardless.
+        ActScope::None => false,
+    }
+}
+
+/// Whether `entry` holds authority to act in `context_id` — the predicate
+/// behind every "which entries are relevant to this context?" filter.
+///
+/// One function because the two `acl list --context` implementations answered
+/// this differently, and both were wrong in a different direction. The offline
+/// CLI matched `allowed_contexts.is_empty() || contains(ctx)`, so an
+/// **empty list matched every context**; the online operation matched
+/// `contains(ctx)`, so an **empty list matched none**. Same command, opposite
+/// answers, and neither is the truth: an empty list means unrestricted for
+/// [`Role::Admin`] (a super-admin does hold every context) and *nothing at all*
+/// for every other role (which therefore holds none).
+///
+/// Ancestry is segment-aware, matching [`AuthClaims::has_context_access`] and
+/// the VTC's equivalent filter: an entry scoped to a parent context does grant
+/// its subtree, so it genuinely carries a child id. Both VTA filters compared
+/// with `contains`, so neither surfaced it.
+pub fn acl_entry_can_act_in(entry: &AclEntry, context_id: &str) -> bool {
+    entry.act_scope().covers(context_id)
+}
+
+/// Whether `entry` holds a grant **at or beneath** `context_id` — the
+/// complement of [`acl_entry_can_act_in`], and the predicate a subtree sweep
+/// (revoke everything under this branch) needs.
+///
+/// See [`ActScope::acts_within`] for the two edges: an unrestricted entry is
+/// deliberately *not* a match, and a multi-context entry matches if any one of
+/// its contexts is inside the subtree.
+pub fn acl_entry_acts_within(entry: &AclEntry, context_id: &str) -> bool {
+    entry.act_scope().acts_within(context_id)
+}
+
+/// Whether `entry` matches `context_id` read in `direction` — the one filter
+/// every context-scoped ACL listing goes through, online and offline.
+///
+/// The direction is explicit at the call site because the answer is only
+/// meaningful paired with the question: `?context=X` alone cannot express
+/// whether the caller means "who may act in X" or "what is granted beneath X",
+/// and the second, asked with the first's filter, returns exactly the entries
+/// that are *not* the ones the caller is looking for (#822).
+pub fn acl_entry_matches_context(
+    entry: &AclEntry,
+    context_id: &str,
+    direction: ContextDirection,
+) -> bool {
+    entry.act_scope().matches_context(context_id, direction)
+}
+
+/// Whether an ACL entry is within the caller's authority to **manage**.
+///
+/// Super admins may manage any entry. A context admin may manage an entry only
+/// if the entry *acts* in a context the caller holds — so neither an
+/// unrestricted ([`ActScope::All`]) nor an acts-nowhere ([`ActScope::None`])
+/// entry is manageable by a context admin, neither naming a context to overlap.
+///
+/// This is the predicate the **mutation** paths gate on (update, delete). It
+/// deliberately ignores [`ApproveScope`]: an entry may confer into your context
+/// while acting entirely inside someone else's, and being able to *see* such an
+/// entry must not become authority to delete it. For the read paths, see
+/// [`is_acl_entry_auditable`].
+pub fn is_acl_entry_visible(caller: &AuthClaims, entry: &AclEntry) -> bool {
+    if caller.is_super_admin() {
+        return true;
+    }
+    entry
+        .act_scope()
+        .named_contexts()
+        .iter()
+        .any(|ctx| caller.has_context_access(ctx))
+}
+
+/// Whether an ACL entry should be **readable** by the caller — the superset of
+/// [`is_acl_entry_visible`] used by `acl list` / `acl get`.
+///
+/// Adds entries holding *conferral* authority over a context the caller
+/// administers. A least-privilege approver acts nowhere, so it names no context
+/// on the act axis and was invisible to the very admins whose contexts it can
+/// confer: an operator asking "who can authorize a change in my context?" could
+/// not see the answer. Conferral is authority, and authority in your context
+/// should be auditable by its admin.
+///
+/// **Read-only by construction.** Widening what an admin may see is not
+/// widening what they may do, and keeping this separate from
+/// [`is_acl_entry_visible`] is what stops it from becoming that — an entry can
+/// administer someone else's context while conferring into yours, and a single
+/// merged predicate would have made that entry deletable by you.
+///
+/// The act axis is unchanged: an unrestricted (super-admin) entry still does
+/// not surface to a context admin merely by being unrestricted.
+pub fn is_acl_entry_auditable(caller: &AuthClaims, entry: &AclEntry) -> bool {
+    if is_acl_entry_visible(caller, entry) {
+        return true;
+    }
+    match &entry.approve_scope {
+        // Confers everywhere, therefore into the caller's contexts too.
+        ApproveScope::All => true,
+        ApproveScope::Contexts(cs) => cs.iter().any(|ctx| caller.has_context_access(ctx)),
+        ApproveScope::None => false,
+    }
+}
+
+#[cfg(test)]
+mod delegated_any_tests {
+    use super::*;
+
+    fn admin(contexts: &[&str]) -> AclEntry {
+        AclEntry::new("did:key:zApprover", Role::Admin, "did:key:zCreator")
+            .with_contexts(contexts.iter().map(|s| s.to_string()).collect())
+    }
+    fn subject(role: Role, contexts: &[&str]) -> AclEntry {
+        AclEntry::new("did:key:zSubject", role, "did:key:zCreator")
+            .with_contexts(contexts.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// A context admin of a *parent* may ratify for a subject scoped to its
+    /// subtree. This was refused until now — the admin path used exact
+    /// membership while the approve-scope path beside it used ancestry, making
+    /// admin standing narrower than an equivalent explicit `ApproveScope`
+    /// grant and contradicting the ACL-gate rule in
+    /// `docs/05-design-notes/hierarchical-contexts.md`.
+    #[test]
+    fn context_admin_covers_a_subject_in_its_subtree() {
+        let approver = admin(&["acme"]);
+        assert!(
+            delegated_any_approver_covers(&approver, &subject(Role::Reader, &["acme/eng"])),
+            "an admin of `acme` administers `acme/eng`, so it may ratify for it"
+        );
+        assert!(
+            delegated_any_approver_covers(
+                &approver,
+                &subject(Role::Reader, &["acme/eng", "acme/sales"])
+            ),
+            "…and for a subject scoped to several of its descendants"
+        );
+    }
+
+    /// The segment-aware guard still holds: a sibling with a shared string
+    /// prefix is not a descendant.
+    #[test]
+    fn context_admin_does_not_cover_a_prefix_sibling() {
+        let approver = admin(&["acme"]);
+        assert!(
+            !delegated_any_approver_covers(&approver, &subject(Role::Reader, &["acme-evil"])),
+            "`acme` must not cover `acme-evil` — segments, not string prefixes"
+        );
+    }
+
+    /// A subject holding *any* context outside the approver's subtree is still
+    /// refused — widening to ancestry must not become "covers if it covers one".
+    #[test]
+    fn context_admin_refuses_a_subject_partly_outside_its_subtree() {
+        let approver = admin(&["acme"]);
+        assert!(
+            !delegated_any_approver_covers(
+                &approver,
+                &subject(Role::Reader, &["acme/eng", "other"])
+            ),
+            "every subject context must fall within the approver's"
+        );
+    }
+
+    /// Flat contexts behave exactly as before, which is why this is safe to
+    /// change now: the two readings only diverge once sub-contexts exist.
+    #[test]
+    fn flat_contexts_are_unchanged_by_ancestry() {
+        let approver = admin(&["ctx-a"]);
+        assert!(delegated_any_approver_covers(
+            &approver,
+            &subject(Role::Reader, &["ctx-a"])
+        ));
+        assert!(!delegated_any_approver_covers(
+            &approver,
+            &subject(Role::Reader, &["ctx-b"])
+        ));
+    }
+
+    #[test]
+    fn super_admin_covers_any_subject() {
+        let sa = admin(&[]); // empty contexts ⇒ super-admin
+        assert!(delegated_any_approver_covers(
+            &sa,
+            &subject(Role::Admin, &["ctx-a"])
+        ));
+        assert!(delegated_any_approver_covers(
+            &sa,
+            &subject(Role::Reader, &[])
+        )); // global subject
+        assert!(delegated_any_approver_covers(
+            &sa,
+            &subject(Role::Application, &["ctx-a", "ctx-b"])
+        ));
+    }
+
+    #[test]
+    fn context_admin_covers_only_within_its_contexts() {
+        let ca = admin(&["ctx-a", "ctx-b"]);
+        // Subject fully within → covered.
+        assert!(delegated_any_approver_covers(
+            &ca,
+            &subject(Role::Reader, &["ctx-a"])
+        ));
+        assert!(delegated_any_approver_covers(
+            &ca,
+            &subject(Role::Reader, &["ctx-a", "ctx-b"])
+        ));
+        // Subject in a context the admin doesn't administer → NOT covered.
+        assert!(!delegated_any_approver_covers(
+            &ca,
+            &subject(Role::Reader, &["ctx-c"])
+        ));
+        assert!(!delegated_any_approver_covers(
+            &ca,
+            &subject(Role::Reader, &["ctx-a", "ctx-c"])
+        ));
+    }
+
+    #[test]
+    fn context_admin_never_covers_a_global_subject() {
+        // A global (empty-context, super-admin-equivalent) subject needs a
+        // super-admin approver; a context admin must never ratify for it.
+        let ca = admin(&["ctx-a"]);
+        assert!(!delegated_any_approver_covers(
+            &ca,
+            &subject(Role::Admin, &[])
+        ));
+    }
+
+    #[test]
+    fn non_admins_never_qualify() {
+        for role in [
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            let not_admin = AclEntry::new("did:key:zX", role, "did:key:zC");
+            assert!(!delegated_any_approver_covers(
+                &not_admin,
+                &subject(Role::Reader, &["ctx-a"])
+            ));
+        }
+    }
+
+    // ── ApproveScope: a least-privilege approver confers without acting ──
+
+    /// A Reader with no contexts and no admin — it can *act* nowhere. Its only
+    /// authority is the approve scope layered on top.
+    fn pure_approver(scope: ApproveScope) -> AclEntry {
+        AclEntry::new("did:key:zApprover", Role::Reader, "did:key:zCreator")
+            .with_approve_scope(scope)
+    }
+
+    #[test]
+    fn approve_scope_covers_semantics() {
+        assert!(!ApproveScope::None.covers("ctx-a"));
+        assert!(ApproveScope::All.covers("anything"));
+        let scoped = ApproveScope::Contexts(vec!["ctx-a".into()]);
+        assert!(scoped.covers("ctx-a"));
+        assert!(!scoped.covers("ctx-b"));
+    }
+
+    #[test]
+    fn approve_all_confers_for_any_subject_without_any_admin_authority() {
+        // The whole point: an approver that holds no admin (acts nowhere) may
+        // still ratify across contexts, including a global subject.
+        let approver = pure_approver(ApproveScope::All);
+        assert!(
+            !approver.is_admin(),
+            "the approver holds no admin authority"
+        );
+        assert!(delegated_any_approver_covers(
+            &approver,
+            &subject(Role::Reader, &["ctx-a"])
+        ));
+        assert!(delegated_any_approver_covers(
+            &approver,
+            &subject(Role::Admin, &[])
+        ));
+    }
+
+    #[test]
+    fn scoped_approve_authority_covers_only_within_scope() {
+        let approver = pure_approver(ApproveScope::Contexts(vec!["ctx-a".into()]));
+        assert!(delegated_any_approver_covers(
+            &approver,
+            &subject(Role::Reader, &["ctx-a"])
+        ));
+        assert!(!delegated_any_approver_covers(
+            &approver,
+            &subject(Role::Reader, &["ctx-b"])
+        ));
+        // A global subject needs `All` (or a super-admin), never a scoped grant.
+        assert!(!delegated_any_approver_covers(
+            &approver,
+            &subject(Role::Admin, &[])
+        ));
+    }
+
+    #[test]
+    fn no_approve_scope_and_no_admin_confers_nothing() {
+        let reader = pure_approver(ApproveScope::None);
+        assert!(!delegated_any_approver_covers(
+            &reader,
+            &subject(Role::Reader, &["ctx-a"])
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The SDK carries the role ceilings and the additive set so a client can
+    /// spell AclEntry 0.2's "ceiling plus an additive grant"; the copies must
+    /// not drift from the ones this crate enforces.
+    #[test]
+    fn sdk_capability_tables_match_the_enforced_ones() {
+        let name = |c: &Capability| {
+            serde_json::to_value(c)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for role in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            let mut ours: Vec<String> = derived_capabilities_for_role(&role)
+                .iter()
+                .map(name)
+                .collect();
+            let mut sdk: Vec<String> = vta_sdk::acl::role_capability_ceiling(&role.to_string())
+                .expect("every role has an SDK ceiling")
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            ours.sort();
+            sdk.sort();
+            assert_eq!(ours, sdk, "{role} ceiling drifted from vta_sdk's copy");
+        }
+        let mut ours: Vec<String> = ADDITIVE_CAPABILITIES.iter().map(name).collect();
+        let mut sdk: Vec<String> = vta_sdk::acl::ADDITIVE_CAPABILITIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        ours.sort();
+        sdk.sort();
+        assert_eq!(ours, sdk, "the additive set drifted from vta_sdk's copy");
+    }
+
+    use super::*;
+    use crate::config::StoreConfig;
+    use crate::store::Store;
+
+    /// The room oracle exists for an agent holding strictly less than its human,
+    /// and `application` is the role such an agent runs as. Pinned because the
+    /// two were missing here for a release: the tasks were gated, the capability
+    /// variants existed, and the one role meant to call them held neither — so
+    /// the intended flow was unreachable and the workaround was a wider role.
+    #[test]
+    fn the_agent_role_can_reach_the_room_oracle() {
+        for cap in [Capability::RoomPresent, Capability::RoomOpen] {
+            assert!(
+                role_has_capability(&Role::Application, cap),
+                "an agent must be able to {cap:?} — the oracle has no other consumer"
+            );
+        }
+    }
+
+    /// The other half of that grant: a read-only consumer is not an agent, and
+    /// minting a credential on a principal's behalf is not a read.
+    #[test]
+    fn a_reader_still_cannot_mint_or_decrypt() {
+        for role in [Role::Reader, Role::Monitor] {
+            for cap in [Capability::RoomPresent, Capability::RoomOpen] {
+                assert!(
+                    !role_has_capability(&role, cap),
+                    "{role:?} must not hold {cap:?}"
+                );
+            }
+        }
+    }
+
+    // ── Capability narrowing ────────────────────────────────────────
+
+    /// The shape every entry written before this feature has, and the one that
+    /// must keep behaving exactly as it did: no narrowing is not "narrowed to
+    /// nothing".
+    #[test]
+    fn an_entry_that_names_no_capabilities_holds_what_its_role_holds() {
+        let role = Role::Application;
+        assert_eq!(
+            effective_capabilities(&role, &[]),
+            derived_capabilities_for_role(&role)
+        );
+    }
+
+    #[test]
+    fn an_explicit_set_narrows_to_the_intersection() {
+        let held = effective_capabilities(
+            &Role::Application,
+            &[Capability::RoomPresent, Capability::MemoryRead],
+        );
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert!(held.contains(&Capability::RoomPresent));
+        assert!(held.contains(&Capability::MemoryRead));
+        assert!(
+            !held.contains(&Capability::Sign),
+            "a capability the entry did not name must be gone: {held:?}"
+        );
+    }
+
+    /// The decision this feature turns on: the role is the ceiling. An entry
+    /// naming something its role never had gains nothing, so a stored row
+    /// cannot out-grant the role an operator reads beside it.
+    #[test]
+    fn an_explicit_set_cannot_widen_beyond_the_role() {
+        let held = effective_capabilities(&Role::Reader, &[Capability::RoomPresent]);
+        assert!(
+            held.is_empty(),
+            "a reader naming room-present must hold nothing: {held:?}"
+        );
+        assert_eq!(
+            capabilities_beyond_role(&Role::Reader, &[Capability::RoomPresent]),
+            vec![Capability::RoomPresent],
+            "and the grant path must be able to say which name it refused"
+        );
+    }
+
+    #[test]
+    fn narrowing_within_the_role_is_not_beyond_it() {
+        assert!(
+            capabilities_beyond_role(&Role::Application, &[Capability::RoomPresent]).is_empty()
+        );
+    }
+
+    #[test]
+    fn entry_has_capability_reads_both_the_role_and_the_narrowing() {
+        let mut entry = AclEntry::new("did:key:zAgent", Role::Application, "did:key:zAdmin");
+        assert!(
+            entry_has_capability(&entry, Capability::MemoryWrite),
+            "un-narrowed, the role decides"
+        );
+
+        entry.capabilities = vec![Capability::RoomPresent];
+        assert!(entry_has_capability(&entry, Capability::RoomPresent));
+        assert!(
+            !entry_has_capability(&entry, Capability::MemoryWrite),
+            "narrowed, what the entry did not name is gone even though the role has it"
+        );
+    }
+
+    // ── Key export (VTI-VTA-003) ────────────────────────────────────
+
+    /// Every admin keeps what the role check used to give them.
+    #[test]
+    fn an_admin_derives_key_export() {
+        assert!(role_has_capability(&Role::Admin, Capability::KeyExport));
+    }
+
+    /// And no other role derives it. This is the half that matters: an
+    /// initiator holds `Sign` and must not thereby hold `KeyExport`, because
+    /// VTI-VTA-003 requires export to be distinct from use, and an exported
+    /// key stays with whoever holds it after their access is revoked.
+    #[test]
+    fn only_admin_derives_key_export() {
+        for role in [
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            assert!(
+                !role_has_capability(&role, Capability::KeyExport),
+                "{role:?} must not derive KeyExport"
+            );
+        }
+        assert!(role_has_capability(&Role::Initiator, Capability::Sign));
+    }
+
+    /// The point of making it a capability: an admin can now have export
+    /// narrowed away, which a role floor could not express. It also means an
+    /// admin narrowed before this capability existed does not have it, since
+    /// its stored set could not name it — the narrowing working as intended.
+    #[test]
+    fn key_export_can_be_narrowed_away_from_an_admin() {
+        let mut entry = AclEntry::new("did:key:zOperator", Role::Admin, "did:key:zRoot");
+        assert!(entry_has_capability(&entry, Capability::KeyExport));
+
+        entry.capabilities = vec![Capability::Sign, Capability::KeyMint];
+        assert!(entry_has_capability(&entry, Capability::Sign));
+        assert!(
+            !entry_has_capability(&entry, Capability::KeyExport),
+            "a narrowed admin holds only what its narrowing names"
+        );
+    }
+
+    /// Nor can a narrowing grant it: naming `KeyExport` on an initiator yields
+    /// nothing, because it is role-derived rather than additive. Anything that
+    /// genuinely needs the raw key is an admin act by design.
+    #[test]
+    fn naming_key_export_does_not_grant_it_to_an_initiator() {
+        let mut entry = AclEntry::new("did:key:zManager", Role::Initiator, "did:key:zRoot");
+        entry.capabilities = vec![Capability::Sign, Capability::KeyExport];
+        assert!(!entry_has_capability(&entry, Capability::KeyExport));
+        assert!(!is_additive(Capability::KeyExport));
+    }
+
+    /// `sign-sshsig` follows `sign`: a role that can reach the general oracle can
+    /// reach the constrained one, so no entry loses a commit signer it had.
+    /// `external/accounts/*` management is an administrator's power only, and
+    /// consuming an account (`external/credentials/issue`) is held by every
+    /// role that can already sign — the binding, not the role, bounds it.
+    #[test]
+    fn external_account_capabilities_split_manage_from_use() {
+        for role in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            assert_eq!(
+                role_has_capability(&role, Capability::ExternalAccountsManage),
+                matches!(role, Role::Admin),
+                "{role:?} manage"
+            );
+            assert_eq!(
+                role_has_capability(&role, Capability::ExternalAuthUse),
+                role_has_capability(&role, Capability::Sign),
+                "{role:?} use"
+            );
+        }
+        assert!(!is_additive(Capability::ExternalAccountsManage));
+        assert!(!is_additive(Capability::ExternalAuthUse));
+        assert_eq!(
+            serde_json::to_value(Capability::ExternalAccountsManage).unwrap(),
+            "external-accounts-manage"
+        );
+        assert_eq!(
+            serde_json::to_value(Capability::ExternalAuthUse).unwrap(),
+            "external-auth-use"
+        );
+    }
+
+    /// The hidden-vetting engine capabilities are the principal's to exercise:
+    /// derived by the roles that act as the principal, never by `application`
+    /// (an agent vets for the principal only when granted by name), and never
+    /// implied by `sign` (VTI-VTA-007).
+    #[test]
+    fn pcs_capabilities_are_the_principals_and_not_sign() {
+        for cap in [
+            Capability::PcsVetter,
+            Capability::PcsApplicant,
+            Capability::PcsVoter,
+            Capability::PcsTrustee,
+        ] {
+            assert!(role_has_capability(&Role::Admin, cap));
+            assert!(role_has_capability(&Role::Initiator, cap));
+            assert!(!role_has_capability(&Role::Application, cap));
+            assert!(!role_has_capability(&Role::Reader, cap));
+            assert!(!role_has_capability(&Role::Monitor, cap));
+            assert!(!is_additive(cap));
+        }
+        assert_eq!(
+            serde_json::to_value(Capability::PcsVetter).unwrap(),
+            "pcs-vetter"
+        );
+        assert_eq!(
+            serde_json::to_value(Capability::PcsApplicant).unwrap(),
+            "pcs-applicant"
+        );
+        assert_eq!(
+            serde_json::to_value(Capability::PcsVoter).unwrap(),
+            "pcs-voter"
+        );
+        assert_eq!(
+            serde_json::to_value(Capability::PcsTrustee).unwrap(),
+            "pcs-trustee"
+        );
+    }
+
+    /// `witness-request` is the principal's, like the PCS capabilities: derived by the
+    /// roles that act as the principal, never by `application`, never implied by `sign`
+    /// (`vta/_shared/0.6/CONVENTIONS.md` §4), and spelled as `device/_shared` 0.1 registers it.
+    #[test]
+    fn witness_request_is_the_principals_and_not_sign() {
+        let cap = Capability::WitnessRequest;
+        assert!(role_has_capability(&Role::Admin, cap));
+        assert!(role_has_capability(&Role::Initiator, cap));
+        assert!(!role_has_capability(&Role::Application, cap));
+        assert!(!role_has_capability(&Role::Reader, cap));
+        assert!(!role_has_capability(&Role::Monitor, cap));
+        assert!(!is_additive(cap));
+        assert_eq!(serde_json::to_value(cap).unwrap(), "witness-request");
+    }
+
+    /// `credential-present` is the principal's: derived by the roles that act as the
+    /// principal, never by `application` or `reader`, never implied by `sign` or
+    /// `vault-read` (`vault/credentials/present/0.1`, *Authorization*), and spelled as
+    /// `device/_shared` 0.2 registers it.
+    #[test]
+    fn credential_present_is_the_principals_and_neither_sign_nor_vault_read() {
+        let cap = Capability::CredentialPresent;
+        assert!(role_has_capability(&Role::Admin, cap));
+        assert!(role_has_capability(&Role::Initiator, cap));
+        assert!(!role_has_capability(&Role::Application, cap));
+        assert!(!role_has_capability(&Role::Reader, cap));
+        assert!(!role_has_capability(&Role::Monitor, cap));
+        assert!(!is_additive(cap));
+        assert_eq!(serde_json::to_value(cap).unwrap(), "credential-present");
+    }
+
+    #[test]
+    fn every_role_that_derives_sign_derives_sign_sshsig() {
+        for role in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            assert_eq!(
+                role_has_capability(&role, Capability::Sign),
+                role_has_capability(&role, Capability::SignSshsig),
+                "{role:?}"
+            );
+        }
+        assert!(!is_additive(Capability::SignSshsig));
+    }
+
+    /// The narrowing a commit signer is provisioned with: SSHSIG only. It must
+    /// not carry the general oracle along with it.
+    #[test]
+    fn narrowing_to_sign_sshsig_drops_the_general_oracle() {
+        let mut entry = AclEntry::new("did:key:zGitSigner", Role::Application, "did:key:zRoot");
+        entry.capabilities = vec![Capability::SignSshsig];
+        assert!(entry_has_capability(&entry, Capability::SignSshsig));
+        assert!(!entry_has_capability(&entry, Capability::Sign));
+        assert!(!entry_has_capability(&entry, Capability::VaultRead));
+    }
+
+    /// `sign-jws`, `sign-csr` and `sign-document` follow `sign` through the
+    /// roles, and a holder narrowed to one holds neither the general oracle
+    /// nor another's, on the wire under their registered names.
+    #[test]
+    fn sign_jws_and_sign_csr_follow_sign_and_narrow_alone() {
+        for role in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            for cap in [
+                Capability::SignJws,
+                Capability::SignCsr,
+                Capability::SignDocument,
+            ] {
+                assert_eq!(
+                    role_has_capability(&role, Capability::Sign),
+                    role_has_capability(&role, cap),
+                    "{role:?} {cap:?}"
+                );
+                assert!(!is_additive(cap));
+            }
+        }
+        let mut entry = AclEntry::new("did:key:zVerifier", Role::Application, "did:key:zRoot");
+        entry.capabilities = vec![Capability::SignDocument];
+        assert!(entry_has_capability(&entry, Capability::SignDocument));
+        assert!(!entry_has_capability(&entry, Capability::SignJws));
+        assert_eq!(
+            serde_json::to_value(Capability::SignDocument).unwrap(),
+            "sign-document"
+        );
+        entry.capabilities = vec![Capability::SignJws];
+        assert!(entry_has_capability(&entry, Capability::SignJws));
+        assert!(!entry_has_capability(&entry, Capability::SignCsr));
+        assert!(!entry_has_capability(&entry, Capability::Sign));
+        assert_eq!(
+            serde_json::to_value(Capability::SignJws).unwrap(),
+            "sign-jws"
+        );
+        assert_eq!(
+            serde_json::to_value(Capability::SignCsr).unwrap(),
+            "sign-csr"
+        );
+    }
+
+    // ── Additive capabilities ───────────────────────────────────────
+
+    /// The invariant that keeps additive capabilities from being an upgrade
+    /// hazard: **no role derives one**.
+    ///
+    /// If one ever appeared in a role's set, every existing entry with that
+    /// role and an empty capability list would gain it silently — for
+    /// `PersonaHolder`, that is every context-scoped administrator on the agent
+    /// waking up with access to the holder's attribute pool.
+    #[test]
+    fn no_role_derives_an_additive_capability() {
+        for role in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+        ] {
+            for cap in ADDITIVE_CAPABILITIES {
+                assert!(
+                    !derived_capabilities_for_role(&role).contains(cap),
+                    "{role:?} must not derive {cap:?} — see ADDITIVE_CAPABILITIES"
+                );
+            }
+        }
+    }
+
+    /// An entry that names nothing still holds exactly its role, additive
+    /// capabilities included-by-nobody. The pre-existing rows keep meaning what
+    /// they meant.
+    #[test]
+    fn an_un_narrowed_entry_gains_no_additive_capability() {
+        let held = effective_capabilities(&Role::Admin, &[]);
+        assert!(!held.contains(&Capability::PersonaHolder));
+    }
+
+    /// Granted by name, it is held — even though the role does not carry it.
+    /// This is the whole point: holder authority is not a subset of what an
+    /// administrator of a context may do.
+    #[test]
+    fn an_additive_capability_is_held_where_it_was_granted() {
+        let held = effective_capabilities(&Role::Admin, &[Capability::PersonaHolder]);
+        assert!(held.contains(&Capability::PersonaHolder));
+    }
+
+    /// Granting *only* an additive capability must not strip the role.
+    ///
+    /// The trap this closes: the narrowing is an intersection, so a list of one
+    /// additive name — which no role contains — would intersect the role's set
+    /// down to nothing. An operator granting an agent holder authority would
+    /// have silently revoked its vault access in the same command.
+    #[test]
+    fn granting_only_an_additive_capability_narrows_nothing() {
+        let held = effective_capabilities(&Role::Admin, &[Capability::PersonaHolder]);
+        for derived in derived_capabilities_for_role(&Role::Admin) {
+            assert!(
+                held.contains(&derived),
+                "{derived:?} was stripped by a grant that named only an additive capability"
+            );
+        }
+    }
+
+    /// The two kinds compose: role-derived names still narrow, and the additive
+    /// one rides alongside whatever survived.
+    #[test]
+    fn an_additive_grant_and_a_narrowing_compose() {
+        let held = effective_capabilities(
+            &Role::Admin,
+            &[Capability::VaultRead, Capability::PersonaHolder],
+        );
+        assert!(held.contains(&Capability::VaultRead));
+        assert!(held.contains(&Capability::PersonaHolder));
+        assert!(
+            !held.contains(&Capability::Sign),
+            "the narrowing still applies to what the role carries: {held:?}"
+        );
+    }
+
+    /// The grant path must not refuse an additive capability for not being in
+    /// the role — it never will be. What guards it instead is a privilege check
+    /// on the *granter*, on the ACL create/update paths.
+    #[test]
+    fn an_additive_capability_is_not_beyond_the_role() {
+        assert!(
+            capabilities_beyond_role(&Role::Admin, &[Capability::PersonaHolder]).is_empty(),
+            "measuring an additive capability against a role would refuse every grant of it"
+        );
+        // And it stays refused where it should be: a name no role carries and
+        // that is not additive is still beyond.
+        assert_eq!(
+            capabilities_beyond_role(&Role::Reader, &[Capability::Sign]),
+            vec![Capability::Sign]
+        );
+    }
+
+    // ── Test fixtures ───────────────────────────────────────────────
+
+    fn temp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = Store::open(&config).expect("open store");
+        (store, dir)
+    }
+
+    fn sample_entry(did: &str, role: Role) -> AclEntry {
+        AclEntry::new(did, role, "did:key:zSetup").with_label(Some(format!("test-{did}")))
+    }
+
+    /// Optimistic concurrency under contention: of writers that all observed
+    /// the same version, exactly one wins. A read-check-write let several pass
+    /// the check, and the last silently discarded the others' edits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_versioned_updates_admit_exactly_one_writer() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("acl").unwrap();
+        let did = "did:key:zVersioned";
+        store_acl_entry(&ks, &sample_entry(did, Role::Reader))
+            .await
+            .unwrap();
+        for _ in 0..40 {
+            let observed = get_acl_entry(&ks, did).await.unwrap().unwrap().version;
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+            let mut tasks = Vec::new();
+            for i in 0..16 {
+                let (ks, barrier) = (ks.clone(), barrier.clone());
+                tasks.push(tokio::spawn(async move {
+                    let entry = sample_entry(did, Role::Reader).with_label(Some(format!("w{i}")));
+                    barrier.wait().await;
+                    update_acl_entry_versioned(&ks, entry, observed)
+                        .await
+                        .is_ok()
+                }));
+            }
+            let mut won = 0;
+            for t in tasks {
+                won += t.await.unwrap() as usize;
+            }
+            assert_eq!(won, 1, "exactly one writer may win a version");
+            assert_eq!(
+                get_acl_entry(&ks, did).await.unwrap().unwrap().version,
+                observed + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_acl_entries_skips_corrupt_rows() {
+        // A single undeserializable row must not abort the whole listing —
+        // otherwise one corrupt entry bricks ACL management and the auth
+        // paths that enumerate entries.
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("acl").unwrap();
+
+        store_acl_entry(&ks, &sample_entry("did:key:zAlice", Role::Admin))
+            .await
+            .unwrap();
+        // Inject garbage under the acl: prefix.
+        ks.insert_raw("acl:did:key:zCorrupt", b"{not valid json".to_vec())
+            .await
+            .unwrap();
+        store_acl_entry(&ks, &sample_entry("did:key:zBob", Role::Reader))
+            .await
+            .unwrap();
+
+        let entries = list_acl_entries(&ks).await.expect("listing must not abort");
+        let dids: Vec<&str> = entries.iter().map(|e| e.did.as_str()).collect();
+        assert!(dids.contains(&"did:key:zAlice"));
+        assert!(dids.contains(&"did:key:zBob"));
+        assert_eq!(entries.len(), 2, "the corrupt row is skipped, not surfaced");
+    }
+
+    /// VTI-ACL-101: an entry written before purposes existed is rewritten to
+    /// state `any` — the authority it held — and an entry that states its
+    /// purposes, narrowed or not, is left alone. Running again changes nothing.
+    #[tokio::test]
+    async fn vti_acl_101_every_entry_comes_to_state_its_purposes() {
+        let (store, _dir) = temp_store();
+        let ks = store.keyspace("acl").unwrap();
+        let mut old = serde_json::to_value(sample_entry("did:key:zOld", Role::Reader)).unwrap();
+        old.as_object_mut().unwrap().remove("purposes");
+        ks.insert_raw("acl:did:key:zOld", serde_json::to_vec(&old).unwrap())
+            .await
+            .unwrap();
+        let narrowed = sample_entry("did:key:zNarrow", Role::Application)
+            .with_purposes(PurposeScope::listed(["taskExecution"]).unwrap());
+        store_acl_entry(&ks, &narrowed).await.unwrap();
+
+        assert_eq!(state_purposes_on_every_entry(&ks).await.unwrap(), 1);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&ks.get_raw("acl:did:key:zOld").await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(raw["purposes"], serde_json::json!({"scope": "any"}));
+        assert_eq!(
+            get_acl_entry(&ks, "did:key:zNarrow")
+                .await
+                .unwrap()
+                .unwrap()
+                .purposes,
+            narrowed.purposes
+        );
+        assert_eq!(state_purposes_on_every_entry(&ks).await.unwrap(), 0);
+    }
+
+    fn scoped_entry(did: &str, role: Role, contexts: &[&str]) -> AclEntry {
+        AclEntry::new(did, role, "did:key:zSetup")
+            .with_contexts(contexts.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn super_admin_claims() -> AuthClaims {
+        AuthClaims {
+            did: "did:key:zSuperAdmin".into(),
+            role: Role::Admin,
+            allowed_contexts: vec![],
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        }
+    }
+
+    fn context_admin_claims(contexts: &[&str]) -> AuthClaims {
+        AuthClaims {
+            did: "did:key:zCtxAdmin".into(),
+            role: Role::Admin,
+            allowed_contexts: contexts.iter().map(|s| s.to_string()).collect(),
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        }
+    }
+
+    // ── Role parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn role_parse_accepts_canonical_lowercase() {
+        assert_eq!(Role::parse("admin").unwrap(), Role::Admin);
+        assert_eq!(Role::parse("initiator").unwrap(), Role::Initiator);
+        assert_eq!(Role::parse("application").unwrap(), Role::Application);
+        assert_eq!(Role::parse("reader").unwrap(), Role::Reader);
+        assert_eq!(Role::parse("monitor").unwrap(), Role::Monitor);
+    }
+
+    #[test]
+    fn role_parse_rejects_unknown() {
+        let err = Role::parse("godmode").expect_err("unknown role must error");
+        assert!(format!("{err:?}").contains("godmode"), "got {err:?}");
+    }
+
+    // ── DeviceBinding wake channel (push wake-up binding) ───────────────
+
+    fn sample_binding() -> DeviceBinding {
+        DeviceBinding {
+            device_id: "dev-1".into(),
+            display_name: "Glenn's iPhone".into(),
+            platform: Some("iOS 19".into()),
+            registered_at: "2026-06-02T00:00:00Z".into(),
+            last_seen_at: None,
+            disabled_at: None,
+            wiped_at: None,
+            hpke_public_key: None,
+            wake: None,
+            uv_key: None,
+        }
+    }
+
+    #[test]
+    fn wake_channel_round_trips_camel_case() {
+        let mut b = sample_binding();
+        b.wake = Some(WakeChannel {
+            gateway: "https://gw.example".into(),
+            handle: "z6MkOpaque".into(),
+            allowed_triggers: vec!["did:web:mediator".into(), "did:web:vta".into()],
+        });
+        let json = serde_json::to_string(&b).unwrap();
+        // Wire is camelCase, mirroring the spec shapes.
+        assert!(json.contains("\"wake\""), "{json}");
+        assert!(json.contains("\"allowedTriggers\""), "{json}");
+        let back: DeviceBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
+    }
+
+    #[test]
+    fn legacy_row_without_wake_deserialises_to_none() {
+        // A binding serialised before the wake field existed.
+        let legacy =
+            r#"{"deviceId":"dev-1","displayName":"old","registeredAt":"2026-01-01T00:00:00Z"}"#;
+        let b: DeviceBinding = serde_json::from_str(legacy).unwrap();
+        assert!(b.wake.is_none());
+        assert!(!b.push_capable());
+    }
+
+    #[test]
+    fn push_capable_requires_wake_and_active_device() {
+        let mut b = sample_binding();
+        assert!(!b.push_capable(), "no wake channel → not push-capable");
+
+        b.wake = Some(WakeChannel {
+            gateway: "did:web:gw".into(),
+            handle: "h".into(),
+            allowed_triggers: vec!["did:web:vta".into()],
+        });
+        assert!(b.push_capable(), "wake set + active → push-capable");
+
+        b.disabled_at = Some("2026-06-02T01:00:00Z".into());
+        assert!(!b.push_capable(), "disabled device is not push-capable");
+
+        b.disabled_at = None;
+        b.wiped_at = Some("2026-06-02T02:00:00Z".into());
+        assert!(!b.push_capable(), "wiped device is not push-capable");
+    }
+
+    #[test]
+    fn role_parse_rejects_case_variation() {
+        // Serde rename_all="lowercase" means Admin != Admin on the wire.
+        // parse() mirrors that contract.
+        assert!(Role::parse("Admin").is_err(), "case-sensitive parse");
+        assert!(Role::parse("ADMIN").is_err());
+    }
+
+    #[test]
+    fn role_display_round_trips_with_parse() {
+        for role in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            let s = format!("{role}");
+            assert_eq!(Role::parse(&s).unwrap(), role, "display->parse cycle");
+        }
+    }
+
+    // ── KeyScope (#818): allowed_keys decode ────────────────────────
+
+    /// The trap the `ActScope` precedent exists for, restated on the key
+    /// axis: `None` and `Some(∅)` are opposite grants and must decode to
+    /// different scopes.
+    #[test]
+    fn key_scope_none_is_unrestricted_and_empty_set_allows_nothing() {
+        let unfiltered = sample_entry("did:key:zA", Role::Application);
+        assert_eq!(unfiltered.key_scope(), KeyScope::AllInScope);
+        assert!(unfiltered.key_scope().allows("any-key"));
+
+        let no_keys =
+            sample_entry("did:key:zB", Role::Application).with_allowed_keys(Some(BTreeSet::new()));
+        assert_eq!(no_keys.key_scope(), KeyScope::Keys(BTreeSet::new()));
+        assert!(
+            !no_keys.key_scope().allows("any-key"),
+            "an empty filter authorizes NO keys — it is never a wildcard"
+        );
+    }
+
+    #[test]
+    fn key_scope_filters_by_exact_key_id() {
+        let entry = sample_entry("did:key:zA", Role::Application)
+            .with_allowed_keys(Some(["key-1".to_string()].into_iter().collect()));
+        assert!(entry.key_scope().allows("key-1"));
+        assert!(!entry.key_scope().allows("key-2"));
+        assert!(
+            !entry.key_scope().allows("key-1x"),
+            "exact match, not prefix"
+        );
+    }
+
+    /// A row serialized before `allowed_keys` existed must deserialise as
+    /// `None` (no filter), preserving behaviour byte-identically — the same
+    /// contract every other additive ACL member honours.
+    #[test]
+    fn legacy_row_without_allowed_keys_deserialises_to_none() {
+        let legacy = serde_json::json!({
+            "did": "did:key:zOld",
+            "role": "application",
+            "label": null,
+            "allowed_contexts": ["ctx-a"],
+            "created_at": 0,
+            "created_by": "did:key:zSetup"
+        });
+        let entry: AclEntry = serde_json::from_value(legacy).unwrap();
+        assert!(entry.allowed_keys.is_none());
+        assert_eq!(entry.key_scope(), KeyScope::AllInScope);
+    }
+
+    /// `Some(∅)` must survive a store round-trip as `Some(∅)` — if
+    /// serialization dropped the empty set, the narrowest grant would come
+    /// back as the widest.
+    #[test]
+    fn empty_allowed_keys_survives_serde_round_trip() {
+        let entry =
+            sample_entry("did:key:zA", Role::Application).with_allowed_keys(Some(BTreeSet::new()));
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"allowed_keys\":[]"), "{json}");
+        let back: AclEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allowed_keys, Some(BTreeSet::new()));
+        assert!(!back.key_scope().allows("k"));
+
+        // And absence stays absent: no filter is not serialized at all.
+        let unfiltered = sample_entry("did:key:zB", Role::Application);
+        let json = serde_json::to_string(&unfiltered).unwrap();
+        assert!(!json.contains("allowed_keys"), "{json}");
+    }
+
+    // ── Expiration ──────────────────────────────────────────────────
+
+    #[test]
+    fn entry_without_expiry_never_expires() {
+        let entry = sample_entry("did:key:zA", Role::Admin);
+        assert!(entry.expires_at.is_none());
+        assert!(
+            !entry.is_expired(u64::MAX),
+            "permanent entries never expire"
+        );
+    }
+
+    #[test]
+    fn entry_with_future_expiry_is_not_expired() {
+        let mut entry = sample_entry("did:key:zA", Role::Admin);
+        entry.expires_at = Some(now_epoch() + 3600);
+        assert!(!entry.is_expired(now_epoch()));
+    }
+
+    #[test]
+    fn entry_with_past_expiry_is_expired() {
+        let mut entry = sample_entry("did:key:zA", Role::Admin);
+        entry.expires_at = Some(now_epoch().saturating_sub(1));
+        assert!(entry.is_expired(now_epoch()));
+    }
+
+    #[test]
+    fn entry_with_exact_expiry_boundary_is_expired() {
+        // Guard choice: `now >= deadline` is expired. The boundary at
+        // equal seconds counts as past — callers don't get a free
+        // extra second of access.
+        let mut entry = sample_entry("did:key:zA", Role::Admin);
+        let now = now_epoch();
+        entry.expires_at = Some(now);
+        assert!(entry.is_expired(now), "now == deadline counts as expired");
+    }
+
+    // ── Store CRUD ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn crud_round_trip() {
+        let (store, _dir) = temp_store();
+        let acl = store.keyspace("acl").unwrap();
+
+        let entry = sample_entry("did:key:zAbc", Role::Admin);
+        store_acl_entry(&acl, &entry).await.unwrap();
+
+        let got = get_acl_entry(&acl, "did:key:zAbc")
+            .await
+            .unwrap()
+            .expect("entry should exist");
+        assert_eq!(got.did, entry.did);
+        assert_eq!(got.role, Role::Admin);
+
+        delete_acl_entry(&acl, "did:key:zAbc").await.unwrap();
+        let gone = get_acl_entry(&acl, "did:key:zAbc").await.unwrap();
+        assert!(gone.is_none(), "deleted entry must be gone");
+    }
+
+    #[tokio::test]
+    async fn list_returns_every_entry() {
+        let (store, _dir) = temp_store();
+        let acl = store.keyspace("acl").unwrap();
+
+        for did in ["did:key:zA", "did:key:zB", "did:key:zC"] {
+            store_acl_entry(&acl, &sample_entry(did, Role::Reader))
+                .await
+                .unwrap();
+        }
+
+        let entries = list_acl_entries(&acl).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        let dids: std::collections::HashSet<_> = entries.iter().map(|e| e.did.as_str()).collect();
+        assert!(dids.contains("did:key:zA"));
+        assert!(dids.contains("did:key:zB"));
+        assert!(dids.contains("did:key:zC"));
+    }
+
+    // ── check_acl ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn check_acl_returns_role_for_present_did() {
+        let (store, _dir) = temp_store();
+        let acl = store.keyspace("acl").unwrap();
+        store_acl_entry(&acl, &sample_entry("did:key:zA", Role::Initiator))
+            .await
+            .unwrap();
+
+        let role = check_acl(&acl, "did:key:zA").await.unwrap();
+        assert_eq!(role, Role::Initiator);
+    }
+
+    #[tokio::test]
+    async fn check_acl_rejects_missing_did_as_forbidden() {
+        let (store, _dir) = temp_store();
+        let acl = store.keyspace("acl").unwrap();
+
+        let err = check_acl(&acl, "did:key:zUnknown")
+            .await
+            .expect_err("missing DID must be rejected");
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "got {err:?}; expected Forbidden so the handler emits 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_acl_rejects_expired_entry() {
+        let (store, _dir) = temp_store();
+        let acl = store.keyspace("acl").unwrap();
+
+        let mut entry = sample_entry("did:key:zExpired", Role::Admin);
+        entry.expires_at = Some(now_epoch().saturating_sub(10));
+        store_acl_entry(&acl, &entry).await.unwrap();
+
+        let err = check_acl(&acl, "did:key:zExpired")
+            .await
+            .expect_err("expired entry must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            matches!(err, AppError::Forbidden(_)) && msg.contains("expired"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_acl_full_returns_role_and_contexts() {
+        let (store, _dir) = temp_store();
+        let acl = store.keyspace("acl").unwrap();
+        store_acl_entry(
+            &acl,
+            &scoped_entry("did:key:zCtx", Role::Admin, &["ctx1", "ctx2"]),
+        )
+        .await
+        .unwrap();
+
+        let (role, contexts) = check_acl_full(&acl, "did:key:zCtx").await.unwrap();
+        assert_eq!(role, Role::Admin);
+        assert_eq!(contexts, vec!["ctx1".to_string(), "ctx2".to_string()]);
+    }
+
+    // ── validate_role_assignment ────────────────────────────────────
+
+    #[test]
+    fn role_assignment_super_admin_can_assign_admin() {
+        validate_role_assignment(&super_admin_claims(), &Role::Admin)
+            .expect("super admin assigns admin");
+    }
+
+    #[test]
+    fn role_assignment_context_admin_can_assign_admin_role_itself() {
+        // A context admin (Role::Admin with non-empty allowed_contexts)
+        // passes validate_role_assignment for the Admin role — the
+        // role-level check only gates `caller.role != Role::Admin`.
+        // The actual escape-prevention is in validate_acl_modification,
+        // which confines the new entry to the caller's own contexts.
+        validate_role_assignment(&context_admin_claims(&["ctx1"]), &Role::Admin)
+            .expect("context admin CAN assign Admin role; scope is enforced separately");
+    }
+
+    #[test]
+    fn role_assignment_non_admin_cannot_assign_admin() {
+        // Initiator, Reader, Application, Monitor cannot mint admins
+        // regardless of scope. Only callers with Role::Admin can
+        // assign Role::Admin.
+        let initiator = AuthClaims {
+            did: "did:key:zIni".into(),
+            role: Role::Initiator,
+            allowed_contexts: vec!["ctx1".into()],
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        };
+        let err = validate_role_assignment(&initiator, &Role::Admin)
+            .expect_err("non-admin must not assign admin");
+        assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn role_assignment_readers_cannot_assign_any_role() {
+        let reader = AuthClaims {
+            did: "did:key:zReader".into(),
+            role: Role::Reader,
+            allowed_contexts: vec!["ctx1".into()],
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        };
+        for target in [
+            Role::Admin,
+            Role::Initiator,
+            Role::Application,
+            Role::Reader,
+            Role::Monitor,
+        ] {
+            let err = validate_role_assignment(&reader, &target)
+                .expect_err(&format!("reader must not assign {target}"));
+            assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn role_assignment_initiator_can_assign_non_admin_roles() {
+        let initiator = AuthClaims {
+            did: "did:key:zIni".into(),
+            role: Role::Initiator,
+            allowed_contexts: vec!["ctx1".into()],
+            session_id: "test-session".into(),
+            access_expires_at: 0,
+            issued_at: 0,
+            amr: Vec::new(),
+            acr: String::new(),
+        };
+        validate_role_assignment(&initiator, &Role::Reader).expect("initiator can assign reader");
+        validate_role_assignment(&initiator, &Role::Application)
+            .expect("initiator can assign application");
+    }
+
+    // ── validate_acl_modification ───────────────────────────────────
+
+    #[test]
+    fn acl_modification_super_admin_can_create_anything() {
+        // admin + no contexts = super-admin (unrestricted)
+        validate_acl_modification(&super_admin_claims(), &Role::Admin, &[])
+            .expect("super admin unrestricted");
+        validate_acl_modification(&super_admin_claims(), &Role::Reader, &["any-ctx".into()])
+            .expect("super admin any-context");
+    }
+
+    #[test]
+    fn acl_modification_context_admin_cannot_create_unrestricted() {
+        // admin + no contexts decodes to `All` — a super-admin grant — and
+        // only a super-admin may confer it.
+        let err = validate_acl_modification(&context_admin_claims(&["ctx1"]), &Role::Admin, &[])
+            .expect_err("context admin must not create an unrestricted entry");
+        assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+    }
+
+    /// The widening: a *non-admin* with no contexts decodes to `None` — acts
+    /// nowhere, grants no authority to act — so a context admin may create it.
+    /// This is how a least-privilege approver is minted; its conferral is gated
+    /// separately by `validate_approve_scope_grant`.
+    #[test]
+    fn acl_modification_context_admin_can_create_acts_nowhere() {
+        for role in [
+            Role::Reader,
+            Role::Application,
+            Role::Initiator,
+            Role::Monitor,
+        ] {
+            validate_acl_modification(&context_admin_claims(&["ctx1"]), &role, &[]).unwrap_or_else(
+                |e| panic!("context admin must be able to create an acts-nowhere {role:?}: {e:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn acl_modification_context_admin_confined_to_own_contexts() {
+        let caller = context_admin_claims(&["ctx1", "ctx2"]);
+        validate_acl_modification(&caller, &Role::Reader, &["ctx1".into()])
+            .expect("own context ok");
+        validate_acl_modification(&caller, &Role::Reader, &["ctx1".into(), "ctx2".into()])
+            .expect("all-own contexts ok");
+
+        let err = validate_acl_modification(&caller, &Role::Reader, &["ctx3".into()])
+            .expect_err("foreign context must be rejected");
+        assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+
+        let err =
+            validate_acl_modification(&caller, &Role::Reader, &["ctx1".into(), "ctx3".into()])
+                .expect_err("mixed own+foreign must be rejected");
+        assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+    }
+
+    // ── acl_entry_can_act_in ────────────────────────────────────────
+
+    /// A super-admin holds every context, so a context filter must surface it.
+    /// The online `list_acl` used a bare `contains()` and omitted these — an
+    /// operator auditing "who can reach context X" never saw the entries with
+    /// the most authority over it.
+    #[test]
+    fn can_act_in_includes_super_admins() {
+        let super_admin = sample_entry("did:key:zSuper", Role::Admin);
+        assert!(acl_entry_can_act_in(&super_admin, "anything"));
+    }
+
+    /// An acts-nowhere entry holds none. The offline `vta acl list` matched
+    /// `is_empty() || contains()` and surfaced these under *every* context.
+    #[test]
+    fn can_act_in_excludes_acts_nowhere_entries() {
+        for role in [Role::Reader, Role::Application, Role::Initiator] {
+            let entry = sample_entry("did:key:zNowhere", role.clone());
+            assert!(
+                !acl_entry_can_act_in(&entry, "anything"),
+                "{role:?} with no contexts acts nowhere"
+            );
+        }
+    }
+
+    /// Hierarchy-aware, matching `has_context_access` and the VTC's filter.
+    /// Both VTA filters used `contains`, so neither surfaced a parent-scoped
+    /// entry under a child id.
+    #[test]
+    fn can_act_in_covers_the_subtree() {
+        let entry = scoped_entry("did:key:zParent", Role::Reader, &["parent"]);
+        assert!(acl_entry_can_act_in(&entry, "parent"), "self");
+        assert!(acl_entry_can_act_in(&entry, "parent/child"), "subtree");
+        assert!(!acl_entry_can_act_in(&entry, "other"), "unrelated");
+        assert!(
+            !acl_entry_can_act_in(&entry, "parentless"),
+            "a string prefix is not an ancestor"
+        );
+    }
+
+    /// The two implementations this replaces disagreed on exactly one input
+    /// class — an empty `allowed_contexts` — and the disagreement was total:
+    /// one matched every context, the other none. Pin both halves together so
+    /// a future edit cannot reintroduce either reading.
+    #[test]
+    fn can_act_in_resolves_the_offline_online_disagreement() {
+        let ctx = "openvtc";
+        // Offline said yes to this, online said no. Correct answer: yes.
+        assert!(acl_entry_can_act_in(
+            &sample_entry("did:key:zA", Role::Admin),
+            ctx
+        ));
+        // Offline said yes to this, online said no. Correct answer: no.
+        assert!(!acl_entry_can_act_in(
+            &sample_entry("did:key:zB", Role::Reader),
+            ctx
+        ));
+    }
+
+    // ── acl_entry_acts_within / acl_entry_matches_context ───────────
+
+    /// The revocation sweep the old filter could not express: under a
+    /// per-purpose leaf layout, `?context=<tenant>/<unit>` returned the
+    /// ancestors keeping their authority and omitted every leaf grant the
+    /// sweep existed to cut (#822).
+    #[test]
+    fn a_subtree_sweep_finds_the_leaves_the_act_filter_omits() {
+        let leaf = scoped_entry(
+            "did:key:zGateway",
+            Role::Application,
+            &["acme/eng/attestation"],
+        );
+        let unit = "acme/eng";
+
+        assert!(
+            !acl_entry_can_act_in(&leaf, unit),
+            "correct for the act question, and the reason the sweep missed it"
+        );
+        assert!(acl_entry_acts_within(&leaf, unit), "the sweep must see it");
+        assert!(acl_entry_matches_context(
+            &leaf,
+            unit,
+            ContextDirection::Any
+        ));
+    }
+
+    /// The sweep must not reach outside its branch — a sibling unit and a
+    /// string-prefix lookalike both stay out.
+    #[test]
+    fn a_subtree_sweep_stops_at_the_branch() {
+        let sibling = scoped_entry("did:key:zOps", Role::Reader, &["acme/ops/keys"]);
+        let lookalike = scoped_entry("did:key:zLook", Role::Reader, &["acme/engineering"]);
+        assert!(!acl_entry_acts_within(&sibling, "acme/eng"));
+        assert!(!acl_entry_acts_within(&lookalike, "acme/eng"));
+        assert!(
+            acl_entry_acts_within(&lookalike, "acme"),
+            "still under acme"
+        );
+    }
+
+    /// A super-admin can act beneath any context, but it is not a grant *of*
+    /// the branch. Returning it from a sweep would hand a caller revoking a
+    /// compromised branch its own super-admin to delete; `any` is where an
+    /// auditor asks for it.
+    #[test]
+    fn a_subtree_sweep_does_not_offer_up_the_super_admin() {
+        let super_admin = sample_entry("did:key:zSuper", Role::Admin);
+        assert!(!acl_entry_acts_within(&super_admin, "acme/eng"));
+        assert!(acl_entry_matches_context(
+            &super_admin,
+            "acme/eng",
+            ContextDirection::ActingIn
+        ));
+        assert!(acl_entry_matches_context(
+            &super_admin,
+            "acme/eng",
+            ContextDirection::Any
+        ));
+    }
+
+    /// An acts-nowhere entry is in no direction's answer.
+    #[test]
+    fn acts_nowhere_is_in_no_direction() {
+        let nowhere = sample_entry("did:key:zNowhere", Role::Reader);
+        for d in ContextDirection::ALL {
+            assert!(
+                !acl_entry_matches_context(&nowhere, "acme", d),
+                "acts-nowhere surfaced under {d}"
+            );
+        }
+    }
+
+    /// The default direction is the pre-#822 filter, entry for entry.
+    #[test]
+    fn the_default_direction_reproduces_the_old_filter() {
+        let entries = [
+            sample_entry("did:key:zSuper", Role::Admin),
+            sample_entry("did:key:zNowhere", Role::Reader),
+            scoped_entry("did:key:zParent", Role::Reader, &["acme"]),
+            scoped_entry("did:key:zSelf", Role::Reader, &["acme/eng"]),
+            scoped_entry("did:key:zLeaf", Role::Reader, &["acme/eng/team-a"]),
+        ];
+        for entry in &entries {
+            assert_eq!(
+                acl_entry_matches_context(entry, "acme/eng", ContextDirection::default()),
+                acl_entry_can_act_in(entry, "acme/eng"),
+                "default direction diverged for {}",
+                entry.did
+            );
+        }
+    }
+
+    // ── is_acl_entry_auditable ──────────────────────────────────────
+
+    /// The audit gap this closes: a least-privilege approver acts nowhere, so
+    /// it names no context on the act axis and never overlapped a context
+    /// admin's scope — leaving that admin unable to see who could authorize a
+    /// change in their own context.
+    #[test]
+    fn auditable_surfaces_an_approver_scoped_to_the_callers_context() {
+        let caller = context_admin_claims(&["ctx1"]);
+        let approver = AclEntry::new("did:key:zApprover", Role::Reader, "did:key:zSetup")
+            .with_approve_scope(ApproveScope::Contexts(vec!["ctx1".into()]));
+
+        assert!(
+            !is_acl_entry_visible(&caller, &approver),
+            "acts nowhere, so it is not the caller's to manage"
+        );
+        assert!(
+            is_acl_entry_auditable(&caller, &approver),
+            "but it confers in ctx1, so ctx1's admin must be able to see it"
+        );
+    }
+
+    /// An `All` approver confers into every context, the caller's included.
+    #[test]
+    fn auditable_surfaces_an_approve_all_holder() {
+        let caller = context_admin_claims(&["ctx1"]);
+        let approver = AclEntry::new("did:key:zGlobal", Role::Reader, "did:key:zSetup")
+            .with_approve_scope(ApproveScope::All);
+        assert!(is_acl_entry_auditable(&caller, &approver));
+    }
+
+    /// Conferral is subtree-aware, matching `ApproveScope::covers`.
+    #[test]
+    fn auditable_follows_context_ancestry() {
+        let caller = context_admin_claims(&["parent"]);
+        let approver = AclEntry::new("did:key:zChild", Role::Reader, "did:key:zSetup")
+            .with_approve_scope(ApproveScope::Contexts(vec!["parent/child".into()]));
+        assert!(
+            is_acl_entry_auditable(&caller, &approver),
+            "an admin of the parent context administers the subtree it confers in"
+        );
+    }
+
+    /// An approver for someone else's context stays hidden — the widening is
+    /// scoped to conferral that actually reaches the caller.
+    #[test]
+    fn auditable_hides_an_approver_for_a_foreign_context() {
+        let caller = context_admin_claims(&["ctx1"]);
+        let approver = AclEntry::new("did:key:zOther", Role::Reader, "did:key:zSetup")
+            .with_approve_scope(ApproveScope::Contexts(vec!["ctx2".into()]));
+        assert!(!is_acl_entry_auditable(&caller, &approver));
+    }
+
+    /// **Read-only by construction.** The mutation predicate must not follow
+    /// the approve axis, or seeing an entry would become authority to delete
+    /// it. An entry that admins someone else's context while conferring into
+    /// ours is exactly the case that would be an escalation.
+    #[test]
+    fn auditable_does_not_confer_manage_authority() {
+        let caller = context_admin_claims(&["ctx1"]);
+        let foreign_admin = scoped_entry("did:key:zForeignAdmin", Role::Admin, &["ctx2"])
+            .with_approve_scope(ApproveScope::Contexts(vec!["ctx1".into()]));
+
+        assert!(
+            is_acl_entry_auditable(&caller, &foreign_admin),
+            "confers into ctx1, so ctx1's admin can see it"
+        );
+        assert!(
+            !is_acl_entry_visible(&caller, &foreign_admin),
+            "but it admins ctx2 — ctx1's admin must not be able to update or delete it"
+        );
+    }
+
+    /// Entries carrying no conferral are unaffected: `auditable` collapses to
+    /// `visible`, so this widens nothing for the ordinary case.
+    #[test]
+    fn auditable_matches_visible_when_nothing_is_conferred() {
+        let caller = context_admin_claims(&["ctx1"]);
+        for entry in [
+            scoped_entry("did:key:zA", Role::Reader, &["ctx1"]),
+            scoped_entry("did:key:zB", Role::Reader, &["ctx2"]),
+            sample_entry("did:key:zC", Role::Admin),
+            sample_entry("did:key:zD", Role::Reader),
+        ] {
+            assert_eq!(
+                is_acl_entry_auditable(&caller, &entry),
+                is_acl_entry_visible(&caller, &entry),
+                "{} must be unaffected by the approve axis",
+                entry.did
+            );
+        }
+    }
+
+    /// A super-admin caller sees everything either way.
+    #[test]
+    fn auditable_is_total_for_a_super_admin() {
+        let caller = super_admin_claims();
+        let entry = scoped_entry("did:key:zAny", Role::Reader, &["whatever"]);
+        assert!(is_acl_entry_auditable(&caller, &entry));
+    }
+
+    // ── is_acl_entry_visible ────────────────────────────────────────
+
+    #[test]
+    fn visibility_super_admin_sees_everything() {
+        let caller = super_admin_claims();
+        assert!(is_acl_entry_visible(
+            &caller,
+            &sample_entry("did:key:zA", Role::Admin)
+        ));
+        assert!(is_acl_entry_visible(
+            &caller,
+            &scoped_entry("did:key:zB", Role::Admin, &["private"])
+        ));
+    }
+
+    #[test]
+    fn visibility_context_admin_sees_overlapping_entries_only() {
+        let caller = context_admin_claims(&["ctx1", "ctx2"]);
+
+        // Entry scoped to ctx1 — visible (overlaps)
+        assert!(is_acl_entry_visible(
+            &caller,
+            &scoped_entry("did:key:zA", Role::Reader, &["ctx1"])
+        ));
+
+        // Entry scoped to ctx3 — not visible (no overlap)
+        assert!(!is_acl_entry_visible(
+            &caller,
+            &scoped_entry("did:key:zB", Role::Reader, &["ctx3"])
+        ));
+
+        // Super-admin entry (empty contexts) — not visible to scoped admin
+        // so they can't enumerate holders of the higher privilege.
+        assert!(!is_acl_entry_visible(
+            &caller,
+            &sample_entry("did:key:zSuper", Role::Admin)
+        ));
+
+        // Entry with mixed contexts — visible if any overlap
+        assert!(is_acl_entry_visible(
+            &caller,
+            &scoped_entry("did:key:zC", Role::Reader, &["ctx2", "ctx99"])
+        ));
+    }
+
+    // ── Serialization compatibility ─────────────────────────────────
+
+    #[test]
+    fn acl_entry_without_expires_at_deserializes() {
+        // Pre-Phase-2 entries were serialized without expires_at; they
+        // must continue to load with expires_at=None (permanent). If
+        // this test breaks, operators with older stores lose their
+        // ACL data on upgrade.
+        let legacy = r#"{
+            "did": "did:key:zLegacy",
+            "role": "admin",
+            "label": "old admin",
+            "allowed_contexts": [],
+            "created_at": 1700000000,
+            "created_by": "did:key:zSetup"
+        }"#;
+        let entry: AclEntry = serde_json::from_str(legacy).expect("legacy shape must deserialize");
+        assert_eq!(entry.did, "did:key:zLegacy");
+        assert!(entry.expires_at.is_none(), "default to permanent");
+    }
+
+    #[test]
+    fn acl_entry_with_missing_allowed_contexts_defaults_to_empty() {
+        // Pre-ACL-scoping entries also omitted allowed_contexts.
+        let legacy = r#"{
+            "did": "did:key:zLegacy",
+            "role": "admin",
+            "label": null,
+            "created_at": 1700000000,
+            "created_by": "did:key:zSetup"
+        }"#;
+        let entry: AclEntry = serde_json::from_str(legacy).expect("legacy shape must deserialize");
+        assert!(entry.allowed_contexts.is_empty());
+    }
+
+    #[test]
+    fn acl_entry_without_approve_scope_defaults_to_none() {
+        // Pre-approver rows omit `approve_scope`; they must load as `None`
+        // (confers nothing) — fail-closed.
+        let legacy = r#"{
+            "did": "did:key:zLegacy",
+            "role": "reader",
+            "label": null,
+            "created_at": 1700000000,
+            "created_by": "did:key:zSetup"
+        }"#;
+        let entry: AclEntry = serde_json::from_str(legacy).expect("legacy shape must deserialize");
+        assert_eq!(entry.approve_scope, ApproveScope::None);
+        assert!(entry.approve_scope.confers_nothing());
+    }
+
+    #[test]
+    fn approve_scope_round_trips_on_the_wire() {
+        for scope in [
+            ApproveScope::None,
+            ApproveScope::All,
+            ApproveScope::Contexts(vec!["ctx-a".into(), "ctx-b".into()]),
+        ] {
+            let e = AclEntry::new("did:key:zA", Role::Reader, "did:key:zC")
+                .with_approve_scope(scope.clone());
+            let json = serde_json::to_string(&e).unwrap();
+            let back: AclEntry = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.approve_scope, scope);
+        }
+    }
+
+    #[test]
+    fn validate_approve_scope_grant_authority() {
+        // `All` is a cross-context authorizer: super-admin only.
+        validate_approve_scope_grant(&super_admin_claims(), &ApproveScope::All)
+            .expect("super admin may grant approve-all");
+        assert!(
+            validate_approve_scope_grant(&context_admin_claims(&["ctx-a"]), &ApproveScope::All)
+                .is_err(),
+            "a context admin must not grant approve-all"
+        );
+
+        // A scoped grant requires the caller to hold each context.
+        let ctx_admin = context_admin_claims(&["ctx-a"]);
+        validate_approve_scope_grant(&ctx_admin, &ApproveScope::Contexts(vec!["ctx-a".into()]))
+            .expect("own context ok");
+        assert!(
+            validate_approve_scope_grant(&ctx_admin, &ApproveScope::Contexts(vec!["ctx-b".into()]))
+                .is_err(),
+            "foreign context must be rejected"
+        );
+
+        // `None` is always allowed; an empty context list is rejected.
+        validate_approve_scope_grant(&ctx_admin, &ApproveScope::None).expect("none ok");
+        assert!(
+            validate_approve_scope_grant(&ctx_admin, &ApproveScope::Contexts(vec![])).is_err(),
+            "empty scope must name a context or use all"
+        );
+    }
+
+    /// `--contexts ''` / `--approve-contexts ''` parse to `[""]`, not to `[]`
+    /// — verified against clap 4 rather than assumed. A one-element list of
+    /// the empty string cleared every `is_empty()` guard while naming no
+    /// context, and nothing on the ACL write path validated the id's shape.
+    /// A super admin hit this most easily: its authority check returns before
+    /// any per-context work.
+    #[test]
+    fn blank_context_ids_are_rejected_on_every_acl_write_path() {
+        let blank = vec![String::new()];
+
+        assert!(
+            validate_acl_modification(&super_admin_claims(), &Role::Reader, &blank).is_err(),
+            "a super admin must not store a context named empty-string"
+        );
+        assert!(
+            validate_acl_modification(&context_admin_claims(&["ctx-a"]), &Role::Reader, &blank)
+                .is_err(),
+            "nor may a context admin"
+        );
+        assert!(
+            validate_approve_scope_grant(
+                &super_admin_claims(),
+                &ApproveScope::Contexts(blank.clone())
+            )
+            .is_err(),
+            "an approve scope of [\"\"] names no context"
+        );
+
+        // Other malformed shapes go the same way, now that the write path
+        // validates at all.
+        for bad in ["/ctx", "ctx/", "a//b", "ev il"] {
+            assert!(
+                validate_acl_modification(&super_admin_claims(), &Role::Reader, &[bad.to_string()])
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+
+        // The legitimate shapes still pass, including the empty *list* that
+        // means super admin.
+        validate_acl_modification(&super_admin_claims(), &Role::Admin, &[])
+            .expect("admin + empty list is still how super admin is expressed");
+        validate_acl_modification(
+            &super_admin_claims(),
+            &Role::Reader,
+            &["acme/eng".to_string()],
+        )
+        .expect("a well-formed nested path is still accepted");
+    }
+}

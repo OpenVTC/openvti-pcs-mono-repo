@@ -1,0 +1,1068 @@
+//! CRUD helpers for [`super::Relationship`] over the
+//! `relationships:` + `relationships_by_did:` keyspaces.
+
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+use vtc_audit::AuditKey;
+use vti_common::error::AppError;
+use vti_common::pagination::{Cursor, Paginated, paginate};
+use vti_common::store::{Batch, KeyspaceHandle};
+
+use crate::credentials::lifecycle::LifecycleEventKind;
+
+use super::Relationship;
+
+/// Primary keyspace prefix. Each VRC lives at
+/// `relationships:<uuid>`.
+pub const RELATIONSHIPS_PREFIX: &[u8] = b"relationships:";
+
+/// Secondary-index prefix. Each `(did, vrc-id)` pair lives at
+/// `relationships_by_did:<did>:<vrc-id>` so a `prefix_iter` on
+/// `relationships_by_did:<did>:` lists only that DID's edges.
+pub const RELATIONSHIPS_BY_DID_PREFIX: &[u8] = b"relationships_by_did:";
+
+fn primary_key(id: Uuid) -> Vec<u8> {
+    let mut k = RELATIONSHIPS_PREFIX.to_vec();
+    k.extend_from_slice(id.to_string().as_bytes());
+    k
+}
+
+/// Digest-index prefix, in the **primary** keyspace so each row is written in
+/// the same store batch as the relationship it names:
+/// `relhash:<vrc-digest-multibase>` → the relationship id. What
+/// [`find_by_hash`] reads, so an idempotent publish is one lookup rather than
+/// a decode of every stored VRC (#2603). Disjoint from
+/// [`RELATIONSHIPS_PREFIX`], so no scan of relationships sees it.
+pub const RELATIONSHIP_HASH_PREFIX: &[u8] = b"relhash:";
+
+fn hash_key(vrc_digest_multibase: &str) -> Vec<u8> {
+    let mut k = RELATIONSHIP_HASH_PREFIX.to_vec();
+    k.extend_from_slice(vrc_digest_multibase.as_bytes());
+    k
+}
+
+fn index_key(did: &str, id: Uuid) -> Vec<u8> {
+    let mut k = RELATIONSHIPS_BY_DID_PREFIX.to_vec();
+    k.extend_from_slice(did.as_bytes());
+    k.push(b':');
+    k.extend_from_slice(id.to_string().as_bytes());
+    k
+}
+
+fn decode(bytes: &[u8]) -> Result<Relationship, AppError> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| AppError::Internal(format!("Relationship decode: {e}")))
+}
+
+/// Retrieve a relationship by id. `Ok(None)` if absent.
+pub async fn get_relationship(
+    primary: &KeyspaceHandle,
+    id: Uuid,
+) -> Result<Option<Relationship>, AppError> {
+    let raw = primary.get_raw(primary_key(id)).await?;
+    match raw {
+        Some(bytes) => Ok(Some(decode(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Store the row + write both secondary-index entries
+/// (issuer + subject). Writes are best-effort-CAS-paired —
+/// a crash between the primary write and the index writes
+/// leaves the primary row visible to `get_relationship` and
+/// invisible to per-DID list queries; the next list call's
+/// orphan-tolerant walk handles this without operator
+/// intervention.
+///
+/// The row and its digest-index row ([`find_by_hash`]) are one store batch in
+/// the primary keyspace, so a stored VRC is always found by its digest.
+pub async fn store_relationship(
+    primary: &KeyspaceHandle,
+    index: &KeyspaceHandle,
+    rel: &Relationship,
+) -> Result<(), AppError> {
+    let mut batch = Batch::new();
+    batch.insert(primary_key(rel.id), rel)?;
+    batch.insert_raw(
+        hash_key(&rel.vrc_digest_multibase),
+        rel.id.to_string().into_bytes(),
+    );
+    primary.apply_batch(batch).await?;
+    // Index entries store just the relationship id as the
+    // value — the primary keyspace holds the body. Storing
+    // the id explicitly (rather than relying on the key
+    // suffix) keeps the value self-describing for tooling.
+    let id_value = serde_json::json!({ "id": rel.id.to_string() });
+    index
+        .insert(
+            String::from_utf8(index_key(&rel.issuer_did, rel.id)).expect("ascii key"),
+            &id_value,
+        )
+        .await?;
+    if rel.subject_did != rel.issuer_did {
+        index
+            .insert(
+                String::from_utf8(index_key(&rel.subject_did, rel.id)).expect("ascii key"),
+                &id_value,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Delete the row + both index entries. Idempotent: deleting
+/// an absent row is a no-op (matches the rest of the
+/// workspace's storage helpers).
+pub async fn delete_relationship(
+    primary: &KeyspaceHandle,
+    index: &KeyspaceHandle,
+    id: Uuid,
+) -> Result<(), AppError> {
+    // Look up the row first so we know which index entries
+    // to clear. If the primary row is absent the caller
+    // path (route layer) should have 404'd already; we
+    // still walk best-effort to clean up any orphan index
+    // rows.
+    if let Some(rel) = get_relationship(primary, id).await? {
+        // A store batch rather than a plain remove, so it is ordered against a
+        // concurrent lifecycle update's conditional write — which then finds
+        // the row gone instead of writing it back after this delete.
+        let mut batch = Batch::new();
+        batch.remove(primary_key(id));
+        // Its digest row goes with it — only while it still names this edge.
+        let digest_row = hash_key(&rel.vrc_digest_multibase);
+        if primary.get_raw(digest_row.clone()).await? == Some(id.to_string().into_bytes()) {
+            batch.remove(digest_row);
+        }
+        primary.apply_batch(batch).await?;
+        index.remove(index_key(&rel.issuer_did, id)).await?;
+        if rel.subject_did != rel.issuer_did {
+            index.remove(index_key(&rel.subject_did, id)).await?;
+        }
+    } else {
+        primary.remove(primary_key(id)).await?;
+    }
+    Ok(())
+}
+
+/// How many times [`update_relationship_with`] re-reads a row another writer
+/// changed between its read and its conditional write. An attempt is lost only
+/// to another write to the same edge that was applied; the bound only stops a
+/// pathological stream of them from holding a caller forever.
+const UPDATE_ATTEMPTS: usize = 64;
+
+/// Read-modify-write one relationship row as a conditional store batch.
+///
+/// `modify` runs on the row as stored and returns whether it changed anything;
+/// the write applies only while the row is still the one read, and is retried
+/// against a fresh read otherwise — so two writers cannot each append to the
+/// copy they read and have the later silently drop the earlier's change, and a
+/// row deleted meanwhile is not written back. `Ok(None)` when there is no row.
+///
+/// Only the primary row is written: the secondary index carries just the edge
+/// id, which a lifecycle change never alters.
+async fn update_relationship_with<F, E>(
+    primary: &KeyspaceHandle,
+    id: Uuid,
+    mut modify: F,
+) -> Result<Option<Relationship>, E>
+where
+    F: FnMut(&mut Relationship) -> Result<bool, E>,
+    E: From<AppError>,
+{
+    let key = primary_key(id);
+    for _ in 0..UPDATE_ATTEMPTS {
+        let Some(raw) = primary.get_raw(key.clone()).await? else {
+            return Ok(None);
+        };
+        let mut rel = decode(&raw)?;
+        if !modify(&mut rel)? {
+            return Ok(Some(rel));
+        }
+        let mut batch = Batch::new();
+        batch
+            .require_unchanged(key.clone(), raw)
+            .insert(key.clone(), &rel)?;
+        if primary.apply_batch(batch).await?.is_applied() {
+            return Ok(Some(rel));
+        }
+    }
+    Err(AppError::Conflict(format!(
+        "VRC {id} kept changing while its lifecycle was being recorded"
+    ))
+    .into())
+}
+
+/// Why [`record_lifecycle_event`] did not record: the transition rules refused
+/// the event ([`LifecycleError`], typed so the caller picks a wire code from
+/// it, #2578), or something else failed — the edge is absent
+/// ([`AppError::NotFound`]), the row kept changing, or storage failed.
+#[derive(Debug, thiserror::Error)]
+pub enum LifecycleRecordError {
+    #[error(transparent)]
+    Refused(#[from] crate::credentials::lifecycle::LifecycleError),
+    #[error(transparent)]
+    Other(#[from] AppError),
+}
+
+impl From<LifecycleRecordError> for AppError {
+    fn from(e: LifecycleRecordError) -> Self {
+        match e {
+            LifecycleRecordError::Refused(e) => e.into(),
+            LifecycleRecordError::Other(e) => e,
+        }
+    }
+}
+
+/// Append a lifecycle event to one edge and persist the row.
+///
+/// A conditional read-modify-write of the primary row
+/// ([`update_relationship_with`]): the event is appended to the row as stored
+/// and written only while it is still that row, so of two events racing on
+/// one edge both are recorded in order or the later is refused by the
+/// transition rules against the earlier — never silently lost. The secondary
+/// index carries only the edge id, so it does not change here.
+///
+/// The transition rules (what may follow what, and that nothing follows a
+/// terminal event) are enforced by
+/// [`crate::credentials::lifecycle::LifecycleLog::record`], not here.
+/// Storage decides where the row goes; the vocabulary decides what is legal.
+///
+/// Returns the updated row so a caller can report the resolved state without a
+/// second read — and so it cannot report a state it did not persist.
+pub async fn record_lifecycle_event(
+    primary: &KeyspaceHandle,
+    _index: &KeyspaceHandle,
+    id: Uuid,
+    kind: LifecycleEventKind,
+    now: DateTime<Utc>,
+) -> Result<Relationship, LifecycleRecordError> {
+    update_relationship_with(primary, id, |rel| {
+        rel.lifecycle.record(kind.clone(), now)?;
+        Ok::<_, LifecycleRecordError>(true)
+    })
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("VRC {id} not found")).into())
+}
+
+/// Record that `by_digest` displaces every edge this issuer already holds to
+/// this subject, and return the ids that were displaced.
+///
+/// A second VRC from the same issuer to the same counterparty is a *version*
+/// of one assertion, not a second relationship: DTG Credentials requires an
+/// R-DID to be unique per counterparty, so the (issuer, subject) pair
+/// identifies the relationship and re-issuing to it is a renewal or a
+/// correction. Before this, both rows simply accumulated and the graph offered
+/// no way to tell which the issuer currently stood behind — three unreciprocated
+/// VRCs between two parties read as three live claims.
+///
+/// Rows that already carry a terminal event are skipped rather than refused: a
+/// third publish must not fail because the first was withdrawn last month, and
+/// [`crate::credentials::lifecycle::LifecycleLog::record`] would (correctly)
+/// refuse to append past a terminal
+/// state. Everything else is superseded, including rows that are merely
+/// expired or suspended — "this was replaced" is a more useful thing to have
+/// recorded than "this lapsed", and it is the true one.
+///
+/// Each edge is updated conditionally on its row as stored
+/// ([`update_relationship_with`]), and the terminal check is made against
+/// that row, so an edge withdrawn since the scan is skipped, not refused.
+pub async fn supersede_prior_edges(
+    primary: &KeyspaceHandle,
+    index: &KeyspaceHandle,
+    issuer_did: &str,
+    subject_did: &str,
+    except_id: Uuid,
+    by_digest: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<Uuid>, AppError> {
+    let mut superseded = Vec::new();
+    // Only the issuer's own edges, through the by-DID index — never a decode
+    // of every stored VRC on each publish (#2603).
+    for rel in edges_of(primary, index, issuer_did).await? {
+        if rel.id == except_id || rel.issuer_did != issuer_did || rel.subject_did != subject_did {
+            continue;
+        }
+        let mut recorded = false;
+        update_relationship_with::<_, AppError>(primary, rel.id, |rel| {
+            recorded = !rel.lifecycle.is_terminal();
+            if recorded {
+                rel.lifecycle.record(
+                    LifecycleEventKind::Superseded {
+                        by: by_digest.to_string(),
+                    },
+                    now,
+                )?;
+            }
+            Ok(recorded)
+        })
+        .await?;
+        if recorded {
+            superseded.push(rel.id);
+        }
+    }
+    Ok(superseded)
+}
+
+/// Find an existing relationship by VRC SHA-256 hash, through the
+/// `relhash:` digest index — one lookup, not a decode of every stored VRC
+/// (#2603). Used for idempotent publish: a second publish of the same VRC
+/// body returns the existing id. The row it names is checked against the
+/// digest, so a stale index row answers `None`, never another edge.
+pub async fn find_by_hash(
+    primary: &KeyspaceHandle,
+    vrc_digest_multibase: &str,
+) -> Result<Option<Relationship>, AppError> {
+    let Some(id) = primary.get_raw(hash_key(vrc_digest_multibase)).await? else {
+        return Ok(None);
+    };
+    let Some(id) = std::str::from_utf8(&id)
+        .ok()
+        .and_then(|s| Uuid::parse_str(s).ok())
+    else {
+        return Ok(None);
+    };
+    Ok(get_relationship(primary, id)
+        .await?
+        .filter(|rel| rel.vrc_digest_multibase == vrc_digest_multibase))
+}
+
+/// Rebuild the `relhash:` digest index from every stored relationship — at
+/// boot and after a restore, so rows written before the index existed are
+/// found by [`find_by_hash`]. Drops rows naming no edge with that digest.
+/// Returns how many index rows it wrote (0 when the index was whole).
+pub async fn rebuild_hash_index(primary: &KeyspaceHandle) -> Result<usize, AppError> {
+    // Where several edges share a digest, the first in key order is named —
+    // what `find_by_hash` answered when it scanned.
+    let mut wanted: std::collections::BTreeMap<String, Uuid> = std::collections::BTreeMap::new();
+    for rel in list_all(primary).await? {
+        wanted.entry(rel.vrc_digest_multibase).or_insert(rel.id);
+    }
+    let mut batch = Batch::new();
+    for (key, value) in primary
+        .prefix_iter_raw(RELATIONSHIP_HASH_PREFIX.to_vec())
+        .await?
+    {
+        let digest = String::from_utf8_lossy(&key[RELATIONSHIP_HASH_PREFIX.len()..]).into_owned();
+        match wanted.get(&digest) {
+            Some(id) if id.to_string().as_bytes() == value.as_slice() => {
+                wanted.remove(&digest);
+            }
+            Some(_) => {}
+            None => {
+                batch.remove(key);
+            }
+        }
+    }
+    let indexed = wanted.len();
+    for (digest, id) in wanted {
+        batch.insert_raw(hash_key(&digest), id.to_string().into_bytes());
+    }
+    if !batch.is_empty() {
+        primary.apply_batch(batch).await?;
+    }
+    Ok(indexed)
+}
+
+/// List **every** relationship (full primary-keyspace scan). For the admin
+/// connections-graph view, which needs the whole edge set at once. Communities
+/// are small enough (and the graph view is admin-only) that an unpaginated scan
+/// is acceptable here; the per-DID [`list_for_did`] stays the paginated path.
+pub async fn list_all(primary: &KeyspaceHandle) -> Result<Vec<Relationship>, AppError> {
+    let pairs = primary
+        .prefix_iter_raw(RELATIONSHIPS_PREFIX.to_vec())
+        .await?;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (_k, v) in pairs {
+        match decode(&v) {
+            Ok(rel) => out.push(rel),
+            Err(e) => tracing::warn!(error = %e, "skipping unparseable relationship row"),
+        }
+    }
+    Ok(out)
+}
+
+/// Paginated list of relationships where `did` is either
+/// issuer or subject. Walks the secondary index, then loads
+/// the primary rows lazily — orphan index entries (where the
+/// primary row is missing) are silently skipped. Cursor signed
+/// under `audit_key`, same pattern as other paginated listers.
+pub async fn list_for_did(
+    primary: &KeyspaceHandle,
+    index: &KeyspaceHandle,
+    audit_key: &AuditKey,
+    did: &str,
+    cursor: Option<&Cursor>,
+    limit: usize,
+) -> Result<Paginated<Relationship>, AppError> {
+    let mut index_prefix = RELATIONSHIPS_BY_DID_PREFIX.to_vec();
+    index_prefix.extend_from_slice(did.as_bytes());
+    index_prefix.push(b':');
+    let mut idx_pairs = index.prefix_iter_raw(index_prefix).await?;
+    idx_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    // Resolve each index entry to its primary row, dropping
+    // orphans. The paginate helper expects `(key, bytes)`
+    // pairs of the same shape it would see from a direct
+    // prefix scan of the primary keyspace; we synthesise
+    // that by re-using the index key (sortable by id) and
+    // packing the primary row's bytes.
+    let mut hydrated: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(idx_pairs.len());
+    for (idx_key, _idx_val) in idx_pairs {
+        // Extract the trailing UUID segment from the index key
+        // — last `:`-delimited piece.
+        let key_str = match std::str::from_utf8(&idx_key) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let Some(id_str) = key_str.rsplit(':').next() else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(id_str) else {
+            continue;
+        };
+        if let Some(raw) = primary.get_raw(primary_key(id)).await? {
+            // P0.11: the prefix `relationships_by_did:<did>:` also matches a
+            // *longer* DID that has `<did>` as a colon-delimited prefix —
+            // `did:webvh:scid:host` vs `did:webvh:scid:host:acme` — because
+            // `did:webvh` DIDs legitimately contain colons. Such a hydrated
+            // row belongs to a different DID, so post-filter on the actual
+            // edge endpoints before including it. Undecodable rows are skipped
+            // (orphan-tolerant, same as a missing primary row).
+            match decode(&raw) {
+                Ok(rel) if rel.issuer_did == did || rel.subject_did == did => {
+                    hydrated.push((idx_key, raw));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let snapshot_id: u64 = hydrated.len() as u64;
+    paginate(hydrated, cursor, limit, &audit_key.key, snapshot_id, decode)
+}
+
+/// Every edge `did` is an endpoint of, through the by-DID index, in id order.
+/// Post-filtered on the decoded endpoints for the `did:webvh` prefix caveat of
+/// [`list_for_did`].
+async fn edges_of(
+    primary: &KeyspaceHandle,
+    index: &KeyspaceHandle,
+    did: &str,
+) -> Result<Vec<Relationship>, AppError> {
+    let mut index_prefix = RELATIONSHIPS_BY_DID_PREFIX.to_vec();
+    index_prefix.extend_from_slice(did.as_bytes());
+    index_prefix.push(b':');
+    let mut out = Vec::new();
+    for idx_key in index.prefix_keys(index_prefix).await? {
+        let Some(Ok(id)) = std::str::from_utf8(&idx_key)
+            .ok()
+            .and_then(|s| s.rsplit(':').next())
+            .map(Uuid::parse_str)
+        else {
+            continue;
+        };
+        // An unreadable row is skipped, as `list_all` skips it.
+        if let Some(raw) = primary.get_raw(primary_key(id)).await?
+            && let Ok(rel) = decode(&raw)
+            && (rel.issuer_did == did || rel.subject_did == did)
+        {
+            out.push(rel);
+        }
+    }
+    Ok(out)
+}
+
+/// Counterparties this DID already has an edge to, as issuer, excluding
+/// `except_subject`.
+///
+/// Used to enforce the DTG Credentials requirement that an R-DID is unique per
+/// counterparty ("a new, unique R-DID for every single entity they connect
+/// with, even within the same community"). The community is the only party
+/// that can see a violation: each counterparty sees only its own edge.
+///
+/// Carries the same `did:webvh` prefix caveat as [`list_for_did`] — the index
+/// prefix `relationships_by_did:<did>:` also matches a longer DID that has
+/// `<did>` as a colon-delimited prefix, so rows are post-filtered on the
+/// decoded issuer.
+pub async fn issuer_counterparties_besides(
+    primary: &KeyspaceHandle,
+    index: &KeyspaceHandle,
+    issuer_did: &str,
+    except_subject: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut index_prefix = RELATIONSHIPS_BY_DID_PREFIX.to_vec();
+    index_prefix.extend_from_slice(issuer_did.as_bytes());
+    index_prefix.push(b':');
+
+    let mut others = Vec::new();
+    for (idx_key, _) in index.prefix_iter_raw(index_prefix).await? {
+        let Ok(key_str) = std::str::from_utf8(&idx_key) else {
+            continue;
+        };
+        let Some(id_str) = key_str.rsplit(':').next() else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(id_str) else {
+            continue;
+        };
+        let Some(raw) = primary.get_raw(primary_key(id)).await? else {
+            continue;
+        };
+        if let Ok(rel) = decode(&raw)
+            && rel.issuer_did == issuer_did
+            && rel.subject_did != except_subject
+            && !others.contains(&rel.subject_did)
+        {
+            others.push(rel.subject_did);
+        }
+    }
+    Ok(others)
+}
+
+/// The DIDs `did` holds an edge with, in either direction, that is in force at
+/// `now` — the directory's `connections` audience (VTI-DIR-023).
+///
+/// Only an edge keyed on `did` itself is read, so a pairwise edge between two
+/// relationship DIDs never counts for a membership DID: the community does not
+/// try to learn whom an R-DID belongs to. Same `did:webvh` prefix caveat as
+/// [`list_for_did`], answered the same way.
+pub async fn counterparties_in_force(
+    primary: &KeyspaceHandle,
+    index: &KeyspaceHandle,
+    did: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<std::collections::BTreeSet<String>, AppError> {
+    let mut index_prefix = RELATIONSHIPS_BY_DID_PREFIX.to_vec();
+    index_prefix.extend_from_slice(did.as_bytes());
+    index_prefix.push(b':');
+
+    let mut out = std::collections::BTreeSet::new();
+    for (idx_key, _) in index.prefix_iter_raw(index_prefix).await? {
+        let Ok(key_str) = std::str::from_utf8(&idx_key) else {
+            continue;
+        };
+        let Some(Ok(id)) = key_str.rsplit(':').next().map(Uuid::parse_str) else {
+            continue;
+        };
+        let Some(raw) = primary.get_raw(primary_key(id)).await? else {
+            continue;
+        };
+        let Ok(rel) = decode(&raw) else {
+            continue;
+        };
+        if !matches!(rel.in_force_at(now), super::InForce::Yes) {
+            continue;
+        }
+        if rel.issuer_did == did {
+            out.insert(rel.subject_did);
+        } else if rel.subject_did == did {
+            out.insert(rel.issuer_did);
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use vtc_audit::AuditKeyStore;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    async fn temp_kss() -> (KeyspaceHandle, KeyspaceHandle, AuditKey, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        })
+        .unwrap();
+        let primary = store.keyspace("relationships").unwrap();
+        let index = store.keyspace("relationships_by_did").unwrap();
+        let audit_key_ks = store.keyspace("audit_key").unwrap();
+        let key_store = AuditKeyStore::new(audit_key_ks);
+        key_store.ensure_initial(&[0xAB; 32]).await.unwrap();
+        let audit_key = key_store.active().await.unwrap();
+        (primary, index, audit_key, dir)
+    }
+
+    fn fresh(issuer: &str, subject: &str) -> Relationship {
+        let id = Uuid::new_v4();
+        Relationship {
+            id,
+            issuer_did: issuer.into(),
+            subject_did: subject.into(),
+            vrc_jsonld: serde_json::json!({
+                "type": ["VerifiableCredential", "DTGCredential", "RelationshipCredential"],
+                "issuer": issuer,
+                "issuerScope": "pairwise",
+                "credentialSubject": { "id": subject }
+            }),
+            vrc_digest_multibase: format!("{:x}", id.as_u128()),
+            created_at: Utc::now(),
+            persona: None,
+            lifecycle: Default::default(),
+        }
+    }
+
+    /// Terminal events racing on one live edge: exactly one is recorded and
+    /// every other is refused by the transition rules. A plain read-modify-
+    /// write let each append to its own copy and all but the last vanish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn racing_lifecycle_events_are_never_lost() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        for _ in 0..40 {
+            let rel = fresh("did:key:zA", "did:key:zB");
+            store_relationship(&primary, &index, &rel).await.unwrap();
+            let now = Utc::now();
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+            let mut tasks = Vec::new();
+            for i in 0..8 {
+                let (primary, index, barrier) = (primary.clone(), index.clone(), barrier.clone());
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    record_lifecycle_event(
+                        &primary,
+                        &index,
+                        rel.id,
+                        LifecycleEventKind::Withdrawn {
+                            reason: Some(format!("w{i}")),
+                        },
+                        now,
+                    )
+                    .await
+                    .is_ok()
+                }));
+            }
+            let mut ok = 0;
+            for t in tasks {
+                ok += t.await.unwrap() as usize;
+            }
+            let stored = get_relationship(&primary, rel.id).await.unwrap().unwrap();
+            assert_eq!(ok, 1, "{ok} terminal events reported recorded");
+            assert_eq!(stored.lifecycle.events().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn round_trip() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let rel = fresh("did:key:zA", "did:key:zB");
+        store_relationship(&primary, &index, &rel).await.unwrap();
+        let got = get_relationship(&primary, rel.id).await.unwrap().unwrap();
+        assert_eq!(got, rel);
+    }
+
+    #[tokio::test]
+    async fn rows_written_before_the_persona_field_still_decode() {
+        // #1067 added `persona` to an already-shipped row. Every edge in
+        // every live VTC predates it, so the field has to be optional on
+        // read, not merely optional on write — a bare `Option` without
+        // `#[serde(default)]` would fail here and take the whole
+        // relationships surface down on upgrade.
+        let raw = serde_json::json!({
+            "id": Uuid::new_v4().to_string(),
+            "issuerDid": "did:key:zA",
+            "subjectDid": "did:key:zB",
+            "vrcJsonld": { "type": ["VerifiableCredential"] },
+            "vrcDigestMultibase": "deadbeef",
+            "createdAt": "2026-01-01T00:00:00Z",
+        });
+        let rel = decode(raw.to_string().as_bytes()).expect("pre-#1067 row must decode");
+        assert!(rel.persona.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_edge() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let r1 = fresh("did:key:zA", "did:key:zB");
+        let r2 = fresh("did:key:zB", "did:key:zC");
+        store_relationship(&primary, &index, &r1).await.unwrap();
+        store_relationship(&primary, &index, &r2).await.unwrap();
+
+        let all = list_all(&primary).await.unwrap();
+        assert_eq!(all.len(), 2);
+        let ids: std::collections::HashSet<_> = all.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&r1.id) && ids.contains(&r2.id));
+    }
+
+    #[tokio::test]
+    async fn delete_clears_primary_and_index() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let rel = fresh("did:key:zA", "did:key:zB");
+        store_relationship(&primary, &index, &rel).await.unwrap();
+        delete_relationship(&primary, &index, rel.id).await.unwrap();
+        assert!(get_relationship(&primary, rel.id).await.unwrap().is_none());
+        // Index entries gone too.
+        let pairs = index
+            .prefix_iter_raw(RELATIONSHIPS_BY_DID_PREFIX.to_vec())
+            .await
+            .unwrap();
+        assert!(pairs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_for_issuer_returns_issued() {
+        let (primary, index, audit, _dir) = temp_kss().await;
+        let r1 = fresh("did:key:zA", "did:key:zB");
+        let r2 = fresh("did:key:zA", "did:key:zC");
+        let r3 = fresh("did:key:zX", "did:key:zY"); // unrelated
+        for r in [&r1, &r2, &r3] {
+            store_relationship(&primary, &index, r).await.unwrap();
+        }
+        let page = list_for_did(&primary, &index, &audit, "did:key:zA", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+        let dids: Vec<_> = page.items.iter().map(|r| r.id).collect();
+        assert!(dids.contains(&r1.id));
+        assert!(dids.contains(&r2.id));
+    }
+
+    #[tokio::test]
+    async fn list_for_subject_returns_received() {
+        let (primary, index, audit, _dir) = temp_kss().await;
+        let r1 = fresh("did:key:zA", "did:key:zSubject");
+        let r2 = fresh("did:key:zB", "did:key:zSubject");
+        let r3 = fresh("did:key:zC", "did:key:zOther");
+        for r in [&r1, &r2, &r3] {
+            store_relationship(&primary, &index, r).await.unwrap();
+        }
+        let page = list_for_did(&primary, &index, &audit, "did:key:zSubject", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_paginates_with_cursor() {
+        let (primary, index, audit, _dir) = temp_kss().await;
+        for _ in 0..10 {
+            let rel = fresh("did:key:zHub", &format!("did:key:z{}", Uuid::new_v4()));
+            store_relationship(&primary, &index, &rel).await.unwrap();
+        }
+        let page1 = list_for_did(&primary, &index, &audit, "did:key:zHub", None, 3)
+            .await
+            .unwrap();
+        assert_eq!(page1.items.len(), 3);
+        let cursor_str = page1.next_cursor.as_ref().expect("more pages");
+        let cursor = Cursor::decode(cursor_str, &audit.key).expect("decode cursor");
+        let page2 = list_for_did(&primary, &index, &audit, "did:key:zHub", Some(&cursor), 3)
+            .await
+            .unwrap();
+        assert_eq!(page2.items.len(), 3);
+        // No overlap between pages.
+        let ids1: std::collections::HashSet<_> = page1.items.iter().map(|r| r.id).collect();
+        for r in &page2.items {
+            assert!(!ids1.contains(&r.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn find_by_hash_returns_existing_row() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let mut rel = fresh("did:key:zA", "did:key:zB");
+        rel.vrc_digest_multibase = "deadbeef".into();
+        store_relationship(&primary, &index, &rel).await.unwrap();
+        let got = find_by_hash(&primary, "deadbeef").await.unwrap();
+        assert_eq!(got.map(|r| r.id), Some(rel.id));
+        let miss = find_by_hash(&primary, "feedface").await.unwrap();
+        assert!(miss.is_none());
+    }
+
+    /// #2603: the digest row is written in the row's own batch and goes with
+    /// it, so `find_by_hash` is one lookup and never names a deleted edge.
+    #[tokio::test]
+    async fn the_digest_index_follows_store_and_delete() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let rel = fresh("did:key:zA", "did:key:zB");
+        let before = primary.journal_seqno().unwrap();
+        store_relationship(&primary, &index, &rel).await.unwrap();
+        // The primary row and its digest row: one record in the primary
+        // keyspace (the by-DID rows are their own keyspace's writes after it).
+        assert!(primary.journal_seqno().unwrap() > before);
+        assert_eq!(
+            primary
+                .get_raw(hash_key(&rel.vrc_digest_multibase))
+                .await
+                .unwrap(),
+            Some(rel.id.to_string().into_bytes())
+        );
+        delete_relationship(&primary, &index, rel.id).await.unwrap();
+        assert!(
+            primary
+                .get_raw(hash_key(&rel.vrc_digest_multibase))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_by_hash(&primary, &rel.vrc_digest_multibase)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The index rows are not relationships: a full listing never sees one.
+        store_relationship(&primary, &index, &fresh("did:key:zC", "did:key:zD"))
+            .await
+            .unwrap();
+        assert_eq!(list_all(&primary).await.unwrap().len(), 1);
+    }
+
+    /// #2603: rows stored before the digest index existed are found after the
+    /// boot rebuild, and a stale index row is dropped.
+    #[tokio::test]
+    async fn the_rebuild_backfills_the_digest_index() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let old = fresh("did:key:zA", "did:key:zB");
+        // Written as an older version did: the row alone.
+        primary
+            .insert(String::from_utf8(primary_key(old.id)).unwrap(), &old)
+            .await
+            .unwrap();
+        primary
+            .insert_raw(hash_key("stale"), Uuid::new_v4().to_string().into_bytes())
+            .await
+            .unwrap();
+        assert!(
+            find_by_hash(&primary, &old.vrc_digest_multibase)
+                .await
+                .unwrap()
+                .is_none(),
+            "not indexed yet"
+        );
+        assert_eq!(rebuild_hash_index(&primary).await.unwrap(), 1);
+        assert_eq!(
+            find_by_hash(&primary, &old.vrc_digest_multibase)
+                .await
+                .unwrap()
+                .map(|r| r.id),
+            Some(old.id)
+        );
+        assert!(primary.get_raw(hash_key("stale")).await.unwrap().is_none());
+        // A second rebuild finds the index whole.
+        assert_eq!(rebuild_hash_index(&primary).await.unwrap(), 0);
+        let _ = index;
+    }
+
+    #[tokio::test]
+    async fn list_does_not_leak_colon_prefix_colliding_did() {
+        // P0.11: `did:webvh` DIDs contain colons, so the index scan for
+        // `did:webvh:s:h` would otherwise also match the keys of
+        // `did:webvh:s:h:x` (whose index keys share the scanned prefix),
+        // leaking another member's relationship rows.
+        let (primary, index, audit, _dir) = temp_kss().await;
+        let short = fresh("did:webvh:s:h", "did:key:zPeer");
+        let long = fresh("did:webvh:s:h:x", "did:key:zPeer2");
+        store_relationship(&primary, &index, &short).await.unwrap();
+        store_relationship(&primary, &index, &long).await.unwrap();
+
+        // Querying the shorter DID must return only its own edge.
+        let page = list_for_did(&primary, &index, &audit, "did:webvh:s:h", None, 10)
+            .await
+            .unwrap();
+        let ids: Vec<_> = page.items.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![short.id], "must return only the exact DID's edge");
+        assert!(
+            !ids.contains(&long.id),
+            "colon-extended DID's edge must not leak"
+        );
+
+        // …and the longer DID still finds its own edge.
+        let page_long = list_for_did(&primary, &index, &audit, "did:webvh:s:h:x", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            page_long.items.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![long.id]
+        );
+    }
+
+    // ─── Lifecycle (#1079) ──────────────────────────────
+
+    #[tokio::test]
+    async fn a_recorded_event_survives_the_round_trip() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let rel = fresh("did:key:zA", "did:key:zB");
+        store_relationship(&primary, &index, &rel).await.unwrap();
+
+        let now = Utc::now();
+        let updated = record_lifecycle_event(
+            &primary,
+            &index,
+            rel.id,
+            LifecycleEventKind::Suspended {
+                reason: Some("under review".into()),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.lifecycle.events().len(), 1);
+
+        // Read back from storage, not from the returned value — the point is
+        // that the append was persisted, not that the in-memory row changed.
+        let stored = get_relationship(&primary, rel.id).await.unwrap().unwrap();
+        assert_eq!(stored.lifecycle, updated.lifecycle);
+        assert!(!stored.in_force_at(now).is_in_force());
+    }
+
+    /// The transition rules live in the vocabulary, not in storage — but a
+    /// refusal has to reach the caller *and* leave the row untouched, or a
+    /// rejected request would still have mutated the graph.
+    #[tokio::test]
+    async fn an_illegal_transition_is_refused_and_writes_nothing() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let rel = fresh("did:key:zA", "did:key:zB");
+        store_relationship(&primary, &index, &rel).await.unwrap();
+        let now = Utc::now();
+
+        let err = record_lifecycle_event(
+            &primary,
+            &index,
+            rel.id,
+            LifecycleEventKind::Restored { reason: None },
+            now,
+        )
+        .await
+        .expect_err("nothing is suspended");
+        assert!(
+            matches!(
+                err,
+                LifecycleRecordError::Refused(
+                    crate::credentials::lifecycle::LifecycleError::NotSuspended
+                )
+            ),
+            "{err:?}"
+        );
+
+        let stored = get_relationship(&primary, rel.id).await.unwrap().unwrap();
+        assert!(stored.lifecycle.is_empty(), "a refusal must not append");
+    }
+
+    #[tokio::test]
+    async fn recording_against_an_absent_edge_is_a_404() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let err = record_lifecycle_event(
+            &primary,
+            &index,
+            Uuid::new_v4(),
+            LifecycleEventKind::Suspended { reason: None },
+            Utc::now(),
+        )
+        .await
+        .expect_err("no such edge");
+        assert!(
+            matches!(err, LifecycleRecordError::Other(AppError::NotFound(_))),
+            "{err:?}"
+        );
+    }
+
+    /// Re-issuing to the same counterparty displaces the earlier edge. The
+    /// (issuer, subject) pair is the relationship — DTG Credentials makes an
+    /// R-DID unique per counterparty — so the later credential is a new
+    /// version of one assertion, not a second one.
+    #[tokio::test]
+    async fn a_reissue_supersedes_the_earlier_edge_to_the_same_counterparty() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let old = fresh("did:key:zA", "did:key:zB");
+        let replacement = fresh("did:key:zA", "did:key:zB");
+        // An edge to a *different* counterparty, and one in the other
+        // direction: neither is displaced by this publication.
+        let other_subject = fresh("did:key:zA", "did:key:zC");
+        let reciprocal = fresh("did:key:zB", "did:key:zA");
+        for r in [&old, &replacement, &other_subject, &reciprocal] {
+            store_relationship(&primary, &index, r).await.unwrap();
+        }
+
+        let now = Utc::now();
+        let displaced = supersede_prior_edges(
+            &primary,
+            &index,
+            "did:key:zA",
+            "did:key:zB",
+            replacement.id,
+            "zNewDigest",
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(displaced, vec![old.id]);
+
+        let stored = get_relationship(&primary, old.id).await.unwrap().unwrap();
+        assert!(!stored.in_force_at(now).is_in_force());
+        for untouched in [replacement.id, other_subject.id, reciprocal.id] {
+            let r = get_relationship(&primary, untouched)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                r.lifecycle.is_empty(),
+                "only the edge to the same counterparty is displaced"
+            );
+        }
+    }
+
+    /// A third publish must not fail because the first was withdrawn last
+    /// month. Terminal rows are skipped, not refused — `record` would
+    /// (correctly) reject an append past a terminal state, and letting that
+    /// error escape would make an unrelated publish fail.
+    #[tokio::test]
+    async fn supersession_skips_an_edge_that_is_already_terminal() {
+        let (primary, index, _audit, _dir) = temp_kss().await;
+        let mut already = fresh("did:key:zA", "did:key:zB");
+        let earlier = Utc::now() - chrono::Duration::days(1);
+        already
+            .lifecycle
+            .record(
+                LifecycleEventKind::Superseded {
+                    by: "zFirstReplacement".into(),
+                },
+                earlier,
+            )
+            .unwrap();
+        store_relationship(&primary, &index, &already)
+            .await
+            .unwrap();
+
+        let displaced = supersede_prior_edges(
+            &primary,
+            &index,
+            "did:key:zA",
+            "did:key:zB",
+            Uuid::new_v4(),
+            "zSecondReplacement",
+            Utc::now(),
+        )
+        .await
+        .expect("a terminal row must not fail the publish");
+        assert!(displaced.is_empty());
+
+        let stored = get_relationship(&primary, already.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.lifecycle.events().len(),
+            1,
+            "the original displacement record is not overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_loop_writes_one_index_entry() {
+        // Edge case: issuer == subject. We only write one
+        // index entry so list_for_did returns the row once.
+        let (primary, index, audit, _dir) = temp_kss().await;
+        let rel = fresh("did:key:zSelf", "did:key:zSelf");
+        store_relationship(&primary, &index, &rel).await.unwrap();
+        let page = list_for_did(&primary, &index, &audit, "did:key:zSelf", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1, "self-edge must list once, not twice");
+    }
+}

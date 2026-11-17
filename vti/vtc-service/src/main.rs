@@ -1,0 +1,1295 @@
+// jemalloc as the global allocator (the `jemalloc` feature, on by default).
+// glibc malloc keeps freed pages in its arenas rather than returning them, so
+// RSS ratchets to the high-water mark and never falls back — indistinguishable
+// from a leak on a memory graph. jemalloc purges freed pages back to the OS.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc tuning, read by jemalloc itself at startup via this well-known symbol.
+///
+/// `background_thread:true` runs the purger on its own thread, so freed pages
+/// are returned even while the process is idle (without it, purging only
+/// happens as a side effect of later allocator calls). `dirty_decay_ms` /
+/// `muzzy_decay_ms` are how long freed pages linger before being returned;
+/// 5s (default 10s) keeps RSS close to the live heap at negligible cost for an
+/// I/O-bound service.
+///
+/// The name is `_rjem_malloc_conf`, not `malloc_conf`: `tikv-jemalloc-sys`
+/// builds jemalloc with the `_rjem_` symbol prefix, so an unprefixed
+/// `malloc_conf` would be silently ignored.
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. This is the name jemalloc documents for
+/// exactly this, it is defined once (in the binary, never the library), and
+/// the value is the NUL-terminated static string jemalloc expects. The type is a
+/// reference to a fixed-size array, a thin pointer matching jemalloc's
+/// `const char *malloc_conf`; a `&[u8]` slice reference would be two words.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+// Module tree is declared in lib.rs (so integration tests under
+// `tests/` can pull the same modules the binary uses). Re-import the
+// pieces this binary needs at the top level.
+use vtc_service::store::keyspaces;
+use vtc_service::{acl_cli, config, did_key, keys, server, status, store, sync_jobs_cli};
+#[cfg(feature = "setup")]
+use vtc_service::{emergency, setup};
+
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use config::{AppConfig, LogFormat};
+use keys::seed_store::create_secret_store;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "vtc", about = "Verifiable Trust Community", version)]
+struct Cli {
+    /// Path to the configuration file
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the setup wizard.
+    ///
+    /// Without arguments, prompts interactively. With `--from <file>`,
+    /// reads a TOML setup-inputs file and provisions end-to-end without
+    /// prompts — suitable for CI, immutable images, or any unattended
+    /// bring-up. See `docs/03-vtc/examples/vtc-setup.example.toml` for
+    /// the worked schema.
+    ///
+    /// For a fully headless (no-TTY) bring-up, setup is two-phase — the
+    /// same shape the mediator and did-hosting services use:
+    ///
+    /// 1. `--setup-key-out <path>` mints an ephemeral did:key, persists
+    ///    it (0600), and prints the `pnm contexts create … --admin-did`
+    ///    command. An operator (or a CI step holding VTA admin) runs that
+    ///    to enrol the setup DID at the VTA. Exits without touching
+    ///    anything else.
+    /// 2. `--from <toml>` (with `setup_key_file` pointing at that path)
+    ///    provisions end-to-end using the now-authorised key.
+    Setup {
+        /// Path to a TOML setup-inputs file. When set, setup runs
+        /// non-interactively. The ephemeral setup key it references
+        /// (`setup_key_file`) must already be ACL-authorised at the VTA.
+        #[arg(long, conflicts_with = "setup_key_out")]
+        from: Option<PathBuf>,
+        /// Phase 1: mint an ephemeral did:key, persist it to <path>
+        /// (0600), print the `pnm contexts create --admin-did` grant
+        /// command, and exit. Does not touch config or the VTA.
+        #[arg(long, conflicts_with = "from")]
+        setup_key_out: Option<PathBuf>,
+        /// Context id used only to render phase 1's printed grant
+        /// command. Must match `context` in the phase-2 setup TOML.
+        #[arg(long, default_value = "default", requires = "setup_key_out")]
+        context: String,
+        /// Run the community in single-administrator mode (VTI-APV-022): every
+        /// administrator is one person, under as many identifiers as they
+        /// hold, so wherever another administrator's consent would be asked,
+        /// the requester's passkey gesture bound to the operation authorizes
+        /// it instead.
+        /// Writes `[acl] single_admin_mode = true` to config.toml; with
+        /// `--from`, the same as `single_admin_mode = true` in the file.
+        #[arg(long, conflicts_with = "setup_key_out")]
+        single_admin: bool,
+    },
+    /// Show VTC status and statistics
+    Status,
+    /// Create a did:key (offline, no server required)
+    CreateDidKey {
+        /// Also create an ACL entry with Admin role for the new DID
+        #[arg(long)]
+        admin: bool,
+        /// Human-readable label for the ACL entry
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Operator-level recovery + administration (offline)
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
+    /// Manage ACL entries (offline — run on a **stopped** daemon)
+    Acl {
+        #[command(subcommand)]
+        command: AclCommands,
+    },
+    /// Triage the trust-registry membership-sync queue (offline — run on
+    /// a **stopped** daemon).
+    ///
+    /// A sync job that has flipped to `Failed` is terminal: the syncer
+    /// skips it on every tick, boot recovery rescues only `InFlight` rows,
+    /// and nothing re-derives it — so the member it carries stays absent
+    /// (or stale) in the trust registry until an operator acts, or until
+    /// the retention sweeper purges the row and the failure becomes
+    /// invisible without becoming fixed.
+    ///
+    /// `list` shows what failed and why; `retry` is the only thing that
+    /// re-drives a failed row; `discard` drops one that should not be.
+    ///
+    /// Sits beside `acl` rather than under `admin` because it is plain
+    /// store access with no setup machinery behind it — `admin` is gated
+    /// on the `setup` feature, and queue triage should not disappear from
+    /// a `--no-default-features` build.
+    SyncJobs {
+        #[command(subcommand)]
+        command: SyncJobCommands,
+    },
+    /// The OpenID4VP verifier identities this VTC presents to wallets
+    /// (offline — run on a **stopped** daemon).
+    ///
+    /// A swiyu or EUDI wallet presents credentials to a verifier it can
+    /// identify, signed with a key the VTA minted for that identity. The key
+    /// reaches this VTC by a sealed hand-off: `request` writes a request,
+    /// `pnm keys bundle` (swiyu) or `pnm keys bundle-key` (EUDI) seals the key
+    /// to it, `install` stores it encrypted. An EUDI identity then needs its
+    /// access certificate: `csr`, then `certificate`.
+    Oid4vp {
+        #[command(subcommand)]
+        command: Oid4vpCommands,
+    },
+    /// This VTC's own keys (offline — run on a **stopped** daemon).
+    ///
+    /// When the VTA rotates a did:webs VTC's key (`pnm webs rotate`), the VTC
+    /// takes over the new keys by a sealed hand-off: `request` writes a
+    /// request, `pnm keys bundle <context> --recipient <request>` seals the
+    /// keys to it, `refresh` checks them against the VTC's resolved document
+    /// and stores them.
+    Keys {
+        #[command(subcommand)]
+        command: KeysCommands,
+    },
+    /// The admin console's files (offline).
+    ///
+    /// To customise the console's look and feel, export it to a directory,
+    /// edit it there, and set `admin_ui.mode = "directory"` and
+    /// `admin_ui.dir` in config.toml. The daemon then serves that
+    /// directory instead of the console built into the binary. The member
+    /// portal works the same way (`--members`, `admin_ui.members_dir`).
+    AdminUi {
+        #[command(subcommand)]
+        command: AdminUiCommands,
+    },
+    /// The public landing page's files (offline).
+    ///
+    /// To give the community its own landing page, export the built-in one
+    /// to a directory, edit it there, and set `website.landing_dir` in
+    /// config.toml. The daemon serves that directory at `/` instead of the
+    /// page built into the binary, re-reading it on every request — no
+    /// rebuild, no restart, no second host.
+    Website {
+        #[command(subcommand)]
+        command: WebsiteCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebsiteCommands {
+    /// Write the landing page built into this binary to a new or empty
+    /// directory.
+    Export {
+        /// Directory to write into. Created if missing; refused if it
+        /// already holds anything.
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminUiCommands {
+    /// Write the console built into this binary to a new or empty directory.
+    Export {
+        /// Directory to write into. Created if missing; refused if it
+        /// already holds anything.
+        dir: PathBuf,
+        /// Export the member portal (`/members`) instead of the admin
+        /// console; serve it with `admin_ui.members_dir`.
+        #[arg(long)]
+        members: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCommands {
+    /// Write a sealed-transfer request for this VTC's current keys, and keep
+    /// its private half here until `refresh`.
+    Request {
+        /// Write the request here instead of to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Open the bundle `pnm keys bundle <context>` sealed to the request,
+    /// check its keys against this VTC's resolved did:webs document, and
+    /// store them in place of the keys the VTA rotated out.
+    Refresh {
+        /// The armored bundle file.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// The digest `pnm keys bundle` printed, carried here separately.
+        #[arg(long)]
+        digest: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum Oid4vpCommands {
+    /// Write a sealed-transfer request for a verifier identity's key, and keep
+    /// its private half here until `install`.
+    Request {
+        /// Your name for the identity, e.g. `swiyu`.
+        #[arg(long)]
+        identity: String,
+        /// Write the request here instead of to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Open the sealed bundle `pnm keys bundle` (a swiyu DID's keys) or
+    /// `pnm keys bundle-key` (an EUDI identity's key) produced for the
+    /// request and store the identity's request-signing key, encrypted.
+    Install {
+        #[arg(long)]
+        identity: String,
+        /// The armored bundle file.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// The digest `pnm keys bundle` printed, carried here separately.
+        #[arg(long)]
+        digest: String,
+        /// The verification method that signs request objects, when the
+        /// bundle holds more than one P-256 key.
+        #[arg(long)]
+        kid: Option<String>,
+    },
+    /// Record a verifier identity whose key the VTA keeps: every request
+    /// object is signed there, through `keys/sign-jws`, and this VTC holds no
+    /// private key. The VTC's DID needs `sign-jws` in the key's context at the
+    /// VTA.
+    Attach {
+        #[arg(long)]
+        identity: String,
+        /// The key's id at the VTA (`pnm keys list`); a P-256 key.
+        #[arg(long)]
+        vta_key: String,
+        /// The key's public half, multibase (`zDn…`), as `pnm keys list`
+        /// shows it. Every JWS the VTA returns must verify under it.
+        #[arg(long)]
+        public_key: String,
+        /// A swiyu identity's DID. Omitted: an EUDI identity, known by the
+        /// access certificate `vtc oid4vp certificate` installs.
+        #[arg(long, requires = "kid")]
+        did: Option<String>,
+        /// The verification method of `--did` that is this key.
+        #[arg(long, requires = "did")]
+        kid: Option<String>,
+    },
+    /// Write a certificate signing request for an EUDI identity's key, signed
+    /// by it, for your registrar to issue the access certificate from.
+    Csr {
+        #[arg(long)]
+        identity: String,
+        /// The certificate's common name.
+        #[arg(long)]
+        common_name: String,
+        #[arg(long)]
+        organization: Option<String>,
+        /// The organisation's registered identifier (2.5.4.97), e.g.
+        /// `VATDE-123456789`.
+        #[arg(long)]
+        organization_identifier: Option<String>,
+        /// ISO 3166-1 alpha-2 country code.
+        #[arg(long)]
+        country: Option<String>,
+        /// A DNS name for the subject alternative name; repeatable.
+        #[arg(long = "dns")]
+        dns_names: Vec<String>,
+        /// Write the PEM request here instead of to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Install the access certificate chain the registrar issued for an EUDI
+    /// identity (PEM, leaf first), and optionally its registration
+    /// certificate.
+    Certificate {
+        #[arg(long)]
+        identity: String,
+        /// PEM file: the access certificate, then each issuer in turn.
+        #[arg(long)]
+        chain: PathBuf,
+        /// The registration certificate, carried in every request's
+        /// `verifier_info`.
+        #[arg(long, requires = "registration_format")]
+        registration_certificate: Option<PathBuf>,
+        /// The `verifier_info` format identifier the wallet ecosystem gives the
+        /// registration certificate.
+        #[arg(long, requires = "registration_certificate")]
+        registration_format: Option<String>,
+    },
+    /// Install the trust statements the swiyu trust registry issued about a
+    /// swiyu identity — its identity trust statement and any protected
+    /// verification authorization — carried in every request's
+    /// `verifier_info`. Each replaces the one of its kind it renews.
+    TrustStatement {
+        #[arg(long)]
+        identity: String,
+        /// A file holding one statement, a compact JWT; repeatable.
+        #[arg(long = "file", required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// List the installed verifier identities.
+    List,
+    /// Remove a verifier identity and its key.
+    Remove {
+        #[arg(long)]
+        identity: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclCommands {
+    /// List every ACL entry.
+    List,
+    /// Add or update the ACL entry for a DID.
+    Add {
+        /// The subject DID the entry grants a role to.
+        #[arg(long)]
+        did: String,
+        /// Community role: admin | moderator | issuer | member | custom:<name>.
+        #[arg(long, default_value = "member")]
+        role: String,
+        /// Human-readable label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Refused: a community holds no contexts (VTI-VTC-010). Kept so an
+        /// old script fails loudly rather than being misread.
+        #[arg(long, value_delimiter = ',', hide = true)]
+        contexts: Vec<String>,
+        /// Administrative role: community-admin | moderator | vetting-lead |
+        /// repo-manager | credential-officer | auditor | approver | none.
+        /// Omitted: the one the community role implies (admin →
+        /// community-admin, moderator → moderator, issuer →
+        /// credential-officer, anything else → none).
+        #[arg(long)]
+        admin_role: Option<String>,
+        /// Narrow the administrative role to this capability, optionally at
+        /// a resource (`git.repo.manage@git-ns:github.com/acme`). Repeatable.
+        /// Omitted: the role's full ceiling.
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        /// Expiry in seconds from now (omit for no expiry).
+        #[arg(long)]
+        expires: Option<u64>,
+    },
+    /// Remove the ACL entry for a DID.
+    Remove {
+        /// The subject DID whose entry to delete.
+        #[arg(long)]
+        did: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommands {
+    /// Reset the install carve-out via the VTA's recovery path.
+    ///
+    /// Run on a **stopped** daemon. Authenticates against the VTA
+    /// using a fresh ephemeral DID the operator authorizes at the
+    /// VTA, then clears every admin ACL entry and admin sister
+    /// record locally and mints a fresh install URL the operator
+    /// can claim with a new passkey. The daemon's next boot emits
+    /// a loud `EmergencyBootstrapInvoked` audit event.
+    ///
+    /// Replaces the BIP-39-mnemonic-based recovery from M0.10's
+    /// initial implementation; see `tasks/vtc-mvp/vta-driven-keys.md`
+    /// §4 for the design.
+    EmergencyBootstrap {
+        /// Skip the "are you sure?" confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// VTA context the recovery DID should be authorized into.
+        /// Defaults to the value persisted in `config.toml`.
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Mint a fresh single-use install URL inviting another administrator.
+    ///
+    /// Run on a **stopped** daemon (fjall lock). Two kinds:
+    ///
+    /// - **No `--did`: a passkey invitation.** The invitee registers a
+    ///   passkey (`vtc/install/claim/passkey/{start,finish}/0.1`), and their
+    ///   administrator DID is the `did:key` of that passkey's own key. The
+    ///   token names no DID and no ACL entry is written now: the daemon writes
+    ///   the derived DID's entry when the claim completes, with the authority
+    ///   recorded on the invitation (a community administrator).
+    /// - **`--did X`: a wallet invitation.** The token names X, whose holder
+    ///   claims it with their wallet by signing as X
+    ///   (`vtc/install/claim/{start,finish}/0.3`). X is granted an admin ACL
+    ///   entry now if it holds none; this is idempotent.
+    ///
+    /// Non-destructive to existing admins and passkeys, unlike
+    /// `emergency-bootstrap`.
+    Invite {
+        /// The DID to invite, claimed with its wallet. Leave it out to invite
+        /// by passkey, whose own key becomes the administrator's DID.
+        #[arg(long)]
+        did: Option<String>,
+        /// Token TTL in seconds (default: 900 = 15 min).
+        #[arg(long, default_value_t = 900)]
+        ttl: u64,
+    },
+    /// Mint an invite for `--did` to enrol a step-up approver (offline).
+    ///
+    /// Run on a **stopped** daemon (fjall lock). The route for a community
+    /// whose administrators are all wallet-only and hold no step-up factor
+    /// (approver design note §6e, R4): it mints the same invite an
+    /// administrator would issue — a URL carrying a single-use token, and a
+    /// claim code to deliver over a separate channel — rather than writing a
+    /// factor directly, so the subject still signs the redemption with their
+    /// own DID and their approver still proves possession. The daemon audits
+    /// the invite as a break-glass at its next start (VTI-APV-016).
+    EnrolApprover {
+        /// The member DID the approver will be bound to.
+        #[arg(long)]
+        did: String,
+        /// Invite TTL in seconds (default: 900 = 15 min; at most 86400).
+        #[arg(long, default_value_t = 900)]
+        ttl: u64,
+    },
+    /// Recover from a backup import interrupted mid-flight (offline,
+    /// irreversible).
+    ///
+    /// The daemon refuses to boot while a backup import's crash-safety
+    /// sentinel is set — a crash, a client disconnect, or a
+    /// `finalize-import` that never landed can leave the backed-up
+    /// keyspaces partially cleared and partially replayed, and that
+    /// refusal has no expiry (its boot-refusal message names this
+    /// command). This does NOT restore anything: it wipes every
+    /// backed-up keyspace back to empty and clears the sentinel so the
+    /// daemon can boot again. If the original backup bundle is still at
+    /// hand, prefer re-running `cnm backup import` with it instead — that
+    /// finishes the restore rather than discarding it.
+    DiscardInterruptedImport {
+        /// Skip the "are you sure?" confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncJobCommands {
+    /// List failed sync jobs — job id, kind, member DID, and the
+    /// registry's verbatim error.
+    List {
+        /// Include pending, in-flight and complete rows, not just failed.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Requeue a failed job for immediate dispatch.
+    ///
+    /// Fix the cause first — a retry against an unchanged registry just
+    /// fails again. An error naming `unsupportedType` means the deployed
+    /// trust registry does not route that Trust Task at all; upgrade the
+    /// registry before retrying.
+    Retry {
+        /// The job to requeue, from `sync-jobs list`.
+        #[arg(long, conflicts_with = "all")]
+        job_id: Option<String>,
+        /// Requeue every failed job. Use when one cause broke them all.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Delete a failed job without dispatching it. The registry's record
+    /// for that member is left exactly as it is.
+    Discard {
+        /// The job to delete, from `sync-jobs list`.
+        #[arg(long)]
+        job_id: String,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    // Pin rustls to the aws-lc-rs backend before any TLS object is built;
+    // see `vta_sdk::crypto_init`. Without this, rustls 0.23 panics on
+    // backend auto-detection when both backends are compiled in.
+    vta_sdk::crypto_init::install_default_crypto_provider();
+
+    let cli = Cli::parse();
+
+    // Same reasoning as the VTA: `[secrets] backend` picks the store and is not
+    // known this early, so this reports rather than exits. See
+    // `warn_store_unavailable`.
+    #[cfg(feature = "keyring")]
+    vta_sdk::keyring_init::warn_store_unavailable("vtc");
+
+    print_banner();
+
+    match cli.command {
+        Some(Commands::Setup {
+            from,
+            setup_key_out,
+            context,
+            single_admin,
+        }) => {
+            #[cfg(feature = "setup")]
+            {
+                let result = match (setup_key_out, from) {
+                    (Some(out), _) => setup::run_setup_phase1(&out, &context).await,
+                    (None, Some(path)) => setup::run_setup_from_file(path, single_admin).await,
+                    (None, None) => setup::run_setup_wizard(cli.config, single_admin).await,
+                };
+                if let Err(e) = result {
+                    eprintln!("Setup failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(feature = "setup"))]
+            {
+                let _ = (from, setup_key_out, context, single_admin);
+                eprintln!("Setup wizard not available (compiled without 'setup' feature)");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Status) => {
+            if let Err(e) = status::run_status(cli.config).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::CreateDidKey { admin, label }) => {
+            let args = did_key::CreateDidKeyArgs {
+                config_path: cli.config,
+                admin,
+                label,
+            };
+            if let Err(e) = did_key::run_create_did_key(args).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Admin { command }) => {
+            #[cfg(feature = "setup")]
+            {
+                match command {
+                    AdminCommands::EmergencyBootstrap { yes, context } => {
+                        if let Err(e) = run_emergency_bootstrap_cli(cli.config, yes, context).await
+                        {
+                            eprintln!("Emergency bootstrap failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    AdminCommands::Invite { did, ttl } => {
+                        if let Err(e) = run_invite_cli(cli.config, did, ttl).await {
+                            eprintln!("Invite failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    AdminCommands::EnrolApprover { did, ttl } => {
+                        if let Err(e) = run_enrol_approver_cli(cli.config, did, ttl).await {
+                            eprintln!("Approver invite failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    AdminCommands::DiscardInterruptedImport { yes } => {
+                        if let Err(e) = run_discard_interrupted_import_cli(cli.config, yes).await {
+                            eprintln!("Discard failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "setup"))]
+            {
+                let _ = command;
+                eprintln!("admin subcommands are unavailable (compiled without 'setup')");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Acl { command }) => {
+            let result = match command {
+                AclCommands::List => acl_cli::run_acl_list(cli.config).await,
+                AclCommands::Add {
+                    did,
+                    role,
+                    label,
+                    contexts,
+                    admin_role,
+                    capabilities,
+                    expires,
+                } => {
+                    acl_cli::run_acl_add(acl_cli::AclAddArgs {
+                        config_path: cli.config,
+                        did,
+                        role,
+                        label,
+                        contexts,
+                        admin_role,
+                        capabilities,
+                        expires,
+                    })
+                    .await
+                }
+                AclCommands::Remove { did } => acl_cli::run_acl_remove(cli.config, did).await,
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::SyncJobs { command }) => {
+            let result = match command {
+                SyncJobCommands::List { all } => sync_jobs_cli::run_list(cli.config, all).await,
+                SyncJobCommands::Retry { job_id, all } => {
+                    sync_jobs_cli::run_retry(cli.config, job_id, all).await
+                }
+                SyncJobCommands::Discard { job_id } => {
+                    sync_jobs_cli::run_discard(cli.config, job_id).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Keys { command }) => {
+            use vtc_service::keys_cli;
+            let result = match command {
+                KeysCommands::Request { out } => keys_cli::run_request(cli.config, out).await,
+                KeysCommands::Refresh { bundle, digest } => {
+                    keys_cli::run_refresh(cli.config, bundle, digest).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Oid4vp { command }) => {
+            use vtc_service::oid4vp_cli;
+            let result = match command {
+                Oid4vpCommands::Request { identity, out } => {
+                    oid4vp_cli::run_request(cli.config, identity, out).await
+                }
+                Oid4vpCommands::Install {
+                    identity,
+                    bundle,
+                    digest,
+                    kid,
+                } => oid4vp_cli::run_install(cli.config, identity, bundle, digest, kid).await,
+                Oid4vpCommands::Attach {
+                    identity,
+                    vta_key,
+                    public_key,
+                    did,
+                    kid,
+                } => {
+                    oid4vp_cli::run_attach(cli.config, identity, vta_key, public_key, did.zip(kid))
+                        .await
+                }
+                Oid4vpCommands::Csr {
+                    identity,
+                    common_name,
+                    organization,
+                    organization_identifier,
+                    country,
+                    dns_names,
+                    out,
+                } => {
+                    let subject = vtc_service::oid4vp::x509::CsrSubject {
+                        common_name,
+                        organization,
+                        organization_identifier,
+                        country,
+                        dns_names,
+                    };
+                    oid4vp_cli::run_csr(cli.config, identity, subject, out).await
+                }
+                Oid4vpCommands::Certificate {
+                    identity,
+                    chain,
+                    registration_certificate,
+                    registration_format,
+                } => {
+                    oid4vp_cli::run_certificate(
+                        cli.config,
+                        identity,
+                        chain,
+                        registration_certificate.zip(registration_format),
+                    )
+                    .await
+                }
+                Oid4vpCommands::TrustStatement { identity, files } => {
+                    oid4vp_cli::run_trust_statement(cli.config, identity, files).await
+                }
+                Oid4vpCommands::List => oid4vp_cli::run_list(cli.config).await,
+                Oid4vpCommands::Remove { identity } => {
+                    oid4vp_cli::run_remove(cli.config, identity).await
+                }
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Website { command }) => {
+            #[cfg(feature = "website")]
+            {
+                let WebsiteCommands::Export { dir } = command;
+                if let Err(e) = vtc_service::website::default_site::export(&dir) {
+                    eprintln!("Export failed: {e}");
+                    std::process::exit(1);
+                }
+                println!(
+                    "Landing page written to {}.\n\
+                     Edit it there, then set in config.toml and restart the daemon once:\n\n\
+                     [website]\n\
+                     landing_dir = \"{}\"\n\n\
+                     Later edits show on the next page load.",
+                    dir.display(),
+                    std::path::absolute(&dir).unwrap_or(dir.clone()).display()
+                );
+            }
+            #[cfg(not(feature = "website"))]
+            {
+                let _ = command;
+                eprintln!("website subcommands are unavailable (compiled without 'website')");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::AdminUi { command }) => {
+            #[cfg(feature = "admin-ui")]
+            {
+                let AdminUiCommands::Export { dir, members } = command;
+                let (bundle, what, setting) = if members {
+                    (&vtc_service::admin_ui::MEMBER_UI_DIR, "Member portal", "")
+                } else {
+                    (
+                        &vtc_service::admin_ui::ADMIN_UI_DIR,
+                        "Admin console",
+                        "mode = \"directory\"\n",
+                    )
+                };
+                if let Err(e) = vtc_service::admin_ui::export(&dir, bundle) {
+                    eprintln!("Export failed: {e}");
+                    std::process::exit(1);
+                }
+                let key = if members { "members_dir" } else { "dir" };
+                println!(
+                    "{what} written to {}.\n\
+                     To serve it, set in config.toml and restart the daemon:\n\n\
+                     [admin_ui]\n\
+                     {setting}{key} = \"{}\"",
+                    dir.display(),
+                    std::path::absolute(&dir).unwrap_or(dir.clone()).display()
+                );
+            }
+            #[cfg(not(feature = "admin-ui"))]
+            {
+                let _ = command;
+                eprintln!("admin-ui subcommands are unavailable (compiled without 'admin-ui')");
+                std::process::exit(1);
+            }
+        }
+        None => {
+            let (config, unknown_keys) = match AppConfig::load_with_unknown_keys(cli.config) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    eprintln!();
+                    eprintln!("To set up a new VTC instance, run:");
+                    eprintln!("  vtc setup");
+                    eprintln!();
+                    eprintln!("Or specify a config file:");
+                    eprintln!("  vtc --config <path>");
+                    std::process::exit(1);
+                }
+            };
+
+            init_tracing(&config);
+            config.warn_unknown_keys(&unknown_keys);
+
+            let store = store::Store::open_with(&config.store, &config.fjall)
+                .expect("failed to open store");
+            let secret_store = create_secret_store(&config).expect("failed to create secret store");
+
+            if let Err(e) = server::run(config, store, secret_store).await {
+                tracing::error!("server error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Interactive `vtc admin emergency-bootstrap` flow.
+///
+/// 1. Loud warning + confirmation (skippable with `--yes`).
+/// 2. Operator authorizes a fresh ephemeral DID at the VTA via
+///    `pnm acl create` (the wizard prints the exact command).
+/// 3. The driver calls the VTA's `provision-integration` flow
+///    (`VtaIntent::AdminRotated`) with that ephemeral DID. The
+///    VTA's accept/reject IS the recovery authority — see
+///    `tasks/vtc-mvp/vta-driven-keys.md` §4.
+/// 4. On success: local admin ACL + sister records cleared, install
+///    carve-out reopened, fresh install token minted.
+#[cfg(feature = "setup")]
+async fn run_emergency_bootstrap_cli(
+    config_path: Option<std::path::PathBuf>,
+    skip_confirm: bool,
+    context: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use dialoguer::Confirm;
+
+    eprintln!();
+    eprintln!("⚠️  EMERGENCY BOOTSTRAP");
+    eprintln!(
+        "This clears every existing admin ACL entry and admin sister record, then\n\
+         reopens the install carve-out so a new operator can claim a fresh install URL.\n\
+         \n\
+         The VTA accepts or rejects the recovery: if your PNM admin credential at the\n\
+         VTA is still valid, the VTA will accept it; otherwise this command fails and\n\
+         no local state is touched. The daemon's next boot emits a loud\n\
+         `EmergencyBootstrapInvoked` audit event.\n"
+    );
+
+    if !skip_confirm {
+        let ok = Confirm::new()
+            .with_prompt("Proceed?")
+            .default(false)
+            .interact()?;
+        if !ok {
+            eprintln!("aborted.");
+            return Ok(());
+        }
+    }
+
+    let outcome = emergency::run_emergency_bootstrap(emergency::EmergencyBootstrapArgs {
+        config_path,
+        context,
+    })
+    .await?;
+
+    eprintln!();
+    eprintln!("✅ emergency bootstrap complete");
+    eprintln!(
+        "   admin ACL entries cleared:  {}",
+        outcome.admin_entries_cleared
+    );
+    eprintln!(
+        "   admin sister records:       {}",
+        outcome.admin_records_cleared
+    );
+    eprintln!();
+    eprintln!("Install URL (one-shot, 15 min TTL):");
+    eprintln!("   {}", outcome.install_url);
+    eprintln!();
+    eprintln!("Claim code (required at claim time — keep separate from the URL):");
+    eprintln!("   {}", outcome.claim_code);
+    eprintln!();
+    eprintln!(
+        "Restart the daemon (`vtc`) so the `EmergencyBootstrapInvoked` audit event lands.\n\
+         Then claim the install URL with a fresh passkey, supplying the claim code above."
+    );
+    Ok(())
+}
+
+/// `vtc admin invite [--did <did>]` — mint a fresh single-use install URL.
+///
+/// Without `--did` it is a **passkey** invitation: the token names no DID and
+/// nothing is written to the ACL now. The invitee's administrator DID is the
+/// `did:key` of the passkey they register, and the daemon writes its entry at
+/// `vtc/install/claim/passkey/finish/0.1` (item 9) with the authority recorded
+/// here — a community administrator, issued from the host.
+///
+/// With `--did X` it is a **wallet** invitation: the token names X, claimed by
+/// signing as X with `vtc/install/claim/{start,finish}/0.3`, and X is granted
+/// an admin ACL entry now if it holds none — otherwise the claim would leave X
+/// with no role and its first sign-in would 403.
+#[cfg(feature = "setup")]
+async fn run_invite_cli(
+    config_path: Option<std::path::PathBuf>,
+    admin_did: Option<String>,
+    ttl_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use vtc_service::acl::{VtcAclEntry, VtcRole, get_acl_entry};
+    use vtc_service::auth::session::now_epoch;
+    use vtc_service::install::{
+        InstallTokenSigner, InstallTokenStore, InvitedAuthority, mint_install_token,
+        mint_passkey_install_token,
+    };
+    use vtc_service::keys::seed_store::create_secret_store;
+    use vtc_service::setup::VtcKeyBundle;
+
+    if let Some(did) = admin_did.as_deref()
+        && !did.starts_with("did:")
+    {
+        return Err(format!("--did must start with 'did:' (got '{did}')").into());
+    }
+
+    let config = vtc_service::config::AppConfig::load(config_path)?;
+    let vtc_did = config
+        .vtc_did
+        .clone()
+        .ok_or("config has no vtc_did — has setup completed?")?;
+    let base_url = config
+        .public_url
+        .clone()
+        .ok_or("config has no public_url — operators cannot build a clickable install URL")?;
+
+    let secret_store = create_secret_store(&config)?;
+    let bundle_bytes = secret_store
+        .get()
+        .await?
+        .ok_or("secret store has no VTC bundle — has setup completed?")?;
+    let bundle = VtcKeyBundle::from_secret_store_bytes(&bundle_bytes)?;
+
+    // The daemon derives the install-token key from the derivation root
+    // (`server::init_auth`); a token minted under anything else never verifies.
+    let root = bundle.derivation_root()?;
+    let signer = InstallTokenSigner::from_master_seed(&*root)?;
+
+    // Open the install + ACL keyspaces directly, which fjall allows only while
+    // the daemon is stopped. Unlike most offline commands this one has an
+    // online twin, so when the daemon holds the store the error names it —
+    // Keyring's VTI-16 concluded from the bare `FjallError: Locked` that
+    // admitting an administrator meant taking the community offline, and it
+    // never did.
+    let store = match vtc_service::store::offline::open_offline(&config.store) {
+        Ok(store) => store,
+        Err(e @ vtc_service::store::offline::OfflineStoreError::DaemonRunning { .. }) => {
+            // A passkey invitation names no DID (create 0.2).
+            let body = match admin_did.as_deref() {
+                Some(did) => format!("{{\"did\": \"{did}\"}}"),
+                None => "{}".to_string(),
+            };
+            return Err(format!(
+                "{e}.\n\nYou do not need to stop it to invite an administrator. Mint the \
+                 invite through the running daemon instead:\n  \
+                 • the admin console: Access → Invite admin\n  \
+                 • or `vtc/admin/invites/create/0.2` with payload {body}, as an existing \
+                 administrator"
+            )
+            .into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let install_ks = store.keyspace(keyspaces::INSTALL)?;
+    let install_store = InstallTokenStore::new(install_ks);
+    let acl_ks = store.keyspace(keyspaces::ACL)?;
+
+    let claim_code = vtc_service::install::claim_secret::generate();
+    let claim_code_hash = vtc_service::install::claim_secret::hash(&claim_code)?;
+    let exp = Utc::now() + ChronoDuration::seconds(ttl_seconds as i64);
+    let issued_via = format!("vtc-cli/{}", env!("CARGO_PKG_VERSION"));
+
+    // What the operator is told the invitation does to the ACL.
+    let acl_line;
+    let minted = match admin_did.as_deref() {
+        None => {
+            // A passkey invitation: nothing in the ACL until the claim, whose
+            // DID nobody knows yet. The authority it will confer is decided
+            // here and recorded with it.
+            let minted = mint_passkey_install_token(&signer, &vtc_did, ttl_seconds)?;
+            install_store
+                .record_issued_passkey(
+                    &minted.jti,
+                    minted.cnonce_bytes,
+                    *minted.ephemeral_signing_key,
+                    exp,
+                    Some(claim_code_hash),
+                    InvitedAuthority::community_admin(issued_via, "vtc admin invite (passkey)"),
+                )
+                .await?;
+            // Issuing it confers unrestricted authority offline, without the
+            // consent the daemon requires (VTI-APV-014) — audited as the
+            // break-glass on the next boot, named by the invitation since the
+            // DID does not exist yet.
+            vtc_service::install::record_offline_acl_write(
+                &store,
+                "vtc admin invite",
+                "invite",
+                &format!("passkey-invitation:{}", minted.jti),
+                Some(&VtcRole::Admin),
+                &[],
+            )
+            .await?;
+            acl_line = "written when the invitation is claimed, for the passkey's own DID \
+                        (role=admin)"
+                .to_string();
+            minted
+        }
+        Some(admin_did) => {
+            // A wallet invitation. Ensure the ACL entry exists with Admin role:
+            // the post-login flow gates on it.
+            //
+            // The entry expires with the invitation until it is claimed
+            // (#2660): the claim makes it permanent, a revocation removes it.
+            let acl_already_present = get_acl_entry(&acl_ks, admin_did).await?.is_some();
+            let minted = mint_install_token(&signer, &vtc_did, admin_did, ttl_seconds)?;
+            if !acl_already_present {
+                let entry = VtcAclEntry {
+                    did: admin_did.to_string(),
+                    role: VtcRole::Admin,
+                    label: Some("vtc admin invite".into()),
+                    // `vtc-admin-roles.md` §9: an invited administrator is a
+                    // community administrator with the full ceiling.
+                    admin: vtc_service::acl::AdminAuthority::community_admin(),
+                    delegated_by: None,
+                    created_at: now_epoch(),
+                    created_by: issued_via.clone(),
+                    updated_at: None,
+                    updated_by: None,
+                    expires_at: None,
+                    resource_grants: Vec::new(),
+                    group_grants: Vec::new(),
+                    label_set_by_subject: false,
+                    suspension: None,
+                };
+                vtc_service::install::write_invite_entry(
+                    &acl_ks,
+                    &install_store,
+                    &minted.jti,
+                    entry.clone(),
+                    exp,
+                    None,
+                )
+                .await?;
+                // An unrestricted admin made offline, without the consent the
+                // daemon requires (VTI-APV-014) — audited as the break-glass on
+                // the next boot.
+                vtc_service::install::record_offline_acl_write(
+                    &store,
+                    "vtc admin invite",
+                    "grant",
+                    &entry.did,
+                    Some(&entry.role),
+                    &entry.capability_list(),
+                )
+                .await?;
+            }
+            install_store
+                .record_issued(
+                    &minted.jti,
+                    minted.cnonce_bytes,
+                    *minted.ephemeral_signing_key,
+                    exp,
+                    Some(claim_code_hash),
+                    Some(admin_did.to_string()),
+                )
+                .await?;
+            acl_line = if acl_already_present {
+                "pre-existing (left untouched)".to_string()
+            } else {
+                "created (role=admin), expiring with the invitation until it is claimed".to_string()
+            };
+            minted
+        }
+    };
+
+    // Flush the ACL entry + install-token row to disk before handing out the
+    // URL — without this the token row may not survive a crash between mint and
+    // the operator's first claim, leaving them with a dead URL (P2.5). Matches
+    // the `acl_cli` / `did_key` offline write paths.
+    store.persist().await?;
+
+    let install_url = format!(
+        "{}/admin/install?token={}",
+        base_url.trim_end_matches('/'),
+        minted.jwt
+    );
+
+    eprintln!();
+    eprintln!("✅ install URL minted");
+    match admin_did.as_deref() {
+        Some(did) => {
+            eprintln!("   Kind:        wallet invitation — claimed by signing as the DID");
+            eprintln!("   Admin DID:   {did}");
+        }
+        None => {
+            eprintln!("   Kind:        passkey invitation — the passkey's own key is the DID");
+            eprintln!("   Admin DID:   derived from the passkey the invitee registers");
+        }
+    }
+    eprintln!("   ACL entry:   {acl_line}");
+    eprintln!("   TTL:         {ttl_seconds}s");
+    eprintln!();
+    eprintln!("Install URL (one-shot):");
+    eprintln!("   {install_url}");
+    eprintln!();
+    eprintln!("Claim code (deliver via a SEPARATE channel — Signal/SMS/in person):");
+    eprintln!("   {claim_code}");
+    eprintln!();
+    eprintln!("Both the URL and the claim code are required to claim the invitation.");
+    eprintln!("A leaked URL alone is not enough — the daemon refuses claim without the code.");
+    eprintln!();
+    eprintln!("Restart the daemon (`vtc`) before claiming — the daemon must be running");
+    eprintln!("for the browser to reach `/admin/install` and the install Trust Tasks.");
+    Ok(())
+}
+
+/// `vtc admin enrol-approver` — mint a step-up approver invite for `--did`
+/// with the daemon stopped (approver design note §6e, R4).
+#[cfg(feature = "setup")]
+async fn run_enrol_approver_cli(
+    config_path: Option<std::path::PathBuf>,
+    subject: String,
+    ttl_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = vtc_service::config::AppConfig::load(config_path)?;
+    let base_url = config
+        .public_url
+        .clone()
+        .ok_or("config has no public_url — the invite needs a URL the subject can open")?;
+    let store = match vtc_service::store::offline::open_offline(&config.store) {
+        Ok(store) => store,
+        Err(e @ vtc_service::store::offline::OfflineStoreError::DaemonRunning { .. }) => {
+            return Err(format!(
+                "{e}.\n\nWhile the daemon runs, another community administrator issues this \
+                 invite instead: the admin console, Members → the member → Invite to enrol an \
+                 approver (`auth/step-up/approver/invite/0.2`)."
+            )
+            .into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let minted = vtc_service::step_up_approver::mint_offline_invite(
+        &store,
+        &base_url,
+        &subject,
+        ttl_seconds,
+    )
+    .await?;
+    // Flush the invite and the break-glass marker before handing out the URL.
+    store.persist().await?;
+
+    let expires = chrono::DateTime::<chrono::Utc>::from_timestamp(minted.expires_at as i64, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    eprintln!();
+    eprintln!("✅ step-up approver invite minted");
+    eprintln!("   Subject:     {subject}");
+    eprintln!("   Invite id:   {}", minted.invite_id);
+    eprintln!("   Expires:     {expires}");
+    eprintln!();
+    eprintln!("Enrolment URL (one-shot):");
+    eprintln!("   {}", minted.url);
+    eprintln!();
+    eprintln!("Claim code (deliver via a SEPARATE channel — Signal/SMS/in person):");
+    eprintln!("   {}", minted.claim_code);
+    eprintln!();
+    eprintln!("The subject opens the URL, types the code, and signs the redemption with");
+    eprintln!("their own DID through their wallet; their approver device signs the");
+    eprintln!("enrolment statement. Five wrong codes void the invite.");
+    eprintln!();
+    eprintln!("Use an approver key this subject uses at no other community: two communities");
+    eprintln!("holding the same approver DID can tell the same person stands behind both.");
+    eprintln!();
+    eprintln!("Restart the daemon (`vtc`) first — it records this invite in the audit log");
+    eprintln!("as an offline (break-glass) action when it starts.");
+    Ok(())
+}
+
+/// `vtc admin discard-interrupted-import` — the irreversible "start over
+/// from empty" recovery for a backup import a crash, a client disconnect,
+/// or a `finalize-import` that never landed left interrupted. The
+/// daemon's boot-refusal message (`server::run`, P3.9) names this command.
+///
+/// Runs offline (fjall lock) like the other `admin` recovery commands.
+/// Does NOT restore the interrupted import's data — it has no decryption
+/// password and no access to the original bundle. An operator who still
+/// has the bundle should answer "no" at the prompt and run `cnm backup
+/// import` with it instead; that finishes the restore rather than
+/// discarding it.
+#[cfg(feature = "setup")]
+async fn run_discard_interrupted_import_cli(
+    config_path: Option<std::path::PathBuf>,
+    skip_confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use dialoguer::Confirm;
+    use vtc_service::backup;
+    use vtc_service::config::AppConfig;
+    use vtc_service::store::keyspaces;
+
+    let config = AppConfig::load(config_path)?;
+    let store = vtc_service::store::offline::open_offline(&config.store)?;
+
+    let config_ks = store.keyspace(keyspaces::CONFIG)?;
+    let Some(since) = backup::import_in_progress_since(&config_ks).await? else {
+        println!("No interrupted import found — nothing to discard.");
+        return Ok(());
+    };
+
+    eprintln!();
+    eprintln!("⚠️  DISCARD INTERRUPTED IMPORT");
+    eprintln!(
+        "An import started at {since} was interrupted before it finished. The ACL, \n\
+         members, policies, status lists, and every other backed-up keyspace are in a \n\
+         partially cleared, partially replayed state — the daemon refuses to boot while \n\
+         that's true.\n\
+         \n\
+         This command WIPES all of that back to completely empty. It does NOT restore \n\
+         the interrupted import. If you still have the original backup bundle, answer no \n\
+         below and run `cnm backup import` with it instead — that finishes the restore.\n"
+    );
+
+    if !skip_confirm {
+        let ok = Confirm::new()
+            .with_prompt("Wipe to empty and clear the marker? (irreversible)")
+            .default(false)
+            .interact()?;
+        if !ok {
+            eprintln!("aborted — the daemon will still refuse to boot until this is resolved.");
+            return Ok(());
+        }
+    }
+
+    backup::discard_interrupted_import(&store).await?;
+
+    eprintln!();
+    eprintln!("✅ wiped to empty and cleared the interrupted-import marker.");
+    eprintln!(
+        "   The daemon will boot now, with no community state. Run `cnm backup import` \
+         (a different backup) or re-provision to repopulate it."
+    );
+    Ok(())
+}
+
+fn print_banner() {
+    let cyan = "\x1b[36m";
+    let magenta = "\x1b[35m";
+    let yellow = "\x1b[33m";
+    let dim = "\x1b[2m";
+    let reset = "\x1b[0m";
+
+    eprintln!(
+        r#"
+{cyan} ██╗   ██╗{magenta}████████╗{yellow} ██████╗{reset}
+{cyan} ██║   ██║{magenta}╚══██╔══╝{yellow}██╔════╝{reset}
+{cyan} ██║   ██║{magenta}   ██║   {yellow}██║     {reset}
+{cyan} ╚██╗ ██╔╝{magenta}   ██║   {yellow}██║     {reset}
+{cyan}  ╚████╔╝ {magenta}   ██║   {yellow}╚██████╗{reset}
+{cyan}   ╚═══╝  {magenta}   ╚═╝   {yellow} ╚═════╝{reset}
+{dim}  Verifiable Trust Community v{version}{reset}
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+    );
+}
+
+fn init_tracing(config: &AppConfig) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log.level));
+
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+
+    match config.log.format {
+        LogFormat::Json => subscriber.json().init(),
+        LogFormat::Text => subscriber.init(),
+    }
+}

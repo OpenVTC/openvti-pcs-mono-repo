@@ -1,0 +1,1147 @@
+//! `consent/*` slice trust-task handlers — the VTA consent store.
+//!
+//! The VTA is the first gate for inbound bridged messaging: a bridge asks
+//! whether a conversation may reach an AI agent (`consent/request`,
+//! **default-deny**); an approver decides (`consent/decision`); the grant is
+//! recorded and the bridge syncs it (`consent/list`) or it is withdrawn
+//! (`consent/revoke`). See the `consent/*` family in the dtgwg registry and
+//! `vti_common::consent`.
+//!
+//! Auth: the approver is the operator **bound for the (platform, context)** in
+//! the approver registry (`consent/approver-set`), or the **enrolled bridge**
+//! relaying the operator's out-of-band choice (bridge-attested). With no binding
+//! configured, `consent/request` is default-denied (`noApprover`) and an admin
+//! of the request's context is the fallback decider.
+//!
+//! **Scope.** A grant records the context of the request it answers
+//! (VTI-CTX-001), and writing or withdrawing one needs authority over that
+//! context (VTI-CTX-002). A grant with no context is written only by a
+//! super-admin's pre-authorization and withdrawn only by a super-admin.
+//! `consent/request`'s `contextHint` must be a context the caller may act in.
+//! Every refusal is audited.
+
+use affinidi_data_integrity::{DataIntegrityProof, SignOptions, crypto_suites::CryptoSuite};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use trust_tasks_rs::TrustTask;
+use uuid::Uuid;
+
+use vti_common::auth::session::now_epoch;
+use vti_common::consent::{
+    ApproverBinding, ConsentEffect, ConsentGrant, ConsentKind, ConsentRoute, ConsentScope,
+    ConsentSubject, ConsumeConsent, consume_pending_consent, delete_consent_grant, get_approver,
+    get_consent_grant, list_approvers, list_consent_grants, new_pending_consent, store_approver,
+    store_consent_grant, store_pending_consent,
+};
+use vti_common::error::AppError;
+
+use super::helpers::{
+    TRANSPORT_TRUST_TASK, TrustTaskOutcome, app_error_to_reject, parse_payload, success_response,
+};
+use crate::audit;
+use crate::auth::AuthClaims;
+use crate::server::AppState;
+
+/// How long a pending consent stays answerable.
+const PENDING_TTL_SECS: u64 = 600;
+
+/// Audit a refused consent operation and pass the refusal through.
+///
+/// VTI-AUD-003: refusals are audited as well as successes. A refusal here is a
+/// caller reaching for a grant outside its authority, which an honest bridge or
+/// operator does not do, so it is also logged at `warn!` with
+/// `security_alert = true`.
+async fn audit_refusal(
+    state: &AppState,
+    auth: &AuthClaims,
+    action: &str,
+    context: Option<&str>,
+    gate: Result<(), AppError>,
+) -> Result<(), AppError> {
+    let Err(e) = gate else { return Ok(()) };
+    tracing::warn!(
+        audit = true,
+        security_alert = true,
+        did = %auth.did,
+        action,
+        context = context.unwrap_or("-"),
+        reason = %e,
+        "consent operation refused",
+    );
+    audit::record_with_detail_best_effort(
+        &state.audit_sink,
+        action,
+        &auth.did,
+        None,
+        "denied",
+        Some(TRANSPORT_TRUST_TASK),
+        context,
+        Some(&e.to_string()),
+    )
+    .await;
+    Err(e)
+}
+
+// ── Wire shapes (camelCase) ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireSubject {
+    platform: String,
+    conversation_ref: String,
+    kind: ConsentKind,
+    agent: String,
+}
+
+impl From<WireSubject> for ConsentSubject {
+    fn from(w: WireSubject) -> Self {
+        ConsentSubject {
+            platform: w.platform,
+            conversation_ref: w.conversation_ref,
+            kind: w.kind,
+            agent: w.agent,
+        }
+    }
+}
+
+impl From<&ConsentSubject> for WireSubject {
+    fn from(s: &ConsentSubject) -> Self {
+        WireSubject {
+            platform: s.platform.clone(),
+            conversation_ref: s.conversation_ref.clone(),
+            kind: s.kind,
+            agent: s.agent.clone(),
+        }
+    }
+}
+
+// The request payloads are the generated `vti_specs::consent::*` types (#2567):
+// every one of these tasks is pinned, so its payload is read as the
+// specification defines it — `deny_unknown_fields` included (#2621) — and
+// converted to the store's types here.
+use vti_specs::consent::{
+    approver_list::v1_0 as approver_list, approver_set::v1_0 as approver_set,
+    decision::v1_0 as decision, list::v1_1 as list, request::v1_0 as request,
+    revoke::v1_0 as revoke,
+};
+
+/// A generated subject's members as the store's [`ConsentSubject`]. Each
+/// `consent/*` module generates its own subject type; they agree member for
+/// member, and the closed `kind` enum is read by its wire value.
+fn consent_subject(
+    platform: &str,
+    conversation_ref: &str,
+    kind: &dyn std::fmt::Display,
+    agent: &str,
+) -> Result<ConsentSubject, AppError> {
+    Ok(ConsentSubject {
+        platform: platform.to_string(),
+        conversation_ref: conversation_ref.to_string(),
+        kind: from_wire(kind, "subject.kind")?,
+        agent: agent.to_string(),
+    })
+}
+
+/// A generated enum as the store's enum of the same wire values (`scope`,
+/// `effect`, `route`, `kind`): both serialize to the one string the
+/// specification names.
+fn from_wire<T: serde::de::DeserializeOwned>(
+    value: &dyn std::fmt::Display,
+    what: &str,
+) -> Result<T, AppError> {
+    serde_json::from_value(Value::String(value.to_string()))
+        .map_err(|e| AppError::Validation(format!("{what}: {e}")))
+}
+
+/// [`consent_subject`] over any `consent/*` module's generated subject.
+macro_rules! subject_of {
+    ($s:expr) => {
+        consent_subject(&$s.platform, &$s.conversation_ref, &$s.kind, &$s.agent)
+    };
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AckResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireGrant {
+    subject: WireSubject,
+    effect: ConsentEffect,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<ConsentScope>,
+    granted_by: String,
+    granted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+    evidence: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListResponse {
+    grants: Vec<WireGrant>,
+}
+
+// Approver registry (Track A) wire shapes.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireApprover {
+    platform: String,
+    context: String,
+    approver: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<ConsentRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_hint: Option<String>,
+}
+
+impl From<ApproverBinding> for WireApprover {
+    fn from(b: ApproverBinding) -> Self {
+        WireApprover {
+            platform: b.platform,
+            context: b.context,
+            approver: b.approver,
+            route: b.route,
+            route_hint: b.route_hint,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApproverSetResponse {
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApproverListResponse {
+    approvers: Vec<WireApprover>,
+}
+
+use vta_sdk::protocols::auth::epoch_to_rfc3339;
+
+impl From<ConsentGrant> for WireGrant {
+    fn from(g: ConsentGrant) -> Self {
+        WireGrant {
+            subject: WireSubject::from(&g.subject),
+            effect: g.effect,
+            scope: g.scope,
+            granted_by: g.granted_by,
+            granted_at: epoch_to_rfc3339(g.granted_at),
+            expires_at: g.expires_at.map(epoch_to_rfc3339),
+            evidence: g.evidence,
+        }
+    }
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────────────
+
+/// `consent/request/1.0` — a bridge asks the VTA to gate a conversation.
+/// Default-deny: if no live grant exists, a pending consent is minted for an
+/// approver to decide. Auth: an authenticated, write-capable bridge.
+pub(super) async fn handle_request(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_write() {
+        return app_error_to_reject(&doc, e);
+    }
+    let payload: request::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let (subject, scope) = match subject_of!(payload.subject)
+        .and_then(|s| Ok((s, from_wire::<ConsentScope>(&payload.scope, "scope")?)))
+    {
+        Ok(v) => v,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let challenge: String = payload.challenge.to_string();
+    let now = now_epoch();
+
+    // Already decided (allow or deny, not expired) → don't re-prompt.
+    match get_consent_grant(&state.consent_ks, &subject).await {
+        Ok(Some(g)) if !g.is_expired(now) => {
+            return success_response(
+                &doc,
+                AckResponse {
+                    status: "accepted",
+                    request_id: Some("existing-grant".to_string()),
+                    grant_id: None,
+                },
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return app_error_to_reject(&doc, e),
+    }
+
+    // A caller-supplied hint must be a context the caller may act in. The hint
+    // picks the approver the request is routed to and becomes the grant's
+    // context, so an unchecked hint let a bridge scoped to one context raise
+    // requests (and so grants) in another (VTI-CTX-002).
+    if let Some(hint) = payload.context_hint.as_deref()
+        && let Err(e) = audit_refusal(
+            state,
+            auth,
+            "consent.request",
+            Some(hint),
+            auth.require_context(hint),
+        )
+        .await
+    {
+        return app_error_to_reject(&doc, e);
+    }
+    let context = payload
+        .context_hint
+        .or_else(|| auth.default_context().map(str::to_string));
+
+    // Resolve the approver for (platform, context). Default-deny: with no
+    // approver bound, there is no one to route consent to → noApprover. Operators
+    // bind one via consent/approver-set.
+    let Some(ctx) = context.clone() else {
+        return app_error_to_reject(
+            &doc,
+            AppError::Forbidden("consent/request: no context to resolve an approver".into()),
+        );
+    };
+    let binding = match get_approver(&state.consent_approvers_ks, &subject.platform, &ctx).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return app_error_to_reject(
+                &doc,
+                AppError::Forbidden(
+                    "consent/request: no approver configured for this platform/context".into(),
+                ),
+            );
+        }
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+
+    // Snapshot the prompt subject (camelCase) before `subject` is moved.
+    let wire_subject = serde_json::to_value(WireSubject::from(&subject)).unwrap_or_default();
+    let display_hint = payload.display_hint.as_ref().map(|h| h.to_string());
+    let first_message_digest = payload.first_message_digest.as_ref().map(|d| d.to_string());
+
+    let pending = new_pending_consent(
+        subject,
+        scope,
+        challenge.clone(),
+        auth.did.clone(),
+        context,
+        PENDING_TTL_SECS,
+    );
+    if let Err(e) = store_pending_consent(&state.consent_ks, &pending).await {
+        return app_error_to_reject(&doc, e);
+    }
+
+    // Track B: a `wake`-routed approver is roused on their device with the prompt
+    // to sign a did-signed `consent/decision`. Best-effort — the mediator queue
+    // and the bridge-relay card remain fallbacks.
+    if binding.route == Some(ConsentRoute::Wake) {
+        maybe_wake_consent_approver(
+            state,
+            &binding.approver,
+            wire_subject,
+            scope,
+            &challenge,
+            display_hint.as_deref(),
+            first_message_digest.as_deref(),
+        )
+        .await;
+    }
+
+    success_response(
+        &doc,
+        AckResponse {
+            status: "accepted",
+            request_id: Some(challenge),
+            grant_id: None,
+        },
+    )
+}
+
+/// Trust Task type of the consent prompt pushed to a `wake`-routed approver's
+/// device, which renders it and replies with a signed `consent/decision`.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+const CONSENT_APPROVE_REQUEST_TYPE: &str =
+    "https://trusttasks.org/spec/consent/approve-request/0.1";
+
+/// Rouse a `wake`-routed approver: push the signed consent prompt to their
+/// device (`step_up::push_to_device`) and ring its doorbell. Best-effort — the
+/// bridge-relay card remains the fallback.
+///
+/// Until this moved onto the durable push, the prompt was only placed in the
+/// mediator registry's in-memory buffer, which nothing in production drains,
+/// and the doorbell then woke the device to collect a document that had never
+/// been sent.
+#[cfg(any(feature = "didcomm", feature = "tsp"))]
+#[allow(clippy::too_many_arguments)]
+async fn maybe_wake_consent_approver(
+    state: &AppState,
+    approver: &str,
+    subject: Value,
+    scope: ConsentScope,
+    challenge: &str,
+    display_hint: Option<&str>,
+    first_message_digest: Option<&str>,
+) {
+    // Built member-by-member so an unset hint is *absent*, not `null`.
+    // `json!` with an `Option` writes the null, and the approver's renderer has
+    // to tell "no label supplied" from "the label is null" — only the first is
+    // a thing that can happen.
+    let mut prompt_payload = serde_json::Map::new();
+    prompt_payload.insert("subject".into(), subject);
+    prompt_payload.insert("scope".into(), serde_json::json!(scope));
+    prompt_payload.insert("challenge".into(), serde_json::json!(challenge));
+    if let Some(h) = display_hint {
+        prompt_payload.insert("displayHint".into(), serde_json::json!(h));
+    }
+    if let Some(d) = first_message_digest {
+        prompt_payload.insert("firstMessageDigest".into(), serde_json::json!(d));
+    }
+    // Signed, like every other document this stack pushes to a human's device,
+    // with the operational key under `authentication`: a prompt asking a person
+    // to approve something must be authenticated by something the device can
+    // check. `issuer` and `recipient` come with it, not as decoration: SPEC
+    // §7.2 item 5b makes `recipient` REQUIRED and item 6 requires the in-band
+    // issuer to match the transport identity. A proof over a document naming
+    // neither party can be replayed at a different approver.
+    let Some(vta_did) = state.config.read().await.vta_did.clone() else {
+        tracing::warn!(
+            approver = %approver,
+            "VTA DID not configured; cannot sign consent approve-request, skipping wake"
+        );
+        return;
+    };
+    let secret =
+        match super::load_operational_secret(state, &vta_did, "consent-approve-request").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e, approver = %approver,
+                    "could not load issuer key to sign consent approve-request, skipping wake"
+                );
+                return;
+            }
+        };
+    let unsigned = serde_json::json!({
+        "id": format!("urn:uuid:{}", Uuid::new_v4()),
+        "type": CONSENT_APPROVE_REQUEST_TYPE,
+        "issuer": vta_did,
+        "recipient": approver,
+        "issuedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "payload": prompt_payload,
+    });
+    // Fail closed: a document that cannot be authenticated must not be the one
+    // that reaches the phone, and "no prompt" is recoverable in a way that
+    // "unverifiable prompt" is not.
+    let proof = match DataIntegrityProof::sign(
+        &unsigned,
+        &secret,
+        SignOptions::new()
+            .with_proof_purpose("authentication")
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e, approver = %approver,
+                "failed to sign consent approve-request, skipping wake"
+            );
+            return;
+        }
+    };
+    let mut approve_request = unsigned;
+    match serde_json::to_value(&proof) {
+        Ok(v) => approve_request["proof"] = v,
+        Err(e) => {
+            tracing::warn!(error = %e, approver = %approver, "could not serialize proof");
+            return;
+        }
+    }
+
+    match super::step_up::push_to_device(
+        state,
+        approver,
+        &approve_request,
+        std::time::Duration::from_secs(PENDING_TTL_SECS),
+    )
+    .await
+    {
+        super::step_up::DevicePush::Queued { push, mediator } => tracing::info!(
+            approver = %approver, mediator = %mediator, push = %push,
+            "consent approve-request queued for the wake approver"
+        ),
+        super::step_up::DevicePush::NoRoute { .. } => tracing::debug!(
+            approver = %approver,
+            "no mediator route for wake approver; relay fallback applies"
+        ),
+        super::step_up::DevicePush::Refused => {}
+    }
+}
+
+#[cfg(not(any(feature = "didcomm", feature = "tsp")))]
+#[allow(clippy::too_many_arguments)]
+async fn maybe_wake_consent_approver(
+    _state: &AppState,
+    _approver: &str,
+    _subject: Value,
+    _scope: ConsentScope,
+    _challenge: &str,
+    _display_hint: Option<&str>,
+    _first_message_digest: Option<&str>,
+) {
+}
+
+/// `consent/decision/1.0` — an approver allows/denies; records a grant.
+/// Auth: the enrolled bridge that requested (bridge-attested), the approver
+/// bound for the request's (platform, context), or, with none bound, an admin
+/// of the request's context (did-signed). A decision with no challenge (an
+/// operator pre-authorization) writes a grant with no context, which only a
+/// super-admin may do.
+pub(super) async fn handle_decision(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let payload: decision::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let converted = subject_of!(payload.subject).and_then(|s| {
+        let effect: ConsentEffect = from_wire(&payload.effect, "effect")?;
+        let scope: Option<ConsentScope> = match &payload.scope {
+            Some(sc) => Some(from_wire(sc, "scope")?),
+            None => None,
+        };
+        Ok((s, effect, scope))
+    });
+    let (subject, effect, requested_scope) = match converted {
+        Ok(v) => v,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let now = now_epoch();
+
+    // Resolve + consume the pending request this decision answers (when echoed).
+    let (evidence, scope_default, context) = if let Some(challenge) = &payload.challenge {
+        match consume_pending_consent(&state.consent_ks, challenge.as_str(), now).await {
+            Ok(ConsumeConsent::Found(p)) => {
+                if p.subject != subject {
+                    return app_error_to_reject(
+                        &doc,
+                        AppError::Validation(
+                            "consent/decision: challenge does not match subject".into(),
+                        ),
+                    );
+                }
+                let is_bridge = auth.did == p.requested_by;
+                if !is_bridge {
+                    // The issuer must be the approver bound for this
+                    // (platform, context); fall back to a context admin only
+                    // when no approver is configured.
+                    let ctx = p.context.clone().unwrap_or_default();
+                    match get_approver(&state.consent_approvers_ks, &subject.platform, &ctx).await {
+                        Ok(Some(b)) if b.approver == auth.did => {}
+                        Ok(Some(_)) => {
+                            return app_error_to_reject(
+                                &doc,
+                                AppError::Forbidden(
+                                    "consent/decision: issuer is not the bound approver".into(),
+                                ),
+                            );
+                        }
+                        Ok(None) => {
+                            // No bound approver: an admin *of the request's
+                            // context* decides. A request with no context
+                            // belongs to none, so only a super-admin may
+                            // decide it. Skipping the context check for an
+                            // empty context let any admin decide it.
+                            let gate = if ctx.is_empty() {
+                                auth.require_super_admin()
+                            } else {
+                                auth.require_admin()
+                                    .and_then(|()| auth.require_context(&ctx))
+                            };
+                            if let Err(e) = audit_refusal(
+                                state,
+                                auth,
+                                "consent.decision",
+                                (!ctx.is_empty()).then_some(ctx.as_str()),
+                                gate,
+                            )
+                            .await
+                            {
+                                return app_error_to_reject(&doc, e);
+                            }
+                        }
+                        Err(e) => return app_error_to_reject(&doc, e),
+                    }
+                }
+                let evidence = if is_bridge {
+                    "bridge-attested"
+                } else {
+                    "did-signed"
+                };
+                (evidence, Some(p.scope), p.context.clone())
+            }
+            Ok(_) => {
+                return app_error_to_reject(
+                    &doc,
+                    AppError::Validation(
+                        "consent/decision: no pending request matches the challenge".into(),
+                    ),
+                );
+            }
+            Err(e) => return app_error_to_reject(&doc, e),
+        }
+    } else {
+        // Operator pre-authorization (no challenge). The payload names no
+        // context, so the grant belongs to none, and a grant decides what an
+        // agent may do on the principal's behalf across the whole VTA. Only a
+        // super-admin may write one (VTI-ACL-022). Any admin could, before.
+        if let Err(e) = audit_refusal(
+            state,
+            auth,
+            "consent.decision",
+            None,
+            auth.require_super_admin(),
+        )
+        .await
+        {
+            return app_error_to_reject(&doc, e);
+        }
+        ("did-signed", None, None)
+    };
+
+    let scope = match effect {
+        ConsentEffect::Allow => Some(
+            requested_scope
+                .or(scope_default)
+                .unwrap_or(ConsentScope::Converse),
+        ),
+        ConsentEffect::Deny => None,
+    };
+    let grant = ConsentGrant {
+        subject,
+        effect,
+        scope,
+        granted_by: auth.did.clone(),
+        granted_at: now,
+        expires_at: payload.expires_at.map(|at| at.timestamp().max(0) as u64),
+        evidence: evidence.to_string(),
+        // The context of the request this answers, so withdrawal can be scoped
+        // to it (VTI-CTX-001/002).
+        context,
+    };
+    if let Err(e) = store_consent_grant(&state.consent_ks, &grant).await {
+        return app_error_to_reject(&doc, e);
+    }
+    success_response(
+        &doc,
+        AckResponse {
+            status: "recorded",
+            request_id: None,
+            grant_id: Some(format!("urn:uuid:{}", Uuid::new_v4())),
+        },
+    )
+}
+
+/// `consent/revoke/1.0` — an operator withdraws a standing grant. Auth: admin of
+/// the grant's context; super-admin for a grant with no context.
+pub(super) async fn handle_revoke(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    let payload: revoke::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let subject = match subject_of!(payload.subject) {
+        Ok(s) => s,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    // No grant → `notFound` as a *status*, not a reject. The published response
+    // schema declares the value ("`revoked` = the grant was deleted.
+    // `notFound` = no grant existed for the subject."), so a conforming
+    // producer is already written to receive it, and rejecting instead means
+    // the VTA can never emit a value its own schema promises.
+    //
+    // It is also the answer the caller wants. Revoke's post-condition is
+    // "no grant for this subject", and with none stored that already holds:
+    // the conversation is at default-deny either way. An operator revoking
+    // twice, or racing another operator to the same grant, would otherwise get
+    // an error for the outcome they asked for. The `consent/revoke:notFound`
+    // error code stays declared upstream for a consumer that cannot answer at
+    // all; it is not this case.
+    let grant = match get_consent_grant(&state.consent_ks, &subject).await {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return success_response(
+                &doc,
+                AckResponse {
+                    status: "notFound",
+                    request_id: None,
+                    grant_id: None,
+                },
+            );
+        }
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    // Withdrawal is scoped to the grant's context: an admin of that context,
+    // or a super-admin for a grant that has none (an operator
+    // pre-authorization, or one written before grants recorded a context).
+    // Admin role alone let any context's admin withdraw every grant on the VTA.
+    let gate = match grant.context.as_deref() {
+        Some(ctx) => auth.require_context(ctx),
+        None => auth.require_super_admin(),
+    };
+    if let Err(e) = audit_refusal(
+        state,
+        auth,
+        "consent.revoke",
+        grant.context.as_deref(),
+        gate,
+    )
+    .await
+    {
+        return app_error_to_reject(&doc, e);
+    }
+    if let Err(e) = delete_consent_grant(&state.consent_ks, &subject).await {
+        return app_error_to_reject(&doc, e);
+    }
+
+    // Withdrawing consent is a change to what an agent may do on someone's
+    // behalf, and the `notFound` path above returns before here on purpose: a
+    // revoke that deleted nothing is not a state change worth a line.
+    if let Err(e) = audit::record_with_detail(
+        &state.audit_sink,
+        "consent.revoke",
+        &auth.did,
+        Some(&subject.conversation_ref),
+        "success",
+        Some(TRANSPORT_TRUST_TASK),
+        None,
+        Some(&format!(
+            "platform={} agent={}",
+            subject.platform, subject.agent
+        )),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "audit record failed for consent.revoke");
+    }
+
+    success_response(
+        &doc,
+        AckResponse {
+            status: "revoked",
+            request_id: None,
+            grant_id: None,
+        },
+    )
+}
+
+/// `consent/list/1.1` — a bridge syncs the grants it enforces. Auth: read.
+pub(super) async fn handle_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_read() {
+        return app_error_to_reject(&doc, e);
+    }
+    let payload: list::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let subject_filter: Option<ConsentSubject> =
+        match payload.subject.as_ref().map(|s| subject_of!(s)) {
+            Some(Ok(s)) => Some(s),
+            Some(Err(e)) => return app_error_to_reject(&doc, e),
+            None => None,
+        };
+    let grants = match list_consent_grants(&state.consent_ks).await {
+        Ok(g) => g,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let wire: Vec<WireGrant> = grants
+        .into_iter()
+        .filter(|g| {
+            payload
+                .agent
+                .as_ref()
+                .is_none_or(|a| g.subject.agent == a.as_str())
+        })
+        .filter(|g| {
+            payload
+                .platform
+                .as_ref()
+                .is_none_or(|p| g.subject.platform == p.as_str())
+        })
+        .filter(|g| subject_filter.as_ref().is_none_or(|s| &g.subject == s))
+        .map(WireGrant::from)
+        .collect();
+    success_response(&doc, ListResponse { grants: wire })
+}
+
+/// `consent/approver-set/1.0` — an admin binds the approver for a
+/// (platform, context). Auth: admin of the context.
+pub(super) async fn handle_approver_set(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    let payload: approver_set::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let route: Option<ConsentRoute> = match payload.route.as_ref().map(|r| from_wire(r, "route")) {
+        Some(Ok(r)) => Some(r),
+        Some(Err(e)) => return app_error_to_reject(&doc, e),
+        None => None,
+    };
+    if let Err(e) = auth.require_admin() {
+        return app_error_to_reject(&doc, e);
+    }
+    if let Err(e) = auth.require_context(&payload.context) {
+        return app_error_to_reject(&doc, e);
+    }
+    let binding = ApproverBinding {
+        platform: payload.platform.to_string(),
+        context: payload.context.to_string(),
+        approver: payload.approver.to_string(),
+        route,
+        route_hint: payload.route_hint,
+    };
+    let audit_detail = format!(
+        "platform={} approver={} route={:?}",
+        binding.platform, binding.approver, binding.route
+    );
+    let audit_context = binding.context.clone();
+    if let Err(e) = store_approver(&state.consent_approvers_ks, &binding).await {
+        return app_error_to_reject(&doc, e);
+    }
+
+    // This binding decides *who gets asked* when a task needs a human. Moved
+    // quietly, it is the whole consent path redirected — point it at yourself
+    // and every gated action is approved by you, with the wallet still showing
+    // its prompt to somebody who never sees it. The approver is recorded in the
+    // detail for exactly that reason: knowing the binding changed is not enough,
+    // the reviewer needs to know what it changed *to*.
+    if let Err(e) = audit::record_with_detail(
+        &state.audit_sink,
+        "consent.approver-set",
+        &auth.did,
+        Some(&audit_context),
+        "success",
+        Some(TRANSPORT_TRUST_TASK),
+        Some(&audit_context),
+        Some(&audit_detail),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "audit record failed for consent.approver-set");
+    }
+
+    success_response(&doc, ApproverSetResponse { status: "set" })
+}
+
+/// `consent/approver-list/1.0` — read the approver bindings. Auth: read.
+pub(super) async fn handle_approver_list(
+    state: &AppState,
+    auth: &AuthClaims,
+    doc: TrustTask<Value>,
+) -> TrustTaskOutcome {
+    if let Err(e) = auth.require_read() {
+        return app_error_to_reject(&doc, e);
+    }
+    let payload: approver_list::Payload = match parse_payload(&doc) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let all = match list_approvers(&state.consent_approvers_ks).await {
+        Ok(v) => v,
+        Err(e) => return app_error_to_reject(&doc, e),
+    };
+    let approvers: Vec<WireApprover> = all
+        .into_iter()
+        .filter(|b| {
+            payload
+                .platform
+                .as_ref()
+                .is_none_or(|p| b.platform == p.as_str())
+        })
+        .filter(|b| {
+            payload
+                .context
+                .as_ref()
+                .is_none_or(|c| b.context == c.as_str())
+        })
+        .map(WireApprover::from)
+        .collect();
+    success_response(&doc, ApproverListResponse { approvers })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_subject_parses_camelcase_and_maps() {
+        let v = serde_json::json!({
+            "platform": "signal",
+            "conversationRef": "sig-1a2b3c4d",
+            "kind": "group",
+            "agent": "did:key:zA",
+        });
+        let s: ConsentSubject = serde_json::from_value::<WireSubject>(v).unwrap().into();
+        assert_eq!(s.conversation_ref, "sig-1a2b3c4d");
+        assert_eq!(s.kind, ConsentKind::Group);
+    }
+
+    #[test]
+    fn request_payload_parses_full_wire() {
+        let v = serde_json::json!({
+            "subject": {"platform":"signal","conversationRef":"sig-1","kind":"dm","agent":"did:key:zA"},
+            "scope": "converse",
+            "challenge": "Q29uc2VudENoYWxsZW5nZQ",
+            "displayHint": "Signal DM",
+            "contextHint": "ctx",
+        });
+        let p: request::Payload = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            from_wire::<ConsentScope>(&p.scope, "scope").unwrap(),
+            ConsentScope::Converse
+        );
+        assert_eq!(p.context_hint.as_deref(), Some("ctx"));
+        assert_eq!(subject_of!(p.subject).unwrap().kind, ConsentKind::Dm);
+    }
+
+    /// #2621: a member the specification does not define is refused, not
+    /// dropped — a mis-cased `contextHint` would otherwise vanish silently.
+    #[test]
+    fn issue_2621_consent_payloads_refuse_unknown_members() {
+        let subject = serde_json::json!({"platform":"signal","conversationRef":"sig-1","kind":"dm","agent":"did:key:zA"});
+        let request = serde_json::json!({
+            "subject": subject, "scope": "converse", "challenge": "Q29uc2VudENoYWxsZW5nZQ",
+            "context_hint": "ctx",
+        });
+        assert!(serde_json::from_value::<request::Payload>(request).is_err());
+        let revoke = serde_json::json!({ "subject": subject, "scope": "converse" });
+        assert!(serde_json::from_value::<revoke::Payload>(revoke).is_err());
+        let set = serde_json::json!({
+            "platform": "signal", "context": "ctx", "approver": "did:web:op", "route_hint": "x",
+        });
+        assert!(serde_json::from_value::<approver_set::Payload>(set).is_err());
+        // `ext` is the framework's extension point, and is accepted.
+        let list = serde_json::json!({ "ext": { "org.example": {} } });
+        assert!(serde_json::from_value::<list::Payload>(list).is_ok());
+    }
+
+    #[test]
+    fn wire_grant_serializes_camelcase() {
+        let g = ConsentGrant {
+            subject: ConsentSubject {
+                platform: "signal".into(),
+                conversation_ref: "sig-1".into(),
+                kind: ConsentKind::Dm,
+                agent: "did:key:zA".into(),
+            },
+            effect: ConsentEffect::Allow,
+            scope: Some(ConsentScope::Converse),
+            granted_by: "did:web:op".into(),
+            granted_at: 1_700_000_000, // 2023-11-14
+            expires_at: None,
+            evidence: "did-signed".into(),
+            context: Some("ctx".into()),
+        };
+        let v = serde_json::to_value(WireGrant::from(g)).unwrap();
+        assert_eq!(v["subject"]["conversationRef"], "sig-1");
+        assert_eq!(v["effect"], "allow");
+        assert_eq!(v["scope"], "converse");
+        assert_eq!(v["grantedBy"], "did:web:op");
+        assert!(v["grantedAt"].as_str().unwrap().starts_with("2023-11"));
+        assert!(v.get("expiresAt").is_none());
+    }
+
+    #[test]
+    fn epoch_rfc3339_round_trips() {
+        let s = epoch_to_rfc3339(1_700_000_000);
+        assert!(s.starts_with("2023-11-14T22:13:20"), "{s}");
+    }
+
+    #[test]
+    fn approver_set_payload_parses_wire_route() {
+        let v = serde_json::json!({
+            "platform": "signal",
+            "context": "ctx",
+            "approver": "did:web:op",
+            "route": "bridge-relay",
+            "routeHint": "sig-0a1b",
+        });
+        let p: approver_set::Payload = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            from_wire::<ConsentRoute>(p.route.as_ref().unwrap(), "route").unwrap(),
+            ConsentRoute::BridgeRelay
+        );
+        assert_eq!(p.route_hint.as_deref(), Some("sig-0a1b"));
+    }
+
+    #[test]
+    fn wire_approver_serializes_camelcase_and_route() {
+        let b = ApproverBinding {
+            platform: "signal".into(),
+            context: "ctx".into(),
+            approver: "did:web:op".into(),
+            route: Some(ConsentRoute::Wake),
+            route_hint: None,
+        };
+        let v = serde_json::to_value(WireApprover::from(b)).unwrap();
+        assert_eq!(v["route"], "wake");
+        assert!(v.get("routeHint").is_none());
+        let list = serde_json::to_value(ApproverListResponse { approvers: vec![] }).unwrap();
+        assert_eq!(list["approvers"], serde_json::json!([]));
+    }
+}
+
+#[cfg(all(test, feature = "didcomm", feature = "webvh"))]
+mod envelope_push_tests {
+    use crate::messaging::registry::MediatorBinding;
+    use serde_json::json;
+    use vti_common::consent::ConsentScope;
+
+    const MEDIATOR: &str = "did:example:mediator";
+    const APPROVER: &str = "did:key:zConsentApprover";
+
+    /// The Track-B wake prompt goes out under the **envelope** type, with the
+    /// task type inside the document.
+    ///
+    /// Same defect as the task-consent request (#900) and the step-up push, in a
+    /// different protocol family: this one is `spec/consent/*` (conversation
+    /// consent), not `spec/task-consent/*`. Neither family puts its task type on
+    /// the DIDComm envelope — the envelope belongs to the binding, not the task.
+    #[tokio::test]
+    async fn consent_approve_request_is_pushed_to_the_approver() {
+        let (state, _dir) = crate::test_support::build_signing_test_app_state().await;
+
+        state
+            .mediator_registry
+            .record_activate(MediatorBinding {
+                mediator_did: MEDIATOR.into(),
+                endpoint: "https://mediator.test".into(),
+            })
+            .await;
+        {
+            let mut cfg = state.config.write().await;
+            cfg.messaging = Some(vti_common::config::MessagingConfig {
+                mediator_url: String::new(),
+                mediator_did: MEDIATOR.into(),
+                mediator_host: None,
+                setup_acl: false,
+                drain_inbox_on_start: false,
+            });
+        }
+
+        let subject = json!({
+            "platform": "signal",
+            "conversationRef": "conv-1",
+            "kind": "dm",
+            "agent": "did:key:zAgent",
+        });
+        super::maybe_wake_consent_approver(
+            &state,
+            APPROVER,
+            subject,
+            ConsentScope::Converse,
+            "challenge-xyz",
+            Some("Signal group 'Family'"),
+            None,
+        )
+        .await;
+
+        let pushed = crate::messaging::push::take_pushes(&state);
+        assert_eq!(pushed.len(), 1, "the approver is roused exactly once");
+        assert_eq!(
+            pushed[0].body.get("type").and_then(|t| t.as_str()),
+            Some(super::CONSENT_APPROVE_REQUEST_TYPE),
+            "the task type belongs in the enveloped document, not on the envelope"
+        );
+        assert_eq!(pushed[0].recipient_did, APPROVER);
+        assert_eq!(
+            pushed[0].body["payload"]["challenge"].as_str(),
+            Some("challenge-xyz"),
+            "the challenge the approver signs against must survive the re-wrap"
+        );
+        assert_eq!(
+            pushed[0].body["payload"]["displayHint"].as_str(),
+            Some("Signal group 'Family'"),
+            "the operator-facing label is the point of the prompt: without it \
+             the approver is asked to decide about an opaque conversationRef"
+        );
+        assert!(
+            !pushed[0].body["payload"]
+                .as_object()
+                .expect("prompt payload is an object")
+                .contains_key("firstMessageDigest"),
+            "an unset hint is absent, not null"
+        );
+
+        // The prompt is authenticated, and the proof verifies against the
+        // document as sent.
+        //
+        // Asserting the `proof` member merely exists would pass on a proof
+        // over different content, which is the failure mode that matters: a
+        // signature copied from another document authenticates that one, not
+        // this one. So this runs the real verifier, and it also pins the two
+        // members that make the proof non-replayable — without `recipient`,
+        // the same signed prompt is valid at any approver.
+        let signer = crate::auth::verify_trust_task_proof(
+            &serde_json::from_value(pushed[0].body.clone())
+                .expect("the pushed document parses as a Trust Task"),
+        )
+        .await
+        .expect("the consent prompt's proof verifies");
+        assert_eq!(
+            pushed[0].body["issuer"].as_str(),
+            Some(signer.as_str()),
+            "SPEC §7.2 item 6: the in-band issuer must be the party that signed"
+        );
+        assert_eq!(
+            pushed[0].body["recipient"].as_str(),
+            Some(APPROVER),
+            "SPEC §7.2 item 5b: recipient is REQUIRED, and it is what stops \
+             this prompt being replayed at a different approver"
+        );
+
+        // And the payload matches the schema we published for it.
+        //
+        // Nothing on this side would otherwise catch a divergence: the prompt
+        // is *produced*, never served, so it never reaches the dispatcher's
+        // `validate_payload`. The party that validates it is the approver's
+        // device — which means a mismatch surfaces as a refused prompt on
+        // someone's phone rather than as a failing build here. That is the
+        // shape of both shipped payload defects this workspace has had
+        // (#895, #919): found by a person, from a rejected request.
+        let schema = vti_specs::schema_index::schema_for(super::CONSENT_APPROVE_REQUEST_TYPE)
+            .expect("consent/approve-request/0.1 is published");
+        trust_tasks_rs::validate::against_schema(schema, &pushed[0].body["payload"])
+            .expect("the prompt we send validates against the schema we published");
+    }
+}

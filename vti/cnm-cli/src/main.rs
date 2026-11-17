@@ -1,0 +1,3170 @@
+mod access;
+mod actions;
+mod actions_watch;
+mod audit;
+mod auth;
+mod backup;
+mod boards;
+mod config;
+mod consent;
+mod did_log;
+mod elections;
+mod git;
+mod member;
+mod members;
+mod networks;
+mod onboard;
+mod pnm_profile;
+mod rooms;
+mod setup;
+mod storage;
+mod vetting;
+mod vtc;
+
+use clap::{Parser, Subcommand, ValueEnum};
+use config::{community_keyring_key, resolve_community};
+use vta_cli_common::exit;
+use vta_sdk::client::VtaClient;
+
+use vta_cli_common::commands::{
+    acl, config as config_cmd, contexts, credentials, did_templates, keys,
+};
+use vta_cli_common::render::{CYAN, DIM, GREEN, RED, RESET, YELLOW, print_section};
+
+#[derive(Parser)]
+#[command(
+    name = "cnm",
+    version,
+    // `--version` only: `-V` is `--verbose` in both CLIs (#2587, #2592).
+    disable_version_flag = true,
+    about = "CLI for VTC Verifiable Trust Agents (community-admin scope)",
+    long_about = "Community Network Manager — community-admin-scoped CLI for the VTA.\n\
+                  \n\
+                  CNM is deliberately a reduced surface compared to `pnm`:\n\
+                  - No `webvh` / `keys import`, and no VTA audit *tail* — those are\n\
+                    VTA-operator concerns and live on pnm. (`cnm audit verify` IS\n\
+                    here: it checks the *community's* own audit chain.)\n\
+                  - `backup` IS here: it backs up the *community's* state (the VTC),\n\
+                    a community-admin concern, distinct from pnm's VTA backup.\n\
+                  - DID-template management is mirrored here because community admins\n\
+                    own context-scoped templates.\n\
+                  - Contexts + ACL + auth-credential generation are present because\n\
+                    a community admin needs to provision application identities."
+)]
+struct Cli {
+    /// Print version
+    #[arg(long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
+
+    /// Base URL of the VTA service (overrides config). A top-level flag: put it
+    /// before the subcommand (`--url` is also a subcommand argument on
+    /// several commands, so it cannot be global).
+    ///
+    /// For the commands that talk to the community's VTC instead — `vetting`,
+    /// `audit`, `backup`, `did-log` — this is the VTC's API base, including
+    /// its mount (`https://<vtc-host>/v1`), and overrides the `VTCRest`
+    /// endpoint the VTC's DID document advertises.
+    #[arg(long, env = "VTA_URL")]
+    url: Option<String>,
+
+    /// The community's VTC DID, for `vetting`, `audit` and `backup`.
+    ///
+    /// Overrides the one recorded in the community profile
+    /// (`cnm community set-vtc`). It is the audience `cnm` authenticates to
+    /// the VTC with, and the DID whose document names the VTC's API base.
+    #[arg(long, global = true, env = "CNM_VTC_DID")]
+    vtc_did: Option<String>,
+
+    /// Override the active community for this command
+    #[arg(short = 'c', long, global = true)]
+    community: Option<String>,
+
+    /// Enable verbose debug output (can also set RUST_LOG=debug). `-V` is
+    /// accepted too, as in `pnm` (where `-v` is `--vta`).
+    #[arg(short, long, short_alias = 'V', global = true)]
+    verbose: bool,
+
+    /// Show full identifiers (DIDs, key ids, template names, …) in
+    /// list output instead of the compact table view that may truncate
+    /// long values. Useful when you need to copy a complete ID.
+    #[arg(long, global = true)]
+    full_display: bool,
+
+    /// Resolve verified agent names for the DIDs shown.
+    ///
+    /// Off by default because it costs network: one DID resolution plus an
+    /// outbound fetch per name a document claims, per DID on screen. A claim
+    /// that does not round-trip back to its DID is marked `[unverified]`
+    /// rather than believed — `alsoKnownAs` alone is self-asserted.
+    #[arg(long, global = true)]
+    resolve_agent_names: bool,
+
+    /// Emit output as JSON instead of a human-readable table. Automatic when
+    /// stdout is not a terminal: `cnm acl list | jq …`.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Force a transport instead of auto-selecting. Auto prefers TSP, then
+    /// DIDComm, then REST. `tsp` / `didcomm` pin a mediator transport and fail
+    /// rather than fall back; `rest` skips both — the recovery path when a
+    /// mediator is unreachable. Applies to the VTA and to the Trust Tasks
+    /// `cnm git` sends the VTC.
+    #[arg(long, value_enum, default_value_t = TransportOpt::Auto, global = true)]
+    transport: TransportOpt,
+
+    /// Accept a VTA REST endpoint on a private network (RFC 1918, IPv6
+    /// unique-local, carrier-grade NAT, `*.internal` / `*.local` names) when
+    /// it comes from a DID document. Off by default: such an endpoint must
+    /// otherwise be a public host, or loopback for local development.
+    #[arg(
+        long,
+        global = true,
+        env = "VTA_ALLOW_PRIVATE_ENDPOINTS",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    allow_private_endpoints: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+/// Transport to use when connecting to the VTA. Mirrors pnm's flag; maps onto
+/// [`vta_sdk::session::TransportChoice`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum TransportOpt {
+    /// Prefer TSP when the VTA advertises it, else DIDComm, else REST.
+    /// Falls back loudly (a WARN naming the mediator) if an advertised TSP
+    /// endpoint doesn't answer.
+    #[default]
+    Auto,
+    /// Force TSP. Fails — rather than falling back — if the VTA advertises no
+    /// `#tsp` service or its TSP mediator doesn't answer.
+    Tsp,
+    /// Force DIDComm, ignoring an advertised `#tsp`. Recovers a VTA whose TSP
+    /// endpoint is broken but whose mediator is healthy.
+    Didcomm,
+    /// Force REST even when a mediator transport is advertised — recovers a VTA
+    /// whose mediator is unreachable.
+    Rest,
+}
+
+impl From<TransportOpt> for vta_sdk::session::TransportChoice {
+    fn from(opt: TransportOpt) -> Self {
+        match opt {
+            TransportOpt::Auto => Self::Auto,
+            TransportOpt::Tsp => Self::Tsp,
+            TransportOpt::Didcomm => Self::Didcomm,
+            TransportOpt::Rest => Self::Rest,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initial setup wizard: the personal VTA, then a community.
+    ///
+    /// The personal VTA is onboarded the way `pnm setup` onboards one: cnm
+    /// mints an ephemeral did:key, an administrator grants it, and on the
+    /// first authentication cnm rotates to a fresh did:key and drops the temp
+    /// one. If `pnm` on this machine already administers the same VTA, the
+    /// wizard offers to make the grant with that session instead; a sealed
+    /// bundle from an administrator stays available for air-gapped setups.
+    ///
+    ///   # Interactive:
+    ///   cnm setup
+    ///
+    ///   # Phase 1 (non-interactive — JSON on stdout):
+    ///   cnm setup --name home
+    ///
+    ///   # Phase 2, once the grant is made (non-interactive — JSON on stdout):
+    ///   cnm setup continue home --vta-did did:webvh:...
+    Setup {
+        #[command(subcommand)]
+        command: Option<SetupCommands>,
+
+        /// Non-interactive phase 1: a name for the personal VTA. Combining
+        /// with `continue` is an error.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Non-interactive phase 1: replace a *pending* personal-VTA setup.
+        /// Never replaces a completed one.
+        #[arg(long)]
+        overwrite: bool,
+    },
+
+    /// Community management
+    Community {
+        #[command(subcommand)]
+        command: CommunityCommands,
+    },
+
+    /// Check service health
+    Health,
+
+    /// Authentication management
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+
+    /// Configuration management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+
+    /// Key management
+    Keys {
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+
+    /// Application context management
+    Contexts {
+        #[command(subcommand)]
+        command: ContextCommands,
+    },
+
+    /// Access control list management
+    Acl {
+        #[command(subcommand)]
+        command: AclCommands,
+    },
+
+    /// Generate auth credentials for applications and services
+    AuthCredential {
+        #[command(subcommand)]
+        command: AuthCredentialCommands,
+    },
+
+    /// Encrypted full-state backup / restore of the community.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
+    },
+
+    /// Audit-trail integrity checks for the community.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
+
+    /// Peer identity vetting: vetter grants, automatic grants, branding,
+    /// statement withdrawals, and seeding vetters from a PGP web of trust.
+    Vetting {
+        #[command(subcommand)]
+        command: vetting::VettingCommands,
+    },
+
+    /// The community's own access-control list, on its VTC: list, show,
+    /// grant, update, change-role, revoke. (`acl` is the community VTA's.)
+    Access {
+        #[command(subcommand)]
+        command: access::AccessCommands,
+    },
+
+    /// Member-facing verbs on your own membership and relationships: renew,
+    /// rotate, personhood revoke, relationships list/publish/revoke, and
+    /// issuing a community statement (Admin or Issuer).
+    Member {
+        #[command(subcommand)]
+        command: member::MemberCommands,
+    },
+
+    /// Admit a DID directly, without a join request: `admit` (Add a member)
+    /// and `make-membership` (an entry with no member record). Decided by the
+    /// community's admission policy. (`member` is your own membership.)
+    Members {
+        #[command(subcommand)]
+        command: members::MembersCommands,
+    },
+
+    /// Answer the community's consent requests: making or widening an
+    /// unrestricted administrator needs another one's approval.
+    Consent {
+        #[command(subcommand)]
+        command: consent::ConsentCommands,
+    },
+
+    /// The administrator action list: operations waiting for approval, the
+    /// ones you asked for, and history.
+    Actions {
+        #[command(subcommand)]
+        command: actions::ActionsCommands,
+    },
+
+    /// Git namespaces: bind a forge owner, grant and revoke git rights,
+    /// adopt repositories, list what the community governs.
+    Git {
+        #[command(subcommand)]
+        command: git::GitCommands,
+    },
+
+    /// The community's boards: create them, decide and select their ideas, moderate notes
+    /// (`vtc/boards/*`). Members propose and vote with `pnm boards` / `pnm elections`.
+    Boards {
+        #[command(subcommand)]
+        command: boards::BoardsCommands,
+    },
+
+    /// The community's polls, surveys and elections: create them from a manifest, list,
+    /// show, close, cancel, and certify a result (`vtc/elections/*`).
+    Elections {
+        #[command(subcommand)]
+        command: elections::ElectionsCommands,
+    },
+
+    /// Data rooms the community itself owns: create them, offer members admission,
+    /// remove members (`vtc/rooms/community/*`). The community's VTA holds their keys.
+    Rooms {
+        #[command(subcommand)]
+        command: rooms::RoomsCommands,
+    },
+
+    /// The Verifiable Trust Networks this community belongs to: list them, join from a
+    /// network's invitation, leave, or reject a listing (`vtc/networks/*`).
+    Networks {
+        #[command(subcommand)]
+        command: networks::NetworksCommands,
+    },
+
+    /// Where the community keeps its rooms' files: its storage configs, and a `sealed`
+    /// config's credential, sealed here to the community (`vtc/storage/*`).
+    Storage {
+        #[command(subcommand)]
+        command: storage::StorageCommands,
+    },
+
+    /// The community's own DID log, when the community self-hosts it: install a
+    /// log the VTA extended (a transport added, a key rotated).
+    #[command(name = "did-log")]
+    DidLog {
+        #[command(subcommand)]
+        command: did_log::DidLogCommands,
+    },
+
+    /// Sealed-transfer bootstrap (consumer side).
+    Bootstrap {
+        #[command(subcommand)]
+        command: BootstrapCommands,
+    },
+
+    /// DID document template management.
+    ///
+    /// Phase 1 surface is offline-only: validate a template file, or scaffold
+    /// a starter by forking a built-in. Later phases will add list/create/
+    /// update/delete commands that hit the VTA.
+    #[command(name = "did-templates")]
+    DidTemplates {
+        #[command(subcommand)]
+        command: DidTemplateCommands,
+    },
+    /// Print a shell completion script (#2592).
+    ///
+    ///   cnm completions bash > ~/.local/share/bash-completion/completions/cnm
+    ///   cnm completions zsh  > "${fpath[1]}/_cnm"
+    ///   cnm completions fish > ~/.config/fish/completions/cnm.fish
+    Completions {
+        /// The shell to generate for.
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum DidTemplateCommands {
+    /// Validate a DID template file against the v1 schema (offline).
+    Validate {
+        /// Path to a template JSON file to validate.
+        file: std::path::PathBuf,
+    },
+
+    /// Scaffold a starter template by forking an embedded built-in (offline).
+    Init {
+        /// Built-in kind or alias to fork.
+        kind: String,
+    },
+
+    /// List every built-in template shipped with this SDK (offline).
+    #[command(name = "list-builtins")]
+    ListBuiltins,
+
+    /// List DID templates stored on the VTA.
+    List {
+        /// FILTER: scope the listing to one context. Omit for global scope.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Show a stored template by name. `--rendered` previews the DID document.
+    Show {
+        /// Template name.
+        name: String,
+        /// LOOKUP SCOPE: which scope to search for the named template.
+        /// Omit for global scope.
+        #[arg(long)]
+        context: Option<String>,
+        /// Render the template rather than showing its raw record.
+        #[arg(long)]
+        rendered: bool,
+        /// `KEY=VALUE` — supply a template variable. Repeatable.
+        #[arg(long = "var", value_parser = parse_key_value_cnm)]
+        vars: Vec<(String, String)>,
+    },
+
+    /// Upload a new template. Global is super-admin-only; context scope is
+    /// writable by context admins.
+    Create {
+        /// Path to a template JSON file.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// TARGET SCOPE: create in this context's scope instead of global.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Replace a stored template.
+    Update {
+        /// Template name.
+        name: String,
+        /// Path to the replacement JSON file.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// TARGET SCOPE: operate on this context's stored template.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Delete a stored template.
+    Delete {
+        /// Template name.
+        name: String,
+        /// TARGET SCOPE: operate on this context's stored template.
+        #[arg(long)]
+        context: Option<String>,
+        /// Delete without asking (needed when there is no terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Export a stored template to stdout as a portable JSON file.
+    Export {
+        /// Template name.
+        name: String,
+        /// LOOKUP SCOPE: export from this context's scope instead of global.
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Compare a local template file against the VTA-stored version.
+    Diff {
+        /// Template name.
+        name: String,
+        /// Path to the local template JSON file.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// LOOKUP SCOPE: fetch stored from this context's scope.
+        #[arg(long)]
+        context: Option<String>,
+    },
+}
+
+fn parse_key_value_cnm(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got '{s}'"))?;
+    Ok((k.to_string(), v.to_string()))
+}
+
+fn is_online_template_cmd(cmd: &DidTemplateCommands) -> bool {
+    !matches!(
+        cmd,
+        DidTemplateCommands::Validate { .. }
+            | DidTemplateCommands::Init { .. }
+            | DidTemplateCommands::ListBuiltins
+    )
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Verify the community's audit hash chain end to end.
+    ///
+    /// Exits non-zero when the chain does not verify, so this works
+    /// as a scheduled check. Note that a pass proves internal
+    /// consistency, not authenticity — the chain is unsigned.
+    Verify,
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    /// Export the community's state to an encrypted backup file.
+    Export {
+        /// Include the audit log (can be large; off by default).
+        #[arg(long)]
+        include_audit: bool,
+        /// Output file path (default: `vtc-backup-<slug>-<ts>.vtcbak`).
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+        /// Replace the output file if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Read the backup password from this file, or `-` for stdin. Without
+        /// it, CNM_BACKUP_PASSWORD is read, then the terminal is asked (no echo).
+        /// With none of them and no terminal, the command fails rather than
+        /// wait: a scheduled backup names one (#2585).
+        #[arg(long, value_name = "PATH|-")]
+        password_file: Option<std::path::PathBuf>,
+    },
+    /// Import the community's state from an encrypted backup file.
+    Import {
+        /// Path to the `.vtcbak` backup file.
+        file: std::path::PathBuf,
+        /// Preview only — show row counts without applying.
+        #[arg(long)]
+        preview: bool,
+        /// Read the backup password from this file, or `-` for stdin. Without
+        /// it, CNM_BACKUP_PASSWORD is read, then the terminal is asked (no echo).
+        /// With none of them and no terminal, the command fails rather than
+        /// wait: a scheduled backup names one (#2585).
+        #[arg(long, value_name = "PATH|-")]
+        password_file: Option<std::path::PathBuf>,
+        /// Replace the VTA's data without asking (needed when there is no
+        /// terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BootstrapCommands {
+    /// Generate an ephemeral keypair and emit a BootstrapRequest for the producer.
+    ///
+    /// The X25519 secret is stored on disk under
+    /// `~/.config/cnm/bootstrap-secrets/<bundle_id>.key` (mode 0600 on Unix).
+    /// The emitted JSON file contains only the public key, a fresh nonce, and
+    /// an optional label — no secrets cross the boundary.
+    Request {
+        /// Output path for the BootstrapRequest JSON.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Optional human-readable label visible to the operator.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Open an armored sealed bundle returned by the producer.
+    ///
+    /// `--expect-digest <hex>` is required by default. Use `--no-verify-digest`
+    /// to opt out (with a warning) — there is no silent TOFU.
+    Open {
+        /// Path to the armored bundle file.
+        #[arg(long)]
+        bundle: std::path::PathBuf,
+        /// Expected SHA-256 digest, communicated out-of-band by the producer.
+        #[arg(long)]
+        expect_digest: Option<String>,
+        /// Skip out-of-band digest verification (testing only — prints a warning).
+        #[arg(long)]
+        no_verify_digest: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommunityCommands {
+    /// List configured communities
+    List,
+    /// Switch default community
+    Use {
+        /// Community slug to set as default
+        name: String,
+    },
+    /// Add a new community, with an admin identity of its own.
+    ///
+    /// Without a name: interactive. With one: mints a fresh did:key for this
+    /// community alone, parks it as pending, prints the grant commands and one
+    /// JSON line (`{slug, admin_did, state}`). Finish with
+    /// `cnm community continue <slug> --vtc-did <did>` once it is granted.
+    Add {
+        /// The community's name. Omit for the interactive wizard.
+        name: Option<String>,
+        /// The local slug (default: derived from the name).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Use the identity of this existing community instead of minting
+        /// one. The two communities then share a key, which links them to
+        /// anyone who sees both ACLs — never done without this flag.
+        #[arg(long, value_name = "COMMUNITY")]
+        reuse_identity: Option<String>,
+        /// The community's VTA, if it has one.
+        #[arg(long)]
+        vta_did: Option<String>,
+        /// Replace a *pending* community of the same slug.
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Finish adding a community: authenticate to its VTC as the pending
+    /// identity (which works once an administrator has granted it) and make
+    /// the community usable. The VTC is `--vtc-did`, else the one given to
+    /// `add`; `--url` overrides the API base its DID document advertises.
+    Continue {
+        /// The pending community's slug.
+        name: String,
+        /// The community's VTA, if it has one.
+        #[arg(long)]
+        vta_did: Option<String>,
+    },
+    /// Roll this machine's identity for a community onto a fresh key, at the
+    /// community's VTC (`acl/swap-key/0.1`): the entry keeps exactly its
+    /// authority and the old DID loses all standing. `continue` already does
+    /// this once; run it again to rotate on a schedule or after a suspected
+    /// compromise. Refused for an identity shared with another community or
+    /// bound to a community VTA.
+    Rotate {
+        /// The community's slug (default: the active community).
+        name: Option<String>,
+    },
+    /// Delete a community connection from this machine: its local config
+    /// entry and stored credential.
+    ///
+    /// Local only — the community's VTA, and the ACL entry that authorises
+    /// this credential on it, are untouched. Revoke that with `cnm acl delete`
+    /// if the credential should stop working.
+    #[command(alias = "remove")]
+    Delete {
+        /// Community slug to delete
+        name: String,
+        /// Skip the confirmation prompt. `--force` is accepted as a hidden
+        /// alias.
+        #[arg(long = "yes", short = 'y', alias = "force")]
+        yes: bool,
+    },
+    /// Show current community info
+    Status,
+    /// Send a DIDComm trust-ping to the community VTA
+    Ping,
+    /// Record the community's VTC DID in the active community profile
+    /// (`-c <name>` for another).
+    ///
+    /// `cnm vetting`, `cnm audit` and `cnm backup` authenticate to the VTC
+    /// with this DID as the audience, and call the API base its DID document
+    /// advertises (`VTCRest`). It is the DID `vtc setup` printed for the
+    /// community, not the community VTA's.
+    #[command(name = "set-vtc")]
+    SetVtc {
+        /// The VTC's DID (`did:webvh:…`).
+        did: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetupCommands {
+    /// Finish a pending personal-VTA setup: bind the VTA DID, authenticate
+    /// (which rotates the temporary did:key to a fresh one and removes the
+    /// temp ACL entry), and — interactively — go on to add a community.
+    ///
+    /// Interactive on a terminal without `--vta-did`; with it, prints one JSON
+    /// line. Re-run it if the grant was not in place yet.
+    Continue {
+        /// The name given to `cnm setup --name` (checked when given).
+        name: Option<String>,
+        /// The personal VTA's DID. Must start with `did:`.
+        #[arg(long)]
+        vta_did: Option<String>,
+        /// The VTA's REST URL, for a did:key VTA that advertises none.
+        #[arg(long)]
+        vta_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Import a credential from an armored sealed bundle and authenticate.
+    ///
+    /// Expects an armored `VTA SEALED BUNDLE` produced by the operator. The
+    /// local secret must already exist under `~/.config/cnm/bootstrap-secrets/`
+    /// — produce one with `cnm bootstrap request --out <request>.json`.
+    Login {
+        /// Path to the armored sealed bundle file.
+        #[arg(long)]
+        credential_bundle: std::path::PathBuf,
+        /// Expected SHA-256 digest, communicated out-of-band by the producer.
+        #[arg(long)]
+        expect_digest: Option<String>,
+        /// Skip out-of-band digest verification. The bundle is then accepted
+        /// only if it is signed by the community's configured VTA DID; the
+        /// admin credentials pnm and cnm seal carry no such signature and
+        /// need --expect-digest.
+        #[arg(long)]
+        no_verify_digest: bool,
+    },
+    /// Clear stored credentials and tokens
+    Logout,
+    /// Show current authentication status
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Get current configuration
+    Get,
+    /// Update configuration
+    Update {
+        // `--community-vta-did` is deliberately absent: the VTA's own identity
+        // is set at setup and immutable at runtime (canonical config/patch
+        // reports it under `rejected`). There is no flag to attempt it with.
+        /// VTA name
+        #[arg(long)]
+        community_vta_name: Option<String>,
+        /// Public URL for this VTA
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Auth rate limiter: SECONDS PER TOKEN, 1-3600. Not a rate — lower
+        /// is looser. Applied live, no restart.
+        #[arg(long, value_name = "SECS")]
+        rate_limit_interval_secs: Option<u64>,
+        /// Auth rate limiter burst, 1-10000. Applied live.
+        #[arg(long, value_name = "N")]
+        rate_limit_burst: Option<u32>,
+        /// DID-log rate limiter (public did.jsonl): SECONDS PER TOKEN, 1-3600.
+        #[arg(long, value_name = "SECS")]
+        did_log_rate_limit_interval_secs: Option<u64>,
+        /// DID-log rate limiter burst, 1-10000. Applied live.
+        #[arg(long, value_name = "N")]
+        did_log_rate_limit_burst: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContextCommands {
+    /// List all application contexts
+    List,
+    /// Get a context by ID
+    Get {
+        /// Context ID (e.g. "vta")
+        id: String,
+    },
+    /// Create a new application context
+    Create {
+        /// Context path: a slug (lowercase alphanumeric + hyphens), or slugs
+        /// joined by `/` to nest (e.g. `acme/eng`). Nesting requires admin of
+        /// the parent; a top-level context is super-admin only.
+        #[arg(long)]
+        id: String,
+        /// Human-readable name
+        #[arg(long)]
+        name: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        /// DID to grant admin access to (must start with `did:`). When set,
+        /// creates an ACL entry with role=admin scoped to this context.
+        #[arg(long)]
+        admin_did: Option<String>,
+        /// Human-readable label for the admin ACL entry.
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Setup-ACL expiry — accepts `N[s|m|h|d|w]` (e.g. `24h`, `7d`).
+        /// When set, the admin entry auto-expires via the VTC's sweeper.
+        /// Requires `--admin-did`.
+        #[arg(long, requires = "admin_did")]
+        admin_expires: Option<String>,
+        /// Mark the admin entry as a **one-time hand-off** (VTI-ACL-054): the
+        /// admin DID may roll over once, while the entry is live, to a long-term
+        /// admin DID the VTA mints for it (provision-integration with an admin
+        /// template). The long-term admin is bounded by your own authority, and
+        /// takes your expiry rather than this entry's. Without it, the rollover
+        /// is refused because the long-term admin would outlive this entry.
+        /// Requires `--admin-expires`.
+        #[arg(long, requires = "admin_expires")]
+        admin_handoff: bool,
+    },
+    /// Update an existing context
+    Update {
+        /// Context ID
+        id: String,
+        /// New name
+        #[arg(long)]
+        name: Option<String>,
+        /// Set the DID for this context
+        #[arg(long, conflicts_with = "clear_did")]
+        did: Option<String>,
+        /// Clear this context's DID, leaving it with no identity of its own.
+        /// The DID is not deleted. Sent as `vta/contexts/update-did/1.1`, so
+        /// it needs only admin over the context.
+        #[arg(long)]
+        clear_did: bool,
+        /// New description
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Update the DID for a context (context admin or super admin)
+    UpdateDid {
+        /// Context ID
+        id: String,
+        /// The new DID to assign
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        did: Option<String>,
+        /// Clear the context's DID instead, leaving it with no identity of its
+        /// own. The DID is not deleted.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Delete an application context and all associated resources
+    Delete {
+        /// Context ID
+        id: String,
+        /// Skip the confirmation prompt. `--force` / `-f` are accepted as
+        /// hidden aliases.
+        #[arg(long = "yes", short = 'y', alias = "force", short_alias = 'f')]
+        yes: bool,
+        /// Finish the deletion even if a DID's hosting server cannot confirm
+        /// removing its published log (down, refusing, or no longer
+        /// registered). Those DIDs may keep resolving and removing them is
+        /// then up to you. Without it you are shown them and asked; `--yes`
+        /// does not answer that question.
+        #[arg(long)]
+        abandon_host_copies: bool,
+    },
+    /// Create a context and mint a sealed admin credential for its first admin.
+    ///
+    /// The admin did:key is generated locally and registered via `POST /acl`;
+    /// the VTA never sees the private key. The minted credential is sealed to
+    /// the `--recipient` and printed as an armored bundle.
+    Bootstrap {
+        /// Context path (e.g. `acme` or `acme/eng`)
+        #[arg(long)]
+        id: String,
+        /// Human-readable name
+        #[arg(long)]
+        name: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+        /// Admin label
+        #[arg(long)]
+        admin_label: Option<String>,
+        /// Path to a BootstrapRequest JSON file produced by `cnm bootstrap request`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519). The X25519 pubkey HPKE seals to
+        /// is derived locally.
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclCommands {
+    /// List ACL entries
+    List {
+        /// FILTER: narrow the listing to one context. Omit to see every entry
+        /// visible to you. See --direction for which way this reads.
+        #[arg(long)]
+        context: Option<String>,
+        /// Which way --context reads along the context hierarchy:
+        /// `acting-in` (default) — who may act IN the context: entries scoped
+        /// to it or to an ancestor of it;
+        /// `subtree` — what is granted BENEATH it: entries scoped to it or to
+        /// a descendant, i.e. the grants a revocation sweep must cut;
+        /// `any` — both.
+        #[arg(long, requires = "context")]
+        direction: Option<String>,
+    },
+    /// Get an ACL entry by DID (`show`, as on `cnm access`)
+    #[command(visible_alias = "show")]
+    Get {
+        /// DID to look up
+        did: String,
+    },
+    /// Create an ACL entry (`grant`, as on `cnm access`)
+    #[command(visible_alias = "grant")]
+    Create {
+        /// DID to grant access to. Positional, as on `get`, `update` and
+        /// `delete` (#2591); `--did <DID>` is still accepted.
+        #[arg(required_unless_present = "did_flag")]
+        did: Option<String>,
+        /// The DID, as a flag (the older spelling).
+        #[arg(long = "did", value_name = "DID", conflicts_with = "did", hide = true)]
+        did_flag: Option<String>,
+        /// Role: admin, initiator, application, or reader
+        #[arg(long)]
+        role: String,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Comma-separated context IDs (empty = unrestricted)
+        #[arg(long, value_delimiter = ',')]
+        contexts: Vec<String>,
+        /// Optional expiry — accepts `N[s|m|h|d|w]` (e.g. `24h`, `7d`). When
+        /// set, the server's ACL sweeper removes the entry after the deadline.
+        /// Without this flag the entry is permanent.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Restrict this DID to invoking the signing oracle on exactly these
+        /// key ids (comma-separated). Intersects with `--contexts` — it can
+        /// only narrow, never widen. Omit for no filter.
+        #[arg(long, value_delimiter = ',')]
+        allowed_keys: Option<Vec<String>>,
+    },
+    /// Update an ACL entry
+    Update {
+        /// DID of the entry to update
+        did: String,
+        /// New role
+        #[arg(long)]
+        role: Option<String>,
+        /// New label
+        #[arg(long)]
+        label: Option<String>,
+        /// New comma-separated context IDs
+        #[arg(long, value_delimiter = ',')]
+        contexts: Option<Vec<String>>,
+        /// Replace the signing-oracle key filter with exactly these key ids
+        /// (comma-separated). The narrowing binds the subject's next sign
+        /// request. Omit to leave the filter unchanged.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            conflicts_with = "allowed_keys_unrestricted"
+        )]
+        allowed_keys: Option<Vec<String>>,
+        /// Remove the signing-oracle key filter entirely (a privilege
+        /// increase — the subject may again use every key in its contexts).
+        #[arg(long)]
+        allowed_keys_unrestricted: bool,
+        /// Optional rationale, recorded in the audit log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Delete an ACL entry (`revoke`, as on `cnm access`). Irreversible: asks
+    /// first on a terminal, and without one needs `--yes`.
+    #[command(visible_alias = "revoke")]
+    Delete {
+        /// DID of the entry to delete
+        did: String,
+        /// Optional rationale, recorded in the audit log.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Delete without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCredentialCommands {
+    /// Generate a new auth credential (did:key minted locally + ACL entry)
+    /// and seal it to the given recipient.
+    Create {
+        /// Role: admin, initiator, application, or reader
+        #[arg(long)]
+        role: String,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Comma-separated context IDs (empty = unrestricted)
+        #[arg(long, value_delimiter = ',')]
+        contexts: Vec<String>,
+        /// Path to a BootstrapRequest JSON file produced by `cnm bootstrap request`.
+        #[arg(long, conflicts_with_all = ["recipient_did", "recipient_nonce"])]
+        recipient: Option<std::path::PathBuf>,
+        /// Recipient's `did:key` (Ed25519). The X25519 pubkey HPKE seals to
+        /// is derived locally.
+        #[arg(long, requires = "recipient_nonce", conflicts_with = "recipient")]
+        recipient_did: Option<String>,
+        /// Recipient's 16-byte nonce in hex.
+        #[arg(long, requires = "recipient_did", conflicts_with = "recipient")]
+        recipient_nonce: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCommands {
+    /// Create a new key
+    Create {
+        /// Key type: ed25519, x25519, p256, mldsa44 or mldsa65 (the last two are
+        /// post-quantum signing, FIPS 204)
+        #[arg(long)]
+        key_type: String,
+        /// BIP-32 derivation path (auto-derived from context if omitted)
+        #[arg(long)]
+        derivation_path: Option<String>,
+        /// Read a BIP-39 mnemonic phrase from this file, or `-` for stdin
+        /// (asked without echo on a terminal). Never on the command line,
+        /// where shell history and `ps` keep it (#2584).
+        #[arg(long, value_name = "PATH|-")]
+        mnemonic_file: Option<std::path::PathBuf>,
+        /// Deprecated: puts the phrase on the command line. Use
+        /// `--mnemonic-file`.
+        #[arg(long, hide = true, conflicts_with = "mnemonic_file")]
+        mnemonic: Option<String>,
+        /// Human-readable label
+        #[arg(long)]
+        label: Option<String>,
+        /// Application context ID
+        #[arg(long)]
+        context_id: Option<String>,
+        /// Create a NON-RECOVERABLE internal key.
+        ///
+        /// Generated from the system CSPRNG, NOT derived from your BIP-39 seed,
+        /// excluded from backups, and never exported by any surface — the VTA
+        /// will only ever sign with it. If this VTA's storage is lost the key is
+        /// gone permanently. Cannot sign did:webvh log entries; may be a signing
+        /// verificationMethod inside a DID document.
+        #[arg(long)]
+        internal: bool,
+        /// Skip the internal-key confirmation prompt (automation only).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Get a key by ID
+    Get {
+        /// Key ID
+        key_id: String,
+        /// Reveal private key material (multibase)
+        #[arg(long)]
+        secret: bool,
+    },
+    /// Revoke (invalidate) a key. Irreversible: asks first on a terminal,
+    /// and without one needs `--yes`.
+    Revoke {
+        /// Key ID
+        key_id: String,
+        /// Optional rationale, recorded in the audit log.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Revoke without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Rename a key
+    Rename {
+        /// Current key ID
+        key_id: String,
+        /// New key ID
+        new_key_id: String,
+    },
+    /// List all keys
+    List {
+        /// Maximum number of keys to return
+        #[arg(long, default_value = "50")]
+        limit: u64,
+        /// Continue from a previous page: the `nextCursor` it printed
+        #[arg(long)]
+        cursor: Option<String>,
+        /// FILTER: only keys with this status (`active` or `revoked`).
+        #[arg(long)]
+        status: Option<String>,
+        /// FILTER: only keys belonging to this context.
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Export secret key material for one or more keys
+    Secrets {
+        /// Key IDs to export (omit to export all active keys in --context)
+        key_ids: Vec<String>,
+        /// REFERENCE: export every active key in this context when no
+        /// `key_ids` are supplied.
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// List seed generations
+    Seeds,
+    /// Rotate to a new seed generation. Asks first on a terminal, and
+    /// without one needs `--yes`.
+    RotateSeed {
+        /// Read the BIP-39 mnemonic for the new seed from this file, or `-`
+        /// for stdin (asked without echo on a terminal). Random if omitted.
+        #[arg(long, value_name = "PATH|-")]
+        mnemonic_file: Option<std::path::PathBuf>,
+        /// Deprecated: puts the phrase on the command line. Use
+        /// `--mnemonic-file`.
+        #[arg(long, hide = true, conflicts_with = "mnemonic_file")]
+        mnemonic: Option<String>,
+        /// Rotate without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+fn print_banner() {
+    use vta_cli_common::startup::banner_color;
+    let green = banner_color("\x1b[32m");
+    let magenta = banner_color("\x1b[35m");
+    let yellow = banner_color("\x1b[33m");
+    let dim = banner_color("\x1b[2m");
+    let reset = banner_color("\x1b[0m");
+
+    eprintln!(
+        r#"
+{green}  ██████╗ {magenta}███╗   ██╗ {yellow}███╗   ███╗{reset}
+{green} ██╔════╝ {magenta}████╗  ██║ {yellow}████╗ ████║{reset}
+{green} ██║      {magenta}██╔██╗ ██║ {yellow}██╔████╔██║{reset}
+{green} ██║      {magenta}██║╚██╗██║ {yellow}██║╚██╔╝██║{reset}
+{green} ╚██████╗ {magenta}██║ ╚████║ {yellow}██║ ╚═╝ ██║{reset}
+{green}  ╚═════╝ {magenta}╚═╝  ╚═══╝ {yellow}╚═╝     ╚═╝{reset}
+{dim}  Community Network Manager v{version}{reset}
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+    );
+}
+
+/// Implementation of `cnm auth login --credential-bundle <file>`.
+///
+/// Opens an armored sealed bundle (matching a secret persisted earlier by
+/// `cnm bootstrap request`), verifies its producer and VTA DID against
+/// `expected_vta_did` (the community's configured DID, when there is one),
+/// and installs the admin credential via `auth::login`.
+async fn auth_login_sealed(
+    client: &VtaClient,
+    keyring_key: &str,
+    credential_bundle: &std::path::Path,
+    expect_digest: Option<&str>,
+    no_verify_digest: bool,
+    expected_vta_did: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir =
+        config::config_dir().map_err(|e| format!("could not resolve config dir: {e}"))?;
+    vta_cli_common::sealed_consumer::validate_digest_flags(expect_digest, no_verify_digest)?;
+    let bundle = vta_cli_common::sealed_consumer::open_admin_credential(
+        credential_bundle,
+        &config_dir,
+        expect_digest,
+        expected_vta_did,
+    )?;
+    eprintln!("Sealed bundle opened and verified.");
+    let base = client
+        .rest_url()
+        .ok_or("login requires a REST connection to the VTC")?;
+    auth::login(&bundle, base, keyring_key).await
+}
+
+/// Resolve CLI `--recipient` / `--recipient-did` / `--recipient-nonce`
+/// arguments into a [`vta_cli_common::sealed_producer::SealedRecipient`].
+fn resolve_recipient(
+    recipient: Option<&std::path::Path>,
+    recipient_did: Option<&str>,
+    recipient_nonce: Option<&str>,
+) -> Result<vta_cli_common::sealed_producer::SealedRecipient, Box<dyn std::error::Error>> {
+    use vta_cli_common::sealed_producer::SealedRecipient;
+    if let Some(path) = recipient {
+        SealedRecipient::from_file(path)
+    } else if let (Some(did), Some(nonce)) = (recipient_did, recipient_nonce) {
+        SealedRecipient::from_inline(did, nonce)
+    } else {
+        Err(
+            "a recipient is required: pass --recipient <file> or both --recipient-did and --recipient-nonce"
+                .into(),
+        )
+    }
+}
+
+/// Returns true if this command requires authentication.
+fn requires_auth(cmd: &Commands) -> bool {
+    if let Commands::DidTemplates { command } = cmd {
+        return is_online_template_cmd(command);
+    }
+    !matches!(
+        cmd,
+        Commands::Health
+            | Commands::Auth { .. }
+            | Commands::Setup { .. }
+            | Commands::Community { .. }
+            | Commands::Bootstrap { .. }
+            // These authenticate to the community itself — the VTC, with the
+            // VTC's DID as the audience — not to the VTA, so they neither need
+            // nor want a VTA connection first. See `vtc.rs`.
+            | Commands::DidLog { .. }
+            | Commands::Vetting { .. }
+            | Commands::Git { .. }
+            | Commands::Rooms { .. }
+            | Commands::Storage { .. }
+            | Commands::Networks { .. }
+            | Commands::Elections { .. }
+            | Commands::Boards { .. }
+            | Commands::Consent { .. }
+            | Commands::Actions { .. }
+            | Commands::Access { .. }
+            | Commands::Member { .. }
+            | Commands::Members { .. }
+            | Commands::Audit { .. }
+            | Commands::Backup { .. }
+            | Commands::Completions { .. }
+    )
+}
+
+/// The active community's keyring key and the VTC it administers.
+///
+/// The VTC's DID is `--vtc-did`, else the profile's `vtc_did`; the API base is
+/// `--url`, else what that DID's document advertises. See
+/// [`vtc::resolve_target`] for why the DID never comes from the server.
+async fn community_vtc(
+    community: &Option<String>,
+    vtc_did: &Option<String>,
+    url: &Option<String>,
+    cnm_config: &config::CnmConfig,
+) -> Result<(String, vtc::VtcTarget), Box<dyn std::error::Error>> {
+    let (slug, profile) = resolve_community(community.as_deref(), cnm_config)?;
+    let did = vtc_did.as_deref().or(profile.vtc_did.as_deref());
+    let target = vtc::resolve_target(did, url.as_deref()).await?;
+    Ok((community_keyring_key(&slug), target))
+}
+
+/// The active community's DID — `--vtc-did`, else its profile's — without resolving it or
+/// reaching the VTC, for the commands that work offline.
+fn community_did_offline(
+    community: &Option<String>,
+    vtc_did: &Option<String>,
+    cnm_config: &config::CnmConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(did) = vtc_did {
+        return Ok(did.clone());
+    }
+    let (slug, profile) = resolve_community(community.as_deref(), cnm_config)?;
+    profile.vtc_did.clone().ok_or_else(|| {
+        format!("community '{slug}' names no VTC DID. Pass it: --vtc-did <the community's DID>")
+            .into()
+    })
+}
+
+/// `cnm bootstrap request --out <PATH> [--label <NAME>]`
+fn bootstrap_request(
+    out: std::path::PathBuf,
+    label: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_dir =
+        config::config_dir().map_err(|e| format!("could not resolve config dir: {e}"))?;
+    let created = vta_cli_common::sealed_consumer::create_bootstrap_request(&config_dir, label)?;
+    let json = serde_json::to_string_pretty(&created.request)?;
+    std::fs::write(&out, json.as_bytes())?;
+
+    let client_did = created.request.client_did.clone();
+    println!("Bootstrap request written to {}", out.display());
+    println!();
+    println!("  Bundle-Id:  {}", created.bundle_id_hex);
+    println!("  Client DID: {client_did}");
+    println!("  Seed saved: {}", created.secret_path.display());
+    println!();
+    println!("Hand the request to the operator. They return an armored sealed bundle.");
+    println!("Verify the SHA-256 digest they print to you out-of-band, then run:");
+    println!("  cnm auth login --credential-bundle <file> --expect-digest <hex>");
+    Ok(())
+}
+
+/// `cnm bootstrap open --bundle <PATH> [--expect-digest <HEX>] [--no-verify-digest]`
+fn bootstrap_open(
+    bundle_path: &std::path::Path,
+    expect_digest: Option<&str>,
+    no_verify_digest: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if no_verify_digest {
+        vta_cli_common::sealed_consumer::warn_no_verify_digest();
+    }
+    let config_dir =
+        config::config_dir().map_err(|e| format!("could not resolve config dir: {e}"))?;
+    // Showing a bundle installs nothing, so the request seed stays: the
+    // `cnm auth login --credential-bundle` printed below needs it (VTI-53).
+    let (opened, secret) = vta_cli_common::sealed_consumer::open_armored_bundle_keeping_secret(
+        bundle_path,
+        &config_dir,
+        expect_digest,
+        no_verify_digest,
+    )?;
+    println!("Sealed bundle opened.");
+    println!();
+    println!("  Bundle-Id:       {}", opened.bundle_id_hex);
+    println!("  Digest (sha256): {}", opened.digest);
+    println!("  Producer DID:    {}", opened.producer.producer_did);
+    println!("  Producer proof:  {:?}", opened.producer.proof);
+    println!();
+    use vta_sdk::sealed_transfer::SealedPayloadV1;
+    match &opened.payload {
+        SealedPayloadV1::AdminCredential(c) => {
+            println!("Payload: AdminCredential");
+            println!("  DID:     {}", c.did);
+            println!("  VTA DID: {}", c.vta_did);
+            if let Some(ref u) = c.vta_url {
+                println!("  VTA URL: {u}");
+            }
+            println!();
+            println!("To install this credential, run:");
+            println!(
+                "  cnm auth login --credential-bundle <bundle> --expect-digest {}",
+                opened.digest
+            );
+        }
+        SealedPayloadV1::ContextProvision(p) => {
+            println!("Payload: ContextProvision");
+            println!("  Context:   {} ({})", p.context_id, p.context_name);
+            println!("  Admin DID: {}", p.admin_did);
+        }
+        SealedPayloadV1::DidSecrets(s) => {
+            println!("Payload: DidSecrets");
+            println!("  DID:     {}", s.did);
+            println!("  Secrets: {}", s.secrets.len());
+        }
+        other => {
+            println!("Payload: {other:?}");
+        }
+    }
+    println!();
+    println!(
+        "The request seed was kept at {} so the bundle can still be installed.",
+        secret.display()
+    );
+    Ok(())
+}
+
+/// Spawn a Ctrl-C / SIGTERM watcher that lets a second signal force the
+/// process out. Operations like a stuck mediator handshake can hold the
+/// async runtime for tens of seconds even though the runtime itself
+/// observed the signal — without this, the operator has no escape.
+fn install_force_exit_handler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    tokio::spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            if SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst) {
+                eprintln!("\nForcing exit.");
+                std::process::exit(exit::INTERRUPTED);
+            }
+            eprintln!("\nShutting down — press Ctrl-C again to force exit.");
+        }
+    });
+}
+
+#[tokio::main]
+async fn main() {
+    // Pin rustls to the aws-lc-rs backend before any TLS object is built;
+    // see `vta_sdk::crypto_init`. Without this, rustls 0.23 panics on
+    // backend auto-detection when both backends are compiled in.
+    vta_sdk::crypto_init::install_default_crypto_provider();
+
+    install_force_exit_handler();
+
+    let cli = Cli::parse();
+
+    // Completions need nothing else: no profile, no keyring, no banner.
+    if let Commands::Completions { shell } = &cli.command {
+        vta_cli_common::startup::print_completions::<Cli>(*shell, "cnm");
+        return;
+    }
+
+    // DID-advertised VTA endpoints are public-only unless the operator opts in.
+    vta_sdk::http::set_allow_private_endpoints(cli.allow_private_endpoints);
+
+    // Propagate --full-display to the shared render module so list
+    // commands from vta-cli-common pick it up.
+    vta_cli_common::render::set_full_display(cli.full_display);
+    vta_cli_common::display::set_resolve_agent_names(cli.resolve_agent_names);
+    // Format, colour and the binary name in hints — the same rules as `pnm`
+    // (`vta_cli_common::startup`, #2587): JSON off a terminal, no colour off
+    // one or under NO_COLOR.
+    vta_cli_common::startup::init_output("cnm", cli.json);
+
+    // Initialize tracing: --verbose sets cnm_cli=debug, or respect RUST_LOG
+    let filter = if cli.verbose {
+        tracing_subscriber::EnvFilter::new("cnm_cli=debug")
+    } else {
+        tracing_subscriber::EnvFilter::from_default_env()
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .with_writer(std::io::stderr)
+        .init();
+
+    // Same shape as PNM: CNM's session lives in the OS credential store, and a
+    // store that cannot be opened reads as "no session" rather than as an
+    // error. See `install_default_store_or_exit`.
+    #[cfg(feature = "keyring")]
+    vta_sdk::keyring_init::install_default_store_or_exit("cnm");
+
+    // The banner is for a person at a terminal; it goes to stderr, so it is
+    // gated on stderr (#2587).
+    if vta_cli_common::startup::banner_wanted() {
+        print_banner();
+    }
+
+    // Load CNM config (multi-community). A profile that exists but does not
+    // parse stops here (#2582): carrying on with an empty one would report
+    // every community as "not configured" and point at `cnm setup`, which
+    // would then overwrite the file.
+    let cnm_config = match config::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(exit::CONFIG);
+        }
+    };
+
+    // Legacy migration notice
+    if cnm_config.communities.is_empty() && auth::has_legacy_session() {
+        eprintln!(
+            "{YELLOW}Detected legacy single-community session.\n\
+             Legacy sessions are no longer used. Run `cnm setup` to configure a community.{RESET}\n"
+        );
+    }
+
+    // Save the URL override before it's consumed by URL resolution
+    let url_override = cli.url.clone();
+
+    // Resolve community URL and keyring key for commands that need a VTA connection.
+    // Setup and Community commands handle their own URL resolution.
+    // For everything else, the URL is derived from the community VTA
+    // DID at runtime — `--url` stays as an ephemeral per-command override.
+    let (url, keyring_key): (String, String) =
+        if requires_auth(&cli.command) || matches!(cli.command, Commands::Auth { .. }) {
+            // Auth-required and Auth commands always need a community
+            match resolve_community(cli.community.as_deref(), &cnm_config) {
+                Ok((slug, community)) => {
+                    let url = match cli.url.clone() {
+                        Some(u) => u,
+                        None => match community.vta_did.as_deref() {
+                            Some(did) => vta_sdk::session::resolve_vta_url(did)
+                                .await
+                                .unwrap_or_default(),
+                            None => String::new(),
+                        },
+                    };
+                    let key = community_keyring_key(&slug);
+                    (url, key)
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(exit::CONFIG);
+                }
+            }
+        } else if matches!(cli.command, Commands::Health) {
+            // Health: use community if available, otherwise require --url
+            match resolve_community(cli.community.as_deref(), &cnm_config) {
+                Ok((slug, community)) => {
+                    let url = match cli.url.clone() {
+                        Some(u) => u,
+                        None => match community.vta_did.as_deref() {
+                            Some(did) => vta_sdk::session::resolve_vta_url(did)
+                                .await
+                                .unwrap_or_default(),
+                            None => String::new(),
+                        },
+                    };
+                    let key = community_keyring_key(&slug);
+                    (url, key)
+                }
+                Err(_) => {
+                    let url = match cli.url {
+                        Some(url) => url,
+                        None => {
+                            eprintln!("Error: no community configured and no --url provided.\n");
+                            eprintln!(
+                                "Either configure a community with `cnm setup`, or provide a URL:"
+                            );
+                            eprintln!("  cnm --url http://localhost:8100 health");
+                            std::process::exit(exit::CONFIG);
+                        }
+                    };
+                    (url, String::new())
+                }
+            }
+        } else {
+            // Setup/Community commands don't need a pre-resolved URL
+            let url = cli
+                .url
+                .unwrap_or_else(|| "http://localhost:8100".to_string());
+            (url, String::new())
+        };
+
+    // Build client: DIDComm-preferred for authenticated commands, REST for others
+    let client = if requires_auth(&cli.command) {
+        // Bootstrap session from personal VTA if needed
+        if auth::loaded_session(&keyring_key).is_none()
+            && let Ok((slug, community)) = resolve_community(cli.community.as_deref(), &cnm_config)
+            && community.context_id.is_some()
+            && let Some(personal_did) = cnm_config
+                .personal_vta
+                .as_ref()
+                .and_then(|p| p.vta_did.as_deref())
+            && let Ok(personal_url) = vta_sdk::session::resolve_vta_url(personal_did).await
+            && let Err(e) =
+                setup::bootstrap_community_session(&slug, community, &personal_url).await
+        {
+            eprintln!(
+                "Error: could not bootstrap session from personal VTA: {e}\n\n\
+                         To fix this, either:\n  \
+                         1. Import a sealed credential bundle from your VTA admin:\n     \
+                            cnm auth login --credential-bundle <bundle.armored> --expect-digest <sha256>\n  \
+                         2. Re-run setup: cnm setup"
+            );
+            std::process::exit(exit::FAILURE);
+        }
+
+        // A community added for its VTC alone holds an identity with no VTA
+        // bound; say so rather than let the SDK report a pending setup.
+        if let Some(s) = auth::loaded_session(&keyring_key)
+            && s.vta_did.is_none()
+        {
+            eprintln!(
+                "Error: this command administers the community's VTA, and this community \
+                 profile has none — it was added for its VTC.\n\n\
+                 The community's own verbs work with it: cnm access, cnm actions, cnm git, \
+                 cnm vetting, cnm member.\n\
+                 A community's VTA is recorded when the community is added or continued:\n  \
+                 cnm community add <name> --vta-did <did>   (or `continue … --vta-did <did>`)"
+            );
+            std::process::exit(exit::CONFIG);
+        }
+        match auth::connect(url_override.as_deref(), cli.transport.into(), &keyring_key).await {
+            Ok(c) => {
+                // A Forbidden hint names this DID's ACL entry (#2586).
+                if let Some(s) = auth::loaded_session(&keyring_key) {
+                    vta_cli_common::render::set_session_did(&s.client_did);
+                }
+                c
+            }
+            Err(e) => exit::fail(e.as_ref()),
+        }
+    } else {
+        VtaClient::new(&url)
+    };
+
+    let result = match cli.command {
+        Commands::Setup {
+            command,
+            name,
+            overwrite,
+        } => match (command, name) {
+            (None, None) => setup::run_setup_wizard().await,
+            (None, Some(name)) => setup::start_personal_non_interactive(&name, overwrite).await,
+            (
+                Some(SetupCommands::Continue {
+                    name,
+                    vta_did,
+                    vta_url,
+                }),
+                None,
+            ) => {
+                setup::continue_personal(
+                    name.as_deref(),
+                    vta_did.as_deref(),
+                    vta_url.as_deref(),
+                    cli.transport.into(),
+                )
+                .await
+            }
+            (Some(_), Some(_)) => Err("conflicting options: `--name` is for phase 1, \
+                 `continue` is for phase 2 — pass one or the other, not both."
+                .into()),
+        },
+        Commands::Community { command } => {
+            cmd_community(
+                command,
+                &cnm_config,
+                cli.community.as_deref(),
+                cli.vtc_did.as_deref(),
+                url_override.as_deref(),
+            )
+            .await
+        }
+        Commands::Health => cmd_health(&client, &keyring_key, &cnm_config).await,
+        Commands::Auth { command } => match command {
+            AuthCommands::Login {
+                credential_bundle,
+                expect_digest,
+                no_verify_digest,
+            } => {
+                let expected_vta_did = resolve_community(cli.community.as_deref(), &cnm_config)
+                    .ok()
+                    .and_then(|(_, community)| community.vta_did.clone());
+                auth_login_sealed(
+                    &client,
+                    &keyring_key,
+                    &credential_bundle,
+                    expect_digest.as_deref(),
+                    no_verify_digest,
+                    expected_vta_did.as_deref(),
+                )
+                .await
+            }
+            AuthCommands::Logout => {
+                auth::logout(&keyring_key);
+                Ok(())
+            }
+            AuthCommands::Status => {
+                auth::status(&keyring_key);
+                Ok(())
+            }
+        },
+        Commands::Config { command } => match command {
+            ConfigCommands::Get => config_cmd::cmd_config_get(&client, "Community ").await,
+            ConfigCommands::Update {
+                community_vta_name,
+                public_url,
+                rate_limit_interval_secs,
+                rate_limit_burst,
+                did_log_rate_limit_interval_secs,
+                did_log_rate_limit_burst,
+            } => {
+                let mut rate_limits = config_cmd::RateLimitOverrides::default();
+                rate_limits.rate_limit_interval_secs = rate_limit_interval_secs;
+                rate_limits.rate_limit_burst = rate_limit_burst;
+                rate_limits.did_log_rate_limit_interval_secs = did_log_rate_limit_interval_secs;
+                rate_limits.did_log_rate_limit_burst = did_log_rate_limit_burst;
+                config_cmd::cmd_config_patch(
+                    &client,
+                    "Community ",
+                    community_vta_name,
+                    public_url,
+                    rate_limits,
+                )
+                .await
+            }
+        },
+        Commands::Contexts { command } => match command {
+            ContextCommands::List => contexts::cmd_context_list(&client).await,
+            ContextCommands::Get { id } => contexts::cmd_context_get(&client, &id).await,
+            ContextCommands::Create {
+                id,
+                name,
+                description,
+                admin_did,
+                admin_label,
+                admin_expires,
+                admin_handoff,
+            } => {
+                let expires_at = match admin_expires.as_deref() {
+                    Some(s) => match vta_cli_common::duration::duration_to_expires_at(s) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            eprintln!("Error: --admin-expires: {e}");
+                            std::process::exit(exit::USAGE);
+                        }
+                    },
+                    None => None,
+                };
+                let admin = contexts::AdminAclOptions {
+                    did: admin_did,
+                    label: admin_label,
+                    expires_at,
+                    expires_duration: admin_expires.clone(),
+                    // A community admin is not the holder of the agent's own
+                    // identity; `pnm contexts create --admin-holder` is where
+                    // that grant is made, deliberately.
+                    holder: false,
+                    handoff: admin_handoff,
+                };
+                contexts::cmd_context_create(&client, &id, &name, description, admin).await
+            }
+            ContextCommands::Update {
+                id,
+                name,
+                did,
+                clear_did,
+                description,
+            } => {
+                // The identity change goes through update-did, never
+                // `contexts/update` — which cannot clear and needs super-admin.
+                if clear_did {
+                    let renamed = if name.is_some() || description.is_some() {
+                        contexts::cmd_context_update(&client, &id, name, None, description).await
+                    } else {
+                        Ok(())
+                    };
+                    match renamed {
+                        Ok(()) => contexts::cmd_context_clear_did(&client, &id).await,
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    contexts::cmd_context_update(&client, &id, name, did, description).await
+                }
+            }
+            ContextCommands::UpdateDid { id, did, clear } => match did {
+                Some(did) if !clear => contexts::cmd_context_update_did(&client, &id, &did).await,
+                _ => contexts::cmd_context_clear_did(&client, &id).await,
+            },
+            ContextCommands::Delete {
+                id,
+                yes,
+                abandon_host_copies,
+            } => contexts::cmd_context_delete(&client, &id, yes, abandon_host_copies).await,
+            ContextCommands::Bootstrap {
+                id,
+                name,
+                description,
+                admin_label,
+                recipient,
+                recipient_did,
+                recipient_nonce,
+            } => match resolve_recipient(
+                recipient.as_deref(),
+                recipient_did.as_deref(),
+                recipient_nonce.as_deref(),
+            ) {
+                Ok(recipient) => {
+                    contexts::cmd_context_bootstrap(
+                        &client,
+                        &id,
+                        &name,
+                        description,
+                        admin_label,
+                        recipient,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            },
+        },
+        Commands::Acl { command } => match command {
+            AclCommands::List { context, direction } => {
+                acl::cmd_acl_list(&client, context.as_deref(), direction.as_deref()).await
+            }
+            AclCommands::Get { did } => acl::cmd_acl_get(&client, &did).await,
+            AclCommands::Create {
+                did,
+                did_flag,
+                role,
+                label,
+                contexts,
+                expires,
+                allowed_keys,
+            } => match expires
+                .as_deref()
+                .map(vta_cli_common::duration::duration_to_expires_at)
+                .transpose()
+            {
+                Ok(expires_at) => {
+                    // cnm does not expose the per-entry step-up or approve flags.
+                    acl::cmd_acl_create(
+                        &client,
+                        // clap requires one of the two.
+                        did.or(did_flag).unwrap_or_default(),
+                        role,
+                        label,
+                        contexts,
+                        expires_at,
+                        None,
+                        None,
+                        false,
+                        Vec::new(),
+                        allowed_keys,
+                        // cnm exposes no capability flags; `None` leaves the
+                        // entry holding everything its role implies.
+                        None,
+                        false,
+                        // Nor purpose flags: `None` grants `any`.
+                        None,
+                    )
+                    .await
+                }
+                Err(e) => Err(format!("--expires: {e}").into()),
+            },
+            AclCommands::Update {
+                did,
+                role,
+                label,
+                contexts,
+                allowed_keys,
+                allowed_keys_unrestricted,
+                reason,
+            } => {
+                // cnm exposes no approve-scope flags; pass `None` so the
+                // scope is left unchanged rather than silently cleared.
+                let allowed_keys =
+                    acl::allowed_keys_from_flags(allowed_keys, allowed_keys_unrestricted);
+                acl::cmd_acl_update(
+                    &client,
+                    &did,
+                    role,
+                    label,
+                    contexts,
+                    None,
+                    None,
+                    None,
+                    allowed_keys,
+                    // cnm exposes no capability flags either; `None` leaves
+                    // any narrowing exactly as it is.
+                    None,
+                    // Purposes are left unchanged.
+                    None,
+                    reason.as_deref(),
+                )
+                .await
+            }
+            AclCommands::Delete { did, reason, yes } => {
+                acl::cmd_acl_delete(&client, &did, reason.as_deref(), yes).await
+            }
+        },
+        Commands::AuthCredential { command } => match command {
+            AuthCredentialCommands::Create {
+                role,
+                label,
+                contexts,
+                recipient,
+                recipient_did,
+                recipient_nonce,
+            } => match resolve_recipient(
+                recipient.as_deref(),
+                recipient_did.as_deref(),
+                recipient_nonce.as_deref(),
+            ) {
+                Ok(recipient) => {
+                    credentials::cmd_auth_credential_create(
+                        &client, role, label, contexts, recipient,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            },
+        },
+        Commands::Backup { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => match command {
+                    BackupCommands::Export {
+                        include_audit,
+                        output,
+                        force,
+                        password_file,
+                    } => {
+                        backup::cmd_export(
+                            &key,
+                            &target,
+                            include_audit,
+                            output,
+                            force,
+                            password_file.as_deref(),
+                        )
+                        .await
+                    }
+                    BackupCommands::Import {
+                        file,
+                        preview,
+                        password_file,
+                        yes,
+                    } => {
+                        backup::cmd_import(
+                            &key,
+                            &target,
+                            file,
+                            preview,
+                            password_file.as_deref(),
+                            yes,
+                        )
+                        .await
+                    }
+                },
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Audit { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => match command {
+                    AuditCommands::Verify => {
+                        audit::cmd_verify(&key, &target, cli.transport.into()).await
+                    }
+                },
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Vetting { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    vetting::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Git { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => git::run(command, &key, &target, cli.transport.into()).await,
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Rooms { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => rooms::run(command, &key, &target, cli.transport.into()).await,
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Networks { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    networks::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Storage { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    storage::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        // Offline: only the community's DID is needed, and it comes from the operator.
+        Commands::Elections {
+            command: elections::ElectionsCommands::Manifest { command },
+        } => community_did_offline(&cli.community, &cli.vtc_did, &cnm_config)
+            .and_then(|did| elections::run_manifest(command, &did)),
+        Commands::Elections { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    elections::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        // Offline: a starting board needs nothing from the community.
+        Commands::Boards {
+            command: command @ boards::BoardsCommands::Init { .. },
+        } => boards::run_init(command),
+        Commands::Boards { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    boards::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Consent { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    consent::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Actions { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    actions::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Access { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    access::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Member { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    member::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Members { command } => {
+            match community_vtc(&cli.community, &cli.vtc_did, &url_override, &cnm_config).await {
+                Ok((key, target)) => {
+                    members::run(command, &key, &target, cli.transport.into()).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::DidLog { command } => {
+            match resolve_community(cli.community.as_deref(), &cnm_config) {
+                Ok((slug, _)) => {
+                    did_log::run(
+                        command,
+                        &community_keyring_key(&slug),
+                        url_override.as_deref(),
+                        cli.transport.into(),
+                    )
+                    .await
+                }
+                Err(e) => Err(format!("{e}").into()),
+            }
+        }
+        Commands::Bootstrap { command } => match command {
+            BootstrapCommands::Request { out, label } => bootstrap_request(out, label),
+            BootstrapCommands::Open {
+                bundle,
+                expect_digest,
+                no_verify_digest,
+            } => bootstrap_open(&bundle, expect_digest.as_deref(), no_verify_digest),
+        },
+        Commands::Completions { .. } => unreachable!("Completions handled before start-up"),
+        Commands::DidTemplates { command } => match command {
+            DidTemplateCommands::Validate { file } => did_templates::cmd_validate(file),
+            DidTemplateCommands::Init { kind } => did_templates::cmd_init(kind),
+            DidTemplateCommands::ListBuiltins => did_templates::cmd_list_builtins(),
+            DidTemplateCommands::List { context } => {
+                did_templates::cmd_list(&client, context.as_deref()).await
+            }
+            DidTemplateCommands::Show {
+                name,
+                context,
+                rendered,
+                vars,
+            } => did_templates::cmd_show(&client, &name, context.as_deref(), rendered, vars).await,
+            DidTemplateCommands::Create { file, context } => {
+                did_templates::cmd_create(&client, context.as_deref(), file).await
+            }
+            DidTemplateCommands::Update {
+                name,
+                file,
+                context,
+            } => did_templates::cmd_update(&client, &name, context.as_deref(), file).await,
+            DidTemplateCommands::Delete { name, context, yes } => {
+                match vta_cli_common::confirm::confirm_or_cancel(
+                    &format!("delete the stored template `{name}`"),
+                    yes,
+                ) {
+                    Ok(true) => did_templates::cmd_delete(&client, &name, context.as_deref()).await,
+                    Ok(false) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+            DidTemplateCommands::Export { name, context } => {
+                did_templates::cmd_export(&client, &name, context.as_deref()).await
+            }
+            DidTemplateCommands::Diff {
+                name,
+                file,
+                context,
+            } => did_templates::cmd_diff(&client, &name, context.as_deref(), file).await,
+        },
+        Commands::Keys { command } => match command {
+            KeyCommands::Create {
+                key_type,
+                derivation_path,
+                mnemonic_file,
+                mnemonic,
+                label,
+                context_id,
+                internal,
+                yes,
+            } => match keys::read_mnemonic(mnemonic_file.as_deref(), mnemonic) {
+                Err(e) => Err(e),
+                Ok(mnemonic) => {
+                    keys::cmd_key_create(
+                        &client,
+                        &key_type,
+                        derivation_path,
+                        mnemonic.map(|m| m.to_string()),
+                        label,
+                        context_id,
+                        internal,
+                        yes,
+                    )
+                    .await
+                }
+            },
+            KeyCommands::Get { key_id, secret } => {
+                keys::cmd_key_get(&client, &key_id, secret).await
+            }
+            KeyCommands::Revoke {
+                key_id,
+                reason,
+                yes,
+            } => keys::cmd_key_revoke(&client, &key_id, reason.as_deref(), yes).await,
+            KeyCommands::Rename { key_id, new_key_id } => {
+                keys::cmd_key_rename(&client, &key_id, &new_key_id).await
+            }
+            KeyCommands::List {
+                limit,
+                cursor,
+                status,
+                context,
+            } => keys::cmd_key_list(&client, cursor, limit, status, context).await,
+            KeyCommands::Secrets { key_ids, context } => {
+                keys::cmd_key_secrets(&client, key_ids, context).await
+            }
+            KeyCommands::Seeds => keys::cmd_seeds_list(&client).await,
+            KeyCommands::RotateSeed {
+                mnemonic_file,
+                mnemonic,
+                yes,
+            } => match keys::read_mnemonic(mnemonic_file.as_deref(), mnemonic) {
+                Ok(mnemonic) => keys::cmd_seeds_rotate(&client, mnemonic, yes).await,
+                Err(e) => Err(e),
+            },
+        },
+    };
+
+    client.shutdown().await;
+
+    if let Err(e) = result {
+        // The same codes as `pnm` (#2587): 3 not found, 4 config/validation,
+        // 5 auth, 1 anything else.
+        exit::fail(e.as_ref());
+    }
+}
+
+async fn cmd_community(
+    command: CommunityCommands,
+    cnm_config: &config::CnmConfig,
+    community_override: Option<&str>,
+    vtc_did: Option<&str>,
+    url: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        CommunityCommands::List => {
+            if cnm_config.communities.is_empty() && cnm_config.pending_communities.is_empty() {
+                println!("No communities configured.");
+                println!("\nRun `cnm setup` to configure your first community.");
+                return Ok(());
+            }
+            let default = cnm_config.default_community.as_deref().unwrap_or("");
+            for (slug, community) in &cnm_config.communities {
+                let marker = if slug == default { " (default)" } else { "" };
+                println!("  {slug}{marker}");
+                println!("    Name: {}", community.name);
+                // Which key this community signs with — each community has its
+                // own unless one was explicitly reused.
+                match auth::loaded_session(&community_keyring_key(slug)) {
+                    Some(s) => println!("    Identity: {}", onboard::short_did(&s.client_did)),
+                    None => println!("    Identity: (none stored)"),
+                }
+                if let Some(ref did) = community.vta_did {
+                    println!("    DID:  {did}");
+                }
+                if let Some(ref ctx) = community.context_id {
+                    println!("    Context: {ctx}");
+                }
+                if let Some(ref vtc) = community.vtc_did {
+                    println!("    VTC:  {vtc}");
+                }
+                println!();
+            }
+            for (slug, p) in &cnm_config.pending_communities {
+                println!("  {slug} {YELLOW}(pending grant){RESET}");
+                println!("    Name: {}", p.name);
+                println!("    Identity: {}", onboard::short_did(&p.admin_did));
+                println!("    Finish: cnm community continue {slug} --vtc-did <vtc-did>");
+                println!();
+            }
+            Ok(())
+        }
+        CommunityCommands::Use { name } => {
+            if !cnm_config.communities.contains_key(&name) {
+                return Err(format!(
+                    "community '{name}' not found.\n\nConfigured communities: {}",
+                    cnm_config
+                        .communities
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into());
+            }
+            let mut config = config::load_config()?;
+            config.default_community = Some(name.clone());
+            config::save_config(&config)?;
+            println!("Default community set to '{name}'.");
+            Ok(())
+        }
+        CommunityCommands::Add {
+            name,
+            slug,
+            reuse_identity,
+            vta_did,
+            overwrite,
+        } => {
+            setup::add_community(setup::AddCommunityArgs {
+                name,
+                slug,
+                reuse_identity,
+                vtc_did: vtc_did.map(str::to_string),
+                vta_did,
+                overwrite,
+            })
+            .await
+        }
+        CommunityCommands::Continue { name, vta_did } => {
+            setup::continue_community(&name, vtc_did, vta_did.as_deref(), url).await
+        }
+        CommunityCommands::Delete { name, yes } => {
+            let mut config = config::load_config()?;
+            // A pending community has no grant to revoke yet: drop its key.
+            if config.pending_communities.remove(&name).is_some() {
+                auth::logout(&community_keyring_key(&name));
+                config::save_config(&config)?;
+                println!("{GREEN}✓{RESET} Pending community '{name}' deleted.");
+                return Ok(());
+            }
+            if !config.communities.contains_key(&name) {
+                return Err(format!("community '{name}' not found.").into());
+            }
+            let key = community_keyring_key(&name);
+            // Read before the keyring entry goes: the notice names the DID
+            // whose ACL entry survives on the VTA.
+            let client_did = auth::loaded_session(&key).map(|s| s.client_did);
+
+            if !yes {
+                print_community_local_only_notice(&name, client_did.as_deref());
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "Delete community '{name}'? This will delete its stored credentials."
+                    ))
+                    .default(false)
+                    .interact()?;
+
+                if !confirm {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            config.communities.remove(&name);
+            // Clear default if it was the deleted community
+            if config.default_community.as_deref() == Some(&name) {
+                config.default_community = config.communities.keys().next().cloned();
+            }
+            // Clear the keyring entry
+            auth::logout(&key);
+            config::save_config(&config)?;
+            println!("{GREEN}✓{RESET} Community '{name}' deleted.");
+            if yes {
+                print_community_local_only_notice(&name, client_did.as_deref());
+            }
+            Ok(())
+        }
+        CommunityCommands::Status => {
+            match resolve_community(None, cnm_config) {
+                Ok((slug, community)) => {
+                    println!("Active community: {slug}");
+                    println!("  Name: {}", community.name);
+                    if let Some(ref did) = community.vta_did {
+                        println!("  DID:  {did}");
+                        // REST endpoint is derived from the DID document at
+                        // runtime — show what was resolved so the operator
+                        // can see the live URL.
+                        if let Ok(url) = vta_sdk::session::resolve_vta_url(did).await {
+                            println!("  URL:  {url} (from DID)");
+                        }
+                    }
+                    if let Some(ref ctx) = community.context_id {
+                        println!("  Context: {ctx}");
+                    }
+                    match community.vtc_did.as_deref() {
+                        Some(vtc) => println!("  VTC:  {vtc}"),
+                        None => println!(
+                            "  VTC:  (not set — `cnm community set-vtc <vtc-did>` for vetting, \
+                             audit and backup)"
+                        ),
+                    }
+                    let key = community_keyring_key(&slug);
+                    auth::status(&key);
+                }
+                Err(_) => {
+                    println!("No community configured.");
+                    println!("\nRun `cnm setup` to get started.");
+                }
+            }
+            Ok(())
+        }
+        CommunityCommands::Rotate { name } => {
+            let slug = match name {
+                Some(n) => n,
+                None => config::resolve_community(community_override, cnm_config)?.0,
+            };
+            setup::rotate_community(&slug, vtc_did, url).await
+        }
+        CommunityCommands::Ping => cmd_community_ping(cnm_config).await,
+        CommunityCommands::SetVtc { did } => {
+            cmd_community_set_vtc(cnm_config, community_override, did.trim()).await
+        }
+    }
+}
+
+/// Whether `url` has no path beyond `/`.
+fn url_has_no_path(url: &str) -> bool {
+    let rest = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .trim_end_matches('/');
+    !rest.contains('/')
+}
+
+/// `cnm community set-vtc <did>` — record the VTC the profile administers.
+async fn cmd_community_set_vtc(
+    cnm_config: &config::CnmConfig,
+    community_override: Option<&str>,
+    did: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (slug, _) = resolve_community(community_override, cnm_config)?;
+    if !did.starts_with("did:") {
+        return Err(format!("`{did}` is not a DID; the VTC's DID starts with `did:`").into());
+    }
+    // Resolve before saving so a typo shows now rather than at the next
+    // `cnm vetting`. An unresolvable DID is still saved: the operator may be
+    // on a network that cannot reach it yet, and `--url` covers the API base
+    // meanwhile.
+    let resolved = vtc::resolve_target(Some(did), None).await;
+    let mut config = config::load_config()?;
+    let entry = config
+        .communities
+        .get_mut(&slug)
+        .ok_or_else(|| format!("community '{slug}' not found in config."))?;
+    entry.vtc_did = Some(did.to_string());
+    config::save_config(&config)?;
+    println!("{GREEN}✓{RESET} Community '{slug}' administers VTC {did}.");
+    match resolved {
+        Ok(target) => {
+            println!("  API:  {} (from its DID document)", target.base);
+            // A community minted before #1615 advertises its bare base URL,
+            // and every call to it then answers 405. Only a deployment that
+            // mounts the API at the root means that.
+            if url_has_no_path(&target.base) {
+                println!(
+                    "  {YELLOW}That names no API mount.{RESET} A VTC serves its API under `/v1` \
+                     unless configured otherwise; if calls answer 405, pass\n  \
+                     `cnm --url {}/v1 …`.",
+                    target.base
+                );
+            }
+        }
+        Err(e) => println!("  {YELLOW}Its API base could not be resolved yet:{RESET} {e}"),
+    }
+    if let Some(session) = auth::loaded_session(&community_keyring_key(&slug)) {
+        println!(
+            "\n`cnm` authenticates to it as {client}. That DID needs a super-admin entry in the \
+             VTC's ACL. On the VTC host, with the daemon stopped:\n  vtc --config \
+             <config.toml> acl add --did {client} --role admin --label cnm",
+            client = session.client_did
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_community_ping(
+    cnm_config: &config::CnmConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (slug, community) = resolve_community(None, cnm_config)?;
+    println!("Community: {} ({slug})", community.name);
+
+    // Need a session to get client DID + VTA DID
+    let key = community_keyring_key(&slug);
+    let session = match auth::loaded_session(&key) {
+        Some(s) => s,
+        None => {
+            return Err("not authenticated — run `cnm auth login` first".into());
+        }
+    };
+
+    let vta_did = session
+        .vta_did
+        .as_deref()
+        .ok_or("community session is pending VTA binding — finish `cnm setup` first")?;
+    let mediator_did = match vta_sdk::session::resolve_mediator_did(vta_did).await? {
+        Some(did) => did,
+        None => {
+            println!("  This community is not using DIDComm Messaging.");
+            return Ok(());
+        }
+    };
+
+    println!("  {CYAN}{:<13}{RESET} {vta_did}", "VTA DID");
+    println!("  {CYAN}{:<13}{RESET} {mediator_did}", "Mediator DID");
+
+    let timeout = std::time::Duration::from_secs(10);
+    match tokio::time::timeout(
+        timeout,
+        vta_sdk::session::send_trust_ping(
+            &session.client_did,
+            &session.private_key_multibase,
+            &mediator_did,
+            Some(vta_did),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(latency)) => println!(
+            "  {CYAN}{:<13}{RESET} {GREEN}✓{RESET} pong ({latency}ms)",
+            "Trust-ping"
+        ),
+        Ok(Err(e)) => println!(
+            "  {CYAN}{:<13}{RESET} {RED}✗{RESET} failed: {e}",
+            "Trust-ping"
+        ),
+        Err(_) => println!(
+            "  {CYAN}{:<13}{RESET} {RED}✗{RESET} timed out",
+            "Trust-ping"
+        ),
+    }
+    Ok(())
+}
+
+async fn cmd_health(
+    client: &VtaClient,
+    keyring_key: &str,
+    cnm_config: &config::CnmConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    let ping_timeout = Duration::from_secs(10);
+
+    // ── Community VTA ──────────────────────────────────────────────
+    print_section("Community VTA");
+
+    match client.health().await {
+        Ok(resp) => {
+            let ver = resp
+                .version
+                .as_deref()
+                .map(|v| format!(" (v{v})"))
+                .unwrap_or_default();
+            println!("  {CYAN}{:<13}{RESET} {GREEN}✓{RESET} ok{ver}", "Service");
+        }
+        Err(e) => {
+            println!(
+                "  {CYAN}{:<13}{RESET} {RED}✗{RESET} unreachable ({e})",
+                "Service"
+            );
+            // Continue to personal VTA section instead of returning error
+            print_personal_vta_section(cnm_config, None, ping_timeout).await;
+            return Ok(());
+        }
+    }
+    println!("  {CYAN}{:<13}{RESET} {}", "URL", client.endpoint_label());
+
+    // Create a shared DID resolver for both sections
+    let resolver = match vta_sdk::resolver::shared_did_resolver_from_env().await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            println!("  {DIM}DID resolution skipped (resolver unavailable: {e}){RESET}");
+            None
+        }
+    };
+
+    // Community DID resolution + trust-ping
+    let session = if keyring_key.is_empty() {
+        None
+    } else {
+        auth::loaded_session(keyring_key)
+    };
+    if let Some(ref session) = session {
+        if let Some(ref resolver) = resolver {
+            print_did_resolution(resolver, "Client DID", &session.client_did, false).await;
+
+            if let Some(vta_did) = session.vta_did.as_deref() {
+                let mediator_did = print_did_resolution(resolver, "VTA DID", vta_did, true).await;
+
+                if let Some(ref mediator_did) = mediator_did {
+                    print_did_resolution(resolver, "Mediator DID", mediator_did, false).await;
+                    match tokio::time::timeout(
+                        ping_timeout,
+                        vta_sdk::session::send_trust_ping(
+                            &session.client_did,
+                            &session.private_key_multibase,
+                            mediator_did,
+                            None,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(latency)) => println!(
+                            "  {CYAN}{:<13}{RESET} {GREEN}✓{RESET} pong ({latency}ms)",
+                            "Trust-ping"
+                        ),
+                        Ok(Err(e)) => println!(
+                            "  {CYAN}{:<13}{RESET} {RED}✗{RESET} trust-ping failed: {e}",
+                            "Trust-ping"
+                        ),
+                        Err(_) => println!(
+                            "  {CYAN}{:<13}{RESET} {RED}✗{RESET} trust-ping timed out",
+                            "Trust-ping"
+                        ),
+                    }
+                }
+            } else {
+                println!(
+                    "  {DIM}(session pending VTA binding — finish `cnm setup` to enable DID resolution){RESET}"
+                );
+            }
+        }
+    } else {
+        println!("  {DIM}(not authenticated — DID resolution skipped){RESET}");
+    }
+
+    // ── Personal VTA ───────────────────────────────────────────────
+    print_personal_vta_section(cnm_config, resolver.as_ref(), ping_timeout).await;
+
+    Ok(())
+}
+
+async fn print_personal_vta_section(
+    cnm_config: &config::CnmConfig,
+    resolver: Option<&affinidi_did_resolver_cache_sdk::DIDCacheClient>,
+    ping_timeout: std::time::Duration,
+) {
+    print_section("Personal VTA");
+
+    let Some(ref personal) = cnm_config.personal_vta else {
+        println!("  {DIM}Not configured.{RESET}");
+        return;
+    };
+    let Some(personal_did) = personal.vta_did.as_deref() else {
+        println!(
+            "  {DIM}(personal VTA configured without a DID — finish `cnm setup` to enable health checks){RESET}"
+        );
+        return;
+    };
+
+    // REST endpoint is derived from the personal VTA's DID document on
+    // every call. Surface what was resolved so the operator can see the
+    // live URL.
+    let personal_url = match vta_sdk::session::resolve_vta_url(personal_did).await {
+        Ok(url) => url,
+        Err(e) => {
+            println!(
+                "  {CYAN}{:<13}{RESET} {RED}✗{RESET} could not resolve REST endpoint from {personal_did}: {e}",
+                "URL"
+            );
+            return;
+        }
+    };
+    let personal_client = VtaClient::new(&personal_url);
+    match personal_client.health().await {
+        Ok(resp) => {
+            let ver = resp
+                .version
+                .as_deref()
+                .map(|v| format!(" (v{v})"))
+                .unwrap_or_default();
+            println!("  {CYAN}{:<13}{RESET} {GREEN}✓{RESET} ok{ver}", "Service");
+        }
+        Err(e) => {
+            println!(
+                "  {CYAN}{:<13}{RESET} {RED}✗{RESET} unreachable ({e})",
+                "Service"
+            );
+            return;
+        }
+    };
+    println!(
+        "  {CYAN}{:<13}{RESET} {personal_url} {DIM}(from DID){RESET}",
+        "URL"
+    );
+
+    // Personal DID resolution + trust-ping
+    let personal_session = auth::loaded_session(config::PERSONAL_KEYRING_KEY);
+    if let Some(ref session) = personal_session {
+        if let Some(resolver) = resolver {
+            print_did_resolution(resolver, "Client DID", &session.client_did, false).await;
+
+            if let Some(vta_did) = session.vta_did.as_deref() {
+                let mediator_did = print_did_resolution(resolver, "VTA DID", vta_did, true).await;
+
+                if let Some(ref mediator_did) = mediator_did {
+                    print_did_resolution(resolver, "Mediator DID", mediator_did, false).await;
+                    match tokio::time::timeout(
+                        ping_timeout,
+                        vta_sdk::session::send_trust_ping(
+                            &session.client_did,
+                            &session.private_key_multibase,
+                            mediator_did,
+                            None,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(latency)) => println!(
+                            "  {CYAN}{:<13}{RESET} {GREEN}✓{RESET} pong ({latency}ms)",
+                            "Trust-ping"
+                        ),
+                        Ok(Err(e)) => println!(
+                            "  {CYAN}{:<13}{RESET} {RED}✗{RESET} trust-ping failed: {e}",
+                            "Trust-ping"
+                        ),
+                        Err(_) => println!(
+                            "  {CYAN}{:<13}{RESET} {RED}✗{RESET} trust-ping timed out",
+                            "Trust-ping"
+                        ),
+                    }
+                }
+            } else {
+                println!(
+                    "  {DIM}(personal session pending VTA binding — finish `pnm setup continue <slug>` to enable DID resolution){RESET}"
+                );
+            }
+        }
+    } else {
+        println!("  {DIM}(not authenticated — DID resolution skipped){RESET}");
+    }
+}
+
+/// Resolve a DID and print the result with colored ✓/✗.
+///
+/// Prints label + DID, then resolution status and detail lines.
+/// When `find_mediator` is true, looks for a DIDCommMessaging service and
+/// extracts the mediator DID from its endpoint URI (if the URI is a `did:`).
+async fn print_did_resolution(
+    resolver: &affinidi_did_resolver_cache_sdk::DIDCacheClient,
+    label: &str,
+    did: &str,
+    find_mediator: bool,
+) -> Option<String> {
+    let method = did
+        .strip_prefix("did:")
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("unknown");
+
+    println!("  {CYAN}{:<13}{RESET} {did}", label);
+
+    let resolved = match resolver.resolve(did).await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("                {RED}✗{RESET} resolution failed: {e}");
+            return None;
+        }
+    };
+
+    println!("                {GREEN}✓{RESET} resolves ({method})");
+
+    // Agent names the document claims via `alsoKnownAs`. Free to report — we
+    // already hold the document — and genuinely diagnostic in a doctor
+    // command. Reported as *claims*, not as this DID's name: `alsoKnownAs` is
+    // self-asserted, and confirming one means resolving it forward and
+    // checking it leads back here (`vta_sdk::display_name::agent_name`).
+    for claim in &resolved.doc.also_known_as {
+        println!("                {DIM}claims (unverified): {claim}{RESET}");
+    }
+
+    for ka in &resolved.doc.key_agreement {
+        println!("                {DIM}keyAgreement: {}{RESET}", ka.get_id());
+    }
+
+    let mut mediator_did: Option<String> = None;
+    for svc in &resolved.doc.service {
+        let types = svc.type_.join(", ");
+        // Endpoint::get_uris() wraps Map-sourced values in JSON quotes; strip them.
+        let uris: Vec<String> = svc
+            .service_endpoint
+            .get_uris()
+            .into_iter()
+            .map(|u| u.trim_matches('"').to_string())
+            .collect();
+
+        if uris.is_empty() {
+            println!("                {DIM}service: {types}{RESET}");
+        } else {
+            for uri in &uris {
+                println!("                {DIM}service: {types} -> {uri}{RESET}");
+            }
+        }
+
+        if find_mediator
+            && svc.type_.iter().any(|t| t == "DIDCommMessaging")
+            && mediator_did.is_none()
+        {
+            mediator_did = uris.into_iter().find(|u| u.starts_with("did:"));
+            if let Some(ref m) = mediator_did {
+                println!("                mediator {GREEN}✓{RESET} {m}");
+            } else {
+                println!("                mediator {RED}✗{RESET} no DID found in service endpoint");
+            }
+        }
+    }
+    mediator_did
+}
+
+/// `cnm community delete` is not a complete delete: it forgets the community
+/// on this machine, while its VTA keeps the ACL entry that authorises the
+/// credential. Say so, and name the command that revokes it.
+fn print_community_local_only_notice(name: &str, client_did: Option<&str>) {
+    eprintln!(
+        "{YELLOW}⚠{RESET} This deletes only the local connection and credential for '{name}'. \
+         The community's VTA, and its ACL entry for this credential, are untouched."
+    );
+    match client_did {
+        Some(did) => eprintln!(
+            "  To revoke the credential on the VTA as well, run this from an admin \
+             connection to it{DIM} (not if it is that VTA's only admin){RESET}:\n    \
+             cnm acl delete {did}"
+        ),
+        None => eprintln!(
+            "  To revoke a credential on the VTA as well, run `cnm acl delete <did>` from \
+             an admin connection to it."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every command a shared hint tells a cnm operator to run parses here
+    /// (root CLAUDE.md, "Operator errors should suggest the fix"): the
+    /// per-binary Auth / Forbidden / Network hints (#2586), `--yes` on every
+    /// command `confirm` refuses without it (#2583), the secret-file flags
+    /// (#2584, #2585), the verb aliases shared with `cnm access` (#2591) and
+    /// the version / completion surface (#2592).
+    #[test]
+    fn remediation_commands_in_shared_hints_parse() {
+        use clap::Parser;
+        let commands: &[&[&str]] = &[
+            // vta-cli-common/src/render.rs
+            &["cnm", "setup"],
+            &[
+                "cnm",
+                "auth",
+                "login",
+                "--credential-bundle",
+                "b.armored",
+                "--expect-digest",
+                "00",
+            ],
+            &["cnm", "community", "list"],
+            &["cnm", "--url", "http://localhost:8100", "health"],
+            &["cnm", "acl", "get", "did:key:z6Mk"],
+            // vta-cli-common/src/commands/did_templates.rs
+            &["cnm", "did-templates", "init", "ai-agent"],
+            &["cnm", "did-templates", "create", "--file", "tpl.json"],
+            &[
+                "cnm",
+                "did-templates",
+                "create",
+                "--context",
+                "c",
+                "--file",
+                "tpl.json",
+            ],
+            // vta-cli-common/src/sealed_consumer.rs
+            &["cnm", "bootstrap", "open", "--bundle", "b.armored"],
+            // vta-cli-common/src/confirm.rs
+            &["cnm", "acl", "delete", "did:key:z6Mk", "--yes"],
+            &[
+                "cnm",
+                "acl",
+                "revoke",
+                "did:key:z6Mk",
+                "--reason",
+                "r",
+                "-y",
+            ],
+            &["cnm", "acl", "show", "did:key:z6Mk"],
+            &["cnm", "acl", "grant", "did:key:z6Mk", "--role", "reader"],
+            &[
+                "cnm",
+                "acl",
+                "create",
+                "--did",
+                "did:key:z6Mk",
+                "--role",
+                "reader",
+            ],
+            &["cnm", "keys", "revoke", "k1", "--yes"],
+            &[
+                "cnm",
+                "keys",
+                "rotate-seed",
+                "--yes",
+                "--mnemonic-file",
+                "-",
+            ],
+            &["cnm", "did-templates", "delete", "t", "--yes"],
+            &["cnm", "backup", "export", "--password-file", "-"],
+            &[
+                "cnm",
+                "backup",
+                "import",
+                "f",
+                "--password-file",
+                "p",
+                "--yes",
+            ],
+            &["cnm", "completions", "zsh"],
+            &["cnm", "-V", "community", "list"],
+        ];
+        for argv in commands {
+            if let Err(e) = super::Cli::try_parse_from(*argv) {
+                panic!("`{}` does not parse: {e}", argv.join(" "));
+            }
+        }
+    }
+
+    /// The shared 429 renderer prints `cnm config update --rate-limit-… <N>`;
+    /// cnm must accept exactly those flags.
+    #[test]
+    fn config_update_accepts_the_flags_the_sdk_hint_prints() {
+        use clap::Parser;
+        for flags in [
+            vta_sdk::rate_limit::VTA_RUNTIME_FLAGS,
+            vta_sdk::rate_limit::VTA_DID_LOG_RUNTIME_FLAGS,
+        ] {
+            let args: Vec<&str> = std::iter::once("cnm")
+                .chain(
+                    flags
+                        .split_whitespace()
+                        .map(|t| if t == "<N>" { "7" } else { t }),
+                )
+                .collect();
+            assert!(
+                super::Cli::try_parse_from(&args).is_ok(),
+                "cnm must accept the SDK hint `{flags}`"
+            );
+        }
+    }
+
+    use super::*;
+
+    /// `community delete` is the name; `remove` stays a hidden alias so
+    /// scripts written against it keep working. `--yes` skips the prompt, and
+    /// `--force` is accepted for parity with the other prompt-skipping deletes.
+    #[test]
+    fn community_delete_parses_with_alias_and_skip_flags() {
+        for verb in ["delete", "remove"] {
+            for (flag, expect_yes) in [
+                (None, false),
+                (Some("--yes"), true),
+                (Some("-y"), true),
+                (Some("--force"), true),
+            ] {
+                let mut argv = vec!["cnm", "community", verb, "home"];
+                argv.extend(flag);
+                let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let Commands::Community {
+                    command: CommunityCommands::Delete { name, yes },
+                } = cli.command
+                else {
+                    panic!("{argv:?} did not parse as community delete");
+                };
+                assert_eq!(name, "home");
+                assert_eq!(yes, expect_yes, "{argv:?}");
+            }
+        }
+    }
+
+    /// Prompt-skip on `contexts delete` is `--yes`; the old `--force` / `-f`
+    /// spellings still parse.
+    #[test]
+    fn contexts_delete_takes_yes_and_still_honours_force() {
+        for flag in ["--yes", "-y", "--force", "-f"] {
+            let cli = Cli::try_parse_from(["cnm", "contexts", "delete", "ctx", flag])
+                .unwrap_or_else(|e| panic!("{flag}: {e}"));
+            let Commands::Contexts {
+                command: ContextCommands::Delete { yes, .. },
+            } = cli.command
+            else {
+                panic!("expected contexts delete");
+            };
+            assert!(yes, "{flag} did not set yes");
+        }
+    }
+
+    // ── requires_auth ──────────────────────────────────────────────
+
+    #[test]
+    fn test_requires_auth_health_false() {
+        assert!(!requires_auth(&Commands::Health));
+    }
+
+    #[test]
+    fn test_requires_auth_auth_login_false() {
+        let cmd = Commands::Auth {
+            command: AuthCommands::Login {
+                credential_bundle: std::path::PathBuf::from("/tmp/fake.armor"),
+                expect_digest: None,
+                no_verify_digest: false,
+            },
+        };
+        assert!(!requires_auth(&cmd));
+    }
+
+    #[test]
+    fn test_requires_auth_keys_true() {
+        let cmd = Commands::Keys {
+            command: KeyCommands::List {
+                limit: 50,
+                cursor: None,
+                status: None,
+                context: None,
+            },
+        };
+        assert!(requires_auth(&cmd));
+    }
+
+    #[test]
+    fn test_requires_auth_config_true() {
+        let cmd = Commands::Config {
+            command: ConfigCommands::Get,
+        };
+        assert!(requires_auth(&cmd));
+    }
+
+    #[test]
+    fn test_requires_auth_acl_true() {
+        let cmd = Commands::Acl {
+            command: AclCommands::List {
+                context: None,
+                direction: None,
+            },
+        };
+        assert!(requires_auth(&cmd));
+    }
+
+    #[test]
+    fn test_requires_auth_contexts_true() {
+        let cmd = Commands::Contexts {
+            command: ContextCommands::List,
+        };
+        assert!(requires_auth(&cmd));
+    }
+
+    #[test]
+    fn test_requires_auth_vtc_commands_false() {
+        // Vetting, audit and backup administer the VTC and authenticate to it
+        // with its own DID as the audience; connecting to the VTA first is
+        // what made them authenticate to the wrong audience.
+        let cmd = Commands::Vetting {
+            command: vetting::VettingCommands::Revocations,
+        };
+        assert!(!requires_auth(&cmd));
+        assert!(!requires_auth(&Commands::Audit {
+            command: AuditCommands::Verify
+        }));
+        assert!(!requires_auth(&Commands::Backup {
+            command: BackupCommands::Import {
+                file: "x.vtcbak".into(),
+                preview: true,
+                password_file: None,
+                yes: false,
+            }
+        }));
+    }
+
+    /// `cnm access` administers the VTC, so it authenticates to the VTC and
+    /// never to the VTA first; every verb's documented shape parses.
+    #[test]
+    fn access_commands_parse_and_need_no_vta_session() {
+        for argv in [
+            vec!["cnm", "access", "list"],
+            vec![
+                "cnm",
+                "access",
+                "list",
+                "--admin-role",
+                "repo-manager",
+                "--capability",
+                "git.repo.manage",
+                "--resource",
+                "git-ns:github.com/acme",
+                "--direction",
+                "subtree",
+            ],
+            vec!["cnm", "access", "show", "did:key:z6Mk"],
+            vec![
+                "cnm",
+                "access",
+                "grant",
+                "did:key:z6Mk",
+                "--admin-role",
+                "repo-manager",
+                "--capability",
+                "git.repo.manage@git-ns:github.com/acme",
+                "--approve",
+                "--expires",
+                "7d",
+            ],
+            vec![
+                "cnm",
+                "access",
+                "update",
+                "did:key:z6Mk",
+                "--capability",
+                "vtc.audit.read",
+            ],
+            vec!["cnm", "access", "update", "did:key:z6Mk", "--full-ceiling"],
+            vec!["cnm", "access", "update", "did:key:z6Mk", "--permanent"],
+            vec![
+                "cnm",
+                "access",
+                "change-role",
+                "did:key:z6Mk",
+                "--from",
+                "member",
+                "--to",
+                "moderator",
+            ],
+            vec!["cnm", "access", "revoke", "did:key:z6Mk"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(!requires_auth(&cli.command), "{argv:?}");
+        }
+        // `--direction` means nothing without a resource to read it against,
+        // and a community holds no contexts to scope by (VTI-VTC-010).
+        assert!(Cli::try_parse_from(["cnm", "access", "list", "--direction", "any"]).is_err());
+        assert!(Cli::try_parse_from(["cnm", "access", "list", "--scope", "ctx-a"]).is_err());
+        // An expiry and a permanent entry cannot both be asked for.
+        assert!(
+            Cli::try_parse_from([
+                "cnm",
+                "access",
+                "update",
+                "did:key:z6Mk",
+                "--expires",
+                "1d",
+                "--permanent"
+            ])
+            .is_err()
+        );
+    }
+
+    /// The contract's command shapes parse (CONTRACT-vetter-registry §9).
+    #[test]
+    fn vetting_commands_parse_as_documented() {
+        for argv in [
+            vec!["cnm", "vetting", "vetters", "list"],
+            vec![
+                "cnm",
+                "vetting",
+                "vetters",
+                "grant",
+                "did:key:z6Mk",
+                "--validity",
+                "180d",
+            ],
+            vec![
+                "cnm",
+                "vetting",
+                "vetters",
+                "revoke",
+                "3f1c9a52-8c1e-4f2b-9d7a-0b6e5c4d3a21",
+            ],
+            vec!["cnm", "vetting", "auto-grant", "show"],
+            vec![
+                "cnm",
+                "vetting",
+                "auto-grant",
+                "set",
+                "--enabled",
+                "true",
+                "--sweep-minutes",
+                "30",
+            ],
+            vec![
+                "cnm",
+                "vetting",
+                "branding",
+                "set",
+                "--accent-color",
+                "#1a2b3c",
+                "--clear",
+                "logo-url",
+            ],
+            vec!["cnm", "--json", "vetting", "revocations"],
+            vec![
+                "cnm",
+                "vetting",
+                "bootstrap-pgp",
+                "--keyring",
+                "k.asc",
+                "--roots",
+                "AAAA,BBBB",
+                "--max-depth",
+                "2",
+                "--links",
+                "links",
+                "--dry-run",
+                "--validity",
+                "365d",
+            ],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!("{argv:?} should parse: {e}");
+            }
+        }
+    }
+
+    /// `git link` starts a link (`--forge`), follows one (`--status`) or lists
+    /// what is linked (`--list`), and those three do not mix.
+    #[test]
+    fn git_link_takes_exactly_one_of_forge_status_or_list() {
+        for ok in [
+            vec!["cnm", "git", "link", "--forge", "github.com"],
+            vec!["cnm", "git", "link", "--forge", "codeberg.org", "--no-wait"],
+            vec!["cnm", "git", "link", "--status", "lnk_4Tq9Xw2P"],
+            vec![
+                "cnm",
+                "git",
+                "link",
+                "--status",
+                "lnk_4Tq9Xw2P",
+                "--no-wait",
+            ],
+            vec!["cnm", "--json", "git", "link", "--list"],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&ok) {
+                panic!("{ok:?} should parse: {e}");
+            }
+        }
+        for bad in [
+            vec!["cnm", "git", "link"],
+            vec!["cnm", "git", "link", "--no-wait"],
+            vec!["cnm", "git", "link", "--list", "--forge", "github.com"],
+            vec!["cnm", "git", "link", "--list", "--status", "lnk_1"],
+            vec!["cnm", "git", "link", "--list", "--no-wait"],
+            vec![
+                "cnm",
+                "git",
+                "link",
+                "--forge",
+                "github.com",
+                "--status",
+                "lnk_1",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&bad).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn git_unlink_takes_a_forge_and_an_optional_account_id() {
+        for ok in [
+            vec!["cnm", "git", "unlink", "--forge", "github.com"],
+            vec![
+                "cnm",
+                "git",
+                "unlink",
+                "--forge",
+                "github.com",
+                "--account-id",
+                "9120045",
+            ],
+        ] {
+            if let Err(e) = Cli::try_parse_from(&ok) {
+                panic!("{ok:?} should parse: {e}");
+            }
+        }
+        assert!(Cli::try_parse_from(["cnm", "git", "unlink"]).is_err());
+    }
+
+    #[test]
+    fn a_bare_origin_names_no_api_mount() {
+        assert!(url_has_no_path("https://vtc.example.com"));
+        assert!(url_has_no_path("https://vtc.example.com/"));
+        assert!(!url_has_no_path("https://vtc.example.com/v1"));
+    }
+
+    #[test]
+    fn test_requires_auth_setup_false() {
+        assert!(!requires_auth(&Commands::Setup {
+            command: None,
+            name: None,
+            overwrite: false,
+        }));
+    }
+
+    #[test]
+    fn test_requires_auth_community_false() {
+        let cmd = Commands::Community {
+            command: CommunityCommands::List,
+        };
+        assert!(!requires_auth(&cmd));
+    }
+}

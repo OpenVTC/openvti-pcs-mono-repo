@@ -1,0 +1,791 @@
+//! Console signing keys — a *delegation*, not an identity.
+//!
+//! The admin console cannot author a signed Trust Task document, which is why
+//! every bearer route the #1641 migration would retire has had to stay
+//! ([#1684](https://github.com/OpenVTC/verifiable-trust-infrastructure/issues/1684)).
+//! `docs/05-design-notes/vtc-console-signing.md` §5A is the design this
+//! implements: the browser generates a **non-extractable** Ed25519 key, derives
+//! a `did:key` from its public half, and the VTC records one sentence about it —
+//!
+//! > console key `K` may act as admin DID `D`
+//!
+//! — and nothing else. The record is a *credential of `D`*, exactly the way a
+//! registered passkey is ([`super::admin::RegisteredPasskey`]), enrolled by `D`
+//! with a passkey gesture bound to the one enrolment, listed beside the
+//! passkeys, and individually revocable. It is served as
+//! `auth/signing-key/{enroll,list,revoke}/0.1`
+//! (`trust_tasks::signing_key_tasks`).
+//!
+//! Every delegation has the `console` scope and an expiry, at most
+//! [`MAX_LIFETIME_DAYS`] away, and an identity holds at most
+//! [`MAX_ACTIVE_PER_IDENTITY`] active ones. A delegated key is accepted for the
+//! administration console's operations only, and **never** as an approver's
+//! attestation: the spine refuses a step-up `approve-response`,
+//! `task-consent/decision` or `confirm/response` signed by any key a
+//! delegation names.
+//!
+//! ## What a delegation confers: nothing
+//!
+//! This is the whole security argument and it is worth stating before the code.
+//! A [`ConsoleKeyDelegation`] carries **no role, no scopes and no
+//! capabilities**. It names an identity that already holds whatever it holds,
+//! and it can never reach further than that identity's own ACL row — which is
+//! read fresh, from the ACL keyspace, on every document
+//! ([`resolve_delegated_admin`]). So:
+//!
+//! - It is not self-promotion. `Invariant::SelfPromotion` (VTI-OPS-050, #1658)
+//!   is about *conferring a role*; a delegation confers none, and the console
+//!   key never appears in `acl list`. That is precisely why the console key
+//!   does **not** get its own ACL row — see §5F of the design note for the
+//!   option that does, and why an XSS that wins a step-up window would be able
+//!   to leave a durable admin row behind under it.
+//! - It does not reinstate the session as an authority chain. #1681's stated
+//!   property — `admin_signer` never consults `sessions_ks` — survives, because
+//!   the delegation resolves to a DID and the DID resolves to an ACL row.
+//! - Removing, demoting or expiring the delegating admin's ACL row kills every
+//!   key delegated from it, at once, with no extra bookkeeping.
+//!
+//! ## Two refusals worth reading before changing anything
+//!
+//! 1. **A console DID that already holds an ACL row cannot be enrolled**
+//!    ([`EnrolError::SubjectHoldsAclRow`]). Without it an admin could name
+//!    *another admin's* DID as their "console key": the record would be inert
+//!    while that DID's own row answered for it, and would silently start
+//!    acting-as the delegator the moment the row was demoted or removed —
+//!    turning a de-escalation into a hand-over.
+//! 2. **A signer that holds an ACL row is answered by that row, full stop** —
+//!    including when the row refuses. [`resolve_delegated_admin`] is consulted
+//!    only for a signer with *no* row at all. The design note's sketch falls
+//!    through on `Forbidden` as well; this is deliberately tighter, and the
+//!    reason is the same as (1): a row that has been demoted or expired must
+//!    not be routed around by a delegation enrolled while it was live. The
+//!    authority is the row.
+//!
+//! ## Storage
+//!
+//! One row per console DID in the [`CONSOLE_KEYS`](crate::store::keyspaces)
+//! keyspace, keyed `console_key:<consoleDid>`, because the hot-path lookup is
+//! *by console DID* — the signer of a document is what we hold, and the admin
+//! it acts for is what we want. The keyspace is **excluded from backup**: a
+//! restored VTC must not resurrect signing authority for a browser profile that
+//! may no longer exist, on a machine that may no longer be the operator's.
+//!
+//! A revocation leaves a **tombstone** rather than deleting the row, so that a
+//! burned key can never be re-enrolled by mistake and the list can say why a
+//! browser stopped working.
+
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use vti_common::error::AppError;
+use vti_common::store::{Batch, KeyspaceHandle};
+
+/// The longest a delegation lives, and the lifetime one gets when its
+/// enrolment asked for none: 30 days, the ceiling
+/// `auth/signing-key/enroll/0.2` item 6 sets.
+pub const MAX_LIFETIME_DAYS: i64 = 30;
+
+/// How many active delegations one identity may hold
+/// (`auth/signing-key/enroll:tooManyKeys`). A console per browser profile an
+/// operator uses; more than this is a key nobody is watching.
+pub const MAX_ACTIVE_PER_IDENTITY: usize = 5;
+
+/// Serialises every check-then-write on the delegation keyspace — enrolment's
+/// "not already enrolled" read and its write, and revocation — so two
+/// concurrent enrolments of one key, for two identities, cannot both succeed
+/// and silently re-point it (enroll item 9, revoke item 6).
+pub static DELEGATION_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// What a delegated key may be accepted for. `console` in this version: the
+/// operations the identity performs through the administration console.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DelegationScope {
+    #[default]
+    Console,
+}
+
+impl DelegationScope {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Console => "console",
+        }
+    }
+}
+
+/// The stored delegation: "this console key may act as this admin DID".
+///
+/// Field names are the on-disk format. `camelCase` because every VTC wire and
+/// storage shape is (R3.1), and because the list endpoint serves this type's
+/// projection straight to the console.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", from = "StoredDelegation")]
+pub struct ConsoleKeyDelegation {
+    /// The console key's own `did:key` — an Ed25519 multikey, the DID the
+    /// browser derives from the public half of its non-extractable keypair.
+    /// This is the document `issuer` and the DID the proof's
+    /// `verificationMethod` names, so it is what a signed document presents.
+    pub console_did: String,
+    /// The identity this key acts as — the enrolment's `identityDid`, which a
+    /// passkey gesture by that identity, bound to the enrolment, established.
+    pub admin_did: String,
+    /// What the key may be accepted for. Rows stored before #1836 carry no
+    /// `scope`; every such delegation was a console key, and `console` is the
+    /// only scope there is, so reading one as `console` widens nothing.
+    #[serde(default)]
+    pub scope: DelegationScope,
+    /// Operator-supplied, e.g. `"Work laptop — Chrome"`. Absent rather than
+    /// empty when nobody chose one: an invented label is indistinguishable
+    /// from a chosen one to somebody deciding which key to revoke — the same
+    /// rule `auth/passkey/list/0.1` states for `deviceLabel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// When the delegation stops authorizing documents — always set, and at
+    /// most [`MAX_LIFETIME_DAYS`] after enrolment. An expired delegation
+    /// refuses on the verification path; it is not swept, because a row nobody
+    /// can use costs a few hundred bytes and it keeps the key burned.
+    pub expires_at: DateTime<Utc>,
+    /// Stamped by [`touch_last_used`] when the delegation authorizes a
+    /// document. Best-effort: a failed write never fails the request, because
+    /// this is a usability signal ("which of these browsers is still in use")
+    /// and not a security one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
+    /// The tombstone. `Some` means revoked, and a revoked row authorizes
+    /// nothing and cannot be re-enrolled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Who revoked it — the owner, or a super-admin doing incident response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_by: Option<String>,
+}
+
+/// The row as stored, tolerant of what #1836 added. Rows written before it
+/// carry no `scope` (every one was a console key, and `console` is the only
+/// scope, so reading one as `console` widens nothing) and no `expiresAt` (they
+/// lasted until revoked). A row with no expiry reads as expiring
+/// [`MAX_LIFETIME_DAYS`] after it was created — the most a fresh enrolment
+/// gets — so a legacy key never outlives the ceiling, and one older than that
+/// is expired and its browser re-enrols.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredDelegation {
+    console_did: String,
+    admin_did: String,
+    #[serde(default)]
+    scope: DelegationScope,
+    #[serde(default)]
+    label: Option<String>,
+    created_at: DateTime<Utc>,
+    #[serde(default)]
+    expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_used_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    revoked_by: Option<String>,
+}
+
+impl From<StoredDelegation> for ConsoleKeyDelegation {
+    fn from(s: StoredDelegation) -> Self {
+        Self {
+            expires_at: s
+                .expires_at
+                .unwrap_or(s.created_at + Duration::days(MAX_LIFETIME_DAYS)),
+            console_did: s.console_did,
+            admin_did: s.admin_did,
+            scope: s.scope,
+            label: s.label,
+            created_at: s.created_at,
+            last_used_at: s.last_used_at,
+            revoked_at: s.revoked_at,
+            revoked_by: s.revoked_by,
+        }
+    }
+}
+
+impl ConsoleKeyDelegation {
+    /// Live *right now*: not revoked, and not past its expiry.
+    ///
+    /// Takes the instant rather than reading the clock so a test can pin it.
+    #[must_use]
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        self.revoked_at.is_none() && self.expires_at > now
+    }
+}
+
+const PREFIX: &[u8] = b"console_key:";
+
+fn key(console_did: &str) -> Vec<u8> {
+    let mut k = PREFIX.to_vec();
+    k.extend_from_slice(console_did.as_bytes());
+    k
+}
+
+/// Read one delegation by console DID. `Ok(None)` if never enrolled.
+pub async fn get_delegation(
+    ks: &KeyspaceHandle,
+    console_did: &str,
+) -> Result<Option<ConsoleKeyDelegation>, AppError> {
+    ks.get(key(console_did)).await
+}
+
+/// Create or overwrite a delegation row.
+pub async fn store_delegation(
+    ks: &KeyspaceHandle,
+    delegation: &ConsoleKeyDelegation,
+) -> Result<(), AppError> {
+    ks.insert(key(&delegation.console_did), delegation).await
+}
+
+/// Every delegation enrolled by `admin_did`, newest first, tombstones included
+/// — the list an operator uses to decide which browser to disown.
+pub async fn list_delegations_for_admin(
+    ks: &KeyspaceHandle,
+    admin_did: &str,
+) -> Result<Vec<ConsoleKeyDelegation>, AppError> {
+    let raw = ks.prefix_iter_raw(PREFIX.to_vec()).await?;
+    let mut out: Vec<ConsoleKeyDelegation> = Vec::new();
+    for (_k, v) in raw {
+        match serde_json::from_slice::<ConsoleKeyDelegation>(&v) {
+            Ok(d) if d.admin_did == admin_did => out.push(d),
+            Ok(_) => {}
+            // A row this build cannot parse is one it must not authorize
+            // either, and `resolve_delegated_admin` refuses it for the same
+            // reason. Warn rather than fail the whole listing: one unreadable
+            // row should not hide the others an operator is trying to revoke.
+            Err(err) => tracing::warn!(error = %err, "skipping unparseable console-key row"),
+        }
+    }
+    out.sort_by_key(|d| std::cmp::Reverse(d.created_at));
+    Ok(out)
+}
+
+/// Why an enrolment was refused. Each variant is a rule the module header
+/// explains; the route maps them onto status codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrolError {
+    /// The console DID is not a `did:key`. A delegation exists so the console
+    /// can sign without network resolution — `TrustTaskVmResolver` resolves
+    /// `did:key` locally — and a DID whose document can be *rewritten* is a
+    /// key the enroller did not enrol.
+    NotADidKey,
+    /// `consoleDid == adminDid`. A self-delegation is a loop that says nothing:
+    /// the signer already has the row.
+    SelfDelegation,
+    /// The console DID already holds an ACL row of its own. Refusal (1) in the
+    /// module header — this is what stops "delegate my authority to that other
+    /// admin, to take effect when they are demoted".
+    SubjectHoldsAclRow,
+    /// Already delegated — to this admin or another one. Re-pointing a console
+    /// key at a different admin is not an edit, it is a hand-over, and it would
+    /// let a second admin claim a key the first enrolled. Revoke and re-enrol.
+    AlreadyDelegated,
+    /// Already delegated *and revoked*. A burned key is not re-usable.
+    Revoked,
+}
+
+impl EnrolError {
+    /// The operator-facing refusal, typed so the route need not restate it.
+    #[must_use]
+    pub fn into_app_error(self, console_did: &str) -> AppError {
+        match self {
+            Self::NotADidKey => AppError::Validation(format!(
+                "consoleDid must be a did:key (the console derives it from its own \
+                 non-extractable Ed25519 key); got {console_did}"
+            )),
+            Self::SelfDelegation => AppError::Validation(
+                "consoleDid must not be your own admin DID — a delegation names a \
+                 *separate* key that may act as it"
+                    .into(),
+            ),
+            Self::SubjectHoldsAclRow => AppError::Conflict(format!(
+                "{console_did} already holds an ACL row of its own, so it is an identity \
+                 rather than a console key; delegating to it would take effect only once \
+                 that row was removed"
+            )),
+            Self::AlreadyDelegated => AppError::Conflict(format!(
+                "{console_did} is already enrolled as a console key; revoke it before \
+                 enrolling it again"
+            )),
+            Self::Revoked => AppError::Conflict(format!(
+                "{console_did} was revoked and cannot be re-enrolled; generate a new \
+                 console key in the browser"
+            )),
+        }
+    }
+}
+
+/// The first enrolment rule `console_did` breaks, if any. These concern the
+/// key, not the identity, so a refusal on them says nothing about
+/// `admin_did`'s standing (enroll item 2).
+pub async fn key_refusal(
+    console_keys_ks: &KeyspaceHandle,
+    acl_ks: &KeyspaceHandle,
+    console_did: &str,
+    admin_did: &str,
+) -> Result<Option<EnrolError>, AppError> {
+    if !console_did.starts_with("did:key:") {
+        return Ok(Some(EnrolError::NotADidKey));
+    }
+    if console_did == admin_did {
+        return Ok(Some(EnrolError::SelfDelegation));
+    }
+    if let Some(existing) = get_delegation(console_keys_ks, console_did).await? {
+        return Ok(Some(if existing.revoked_at.is_some() {
+            EnrolError::Revoked
+        } else {
+            EnrolError::AlreadyDelegated
+        }));
+    }
+    if crate::acl::get_acl_entry(acl_ks, console_did)
+        .await?
+        .is_some()
+    {
+        return Ok(Some(EnrolError::SubjectHoldsAclRow));
+    }
+    Ok(None)
+}
+
+/// The expiry a delegation gets: the earlier of the requested one and
+/// [`MAX_LIFETIME_DAYS`] from `now`, or that maximum when none was requested.
+#[must_use]
+pub fn capped_expiry(requested: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<Utc> {
+    let ceiling = now + Duration::days(MAX_LIFETIME_DAYS);
+    requested.map_or(ceiling, |r| r.min(ceiling))
+}
+
+/// Check every key rule and, if they all hold, write a `console` delegation of
+/// `console_did` to `admin_did`, expiring at [`capped_expiry`].
+///
+/// The caller holds [`DELEGATION_LOCK`] and has already established that the
+/// enrolling party controls `admin_did` and that it has the standing to lend.
+pub async fn enrol_delegation(
+    console_keys_ks: &KeyspaceHandle,
+    acl_ks: &KeyspaceHandle,
+    console_did: &str,
+    admin_did: &str,
+    label: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<ConsoleKeyDelegation, AppError> {
+    if let Some(refusal) = key_refusal(console_keys_ks, acl_ks, console_did, admin_did).await? {
+        return Err(refusal.into_app_error(console_did));
+    }
+    let now = Utc::now();
+    let delegation = ConsoleKeyDelegation {
+        console_did: console_did.to_string(),
+        admin_did: admin_did.to_string(),
+        scope: DelegationScope::Console,
+        label: label.filter(|l| !l.trim().is_empty()),
+        created_at: now,
+        expires_at: capped_expiry(expires_at, now),
+        last_used_at: None,
+        revoked_at: None,
+        revoked_by: None,
+    };
+    store_delegation(console_keys_ks, &delegation).await?;
+    Ok(delegation)
+}
+
+/// How many of `admin_did`'s delegations are active at `now`.
+pub async fn active_count(
+    ks: &KeyspaceHandle,
+    admin_did: &str,
+    now: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    Ok(list_delegations_for_admin(ks, admin_did)
+        .await?
+        .iter()
+        .filter(|d| d.is_active_at(now))
+        .count())
+}
+
+/// Mark a delegation revoked. Idempotent on an already-revoked row: the caller
+/// wanted it gone and it is gone, so answering 404 would be a lie.
+///
+/// Returns the tombstoned row, or `Ok(None)` when no such delegation exists.
+pub async fn revoke_delegation(
+    ks: &KeyspaceHandle,
+    console_did: &str,
+    revoked_by: &str,
+) -> Result<Option<ConsoleKeyDelegation>, AppError> {
+    // A store batch rather than a plain insert, so the tombstone is ordered
+    // against `touch_last_used`'s conditional stamp: the stamp either lands
+    // first (and is overwritten here) or finds the row revoked. A plain write
+    // could land between the stamp's check and its commit, and the stamp would
+    // then write the un-revoked row back.
+    let k = key(console_did);
+    loop {
+        let Some(raw) = ks.get_raw(k.clone()).await? else {
+            return Ok(None);
+        };
+        let mut delegation: ConsoleKeyDelegation = serde_json::from_slice(&raw)?;
+        if delegation.revoked_at.is_some() {
+            return Ok(Some(delegation));
+        }
+        delegation.revoked_at = Some(Utc::now());
+        delegation.revoked_by = Some(revoked_by.to_string());
+        let mut batch = Batch::new();
+        batch
+            .require_unchanged(k.clone(), raw)
+            .insert(k.clone(), &delegation)?;
+        // Refused only by a concurrent stamp, which cannot recur once this
+        // lands, so the loop is bounded by the stamps already in flight.
+        if ks.apply_batch(batch).await?.is_applied() {
+            return Ok(Some(delegation));
+        }
+    }
+}
+
+/// The admin DID a signed document's signer may act as, or `None`.
+///
+/// **This is the whole verification-side surface.** It answers only "which DID
+/// does this key stand in for"; the caller then resolves *that* DID's ACL row,
+/// at execution time, exactly as it does for a signer who signed with their own
+/// key. A revoked delegation, an expired one, an unknown signer and an
+/// unreadable row all answer `None`, and `None` means the caller refuses.
+pub async fn resolve_delegated_admin(
+    ks: &KeyspaceHandle,
+    signer_did: &str,
+) -> Result<Option<ConsoleKeyDelegation>, AppError> {
+    Ok(get_delegation(ks, signer_did)
+        .await?
+        .filter(|d| d.is_active_at(Utc::now())))
+}
+
+/// Stamp `last_used_at`. Best-effort by contract: errors are logged, never
+/// returned, because a storage hiccup must not turn an authorized operation
+/// into a refusal.
+///
+/// Stamps the row as stored, and only while it is still that row and still
+/// active — never the caller's copy, which was read before the operation ran
+/// and outside [`DELEGATION_LOCK`]. Writing that copy back undid a revocation
+/// that landed in between, reactivating a disowned console key. A stamp lost to
+/// a concurrent write is not retried.
+pub async fn touch_last_used(ks: &KeyspaceHandle, delegation: &ConsoleKeyDelegation) {
+    if let Err(err) = stamp_last_used(ks, &delegation.console_did).await {
+        tracing::warn!(
+            console_did = %delegation.console_did,
+            error = %err,
+            "could not stamp console-key last-used"
+        );
+    }
+}
+
+async fn stamp_last_used(ks: &KeyspaceHandle, console_did: &str) -> Result<(), AppError> {
+    let k = key(console_did);
+    let Some(raw) = ks.get_raw(k.clone()).await? else {
+        return Ok(());
+    };
+    let mut current: ConsoleKeyDelegation = serde_json::from_slice(&raw)?;
+    let now = Utc::now();
+    if !current.is_active_at(now) {
+        return Ok(());
+    }
+    current.last_used_at = Some(now);
+    let mut batch = Batch::new();
+    batch
+        .require_unchanged(k.clone(), raw)
+        .insert(k, &current)?;
+    ks.apply_batch(batch).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acl::VtcRole;
+    use crate::test_support::seed_acl;
+    use chrono::Duration;
+    use vti_common::config::StoreConfig;
+    use vti_common::store::Store;
+
+    const CONSOLE: &str = "did:key:z6MkConsoleBrowserOne";
+    const ADMIN: &str = "did:key:z6MkAdminOperator";
+
+    /// A row stored before #1836 has no `scope` and no `expiresAt`; it must
+    /// still read — as `console`, expiring a ceiling after creation — or every
+    /// console sign-in 500s on it.
+    #[test]
+    fn a_row_stored_before_scope_and_expiry_still_reads() {
+        let row = r#"{"consoleDid":"did:key:z6MkOld","adminDid":"did:key:z6MkAdmin","createdAt":"2026-09-01T00:00:00Z"}"#;
+        let d: ConsoleKeyDelegation = serde_json::from_str(row).expect("legacy row reads");
+        assert_eq!(d.scope, DelegationScope::Console);
+        assert_eq!(
+            d.expires_at,
+            d.created_at + Duration::days(MAX_LIFETIME_DAYS)
+        );
+    }
+
+    fn temp_store() -> (KeyspaceHandle, KeyspaceHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = StoreConfig {
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = Store::open(&cfg).expect("store");
+        let console = store.keyspace("console-keys-test").expect("ks");
+        let acl = store.keyspace("console-keys-acl-test").expect("ks");
+        (console, acl, dir)
+    }
+
+    #[tokio::test]
+    async fn a_delegation_round_trips_and_resolves() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+
+        let d = enrol_delegation(
+            &console_ks,
+            &acl_ks,
+            CONSOLE,
+            ADMIN,
+            Some("Work laptop".into()),
+            None,
+        )
+        .await
+        .expect("enrol");
+        assert_eq!(d.admin_did, ADMIN);
+        assert_eq!(d.label.as_deref(), Some("Work laptop"));
+
+        let resolved = resolve_delegated_admin(&console_ks, CONSOLE)
+            .await
+            .expect("resolve")
+            .expect("active");
+        assert_eq!(resolved.admin_did, ADMIN);
+    }
+
+    /// The property the whole design rests on: a delegation is a *credential*,
+    /// so it must never outlive its own revocation by even one request.
+    #[tokio::test]
+    async fn a_revoked_delegation_stops_resolving_immediately() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect("enrol");
+
+        revoke_delegation(&console_ks, CONSOLE, ADMIN)
+            .await
+            .expect("revoke")
+            .expect("existed");
+
+        assert!(
+            resolve_delegated_admin(&console_ks, CONSOLE)
+                .await
+                .expect("resolve")
+                .is_none(),
+            "a revoked delegation must resolve to nothing"
+        );
+    }
+
+    /// A last-used stamp carrying a copy read before a revocation must not
+    /// write it back: the stale write reactivated the revoked key.
+    #[tokio::test]
+    async fn a_last_used_stamp_never_reactivates_a_revoked_delegation() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect("enrol");
+        let stale = resolve_delegated_admin(&console_ks, CONSOLE)
+            .await
+            .expect("resolve")
+            .expect("active");
+
+        revoke_delegation(&console_ks, CONSOLE, ADMIN)
+            .await
+            .expect("revoke")
+            .expect("existed");
+        touch_last_used(&console_ks, &stale).await;
+
+        assert!(
+            resolve_delegated_admin(&console_ks, CONSOLE)
+                .await
+                .expect("resolve")
+                .is_none(),
+            "a last-used stamp reactivated a revoked console key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_last_used_stamp_records_use_of_a_live_delegation() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect("enrol");
+        let d = get_delegation(&console_ks, CONSOLE).await.unwrap().unwrap();
+        assert!(d.last_used_at.is_none());
+        touch_last_used(&console_ks, &d).await;
+        let d = get_delegation(&console_ks, CONSOLE).await.unwrap().unwrap();
+        assert!(d.last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_expired_delegation_stops_resolving() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        enrol_delegation(
+            &console_ks,
+            &acl_ks,
+            CONSOLE,
+            ADMIN,
+            None,
+            Some(Utc::now() - Duration::seconds(1)),
+        )
+        .await
+        .expect("enrol");
+
+        assert!(
+            resolve_delegated_admin(&console_ks, CONSOLE)
+                .await
+                .expect("resolve")
+                .is_none()
+        );
+    }
+
+    /// Refusal (1). Delegating to a DID that has its own ACL row would be inert
+    /// until that row went away and would then hand over the delegator's
+    /// authority — a demotion that silently promotes.
+    #[tokio::test]
+    async fn a_did_with_its_own_acl_row_cannot_be_enrolled() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        let other_admin = "did:key:z6MkAnotherAdmin";
+        seed_acl(&acl_ks, other_admin, VtcRole::Admin).await;
+
+        let err = enrol_delegation(&console_ks, &acl_ks, other_admin, ADMIN, None, None)
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_second_admin_cannot_repoint_an_enrolled_console_key() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        let rival = "did:key:z6MkRivalAdmin";
+        seed_acl(&acl_ks, rival, VtcRole::Admin).await;
+        enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect("enrol");
+
+        let err = enrol_delegation(&console_ks, &acl_ks, CONSOLE, rival, None, None)
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+        assert_eq!(
+            get_delegation(&console_ks, CONSOLE)
+                .await
+                .expect("read")
+                .expect("present")
+                .admin_did,
+            ADMIN,
+            "the first enrolment stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_console_key_cannot_be_re_enrolled() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect("enrol");
+        revoke_delegation(&console_ks, CONSOLE, ADMIN)
+            .await
+            .expect("revoke");
+
+        let err = enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_did_key_and_a_self_delegation_are_refused() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+
+        assert!(matches!(
+            enrol_delegation(
+                &console_ks,
+                &acl_ks,
+                "did:web:console.example.com",
+                ADMIN,
+                None,
+                None
+            )
+            .await
+            .expect_err("must refuse"),
+            AppError::Validation(_)
+        ));
+        assert!(matches!(
+            enrol_delegation(&console_ks, &acl_ks, ADMIN, ADMIN, None, None)
+                .await
+                .expect_err("must refuse"),
+            AppError::Validation(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn listing_is_scoped_to_the_enrolling_admin() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        let other = "did:key:z6MkOtherOperator";
+        seed_acl(&acl_ks, other, VtcRole::Admin).await;
+
+        enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect("enrol");
+        enrol_delegation(
+            &console_ks,
+            &acl_ks,
+            "did:key:z6MkTheirBrowser",
+            other,
+            None,
+            None,
+        )
+        .await
+        .expect("enrol");
+
+        let mine = list_delegations_for_admin(&console_ks, ADMIN)
+            .await
+            .expect("list");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].console_did, CONSOLE);
+    }
+
+    #[tokio::test]
+    async fn revoking_is_idempotent_and_keeps_the_first_revoker() {
+        let (console_ks, acl_ks, _dir) = temp_store();
+        seed_acl(&acl_ks, ADMIN, VtcRole::Admin).await;
+        enrol_delegation(&console_ks, &acl_ks, CONSOLE, ADMIN, None, None)
+            .await
+            .expect("enrol");
+
+        let first = revoke_delegation(&console_ks, CONSOLE, ADMIN)
+            .await
+            .expect("revoke")
+            .expect("existed");
+        let second = revoke_delegation(&console_ks, CONSOLE, "did:key:z6MkSomeoneElse")
+            .await
+            .expect("revoke again")
+            .expect("existed");
+        assert_eq!(first.revoked_at, second.revoked_at);
+        assert_eq!(second.revoked_by.as_deref(), Some(ADMIN));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_signer_resolves_to_nothing() {
+        let (console_ks, _acl_ks, _dir) = temp_store();
+        assert!(
+            resolve_delegated_admin(&console_ks, "did:key:z6MkNeverSeen")
+                .await
+                .expect("resolve")
+                .is_none()
+        );
+    }
+}
