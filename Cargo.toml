@@ -57,6 +57,8 @@ members = [
   "openvtc/openvtc-core",
   "openvtc/openvtc",
 ]
+# infra/ vendors the mediator and DID host as their own workspaces.
+exclude = ["infra"]
 resolver = "3"
 
 [workspace.package]

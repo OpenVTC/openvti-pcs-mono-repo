@@ -115,8 +115,7 @@ pub(crate) fn record_error(
 #[cfg(test)]
 pub(crate) async fn test_tdk() -> affinidi_tdk::TDK {
     affinidi_tdk::TDK::new(
-        affinidi_tdk::common::config::TDKConfig::builder()
-            .with_load_environment(false)
+        openvtc_core::resolver_policy::tdk_config_builder()
             .build()
             .expect("TDK config builds"),
         None,

@@ -72,6 +72,7 @@ pub mod rebuild;
 pub mod rebuild_apply;
 pub mod relationships;
 pub mod renewal;
+pub mod resolver_policy;
 pub mod secure_store;
 /// The Trust Task specifications this crate speaks, generated at build time by
 /// `trust-tasks-build` from the versions pinned in `trust-tasks.lock` — the same

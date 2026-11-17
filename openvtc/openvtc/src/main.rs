@@ -86,8 +86,7 @@ async fn load_config_for_health(
     };
 
     let mut tdk = match affinidi_tdk::TDK::new(
-        affinidi_tdk::common::config::TDKConfig::builder()
-            .with_load_environment(false)
+        openvtc_core::resolver_policy::tdk_config_builder()
             .build()
             .ok()?,
         None,
@@ -574,7 +573,7 @@ async fn main() -> Result<()> {
             // checked against the issuer's DID document before anything —
             // including the issuer it names — is used.
             let resolver = affinidi_tdk::did_resolver::DIDCacheClient::new(
-                affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder::default().build(),
+                openvtc_core::resolver_policy::did_cache_config(),
             )
             .await
             .map_err(|e| {

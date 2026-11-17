@@ -1297,6 +1297,7 @@ async fn connect_listener(service: &Messaging, spec: &ListenerSpec) -> Result<()
     );
     let tdk = TDKSharedState::new(
         TDKConfig::builder()
+            .with_did_resolver_config(crate::resolver_policy::did_cache_config())
             .build()
             .map_err(|e| fail(format!("TDK config: {e}")))?,
     )

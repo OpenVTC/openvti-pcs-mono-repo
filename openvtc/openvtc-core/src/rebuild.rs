@@ -397,7 +397,7 @@ pub async fn plan(
         Err("no DID resolver was needed".to_string())
     } else {
         affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
-            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+            crate::resolver_policy::did_cache_config(),
         )
         .await
         .map_err(|e| {

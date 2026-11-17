@@ -32,8 +32,7 @@ pub async fn load_account(
     admin: Admin,
 ) -> Result<(Config, TDK, Option<VtaClient>)> {
     let mut tdk = TDK::new(
-        affinidi_tdk::common::config::TDKConfig::builder()
-            .with_load_environment(false)
+        openvtc_core::resolver_policy::tdk_config_builder()
             .build()
             .map_err(|e| anyhow!("TDK config failed: {e}"))?,
         None,
