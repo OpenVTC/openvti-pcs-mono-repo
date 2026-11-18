@@ -69,8 +69,8 @@ pub const JWT_MODE_PROVIDE: &str = "provide";
 ///   ambient cookie, so a wildcard does not expose them to CSRF).
 /// - `list` ⇒ `cors_allow_origin = "<comma-separated origins>"` ⇒ only
 ///   the listed origins. Entries are exact, scheme-qualified origins
-///   (`https://app.affinidi.com`) or leftmost-label sub-domain wildcards
-///   (`https://*.affinidi.com`). See [`crate::app::validate_cors_domains`].
+///   (`https://anonymized.example`) or leftmost-label sub-domain wildcards
+///   (`https://*.anonymized.example`). See [`crate::app::validate_cors_domains`].
 pub const CORS_MODE_NONE: &str = "none";
 pub const CORS_MODE_ANY: &str = "any";
 pub const CORS_MODE_LIST: &str = "list";

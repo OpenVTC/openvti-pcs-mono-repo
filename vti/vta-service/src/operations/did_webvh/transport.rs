@@ -157,21 +157,21 @@ mod tests {
         })
     }
 
-    /// The verbatim `WebVHHosting` entry `webvh.storm.ws` publishes: the base
+    /// The verbatim `WebVHHosting` entry `webvh.anon.org` publishes: the base
     /// is the origin plus `/api`, and `hostingPath` is ignored (#756/#759).
     #[test]
     fn the_live_hosting_entry_yields_the_origin_api_base() {
         let svc: affinidi_tdk::did_common::service::Service = serde_json::from_str(
             r#"{
-                "id": "did:webvh:QmUcyd...:webvh.storm.ws#webvh-hosting",
+                "id": "did:webvh:QmUcyd...:webvh.anon.org#webvh-hosting",
                 "type": "WebVHHosting",
-                "serviceEndpoint": { "hostingPath": "/webvh", "uri": "https://webvh.storm.ws" }
+                "serviceEndpoint": { "hostingPath": "/webvh", "uri": "https://webvh.anon.org" }
             }"#,
         )
         .expect("the live WebVHHosting entry parses");
         assert_eq!(
             resolve_host_reach(std::slice::from_ref(&svc)),
-            base("https://webvh.storm.ws/api")
+            base("https://webvh.anon.org/api")
         );
     }
 

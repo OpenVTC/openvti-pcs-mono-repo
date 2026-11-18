@@ -38,12 +38,12 @@ pub(super) fn open_face() -> openvtc_core::persona::profile::ProfileDetail {
         resolved: vec![
             ResolvedClaim {
                 claim_type: "name.legal".into(),
-                value: Some(serde_json::json!("Glenn Gore")),
+                value: Some(serde_json::json!("Alex Example")),
                 ..ResolvedClaim::default()
             },
             ResolvedClaim {
                 claim_type: "email.work".into(),
-                value: Some(serde_json::json!("glenn@example.com")),
+                value: Some(serde_json::json!("alex@example.com")),
                 ..ResolvedClaim::default()
             },
         ],

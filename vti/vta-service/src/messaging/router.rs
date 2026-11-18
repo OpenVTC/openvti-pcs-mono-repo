@@ -329,7 +329,7 @@ pub async fn dispatch(
     // through the envelope above like everything else; typed as itself it
     // falls to `handle_unknown`, which refuses it naming the envelope.
 
-    // The TEE attestation reads were bare `firstperson.network/vta/1.0/
+    // The TEE attestation reads were bare `anonymized.example/vta/1.0/
     // attestation/*` messages here, which nothing sent. They are
     // `vta/attestation/*` Trust Tasks on the spine now, reached through the
     // envelope above.

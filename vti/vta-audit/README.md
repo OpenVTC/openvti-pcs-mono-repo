@@ -14,5 +14,5 @@ Depends only on `vti-common` and `vta-sdk`. `vta-service` re-exports it as
 `crate::audit`, so existing `crate::audit::record` / `audit!(…)` call sites are
 unchanged.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

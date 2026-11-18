@@ -1449,8 +1449,8 @@ mod header_tests {
     #[test]
     fn a_distinct_self_name_is_shown() {
         assert_eq!(
-            header_self_name("Glenn", "webvh.storm.ws/@first-vtc"),
-            Some("Glenn")
+            header_self_name("Alex", "webvh.anon.org/@first-vtc"),
+            Some("Alex")
         );
     }
 
@@ -1460,7 +1460,7 @@ mod header_tests {
     #[test]
     fn a_self_name_equal_to_the_community_is_suppressed() {
         assert_eq!(
-            header_self_name("webvh.storm.ws/@first-vtc", "webvh.storm.ws/@first-vtc"),
+            header_self_name("webvh.anon.org/@first-vtc", "webvh.anon.org/@first-vtc"),
             None
         );
     }
@@ -1495,7 +1495,7 @@ mod wrap_text_tests {
     #[test]
     fn hard_splits_a_token_longer_than_the_width() {
         let did =
-            "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.storm.ws:first-vtc";
+            "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.anon.org:first-vtc";
         let got = wrap_text(did, 20);
         assert!(
             got.iter().all(|l| l.chars().count() <= 20),

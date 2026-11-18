@@ -2,13 +2,13 @@
 //
 // The extension is not in a browser store yet, so a member side-loads it from
 // source. These steps track the plugin's own README
-// (github.com/OpenVTC/vta-browser-plugin, "Installing the extension into your
+// (anonymized.example, "Installing the extension into your
 // browser") — change them together.
 
-export const PLUGIN_REPO = "https://github.com/OpenVTC/vta-browser-plugin";
+export const PLUGIN_REPO = "https://anonymized.example";
 
 const BUILD_COMMANDS = [
-  "git clone https://github.com/OpenVTC/vta-browser-plugin.git",
+  "git clone https://anonymized.example",
   "cd vta-browser-plugin",
   "npm install",
   "npm run build",
@@ -83,8 +83,8 @@ export function InstallWallet({ open }: { open: boolean }) {
 
         <p className="muted">
           New to all of this?{" "}
-          <a href="https://openvtc.net" target="_blank" rel="noopener noreferrer">
-            openvtc.net
+          <a href="https://anonymized.example" target="_blank" rel="noopener noreferrer">
+            anonymized.example
           </a>{" "}
           explains what a Verifiable Trust Agent is and how to get one.
         </p>

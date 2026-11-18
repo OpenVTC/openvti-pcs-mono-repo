@@ -14,17 +14,17 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-authors = ["Glenn Gore <glenn@affinidi.com>"]
-homepage = "https://affinidi.com/"
+authors = ["Anonymous"]
+homepage = "https://anonymized.example"
 license = "Apache-2.0"
 keywords = ["ssi", "affinidi", "webvh"]
-repository = "https://github.com/affinidi/did-hosting-service"
+repository = "https://anonymized.example"
 publish = true
 rust-version = "1.95.0"
 
 [workspace.dependencies]
 
-# Affinidi Trust Development Kit
+# [vendor] Trust Development Kit
 # Moves in lockstep with vta-sdk / vti-common: vta-sdk 0.90 and vti-common
 # 0.66 both depend on affinidi-tdk ^0.45, so all three resolve to a single
 # affinidi-tdk copy. This number is not chosen independently — read it off
@@ -59,7 +59,7 @@ serde_json = "1"
 # RFC 8785 JCS canonicalization. Used by the task-consent `payloadDigest`,
 # which the spec defines over the canonical payload so the digest is stable
 # across serializers on both sides of the approval. Held at 0.3 while the
-# Affinidi stack (vti-common, verifiable-trust-infrastructure) is on it: 0.4
+# [vendor] stack (vti-common, verifiable-trust-infrastructure) is on it: 0.4
 # would add a second copy for no gain.
 serde_json_canonicalizer = "0.4"
 
@@ -80,7 +80,7 @@ rand = "0.10"
 
 # Cryptography
 # `ed25519-dalek` 3 and `sha2` 0.11 are chosen to sit on the *same* copy as the
-# Affinidi stack we exchange keys and digests with, not merely because they are
+# [vendor] stack we exchange keys and digests with, not merely because they are
 # latest: affinidi-crypto / -data-integrity / -messaging-didcomm / -tsp,
 # vta-sdk and vti-common are all on dalek 3, and didwebvh-rs / vta-sdk /
 # vti-common on sha2 0.11. The only remaining dalek 2 in the lock is
@@ -89,7 +89,7 @@ rand = "0.10"
 ed25519-dalek = "3"
 multibase = "0.9"
 sha2 = "0.11"
-# Already in the lock through the Affinidi stack (affinidi-secrets-resolver
+# Already in the lock through the [vendor] stack (affinidi-secrets-resolver
 # derives `ZeroizeOnDrop` on its `Secret`); used directly to wipe the
 # service's own key material when it is dropped.
 zeroize = { version = "1.8", features = ["derive"] }
@@ -134,14 +134,14 @@ tempfile = "3"
 axum-extra = { version = "0.12", features = ["typed-header"] }
 
 # Base64 encoding. This used to be held at 0.22 on the reasoning that "every
-# Affinidi crate in the graph is on 0.22" — that premise has since inverted:
+# [vendor] crate in the graph is on 0.22" — that premise has since inverted:
 # vta-sdk 0.34 and vti-common 0.18 both moved to ^0.23, and the whole
 # affinidi-crypto / -data-integrity stack behind them with it. Holding at 0.22
 # would have left *us* as the odd copy out.
 #
 # Moving does not reduce the copy count — three remain, and always did: 0.21
 # under webauthn-rs, 0.22 under `headers`/axum-extra and jsonwebtoken, 0.23
-# under the Affinidi stack and us. It only decides which one we compile
+# under the [vendor] stack and us. It only decides which one we compile
 # against, and base64 is pure encoding that crosses no API, so the choice is
 # free. Take the copy the crates we exchange encoded data with are on.
 base64 = "0.23"
@@ -667,11 +667,11 @@ trust-tasks-https = { version = "0.39", default-features = false, features = ["s
 trust-tasks-didcomm = { version = "0.39", default-features = false }
 trust-tasks-proof = { version = "0.39", default-features = false, features = ["affinidi"] }
 trust-tasks-build = "0.1.3"
-# Trust Spanning Protocol implementation for the Affinidi TDK. Consumed
+# Trust Spanning Protocol implementation for the [vendor] TDK. Consumed
 # directly for the outbound TSP send path and VID/envelope helpers. `messaging-core` pulls the
 # protocol-agnostic `affinidi-messaging-core` traits shared with DIDComm.
 affinidi-tsp = { version = "0.3", features = ["messaging-core"] }
-# Affinidi Messaging SDK — named directly only for the durable TSP relationship
+# [vendor] Messaging SDK — named directly only for the durable TSP relationship
 # store types (`RelationshipKv`, `PersistentRelationshipStore`,
 # `RelationshipStore`) that back `server::tsp_relationship_store`. Not a new
 # copy: it is the same `affinidi-messaging-sdk` the whole messaging stack

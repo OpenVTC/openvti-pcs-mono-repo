@@ -130,7 +130,7 @@ describe("Repos plugin — overview", () => {
     mockFetch(gitNsRoutes());
     mount();
 
-    const personal = await screen.findByRole("article", { name: "github.com/glenn-g" });
+    const personal = await screen.findByRole("article", { name: "github.com/alex-g" });
     expect(within(personal).getByText("Personal account")).toBeTruthy();
     expect(within(personal).getByText("Manual mode")).toBeTruthy();
     expect(within(personal).getByText("account holder only")).toBeTruthy();
@@ -275,7 +275,7 @@ describe("Repos plugin — overview", () => {
     const acme = await screen.findByRole("article", { name: "github.com/acme" });
     expect(within(acme).getByRole("button", { name: "Reseat github.com/acme" })).toBeTruthy();
     expect(acme.textContent).toMatch(/Needs a community administrator/);
-    const personal = screen.getByRole("article", { name: "github.com/glenn-g" });
+    const personal = screen.getByRole("article", { name: "github.com/alex-g" });
     expect(within(personal).queryByRole("button", { name: /Reseat/ })).toBeNull();
   });
 
@@ -287,7 +287,7 @@ describe("Repos plugin — overview", () => {
     expect(within(acme).queryByRole("button", { name: /Reseat/ })).toBeNull();
     expect(acme.textContent).not.toMatch(/Needs a community administrator/);
     // …and nothing in a namespace they do not administer, nor binding.
-    const personal = screen.getByRole("article", { name: "github.com/glenn-g" });
+    const personal = screen.getByRole("article", { name: "github.com/alex-g" });
     expect(within(personal).queryByRole("button", { name: /Unbind/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Bind namespace/ })).toBeNull();
   });
@@ -528,14 +528,14 @@ describe("Repos plugin — overview", () => {
     vi.mocked(signingAvailable).mockResolvedValue(true);
     vi.mocked(postSignedTrustTask).mockResolvedValue({
       repo: {},
-      manualSteps: ["gh repo create glenn-g/tool --public", "vgi repo init"],
+      manualSteps: ["gh repo create alex-g/tool --public", "vgi repo init"],
     });
     mockFetch(gitNsRoutes());
-    mount("/repos?namespace=ns_glenn");
+    mount("/repos?namespace=ns_alex");
 
-    await screen.findByText("github.com/glenn-g · repositories");
+    await screen.findByText("github.com/alex-g · repositories");
     fireEvent.click(screen.getByRole("button", { name: "New repo" }));
-    const form = await screen.findByRole("dialog", { name: "New repository in github.com/glenn-g" });
+    const form = await screen.findByRole("dialog", { name: "New repository in github.com/alex-g" });
     expect(form.textContent).toMatch(/no bot can create a repository/);
     fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "Tool" } });
     fireEvent.click(within(form).getByRole("button", { name: "Build the repository" }));
@@ -544,15 +544,15 @@ describe("Repos plugin — overview", () => {
     fireEvent.click(within(form).getByLabelText("Private"));
     fireEvent.click(within(form).getByRole("button", { name: "Build the repository" }));
 
-    const sign = await screen.findByRole("dialog", { name: "Create glenn-g/tool" });
+    const sign = await screen.findByRole("dialog", { name: "Create alex-g/tool" });
     expect(within(sign).getByLabelText("Command").textContent).toBe(
-      "cnm git create --namespace=ns_glenn tool --visibility=private",
+      "cnm git create --namespace=ns_alex tool --visibility=private",
     );
     fireEvent.click(await within(sign).findByRole("button", { name: "Sign and send" }));
-    expect(await within(sign).findByText("gh repo create glenn-g/tool --public")).toBeTruthy();
+    expect(await within(sign).findByText("gh repo create alex-g/tool --public")).toBeTruthy();
     expect(postSignedTrustTask).toHaveBeenCalledWith(
       "https://trusttasks.org/spec/git-ns/repo/create/0.4",
-      { namespace: "ns_glenn", name: "tool", visibility: "private" },
+      { namespace: "ns_alex", name: "tool", visibility: "private" },
     );
   });
 

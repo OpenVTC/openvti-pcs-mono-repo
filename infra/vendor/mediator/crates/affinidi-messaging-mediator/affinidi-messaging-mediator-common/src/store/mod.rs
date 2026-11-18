@@ -1,4 +1,4 @@
-//! Storage backend traits for the Affinidi Messaging Mediator.
+//! Storage backend traits for the [vendor] Messaging Mediator.
 //!
 //! [`MediatorStore`] is the semantic interface every backend satisfies. It
 //! is shaped from the *consumer* perspective — what the mediator's request

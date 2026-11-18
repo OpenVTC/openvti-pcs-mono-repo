@@ -20,7 +20,7 @@ use tracing::{Instrument, Level, debug, info, span};
 
 /// POST /authenticate
 /// Response from client to the challenge
-/// Unpack the message (only accepts Affinidi Authenticate Protocol)
+/// Unpack the message (only accepts [vendor] Authenticate Protocol)
 /// Retrieve Session data from database
 /// Check that the DID matches from the message to the session DID recorded
 pub async fn authentication_response(

@@ -3,7 +3,7 @@
 //!
 //! Spec: `docs/05-design-notes/runtime-service-management.md`.
 //!
-//! Naming follows the `firstperson.network/protocols/<name>/1.0`
+//! Naming follows the `anonymized.example/protocols/<name>/1.0`
 //! convention used elsewhere in this crate. Two protocols:
 //!
 //! - **services-management/1.0** — REST + DIDComm enable / update /

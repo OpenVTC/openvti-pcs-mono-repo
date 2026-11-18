@@ -39,7 +39,7 @@ no pushed document.
    mints stay Ed25519 / X25519.
 6. **Each VTC is its own verifier.** A wallet trusts the party it presents to, so
    registration with swiyu or an EUDI registrar is per VTC operator, not
-   Affinidi's. VTI supplies the tooling; the operator does the registering.
+   [vendor]'s. VTI supplies the tooling; the operator does the registering.
 
 ## What the wallets require (as of October 2026)
 

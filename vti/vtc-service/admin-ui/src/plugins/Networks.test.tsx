@@ -181,7 +181,7 @@ describe("Networks", () => {
     network: NETWORK_DID,
     url: NETWORK_URL,
     name: "First Network",
-    owner: "Glenn Gore (Affinidi)",
+    owner: "Alex Example (Affinidi)",
     framework: { iri: "https://vtn.example/governance", version: "1.0" },
     roles: [
       { name: "admins", required: true },
@@ -201,7 +201,7 @@ describe("Networks", () => {
     mount(`/networks?join=${encodeURIComponent(NETWORK_URL)}`);
 
     expect(await screen.findByRole("heading", { name: "First Network" })).toBeTruthy();
-    expect(screen.getByText("Glenn Gore (Affinidi)")).toBeTruthy();
+    expect(screen.getByText("Alex Example (Affinidi)")).toBeTruthy();
     expect(screen.getByText("admins (required), news")).toBeTruthy();
     expect(screen.getByText(/Listed, waiting for this community to accept/)).toBeTruthy();
     await waitFor(() =>

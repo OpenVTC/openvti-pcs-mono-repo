@@ -1,6 +1,6 @@
 # vta-service
 
-Verifiable Trust Agent (VTA) service for the [First Person Network](https://www.firstperson.network/white-paper). A VTA manages cryptographic keys, DID-based authentication, DIDComm messaging, and access control policies for a Verifiable Trust Community.
+Verifiable Trust Agent (VTA) service for the [[network]](https://anonymized.example). A VTA manages cryptographic keys, DID-based authentication, DIDComm messaging, and access control policies for a Verifiable Trust Community.
 
 ## Quick Start
 

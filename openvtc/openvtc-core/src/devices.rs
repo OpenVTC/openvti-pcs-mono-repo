@@ -503,9 +503,9 @@ mod tests {
     #[test]
     fn the_warning_names_the_other_instance() {
         let now = Utc::now();
-        let siblings = vec![record("glenn-laptop", Some(now))];
+        let siblings = vec![record("alex-laptop", Some(now))];
         let warning = sibling_warning(&siblings).expect("a live sibling warns");
-        assert!(warning.contains("OpenVTC on glenn-laptop"), "{warning}");
+        assert!(warning.contains("OpenVTC on alex-laptop"), "{warning}");
         assert!(warning.contains("mediator"), "{warning}");
     }
 

@@ -1,6 +1,6 @@
 # Predicate Credentials (PCreds)
 
-[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://github.com/etairi/predicate-credential-system)
+[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://anonymized.example)
 
 Rust implementation of the *predicate credentials* (PCreds) of the accompanying paper. In the
 words of its §4: "A predicate credential system (PCreds) lets users obtain a credential from a
@@ -16,7 +16,7 @@ distinct credentialed users, without learning who they are. Built on
 The module `pcreds` implements the protocol `Π_PCreds` (§4.2) of the ideal functionality
 `F_PCreds` (§4.1), generic over its building blocks, with the pairing-based instantiations of §5
 and the post-quantum instantiation of §5.2.3 (feature `lattice`; see
-[Instantiations](#instantiations)). The standalone [Jali library](https://github.com/etairi/jali)
+[Instantiations](#instantiations)). The standalone [Jali library](https://anonymized.example)
 implements the lattice zero-knowledge proofs that the lattice instantiation uses (the LNP22 proof
 stack described in the [Rust port plan](./docs/lnp22-rust-port-plan.md)); this crate depends on
 its crates.io release (feature `jali`). See Jali's README for its status and limits.
@@ -361,7 +361,7 @@ feature `jali`.
 | `asm` | no | Assembly backend of `ark-ff` on x86_64 (bmi2 + adx); a no-op elsewhere. |
 | `print-trace` | no | Nested timings from `ark_std`. |
 | `test-utils` | no | Test helpers: the INSECURE hash-to-group oracle `hash::testing` (known discrete logarithms). Never enable in a deployment. |
-| `jali` | no | Re-exports [Jali](https://github.com/etairi/jali) as `predicate_credential_system::jali`, the proof backend of the lattice instantiation. |
+| `jali` | no | Re-exports [Jali](https://anonymized.example) as `predicate_credential_system::jali`, the proof backend of the lattice instantiation. |
 | `lattice` | no | The post-quantum instantiation: the modules `lattice` and `pcreds::lattice` (`LatticeBackend`, `Σ-vSIS`), and `kiprf::LWR`. Its proofs are straight-line extractable: Jali's extractable mode (Katsumata's transform, classical random-oracle model) with the embedded extraction sets. Enables `jali` (with Jali's `serde`, which loads the embedded parameter sets) and `ntru-trapdoor`. Jali and `ntru-trapdoor` come from crates.io, pinned to one release each (Jali `=0.3.0`, `ntru-trapdoor` `=0.1.1`). |
 | `lattice-plain` | no | The lattice instantiation with plain Fiat–Shamir proofs instead of the straight-line extractable ones, extracted by rewinding only. The proofs are several times shorter. It changes the lattice proofs and the digest of the lattice `pp`, so every party of a deployment builds with the same choice. Enables `lattice`. `lattice-extractable` overrides it. The pairing instantiation is unchanged. |
 | `lattice-extractable` | no | The straight-line extractable proofs that `lattice` proves by default, kept for the commands of earlier versions. Overrides `lattice-plain`, so a build with every feature is extractable. Enables `lattice`. |

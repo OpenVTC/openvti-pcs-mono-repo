@@ -21,7 +21,7 @@ pub const MAX_RESOLVE_DIDS: usize = 64;
 ///
 /// Shared by the ACL routes and `change_did_owner`.
 ///
-/// Accepts either a DID, or an **agent name** (`webvh.storm.ws/@alice`) which
+/// Accepts either a DID, or an **agent name** (`webvh.anon.org/@alice`) which
 /// is resolved to the DID that currently holds it. Names are far easier to type
 /// correctly than a `did:webvh:Qm…` string, and a mistyped ACL subject is a
 /// silent failure — the entry simply never matches anyone.

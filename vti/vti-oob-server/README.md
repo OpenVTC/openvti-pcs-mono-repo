@@ -4,7 +4,7 @@ The approving side of wallet sign-in started by a trigger link: the `auth/oob/*`
 
 Used by:
 - **`vtc-service`**: member-portal and operator-console sign-in. `redeem` issues a session and its cookies.
-- **The VTN service**, in [OpenVTC/verifiable-trust-network](https://github.com/OpenVTC/verifiable-trust-network). It has no cookies or sessions: `redeem` registers `K_b` as a key delegated to act as the approver for a fixed `signingScope`, for a bounded time. It depends on this crate, never the reverse.
+- **The VTN service**, in [OpenVTC/verifiable-trust-network](https://anonymized.example). It has no cookies or sessions: `redeem` registers `K_b` as a key delegated to act as the approver for a fixed `signingScope`, for a bounded time. It depends on this crate, never the reverse.
 
 ## The flow
 

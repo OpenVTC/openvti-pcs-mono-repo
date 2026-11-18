@@ -2,7 +2,7 @@
 //! one place a proof's `verificationMethod` becomes public-key bytes.
 //!
 //! A Trust Task proof may be made by **any DID that can name a key**:
-//! `did:key:z6Mk…#z6Mk…`, `did:webvh:<scid>:example.com:glenn#key-0`,
+//! `did:key:z6Mk…#z6Mk…`, `did:webvh:<scid>:example.com:alex#key-0`,
 //! `did:web:example.com#key-1`. The DID method is not the authorization —
 //! resolving the verification method and checking the signature is.
 //!
@@ -715,7 +715,7 @@ mod tests {
     async fn a_did_key_only_resolver_names_its_own_limit() {
         let err = TrustTaskVmResolver::did_key_only()
             .resolve_vm_for_purpose(
-                "did:webvh:QmScid:example.com:glenn#key-0",
+                "did:webvh:QmScid:example.com:alex#key-0",
                 ProofPurpose::AssertionMethod,
             )
             .await
@@ -738,14 +738,14 @@ mod tests {
         let doc: TrustTask<serde_json::Value> = serde_json::from_value(serde_json::json!({
             "id": "urn:uuid:11111111-1111-4111-8111-111111111111",
             "type": "https://trusttasks.org/spec/vta/contexts/create/1.0",
-            "issuer": "did:webvh:QmScid:example.com:glenn",
+            "issuer": "did:webvh:QmScid:example.com:alex",
             "recipient": "did:key:z6MkVta",
             "payload": {},
             "proof": {
                 "type": "DataIntegrityProof",
                 "cryptosuite": "eddsa-jcs-2022",
                 "proofPurpose": "assertionMethod",
-                "verificationMethod": "did:webvh:QmScid:example.com:glenn#key-0",
+                "verificationMethod": "did:webvh:QmScid:example.com:alex#key-0",
                 "created": "2026-08-29T00:00:00Z",
                 "proofValue": "z2aBcD"
             }

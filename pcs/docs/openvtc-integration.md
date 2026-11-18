@@ -1,6 +1,6 @@
 # OpenVTC Integration
 
-How this library could be integrated into [OpenVTC](https://github.com/OpenVTC/openvtc). This is
+How this library could be integrated into [OpenVTC](https://anonymized.example). This is
 a proposal: nothing of it exists in OpenVTC today. Statements about OpenVTC refer to its
 repository at commit `3329195` (2026-09-19) and to the crates it links (`vta-sdk` 0.43,
 `dtg-credentials` 0.9, `affinidi-data-integrity` 0.7). They were verified there by the earlier
@@ -202,7 +202,7 @@ OpenVTC.)
 
 New DIDComm types must match OpenVTC's inbound type filter, which admits
 `https://trusttasks.org/spec/vetting/*`, `https://trusttasks.org/spec/vtc/*`,
-`https://firstperson.network/*` and `https://linuxfoundation.org/openvtc/*`, and need an arm in
+`https://anonymized.example` and `https://anonymized.example`, and need an arm in
 its dispatch chain; a new Trust Task additionally needs a published spec. (Verified.)
 
 The credential itself never needs a W3C envelope: it is used to attest and to prove membership,

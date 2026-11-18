@@ -1898,7 +1898,7 @@ mod tests {
             .proof
             .as_mut()
             .unwrap()
-            .verification_method = "did:webvh:QmScid:example.com:glenn#key-0".to_string();
+            .verification_method = "did:webvh:QmScid:example.com:alex#key-0".to_string();
 
         let mut bad_sig_doc = signed_doc(&sk, &did, &vm);
         bad_sig_doc.payload = json!({ "subject": did, "decision": "approved", "tampered": true });

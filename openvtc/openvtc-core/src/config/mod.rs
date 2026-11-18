@@ -638,7 +638,7 @@ const PROFILE_LABEL_DID_WIDTH: usize = 32;
 ///
 /// The middle arm is not `context_path::render_for_display(&c.vtc_did)`.
 /// That is a **sub-context** helper: it splits on the last `/` and returns the
-/// tail, which is right for `openvtc-glenn/qmxi1pzd4nev` and a no-op on a DID,
+/// tail, which is right for `openvtc-alex/qmxi1pzd4nev` and a no-op on a DID,
 /// since a DID contains no `/`, so its "slug" would be the whole
 /// `did:webvh:Qm…` string. A verified agent name is the readable label.
 ///
@@ -1940,7 +1940,7 @@ mod membership_profile_label_tests {
         CommunityRecord::new_pending(
             VTC_DID.to_string(),
             display_name.map(ToString::to_string),
-            "openvtc-glenn/qmxi1pzd4nev".to_string(),
+            "openvtc-alex/qmxi1pzd4nev".to_string(),
             PersonaId::default(),
             uuid::Uuid::nil(),
             chrono::Utc::now(),

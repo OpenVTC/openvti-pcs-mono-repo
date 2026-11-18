@@ -368,7 +368,7 @@ impl AppState {
     /// The resolver Trust Task Data-Integrity proofs are verified with.
     ///
     /// Carries the configured DID cache, so a proof by any DID that names a key
-    /// — `did:webvh:<scid>:example.com:glenn#key-0` as much as a `did:key` —
+    /// — `did:webvh:<scid>:example.com:alex#key-0` as much as a `did:key` —
     /// resolves. With no cache configured this degrades to `did:key` only,
     /// which is what a deployment with no outbound DID resolution gets.
     pub fn trust_task_vm_resolver(&self) -> vti_common::auth::TrustTaskVmResolver {

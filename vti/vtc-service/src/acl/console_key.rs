@@ -2,7 +2,7 @@
 //!
 //! The admin console cannot author a signed Trust Task document, which is why
 //! every bearer route the #1641 migration would retire has had to stay
-//! ([#1684](https://github.com/OpenVTC/verifiable-trust-infrastructure/issues/1684)).
+//! ([#1684](https://anonymized.example)).
 //! `docs/05-design-notes/vtc-console-signing.md` §5A is the design this
 //! implements: the browser generates a **non-extractable** Ed25519 key, derives
 //! a `did:key` from its public half, and the VTC records one sentence about it —

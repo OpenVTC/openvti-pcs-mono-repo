@@ -1,7 +1,7 @@
 # vti-common
 
 Shared server-side infrastructure for VTA and VTC services in the
-[Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+[Verifiable Trust Infrastructure](https://anonymized.example)
 workspace.
 
 ## Overview

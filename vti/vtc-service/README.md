@@ -1,9 +1,9 @@
 # vtc-service
 
 Verifiable Trust Community (VTC) service for the
-[First Person Network](https://www.firstperson.network/white-paper).
+[[network]](https://anonymized.example).
 Part of the
-[Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+[Verifiable Trust Infrastructure](https://anonymized.example)
 workspace.
 
 ## What this crate provides

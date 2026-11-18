@@ -202,9 +202,9 @@ describe("signed git-ns tasks", () => {
     // On a personal account owners get collaborator `write`, so taking off
     // `write` — or anything above it — weighs as revoking ownership.
     const user = { own: "write", maintain: "write", commit: "none" };
-    expect(driftRevertTask("github.com/glenn-g/x", admin, undefined, user).consent).toBe("elevated");
+    expect(driftRevertTask("github.com/alex-g/x", admin, undefined, user).consent).toBe("elevated");
     expect(
-      driftRevertTask("github.com/glenn-g/x", { ...admin, observed: "read" }, undefined, user).consent,
+      driftRevertTask("github.com/alex-g/x", { ...admin, observed: "read" }, undefined, user).consent,
     ).toBe("normal");
     // Under the bridge's map: owners given only `maintain` make a `maintain`
     // revert an owner-level one; maintainers given `admin` do not lower it.

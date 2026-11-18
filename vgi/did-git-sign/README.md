@@ -69,7 +69,7 @@ The `tsp` feature is on by default, so the TSP leg of setup is built in;
 `--no-default-features` builds without it and falls back to DIDComm.
 
 `did-git-sign` is the signing half of
-[Verifiable Git Infrastructure (VGI)](https://github.com/OpenVTC/verifiable-git-infrastructure);
+[Verifiable Git Infrastructure (VGI)](https://anonymized.example);
 the CI verifier is the separate [`verify-trust`](https://crates.io/crates/verify-trust) crate.
 
 ## Setup
@@ -315,7 +315,7 @@ wrong community. Use git's conditional includes, one file per community:
 
 ```ini
 # ~/.gitconfig
-[includeIf "hasconfig:remote.*.url:https://github.com/OpenVTC/**"]
+[includeIf "hasconfig:remote.*.url:https://anonymized.example"]
     path = ~/.config/git/community-openvtc
 ```
 

@@ -11,8 +11,8 @@ built from this repository's root cargo workspace.
 
 | Directory | Upstream | Commit | Commit date | Exported from |
 |---|---|---|---|---|
-| `vendor/mediator/` | https://github.com/affinidi/affinidi-messaging-mediator | `de8c98b8b41aad2377e597d69beb224a8806a555` | 2026-11-17 | `origin/main` (workspace version 0.54.0) |
-| `vendor/did-hosting/` | https://github.com/affinidi/affinidi-webvh-service | `639c4f9fd619eb85cd2ba45a70ac96540b83adf5` | 2026-11-17 | `origin/main` (crates at 0.12.0) |
+| `vendor/mediator/` | https://anonymized.example | `[withheld for review]` | 2026-11-17 | `origin/main` (workspace version 0.54.0) |
+| `vendor/did-hosting/` | https://anonymized.example | `[withheld for review]` | 2026-11-17 | `origin/main` (crates at 0.12.0) |
 
 Both were exported with `git archive <sha>`, so only tracked files came along
 (no build output, no untracked files, no local branch state). License: Apache-2.0
@@ -80,7 +80,7 @@ a deployment.
 - The VTA/VTC image (`docker/vti.Dockerfile`) uses the root workspace's own
   release profile unchanged.
 
-## Third-party components that are neither Affinidi/OpenVTC code nor standard base images
+## Third-party components that are neither [vendor]/OpenVTC code nor standard base images
 
 None are vendored. At **build time** the Dockerfiles download, as usual:
 

@@ -422,7 +422,7 @@ letting the flag imply more.
 Finally, this is per-community by definition — the spec's glossary says
 *"exactly one membership in that VTC"*. Personhood that means something
 *across* communities is a VTN-level property; see the spec's VTN
-definition and the [First Person Network](https://www.firstperson.network/).
+definition and the [[network]](https://anonymized.example).
 
 ### Revocation
 

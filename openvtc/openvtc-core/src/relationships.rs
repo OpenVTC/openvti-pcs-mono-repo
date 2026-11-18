@@ -1089,7 +1089,7 @@ pub async fn verify_did_binding(
 
 /// Creates and sends a relationship rejection message to the remote party via DIDComm.
 ///
-/// - `atm`: The Affinidi Trusted Messaging service instance.
+/// - `atm`: The [vendor] Trusted Messaging service instance.
 /// - `from_profile`: ATM profile of the responder (our identity).
 /// - `to`: DID of the remote party who initiated the request.
 /// - `mediator_did`: DID of the mediator used for message forwarding.

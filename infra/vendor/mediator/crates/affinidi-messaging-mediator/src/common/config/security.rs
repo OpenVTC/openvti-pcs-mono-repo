@@ -83,22 +83,22 @@ pub enum CorsOriginPolicy {
 #[derive(Clone, Debug)]
 pub enum OriginMatcher {
     /// An exact, scheme-qualified origin, compared byte-for-byte against
-    /// the request `Origin` (e.g. `https://app.affinidi.com`).
+    /// the request `Origin` (e.g. `https://anonymized.example`).
     Exact(HeaderValue),
-    /// A `scheme://*.suffix[:port]` wildcard (e.g. `https://*.affinidi.com`).
+    /// A `scheme://*.suffix[:port]` wildcard (e.g. `https://*.anonymized.example`).
     ///
     /// Matches a request origin iff the scheme and port match exactly and
     /// the request host is a sub-domain of `suffix` — i.e. it ends with
     /// `.suffix` and has at least one label in front of that boundary
-    /// dot. The boundary dot is mandatory, so `https://*.affinidi.com`
-    /// matches `https://app.affinidi.com` and `https://a.b.affinidi.com`
-    /// but NOT the apex `https://affinidi.com` (add it explicitly) nor a
+    /// dot. The boundary dot is mandatory, so `https://*.anonymized.example`
+    /// matches `https://anonymized.example` and `https://a.b.anonymized.example`
+    /// but NOT the apex `https://anonymized.example` (add it explicitly) nor a
     /// look-alike like `https://evilaffinidi.com`.
     WildcardSubdomain {
         /// Lower-cased scheme, e.g. `https`.
         scheme: String,
         /// Lower-cased registrable suffix the sub-domain must sit under,
-        /// e.g. `affinidi.com`.
+        /// e.g. `anonymized.example`.
         suffix: String,
         /// Explicit port the request origin must carry, if the pattern
         /// pinned one (`https://*.x.com:8443`). `None` means the origin
@@ -1126,7 +1126,7 @@ mod tests {
             "https://*.affinidi.com",
             "https://affinidi.com.evil.com"
         ));
-        // An empty leftmost label ("https://.affinidi.com") isn't a
+        // An empty leftmost label ("https://.anonymized.example") isn't a
         // sub-domain.
         assert!(!allows("https://*.affinidi.com", "https://.affinidi.com"));
     }

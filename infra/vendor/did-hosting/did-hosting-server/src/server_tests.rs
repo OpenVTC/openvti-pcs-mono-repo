@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn mnemonic_from_did_simple() {
     let did =
-        "did:webvh:QmaErmPvnHUDaaiM4phkDgrK58T49cxgmCUtKon9gwyWtJ:webvh.storm.ws:webvh:server1";
+        "did:webvh:QmaErmPvnHUDaaiM4phkDgrK58T49cxgmCUtKon9gwyWtJ:webvh.anon.org:webvh:server1";
     assert_eq!(mnemonic_from_did(did).unwrap(), "webvh/server1");
 }
 
@@ -17,8 +17,8 @@ fn mnemonic_from_did_single_path() {
 
 #[test]
 fn mnemonic_from_did_deep_path() {
-    let did = "did:webvh:QmABC:example.com:people:staff:glenn";
-    assert_eq!(mnemonic_from_did(did).unwrap(), "people/staff/glenn");
+    let did = "did:webvh:QmABC:example.com:people:staff:alex";
+    assert_eq!(mnemonic_from_did(did).unwrap(), "people/staff/alex");
 }
 
 /// A standalone edge with no control plane is not a supported shape: the

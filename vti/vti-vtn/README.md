@@ -4,7 +4,7 @@ The **Verifiable Trust Network** (VTN) protocol: the part of a network that is n
 
 Used by:
 - **`vtc-service`**: a community as a network member. It acknowledges or repudiates listings, registers groups, relays broadcasts, and hands out room-pass evidence.
-- **The VTN service and its `nnm` CLI**, in [OpenVTC/verifiable-trust-network](https://github.com/OpenVTC/verifiable-trust-network). They depend on this crate, never the reverse.
+- **The VTN service and its `nnm` CLI**, in [OpenVTC/verifiable-trust-network](https://anonymized.example). They depend on this crate, never the reverse.
 
 | Module | What |
 |---|---|

@@ -4,14 +4,14 @@ import { hueOf, initials, nameOf, safeUrl, vcardOf } from "./member-card";
 
 describe("drawing a member", () => {
   it("names a member by their name, else their nickname, else nothing", () => {
-    expect(nameOf({ displayName: "Glenn Gore", nickname: "Glenn" })).toBe("Glenn Gore");
-    expect(nameOf({ nickname: "glenn" })).toBe("glenn");
+    expect(nameOf({ displayName: "Alex Example", nickname: "Alex" })).toBe("Alex Example");
+    expect(nameOf({ nickname: "alex" })).toBe("alex");
     expect(nameOf({ role: "member" })).toBeNull();
     expect(nameOf({ displayName: "   " })).toBeNull();
   });
 
   it("takes initials from the first and last words", () => {
-    expect(initials("Glenn Gore")).toBe("GG");
+    expect(initials("Alex Example")).toBe("GG");
     expect(initials("Carol Ann Example")).toBe("CE");
     expect(initials("cee")).toBe("C");
     expect(initials(null)).toBe("?");
@@ -24,7 +24,7 @@ describe("drawing a member", () => {
   });
 
   it("links only http and https", () => {
-    expect(safeUrl("https://affinidi.com")).toBe("https://affinidi.com/");
+    expect(safeUrl("https://anonymized.example")).toBe("https://anonymized.example/");
     expect(safeUrl("javascript:alert(1)")).toBeNull();
     expect(safeUrl("data:text/html,x")).toBeNull();
     expect(safeUrl("not a url")).toBeNull();
@@ -38,11 +38,11 @@ describe("saving a contact", () => {
     const card = vcardOf(
       "dir_x",
       {
-        displayName: "Glenn Gore",
-        nickname: "Glenn",
+        displayName: "Alex Example",
+        nickname: "Alex",
         pronouns: "He/Him",
         bio: "CEO; builds things, mostly\nopen source",
-        links: ["https://affinidi.com", "javascript:alert(1)"],
+        links: ["https://anonymized.example", "javascript:alert(1)"],
         role: "admin",
         avatar: { sha256: "a".repeat(64), mediaType: "image/jpeg" },
         "org.example.team": "Platform",
@@ -51,11 +51,11 @@ describe("saving a contact", () => {
       "Acme Guild",
     );
     expect(card.startsWith("BEGIN:VCARD\r\nVERSION:4.0\r\n")).toBe(true);
-    expect(card).toContain("FN:Glenn Gore\r\n");
-    expect(card).toContain("NICKNAME:Glenn\r\n");
+    expect(card).toContain("FN:Alex Example\r\n");
+    expect(card).toContain("NICKNAME:Alex\r\n");
     expect(card).toContain("PRONOUNS:He/Him\r\n");
     expect(card).toContain("NOTE:CEO\\; builds things\\, mostly\\nopen source\r\n");
-    expect(card).toContain("URL:https://affinidi.com/\r\n");
+    expect(card).toContain("URL:https://anonymized.example");
     expect(card).not.toContain("javascript");
     expect(card).toContain("ORG:Acme Guild\r\n");
     expect(card).toContain("X-VTC-FIELD;LABEL=Team:Platform\r\n");

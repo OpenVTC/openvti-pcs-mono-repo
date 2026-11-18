@@ -4,8 +4,7 @@
     "title": "Verifiable Trust Community (VTC) API",
     "description": "Community lifecycle, ACL, audit, policy, credentials, endorsements, and cross-community recognition REST surface of a Verifiable Trust Community.",
     "contact": {
-      "name": "Glenn Gore",
-      "email": "glenn@affinidi.com"
+      "name": "Anonymous"
     },
     "license": {
       "name": "Apache-2.0",

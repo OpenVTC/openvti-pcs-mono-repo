@@ -20,5 +20,5 @@ event's serialized `type` / `data`, so renaming either breaks verification of
 every stored chain. `tests/stored_chain.rs` verifies a chain written before the
 vocabulary moved here.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

@@ -1,4 +1,4 @@
-//! `pnm messaging console` — operate an Affinidi messaging mediator as a DID
+//! `pnm messaging console` — operate an [vendor] messaging mediator as a DID
 //! this VTA manages.
 //!
 //! The console (`affinidi-messaging-mediator-tui`) authenticates to the

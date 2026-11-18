@@ -1076,9 +1076,9 @@ fn render_step_content(frame: &mut Frame, area: Rect, app: &WizardApp) {
                     "Each entry is matched against the browser's Origin header; the matched \
                      origin is echoed back.\n\n\
                      Accepted forms:\n  \
-                     https://app.affinidi.com       exact, scheme-qualified origin\n  \
-                     https://*.affinidi.com         any sub-domain of affinidi.com (any depth)\n  \
-                     https://*.affinidi.com:8443    pin a non-default port\n\n\
+                     https://anonymized.example       exact, scheme-qualified origin\n  \
+                     https://*.anonymized.example         any sub-domain of anonymized.example (any depth)\n  \
+                     https://*.anonymized.example:8443    pin a non-default port\n\n\
                      Notes:\n  \
                      - scheme and port must match exactly; '*' is only the leftmost label.\n  \
                      - '*.affinidi.com' does NOT cover the apex 'affinidi.com' — add it \

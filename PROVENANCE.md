@@ -4,16 +4,34 @@ This repository is a source snapshot assembled for review. Each directory
 comes from an upstream repository at a fixed commit. The upstream history is
 not included.
 
+**Anonymised for review.** Personal names, email addresses and handles, and
+the links and names of the organisations and projects behind this code have
+been removed or replaced (`https://anonymized.example`, `[vendor]`,
+`[network]`, `[foundation]`). Upstream repositories and commit hashes are
+withheld until after review. Two kinds of name are kept on purpose:
+
+- **Functional identifiers**, which the code would break without: crates.io
+  dependency names, and protocol URIs inside the specifications and the code
+  (Trust Task type URIs, credential type and DIDComm message type URIs).
+- **The copyright notice in `pcs/LICENSE`**, which the MIT licence requires
+  to be kept.
+- **Vendored Trust Task specification bundles** (`vti/*/trust-tasks/**`),
+  which are published specification text pinned by hash in each
+  `trust-tasks.lock`; two of them (`device/list/0.3`, `device/register/0.2`)
+  use a personal first name as example data.
+
+The git history of this repository is not anonymised.
+
 | Directory | Upstream | Ref | Commit | Licence |
 |---|---|---|---|---|
-| `pcs/` | https://github.com/OpenVTC/predicate-credential-system | `feat/pcreds-jali-0.3` | `023b13d18562a546ce1e98f24383ea2d6b270754` | MIT (`pcs/LICENSE`) |
-| `vti/` | https://github.com/OpenVTC/verifiable-trust-infrastructure | `main` | `32cd9ff724aac19a81bb622aaa6d1fd6d0d65baf` | Apache-2.0 (`vti/LICENSE`) |
-| `openvtc/` | https://github.com/OpenVTC/openvtc | `main` | `7fbe7a3d39a577605f3cc1fac7d497e933205928` | Apache-2.0 (`openvtc/LICENSE`) |
-| `vgi/did-git-sign/` | https://github.com/OpenVTC/verifiable-git-infrastructure | `v0.33.0` | `27e0d34fee2429c11645092185ffc8dd19038db7` | Apache-2.0 (`vgi/LICENSE`) |
+| `pcs/` | https://anonymized.example | `feat/pcreds-jali-0.3` | `[withheld for review]` | MIT (`pcs/LICENSE`) |
+| `vti/` | https://anonymized.example | `main` | `[withheld for review]` | Apache-2.0 (`vti/LICENSE`) |
+| `openvtc/` | https://anonymized.example | `main` | `[withheld for review]` | Apache-2.0 (`openvtc/LICENSE`) |
+| `vgi/did-git-sign/` | https://anonymized.example | `v0.33.0` | `[withheld for review]` | Apache-2.0 (`vgi/LICENSE`) |
 | `infra/vendor/*` | see `infra/PROVENANCE.md` | | | |
 
 Every other crate is resolved from crates.io at the versions pinned in
-`Cargo.lock`. That includes the Affinidi Trust Development Kit, the
+`Cargo.lock`. That includes the [vendor] Trust Development Kit, the
 `trust-tasks-*` crates, arkworks, Jali and `ntru-trapdoor`.
 
 ## What was taken

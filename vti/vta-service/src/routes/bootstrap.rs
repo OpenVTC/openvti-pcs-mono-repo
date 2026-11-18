@@ -464,7 +464,7 @@ mod tests {
         // substring of the original label. A regression here would mean
         // the hash helper got replaced with an echo / truncation by
         // someone not thinking about PII.
-        let raw = "glenn's iphone";
+        let raw = "alex's iphone";
         let hashed = label_hash_prefix(Some(raw));
         for substr_len in 3..=raw.len() {
             for start in 0..=(raw.len() - substr_len) {

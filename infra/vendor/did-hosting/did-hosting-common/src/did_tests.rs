@@ -245,12 +245,12 @@ fn build_did_document_correct_did_id() {
 fn build_did_document_nested_path() {
     let doc = build_did_document(
         "example.com",
-        "people/staff/glenn",
+        "people/staff/alex",
         "z6Mk...",
         &Default::default(),
     );
     let id = doc["id"].as_str().unwrap();
-    assert!(id.contains(":people:staff:glenn"));
+    assert!(id.contains(":people:staff:alex"));
     assert!(!id.contains('/'));
 }
 
@@ -543,7 +543,7 @@ fn implicit_service_predicate_matches_only_whois_and_files() {
 #[test]
 fn implicit_predicate_matches_url_parsed_service_ids() {
     let base =
-        "did:webvh:QmRUN4vrMp6cS1xqWSH46bCipf9W95VrFDyyFBm8XXcZ1E:webvh.storm.ws:webvh-server1"; // retired-name-ok: a real DID
+        "did:webvh:QmRUN4vrMp6cS1xqWSH46bCipf9W95VrFDyyFBm8XXcZ1E:webvh.anon.org:webvh-server1"; // retired-name-ok: a real DID
     for frag in ["whois", "files"] {
         let parsed = url::Url::parse(&format!("{base}#{frag}")).expect("parse service id");
         assert!(

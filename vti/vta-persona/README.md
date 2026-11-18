@@ -69,8 +69,8 @@ the holder's values in a comparable form.
 ## Status
 
 Early. The API will change. See
-[`CHANGELOG.md`](https://github.com/OpenVTC/verifiable-trust-infrastructure/blob/main/vta-persona/CHANGELOG.md)
-and the [workspace](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+[`CHANGELOG.md`](https://anonymized.example)
+and the [workspace](https://anonymized.example)
 for how it is used in a running agent.
 
 ## Licence

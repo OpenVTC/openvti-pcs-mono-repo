@@ -101,7 +101,7 @@ provisioned through `provision-integration`.
 
 **The rule is: any DID that can name a key may sign.** The DID method is not
 the authorization; resolving the verification method and checking the signature
-is. `did:key:z6Mk…#z6Mk…`, `did:webvh:<scid>:example.com:glenn#key-0` and
+is. `did:key:z6Mk…#z6Mk…`, `did:webvh:<scid>:example.com:alex#key-0` and
 `did:web:example.com#key-1` are all ordinary holders.
 
 The restriction was never a policy anyone chose. It was the shape of two

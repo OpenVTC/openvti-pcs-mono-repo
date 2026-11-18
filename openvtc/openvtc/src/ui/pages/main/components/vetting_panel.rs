@@ -2693,7 +2693,7 @@ mod desk_tests {
     /// `…:pcs-vtcuntil 2027-09-23`.
     #[test]
     fn the_desk_header_keeps_a_long_name_apart_from_its_grant() {
-        let did = "did:webvh:QmZM…VxW1:webvh.storm.ws:pcs-vtc";
+        let did = "did:webvh:QmZM…VxW1:webvh.anon.org:pcs-vtc";
         let v = VettingState {
             tab: VettingTab::Desk,
             standing: vec![
@@ -2991,7 +2991,7 @@ mod desk_tests {
         let ticket = TicketRow {
             id: "t1".into(),
             code: "9ENN-8R76".into(),
-            community: "webvh.storm.ws/@first-vtc".into(),
+            community: "webvh.anon.org/@first-vtc".into(),
             uses_left: 1,
             expires: "2026-09-29".into(),
             live: true,
@@ -3003,7 +3003,7 @@ mod desk_tests {
             desk_view: DeskView::Tickets,
             tickets: vec![ticket].into(),
             standing: vec![standing_row(
-                "webvh.storm.ws/@first-vtc",
+                "webvh.anon.org/@first-vtc",
                 "until 2027-09-15",
                 false,
                 "listed in the directory",

@@ -31,9 +31,9 @@ pub(crate) fn validate_fjall_data_dir(path: &str) -> Result<(), String> {
 /// return its normalised (trimmed, comma-joined) form.
 ///
 /// Each comma-separated entry must be one of:
-///   * an exact, scheme-qualified origin — `https://app.affinidi.com`; or
-///   * a leftmost-label sub-domain wildcard — `https://*.affinidi.com`
-///     (optionally with a port: `https://*.affinidi.com:8443`).
+///   * an exact, scheme-qualified origin — `https://anonymized.example`; or
+///   * a leftmost-label sub-domain wildcard — `https://*.anonymized.example`
+///     (optionally with a port: `https://*.anonymized.example:8443`).
 ///
 /// Unlike the mediator's lenient server-side parse, the wizard *requires*
 /// a scheme on every entry (per the operator's chosen validation policy)
@@ -75,7 +75,7 @@ fn validate_cors_entry(entry: &str) -> Result<(), String> {
     let Some((scheme, host_port)) = entry.split_once("://") else {
         return Err(format!(
             "'{entry}' is missing a scheme — write e.g. 'https://app.affinidi.com' or \
-             'https://*.affinidi.com'."
+             'https://*.anonymized.example'."
         ));
     };
     if scheme.is_empty() {

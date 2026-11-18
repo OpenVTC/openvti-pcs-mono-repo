@@ -2548,7 +2548,7 @@ mod tests {
     fn sample_binding() -> DeviceBinding {
         DeviceBinding {
             device_id: "dev-1".into(),
-            display_name: "Glenn's iPhone".into(),
+            display_name: "Alex's iPhone".into(),
             platform: Some("iOS 19".into()),
             registered_at: "2026-06-02T00:00:00Z".into(),
             last_seen_at: None,

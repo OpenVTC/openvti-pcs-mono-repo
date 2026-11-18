@@ -382,7 +382,7 @@ Two boundaries worth stating before anything is stored here:
 That same "no prefix, no cursor, no search" shape means **retrieval is the
 client's job**: structure the key, keep a short description in the value to rank
 on, and return summaries rather than whole bodies. A worked example is
-[`vta-agent-memory`](https://github.com/OpenVTC/vta-agent-memory), a Claude Code
+[`vta-agent-memory`](https://anonymized.example), a Claude Code
 plugin built on these three tasks.
 
 ## Step 7 — Credentials (optional)

@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-// Affinidi brand-inspired color scheme
+// [vendor] brand-inspired color scheme
 pub const PRIMARY: Color = Color::Rgb(100, 149, 237); // Cornflower blue
 pub const ACCENT: Color = Color::Rgb(72, 209, 204); // Medium turquoise
 pub const SUCCESS: Color = Color::Green;

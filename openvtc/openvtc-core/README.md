@@ -1,9 +1,9 @@
 # OpenVTC Core Library
 
-[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://github.com/OpenVTC/openvtc)
+[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://anonymized.example)
 [![docs.rs](https://img.shields.io/docsrs/openvtc-core)](https://docs.rs/openvtc-core)
 
-Core library for [OpenVTC](https://github.com/OpenVTC/openvtc) (Open
+Core library for [OpenVTC](https://anonymized.example) (Open
 Verifiable Trust Communities), a client for joining and taking part in
 verifiable trust communities with Decentralised Identifiers (DIDs) and
 Verifiable Credentials.
@@ -68,4 +68,4 @@ fn main() -> Result<(), openvtc_core::errors::OpenVTCError> {
 
 ## License
 
-Licensed under [Apache-2.0](https://github.com/OpenVTC/openvtc/blob/main/LICENSE).
+Licensed under [Apache-2.0](https://anonymized.example).

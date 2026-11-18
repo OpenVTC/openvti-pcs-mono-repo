@@ -168,7 +168,7 @@ neither of the two paths a reader might assume:
 
 - **Not the DID-log location.** That is derived from the DID identifier itself
   — `did:webvh:<scid>:<domain>[:<path>]` resolves to
-  `https://<domain>/<path>/did.jsonl`. `webvh.storm.ws` advertises
+  `https://<domain>/<path>/did.jsonl`. `webvh.anon.org` advertises
   `hostingPath: "/webvh"` and serves its logs at the root
   (`/magic-depart/did.jsonl` → 200, `/webvh/magic-depart/did.jsonl` → 404).
 - **Not the REST control-plane base.** The hosting service nests its whole API
@@ -224,7 +224,7 @@ it. `vtc-host` publishes its own `SignInPortal`, at the member portal
 
 Only DIDs minted from now on get the entry; an existing document is never
 changed for you. A node minted earlier from a `did-host-http*` template (the
-case that surfaced this was `webvh.storm.ws`) gets it with a document edit at
+case that surfaced this was `webvh.anon.org`) gets it with a document edit at
 the VTA that manages the DID:
 
 ```sh

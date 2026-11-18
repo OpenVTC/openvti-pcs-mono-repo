@@ -163,14 +163,14 @@ async fn vti_acl_052_subject_may_relabel_own_entry() {
         &signed(
             &a,
             UPDATE,
-            json!({ "subject": a.did, "label": "Glenn's laptop" }),
+            json!({ "subject": a.did, "label": "Alex's laptop" }),
         )
         .await,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     let after = entry(&fix, &a.did).await;
-    assert_eq!(after.label.as_deref(), Some("Glenn's laptop"));
+    assert_eq!(after.label.as_deref(), Some("Alex's laptop"));
     assert!(after.label_set_by_subject);
     assert_eq!(
         after.admin,

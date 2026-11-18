@@ -34,7 +34,7 @@ pub enum OpenVTCError {
     #[error("DataIntegrityProof Error: {0}")]
     DataIntegrityProof(#[from] DataIntegrityError),
 
-    /// An error from the Affinidi Trusted Messaging (ATM) layer.
+    /// An error from the [vendor] Trusted Messaging (ATM) layer.
     #[error("ATM Error: {0}")]
     ATM(#[from] ATMError),
 

@@ -277,7 +277,7 @@ relationship DID, presents your credentials, and verifies and stores the witness
 credential. OpenVTC only carries the documents to the witness, on the relationship
 DID's own connection, and hands its answers back to the VTA. Nothing is signed on
 this device. See VTI's
-[the VTA as a witnessed party](https://github.com/OpenVTC/verifiable-trust-infrastructure/blob/main/docs/02-vta/witness-party.md).
+[the VTA as a witnessed party](https://anonymized.example).
 
 **In the TUI:** open the relationship in **My Relationships**, press **`w`**,
 type the witness's DID or agent name, and press **Enter**. To also present your

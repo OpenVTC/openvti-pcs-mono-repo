@@ -1,4 +1,4 @@
-//! Error code registry for the Affinidi Messaging Mediator.
+//! Error code registry for the [vendor] Messaging Mediator.
 //!
 //! Every numeric error code the mediator (and its storage and processors)
 //! raises is a constant here. Handlers use these constants, never integer

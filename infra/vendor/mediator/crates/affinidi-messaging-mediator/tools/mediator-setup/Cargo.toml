@@ -80,7 +80,7 @@ serde_json.workspace = true
 base64.workspace = true
 url.workspace = true
 
-# ── Affinidi TDK (DID generation, secrets, crypto) ──────────────────────
+# ── [vendor] TDK (DID generation, secrets, crypto) ──────────────────────
 ## Uses did-peer feature for did:peer generation. Does NOT depend on the
 ## mediator crate itself — only writes config files the mediator reads.
 affinidi-tdk = { workspace = true, features = ["did-peer"] }

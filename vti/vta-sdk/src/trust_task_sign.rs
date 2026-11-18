@@ -47,8 +47,8 @@ pub enum TrustTaskSignError {
     NotDidKey(String),
     /// A verification method that does not identify a key: not a `did:`, or
     /// carrying no `#fragment`. A proof names *a key*, not a subject, so
-    /// `did:webvh:<scid>:example.com:glenn` is not one and
-    /// `did:webvh:<scid>:example.com:glenn#key-0` is.
+    /// `did:webvh:<scid>:example.com:alex` is not one and
+    /// `did:webvh:<scid>:example.com:alex#key-0` is.
     NotAVerificationMethod(String),
     /// The holder's private key could not be decoded from its multibase form.
     BadPrivateKey(String),
@@ -69,7 +69,7 @@ impl std::fmt::Display for TrustTaskSignError {
             Self::NotAVerificationMethod(vm) => write!(
                 f,
                 "`{vm}` does not identify a key: a verification method is a DID with a \
-                 `#fragment`, e.g. did:webvh:<scid>:example.com:glenn#key-0"
+                 `#fragment`, e.g. did:webvh:<scid>:example.com:alex#key-0"
             ),
             Self::BadPrivateKey(e) => write!(f, "decode holder private key: {e}"),
             Self::TypeUri(e) => write!(f, "Trust Task type URI parse: {e}"),
@@ -118,7 +118,7 @@ pub fn build_unsigned(
 /// **Any DID that can name a key may sign.** The verifier resolves the
 /// verification method and checks the signature; the DID method is not the
 /// authorization. `did:key:z6Mk…#z6Mk…`,
-/// `did:webvh:<scid>:example.com:glenn#key-0` and `did:web:example.com#key-1`
+/// `did:webvh:<scid>:example.com:alex#key-0` and `did:web:example.com#key-1`
 /// are all ordinary holders.
 ///
 /// This type exists because the two cases differ in one way that a bare
@@ -149,7 +149,7 @@ impl HolderKey {
     /// A holder that names its own verification method — the general case.
     ///
     /// `verification_method` must be a DID with a `#fragment`, e.g.
-    /// `did:webvh:<scid>:example.com:glenn#key-0`. Whether the key is *in* that
+    /// `did:webvh:<scid>:example.com:alex#key-0`. Whether the key is *in* that
     /// DID document, and whether the DID document is reachable, is the
     /// verifier's business; this only refuses what cannot identify a key at all.
     pub fn new(
@@ -380,13 +380,13 @@ mod tests {
     /// of identifier.
     #[tokio::test]
     async fn a_did_webvh_holder_signs_and_names_its_key() {
-        const VM: &str = "did:webvh:QmScidExample:example.com:glenn#key-0";
+        const VM: &str = "did:webvh:QmScidExample:example.com:alex#key-0";
         let (_did, pk) = did_key_from_seed(0xb2);
 
         let key = HolderKey::new(VM, &pk).expect("a DID with a fragment is a verification method");
         assert_eq!(
             key.holder_did(),
-            "did:webvh:QmScidExample:example.com:glenn"
+            "did:webvh:QmScidExample:example.com:alex"
         );
 
         let body = build_signed_with(TYPE, json!({"vp": {}}), &key, "did:key:z6MkVtc")
@@ -410,8 +410,8 @@ mod tests {
     #[test]
     fn a_verification_method_must_name_a_key() {
         for bad in [
-            "did:webvh:QmScid:example.com:glenn",
-            "did:webvh:QmScid:example.com:glenn#",
+            "did:webvh:QmScid:example.com:alex",
+            "did:webvh:QmScid:example.com:alex#",
             "https://example.com/keys#key-0",
             "no-scheme#key-0",
         ] {
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(key.holder_did(), did);
 
         assert!(matches!(
-            HolderKey::from_did_key("did:webvh:QmScid:example.com:glenn", &pk),
+            HolderKey::from_did_key("did:webvh:QmScid:example.com:alex", &pk),
             Err(TrustTaskSignError::NotDidKey(_))
         ));
     }

@@ -946,7 +946,7 @@ pub const PERSONA_LISTENER_ID: &str = "persona";
 /// Display is a separate concern, handled where the id is *rendered* rather than
 /// where it is minted: the runtime loop formats listener ids through
 /// `resolve_did_to_display`, so the activity log reads
-/// `Listener 'webvh.storm.ws/@magic-depart' connected`.
+/// `Listener 'webvh.anon.org/@magic-depart' connected`.
 ///
 /// Derived from the DID alone (not the full `Config`) so the runtime and message
 /// senders (`listener_id_for_did`) agree on the same id without extra context.
@@ -3538,7 +3538,7 @@ mod persona_listener_id_tests {
     /// The contract: the id *is* the DID, not a shortened slug.
     #[test]
     fn the_id_is_the_did_verbatim() {
-        let did = "did:webvh:QmR6e4:webvh.storm.ws:magic-depart";
+        let did = "did:webvh:QmR6e4:webvh.anon.org:magic-depart";
         assert_eq!(persona_listener_id(did), did);
     }
 

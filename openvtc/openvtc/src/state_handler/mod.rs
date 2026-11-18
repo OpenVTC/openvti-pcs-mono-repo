@@ -81,7 +81,7 @@ pub(crate) struct LifecycleLine {
 ///
 /// A listener is identified by its DID, so every message here runs the
 /// identifier through [`resolve_did_to_display`] — the operator sees
-/// `webvh.storm.ws/@magic-depart` rather than 90 characters of `did:webvh:`.
+/// `webvh.anon.org/@magic-depart` rather than 90 characters of `did:webvh:`.
 /// The logger task cannot do this itself: it is detached and has no `Config`.
 ///
 /// Only the *display* changes. The listener id remains the DID everywhere it is
@@ -4033,12 +4033,12 @@ mod tests {
     /// different listeners can produce byte-identical lines.
     #[test]
     fn lifecycle_log_shows_the_agent_name_and_the_listener_id() {
-        const DID: &str = "did:webvh:QmScidAAAAAAAAAAAAAAAAAAAAAAAA:webvh.storm.ws:magic-depart";
+        const DID: &str = "did:webvh:QmScidAAAAAAAAAAAAAAAAAAAAAAAA:webvh.anon.org:magic-depart";
 
         let mut config = crate::state_handler::dispatch_util::test_config();
         config.set_cached_agent_name(
             DID,
-            Some("webvh.storm.ws/@magic-depart".into()),
+            Some("webvh.anon.org/@magic-depart".into()),
             chrono::Utc::now(),
         );
 
@@ -4049,7 +4049,7 @@ mod tests {
             },
         );
         assert!(
-            line.summary.contains("'webvh.storm.ws/@magic-depart'"),
+            line.summary.contains("'webvh.anon.org/@magic-depart'"),
             "{}",
             line.summary
         );

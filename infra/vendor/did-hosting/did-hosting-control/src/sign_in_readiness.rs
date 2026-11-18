@@ -20,7 +20,7 @@
 //!
 //! A server DID minted from a template that lacks the required ones serves
 //! everything else perfectly well, and the wallet only says "This code can't
-//! be used" (the `did:webvh:…:webvh.storm.ws` case). So at startup a background task
+//! be used" (the `did:webvh:…:webvh.anon.org` case). So at startup a background task
 //! resolves the server's own DID with the service's resolver, checks the
 //! latest document, and logs one warning naming what is missing or wrong, the exact
 //! JSON to add (built with the same `did_hosting_common::did::add_*` helpers
@@ -546,8 +546,8 @@ pub async fn readiness_endpoint(State(state): State<AppState>) -> impl IntoRespo
 mod tests {
     use super::*;
 
-    const DID: &str = "did:webvh:QmSNo2TJRq5xiiYhHZNrTqoaq8bivffWq4PZXjQQAzvNtr:webvh.storm.ws";
-    const URL: &str = "https://webvh.storm.ws";
+    const DID: &str = "did:webvh:QmSNo2TJRq5xiiYhHZNrTqoaq8bivffWq4PZXjQQAzvNtr:webvh.anon.org";
+    const URL: &str = "https://webvh.anon.org";
 
     fn entry(service: SignInService) -> Value {
         fix_entry(DID, URL, service).unwrap()
@@ -581,7 +581,7 @@ mod tests {
             json!({"id": format!("{DID}#didcomm"), "type": "DIDCommMessaging", "serviceEndpoint": "x"}),
         );
         assert_eq!(
-            check_document(&doc_with(services), "https://webvh.storm.ws/"),
+            check_document(&doc_with(services), "https://webvh.anon.org/"),
             READY
         );
     }
@@ -661,10 +661,10 @@ mod tests {
     #[test]
     fn a_trust_task_base_other_than_origin_api_is_wrong() {
         for bad in [
-            json!("https://webvh.storm.ws"),
-            json!("https://webvh.storm.ws/api/trust-tasks"),
+            json!("https://webvh.anon.org"),
+            json!("https://webvh.anon.org/api/trust-tasks"),
             json!("https://other.example/api"),
-            json!("http://webvh.storm.ws/api"),
+            json!("http://webvh.anon.org/api"),
         ] {
             let problems = problems(check_document(
                 &doc_with(with_endpoint(SignInService::TrustTaskHttps, bad.clone())),
@@ -674,7 +674,7 @@ mod tests {
             assert_eq!(problems[0].service, SignInService::TrustTaskHttps);
             assert!(matches!(
                 &problems[0].defect,
-                Defect::WrongEndpoint { expected, .. } if expected == "https://webvh.storm.ws/api"
+                Defect::WrongEndpoint { expected, .. } if expected == "https://webvh.anon.org/api"
             ));
         }
         // A trailing slash on the base is the same base.
@@ -682,7 +682,7 @@ mod tests {
             check_document(
                 &doc_with(with_endpoint(
                     SignInService::TrustTaskHttps,
-                    json!("https://webvh.storm.ws/api/")
+                    json!("https://webvh.anon.org/api/")
                 )),
                 URL
             ),
@@ -694,8 +694,8 @@ mod tests {
     fn a_portal_off_the_public_origin_or_not_https_is_wrong() {
         for bad in [
             json!("https://elsewhere.example/login"),
-            json!("http://webvh.storm.ws/login"),
-            json!("https://webvh.storm.ws:8443/login"),
+            json!("http://webvh.anon.org/login"),
+            json!("https://webvh.anon.org:8443/login"),
             json!({"not": "a url"}),
         ] {
             let problems = problems(check_document(
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn webvh_hosting_needs_an_object_with_a_uri_on_the_origin() {
         for bad in [
-            json!("https://webvh.storm.ws"),
+            json!("https://webvh.anon.org"),
             json!({"uri": "https://elsewhere.example"}),
         ] {
             let r = check_document(
@@ -759,12 +759,12 @@ mod tests {
         assert_eq!(
             entry(SignInService::TrustTaskHttps),
             json!({"id": format!("{DID}#trust-tasks"), "type": "TrustTaskHTTPS",
-                   "serviceEndpoint": "https://webvh.storm.ws/api"})
+                   "serviceEndpoint": "https://webvh.anon.org/api"})
         );
         assert_eq!(
             entry(SignInService::SignInPortal),
             json!({"id": format!("{DID}#sign-in-portal"), "type": "SignInPortal",
-                   "serviceEndpoint": "https://webvh.storm.ws/login"})
+                   "serviceEndpoint": "https://webvh.anon.org/login"})
         );
     }
 
@@ -790,12 +790,12 @@ mod tests {
         let problems = vec![Problem {
             service: SignInService::TrustTaskHttps,
             defect: Defect::WrongEndpoint {
-                found: "https://webvh.storm.ws".into(),
-                expected: "https://webvh.storm.ws/api".into(),
+                found: "https://webvh.anon.org".into(),
+                expected: "https://webvh.anon.org/api".into(),
             },
         }];
         let text = warning_text(DID, URL, &problems).unwrap();
-        assert!(text.contains("TrustTaskHTTPS points at \"https://webvh.storm.ws\""));
+        assert!(text.contains("TrustTaskHTTPS points at \"https://webvh.anon.org\""));
         assert!(text.contains("#trust-tasks"));
         assert!(!text.contains("#sign-in-portal"));
         assert!(!text.contains("#webvh-hosting"));

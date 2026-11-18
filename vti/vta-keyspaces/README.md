@@ -12,5 +12,5 @@ key formats do not.
 `no_bare_keyspace_literals` guard that forbids bare `.keyspace("…")` literals in
 its own source.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

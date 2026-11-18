@@ -3,7 +3,7 @@
 Status: **Implemented.** Specifications published upstream as
 `vta/app-state/{get,put,list,delete,get-many,put-many}/1.0`
 (trustoverip/dtgwg-trust-tasks-tf#252, #253); served by this workspace per
-[#1029](https://github.com/OpenVTC/verifiable-trust-infrastructure/issues/1029).
+[#1029](https://anonymized.example).
 
 Two things in this note were changed by building it, and both are corrected
 in place below rather than left for a reader to trip over: the version counter

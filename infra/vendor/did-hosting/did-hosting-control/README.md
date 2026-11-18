@@ -1,4 +1,4 @@
-# Affinidi DID Hosting Control Plane
+# [vendor] DID Hosting Control Plane
 
 The DID Hosting Control Plane is the authoritative source of truth for
 all DID management. Every management operation (DID lifecycle, agent
@@ -13,7 +13,7 @@ registry, and supports passkey (WebAuthn) sign-in.
 > warranties or guarantees, and by using this framework, users
 > agree to assume all risks associated with its deployment and
 > use including implementing security, and privacy measures in
-> their applications. Affinidi assumes no liability for any
+> their applications. [vendor] assumes no liability for any
 > issues arising from the use or modification of the project.
 
 ## Getting Started
@@ -424,16 +424,16 @@ hesitate to contact us using
 
 ### Reporting technical issues
 
-If you have a technical issue with the Affinidi DID Hosting Service
+If you have a technical issue with the [vendor] DID Hosting Service
 codebase, you can also create an issue directly in GitHub.
 
 1. Ensure the bug was not already reported by searching on
    GitHub under
-   [Issues](https://github.com/affinidi/affinidi-webvh-service/issues).
+   [Issues](https://anonymized.example).
 
 2. If you're unable to find an open issue addressing the
    problem,
-   [open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new).
+   [open a new one](https://anonymized.example).
    Be sure to include a **title and clear description**, as
    much relevant information as possible, and a **code sample**
    or an **executable test case** demonstrating the expected

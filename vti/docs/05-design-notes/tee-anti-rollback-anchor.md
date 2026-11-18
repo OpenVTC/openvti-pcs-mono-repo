@@ -2,7 +2,7 @@
 
 Status: **implemented** — `vta-tee/src/anchor.rs` (the DynamoDB anti-rollback
 anchor and its MAC). Originally a draft for review.
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-06-11
 Tracking: Phase-0 hardening item **P0.2** (XL). Depends on **P0.1** (AAD
 binding, merged #346). Sequenced before its own implementation PRs.

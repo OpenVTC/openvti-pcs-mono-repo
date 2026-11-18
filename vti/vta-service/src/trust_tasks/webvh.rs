@@ -1019,7 +1019,7 @@ mod tests {
     /// you typed".
     #[test]
     fn a_truncated_did_is_refused_as_malformed_not_as_missing() {
-        let bad = "did:webvh:QmbsoTcwkM\u{2026}:webvh.storm.ws:hurdle-surface";
+        let bad = "did:webvh:QmbsoTcwkM\u{2026}:webvh.anon.org:hurdle-surface";
         let outcome = reject_malformed_did(&doc(bad), bad).expect("a truncated DID is refused");
 
         let rendered = String::from_utf8_lossy(&outcome.body).to_string();
@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn a_well_formed_did_is_not_refused() {
         for good in [
-            "did:webvh:QmbsoTcwkMjqaezmeFW4c6yth2sKDGtDiaGrzS1e3BvdZX:webvh.storm.ws:hurdle-surface",
+            "did:webvh:QmbsoTcwkMjqaezmeFW4c6yth2sKDGtDiaGrzS1e3BvdZX:webvh.anon.org:hurdle-surface",
             "did:key:z6MkhBYkvHQSLDmhVQWoy6ZiQc2VU3EFYjLz2KQ2YQDQ77Ag",
             "did:web:example.com%3A8443:path",
         ] {

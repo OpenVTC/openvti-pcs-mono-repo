@@ -176,11 +176,11 @@ mod tests {
     #[test]
     fn parse_identifier_deep_path() {
         let p = Webvh
-            .parse_identifier("did:webvh:QmABC:example.com:people:staff:glenn")
+            .parse_identifier("did:webvh:QmABC:example.com:people:staff:alex")
             .unwrap();
         assert_eq!(p.scid.as_deref(), Some("QmABC"));
         assert_eq!(p.domain, "example.com");
-        assert_eq!(p.path, "people:staff:glenn");
+        assert_eq!(p.path, "people:staff:alex");
     }
 
     #[test]
@@ -242,8 +242,8 @@ mod tests {
 
     #[test]
     fn resolution_url_deep_path_converts_colons_to_slashes() {
-        let url = Webvh.resolution_url("example.com", "people:staff:glenn");
-        assert_eq!(url, "https://example.com/people/staff/glenn/did.jsonl");
+        let url = Webvh.resolution_url("example.com", "people:staff:alex");
+        assert_eq!(url, "https://example.com/people/staff/alex/did.jsonl");
     }
 
     #[test]

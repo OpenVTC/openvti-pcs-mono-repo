@@ -291,7 +291,7 @@ not after the fifth.
   [`vtc-ceremony-visual-guide.html`](./vtc-ceremony-visual-guide.html)
 - MVP grounding: [`vtc-mvp.md`](./vtc-mvp.md) · Rollback pattern:
   [`runtime-service-management.md`](./runtime-service-management.md)
-- DTG credentials: <https://github.com/OpenVTC/dtg-credentials> · DIF Presentation Exchange:
+- DTG credentials: <https://anonymized.example> · DIF Presentation Exchange:
   <https://identity.foundation/presentation-exchange/> · ToIP TRQP:
   <https://github.com/trustoverip/tswg-trust-registry-protocol> · Rego:
   <https://www.openpolicyagent.org/docs/policy-language>

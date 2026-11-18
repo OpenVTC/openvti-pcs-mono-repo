@@ -624,17 +624,17 @@ mod tests {
     use serde_json::json;
 
     /// The shape the deployed VTC actually had, verbatim from
-    /// `https://webvh.storm.ws/first-vtc/did.jsonl` at log version 3:
+    /// `https://webvh.anon.org/first-vtc/did.jsonl` at log version 3:
     /// REST + status-list + TSP, and **no** `DIDCommMessaging`.
     fn deployed_shape() -> ServiceCapabilities {
         ServiceCapabilities::from_did_document(&json!({
             "service": [
                 { "id": "did:webvh:x:h:first-vtc#vtc-rest",
                   "type": "VTCRest",
-                  "serviceEndpoint": "https://first.openvtc.net" },
+                  "serviceEndpoint": "https://community.anon.org" },
                 { "id": "did:webvh:x:h:first-vtc#vtc-status-list",
                   "type": "VTCStatusList",
-                  "serviceEndpoint": "https://first.openvtc.net/v1/status-lists" },
+                  "serviceEndpoint": "https://community.anon.org/v1/status-lists" },
                 { "id": "did:webvh:x:h:first-vtc#tsp",
                   "type": "TSPTransport",
                   "serviceEndpoint": "did:webvh:y:h:mediator" },
@@ -673,7 +673,7 @@ mod tests {
             "service": [
                 { "id": "did:webvh:x:h:first-vtc#vtc-rest",
                   "type": "VTCRest",
-                  "serviceEndpoint": "https://first.openvtc.net" },
+                  "serviceEndpoint": "https://community.anon.org" },
             ]
         }))
     }

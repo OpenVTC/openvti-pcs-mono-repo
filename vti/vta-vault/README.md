@@ -20,5 +20,5 @@ paths reach it through the same `crate::vault::…` paths as before.
 
 Both are off by default.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

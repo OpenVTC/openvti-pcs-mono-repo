@@ -1,4 +1,4 @@
-//! Affinidi Messaging Mediator.
+//! [vendor] Messaging Mediator.
 //!
 //! A [DIDComm v2](https://identity.foundation/didcomm-messaging/spec/) and
 //! [Trust Spanning Protocol](https://trustoverip.github.io/tswg-tsp-specification/)
@@ -76,7 +76,7 @@
 //! binary, the test mediator and this crate's integration tests can reach
 //! them; they are hidden from these docs and may change in any release.
 //!
-//! [README]: https://github.com/affinidi/affinidi-messaging-mediator/blob/main/crates/affinidi-messaging-mediator/README.md
+//! [README]: https://anonymized.example
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(not(any(feature = "didcomm", feature = "tsp")))]

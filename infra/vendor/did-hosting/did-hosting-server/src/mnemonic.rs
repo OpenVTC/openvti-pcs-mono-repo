@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn valid_nested_path() {
-        assert!(validate_custom_path("people/staff/glenn").is_ok());
+        assert!(validate_custom_path("people/staff/alex").is_ok());
     }
 
     #[test]

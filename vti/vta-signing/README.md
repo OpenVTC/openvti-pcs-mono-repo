@@ -44,5 +44,5 @@ change rather than here:
   through `affinidi-data-integrity` over its own key type.
 - **Room, voting and witness signatures**, and the `did:webvh` log updates.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

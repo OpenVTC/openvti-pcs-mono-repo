@@ -2,7 +2,7 @@
 
 Status: **Draft — for review** (no code yet; checked 2026-11-13: nothing in
 `vta-tee` or `vta-config` implements it)
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-07-22
 Tracking: proposed follow-on to Phase-0 TEE hardening. Adjacent to **P0.2e**
 (cross-account anchor, `tasks/vta-architecture-todo.md:110`) — same threat

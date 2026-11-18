@@ -66,15 +66,15 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 publish = false
-authors = ["Glenn Gore <glenn@affinidi.com>"]
+authors = ["Anonymous"]
 rust-version = "1.95.0"
 license = "Apache-2.0"
-repository = "https://github.com/OpenVTC/verifiable-trust-infrastructure"
+repository = "https://anonymized.example"
 
 [workspace.dependencies]
 
 # Foreign-language bindings for the mobile engine crate (`vta-mobile-core`).
-# Affinidi Trust Development Kit.
+# [vendor] Trust Development Kit.
 # The enforced-authcrypt fix (affinidi-tdk-rs #671 — `unpack` rejects plaintext
 # / anoncrypt / forged-`from` envelopes by default) landed in 0.8.5, which is
 # why this once carried a minimum-patch pin. Every 0.9+ release is past it, so

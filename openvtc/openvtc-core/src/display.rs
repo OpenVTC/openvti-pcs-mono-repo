@@ -123,8 +123,8 @@ pub fn truncate_did_centered(did: &str, max_len: usize) -> Cow<'_, str> {
 /// So the SCID is what gives way:
 ///
 /// ```text
-/// did:webvh:QmUFMgMsbGpei5bGSx6yXT8ZTkmKUT7sQMGWFkx28aFtL3:webvh.storm.ws:kid-long
-/// did:webvh:QmUF…aFtL3:webvh.storm.ws:kid-long
+/// did:webvh:QmUFMgMsbGpei5bGSx6yXT8ZTkmKUT7sQMGWFkx28aFtL3:webvh.anon.org:kid-long
+/// did:webvh:QmUF…aFtL3:webvh.anon.org:kid-long
 /// ```
 ///
 /// The last path segment of a `did:webvh` — the part people recognise
@@ -159,7 +159,7 @@ pub fn webvh_path_tail(did: &str) -> Option<String> {
 ///
 /// A `did:scid:vh:1` gives up its SCID the same way, keeping any `?src=`
 /// locator, which is where its host and path are:
-/// `did:scid:vh:1:QmUF…aFtL3?src=webvh.storm.ws/kid-long`.
+/// `did:scid:vh:1:QmUF…aFtL3?src=webvh.anon.org/kid-long`.
 #[must_use]
 pub fn shorten_webvh(did: &str, scid_keep: usize) -> Cow<'_, str> {
     let scid = if did.starts_with(vta_sdk::did_scid::SCID_VH_PREFIX) {
@@ -333,10 +333,10 @@ mod tests {
         let scid = "QmUFMgMsbGpei5bGSx6yXT8ZTkmKUT7sQMGWFkx28aFtL3";
         assert_eq!(
             shorten_webvh(
-                &format!("did:scid:vh:1:{scid}?src=webvh.storm.ws/kid-long"),
+                &format!("did:scid:vh:1:{scid}?src=webvh.anon.org/kid-long"),
                 4
             ),
-            "did:scid:vh:1:QmUF…FtL3?src=webvh.storm.ws/kid-long"
+            "did:scid:vh:1:QmUF…FtL3?src=webvh.anon.org/kid-long"
         );
         assert_eq!(
             shorten_webvh(&format!("did:scid:vh:1:{scid}"), 4),
@@ -448,11 +448,11 @@ mod tests {
     #[test]
     fn shortening_a_webvh_keeps_the_host_and_path() {
         let did =
-            "did:webvh:QmUFMgMsbGpei5bGSx6yXT8ZTkmKUT7sQMGWFkx28aFtL3:webvh.storm.ws:kid-long";
+            "did:webvh:QmUFMgMsbGpei5bGSx6yXT8ZTkmKUT7sQMGWFkx28aFtL3:webvh.anon.org:kid-long";
         let short = shorten_webvh(did, 4);
-        assert_eq!(short, "did:webvh:QmUF\u{2026}FtL3:webvh.storm.ws:kid-long");
+        assert_eq!(short, "did:webvh:QmUF\u{2026}FtL3:webvh.anon.org:kid-long");
         assert!(short.ends_with("kid-long"), "the path survives");
-        assert!(short.contains("webvh.storm.ws"), "and so does the host");
+        assert!(short.contains("webvh.anon.org"), "and so does the host");
         assert!(short.chars().count() < did.chars().count());
     }
 

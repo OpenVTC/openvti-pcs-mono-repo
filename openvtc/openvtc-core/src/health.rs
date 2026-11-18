@@ -1301,12 +1301,12 @@ mod tests {
         let files = ServiceEntry {
             id: "#files".into(),
             types: vec!["relativeRef".into()],
-            endpoint: "https://webvh.storm.ws/army-provide".into(),
+            endpoint: "https://webvh.anon.org/army-provide".into(),
         };
         let whois = ServiceEntry {
             id: "#whois".into(),
             types: vec!["LinkedVerifiablePresentation".into()],
-            endpoint: "https://webvh.storm.ws/army-provide/whois.vp".into(),
+            endpoint: "https://webvh.anon.org/army-provide/whois.vp".into(),
         };
         assert!(
             !is_routable(&files),

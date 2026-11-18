@@ -1,6 +1,6 @@
 # affinidi-messaging-mediator-common
 
-Shared code for the Affinidi Messaging Mediator, its setup wizard, and its
+Shared code for the [vendor] Messaging Mediator, its setup wizard, and its
 processors:
 
 - `types`: request and response types shared with clients, re-exported from

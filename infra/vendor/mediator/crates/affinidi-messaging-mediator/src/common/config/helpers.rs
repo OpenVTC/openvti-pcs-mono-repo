@@ -935,7 +935,7 @@ mod tests {
             .expect("guard must pass when a secret covers the keyAgreement kid");
     }
 
-    /// Regression for the storm.ws label-as-kid outage: the document publishes a
+    /// Regression for the anon.org label-as-kid outage: the document publishes a
     /// `keyAgreement` kid, but the loaded secret is keyed under the *wrong* id (a
     /// decorative `did:key` label, as `vta-sdk` < 0.11.1 produced). The guard
     /// must abort boot rather than let the mediator fail every `/authenticate` at

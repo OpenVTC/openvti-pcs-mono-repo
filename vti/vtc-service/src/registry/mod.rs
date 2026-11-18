@@ -29,7 +29,7 @@
 //! a TRQP-v2.0-compliant HTTP query surface (`POST
 //! /recognition`, `POST /authorization`) **plus** a DIDComm-only
 //! admin protocol for record mutations (URIs under
-//! `https://affinidi.com/didcomm/protocols/tr-admin/1.0/`). The
+//! `https://anonymized.example`). The
 //! upstream does **not** publish a Rust client crate.
 //!
 //! Phase 3 D1 originally proposed a git-dep on the upstream;

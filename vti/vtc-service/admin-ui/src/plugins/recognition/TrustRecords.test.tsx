@@ -12,8 +12,8 @@ vi.mock("@/lib/api", async (original) => ({
   postSignedRead: (await import("@/test/signed-read")).unsignedRead,
 }));
 
-const VTC = "did:webvh:QmVtcScidAbcdef:webvh.storm.ws:first-vtc";
-const ALICE = "did:webvh:QmAliceScid123:webvh.storm.ws:glance-arrow";
+const VTC = "did:webvh:QmVtcScidAbcdef:webvh.anon.org:first-vtc";
+const ALICE = "did:webvh:QmAliceScid123:webvh.anon.org:glance-arrow";
 const BOB = "did:webvh:QmBobScid45678:dids.firstperson.dev:stem-wall";
 
 const membership = (entityId: string, recognized = true): RegistryRecordRow => ({

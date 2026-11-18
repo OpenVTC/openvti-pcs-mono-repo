@@ -68,7 +68,7 @@ pub struct ClientIdentity {
     ///
     /// `None` means "derive it", which is only possible for a `did:key`, whose
     /// key *is* its identifier. Every other method must name one —
-    /// `did:webvh:<scid>:example.com:glenn#key-0` — because a DID document
+    /// `did:webvh:<scid>:example.com:alex#key-0` — because a DID document
     /// decides what its keys are called and no amount of string manipulation
     /// can guess it.
     pub verification_method: Option<String>,
@@ -3612,7 +3612,7 @@ mod tests {
     /// indistinguishable to the caller.
     #[tokio::test]
     async fn a_resolver_failure_reports_retrieval_not_invalid_proof() {
-        let vta_did = "did:webvh:QmScid:example.com:glenn";
+        let vta_did = "did:webvh:QmScid:example.com:alex";
         let client = signed_reply_client_named(vta_did);
         let doc = serde_json::json!({
             "id": "urn:uuid:00000000-0000-4000-8000-000000000002",
@@ -3719,7 +3719,7 @@ mod tests {
             "payload": {
                 "code": "internalError",
                 "message": "set_agent_name: name_taken: `ops` is already bound on \
-                            webvh.storm.ws",
+                            webvh.anon.org",
                 "retryable": false,
             },
         });
@@ -4077,7 +4077,7 @@ mod tests {
     #[cfg(all(feature = "session", feature = "tsp"))]
     #[test]
     fn same_mediator_multiplexes_rather_than_opening_a_second_socket() {
-        let mediator = "did:webvh:QmTS3a:webvh.storm.ws:mediator";
+        let mediator = "did:webvh:QmTS3a:webvh.anon.org:mediator";
         assert_eq!(tsp_leg_kind(mediator, mediator), TspLegKind::Multiplexed);
     }
 
@@ -4089,7 +4089,7 @@ mod tests {
     fn a_separate_tsp_mediator_gets_its_own_session() {
         assert_eq!(
             tsp_leg_kind(
-                "did:webvh:QmTS3a:webvh.storm.ws:mediator",
+                "did:webvh:QmTS3a:webvh.anon.org:mediator",
                 "did:web:tsp-mediator.example.com",
             ),
             TspLegKind::Separate

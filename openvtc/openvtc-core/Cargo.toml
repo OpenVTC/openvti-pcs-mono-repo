@@ -1,7 +1,7 @@
 [package]
 name = "openvtc-core"
 description = "Core library for OpenVTC (Open Verifiable Trust Communities): configuration, DID personas, VTA client, DIDComm/TSP messaging and verifiable credentials"
-documentation = "https://docs.rs/openvtc-core"
+documentation = "https://anonymized.example"
 keywords = ["did", "credentials", "didcomm", "trust", "identity"]
 categories = ["cryptography", "authentication"]
 version = "0.8.0"
@@ -11,7 +11,7 @@ authors.workspace = true
 rust-version.workspace = true
 readme = "README.md"
 license.workspace = true
-repository = "https://github.com/OpenVTC/openvtc"
+repository = "https://anonymized.example"
 
 [features]
 # Hardware OpenPGP-card key storage is off in the research build: it needs

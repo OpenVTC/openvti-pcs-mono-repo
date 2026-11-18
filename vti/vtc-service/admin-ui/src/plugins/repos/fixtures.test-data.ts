@@ -63,10 +63,10 @@ export const ACME: GitNsNamespaceRow = {
 };
 
 export const PERSONAL: GitNsNamespaceRow = {
-  id: "ns_glenn",
+  id: "ns_alex",
   forge: "github.com",
-  owner: "glenn-g",
-  resource: "github.com/glenn-g",
+  owner: "alex-g",
+  resource: "github.com/alex-g",
   mode: "manual",
   state: "bound",
   kind: "user",

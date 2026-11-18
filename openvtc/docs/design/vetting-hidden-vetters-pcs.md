@@ -22,7 +22,7 @@ that community vetted him, without the VTC (or anyone else) learning which vette
 V0 named-vetter flow, which it does not change. Do not let it touch the 5 Oct V0 critical path.
 
 **Sources read:**
-- `etairi/predicate-credential-system` @ `aa57efd`: README, all of `docs/`, `src/pcs/context.rs`,
+- `upstream/predicate-credential-system` @ `aa57efd`: README, all of `docs/`, `src/pcs/context.rs`,
   `src/kiprf/mod.rs`. The test suite (426 tests, 1 ignored) and benchmarks were run locally.
 - `OpenVTC/openvtc` @ `63d1fa1`.
 - `verifiable-trust-infrastructure` @ `6f26af19`. `origin/main` is at `1f6025ea`; the two
@@ -423,7 +423,7 @@ All of these fall inside OpenVTC's inbound filter (`trusttasks.org/spec/vetting/
     refresh.
   - Proving runs under `spawn_blocking`, as Argon2id does.
 - **Dependency:** OpenVTC's `deny.toml` forbids git dependencies. The crate must reach crates.io
-  (the name was free on 2026-09-19); this is Erkan Tairi's call. Vendoring would put MIT code
+  (the name was free on 2026-09-19); this is the original author's call. Vendoring would put MIT code
   into an Apache-2.0 workspace.
 
 ## 10. Sequence
@@ -540,7 +540,7 @@ Bob (applicant)          Vetter_j (pairwise DID)              VTC
     token spend rules hold before four specs are written. The PCS author already ran a similar
     smoke test inside OpenVTC.
 12. **Ownership of library changes.** The application context, the token binding and the
-    crates.io release all live in Erkan Tairi's repo. Agree whether we send PRs upstream or
+    crates.io release all live in the original author's repo. Agree whether we send PRs upstream or
     Berkeley implements them; everything else waits on it.
 13. **Reconcile the documents.**
     - `vetting-process.md` §14.2 points V2 at the `OpenVTC/probablistic-sampling-for-connection-vcs`

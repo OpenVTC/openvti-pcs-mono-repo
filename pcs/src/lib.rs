@@ -123,7 +123,7 @@ pub mod sigma;
 
 pub use crate::error::Error;
 
-/// Jali, the standalone lattice zero-knowledge library (<https://github.com/etairi/jali>),
+/// Jali, the standalone lattice zero-knowledge library (<https://anonymized.example>),
 /// re-exported with the feature `jali`. It is the proof backend of the post-quantum
 /// instantiation (feature `lattice`).
 #[cfg(feature = "jali")]

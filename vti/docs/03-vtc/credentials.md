@@ -9,7 +9,7 @@ DTG Credentials Core Specification's v1 context — `@context`
 top-level `issuerScope`, which is always `public`: the community issues as
 itself, under the DID every verifier recognises
 (`vtc-service/src/credentials/dtg.rs`). The retired
-`firstperson.network` context, and the retired endorsement and witness types,
+`anonymized.example` context, and the retired endorsement and witness types,
 are refused on ingress with no alias (`credentials/ingress.rs`).
 
 | Credential | `type` | Subject | Issued by | Typical issuance trigger |

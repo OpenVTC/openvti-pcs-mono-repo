@@ -13,7 +13,7 @@
 //! When either is missing the wallet refuses the code ("This code can't be
 //! used") and nothing on the VTC side notices: every request it would have
 //! seen never arrives. The DID-hosting case that prompted this check
-//! (`webvh.storm.ws`, minted from a template that lacked `SignInPortal`) failed
+//! (`webvh.anon.org`, minted from a template that lacked `SignInPortal`) failed
 //! exactly that way. `VTCRest` is not checked: neither the portal nor the
 //! wallet flow reads it.
 //!

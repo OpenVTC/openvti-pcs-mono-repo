@@ -26,7 +26,7 @@
 //! `VtaClient` dispatches the
 //! `trusttasks.org/spec/vta/(contexts/)did-templates/*` tasks through
 //! the binding envelope, and the VTA serves them via its trust-task
-//! dispatcher. The `firstperson.network/protocols/did-template-management/1.0`
+//! dispatcher. The `anonymized.example/protocols/did-template-management/1.0`
 //! message-type constants below are **deprecated** — they were the
 //! never-routed raw-protocol scheme and are retained only for
 //! backward compatibility; no current code path emits them.

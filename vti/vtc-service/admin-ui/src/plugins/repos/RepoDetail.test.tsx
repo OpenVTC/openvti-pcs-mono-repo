@@ -206,7 +206,7 @@ describe("Repo detail", () => {
   });
 
   it("names a solo owner's unreviewed workflow changes on a personal account", async () => {
-    const repo = { ...WIDGETS, namespace: PERSONAL.id, resource: "github.com/glenn-g/tool" };
+    const repo = { ...WIDGETS, namespace: PERSONAL.id, resource: "github.com/alex-g/tool" };
     mockFetch(gitNsRoutes({ repos: [repo] }));
     mount(repo.resource);
 

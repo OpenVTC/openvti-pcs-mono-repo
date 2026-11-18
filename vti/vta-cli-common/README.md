@@ -1,7 +1,7 @@
 # vta-cli-common
 
 Shared CLI command handlers and rendering helpers for VTA CLIs. Part of the
-[Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+[Verifiable Trust Infrastructure](https://anonymized.example)
 workspace.
 
 ## Overview

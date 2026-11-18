@@ -2718,9 +2718,9 @@ pub(crate) mod tests {
         let persona_did = "did:webvh:QmScidPersonaAAAAAAAAAAAAAAAAAAA:example.com:persona";
         let vtc_did = "did:webvh:QmScidCommunityBBBBBBBBBBBBBBBBBB:example.com:community";
         let mut config = config_with_membership(persona_did, None, vtc_did, None);
-        config.public.friendly_name = "Glenn".to_string();
+        config.public.friendly_name = "Alex".to_string();
 
-        assert_eq!(MainMenuConfigState::from(&config).name, "Glenn");
+        assert_eq!(MainMenuConfigState::from(&config).name, "Alex");
     }
 
     /// The point of the summary line: "is this still good, and for how long"

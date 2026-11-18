@@ -3,7 +3,7 @@
 //! The shape — `PasskeyState` trait, `build_webauthn(public_url)` helper,
 //! `Enrollment` / `PasskeyUser` / `CredentialMapping` storage types,
 //! `claimed_at` ceremony-lock pattern — is adopted from
-//! [`affinidi/affinidi-webvh-service`](https://github.com/affinidi/affinidi-webvh-service)
+//! [`affinidi/affinidi-webvh-service`](https://anonymized.example)
 //! (`webvh-common/src/server/passkey/`), which already proves the
 //! pattern in production. Both VTA and VTC implement `PasskeyState`
 //! on their `AppState` and reuse the same enrolment + login

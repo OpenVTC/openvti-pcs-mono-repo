@@ -1816,7 +1816,7 @@ Two smaller consequences worth naming:
   compile error; with the dependency private it would have become a silent
   runtime failure, so the installation has to be callable from here.
 
-[#770]: https://github.com/affinidi/affinidi-tdk-rs/issues/770
+[#770]: https://anonymized.example
 
 ## Unreleased (0.21.0) — `trust-tasks-rs` 0.18
 
@@ -1887,7 +1887,7 @@ hardening has been corrected to say precisely which hops are now covered.
 Not a behaviour change for any deployment leaving `relay_trusted_mediators`
 empty, which is the default and means "accept any peer".
 
-[#758]: https://github.com/affinidi/affinidi-tdk-rs/issues/758
+[#758]: https://anonymized.example
 
 ## Unreleased (0.20.9) — TSP direct delivery honours `local_direct_delivery_allowed`
 
@@ -1928,7 +1928,7 @@ themselves — every caller of those needs it, since protocol selection and pure
 auth are only observable once a message is accepted. Tests whose subject *is* the
 policy state it at the call site instead.
 
-[#757]: https://github.com/affinidi/affinidi-tdk-rs/issues/757
+[#757]: https://anonymized.example
 
 ## Unreleased (0.20.8) — state the v2 addressing contract: DID-addressed, no keylist
 
@@ -1969,7 +1969,7 @@ where a forward to the same DID would auto-create the account.
 
 No behaviour change: documentation, one extracted constant, and three tests.
 
-[#755]: https://github.com/affinidi/affinidi-tdk-rs/issues/755
+[#755]: https://anonymized.example
 
 ## Unreleased (0.20.7) — bind a TSP envelope's sender to the authenticated session
 
@@ -2032,7 +2032,7 @@ TSP. That is a policy change with far wider blast radius than this fix — it
 changes the default fixture's behaviour for ~20 existing tests — and is being
 handled on its own rather than folded in here.
 
-[#754]: https://github.com/affinidi/affinidi-tdk-rs/issues/754
+[#754]: https://anonymized.example
 
 ## Unreleased (0.20.6) — TSP forwarding follows a next hop that names its mediator by DID
 
@@ -2052,7 +2052,7 @@ was only reading the first:
 
 ```text
 persona     #tsp  TSPTransport  serviceEndpoint: did:webvh:…firstperson-mediator
-that mediator #tsp TSPTransport  serviceEndpoint: https://mediator.firstperson.dev/mediator/v1
+that mediator #tsp TSPTransport  serviceEndpoint: https://anonymized.example
 ```
 
 - `forward_tsp_remote` no longer takes `endpoints.first()` as a URL. A new

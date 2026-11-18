@@ -1,4 +1,4 @@
-# Affinidi DID Hosting Common
+# [vendor] DID Hosting Common
 
 The shared library under every DID Hosting binary, and the client crate for
 anything that talks to a DID Hosting control plane. It carries the
@@ -11,7 +11,7 @@ services share.
 > warranties or guarantees, and by using this framework, users
 > agree to assume all risks associated with its deployment and
 > use including implementing security, and privacy measures in
-> their applications. Affinidi assumes no liability for any
+> their applications. [vendor] assumes no liability for any
 > issues arising from the use or modification of the project.
 
 ## What is in it
@@ -133,9 +133,9 @@ hesitate to contact us using
 [this link](https://share.hsforms.com/1i-4HKZRXSsmENzXtPdIG4g8oa2v).
 
 If you have a technical issue with the codebase, search the
-[issues](https://github.com/affinidi/affinidi-webvh-service/issues) and, if
+[issues](https://anonymized.example) and, if
 it is not there,
-[open a new one](https://github.com/affinidi/affinidi-webvh-service/issues/new)
+[open a new one](https://anonymized.example)
 with a clear description and, ideally, a failing test.
 
 ## Contributing

@@ -1,6 +1,6 @@
 # openvtc
 
-The client for [OpenVTC](https://github.com/OpenVTC/openvtc) (Open Verifiable
+The client for [OpenVTC](https://anonymized.example) (Open Verifiable
 Trust Communities): a terminal user interface (TUI) for joining verifiable
 trust communities and managing your identities, relationships and verifiable
 credentials, plus headless subcommands. Built with [ratatui](https://ratatui.rs/).
@@ -62,7 +62,7 @@ openvtc -p my-profile
 openvtc health
 ```
 
-See the [command reference](https://github.com/OpenVTC/openvtc/blob/main/docs/openvtc-tool-commands.md)
+See the [command reference](https://anonymized.example)
 for every subcommand and flag.
 
 ## Configuration
@@ -219,7 +219,7 @@ Useful patterns to look for in the logs:
 
 ## Documentation
 
-- [Command Reference](https://github.com/OpenVTC/openvtc/blob/main/docs/openvtc-tool-commands.md)
-- [Relationships and VRCs Guide](https://github.com/OpenVTC/openvtc/blob/main/docs/relationships-vrcs.md)
-- [Backup and Restore](https://github.com/OpenVTC/openvtc/blob/main/docs/backup-restore.md)
-- [Themes](https://github.com/OpenVTC/openvtc/blob/main/docs/themes.md)
+- [Command Reference](https://anonymized.example)
+- [Relationships and VRCs Guide](https://anonymized.example)
+- [Backup and Restore](https://anonymized.example)
+- [Themes](https://anonymized.example)

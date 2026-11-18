@@ -24,7 +24,7 @@ beside an agent store (§6.1).
 
 The motivating case is shared agent memory. An agent's own memory stays where
 it is today — private to one VTA context (`vta/memory/{put,list,delete}/0.1`,
-consumed by [`vta-agent-memory`](https://github.com/OpenVTC/vta-agent-memory)) —
+consumed by [`vta-agent-memory`](https://anonymized.example)) —
 and a room is the surface an agent *also* recalls from, whose access control
 belongs to the people in the room.
 

@@ -1496,7 +1496,7 @@ impl VtcClient {
     /// verification method is named rather than derived.
     ///
     /// A [`HolderKey`] names the verification method the proof will carry — for
-    /// a `did:webvh` persona, `did:webvh:<scid>:example.com:glenn#key-0`. The
+    /// a `did:webvh` persona, `did:webvh:<scid>:example.com:alex#key-0`. The
     /// server takes that method's DID as the applicant, so the key must be one
     /// the holder's *published document* names: a proof this client signs
     /// happily is still refused if the document does not carry the method.
@@ -2539,11 +2539,11 @@ mod tests {
     #[test]
     fn a_holder_key_names_any_did_method() {
         let webvh = HolderKey::new(
-            "did:webvh:QmScid:example.com:glenn#key-0",
+            "did:webvh:QmScid:example.com:alex#key-0",
             "z3u2en7t5LR2WtQH5PfFqMqwVHBeXouLzo6haApm8XHqvjxq",
         )
         .expect("a did:webvh verification method is a verification method");
-        assert_eq!(webvh.holder_did(), "did:webvh:QmScid:example.com:glenn");
+        assert_eq!(webvh.holder_did(), "did:webvh:QmScid:example.com:alex");
 
         // …and the `did:key` wrapper still derives its own, so the common case
         // keeps its shorter call.
@@ -2559,7 +2559,7 @@ mod tests {
     /// construction rather than producing a proof nothing can resolve.
     #[test]
     fn a_did_without_a_fragment_is_not_a_verification_method() {
-        assert!(HolderKey::new("did:webvh:QmScid:example.com:glenn", "z3u2").is_err());
+        assert!(HolderKey::new("did:webvh:QmScid:example.com:alex", "z3u2").is_err());
     }
 
     /// A refusal from the document endpoint that names a declared code and
