@@ -44,10 +44,10 @@ use zeroize::Zeroizing;
 use vti_vetting_pcs::{
     ProtoError,
     applicant::ApplicantEngine,
+    applicant::ApplicantRef,
     community::CommunityParams,
     issuer::{RootCredentialWire, TokenBatchWire},
     meta::StatementMeta,
-    applicant::ApplicantRef,
     scheme::{BindingRef, MemberIds, member_id, member_key_from_seed, point_from_text},
     snapshot::{ApplicantSnapshot, HeldAttestation, VetterSnapshot},
     vetter::{EnrolmentBlinding, VetterEngine},
@@ -799,7 +799,8 @@ pub async fn attest(
     if meta.community != community {
         return Err(PcsError::CommunityMismatch);
     }
-    let applicant = ApplicantRef::from_text(applicant_id).map_err(|_| PcsError::ApplicantInvalid)?;
+    let applicant =
+        ApplicantRef::from_text(applicant_id).map_err(|_| PcsError::ApplicantInvalid)?;
     let _guard = write_lock().await;
     let record = vetter_record(state, context_id, community)
         .await?
@@ -821,7 +822,10 @@ pub async fn attest(
         other => proto(other),
     })?;
     let mut rng = vti_vetting_pcs::rand::rngs::OsRng;
-    let attestation = match v.engine.attest(&params, &reservation, &applicant, meta, &mut rng) {
+    let attestation = match v
+        .engine
+        .attest(&params, &reservation, &applicant, meta, &mut rng)
+    {
         Ok(a) => a,
         Err(ProtoError::NoLiveCredential | ProtoError::NoCredentialForPeriod(_)) => {
             v.engine.decline(&reservation);
@@ -1175,8 +1179,7 @@ fn load_applicant(
         .hvk(&st.label)
         .map_err(|e| PcsError::ParametersInvalid(e.to_string()))?;
     let id = member_id(params.pcreds(), hvk, usk).map_err(proto)?;
-    let mut snap =
-        ApplicantSnapshot::new(usk, &st.label, &id, &record.join_did).map_err(proto)?;
+    let mut snap = ApplicantSnapshot::new(usk, &st.label, &id, &record.join_did).map_err(proto)?;
     snap.held = st.held;
     ApplicantEngine::restore(&snap, params).map_err(proto)
 }

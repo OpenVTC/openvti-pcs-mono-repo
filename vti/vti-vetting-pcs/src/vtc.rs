@@ -24,7 +24,9 @@ use crate::{
     verifier::{Verifier, VerifierParams},
 };
 
-pub use crate::verifier::{Decision, MAX_ATTESTATIONS, StatementRecord, Submission, withdraw_context};
+pub use crate::verifier::{
+    Decision, MAX_ATTESTATIONS, StatementRecord, Submission, withdraw_context,
+};
 
 /// Three a tick unless the community says otherwise — the same default `vtc-service` carries.
 pub const DEFAULT_DRIP_PER_TICK: usize = 3;

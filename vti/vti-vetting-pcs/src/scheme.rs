@@ -154,16 +154,24 @@ pub fn keys_text<T: CanonicalSerialize>(keys: &[T]) -> Result<String, ProtoError
 pub fn keys_from_text<T: CanonicalDeserialize>(text: &str) -> Result<Vec<T>, ProtoError> {
     let bytes = from_multibase(text)?;
     let mut reader = bytes.as_slice();
-    let n = u64::deserialize_compressed(&mut reader).map_err(predicate_credential_system::Error::from)?;
+    let n = u64::deserialize_compressed(&mut reader)
+        .map_err(predicate_credential_system::Error::from)?;
     if n > 1024 {
-        return Err(ProtoError::Serialization(format!("{n} keys is not a plausible list")));
+        return Err(ProtoError::Serialization(format!(
+            "{n} keys is not a plausible list"
+        )));
     }
     let mut keys = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        keys.push(T::deserialize_compressed(&mut reader).map_err(predicate_credential_system::Error::from)?);
+        keys.push(
+            T::deserialize_compressed(&mut reader)
+                .map_err(predicate_credential_system::Error::from)?,
+        );
     }
     if !reader.is_empty() {
-        return Err(ProtoError::Serialization("trailing bytes after the key list".into()));
+        return Err(ProtoError::Serialization(
+            "trailing bytes after the key list".into(),
+        ));
     }
     Ok(keys)
 }
@@ -198,9 +206,12 @@ pub fn labelled_from_text<T: CanonicalDeserialize>(text: &str) -> Result<(String
         .map_err(predicate_credential_system::Error::from)?;
     let label = String::from_utf8(label)
         .map_err(|_| ProtoError::Serialization("the label is not UTF-8".into()))?;
-    let value = T::deserialize_compressed(&mut reader).map_err(predicate_credential_system::Error::from)?;
+    let value =
+        T::deserialize_compressed(&mut reader).map_err(predicate_credential_system::Error::from)?;
     if !reader.is_empty() {
-        return Err(ProtoError::Serialization("trailing bytes after the value".into()));
+        return Err(ProtoError::Serialization(
+            "trailing bytes after the value".into(),
+        ));
     }
     Ok((label, value))
 }
@@ -246,7 +257,10 @@ pub fn seeded_rng(seed: &[u8; 32]) -> rand_chacha::ChaCha20Rng {
 /// [`ProtoError::Pcs`] if the scheme instance cannot be set up.
 pub fn member_key_from_seed(community: &str, seed: &[u8; 32]) -> Result<Usk, ProtoError> {
     let p = pcreds(community)?;
-    Ok(<Bk as Backend>::tag_keygen(p.params(), &mut seeded_rng(seed)))
+    Ok(<Bk as Backend>::tag_keygen(
+        p.params(),
+        &mut seeded_rng(seed),
+    ))
 }
 
 /// The member `usk` registers as under the helper key `hvk`.

@@ -244,7 +244,9 @@ impl TokenVerifier {
     /// The signature check alone: valid under the key of a live label. Also what the
     /// applicant's engine runs on receipt (§13 C5), with the published keys.
     pub fn signature_ok(&self, spend: &TokenSpend) -> Result<bool, ProtoError> {
-        Ok(self.tvk(&spend.label).is_some_and(|tvk| verify_spend(tvk, spend)))
+        Ok(self
+            .tvk(&spend.label)
+            .is_some_and(|tvk| verify_spend(tvk, spend)))
     }
 
     /// Record a verified spend in its label's spent set.
@@ -359,8 +361,13 @@ impl TokenIssuer {
             requests
                 .iter()
                 .map(|req| {
-                    <Base as PairingBase<E>>::blind_issue(&(), &tsk, &G1Request(req.commitment), rng)
-                        .ok_or(ProtoError::Pcs(PcsError::InvalidIssuanceEncoding))
+                    <Base as PairingBase<E>>::blind_issue(
+                        &(),
+                        &tsk,
+                        &G1Request(req.commitment),
+                        rng,
+                    )
+                    .ok_or(ProtoError::Pcs(PcsError::InvalidIssuanceEncoding))
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -435,7 +442,10 @@ impl HeldToken {
     }
 
     pub fn parts(&self) -> Result<(Fr, PSPair<E>), ProtoError> {
-        Ok((dec::<Fr>(&self.serial)?, dec::<PSPair<E>>(&self.credential)?))
+        Ok((
+            dec::<Fr>(&self.serial)?,
+            dec::<PSPair<E>>(&self.credential)?,
+        ))
     }
 }
 

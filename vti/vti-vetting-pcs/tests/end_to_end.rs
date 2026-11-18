@@ -72,7 +72,11 @@ fn applicant(w: &mut World, join_did: &str) -> ApplicantEngine {
 
 fn reference(w: &World, app: &ApplicantEngine) -> ApplicantRef {
     // Through its text, as the reference travels.
-    let text = app.reference(&w.vtc.params().unwrap()).unwrap().to_text().unwrap();
+    let text = app
+        .reference(&w.vtc.params().unwrap())
+        .unwrap()
+        .to_text()
+        .unwrap();
     ApplicantRef::from_text(&text).unwrap()
 }
 
@@ -569,7 +573,13 @@ fn a_vetter_answers_only_a_proven_reference() {
     tampered.ssid[0] ^= 1;
     let r = w.vetters[0].accept(None, 2).unwrap();
     assert!(matches!(
-        w.vetters[0].attest(&w.vtc.params().unwrap(), &r, &tampered, m.clone(), &mut w.rng),
+        w.vetters[0].attest(
+            &w.vtc.params().unwrap(),
+            &r,
+            &tampered,
+            m.clone(),
+            &mut w.rng
+        ),
         Err(ProtoError::Pcs(_))
     ));
     // Mallory's proof under Bob's identifier.
@@ -870,8 +880,14 @@ fn a_seeded_key_is_the_same_key_every_time() {
     let a = VetterEngine::enrol_from_seed("member-a", &params, &[7; 32]).unwrap();
     let again = VetterEngine::enrol_from_seed("member-a", &params, &[7; 32]).unwrap();
     let other = VetterEngine::enrol_from_seed("member-a", &params, &[8; 32]).unwrap();
-    assert_eq!(a.id(&params, label).unwrap(), again.id(&params, label).unwrap());
-    assert_ne!(a.id(&params, label).unwrap(), other.id(&params, label).unwrap());
+    assert_eq!(
+        a.id(&params, label).unwrap(),
+        again.id(&params, label).unwrap()
+    );
+    assert_ne!(
+        a.id(&params, label).unwrap(),
+        other.id(&params, label).unwrap()
+    );
     assert_eq!(a.snapshot().unwrap().usk, again.snapshot().unwrap().usk);
     // Rebuilt from the seed and the community alone, as a VTA does on every use.
     let usk = member_key_from_seed(COMMUNITY, &[7; 32]).unwrap();

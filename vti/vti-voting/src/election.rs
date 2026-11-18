@@ -8,10 +8,7 @@
 
 use predicate_credential_system::hash::{HashToGroup, bls12_381::G1Hasher};
 
-use crate::{
-    VotingError,
-    scheme::G1,
-};
+use crate::{VotingError, scheme::G1};
 
 /// Domain of the election point oracle. A new derivation is a new domain, never a parameter.
 pub const ELECTION_POINT_DOMAIN: &[u8] = b"vti/vote/election-point/v1";

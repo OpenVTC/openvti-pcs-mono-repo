@@ -357,7 +357,8 @@ async fn trustees_and_a_voter_run_a_sealed_election_through_the_vta() {
         Election::new(community(), ElectionId::new("sealed-2027").unwrap(), digest).unwrap();
     let id =
         vti_vetting_pcs::scheme::point_from_text(first["request"]["id"].as_str().unwrap()).unwrap();
-    let request = vti_vetting_pcs::issuer::request_from_value(&first["request"]["request"]).unwrap();
+    let request =
+        vti_vetting_pcs::issuer::request_from_value(&first["request"]["request"]).unwrap();
     let pre = vti_vetting_pcs::scheme::enc(
         &reg.issue_ticket(&election, &id, &request, &mut rng)
             .unwrap(),

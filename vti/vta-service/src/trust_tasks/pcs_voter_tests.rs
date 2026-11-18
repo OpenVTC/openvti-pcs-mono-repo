@@ -192,7 +192,8 @@ async fn a_member_votes_through_the_vta_and_checks_the_receipt() {
     let election = Election::new(COMMUNITY, ElectionId::new("agm-2027").unwrap(), digest).unwrap();
     let id =
         vti_vetting_pcs::scheme::point_from_text(first["request"]["id"].as_str().unwrap()).unwrap();
-    let request = vti_vetting_pcs::issuer::request_from_value(&first["request"]["request"]).unwrap();
+    let request =
+        vti_vetting_pcs::issuer::request_from_value(&first["request"]["request"]).unwrap();
     let pre = reg
         .issue_ticket(&election, &id, &request, &mut rng)
         .unwrap();
@@ -604,7 +605,8 @@ async fn the_vta_keeps_no_clear_pairing_and_discards_after_the_election() {
     let id =
         vti_vetting_pcs::scheme::point_from_text(registered["request"]["id"].as_str().unwrap())
             .unwrap();
-    let request = vti_vetting_pcs::issuer::request_from_value(&registered["request"]["request"]).unwrap();
+    let request =
+        vti_vetting_pcs::issuer::request_from_value(&registered["request"]["request"]).unwrap();
     let pre = vti_vetting_pcs::scheme::enc(
         &reg.issue_ticket(&election, &id, &request, &mut rng)
             .unwrap(),

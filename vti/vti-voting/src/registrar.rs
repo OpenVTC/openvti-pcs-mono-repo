@@ -164,7 +164,10 @@ impl Registrar {
             .open
             .evaluate_request(&helper, request, &ticket_ssid(election))?;
         let _guard = self.hsk_lock.lock().expect("helper signing lock");
-        match self.open.respond(&mut helper, evaluated, Decision::Root, rng)? {
+        match self
+            .open
+            .respond(&mut helper, evaluated, Decision::Root, rng)?
+        {
             Reply::PreCredential(pre) => Ok(pre),
             // The record is fresh on every call: neither occurs for a root admission.
             Reply::Issued | Reply::Fail => Err(VotingError::Pcs(

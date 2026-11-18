@@ -219,6 +219,9 @@ fn regenerate_fixture() {
         "extensions": wire.to_extensions().unwrap(),
         "expect": { "satisfied": true, "distinctVetters": 2 },
     });
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/submission.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/submission.json"
+    );
     std::fs::write(path, serde_json::to_string_pretty(&fixture).unwrap() + "\n").unwrap();
 }

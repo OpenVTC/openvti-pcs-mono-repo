@@ -43,7 +43,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ProtoError,
-    scheme::{Bk, G1, Hvk, Pcreds, Tvk, enc, enrolment_ssid, keys_text, pcreds, period_of, point_text},
+    scheme::{
+        Bk, G1, Hvk, Pcreds, Tvk, enc, enrolment_ssid, keys_text, pcreds, period_of, point_text,
+    },
     token::{TokenIssuer, TokenRequest, TokenVerifier},
 };
 

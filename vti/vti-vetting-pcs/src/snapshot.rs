@@ -93,9 +93,7 @@ impl ApplicantSnapshot {
         })
     }
 
-    pub(crate) fn parts(
-        &self,
-    ) -> Result<(Usk, String, G1, Vec<HiddenAttestation>), ProtoError> {
+    pub(crate) fn parts(&self) -> Result<(Usk, String, G1, Vec<HiddenAttestation>), ProtoError> {
         let held = self
             .held
             .iter()

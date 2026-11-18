@@ -717,10 +717,7 @@ async fn list_webvh_dids(
         .collect())
 }
 
-fn dids_in_subtree(
-    dids: &[ListedDid],
-    root: &str,
-) -> Vec<ListedDid> {
+fn dids_in_subtree(dids: &[ListedDid], root: &str) -> Vec<ListedDid> {
     let mut found: Vec<_> = dids
         .iter()
         .filter(|d| in_subtree(root, &d.context_id))
@@ -753,10 +750,7 @@ fn context_label(id: &str, name: &str, dids: usize, primary: Option<&str>) -> St
 
 /// A DID in the picker: its name when the book has one, and the context it
 /// lives in, since the candidates now span a subtree.
-fn did_label(
-    book: &vta_sdk::display_name::NameBook,
-    did: &ListedDid,
-) -> String {
+fn did_label(book: &vta_sdk::display_name::NameBook, did: &ListedDid) -> String {
     format!("{} — in {}", names::inline(book, &did.did), did.context_id)
 }
 

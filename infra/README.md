@@ -361,23 +361,26 @@ hiding all of them. So the script runs peer vetting with no hidden criterion,
 then adds `kernel-developer-hidden` and turns hidden vetting on for the hidden
 run.
 
-**Status (2026-11-18): in progress, not yet passing end to end.**
+**Status (2026-11-18): both flows pass end to end against this stack.**
 
-Verified against this stack:
-- Profiles are created with no prompts.
-- The vetters join with the administrator approving in the console.
-- The membership credentials are delivered and stored.
-- The vetter grants arrive.
-- The applicant creates a persona, starts an application, and makes a face
-  carrying its legal name.
-- A vetter's ticket request reaches the community and asks how it vets.
+- **Peer vetting:** `alice-<run>` is admitted under `kernel-developer` with two
+  named statements. The VTC logs `join request decided under criterion
+  kernel-developer`.
+- **Hidden vetting:** `bob-<run>` is admitted under `kernel-developer-hidden`
+  on a PCS proof. The VTC logs `hidden-vetting proof verified and counted …
+  attestations=2 counted=2` and `verdict="allow"`. The community counts two
+  distinct vetters without learning who they are.
 
-Not yet passing: the ticket, request, session, card, attestation and join
-steps. These are still being scripted against the live stack. The same
-protocol steps pass in process (`../scripts/run-demos.sh`, demos `peer` and
-`hidden`).
+A run takes about 10–15 minutes per flow. Most of that is the clients'
+start-up, the community's requirement checks and the VTA's PCS work.
 
-Getting this far found four client bugs that block any localhost stack. They
+Two parts are still manual, on purpose:
+- An admin approving the vetters' own join requests (`bin/console approve-join`).
+- An admin naming them vetters (`bin/cnm vetting vetters grant`).
+
+The script does both, as the administrator.
+
+Getting here found four client bugs that block any localhost stack. They
 are fixed in this repository (see `PROVENANCE.md`):
 - Two places still resolved DIDs with the public-only host policy.
 - Membership credentials were refused because the community's status list was
@@ -385,7 +388,6 @@ are fixed in this repository (see `PROVENANCE.md`):
 - The community's manifest was refused over http.
 
 The mediator's Trust Task proof verifier also needs its private-host opt-in
-(`vendor/patches/mediator-local.patch`). The patched mediator image is not
-built yet: the build needs more than an 8 GB Docker VM at its release
-settings. Until it is rebuilt, the VTC logs refused delivery-status checks.
-That is noise; delivery itself works.
+(`vendor/patches/mediator-local.patch`); without it the VTC's delivery-status
+checks are refused. The image builds in an 8 GB Docker VM at
+`CARGO_BUILD_JOBS=1` (the default in `docker/mediator.Dockerfile`).

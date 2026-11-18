@@ -1348,7 +1348,11 @@ mod tests {
         assert_eq!(again_at, at, "the first reset's time, unchanged");
         assert_eq!(audit_count(&state, "HiddenVetterBindingReset").await, 1);
         let record = record_of(&state, VETTER).await;
-        assert_eq!(bound_id(&record), first.wire.id, "the recorded identifier stays");
+        assert_eq!(
+            bound_id(&record),
+            first.wire.id,
+            "the recorded identifier stays"
+        );
         assert_eq!(record.reset.as_ref().unwrap().reset_by, ADMIN);
 
         // The key was found: the recorded identifier enrols as if there were no reset — here a
@@ -1443,9 +1447,16 @@ mod tests {
 
         // November alone: re-bound, labels afresh, the old ones retired.
         let nov_only = live(&state, &[NOV]);
-        enrol(&state, COMMUNITY, &nov_only, VETTER, &new_key.wire, Utc::now())
-            .await
-            .expect("re-bound");
+        enrol(
+            &state,
+            COMMUNITY,
+            &nov_only,
+            VETTER,
+            &new_key.wire,
+            Utc::now(),
+        )
+        .await
+        .expect("re-bound");
         let record = record_of(&state, VETTER).await;
         assert_eq!(bound_id(&record), new_key.wire.id);
         assert_eq!(
@@ -1497,7 +1508,11 @@ mod tests {
         let mine = show_binding(&state, VETTER, &labels).await.unwrap();
         let bound = BindingRef::from_text(mine.id.as_deref().unwrap()).unwrap();
         assert_eq!(point_text(&bound.id).unwrap(), vetter.wire.id);
-        assert_eq!(bound.hvk, issuer.hvk(PERIOD), "the binding names its period's key");
+        assert_eq!(
+            bound.hvk,
+            issuer.hvk(PERIOD),
+            "the binding names its period's key"
+        );
         assert_eq!(mine.enrolled_labels, vec![format!("vetter/{PERIOD}")]);
         assert!(mine.reset.is_none());
 
