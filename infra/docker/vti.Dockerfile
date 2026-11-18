@@ -57,12 +57,22 @@ WORKDIR /build
 # Parallel rustc jobs. Docker Desktop's default VM (~8 GiB) runs out of memory
 # with one job per core; raise this on a bigger build host. The workspace's own
 # [profile.release] (thin LTO, codegen-units = 1) is used unchanged.
-ARG CARGO_BUILD_JOBS=2
+# One job: two generated Trust Task crates (vti-specs-*, ~20 MB of Rust each)
+# compiling at once exceed an 8 GB Docker VM. Raise it on a bigger machine.
+ARG CARGO_BUILD_JOBS=1
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 COPY . .
 COPY --from=admin-ui /ui/dist/ vti/vtc-service/admin-ui/dist/
 COPY --from=admin-ui /ui/dist-members/ vti/vtc-service/admin-ui/dist-members/
 ENV VTC_SKIP_ADMIN_UI_BUILD=1
+# The workspace release profile (codegen-units = 1, thin LTO) makes rustc hold
+# each generated Trust Task crate (vti-specs-*) whole while optimising it; two
+# at once exceed an 8 GB Docker VM and get OOM-killed. A local stack does not
+# need the smallest binary, so the image relaxes both.
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_PROFILE_RELEASE_LTO=off
+# The generated wire types gain nothing from heavy optimisation.
+ARG SPECS_OPT='--config profile.release.package.vti-specs.opt-level=1 --config profile.release.package.vti-specs-core.opt-level=1 --config profile.release.package.vti-specs-rooms.opt-level=1 --config profile.release.package.vti-specs-vta.opt-level=1 --config profile.release.package.vti-specs-vtc.opt-level=1 --config profile.release.package.vti-specs-vtn.opt-level=1'
 # One cargo invocation per package, as upstream VTI's Dockerfile does: in a
 # single multi-package `--no-default-features` build the `pkg/feature` flags did
 # not all reach `vta-service` / `vtc-service` (e.g. `rest`), and both failed to
@@ -74,10 +84,10 @@ ARG CNM_FEATURES="config-session"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target,id=openvtc-research-vti-target \
-    cargo build --release --locked -p vta-service --no-default-features --features "${VTA_FEATURES}" && \
-    cargo build --release --locked -p vtc-service --no-default-features --features "${VTC_FEATURES}" && \
-    cargo build --release --locked -p pnm-cli --no-default-features --features "${PNM_FEATURES}" && \
-    cargo build --release --locked -p cnm-cli --no-default-features --features "${CNM_FEATURES}" && \
+    cargo build ${SPECS_OPT} --release --locked -p vta-service --no-default-features --features "${VTA_FEATURES}" && \
+    cargo build ${SPECS_OPT} --release --locked -p vtc-service --no-default-features --features "${VTC_FEATURES}" && \
+    cargo build ${SPECS_OPT} --release --locked -p pnm-cli --no-default-features --features "${PNM_FEATURES}" && \
+    cargo build ${SPECS_OPT} --release --locked -p cnm-cli --no-default-features --features "${CNM_FEATURES}" && \
     mkdir -p /out && \
     cp target/release/vta target/release/vtc target/release/pnm target/release/cnm /out/
 

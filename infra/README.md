@@ -61,7 +61,7 @@ slug, the DID host registered on it).
 
 - Docker with Compose v2 (Docker Desktop on macOS works). **Give Docker at
   least 8 GB of memory**; 12 GB+ is comfortable. Rust builds are memory-bound:
-  the Dockerfiles default to `CARGO_BUILD_JOBS=2` so they fit in 8 GB. With
+  the mediator and DID-host Dockerfiles default to `CARGO_BUILD_JOBS=2` and the VTI image to `1` (its generated Trust Task crates are ~20 MB of Rust each), so they fit in 8 GB. With
   more memory, build faster with
   `docker compose build --build-arg CARGO_BUILD_JOBS=8`.
 - ~25 GB free disk for images and build caches.
