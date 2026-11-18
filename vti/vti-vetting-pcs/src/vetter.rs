@@ -1,120 +1,120 @@
-//! The vetter's PCS engine, i.e. what runs inside the vetter's VTA (design §13 C7): the
-//! stable `usk`, the root credentials per period, the token bucket, attest, refresh and
-//! withdraw. openvtc would only drive these.
+//! The vetter's PCS engine, i.e. what runs inside the vetter's VTA (design §13 C7): the `usk`,
+//! one root credential per vetter period, the token bucket, attest, refresh and withdraw.
+//! openvtc only drives these.
+//!
+//! One key, many periods: the vetter registers the same `usk` under each period's helper key
+//! (`Protocol::register_reusing`), so its identifier and its tags differ, unlinkably, from one
+//! period to the next. A VTA derives the key from a seed and never stores it (§13 C7); a key
+//! that is ever recovered links the vetter's attestations of every period it held, which is the
+//! price of not storing per-period keys (design §18.2 prefers a key per period).
 
 use std::collections::BTreeMap;
 
 use predicate_credential_system::{
-    kiprf::{KIPRF, prove_tag},
-    pcs::{Credential, IssuanceState, PredicateCredentialSystem, UserSecretKey},
+    Error as PcsError,
+    pcreds::{Attestation, Backend, Credential, IssuanceState, PendingAttestation},
     sigma::FSProof,
 };
 use rand::{CryptoRng, RngCore};
+use zeroize::Zeroize;
 
 #[cfg(any(test, feature = "harness"))]
 use crate::vtc::Vtc;
 use crate::{
     ProtoError,
+    applicant::ApplicantRef,
     community::CommunityParams,
     issuer::{
         RootCredentialWire, RootRequestWire, TokenBatchRequestWire, TokenBatchWire,
         TokenRequestWire,
     },
     meta::StatementMeta,
-    scheme::{Base, E, Fr, G1, point_text, scalar_text, vetter_predicate},
+    scheme::{
+        Bk, Fr, G1, Member, Usk, enrolment_ssid, member, period_of, point_text, scalar_text,
+        vetter_label,
+    },
     snapshot::VetterSnapshot,
-    token::{Reservation, TokenWallet},
+    token::{Reservation, TokenSpend, TokenWallet},
     verifier::withdraw_context,
 };
 
 /// The blinding state of an enrolment in flight.
 ///
 /// Named here so a caller can hold one across a round trip without depending on the PCS crate
-/// directly. It is deliberately not serialisable: it is useless without the community's answer
-/// and dangerous to keep past it.
-pub type EnrolmentBlinding = IssuanceState<E, Base>;
+/// directly. It is useless without the community's answer and dangerous to keep past it.
+pub type EnrolmentBlinding = IssuanceState<Bk>;
 
 /// An attestation as the applicant receives it (`vetting/attestation/0.1`).
 #[derive(Debug, Clone)]
 pub struct HiddenAttestation {
-    pub attestation: predicate_credential_system::pcs::Attestation<E, Base>,
+    /// The vetter label whose helper key the attestation is under: the applicant's.
+    pub label: String,
+    pub attestation: Attestation<Bk>,
     pub meta: StatementMeta,
-    pub token: crate::token::TokenSpend,
+    pub token: TokenSpend,
+}
+
+/// A statement this vetter made, kept so that it can be attested again without a new session
+/// (design §4.3).
+#[derive(Debug, Clone)]
+pub(crate) struct Logged {
+    pub label: String,
+    pub applicant: G1,
+    pub meta: StatementMeta,
 }
 
 pub struct VetterEngine {
     pub member: String,
-    usk: UserSecretKey<E>,
-    id: G1,
-    creds: BTreeMap<String, Credential<E, Base>>,
+    usk: Usk,
+    /// Root credentials by vetter label (`vetter/<period>`).
+    creds: BTreeMap<String, Credential<Bk>>,
     wallet: TokenWallet,
     /// A limit below the community's drip, kept here and never sent anywhere (§5.1).
     pub personal_limit: Option<usize>,
     attested: usize,
-    /// What was attested, so an attestation can be refreshed without a new session (§4.3).
-    log: Vec<(G1, StatementMeta)>,
+    log: Vec<Logged>,
+}
+
+impl Drop for VetterEngine {
+    fn drop(&mut self) {
+        self.usk.zeroize();
+    }
 }
 
 impl VetterEngine {
     #[cfg(any(test, feature = "harness"))]
-    /// A vetter's key pair: generated once, stable for life (§13 C2).
+    /// A vetter with a fresh key, against the in-process community object.
     pub fn new<R: RngCore + CryptoRng>(
         member: &str,
         vtc: &Vtc,
         rng: &mut R,
     ) -> Result<Self, ProtoError> {
-        let (id, usk) = vtc.open().user_keygen(rng)?;
-        Ok(Self {
-            member: member.to_string(),
-            usk,
-            id,
-            creds: BTreeMap::new(),
-            wallet: TokenWallet::new(&vtc.community)?,
-            personal_limit: None,
-            attested: 0,
-            log: Vec::new(),
-        })
+        Self::enrol_new(member, &vtc.params()?, rng)
     }
 
-    /// A vetter's key pair from a community's **published** parameters.
+    /// A vetter's key from a community's **published** parameters.
     ///
-    /// [`Self::new`] takes a [`Vtc`], which only the community has. This is the same act on the
-    /// other side of the wire: a member who has read a manifest and holds a vetter grant mints
-    /// the key pair every tag of theirs will derive from, and enrols with it.
-    ///
-    /// `member` is the DID this vetter will sign its requests with. It is bound into the opening
-    /// proofs the token drip sends and checked by the community against the signer, so it is not
-    /// a display name and cannot be changed later without abandoning the wallet.
+    /// `member` is the DID this vetter will sign its requests with. It is bound into the root
+    /// request's session and into the opening proofs the token drip sends, and checked by the
+    /// community against the signer, so it is not a display name and cannot be changed later
+    /// without abandoning the wallet.
     ///
     /// # Errors
     ///
-    /// [`ProtoError::Pcs`] if the key pair cannot be generated, or the wallet cannot be opened
-    /// for this community.
+    /// Never, today; kept fallible for a key generation that can refuse.
     pub fn enrol_new<R: RngCore + CryptoRng>(
         member: &str,
         params: &CommunityParams,
         rng: &mut R,
     ) -> Result<Self, ProtoError> {
-        let (id, usk) = params.open().user_keygen(rng)?;
-        Ok(Self {
-            member: member.to_string(),
-            usk,
-            id,
-            creds: BTreeMap::new(),
-            wallet: TokenWallet::new(params.community())?,
-            personal_limit: None,
-            attested: 0,
-            log: Vec::new(),
-        })
+        let usk = <Bk as Backend>::tag_keygen(params.pcreds().params(), rng);
+        Ok(Self::with_key(member, usk))
     }
 
-    /// [`Self::enrol_new`], with the key pair derived from `seed` instead of drawn.
-    ///
-    /// This is how a VTA holds a vetter's key (design §13 C7): `seed` is derived from the
-    /// context's derivation base (VTI-KEY-030), so the same seed always gives the same `usk` and
-    /// `id` — the key never has to be stored, and one vetter cannot end up with two (§13 C2).
-    /// The scheme's key generation restarts on a degenerate draw, and a seeded stream makes the
-    /// restarts deterministic too.
+    /// [`Self::enrol_new`], with the key derived from `seed` instead of drawn: how a VTA holds a
+    /// vetter's key (design §13 C7). `seed` is derived from the context's derivation base
+    /// (VTI-KEY-030), so the same seed always gives the same `usk` — the key never has to be
+    /// stored.
     ///
     /// # Errors
     ///
@@ -127,89 +127,104 @@ impl VetterEngine {
         Self::enrol_new(member, params, &mut crate::scheme::seeded_rng(seed))
     }
 
-    pub fn id(&self) -> &G1 {
-        &self.id
+    fn with_key(member: &str, usk: Usk) -> Self {
+        Self {
+            member: member.to_string(),
+            usk,
+            creds: BTreeMap::new(),
+            wallet: TokenWallet::new(),
+            personal_limit: None,
+            attested: 0,
+            log: Vec::new(),
+        }
     }
 
-    /// The storable form, for openvtc's encrypted config. Carries `usk`, the key every tag of
-    /// this vetter derives from: see [`crate::snapshot`].
+    /// The vetter as a user of `label`'s helper key.
+    fn user(&self, params: &CommunityParams, label: &str) -> Result<Member, ProtoError> {
+        member(params.pcreds(), params.hvk(label)?, &self.usk)
+    }
+
+    /// The vetter's identifier under `label` (`vetter/<period>`), a live label of `params`.
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if the label is not live.
+    pub fn id(&self, params: &CommunityParams, label: &str) -> Result<G1, ProtoError> {
+        Ok(*self.user(params, label)?.id())
+    }
+
+    /// The labels this vetter holds a credential under, newest first.
+    #[must_use]
+    pub fn enrolled_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self.creds.keys().cloned().collect();
+        labels.sort_unstable_by(|a, b| b.cmp(a));
+        labels
+    }
+
+    /// The storable form. Carries `usk`, the key every tag of this vetter derives from: see
+    /// [`crate::snapshot`].
     pub fn snapshot(&self) -> Result<VetterSnapshot, ProtoError> {
-        let mut snap = VetterSnapshot::new(&self.member, &self.usk, &self.id)?;
-        for (period, cred) in &self.creds {
-            snap.put_credential(period, cred)?;
+        let mut snap = VetterSnapshot::new(&self.member, &self.usk)?;
+        for (label, cred) in &self.creds {
+            snap.put_credential(label, cred)?;
         }
         snap.tokens = self.wallet.snapshot()?;
         snap.pending = self.wallet.pending_snapshot()?;
         snap.personal_limit = self.personal_limit;
-        for (id, meta) in &self.log {
-            snap.record(id, meta)?;
+        for logged in &self.log {
+            snap.record(logged)?;
         }
         Ok(snap)
     }
 
     /// Restore a vetter's engine from storage.
-    pub fn restore(snap: &VetterSnapshot, community: &str) -> Result<Self, ProtoError> {
-        let (usk, id) = snap.key()?;
-        let mut creds = BTreeMap::new();
-        for period in snap.credentials.keys() {
-            if let Some(c) = snap.credential(period)? {
-                creds.insert(period.clone(), c);
-            }
-        }
-        let mut log = Vec::new();
-        for (raw, meta) in &snap.log {
-            let id: G1 = predicate_credential_system::serialization::from_bytes(
-                &predicate_credential_system::serialization::from_multibase(raw)?,
-            )?;
-            log.push((id, meta.clone()));
-        }
-        let mut wallet = TokenWallet::restore(community, &snap.tokens)?;
-        wallet.restore_pending(&snap.pending)?;
-        Ok(Self {
-            member: snap.member.clone(),
-            usk,
-            id,
-            creds,
-            wallet,
-            personal_limit: snap.personal_limit,
-            attested: 0,
-            log,
-        })
-    }
-
-    /// The vetter's half of enrolment: a blinded request for `period`, built with the SAME
-    /// `usk` every time, and the blinding state that unblinds what comes back.
-    ///
-    /// Split from [`Self::accept_enrolment`] because the two halves are a round trip in a
-    /// deployment — the request is what a Trust Task carries, and the community's answer comes
-    /// back later. The community sees a commitment; it never sees the credential it made.
     ///
     /// # Errors
-    /// [`ProtoError::Pcs`] if the request cannot be built, [`ProtoError::Serialization`] if it
-    /// cannot be encoded.
+    /// [`ProtoError::Pcs`] or [`ProtoError::Serialization`] if a stored value does not decode.
+    pub fn restore(snap: &VetterSnapshot) -> Result<Self, ProtoError> {
+        let mut engine = Self::with_key(&snap.member, snap.key()?);
+        for label in snap.credentials.keys() {
+            if let Some(c) = snap.credential(label)? {
+                engine.creds.insert(label.clone(), c);
+            }
+        }
+        engine.log = snap.logged()?;
+        engine.wallet = TokenWallet::restore(&snap.tokens)?;
+        engine.wallet.restore_pending(&snap.pending)?;
+        engine.personal_limit = snap.personal_limit;
+        Ok(engine)
+    }
+
+    /// The vetter's half of enrolment under `period` (a bare period or its `vetter/` label): a
+    /// blinded root request with no attestations, under the session the community rebuilds for
+    /// this member, and the blinding state that unblinds what comes back.
+    ///
+    /// Split from [`Self::accept_enrolment`] because the two halves are a round trip in a
+    /// deployment. The community sees a commitment; it never sees the credential it made.
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if the period is not live; [`ProtoError::Pcs`] if the
+    /// request cannot be built.
     pub fn enrolment_request<R: RngCore + CryptoRng>(
         &self,
         params: &CommunityParams,
         period: &str,
         rng: &mut R,
-    ) -> Result<(RootRequestWire, IssuanceState<E, Base>), ProtoError> {
-        let f = vetter_predicate(period);
-        let (request, state) =
-            params
-                .open()
-                .root_request(params.hvk(), &f, &self.id, &self.usk, rng)?;
-        Ok((
-            RootRequestWire {
-                label: format!("vetter/{period}"),
-                id: point_text(&self.id)?,
-                request: serde_json::to_value(&request)
-                    .map_err(|e| ProtoError::Serialization(e.to_string()))?,
-            },
-            state,
-        ))
+    ) -> Result<(RootRequestWire, EnrolmentBlinding), ProtoError> {
+        let period = period_of(period);
+        let label = vetter_label(period);
+        let user = self.user(params, &label)?;
+        let ssid = enrolment_ssid(params.community(), &self.member, period);
+        let (request, state) = params.pcreds().request_credential(
+            params.hvk(&label)?,
+            &user,
+            Vec::new(),
+            &ssid,
+            rng,
+        )?;
+        Ok((RootRequestWire::of(&label, &request)?, state))
     }
 
-    /// Unblind the community's answer into this vetter's class credential.
+    /// Unblind the community's answer into this vetter's credential for its label.
     ///
     /// # Errors
     /// [`ProtoError::Serialization`] if the answer cannot be decoded, [`ProtoError::Pcs`] if it
@@ -219,15 +234,15 @@ impl VetterEngine {
         &mut self,
         params: &CommunityParams,
         answer: &RootCredentialWire,
-        state: &IssuanceState<E, Base>,
+        state: EnrolmentBlinding,
     ) -> Result<(), ProtoError> {
-        let period = answer.label.trim_start_matches("vetter/").to_string();
-        let f = vetter_predicate(&period);
+        let label = vetter_label(period_of(&answer.label));
+        let user = self.user(params, &label)?;
         let pre = crate::scheme::dec(&answer.pre_credential)?;
         let cred = params
-            .open()
-            .unblind(params.hvk(), &self.usk, &f, &pre, state)?;
-        self.creds.insert(period, cred);
+            .pcreds()
+            .unblind(params.hvk(&label)?, &user, &pre, state)?;
+        self.creds.insert(label, cred);
         Ok(())
     }
 
@@ -237,7 +252,8 @@ impl VetterEngine {
     /// vetted anyone, because a fetch that tracked activity would report activity.
     ///
     /// # Errors
-    /// [`ProtoError::Pcs`] or [`ProtoError::Serialization`] if a request cannot be built.
+    /// [`ProtoError::LabelNotLive`] if `label` is not live; [`ProtoError::Pcs`] if a request
+    /// cannot be built.
     pub fn drip_request<R: RngCore + CryptoRng>(
         &mut self,
         params: &CommunityParams,
@@ -246,9 +262,14 @@ impl VetterEngine {
         r: usize,
         rng: &mut R,
     ) -> Result<TokenBatchRequestWire, ProtoError> {
+        let tvk = params
+            .tokens()
+            .tvk(label)
+            .ok_or_else(|| ProtoError::LabelNotLive(label.to_string()))?
+            .clone();
         let reqs = self
             .wallet
-            .prepare(params.tokens().tvk(), label, &self.member, tick, r, rng)?;
+            .prepare(&tvk, label, &self.member, tick, r, rng)?;
         Ok(TokenBatchRequestWire {
             label: label.to_string(),
             tick,
@@ -269,20 +290,25 @@ impl VetterEngine {
         params: &CommunityParams,
         served: &TokenBatchWire,
     ) -> Result<usize, ProtoError> {
+        let tvk = params
+            .tokens()
+            .tvk(&served.label)
+            .ok_or_else(|| ProtoError::LabelNotLive(served.label.clone()))?
+            .clone();
         let pres = served
             .pre_credentials
             .iter()
             .map(|p| crate::scheme::dec(p))
             .collect::<Result<Vec<_>, _>>()?;
         self.wallet
-            .receive(params.tokens().tvk(), &served.label, served.tick, &pres)?;
+            .receive(&tvk, &served.label, served.tick, &pres)?;
         self.wallet.expire(params.tokens().live_labels());
         Ok(pres.len())
     }
 
     #[cfg(any(test, feature = "harness"))]
-    /// Root request for the VTC's current period, with the SAME `usk` every time. The two
-    /// halves above, against the in-process community object.
+    /// Root request for the community's current period. The two halves above, against the
+    /// in-process community object.
     pub fn enroll<R: RngCore + CryptoRng>(
         &mut self,
         vtc: &mut Vtc,
@@ -291,16 +317,15 @@ impl VetterEngine {
         let period = vtc.current_period().to_string();
         let params = vtc.params()?;
         let (wire, state) = self.enrolment_request(&params, &period, rng)?;
-        let request = serde_json::from_value(wire.request.clone())
-            .map_err(|e| ProtoError::Serialization(e.to_string()))?;
-        let pre = vtc.issue_vetter_root(&self.member, &self.id, &request, rng)?;
+        let (_, request) = wire.parse()?;
+        let pre = vtc.issue_vetter_root(&self.member, &request, rng)?;
         self.accept_enrolment(
             &params,
             &RootCredentialWire {
                 label: wire.label.clone(),
                 pre_credential: crate::scheme::enc(&pre)?,
             },
-            &state,
+            state,
         )
     }
 
@@ -338,9 +363,12 @@ impl VetterEngine {
     }
 
     #[cfg(any(test, feature = "harness"))]
-    /// Tokens whose label closed are gone.
+    /// Tokens whose label closed are gone, and so are the credentials of periods that are no
+    /// longer live. The log of statements stays, for refreshes.
     pub fn expire(&mut self, vtc: &Vtc) {
         self.wallet.expire(vtc.token_verifier().live_labels());
+        let live: Vec<String> = vtc.live_periods().iter().map(|p| vetter_label(p)).collect();
+        self.creds.retain(|label, _| live.contains(label));
     }
 
     pub fn tokens_held(&self) -> usize {
@@ -363,6 +391,9 @@ impl VetterEngine {
     }
 
     /// Accepting a `vetting/request` reserves a token (§5.2), or declines `atCapacity`.
+    ///
+    /// # Errors
+    /// [`ProtoError::AtCapacity`] if no token is free or the personal limit is reached.
     pub fn accept(
         &mut self,
         prefer_label: Option<&str>,
@@ -384,95 +415,179 @@ impl VetterEngine {
         self.wallet.release(r);
     }
 
-    /// Attest for `applicant_id` after the human check: spend the reserved token, bind its
-    /// serial and the statement metadata into `ctx_j`, attest under the newest live period.
+    /// The applicant's `π_id`, checked under the applicant's period and the community's contact
+    /// name ([`crate::applicant`], "The applicant's reference"), before any token is spent.
+    fn receive(
+        &self,
+        params: &CommunityParams,
+        applicant: &ApplicantRef,
+    ) -> Result<PendingAttestation<Bk>, ProtoError> {
+        if !self.creds.contains_key(&applicant.label) {
+            return Err(ProtoError::NoCredentialForPeriod(applicant.label.clone()));
+        }
+        Ok(params.pcreds().receive_attestation_request(
+            params.hvk(&applicant.label)?,
+            &applicant.request,
+            &applicant.ssid,
+            params.community().as_bytes(),
+        )?)
+    }
+
+    /// The attestation, bound to `meta` completed with the token's label and serial. Fallible,
+    /// and touches no state.
+    fn sign<R: RngCore + CryptoRng>(
+        &self,
+        params: &CommunityParams,
+        applicant: &ApplicantRef,
+        token_label: &str,
+        token_serial: &Fr,
+        mut meta: StatementMeta,
+        rng: &mut R,
+    ) -> Result<(Attestation<Bk>, StatementMeta), ProtoError> {
+        let pending = self.receive(params, applicant)?;
+        meta.token_label = token_label.to_string();
+        meta.token_serial = scalar_text(token_serial)?;
+        let app = meta.context_bytes()?;
+        let user = self.user(params, &applicant.label)?;
+        let attestation = params.pcreds().attest_in_context(
+            params.hvk(&applicant.label)?,
+            &user,
+            &self.creds[&applicant.label],
+            pending,
+            &app,
+            rng,
+        )?;
+        Ok((attestation, meta))
+    }
+
+    /// Infallible: count and log a signed attestation.
+    fn record(
+        &mut self,
+        applicant: &ApplicantRef,
+        attestation: Attestation<Bk>,
+        meta: StatementMeta,
+        token: TokenSpend,
+    ) -> HiddenAttestation {
+        self.attested += 1;
+        self.log.push(Logged {
+            label: applicant.label.clone(),
+            applicant: *applicant.id(),
+            meta: meta.clone(),
+        });
+        HiddenAttestation {
+            label: applicant.label.clone(),
+            attestation,
+            meta,
+            token,
+        }
+    }
+
+    /// Attest for `applicant` after the human check: check its `π_id` under the applicant's
+    /// period, bind the reserved token's serial and the statement metadata into the
+    /// attestation's context, attest with this vetter's credential of that period, and only then
+    /// spend the token, so that a failed attestation leaves it reserved, not lost.
+    ///
+    /// # Errors
+    /// [`ProtoError::NoCredentialForPeriod`] if the vetter holds no credential for the
+    /// applicant's period; [`ProtoError::Pcs`] if `π_id` does not verify or the attestation
+    /// cannot be made.
     pub fn attest<R: RngCore + CryptoRng>(
         &mut self,
         params: &CommunityParams,
         reservation: &Reservation,
-        applicant_id: &G1,
+        applicant: &ApplicantRef,
         meta: StatementMeta,
         rng: &mut R,
     ) -> Result<HiddenAttestation, ProtoError> {
-        let period = params
-            .vetter_labels()
-            .iter()
-            .map(|l| l.trim_start_matches("vetter/").to_string())
-            .find(|p| self.creds.contains_key(p))
-            .ok_or(ProtoError::NoLiveCredential)?;
-        let token = self.wallet.spend(params.tokens().tvk(), reservation, rng)?;
-        self.attest_with_token(params, &period, token, applicant_id, meta, rng)
+        let (attestation, meta) = self.sign(
+            params,
+            applicant,
+            &reservation.label,
+            &reservation.serial,
+            meta,
+            rng,
+        )?;
+        let token = self.wallet.spend(reservation, rng)?;
+        Ok(self.record(applicant, attestation, meta, token))
     }
 
     /// ADVERSARY HOOK for tests: attest with a token of the caller's choosing, e.g. one already
-    /// spent. An honest engine never does this; the VTC's spent set is what stops it.
+    /// spent. An honest engine never does this; the community's spent set is what stops it.
     #[doc(hidden)]
     pub fn attest_with_token<R: RngCore + CryptoRng>(
         &mut self,
         params: &CommunityParams,
-        period: &str,
-        token: crate::token::TokenSpend,
-        applicant_id: &G1,
-        mut meta: StatementMeta,
+        token: TokenSpend,
+        applicant: &ApplicantRef,
+        meta: StatementMeta,
         rng: &mut R,
     ) -> Result<HiddenAttestation, ProtoError> {
-        let period = period.to_string();
-        meta.token_label = token.label.clone();
-        meta.token_serial = scalar_text(&token.serial)?;
-        let app = meta.context_bytes()?;
-        let attestation = params.open().attest_in_context(
-            params.hvk(),
-            &self.usk,
-            &vetter_predicate(&period),
-            &self.creds[&period],
-            applicant_id,
-            &app,
-            rng,
-        )?;
-        self.attested += 1;
-        self.log.push((*applicant_id, meta.clone()));
-        Ok(HiddenAttestation {
-            attestation,
-            meta,
-            token,
-        })
+        let (attestation, meta) =
+            self.sign(params, applicant, &token.label, &token.serial, meta, rng)?;
+        Ok(self.record(applicant, attestation, meta, token))
     }
 
-    /// Refresh after a rotation: the same statement, a fresh token, the current period. The
-    /// tag is the same as before (§13 C2), so the two cannot count as two vetters.
+    /// Refresh: the statement this vetter made for the applicant `previous`, attested again for
+    /// `applicant` with a fresh token and no new human check (design §4.3).
+    ///
+    /// Within one period `applicant` is the same application and the tag is the same. After a
+    /// rotation the applicant has registered again under the new period, with a new identifier,
+    /// so the refreshed attestation has a new tag: tags under different helper keys are
+    /// unlinkable, which is why a request never mixes periods, and so why one vetter cannot count
+    /// twice in one.
+    ///
+    /// # Errors
+    /// [`ProtoError::NoSuchStatement`] if this vetter made no statement for `previous`, and
+    /// those of [`Self::attest`].
     pub fn refresh<R: RngCore + CryptoRng>(
         &mut self,
         params: &CommunityParams,
-        applicant_id: &G1,
+        previous: &G1,
+        applicant: &ApplicantRef,
         rng: &mut R,
     ) -> Result<HiddenAttestation, ProtoError> {
-        let (_, meta) = self
+        let meta = self
             .log
             .iter()
             .rev()
-            .find(|(id, _)| id == applicant_id)
-            .cloned()
-            .ok_or(ProtoError::NoLiveCredential)?;
+            .find(|l| l.applicant == *previous)
+            .map(|l| l.meta.clone())
+            .ok_or(ProtoError::NoSuchStatement)?;
         let reservation = self.accept(None, 0)?;
-        self.attested -= 1; // a refresh is not a new vetting
-        self.attest(params, &reservation, applicant_id, meta, rng)
+        match self.attest(params, &reservation, applicant, meta, rng) {
+            Ok(att) => {
+                self.attested -= 1; // a refresh is not a new vetting
+                Ok(att)
+            }
+            Err(e) => {
+                // `attest` spends the token only once the attestation is made, so it is still
+                // reserved here and goes back to the free pool.
+                self.wallet.release(&reservation);
+                Err(e)
+            }
+        }
     }
 
-    /// Withdraw one statement: the tag, and a proof of knowledge of the key behind it that
-    /// does not link to this vetter's `id` (§4.4).
+    /// Withdraw one statement: the tag `t = Tag(usk, x_Q)` at the applicant's recipient point
+    /// under `label`, and a proof of knowledge of the key behind it that does not link to this
+    /// vetter's identifier (§4.4).
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if `label` is not live; [`ProtoError::Pcs`] if the tag is
+    /// undefined or the proof cannot be made.
     pub fn withdraw<R: RngCore + CryptoRng>(
         &self,
         params: &CommunityParams,
+        label: &str,
         applicant_id: &G1,
         rng: &mut R,
     ) -> Result<(G1, FSProof<Fr>), ProtoError> {
-        let prf = params.open().tag();
-        let s = params.open().tag_point(applicant_id)?;
-        let tag = prf
-            .eval(self.usk.expose_scalar(), &s)
-            .ok_or(predicate_credential_system::Error::UndefinedTag)?;
-        let ctx = withdraw_context(params.community(), &point_text(applicant_id)?);
-        let proof = prove_tag(prf, self.usk.expose_scalar(), &tag, &s, &ctx, rng)?;
+        let hvk = params.hvk(label)?;
+        let pp = params.pcreds().params();
+        let xq = params.pcreds().recipient_point(hvk.vk(), applicant_id)?;
+        let tag = <Bk as Backend>::tag(pp, &self.usk, &xq).ok_or(PcsError::UndefinedTag)?;
+        let ctx = withdraw_context(params.community(), label, &point_text(applicant_id)?);
+        let proof = <Bk as Backend>::prove_tag(pp, &tag, &xq, &self.usk, &ctx, rng)?;
         Ok((tag, proof))
     }
 }

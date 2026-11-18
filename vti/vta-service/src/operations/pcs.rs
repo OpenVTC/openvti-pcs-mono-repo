@@ -47,7 +47,8 @@ use vti_vetting_pcs::{
     community::CommunityParams,
     issuer::{RootCredentialWire, TokenBatchWire},
     meta::StatementMeta,
-    scheme::{member_key_from_seed, point_from_text, point_text},
+    applicant::ApplicantRef,
+    scheme::{BindingRef, MemberIds, member_id, member_key_from_seed, point_from_text},
     snapshot::{ApplicantSnapshot, HeldAttestation, VetterSnapshot},
     vetter::{EnrolmentBlinding, VetterEngine},
     wire::{SUITE, SubmissionWire},
@@ -309,6 +310,10 @@ struct VetterState {
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ApplicantState {
+    /// The vetter label the application lives under: its helper key is the one its identifier
+    /// is under.
+    #[serde(default)]
+    label: String,
     held: Vec<HeldAttestation>,
 }
 
@@ -499,11 +504,9 @@ async fn load_vetter(
         record.seed_id,
     )
     .await?;
-    let (id, usk) = member_key_from_seed(&record.community, &seed).map_err(proto)?;
-    let keyed = VetterSnapshot::new(&record.member_did, &usk, &id).map_err(proto)?;
-    st.snapshot.usk = keyed.usk;
-    st.snapshot.id = keyed.id;
-    let engine = VetterEngine::restore(&st.snapshot, &record.community).map_err(proto)?;
+    let usk = member_key_from_seed(&record.community, &seed).map_err(proto)?;
+    st.snapshot = st.snapshot.with_key(&usk).map_err(proto)?;
+    let engine = VetterEngine::restore(&st.snapshot).map_err(proto)?;
     Ok(LoadedVetter {
         record,
         engine,
@@ -512,8 +515,7 @@ async fn load_vetter(
 }
 
 async fn save_vetter(state: &AppState, v: &LoadedVetter) -> Result<()> {
-    let mut snapshot = v.engine.snapshot().map_err(proto)?;
-    snapshot.usk = String::new();
+    let snapshot = v.engine.snapshot().map_err(proto)?.without_key();
     store_secret_json(
         state,
         &vetter_key(&v.record.context_id, &v.record.community),
@@ -534,11 +536,7 @@ fn vetter_summary(
     snap: &VetterSnapshot,
     enrolments: &BTreeMap<String, String>,
 ) -> Value {
-    let mut enrolled: Vec<String> = snap
-        .credentials
-        .keys()
-        .map(|p| format!("vetter/{p}"))
-        .collect();
+    let mut enrolled: Vec<String> = snap.credentials.keys().cloned().collect();
     enrolled.sort_unstable_by(|a, b| b.cmp(a));
     let draws: Vec<Value> = snap
         .pending
@@ -596,13 +594,9 @@ pub async fn root_request(
                 suite: SUITE.to_string(),
                 path,
                 seed_id,
-                id: point_text(engine.id()).map_err(proto)?,
+                id: String::new(),
                 created_at: Utc::now(),
             };
-            state
-                .pcs_engine_ks
-                .insert(vetter_key(context_id, community), &record)
-                .await?;
             LoadedVetter {
                 record,
                 engine,
@@ -610,12 +604,24 @@ pub async fn root_request(
             }
         }
     };
-    let period = label.trim_start_matches("vetter/");
     let mut rng = vti_vetting_pcs::rand::rngs::OsRng;
     let (wire, blinding) = v
         .engine
-        .enrolment_request(&params, period, &mut rng)
+        .enrolment_request(&params, label, &mut rng)
         .map_err(proto)?;
+    // The identifier the community will bind: this period's, with the period's key
+    // (`BindingRef`), so that a recovery can search for it.
+    v.record.id = BindingRef {
+        label: label.to_string(),
+        hvk: params.hvk(label).map_err(proto)?.vk().clone(),
+        id: point_from_text(&wire.id).map_err(proto)?,
+    }
+    .to_text()
+    .map_err(proto)?;
+    state
+        .pcs_engine_ks
+        .insert(vetter_key(context_id, community), &v.record)
+        .await?;
     let blinding = blinding
         .to_bytes()
         .map_err(|e| proto(ProtoError::from(e)))?;
@@ -650,7 +656,9 @@ pub async fn root_accept(
         predicate_credential_system::serialization::from_multibase(&encoded)
             .map_err(|e| proto(ProtoError::from(e)))?,
     );
-    let blinding = EnrolmentBlinding::from_bytes(&bytes).map_err(|e| proto(ProtoError::from(e)))?;
+    let blinding: EnrolmentBlinding =
+        predicate_credential_system::serialization::from_bytes(&bytes)
+            .map_err(|e| proto(ProtoError::from(e)))?;
     v.engine
         .accept_enrolment(
             &params,
@@ -658,7 +666,7 @@ pub async fn root_accept(
                 label: label.to_string(),
                 pre_credential: pre_credential.to_string(),
             },
-            &blinding,
+            blinding,
         )
         .map_err(|e| PcsError::CredentialInvalid(e.to_string()))?;
     v.enrolments.remove(label);
@@ -791,7 +799,7 @@ pub async fn attest(
     if meta.community != community {
         return Err(PcsError::CommunityMismatch);
     }
-    let id = point_from_text(applicant_id).map_err(|_| PcsError::ApplicantInvalid)?;
+    let applicant = ApplicantRef::from_text(applicant_id).map_err(|_| PcsError::ApplicantInvalid)?;
     let _guard = write_lock().await;
     let record = vetter_record(state, context_id, community)
         .await?
@@ -800,10 +808,10 @@ pub async fn attest(
     // Enrolment before a token is reserved: a vetter with no live credential has nothing to
     // attest under, and "no token" would send it to wait for a drip that cannot help.
     let snap = v.engine.snapshot().map_err(proto)?;
-    let enrolled = params.vetter_labels().iter().any(|l| {
-        snap.credentials
-            .contains_key(l.trim_start_matches("vetter/"))
-    });
+    let enrolled = params
+        .vetter_labels()
+        .iter()
+        .any(|l| snap.credentials.contains_key(l));
     if !enrolled {
         return Err(PcsError::NotEnrolled);
     }
@@ -813,10 +821,17 @@ pub async fn attest(
         other => proto(other),
     })?;
     let mut rng = vti_vetting_pcs::rand::rngs::OsRng;
-    let attestation = match v.engine.attest(&params, &reservation, &id, meta, &mut rng) {
+    let attestation = match v.engine.attest(&params, &reservation, &applicant, meta, &mut rng) {
         Ok(a) => a,
-        Err(ProtoError::NoLiveCredential) => return Err(PcsError::NotEnrolled),
+        Err(ProtoError::NoLiveCredential | ProtoError::NoCredentialForPeriod(_)) => {
+            v.engine.decline(&reservation);
+            return Err(PcsError::NotEnrolled);
+        }
         Err(ProtoError::AtCapacity { .. }) => return Err(PcsError::NoToken),
+        Err(ProtoError::PeriodNotLive(_) | ProtoError::Pcs(_)) => {
+            v.engine.decline(&reservation);
+            return Err(PcsError::ApplicantInvalid);
+        }
         Err(e) => return Err(proto(e)),
     };
     save_vetter(state, &v).await?;
@@ -914,7 +929,7 @@ async fn vetter_elsewhere(
         };
         if r.community == community
             && r.context_id != context_id
-            && point_from_text(&r.id).is_ok_and(|p| p == *id)
+            && BindingRef::from_text(&r.id).is_ok_and(|b| b.id == *id)
             && may_act_in(&r.context_id)
         {
             return Ok(Some(r.context_id));
@@ -942,9 +957,11 @@ pub async fn vetter_recover(
     bound_id: &str,
     may_act_in: impl Fn(&str) -> bool,
 ) -> Result<(bool, Value)> {
-    // A string the schema admits but that is no point in the group is no key's identifier.
-    let bound = point_from_text(bound_id)
-        .map_err(|_| PcsError::BoundKeyNotFound("boundId is not a PCS identifier".to_string()))?;
+    // A string the schema admits but that is no binding is no key's identifier. The binding
+    // names the period's key, under which the identifier is searched for (`BindingRef`).
+    let binding = BindingRef::from_text(bound_id)
+        .map_err(|_| PcsError::BoundKeyNotFound("boundId is not a PCS binding".to_string()))?;
+    let bound = binding.id;
     let _guard = write_lock().await;
     let existing = vetter_record(state, context_id, community).await?;
     if let Some(record) = &existing {
@@ -954,7 +971,7 @@ pub async fn vetter_recover(
         }
         let st = load_vetter_state(state, record).await?;
         // Rule 3: already the bound key.
-        if point_from_text(&record.id).is_ok_and(|p| p == bound) {
+        if BindingRef::from_text(&record.id).is_ok_and(|b| b.id == bound) {
             return Ok((false, vetter_summary(record, &st.snapshot, &st.enrolments)));
         }
         // Rule 4: anything a community issued to the current key.
@@ -980,7 +997,9 @@ pub async fn vetter_recover(
             "the context does not exist".to_string(),
         ));
     }
-    let ids = vti_vetting_pcs::scheme::MemberIds::for_community(community).map_err(proto)?;
+    let ids = MemberIds::for_period(community, &binding.hvk).map_err(|_| {
+        PcsError::BoundKeyNotFound("boundId names no helper key of this community".to_string())
+    })?;
     let skip = paths_held(state).await?;
     let outcome = super::key_custody::search_pcs_member_keys(
         &state.contexts_ks,
@@ -1019,7 +1038,7 @@ pub async fn vetter_recover(
         suite: SUITE.to_string(),
         path,
         seed_id,
-        id: point_text(&bound).map_err(proto)?,
+        id: bound_id.to_string(),
         created_at: existing.as_ref().map_or_else(Utc::now, |r| r.created_at),
     };
     let st = VetterState {
@@ -1122,11 +1141,14 @@ async fn load_applicant_state(
     .await
 }
 
-async fn load_applicant(
+/// What an application is rebuilt from: its key, derived again from its seed, and its state.
+/// The async half of [`load_applicant`]; nothing here borrows the community's parameters across
+/// an await.
+async fn load_applicant_parts(
     state: &AppState,
     caller: &Caller<'_>,
     record: &ApplicationRecord,
-) -> Result<ApplicantEngine> {
+) -> Result<(vti_vetting_pcs::scheme::Usk, ApplicantState)> {
     let st = load_applicant_state(state, record).await?;
     let seed = member_seed(
         state,
@@ -1136,15 +1158,33 @@ async fn load_applicant(
         record.seed_id,
     )
     .await?;
-    let (id, usk) = member_key_from_seed(&record.community, &seed).map_err(proto)?;
-    let mut snap = ApplicantSnapshot::new(&usk, &id, &record.join_did).map_err(proto)?;
+    let usk = member_key_from_seed(&record.community, &seed).map_err(proto)?;
+    Ok((usk, st))
+}
+
+/// The application's engine under the community's parameters.
+fn load_applicant(
+    record: &ApplicationRecord,
+    params: &CommunityParams,
+    usk: &vti_vetting_pcs::scheme::Usk,
+    st: ApplicantState,
+) -> Result<ApplicantEngine> {
+    // The application lives in one period: once its key is no longer published, nothing it
+    // holds can be proved any more.
+    let hvk = params
+        .hvk(&st.label)
+        .map_err(|e| PcsError::ParametersInvalid(e.to_string()))?;
+    let id = member_id(params.pcreds(), hvk, usk).map_err(proto)?;
+    let mut snap =
+        ApplicantSnapshot::new(usk, &st.label, &id, &record.join_did).map_err(proto)?;
     snap.held = st.held;
-    ApplicantEngine::restore(&snap).map_err(proto)
+    ApplicantEngine::restore(&snap, params).map_err(proto)
 }
 
 async fn save_applicant(
     state: &AppState,
     record: &ApplicationRecord,
+    label: &str,
     held: Vec<HeldAttestation>,
 ) -> Result<()> {
     store_secret_json(
@@ -1152,7 +1192,10 @@ async fn save_applicant(
         &app_key(&record.application_id),
         APPLICANT_STATE_TYPE,
         record.seed_id,
-        &ApplicantState { held },
+        &ApplicantState {
+            label: label.to_string(),
+            held,
+        },
     )
     .await
 }
@@ -1178,11 +1221,16 @@ pub async fn create_application(
         suite: SUITE.to_string(),
         path,
         seed_id,
-        id: point_text(engine.id()).map_err(proto)?,
+        // The application's attestation request, as every vetter receives it: the identifier
+        // with its proof of ownership (`ApplicantRef`).
+        id: engine
+            .reference(&params)
+            .and_then(|r| r.to_text())
+            .map_err(proto)?,
         created_at: Utc::now(),
     };
     let _guard = write_lock().await;
-    save_applicant(state, &record, Vec::new()).await?;
+    save_applicant(state, &record, engine.label(), Vec::new()).await?;
     state
         .pcs_engine_ks
         .insert(app_key(&record.application_id), &record)
@@ -1229,12 +1277,13 @@ pub async fn verify_attestation(
         .restore()
         .map_err(|e| PcsError::AttestationInvalid(e.to_string()))?;
     let _guard = write_lock().await;
-    let mut engine = load_applicant(state, caller, record).await?;
+    let (usk, st) = load_applicant_parts(state, caller, record).await?;
+    let mut engine = load_applicant(record, &params, &usk, st)?;
     engine
         .replace(&params, att)
         .map_err(|e| PcsError::AttestationInvalid(e.to_string()))?;
     let snap = engine.snapshot().map_err(proto)?;
-    save_applicant(state, record, snap.held.clone()).await?;
+    save_applicant(state, record, &snap.label, snap.held.clone()).await?;
     let accepted =
         serde_json::to_value(&held.meta).map_err(|e| AppError::Internal(e.to_string()))?;
     Ok((application_summary(record, &snap.held), accepted))
@@ -1250,7 +1299,8 @@ pub async fn prove(
     challenge: &str,
 ) -> Result<Value> {
     let params = community_params(&record.community, published)?;
-    let engine = load_applicant(state, caller, record).await?;
+    let (usk, st) = load_applicant_parts(state, caller, record).await?;
+    let engine = load_applicant(record, &params, &usk, st)?;
     if engine.usable(&params).map_err(proto)? == 0 {
         return Err(PcsError::NoUsableAttestation);
     }

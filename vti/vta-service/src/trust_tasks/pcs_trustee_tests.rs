@@ -26,6 +26,20 @@ static COMMUNITY_KEY: std::sync::LazyLock<(String, HolderKey)> =
 fn community() -> &'static str {
     &COMMUNITY_KEY.0
 }
+/// The voting parameters of `m`'s election: under `pcreds` every election has its own key.
+fn params_for(reg: &Registrar, m: &Value) -> Value {
+    json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&election_of(m)).unwrap() })
+}
+
+fn election_of(m: &Value) -> Election {
+    Election::new(
+        community(),
+        ElectionId::new(m["electionId"].as_str().unwrap()).unwrap(),
+        manifest_digest(m).unwrap(),
+    )
+    .unwrap()
+}
+
 const CTX: &str = "member";
 
 fn claims(did: &str) -> AuthClaims {
@@ -165,7 +179,7 @@ async fn authorize(
             .ok()
     })
     .await;
-    let closing = vti_voting::audit::decryption(m, &reg.params(), &entries, &proven)
+    let closing = vti_voting::audit::decryption(m, &reg.params(&election_of(m)), &entries, &proven)
         .unwrap()
         .expect("the board has closed");
     let size = closing.index as usize + 1;
@@ -231,7 +245,7 @@ async fn trustees_and_a_voter_run_a_sealed_election_through_the_vta() {
     let digest = manifest_digest(&m).unwrap();
     let mut rng = StdRng::seed_from_u64(0xC0);
     let reg = Registrar::generate(community(), &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
+    let params = params_for(&reg, &m);
     let mut bb = BallotBox::new(&box_did);
     let now = chrono::Utc::now;
     bb.register(
@@ -343,7 +357,7 @@ async fn trustees_and_a_voter_run_a_sealed_election_through_the_vta() {
         Election::new(community(), ElectionId::new("sealed-2027").unwrap(), digest).unwrap();
     let id =
         vti_vetting_pcs::scheme::point_from_text(first["request"]["id"].as_str().unwrap()).unwrap();
-    let request = serde_json::from_value(first["request"]["request"].clone()).unwrap();
+    let request = vti_vetting_pcs::issuer::request_from_value(&first["request"]["request"]).unwrap();
     let pre = vti_vetting_pcs::scheme::enc(
         &reg.issue_ticket(&election, &id, &request, &mut rng)
             .unwrap(),
@@ -724,7 +738,7 @@ async fn the_trustee_tasks_refuse_with_the_codes_their_specifications_declare() 
     // outside the window.
     let mut rng = StdRng::seed_from_u64(0xC1);
     let reg = Registrar::generate(community(), &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
+    let params = params_for(&reg, &m);
     let ve = |manifest: &Value, steps: &Value, ballot: Value| {
         doc(
             uris::TASK_VTA_PCS_VOTE_ENCRYPTED_0_5,
@@ -837,7 +851,7 @@ async fn a_trustee_reads_its_election_on_a_private_board_through_the_vta() {
         community(),
         &json!({ "community": community(), "manifest": m,
                  "manifestDigest": digest_multibase(&digest),
-                 "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() } }),
+                 "parameters": params_for(&reg, &m) }),
         chrono::Utc::now() - chrono::Duration::hours(2),
     )
     .unwrap();
@@ -951,7 +965,7 @@ async fn a_trustee_vta_acts_on_signed_steps_only() {
         community(),
         &json!({ "community": community(), "manifest": m,
                  "manifestDigest": digest_multibase(&digest),
-                 "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() } }),
+                 "parameters": params_for(&reg, &m) }),
         before,
     )
     .unwrap();

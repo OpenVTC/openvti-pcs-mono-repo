@@ -37,8 +37,8 @@ fn main() {
     let t = Instant::now();
     let reg = Registrar::derive(COMMUNITY, &[9; 32]).unwrap();
     let setup = t.elapsed();
-    let params = reg.params();
     let election = Election::new(COMMUNITY, ElectionId::new("bench").unwrap(), [1; 32]).unwrap();
+    let params = reg.params(&election);
 
     let (mut keygen, mut request, mut issue, mut accept, mut cast_t) = (
         Duration::ZERO,
@@ -62,13 +62,13 @@ fn main() {
 
         let t = Instant::now();
         let pre = reg
-            .issue_ticket(&election, voter.id(), &req, &mut rng)
+            .issue_ticket(&election, &voter.id(&params).unwrap(), &req, &mut rng)
             .unwrap();
         issue += t.elapsed();
 
         let t = Instant::now();
         let ticket = voter
-            .accept_ticket(&params, &election, &pre, &state)
+            .accept_ticket(&params, &election, &pre, state)
             .unwrap();
         accept += t.elapsed();
 

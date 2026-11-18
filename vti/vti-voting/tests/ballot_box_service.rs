@@ -24,7 +24,7 @@ fn a_restored_ballot_box_answers_as_the_original() {
         "community": COMMUNITY,
         "manifest": s.manifest,
         "manifestDigest": digest_multibase(&s.digest),
-        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": s.reg.public_text().unwrap() },
+        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": s.reg.public_text(&s.election()).unwrap() },
     });
     bb.register(COMMUNITY, &reg_payload, t("2026-10-30T00:00:00Z"))
         .unwrap();
@@ -114,7 +114,7 @@ fn setup(visibility: &str, revote: &str, early: bool) -> Setup {
         "community": COMMUNITY,
         "manifest": manifest,
         "manifestDigest": digest_multibase(&digest),
-        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() },
+        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&Election::new(COMMUNITY, ElectionId::new("agm-2027").unwrap(), digest).unwrap()).unwrap() },
     });
     let answer = bb
         .register(COMMUNITY, &payload, t("2026-10-30T00:00:00Z"))
@@ -139,13 +139,13 @@ impl Setup {
     }
 
     fn voter(&self, seed: u64) -> (Voter, Ticket) {
-        let params = self.reg.params();
+        let params = self.reg.params(&self.election());
         let mut r = StdRng::seed_from_u64(seed);
         let v = Voter::generate(&params, &mut r).unwrap();
         let e = self.election();
         let (req, st) = v.ticket_request(&params, &e, &mut r).unwrap();
-        let pre = self.reg.issue_ticket(&e, v.id(), &req, &mut r).unwrap();
-        let ticket = v.accept_ticket(&params, &e, &pre, &st).unwrap();
+        let pre = self.reg.issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let ticket = v.accept_ticket(&params, &e, &pre, st).unwrap();
         (v, ticket)
     }
 
@@ -166,7 +166,7 @@ impl Setup {
     fn cast_payload(&self, v: &Voter, ticket: &Ticket, ballot: &Value, seed: u64) -> Value {
         let cast = v
             .cast_wire(
-                &self.reg.params(),
+                &self.reg.params(&self.election()),
                 ticket,
                 ballot,
                 &mut StdRng::seed_from_u64(seed),
@@ -481,7 +481,7 @@ fn vot_012_013_only_the_community_registers_closes_or_cancels() {
         "community": COMMUNITY,
         "manifest": other,
         "manifestDigest": digest_multibase(&manifest_digest(&other).unwrap()),
-        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": s.reg.public_text().unwrap() },
+        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": s.reg.public_text(&s.election()).unwrap() },
     });
     assert_eq!(
         s.bb.register(COMMUNITY, &payload, now).unwrap_err().local,

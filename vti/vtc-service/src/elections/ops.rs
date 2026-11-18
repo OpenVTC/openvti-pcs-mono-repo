@@ -79,14 +79,37 @@ pub async fn registrar(state: &AppState) -> Result<Arc<Registrar>, AppError> {
         .cloned()
 }
 
-/// `VotingParameters`: what a member's agent takes a ticket under (VTI-VOT-020).
+/// The scheme's view of a stored election: the community, its identifier and its manifest
+/// digest.
 ///
 /// # Errors
-/// As [`registrar`].
-pub async fn parameters(state: &AppState) -> Result<Value, AppError> {
+/// [`AppError::Internal`] if the stored identifier or digest does not read.
+pub async fn election_of_record(
+    state: &AppState,
+    rec: &ElectionRecord,
+) -> Result<Election, AppError> {
+    let digest = rules::digest_from_multibase(&rec.manifest_digest)
+        .ok_or_else(|| AppError::Internal("a stored manifest digest does not decode".into()))?;
+    Election::new(
+        &community_did(state).await,
+        ElectionId::new(&rec.election_id)
+            .map_err(|e| AppError::Internal(format!("a stored election id: {e}")))?,
+        digest,
+    )
+    .map_err(|e| AppError::Internal(format!("election: {e}")))
+}
+
+/// `VotingParameters`: what a member's agent takes a ticket to `rec` under (VTI-VOT-020). Under
+/// `pcreds` every election has its own voting key (`vti_voting::scheme`), so these are the
+/// election's.
+///
+/// # Errors
+/// As [`registrar`] and [`election_of_record`].
+pub async fn parameters(state: &AppState, rec: &ElectionRecord) -> Result<Value, AppError> {
     let reg = registrar(state).await?;
+    let election = election_of_record(state, rec).await?;
     let key = reg
-        .public_text()
+        .public_text(&election)
         .map_err(|e| AppError::Internal(format!("encode the voting key: {e}")))?;
     Ok(json!({ "suite": SUITE, "votingKey": key }))
 }
@@ -405,7 +428,7 @@ pub async fn deliver_registration(
         "community": community_did(state).await,
         "manifest": rec.manifest,
         "manifestDigest": rec.manifest_digest,
-        "parameters": parameters(state).await?,
+        "parameters": parameters(state, &rec).await?,
     });
     let answer = match state.elections.link() {
         Some(link) => {
@@ -711,7 +734,7 @@ pub async fn issue_ticket(
         vti_vetting_pcs::scheme::point_from_text(ask.request["id"].as_str().unwrap_or_default())
             .map_err(|e| IssueError::RequestInvalid(format!("id: {e}")))?;
     let request: vti_voting::voter::TicketRequest =
-        serde_json::from_value(ask.request["request"].clone())
+        vti_vetting_pcs::issuer::request_from_value(&ask.request["request"])
             .map_err(|e| IssueError::RequestInvalid(format!("request: {e}")))?;
     let digest = rules::digest_from_multibase(&rec.manifest_digest)
         .ok_or_else(|| AppError::Internal("a stored manifest digest does not decode".into()))?;
@@ -1101,9 +1124,12 @@ pub async fn authorize_decryption(state: &AppState, election_id: &str) {
     let Ok(reg) = registrar(state).await else {
         return;
     };
+    let Ok(election) = election_of_record(state, &rec).await else {
+        return;
+    };
     let closing = match vti_voting::audit::decryption(
         &rec.manifest,
-        &reg.params(),
+        &reg.params(&election),
         &entries,
         &proven,
     ) {
@@ -1308,7 +1334,10 @@ pub async fn verify(
         .filter_map(|c| HeadRef::from_wire(&c["head"]).ok())
         .collect();
     let reg = registrar(state).await?;
-    let params = reg.params();
+    let election = election_of_record(state, rec)
+        .await
+        .map_err(CertifyError::App)?;
+    let params = reg.params(&election);
     vti_voting::audit::audit(Evidence {
         manifest: &rec.manifest,
         params: &params,

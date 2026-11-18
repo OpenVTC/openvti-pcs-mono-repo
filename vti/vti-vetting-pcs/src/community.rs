@@ -6,76 +6,89 @@
 //! manifest published (`vetting.ext`, design §8). The community's own copy is
 //! [`Vtc::params`](crate::vtc::Vtc::params), so the tests drive the same code path a client
 //! does.
+//!
+//! One helper key per live vetter label and one token key per live token label
+//! ([`crate::scheme`], "Published keys on the wire").
 
-use predicate_credential_system::{
-    pcs::{Predicate, PredicateCredentialSystem, SetupParams},
-    serialization::{from_bytes, from_multibase},
-};
+use std::collections::BTreeMap;
 
 use crate::{
     ProtoError,
-    scheme::{Fr, Hvk, Open, deployment_label},
+    scheme::{CheckedHvk, Hvk, Pcreds, Tvk, keys_from_text, pcreds},
     token::{TokenSpend, TokenVerifier},
 };
 
 /// The published half of a community's hidden-vetting deployment.
 pub struct CommunityParams {
     community: String,
-    open: Open,
-    hvk: Hvk,
+    pcreds: Pcreds,
+    /// Live vetter labels, current first, each with its checked helper key.
+    periods: Vec<(String, CheckedHvk)>,
     tokens: TokenVerifier,
-    /// Live vetter class labels, current first, exactly as published (`vetter/2026-10`).
-    vetter_labels: Vec<String>,
     /// How many tokens a vetter may draw per tick. Published because the vetter has to know
     /// what to ask for, and because the community enforces it whatever the vetter asks.
     drip_per_tick: usize,
 }
 
 impl CommunityParams {
-    /// From what a manifest carries: the two verification keys as multibase, and the live
-    /// labels.
+    /// From what a manifest carries: the two key lists as multibase, and the live labels they
+    /// are aligned with.
     ///
     /// # Errors
-    /// [`ProtoError::Serialization`] if a key cannot be decoded, or the deployment parameters
-    /// cannot be derived.
+    /// [`ProtoError::Serialization`] if a key list cannot be decoded or does not match its
+    /// labels, [`ProtoError::Pcs`] if a helper key is not a key of this deployment.
     pub fn published(
         community: &str,
-        hvk: &str,
-        tvk: &str,
+        helper_keys: &str,
+        token_keys: &str,
         vetter_labels: Vec<String>,
         token_labels: Vec<String>,
         drip_per_tick: usize,
     ) -> Result<Self, ProtoError> {
-        let hvk: Hvk = from_bytes(&from_multibase(hvk)?)?;
-        let tvk = from_bytes(&from_multibase(tvk)?)?;
-        Self::new(
-            community,
-            hvk,
-            tvk,
-            vetter_labels,
-            token_labels,
-            drip_per_tick,
-        )
+        let hvks: Vec<Hvk> = keys_from_text(helper_keys)?;
+        let tvks: Vec<Tvk> = keys_from_text(token_keys)?;
+        Self::new(community, hvks, tvks, vetter_labels, token_labels, drip_per_tick)
     }
 
-    /// From values already decoded.
+    /// From values already decoded: `hvks[i]` is the key of `vetter_labels[i]`, and `tvks[i]`
+    /// of `token_labels[i]`.
     ///
     /// # Errors
-    /// [`ProtoError::Pcs`] if the deployment parameters cannot be derived from the label.
+    /// [`ProtoError::Serialization`] if a list does not match its labels, [`ProtoError::Pcs`]
+    /// if the deployment parameters cannot be derived or a helper key is not one of its keys.
     pub fn new(
         community: &str,
-        hvk: Hvk,
-        tvk: <crate::scheme::Base as predicate_credential_system::cred::CredentialBase>::VerificationKey,
+        hvks: Vec<Hvk>,
+        tvks: Vec<Tvk>,
         vetter_labels: Vec<String>,
         token_labels: Vec<String>,
         drip_per_tick: usize,
     ) -> Result<Self, ProtoError> {
+        if hvks.len() != vetter_labels.len() {
+            return Err(ProtoError::Serialization(format!(
+                "{} helper keys for {} vetter labels",
+                hvks.len(),
+                vetter_labels.len()
+            )));
+        }
+        if tvks.len() != token_labels.len() {
+            return Err(ProtoError::Serialization(format!(
+                "{} token keys for {} token labels",
+                tvks.len(),
+                token_labels.len()
+            )));
+        }
+        let pcreds = pcreds(community)?;
+        let periods = vetter_labels
+            .into_iter()
+            .zip(hvks)
+            .map(|(label, vk)| Ok((label, pcreds.helper_key(&vk)?)))
+            .collect::<Result<Vec<_>, ProtoError>>()?;
         Ok(Self {
             community: community.to_string(),
-            open: Open::setup(SetupParams::new(deployment_label(community)))?,
-            hvk,
-            tokens: TokenVerifier::new(community, tvk, token_labels)?,
-            vetter_labels,
+            pcreds,
+            periods,
+            tokens: TokenVerifier::new(token_labels.into_iter().zip(tvks)),
             drip_per_tick,
         })
     }
@@ -83,18 +96,47 @@ impl CommunityParams {
     pub fn community(&self) -> &str {
         &self.community
     }
-    pub fn open(&self) -> &Open {
-        &self.open
+    pub fn pcreds(&self) -> &Pcreds {
+        &self.pcreds
     }
-    pub fn hvk(&self) -> &Hvk {
-        &self.hvk
+    /// The scheme instance, by its earlier name.
+    pub fn open(&self) -> &Pcreds {
+        &self.pcreds
+    }
+    /// The checked helper key of a live vetter label (`vetter/<period>`).
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if the label is not live.
+    pub fn hvk(&self, label: &str) -> Result<&CheckedHvk, ProtoError> {
+        self.periods
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, k)| k)
+            .ok_or_else(|| ProtoError::PeriodNotLive(label.to_string()))
+    }
+    /// The current vetter label: the first published.
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if no label is live.
+    pub fn current_label(&self) -> Result<&str, ProtoError> {
+        self.periods
+            .first()
+            .map(|(l, _)| l.as_str())
+            .ok_or_else(|| ProtoError::PeriodNotLive("(none)".into()))
     }
     pub fn tokens(&self) -> &TokenVerifier {
         &self.tokens
     }
     /// Live vetter labels, current first.
-    pub fn vetter_labels(&self) -> &[String] {
-        &self.vetter_labels
+    pub fn vetter_labels(&self) -> Vec<String> {
+        self.periods.iter().map(|(l, _)| l.clone()).collect()
+    }
+    /// The live vetter labels with their keys, current first.
+    pub fn helper_keys(&self) -> BTreeMap<String, Hvk> {
+        self.periods
+            .iter()
+            .map(|(l, k)| (l.clone(), k.vk().clone()))
+            .collect()
     }
     /// The published drip rate: what a vetter asks for each tick, and the most the community
     /// will sign.
@@ -102,26 +144,10 @@ impl CommunityParams {
         self.drip_per_tick
     }
 
-    /// The root predicate of a published vetter label.
-    pub fn vetter_predicate(label: &str) -> Predicate {
-        Predicate::root(label.as_bytes().to_vec())
-    }
-
-    /// `φ` of every live vetter label: what a client checks an attestation's class against.
+    /// Whether a token verifies under the published key of a live label.
     ///
     /// # Errors
-    /// [`ProtoError::Pcs`] if a label cannot be encoded.
-    pub fn live_phis(&self) -> Result<Vec<Fr>, ProtoError> {
-        self.vetter_labels
-            .iter()
-            .map(|l| Ok(self.open.enc_pred(&Self::vetter_predicate(l))?))
-            .collect()
-    }
-
-    /// Whether a token verifies under the published token key and a live label.
-    ///
-    /// # Errors
-    /// [`ProtoError::Pcs`] if the label's `φ` cannot be derived.
+    /// Never, today; kept fallible for a key that has to be decoded on use.
     pub fn token_ok(&self, spend: &TokenSpend) -> Result<bool, ProtoError> {
         self.tokens.signature_ok(spend)
     }

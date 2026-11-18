@@ -44,7 +44,7 @@ use vti_vetting_pcs::{
         DripOrder, Issuer, RootCredentialWire, RootRequestWire, TokenBatchRequestWire,
         TokenBatchWire,
     },
-    scheme::{Base, E, point_from_text},
+    scheme::BindingRef,
     token::TokenVerifier,
 };
 
@@ -433,7 +433,7 @@ pub fn publish(
     drip_per_tick: usize,
 ) -> Result<HiddenVettingConfig, AppError> {
     let (hvk, tvk) = derive_issuer(state, community_did)?
-        .public_text()
+        .public_text(&live_periods, &live_token_labels)
         .map_err(|e| AppError::Internal(format!("encode hidden-vetting keys: {e}")))?;
     Ok(HiddenVettingConfig {
         suite: vti_vetting_pcs::wire::SUITE.to_string(),
@@ -447,6 +447,37 @@ pub fn publish(
         // running (§5.1), never a state it is published into.
         events: Vec::new(),
     })
+}
+
+/// Whether two configurations publish the same key for every label they share. Under `pcreds`
+/// each vetter period and each token label has its own key, so a rotation changes the published
+/// key lists without any key changing; a key that differs for a label both still publish means
+/// the keys were derived from another master secret.
+#[must_use]
+pub fn same_keys(stored: &HiddenVettingConfig, fresh: &HiddenVettingConfig) -> bool {
+    use std::collections::BTreeMap;
+    use vti_vetting_pcs::scheme::{Hvk, Tvk, keys_from_text};
+    fn by_label<K: vti_vetting_pcs::scheme::CanonicalDeserialize + PartialEq>(
+        labels: &[String],
+        keys: &str,
+    ) -> Option<BTreeMap<String, K>> {
+        let keys: Vec<K> = keys_from_text(keys).ok()?;
+        (keys.len() == labels.len()).then(|| labels.iter().cloned().zip(keys).collect())
+    }
+    let (Some(a), Some(b)) = (
+        by_label::<Hvk>(&stored.live_periods, &stored.hvk),
+        by_label::<Hvk>(&fresh.live_periods, &fresh.hvk),
+    ) else {
+        return false;
+    };
+    let (Some(c), Some(d)) = (
+        by_label::<Tvk>(&stored.live_token_labels, &stored.tvk),
+        by_label::<Tvk>(&fresh.live_token_labels, &fresh.tvk),
+    ) else {
+        return false;
+    };
+    a.iter().all(|(l, k)| b.get(l).is_none_or(|k2| k2 == k))
+        && c.iter().all(|(l, k)| d.get(l).is_none_or(|k2| k2 == k))
 }
 
 /// This community's issuer, derived and then checked against what it published.
@@ -464,7 +495,7 @@ pub fn issuer(
 ) -> Result<Issuer, AppError> {
     let issuer = derive_issuer(state, community_did)?;
     let (hvk, tvk) = issuer
-        .public_text()
+        .public_text(&config.live_periods, &config.live_token_labels)
         .map_err(|e| AppError::Internal(format!("encode hidden-vetting keys: {e}")))?;
     if hvk != config.hvk || tvk != config.tvk {
         return Err(AppError::Internal(
@@ -554,11 +585,36 @@ pub async fn enrol(
         .get(enrol_key(member_did))
         .await?
         .unwrap_or_default();
-    // The identifier first: every answer below depends on it. A member asking under a label
-    // they hold, with another identifier, has not lost an answer — they have a second key, and
-    // a second key is the thing that would count twice.
+    let (id, parsed) = request
+        .parse()
+        .map_err(|e| AppError::Validation(format!("root request: {e}")))?;
+    // What the community binds: the identifier under this period's key, with the key
+    // (`BindingRef`), so that a member's agent can search for the key behind it.
+    let binding = BindingRef {
+        label: label.clone(),
+        hvk: derive_issuer(state, community_did)?.hvk(period),
+        id,
+    }
+    .to_text()
+    .map_err(|e| AppError::Internal(format!("encode the binding: {e}")))?;
+    // The identifier first: every answer below depends on it. Under `pcreds` an identifier is
+    // one period's (a period is a helper key), so the comparison is with the identifier bound
+    // under THIS label: a member asking under a label they hold, with another identifier, has
+    // not lost an answer — they have a second key in one period, and that is the thing that
+    // would count twice. A new period binds a new identifier; no request spans two periods.
+    //
+    // A pending reset (pcs-binding/reset/0.1) keeps its published rule: the administrator has
+    // declared the bound key lost, and a new key is bound in its place — labels afresh, the old
+    // ones retired — only once none of the old key's labels is live.
+    let bound_here = BindingRef::from_text(&record.id)
+        .ok()
+        .filter(|b| b.label == label);
+    let differs = match &bound_here {
+        Some(b) => b.id != id,
+        None => !record.id.is_empty() && record.reset.is_some(),
+    };
     let mut rebind = false;
-    if !record.id.is_empty() && record.id != request.id {
+    if differs {
         if record.reset.is_none() {
             return Err(AppError::Validation(format!(
                 "{member_did} is bound to another PCS identifier; a member holds one. Read the \
@@ -595,22 +651,16 @@ pub async fn enrol(
         }
     }
 
-    let id = point_from_text(&request.id)
-        .map_err(|e| AppError::Validation(format!("PCS identifier: {e}")))?;
-    let parsed = serde_json::from_value(request.request.clone())
-        .map_err(|e| AppError::Validation(format!("root request: {e}")))?;
     let pre = issuer(state, community_did, config)?
         .issue_root(
+            member_did,
             period,
-            &id,
             &parsed,
             &mut vti_vetting_pcs::rand::rngs::OsRng,
         )
         .map_err(|e| AppError::Validation(format!("root request does not verify: {e}")))?;
-    let pre_credential = vti_vetting_pcs::scheme::enc::<
-        <Base as predicate_credential_system::cred::CredentialBase>::PreCredential,
-    >(&pre)
-    .map_err(|e| AppError::Internal(format!("encode pre-credential: {e}")))?;
+    let pre_credential = vti_vetting_pcs::scheme::enc(&pre)
+        .map_err(|e| AppError::Internal(format!("encode pre-credential: {e}")))?;
 
     // A reset the member's own recorded identifier answers is cancelled: the key was found
     // (rule 1). Audited beside the enrolment it rode on.
@@ -624,7 +674,7 @@ pub async fn enrol(
                 record.retired_labels.push(l.clone());
             }
         }
-        record.id = request.id.clone();
+        record.id = binding.clone();
         record.labels.push((label.clone(), now));
         record.reissues.clear();
         record.reset = None;
@@ -641,7 +691,7 @@ pub async fn enrol(
         })
     } else {
         let rotation = !record.labels.is_empty();
-        record.id = request.id.clone();
+        record.id = binding.clone();
         record.labels.push((label.clone(), now));
         AuditEvent::HiddenVetterEnrolled(HiddenVetterEnrolledData {
             label: label.clone(),
@@ -764,11 +814,11 @@ pub async fn drip(
 
     let issuer = issuer(state, community_did, config)?;
     let verifier = TokenVerifier::new(
-        community_did,
-        issuer.tvk().clone(),
-        config.live_token_labels.clone(),
-    )
-    .map_err(|e| AppError::Internal(format!("token parameters: {e}")))?;
+        config
+            .live_token_labels
+            .iter()
+            .map(|l| (l.clone(), issuer.tvk(l))),
+    );
     let pres = issuer
         .issue_tokens(
             &verifier,
@@ -783,15 +833,11 @@ pub async fn drip(
         )
         .map_err(|e| AppError::Validation(format!("drip refused: {e}")))?;
 
-    let pre_credentials =
-        pres.iter()
-            .map(
-                vti_vetting_pcs::scheme::enc::<
-                    predicate_credential_system::cred::ps::PSPreCredential<E>,
-                >,
-            )
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| AppError::Internal(format!("encode token: {e}")))?;
+    let pre_credentials = pres
+        .iter()
+        .map(vti_vetting_pcs::scheme::enc)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| AppError::Internal(format!("encode token: {e}")))?;
 
     // Recorded after signing, for the same reason enrolment is: losing the row costs the
     // community a repeated tick, never a vetter their quota. A concurrent second request for
@@ -833,14 +879,15 @@ pub async fn drip(
 mod tests {
     use super::*;
 
-    use predicate_credential_system::pcs::PredicateCredentialSystem;
+    use predicate_credential_system::pcreds::Backend;
     use serde_json::json;
     use uuid::Uuid;
     use vti_vetting_pcs::rand::{SeedableRng, rngs::StdRng};
     use vti_vetting_pcs::{
         issuer::TokenRequestWire,
-        scheme::{point_text, vetter_predicate},
+        scheme::{Bk, Usk, enrolment_ssid, member, point_text, vetter_label},
         token::TokenWallet,
+        vetter::EnrolmentBlinding,
     };
 
     use crate::endorsements::VETTER_GRANT_ROW_TYPE;
@@ -879,55 +926,56 @@ mod tests {
             .unwrap();
     }
 
-    /// The vetter's half of enrolment: a key of its own, and a blinded request for the label.
-    /// (`VetterEngine` on the openvtc branch does exactly this; here it is inline, because the
-    /// member side does not live in this workspace.)
+    /// The vetter's half of enrolment: a key of its own, and a blinded root request for the
+    /// period — the `pcreds` credential request with no attestations that
+    /// `vti_vetting_pcs::vetter::VetterEngine` makes, inline so the test holds the key.
     struct VetterSide {
         wire: RootRequestWire,
-        id: vti_vetting_pcs::scheme::G1,
-        usk: predicate_credential_system::pcs::UserSecretKey<E>,
-        blinding: predicate_credential_system::pcs::IssuanceState<E, Base>,
+        usk: Usk,
+        blinding: EnrolmentBlinding,
+        period: String,
     }
 
     impl VetterSide {
-        /// A request for `period` from a key the vetter already has — what a rotation looks
-        /// like from the member's side: same `usk`, same identifier, new label.
-        fn again(
-            issuer: &Issuer,
-            period: &str,
-            id: vti_vetting_pcs::scheme::G1,
-            usk: predicate_credential_system::pcs::UserSecretKey<E>,
-            rng: &mut StdRng,
-        ) -> Self {
-            let f = vetter_predicate(period);
-            let (request, blinding) = issuer
-                .open()
-                .root_request(issuer.hvk(), &f, &id, &usk, rng)
+        /// A request for `period` from a key the vetter already has.
+        fn again(issuer: &Issuer, period: &str, usk: Usk, rng: &mut StdRng) -> Self {
+            let pcreds = issuer.pcreds();
+            let hvk = pcreds.helper_key(&issuer.hvk(period)).unwrap();
+            let user = member(pcreds, &hvk, &usk).unwrap();
+            let ssid = enrolment_ssid(COMMUNITY, VETTER, period);
+            let (request, blinding) = pcreds
+                .request_credential(&hvk, &user, Vec::new(), &ssid, rng)
                 .unwrap();
             Self {
-                wire: RootRequestWire {
-                    label: format!("vetter/{period}"),
-                    id: point_text(&id).unwrap(),
-                    request: serde_json::to_value(&request).unwrap(),
-                },
-                id,
+                wire: RootRequestWire::of(&vetter_label(period), &request).unwrap(),
                 usk,
                 blinding,
+                period: period.to_string(),
             }
+        }
+
+        /// The community's answer, unblinded into a credential on this key.
+        fn unblind(self, issuer: &Issuer, answer: &RootCredentialWire) {
+            let pcreds = issuer.pcreds();
+            let hvk = pcreds.helper_key(&issuer.hvk(&self.period)).unwrap();
+            let user = member(pcreds, &hvk, &self.usk).unwrap();
+            let pre = vti_vetting_pcs::scheme::dec(&answer.pre_credential).unwrap();
+            pcreds
+                .unblind(&hvk, &user, &pre, self.blinding)
+                .expect("what the community signed unblinds into a usable credential");
         }
     }
 
-    /// The same secret key again. `UserSecretKey` is deliberately not `Clone`; a test that plays
-    /// one vetter asking twice needs it twice, so it goes through its canonical encoding.
-    fn copy_usk(
-        usk: &predicate_credential_system::pcs::UserSecretKey<E>,
-    ) -> predicate_credential_system::pcs::UserSecretKey<E> {
-        vti_vetting_pcs::scheme::dec(&vti_vetting_pcs::scheme::enc(usk).unwrap()).unwrap()
+    /// A fresh key, and a request for `period` from it. (The member is `VETTER`: a root request
+    /// is bound to the member it is made for.)
+    fn root_request(issuer: &Issuer, period: &str, rng: &mut StdRng) -> VetterSide {
+        let usk = <Bk as Backend>::tag_keygen(issuer.pcreds().params(), rng);
+        VetterSide::again(issuer, period, usk, rng)
     }
 
-    fn root_request(issuer: &Issuer, period: &str, rng: &mut StdRng) -> VetterSide {
-        let (id, usk) = issuer.open().user_keygen(rng).unwrap();
-        VetterSide::again(issuer, period, id, usk, rng)
+    /// The identifier a record binds, as the root request wrote it.
+    fn bound_id(record: &EnrolmentRecord) -> String {
+        point_text(&BindingRef::from_text(&record.id).unwrap().id).unwrap()
     }
 
     /// The whole minting half, against the real store: who may enrol, once per label, one
@@ -984,17 +1032,9 @@ mod tests {
             spec::Response::validate_value(&serde_json::to_value(&answer).unwrap())
                 .expect("the community's answer is what the specification describes");
         }
-        let pre = vti_vetting_pcs::scheme::dec(&answer.pre_credential).unwrap();
-        issuer
-            .open()
-            .unblind(
-                issuer.hvk(),
-                &vetter.usk,
-                &vetter_predicate(PERIOD),
-                &pre,
-                &vetter.blinding,
-            )
-            .expect("what the community signed unblinds into a usable credential");
+        let req = &req.clone();
+        let vetter_usk = vetter.usk;
+        vetter.unblind(&issuer, &answer);
 
         // Twice under one label, with the same identifier, is a re-issue — a client that lost
         // the answer — and adds no vetter: the enrolment count is still one.
@@ -1009,9 +1049,9 @@ mod tests {
             1
         );
 
-        // Next period, the same member may enrol again — and only with the identifier they
-        // were bound to. A second identifier would hold two class credentials at once and
-        // count twice in one proof (§13 C2).
+        // Next period, the same member enrols again. Under `pcreds` a period is a helper key, so
+        // its identifier is a new one whatever key it is on — no request spans two periods —
+        // and the binding is per period: a second identifier IN that period is the one refused.
         const NEXT: &str = "2026-10";
         let rotated = publish(
             &state,
@@ -1021,22 +1061,7 @@ mod tests {
             3,
         )
         .unwrap();
-        let stranger_key = root_request(&issuer, NEXT, &mut rng);
-        let err = enrol(
-            &state,
-            COMMUNITY,
-            &rotated,
-            VETTER,
-            &stranger_key.wire,
-            Utc::now(),
-        )
-        .await
-        .expect_err("a member holds one identifier");
-        assert!(
-            format!("{err}").contains("bound to another PCS identifier"),
-            "{err}"
-        );
-        let same_key = VetterSide::again(&issuer, NEXT, vetter.id, vetter.usk, &mut rng);
+        let same_key = VetterSide::again(&issuer, NEXT, vetter_usk, &mut rng);
         enrol(
             &state,
             COMMUNITY,
@@ -1046,12 +1071,28 @@ mod tests {
             Utc::now(),
         )
         .await
-        .expect("a rotation re-issues to the same identifier");
+        .expect("a new period enrols the member again");
+        let second_key = root_request(&issuer, NEXT, &mut rng);
+        let err = enrol(
+            &state,
+            COMMUNITY,
+            &rotated,
+            VETTER,
+            &second_key.wire,
+            Utc::now(),
+        )
+        .await
+        .expect_err("a member holds one identifier per period");
+        assert!(
+            format!("{err}").contains("bound to another PCS identifier"),
+            "{err}"
+        );
 
         // The drip: the published rate, once a tick, and what comes back unblinds.
-        let mut wallet = TokenWallet::new(COMMUNITY).unwrap();
+        let tvk = issuer.tvk(TOKEN_LABEL);
+        let mut wallet = TokenWallet::new();
         let requests = wallet
-            .prepare(issuer.tvk(), TOKEN_LABEL, VETTER, 1, 3, &mut rng)
+            .prepare(&tvk, TOKEN_LABEL, VETTER, 1, 3, &mut rng)
             .unwrap();
         let batch = TokenBatchRequestWire {
             label: TOKEN_LABEL.to_string(),
@@ -1079,7 +1120,7 @@ mod tests {
             .map(|p| vti_vetting_pcs::scheme::dec(p).unwrap())
             .collect::<Vec<_>>();
         wallet
-            .receive(issuer.tvk(), TOKEN_LABEL, 1, &pres)
+            .receive(&tvk, TOKEN_LABEL, 1, &pres)
             .expect("the tokens unblind under the published key");
         assert_eq!(wallet.free(), 3);
 
@@ -1091,7 +1132,7 @@ mod tests {
 
         // And more than the published rate is refused, whatever the vetter asks for.
         let greedy = wallet
-            .prepare(issuer.tvk(), TOKEN_LABEL, VETTER, 2, 9, &mut rng)
+            .prepare(&tvk, TOKEN_LABEL, VETTER, 2, 9, &mut rng)
             .unwrap();
         let err = drip(
             &state,
@@ -1144,10 +1185,11 @@ mod tests {
             .await
             .expect("first enrolment");
         // The tick the vetter drew before losing it.
-        let mut wallet = TokenWallet::new(COMMUNITY).unwrap();
+        let tvk = issuer.tvk(TOKEN_LABEL);
+        let mut wallet = TokenWallet::new();
         let tick = |wallet: &mut TokenWallet, tick: u32, n: usize, rng: &mut StdRng| {
             let requests = wallet
-                .prepare(issuer.tvk(), TOKEN_LABEL, VETTER, tick, n, rng)
+                .prepare(&tvk, TOKEN_LABEL, VETTER, tick, n, rng)
                 .unwrap();
             TokenBatchRequestWire {
                 label: TOKEN_LABEL.to_string(),
@@ -1176,8 +1218,7 @@ mod tests {
         // The same identifier, fresh blinding: re-issued, and it unblinds into a credential on
         // the same key — so every tag it makes is the tag the first one would have made.
         for n in 1..=MAX_REISSUES_PER_LABEL {
-            let again =
-                VetterSide::again(&issuer, PERIOD, first.id, copy_usk(&first.usk), &mut rng);
+            let again = VetterSide::again(&issuer, PERIOD, first.usk, &mut rng);
             let answer = enrol(&state, COMMUNITY, &config, VETTER, &again.wire, Utc::now())
                 .await
                 .unwrap_or_else(|e| panic!("re-issue {n}: {e}"));
@@ -1188,17 +1229,7 @@ mod tests {
                 spec::Response::validate_value(&serde_json::to_value(&answer).unwrap())
                     .expect("a re-issue answers in the first enrolment's shape");
             }
-            let pre = vti_vetting_pcs::scheme::dec(&answer.pre_credential).unwrap();
-            issuer
-                .open()
-                .unblind(
-                    issuer.hvk(),
-                    &again.usk,
-                    &vetter_predicate(PERIOD),
-                    &pre,
-                    &again.blinding,
-                )
-                .expect("the re-issued answer unblinds");
+            again.unblind(&issuer, &answer);
 
             let record: EnrolmentRecord = state
                 .vetting_pcs_issue_ks
@@ -1208,11 +1239,11 @@ mod tests {
                 .unwrap();
             assert_eq!(record.reissued(&label), n, "the count is the store's");
             assert_eq!(record.labels.len(), 1, "the label is recorded once");
-            assert_eq!(record.id, first.wire.id);
+            assert_eq!(bound_id(&record), first.wire.id);
         }
 
         // The bound: past it, the member is refused as before, under the declared code.
-        let again = VetterSide::again(&issuer, PERIOD, first.id, copy_usk(&first.usk), &mut rng);
+        let again = VetterSide::again(&issuer, PERIOD, first.usk, &mut rng);
         let err = enrol(&state, COMMUNITY, &config, VETTER, &again.wire, Utc::now())
             .await
             .expect_err("re-issues are bounded");
@@ -1277,8 +1308,6 @@ mod tests {
 
     const ADMIN: &str = "did:key:z6MkAdmin";
     const OCT: &str = "2026-10";
-    const NOV: &str = "2026-11";
-    const DEC: &str = "2026-12";
 
     /// pcs-binding/reset/0.1: nothing to reset for a member who never enrolled; a repeated reset
     /// is the first one; and the member's own identifier, found again, cancels it.
@@ -1319,28 +1348,30 @@ mod tests {
         assert_eq!(again_at, at, "the first reset's time, unchanged");
         assert_eq!(audit_count(&state, "HiddenVetterBindingReset").await, 1);
         let record = record_of(&state, VETTER).await;
-        assert_eq!(record.id, first.wire.id, "the recorded identifier stays");
+        assert_eq!(bound_id(&record), first.wire.id, "the recorded identifier stays");
         assert_eq!(record.reset.as_ref().unwrap().reset_by, ADMIN);
 
         // The key was found: the recorded identifier enrols as if there were no reset — here a
         // re-issue under the label it holds — and the reset is gone.
-        let found = VetterSide::again(&issuer, PERIOD, first.id, copy_usk(&first.usk), &mut rng);
+        let found = VetterSide::again(&issuer, PERIOD, first.usk, &mut rng);
         enrol(&state, COMMUNITY, &config, VETTER, &found.wire, Utc::now())
             .await
             .expect("the recorded identifier enrols after a reset");
         let record = record_of(&state, VETTER).await;
         assert!(record.reset.is_none(), "the reset is cleared");
-        assert_eq!(record.id, first.wire.id);
+        assert_eq!(bound_id(&record), first.wire.id);
         assert_eq!(record.reissued(&format!("vetter/{PERIOD}")), 1);
         assert_eq!(audit_count(&state, "HiddenVetterResetCancelled").await, 1);
     }
 
-    /// pcs-binding/reset/0.1, "Enrolment after a reset": a new identifier is refused while any
-    /// label the old one enrolled under is live — judged at each request, so turning the old
-    /// label live again keeps refusing — and bound once none is, its labels afresh, the old ones
-    /// retired for good.
+    /// Under `pcreds` an identifier is one period's (a period is a helper key), so the binding is
+    /// per period: a second identifier in a period is refused, and the next period binds the
+    /// member's identifier under its own key. A reset (pcs-binding/reset/0.1) keeps its rule: a
+    /// new key is bound in place of a lost one only once none of the old key's labels is live,
+    /// labels afresh, the old ones retired for good.
     #[tokio::test]
-    async fn a_new_identifier_is_bound_only_once_the_old_labels_are_gone() {
+    async fn the_binding_is_per_period_and_a_reset_waits_for_the_old_labels() {
+        const NOV: &str = "2026-11";
         let tv = TestVtc::builder()
             .vtc_did(COMMUNITY)
             .with_signers(true)
@@ -1353,20 +1384,15 @@ mod tests {
         let issuer = issuer(&state, COMMUNITY, &sep).unwrap();
         grant_vetter(&state, VETTER).await;
 
-        // Enrolled under September and October with one key, which is then lost.
+        // Enrolled under September.
         let old = root_request(&issuer, PERIOD, &mut rng);
         enrol(&state, COMMUNITY, &sep, VETTER, &old.wire, Utc::now())
             .await
             .unwrap();
-        let oct = live(&state, &[OCT, PERIOD]);
-        let old_oct = VetterSide::again(&issuer, OCT, old.id, copy_usk(&old.usk), &mut rng);
-        enrol(&state, COMMUNITY, &oct, VETTER, &old_oct.wire, Utc::now())
-            .await
-            .unwrap();
-
-        // Without a reset, a new key is refused as it always was.
-        let new_oct = root_request(&issuer, OCT, &mut rng);
-        let err = enrol(&state, COMMUNITY, &oct, VETTER, &new_oct.wire, Utc::now())
+        // A second key in September is refused: two credentials of one period would count twice
+        // in one request.
+        let second = root_request(&issuer, PERIOD, &mut rng);
+        let err = enrol(&state, COMMUNITY, &sep, VETTER, &second.wire, Utc::now())
             .await
             .expect_err("bound");
         assert!(
@@ -1374,6 +1400,25 @@ mod tests {
             "{err}"
         );
 
+        // October: a new period binds the member's identifier under October's key, whatever key.
+        let oct = live(&state, &[OCT, PERIOD]);
+        let oct_key = root_request(&issuer, OCT, &mut rng);
+        enrol(&state, COMMUNITY, &oct, VETTER, &oct_key.wire, Utc::now())
+            .await
+            .expect("a new period binds afresh");
+        let record = record_of(&state, VETTER).await;
+        assert_eq!(bound_id(&record), oct_key.wire.id);
+        assert_eq!(
+            BindingRef::from_text(&record.id).unwrap().label,
+            format!("vetter/{OCT}")
+        );
+        // ... and within October that identifier is the only one.
+        let stale = VetterSide::again(&issuer, OCT, old.usk, &mut rng);
+        enrol(&state, COMMUNITY, &oct, VETTER, &stale.wire, Utc::now())
+            .await
+            .expect_err("the September key is not October's");
+
+        // The October key is lost and reset: a new key waits for every label the old one holds.
         let (_, waiting) = reset_binding(
             &state,
             VETTER,
@@ -1388,64 +1433,31 @@ mod tests {
             waiting,
             vec![format!("vetter/{PERIOD}"), format!("vetter/{OCT}")]
         );
-
-        // November, October still live: the new key is still refused, under the same refusal
-        // (`identifierRebound`), naming what it waits on.
         let nov = live(&state, &[NOV, OCT]);
         let new_key = root_request(&issuer, NOV, &mut rng);
         let err = enrol(&state, COMMUNITY, &nov, VETTER, &new_key.wire, Utc::now())
             .await
             .expect_err("October is live");
         let text = format!("{err}");
-        assert!(text.contains("bound to another PCS identifier"), "{text}");
         assert!(text.contains(&format!("vetter/{OCT}")), "{text}");
-        assert!(
-            !text.contains(&format!("vetter/{PERIOD}")),
-            "September left: {text}"
-        );
 
-        // Hidden vetting turned off and on again with October still listed: still refused. The
-        // rule is the live set at the request, not at the reset.
-        let back = live(&state, &[NOV, OCT]);
-        let again = VetterSide::again(&issuer, NOV, new_key.id, copy_usk(&new_key.usk), &mut rng);
-        enrol(&state, COMMUNITY, &back, VETTER, &again.wire, Utc::now())
-            .await
-            .expect_err("October is live again");
-        let view = show_binding(&state, VETTER, &vetter_labels(&back))
-            .await
-            .unwrap();
-        assert_eq!(
-            view.reset.as_ref().unwrap().1,
-            vec![format!("vetter/{OCT}")]
-        );
-
-        // December alone: nothing the old key holds is live, and the new key is bound.
-        let dec = live(&state, &[DEC, NOV]);
-        let view = show_binding(&state, VETTER, &vetter_labels(&dec))
-            .await
-            .unwrap();
-        assert!(view.reset.as_ref().unwrap().1.is_empty(), "open");
-        let new_dec = VetterSide::again(&issuer, DEC, new_key.id, copy_usk(&new_key.usk), &mut rng);
-        let answer = enrol(&state, COMMUNITY, &dec, VETTER, &new_dec.wire, Utc::now())
+        // November alone: re-bound, labels afresh, the old ones retired.
+        let nov_only = live(&state, &[NOV]);
+        enrol(&state, COMMUNITY, &nov_only, VETTER, &new_key.wire, Utc::now())
             .await
             .expect("re-bound");
-        assert_eq!(answer.label, format!("vetter/{DEC}"));
         let record = record_of(&state, VETTER).await;
-        assert_eq!(
-            record.id, new_key.wire.id,
-            "the new identifier in place of the old"
-        );
+        assert_eq!(bound_id(&record), new_key.wire.id);
         assert_eq!(
             record
                 .labels
                 .iter()
                 .map(|(l, _)| l.clone())
                 .collect::<Vec<_>>(),
-            vec![format!("vetter/{DEC}")],
+            vec![format!("vetter/{NOV}")],
             "labels start afresh"
         );
         assert!(record.reset.is_none(), "the reset is done");
-        assert!(record.reissues.is_empty());
         assert_eq!(
             record.retired_labels,
             vec![format!("vetter/{PERIOD}"), format!("vetter/{OCT}")]
@@ -1454,17 +1466,10 @@ mod tests {
         // The audit log never holds an identifier, old or new.
         assert_eq!(audit_count(&state, &old.wire.id).await, 0);
         assert_eq!(audit_count(&state, &new_key.wire.id).await, 0);
-
-        // Now the old key is the stranger: refused, and a further reset is a fresh one.
-        let stale = VetterSide::again(&issuer, DEC, old.id, copy_usk(&old.usk), &mut rng);
-        enrol(&state, COMMUNITY, &dec, VETTER, &stale.wire, Utc::now())
-            .await
-            .expect_err("the old key is not the bound one any more");
-
-        // And the old labels never come back.
-        let asked = vec![format!("vetter/{OCT}"), format!("vetter/{DEC}")];
         assert_eq!(
-            retired_among(&state, &asked).await.unwrap(),
+            retired_among(&state, &[format!("vetter/{OCT}"), format!("vetter/{NOV}")])
+                .await
+                .unwrap(),
             vec![format!("vetter/{OCT}")]
         );
     }
@@ -1490,7 +1495,9 @@ mod tests {
         let labels = vetter_labels(&config);
 
         let mine = show_binding(&state, VETTER, &labels).await.unwrap();
-        assert_eq!(mine.id.as_deref(), Some(vetter.wire.id.as_str()));
+        let bound = BindingRef::from_text(mine.id.as_deref().unwrap()).unwrap();
+        assert_eq!(point_text(&bound.id).unwrap(), vetter.wire.id);
+        assert_eq!(bound.hvk, issuer.hvk(PERIOD), "the binding names its period's key");
         assert_eq!(mine.enrolled_labels, vec![format!("vetter/{PERIOD}")]);
         assert!(mine.reset.is_none());
 

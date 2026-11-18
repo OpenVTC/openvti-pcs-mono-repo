@@ -1,24 +1,21 @@
 //! Storable forms of the member-side engines.
 //!
-//! openvtc keeps these in its encrypted `ProtectedConfig` between runs, so an application
-//! survives a restart: the applicant's key and the attestations it has gathered, the vetter's
-//! credential and the tokens it holds.
+//! A VTA keeps these in its engine keyspace between calls, so an application survives a
+//! restart: the applicant's attestations, the vetter's credentials and the tokens it holds.
 //!
-//! **These carry secrets.** `usk` is the key every tag of its holder is derived from, so a copy
-//! of a vetter's snapshot links every attestation that vetter ever made. It belongs wherever
-//! the persona keys belong, and in the design's intended shape (§13 C7) it never leaves the
-//! VTA at all — this type is the interim, for a client that runs the engine itself.
+//! **These can carry secrets.** `usk` is the key every tag of its holder is derived from, so a
+//! copy of a vetter's snapshot links every attestation that vetter ever made. A VTA derives the
+//! key from a seed and stores the snapshot without it (design §13 C7); the field is here for a
+//! client that runs the engine itself.
 //!
 //! Binary values travel as multibase base58btc over the crate's validated canonical encoding,
-//! the same convention as `wire`.
+//! the same convention as `wire`. An attestation's text carries its vetter label with it
+//! ([`crate::scheme::labelled_text`]), because under `pcreds` an attestation means something
+//! only under the helper key of its period.
 
 use std::collections::BTreeMap;
 
-use predicate_credential_system::{
-    cred::ps::PSShownCredential,
-    pcs::{Attestation, Credential, UserSecretKey},
-    serialization::to_multibase,
-};
+use predicate_credential_system::pcreds::{Attestation, Credential};
 use serde::{Deserialize, Serialize};
 
 pub use crate::token::{HeldToken, PendingToken};
@@ -26,15 +23,16 @@ pub use crate::token::{HeldToken, PendingToken};
 use crate::{
     ProtoError,
     meta::StatementMeta,
-    scheme::{Base, E, Fr, G1, dec, enc},
+    scheme::{Bk, E, Fr, G1, Usk, dec, enc, labelled_from_text, labelled_text},
     token::TokenSpend,
-    vetter::HiddenAttestation,
+    vetter::{HiddenAttestation, Logged},
 };
 
 /// One attestation the applicant holds, with what it needs to present it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HeldAttestation {
+    /// The attestation with its vetter label ([`labelled_text`]).
     pub attestation: String,
     pub meta: StatementMeta,
     pub token_label: String,
@@ -45,7 +43,7 @@ pub struct HeldAttestation {
 impl HeldAttestation {
     pub fn of(att: &HiddenAttestation) -> Result<Self, ProtoError> {
         Ok(Self {
-            attestation: enc(&att.attestation)?,
+            attestation: labelled_text(&att.label, &att.attestation)?,
             meta: att.meta.clone(),
             token_label: att.token.label.clone(),
             token_serial: enc(&att.token.serial)?,
@@ -54,13 +52,17 @@ impl HeldAttestation {
     }
 
     pub fn restore(&self) -> Result<HiddenAttestation, ProtoError> {
+        let (label, attestation) = labelled_from_text::<Attestation<Bk>>(&self.attestation)?;
         Ok(HiddenAttestation {
-            attestation: dec::<Attestation<E, Base>>(&self.attestation)?,
+            label,
+            attestation,
             meta: self.meta.clone(),
             token: TokenSpend {
                 label: self.token_label.clone(),
                 serial: dec::<Fr>(&self.token_serial)?,
-                shown: dec::<PSShownCredential<E>>(&self.token_shown)?,
+                shown: dec::<predicate_credential_system::pcreds::pairing::PSPair<E>>(
+                    &self.token_shown,
+                )?,
             },
         })
     }
@@ -70,8 +72,10 @@ impl HeldAttestation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApplicantSnapshot {
-    /// SECRET: the key the applicant's identifier and proofs are built from.
+    /// SECRET: the key the applicant's identifier and requests are built from.
     pub usk: String,
+    /// The vetter label the application lives under.
+    pub label: String,
     pub id: String,
     pub join_did: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -79,9 +83,10 @@ pub struct ApplicantSnapshot {
 }
 
 impl ApplicantSnapshot {
-    pub fn new(usk: &UserSecretKey<E>, id: &G1, join_did: &str) -> Result<Self, ProtoError> {
+    pub fn new(usk: &Usk, label: &str, id: &G1, join_did: &str) -> Result<Self, ProtoError> {
         Ok(Self {
-            usk: to_multibase(&usk.to_bytes()?),
+            usk: enc(usk)?,
+            label: label.to_string(),
             id: enc(id)?,
             join_did: join_did.to_string(),
             held: Vec::new(),
@@ -90,15 +95,28 @@ impl ApplicantSnapshot {
 
     pub(crate) fn parts(
         &self,
-    ) -> Result<(UserSecretKey<E>, G1, Vec<HiddenAttestation>), ProtoError> {
-        let usk = UserSecretKey::from_scalar(dec::<Fr>(&self.usk)?);
+    ) -> Result<(Usk, String, G1, Vec<HiddenAttestation>), ProtoError> {
         let held = self
             .held
             .iter()
             .map(HeldAttestation::restore)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((usk, dec::<G1>(&self.id)?, held))
+        Ok((
+            dec::<Fr>(&self.usk)?,
+            self.label.clone(),
+            dec::<G1>(&self.id)?,
+            held,
+        ))
     }
+}
+
+/// One statement a vetter made, stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoggedStatement {
+    pub label: String,
+    pub applicant: String,
+    pub meta: StatementMeta,
 }
 
 /// The vetter's engine, stored. One per community.
@@ -107,30 +125,28 @@ impl ApplicantSnapshot {
 pub struct VetterSnapshot {
     pub member: String,
     /// SECRET, and the most sensitive value here: every tag this vetter has ever produced is
-    /// derived from it, so a copy links their attestations to each other.
+    /// derived from it. Empty in a snapshot stored without its key.
     pub usk: String,
-    pub id: String,
-    /// Root credentials by class label period, e.g. `2026-10`.
+    /// Root credentials by vetter label, e.g. `vetter/2026-10`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub credentials: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tokens: Vec<HeldToken>,
     /// Draws asked for and not yet answered, so an answer still unblinds after the engine has
-    /// been stored and restored — which, in openvtc, happens between every request and its
-    /// answer. SECRET, as `tokens` is.
+    /// been stored and restored. SECRET, as `tokens` is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<PendingToken>,
     /// A limit below the community's drip, kept locally and never sent anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub personal_limit: Option<usize>,
-    /// What was attested, so a rotation can be refreshed without a new session.
+    /// What was attested, so a statement can be refreshed without a new session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub log: Vec<(String, StatementMeta)>,
+    pub log: Vec<LoggedStatement>,
 }
 
 impl VetterSnapshot {
-    /// A snapshot with no key material, for exercising the parts that read only its
-    /// bookkeeping — which labels it holds a credential under, and how many tokens it has.
+    /// A snapshot with no key material, for the parts that read only its bookkeeping — which
+    /// labels it holds a credential under, and how many tokens it has.
     ///
     /// Not `Default`: a snapshot without a key is not a vetter, and making one implicitly
     /// constructible would let that mistake compile.
@@ -139,7 +155,6 @@ impl VetterSnapshot {
         Self {
             member: member.to_string(),
             usk: String::new(),
-            id: String::new(),
             credentials: BTreeMap::new(),
             tokens: Vec::new(),
             pending: Vec::new(),
@@ -148,47 +163,69 @@ impl VetterSnapshot {
         }
     }
 
-    pub fn new(member: &str, usk: &UserSecretKey<E>, id: &G1) -> Result<Self, ProtoError> {
-        Ok(Self {
-            member: member.to_string(),
-            usk: to_multibase(&usk.to_bytes()?),
-            id: enc(id)?,
-            credentials: BTreeMap::new(),
-            tokens: Vec::new(),
-            pending: Vec::new(),
-            personal_limit: None,
-            log: Vec::new(),
-        })
+    pub fn new(member: &str, usk: &Usk) -> Result<Self, ProtoError> {
+        let mut snap = Self::without_keys(member);
+        snap.usk = enc(usk)?;
+        Ok(snap)
     }
 
-    pub(crate) fn key(&self) -> Result<(UserSecretKey<E>, G1), ProtoError> {
-        Ok((
-            UserSecretKey::from_scalar(dec::<Fr>(&self.usk)?),
-            dec::<G1>(&self.id)?,
-        ))
+    /// The same snapshot without its key: what a VTA stores.
+    #[must_use]
+    pub fn without_key(&self) -> Self {
+        let mut snap = self.clone();
+        snap.usk = String::new();
+        snap
     }
 
-    pub(crate) fn credential(
-        &self,
-        period: &str,
-    ) -> Result<Option<Credential<E, Base>>, ProtoError> {
+    /// The same snapshot with `usk` put back: what a VTA restores from.
+    ///
+    /// # Errors
+    /// [`ProtoError::Pcs`] if the key cannot be encoded.
+    pub fn with_key(&self, usk: &Usk) -> Result<Self, ProtoError> {
+        let mut snap = self.clone();
+        snap.usk = enc(usk)?;
+        Ok(snap)
+    }
+
+    pub(crate) fn key(&self) -> Result<Usk, ProtoError> {
+        dec::<Fr>(&self.usk)
+    }
+
+    pub(crate) fn credential(&self, label: &str) -> Result<Option<Credential<Bk>>, ProtoError> {
         self.credentials
-            .get(period)
-            .map(|c| dec::<Credential<E, Base>>(c))
+            .get(label)
+            .map(|c| dec::<Credential<Bk>>(c))
             .transpose()
     }
 
     pub(crate) fn put_credential(
         &mut self,
-        period: &str,
-        cred: &Credential<E, Base>,
+        label: &str,
+        cred: &Credential<Bk>,
     ) -> Result<(), ProtoError> {
-        self.credentials.insert(period.to_string(), enc(cred)?);
+        self.credentials.insert(label.to_string(), enc(cred)?);
         Ok(())
     }
 
-    pub(crate) fn record(&mut self, id: &G1, meta: &StatementMeta) -> Result<(), ProtoError> {
-        self.log.push((enc(id)?, meta.clone()));
+    pub(crate) fn record(&mut self, logged: &Logged) -> Result<(), ProtoError> {
+        self.log.push(LoggedStatement {
+            label: logged.label.clone(),
+            applicant: enc(&logged.applicant)?,
+            meta: logged.meta.clone(),
+        });
         Ok(())
+    }
+
+    pub(crate) fn logged(&self) -> Result<Vec<Logged>, ProtoError> {
+        self.log
+            .iter()
+            .map(|l| {
+                Ok(Logged {
+                    label: l.label.clone(),
+                    applicant: dec::<G1>(&l.applicant)?,
+                    meta: l.meta.clone(),
+                })
+            })
+            .collect()
     }
 }

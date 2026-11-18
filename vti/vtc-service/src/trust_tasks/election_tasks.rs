@@ -815,7 +815,7 @@ async fn handle_show(
              vtc/elections/show/0.2 cannot carry; read it with vtc/elections/show/0.3",
         );
     }
-    let parameters = match ops::parameters(state).await {
+    let parameters = match ops::parameters(state, &rec).await {
         Ok(p) => p,
         Err(e) => return app_error_to_reject(&doc, &e),
     };

@@ -90,7 +90,7 @@ fn registration(community: &Identity, service_did: &str, id: &str) -> Value {
         "community": community.did,
         "manifest": manifest,
         "manifestDigest": digest_multibase(&digest),
-        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() },
+        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&election_of(&community.did, &manifest, &digest)).unwrap() },
     })
 }
 
@@ -510,7 +510,7 @@ async fn an_election_over_http_with_a_restart() {
         "community": community.did,
         "manifest": manifest,
         "manifestDigest": digest_multibase(&digest),
-        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() },
+        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&election_of(&community.did, &manifest, &digest)).unwrap() },
     });
 
     // Unsigned registration: refused, and the refusal is signed too.
@@ -555,20 +555,20 @@ async fn an_election_over_http_with_a_restart() {
     assert_eq!(signed_by(&answer).await, service_did);
 
     // A voter: ticket from the registrar, cast from a one-time key.
-    let params = reg.params();
     let election = Election::new(
         &community.did,
         ElectionId::new("board-2027").unwrap(),
         digest,
     )
     .unwrap();
+    let params = reg.params(&election);
     let mut r = StdRng::seed_from_u64(3);
     let voter = Voter::generate(&params, &mut r).unwrap();
     let (req, st) = voter.ticket_request(&params, &election, &mut r).unwrap();
     let pre = reg
-        .issue_ticket(&election, voter.id(), &req, &mut r)
+        .issue_ticket(&election, &voter.id(&params).unwrap(), &req, &mut r)
         .unwrap();
-    let ticket = voter.accept_ticket(&params, &election, &pre, &st).unwrap();
+    let ticket = voter.accept_ticket(&params, &election, &pre, st).unwrap();
     let ballot = json!({
         "electionId": "board-2027",
         "manifestDigest": digest_multibase(&digest),
@@ -746,7 +746,7 @@ async fn trustees_enrol_over_http() {
         "community": community.did,
         "manifest": manifest,
         "manifestDigest": digest_multibase(&digest),
-        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() },
+        "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&election_of(&community.did, &manifest, &digest)).unwrap() },
     });
     let (status, _) = send(
         &svc,
@@ -1245,4 +1245,14 @@ async fn an_unsigned_read_over_messaging_is_answered_and_a_close_is_not() {
     let answer = out.doc.expect("answered");
     assert_eq!(answer["payload"]["code"], "proofRequired", "{answer}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The election a registration names: under `pcreds` its voting key is its own.
+fn election_of(community: &str, manifest: &serde_json::Value, digest: &[u8; 32]) -> Election {
+    Election::new(
+        community,
+        ElectionId::new(manifest["electionId"].as_str().unwrap()).unwrap(),
+        *digest,
+    )
+    .unwrap()
 }

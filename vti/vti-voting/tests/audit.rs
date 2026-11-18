@@ -65,13 +65,13 @@ fn run(revote: &str) -> Run {
             "community": COMMUNITY,
             "manifest": manifest,
             "manifestDigest": digest_multibase(&digest),
-            "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() },
+            "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&Election::new(COMMUNITY, ElectionId::new("agm-2027").unwrap(), digest).unwrap()).unwrap() },
         }),
         t("2026-10-30T00:00:00Z"),
     )
     .unwrap();
     let election = Election::new(COMMUNITY, ElectionId::new("agm-2027").unwrap(), digest).unwrap();
-    let params = reg.params();
+    let params = reg.params(&election);
     let ballot = |choice: &str| {
         json!({
             "electionId": "agm-2027",
@@ -89,8 +89,8 @@ fn run(revote: &str) -> Run {
         let mut r = StdRng::seed_from_u64(seed);
         let v = Voter::generate(&params, &mut r).unwrap();
         let (req, st) = v.ticket_request(&params, &election, &mut r).unwrap();
-        let pre = reg.issue_ticket(&election, v.id(), &req, &mut r).unwrap();
-        let ticket = v.accept_ticket(&params, &election, &pre, &st).unwrap();
+        let pre = reg.issue_ticket(&election, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let ticket = v.accept_ticket(&params, &election, &pre, st).unwrap();
         for choice in choices {
             if revote == "refuse" && choice == "no" && seed == 10 {
                 continue;
@@ -136,7 +136,7 @@ fn run(revote: &str) -> Run {
 }
 
 fn check(r: &Run, entries: &[Value], result: &Value, tickets: u64) -> Result<u64, AuditFailure> {
-    let params = r.reg.params();
+    let params = r.reg.params(&election_of(r));
     audit(Evidence {
         manifest: &r.manifest,
         params: &params,
@@ -174,7 +174,7 @@ fn every_kind_of_tampering_is_caught() {
     );
 
     // A checkpoint the board does not extend: the ballot box rewrote history after it.
-    let params = r.reg.params();
+    let params = r.reg.params(&election_of(&r));
     let forged = HeadRef {
         tree_size: r.checkpoint.tree_size,
         root: [7u8; 32],
@@ -215,7 +215,7 @@ fn every_kind_of_tampering_is_caught() {
 
     // Another community's key: no cast verifies.
     let other = Registrar::generate(COMMUNITY, &mut StdRng::seed_from_u64(99)).unwrap();
-    let other_params = other.params();
+    let other_params = other.params(&election_of(&r));
     assert!(matches!(
         audit(Evidence {
             manifest: &r.manifest,
@@ -235,4 +235,14 @@ fn every_kind_of_tampering_is_caught() {
 fn a_refuse_board_verifies_too() {
     let r = run("refuse");
     assert_eq!(check(&r, &r.entries, &r.result, 3), Ok(3));
+}
+
+/// The election a run registered.
+fn election_of(r: &Run) -> Election {
+    Election::new(
+        COMMUNITY,
+        ElectionId::new("agm-2027").unwrap(),
+        manifest_digest(&r.manifest).unwrap(),
+    )
+    .unwrap()
 }

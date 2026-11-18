@@ -573,8 +573,11 @@ pub async fn register(
     );
     let request = json!({
         "label": format!("voter/{election_id}"),
-        "id": vti_voting::scheme::point_text(v.id()).map_err(proto)?,
-        "request": serde_json::to_value(&req).map_err(|e| AppError::Internal(e.to_string()))?,
+        "id": vti_voting::scheme::point_text(
+            &v.id(&params).map_err(|e| PcsError::App(AppError::Internal(format!("voter id: {e}"))))?,
+        )
+        .map_err(proto)?,
+        "request": vti_vetting_pcs::issuer::request_value(&req).map_err(proto)?,
     });
     let rec = VoterRecord {
         context_id: context_id.to_string(),
@@ -657,13 +660,14 @@ pub async fn accept(
         predicate_credential_system::serialization::from_multibase(&encoded)
             .map_err(|e| proto(e.into()))?,
     );
-    let blinding = TicketState::from_bytes(&bytes).map_err(|e| proto(e.into()))?;
+    let blinding: TicketState = predicate_credential_system::serialization::from_bytes(&bytes)
+        .map_err(|e| proto(e.into()))?;
     let pre = vti_vetting_pcs::scheme::dec(answer["preCredential"].as_str().unwrap_or_default())
         .map_err(|e| PcsError::CredentialInvalid(e.to_string()))?;
     let election = election_of(&rec)?;
     let v = voter(state, caller, &rec, &params).await?;
     let ticket = v
-        .accept_ticket(&params, &election, &pre, &blinding)
+        .accept_ticket(&params, &election, &pre, blinding)
         .map_err(|e| PcsError::CredentialInvalid(e.to_string()))?;
     st.ticket = Some(
         ticket

@@ -138,7 +138,7 @@ impl Run {
                 "community": COMMUNITY,
                 "manifest": manifest,
                 "manifestDigest": digest_multibase(&digest),
-                "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() },
+                "parameters": { "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&Election::new(COMMUNITY, ElectionId::new("board-2027").unwrap(), digest).unwrap()).unwrap() },
             }),
             t("2026-10-30T00:00:00Z"),
         )
@@ -287,13 +287,13 @@ impl Run {
     }
 
     fn cast(&mut self, seed: u64, ballot: Value) -> Value {
-        let params = self.reg.params();
+        let params = self.reg.params(&self.election());
         let mut r = StdRng::seed_from_u64(seed);
         let v = Voter::generate(&params, &mut r).unwrap();
         let e = self.election();
         let (req, st) = v.ticket_request(&params, &e, &mut r).unwrap();
-        let pre = self.reg.issue_ticket(&e, v.id(), &req, &mut r).unwrap();
-        let ticket = v.accept_ticket(&params, &e, &pre, &st).unwrap();
+        let pre = self.reg.issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let ticket = v.accept_ticket(&params, &e, &pre, st).unwrap();
         let status = self.status(DURING);
         let ek = wire::election_key(&status["electionKey"], Threshold::new(2, 3).unwrap()).unwrap();
         let m: Manifest = serde_json::from_value(self.manifest.clone()).unwrap();
@@ -308,13 +308,13 @@ impl Run {
     /// Another ticket holder's cast of `form` — someone else's encrypted form, copied verbatim —
     /// under its own ticket and tag.
     fn recast(&mut self, seed: u64, form: EncryptedForm) -> Value {
-        let params = self.reg.params();
+        let params = self.reg.params(&self.election());
         let mut r = StdRng::seed_from_u64(seed);
         let v = Voter::generate(&params, &mut r).unwrap();
         let e = self.election();
         let (req, st) = v.ticket_request(&params, &e, &mut r).unwrap();
-        let pre = self.reg.issue_ticket(&e, v.id(), &req, &mut r).unwrap();
-        let ticket = v.accept_ticket(&params, &e, &pre, &st).unwrap();
+        let pre = self.reg.issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let ticket = v.accept_ticket(&params, &e, &pre, st).unwrap();
         let cast = v
             .cast_encrypted_wire(&params, &ticket, &form, &mut r)
             .unwrap();
@@ -340,7 +340,7 @@ impl Run {
     /// computes the targets itself, and pins their digest under the board through the close.
     fn authorize(&mut self) -> Value {
         let entries = self.entries();
-        let params = self.reg.params();
+        let params = self.reg.params(&self.election());
         let closing = vti_voting::audit::decryption(
             &self.manifest,
             &params,
@@ -436,7 +436,7 @@ impl Run {
             .board_head(Caller::Anonymous, &sel, t(AFTER))
             .unwrap();
         let result = self.bb.result(Caller::Anonymous, &sel, t(AFTER)).unwrap();
-        let params = self.reg.params();
+        let params = self.reg.params(&self.election());
         // Tampered entries no longer hash to the head: certify against their own root, so the
         // check that fails is the recount's.
         let mut b = vti_voting::board::Board::new();

@@ -30,14 +30,66 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use predicate_credential_system::pcs::PredicateCredentialSystem;
+use predicate_credential_system::pcreds::Backend;
 use vtc_service::test_support::TestVtc;
 use vtc_service::vetting::pcs_tasks;
 use vti_vetting_pcs::{
+    issuer::{Issuer, RootRequestWire},
     rand::{SeedableRng, rngs::StdRng},
-    scheme::{point_text, vetter_predicate},
+    scheme::{Bk, Usk, enrolment_ssid, member, vetter_label},
     token::TokenWallet,
+    vetter::EnrolmentBlinding,
 };
+
+/// The identifier a `pcs-binding/show` answer binds (its `id` is a `BindingRef`).
+fn bound_id(body: &Value) -> Value {
+    let binding = vti_vetting_pcs::scheme::BindingRef::from_text(
+        body["payload"]["id"].as_str().expect("an identifier"),
+    )
+    .expect("a binding");
+    json!(vti_vetting_pcs::scheme::point_text(&binding.id).unwrap())
+}
+
+/// A fresh member key under the community's scheme.
+fn fresh_usk(issuer: &Issuer, rng: &mut StdRng) -> Usk {
+    <Bk as Backend>::tag_keygen(issuer.pcreds().params(), rng)
+}
+
+/// The member's half of enrolment, as `vti_vetting_pcs::vetter::VetterEngine` makes it: a
+/// `pcreds` credential request with no attestations under `period`'s key, bound to `member_did`,
+/// in its `pcs-root` payload form, and the blinding that unblinds the answer.
+fn root_request(
+    issuer: &Issuer,
+    member_did: &str,
+    period: &str,
+    usk: &Usk,
+    rng: &mut StdRng,
+) -> (Value, EnrolmentBlinding) {
+    let pcreds = issuer.pcreds();
+    let hvk = pcreds.helper_key(&issuer.hvk(period)).unwrap();
+    let user = member(pcreds, &hvk, usk).unwrap();
+    let ssid = enrolment_ssid(issuer.community(), member_did, period);
+    let (request, blinding) = pcreds
+        .request_credential(&hvk, &user, Vec::new(), &ssid, rng)
+        .unwrap();
+    let wire = RootRequestWire::of(&vetter_label(period), &request).unwrap();
+    (serde_json::to_value(&wire).unwrap(), blinding)
+}
+
+/// Unblind the community's `preCredential` for `period` with `usk`.
+fn unblind(issuer: &Issuer, period: &str, usk: &Usk, pre: &str, blinding: EnrolmentBlinding) {
+    let pcreds = issuer.pcreds();
+    let hvk = pcreds.helper_key(&issuer.hvk(period)).unwrap();
+    let user = member(pcreds, &hvk, usk).unwrap();
+    pcreds
+        .unblind(
+            &hvk,
+            &user,
+            &vti_vetting_pcs::scheme::dec(pre).unwrap(),
+            blinding,
+        )
+        .expect("the answer unblinds under the published key");
+}
 
 const COMMUNITY: &str = "did:key:z6MkfMhiddenVettingTasks";
 const PERIOD: &str = "2026-09";
@@ -269,22 +321,10 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
     h.grant_vetter(&vetter_did).await;
 
     // --- 1. enrol ---------------------------------------------------------------------------
-    let (id, usk) = issuer.open().user_keygen(&mut rng).unwrap();
-    let f = vetter_predicate(PERIOD);
-    let (request, blinding) = issuer
-        .open()
-        .root_request(issuer.hvk(), &f, &id, &usk, &mut rng)
-        .unwrap();
+    let usk = fresh_usk(&issuer, &mut rng);
+    let (request, blinding) = root_request(&issuer, &vetter_did, PERIOD, &usk, &mut rng);
     let (status, body) = h
-        .post(
-            &vetter_key,
-            pcs_tasks::PCS_ROOT_TYPE,
-            json!({
-                "label": format!("vetter/{PERIOD}"),
-                "id": point_text(&id).unwrap(),
-                "request": serde_json::to_value(&request).unwrap(),
-            }),
-        )
+        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, request.clone())
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let pre = body
@@ -292,67 +332,27 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("no pre-credential in {body}"));
     // What comes back unblinds into a credential the community has never seen.
-    issuer
-        .open()
-        .unblind(
-            issuer.hvk(),
-            &usk,
-            &f,
-            &vti_vetting_pcs::scheme::dec(pre).unwrap(),
-            &blinding,
-        )
-        .expect("the answer unblinds under the published key");
+    unblind(&issuer, PERIOD, &usk, pre, blinding);
 
     // Asking again under the label, with the same identifier and fresh blinding, is a client
     // that lost the answer: it is re-issued, in the same shape as the first answer.
-    let (again, again_blinding) = issuer
-        .open()
-        .root_request(issuer.hvk(), &f, &id, &usk, &mut rng)
-        .unwrap();
+    let (again, again_blinding) = root_request(&issuer, &vetter_did, PERIOD, &usk, &mut rng);
     let (status, body) = h
-        .post(
-            &vetter_key,
-            pcs_tasks::PCS_ROOT_TYPE,
-            json!({
-                "label": format!("vetter/{PERIOD}"),
-                "id": point_text(&id).unwrap(),
-                "request": serde_json::to_value(&again).unwrap(),
-            }),
-        )
+        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, again)
         .await;
     assert_eq!(status, StatusCode::OK, "a lost answer is re-issued: {body}");
     let pre = body
         .pointer("/payload/preCredential")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("no pre-credential in {body}"));
-    issuer
-        .open()
-        .unblind(
-            issuer.hvk(),
-            &usk,
-            &f,
-            &vti_vetting_pcs::scheme::dec(pre).unwrap(),
-            &again_blinding,
-        )
-        .expect("the re-issued answer unblinds");
+    unblind(&issuer, PERIOD, &usk, pre, again_blinding);
 
     // Another identifier under the same label is a second key, and is refused: a member
-    // holding two would count twice in one proof.
-    let (other_id, other_usk) = issuer.open().user_keygen(&mut rng).unwrap();
-    let (other, _) = issuer
-        .open()
-        .root_request(issuer.hvk(), &f, &other_id, &other_usk, &mut rng)
-        .unwrap();
+    // holding two in one period would count twice in one request.
+    let other_usk = fresh_usk(&issuer, &mut rng);
+    let (other, _) = root_request(&issuer, &vetter_did, PERIOD, &other_usk, &mut rng);
     let (status, body) = h
-        .post(
-            &vetter_key,
-            pcs_tasks::PCS_ROOT_TYPE,
-            json!({
-                "label": format!("vetter/{PERIOD}"),
-                "id": point_text(&other_id).unwrap(),
-                "request": serde_json::to_value(&other).unwrap(),
-            }),
-        )
+        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, other)
         .await;
     assert_ne!(
         status,
@@ -380,15 +380,7 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
         ks.insert(key, &record).await.unwrap();
     }
     let (status, body) = h
-        .post(
-            &vetter_key,
-            pcs_tasks::PCS_ROOT_TYPE,
-            json!({
-                "label": format!("vetter/{PERIOD}"),
-                "id": point_text(&id).unwrap(),
-                "request": serde_json::to_value(&request).unwrap(),
-            }),
-        )
+        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, request.clone())
         .await;
     assert_ne!(
         status,
@@ -401,23 +393,15 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
     let (stranger_did, stranger_key) = identity(0xB7);
     let _ = stranger_did;
     let (status, body) = h
-        .post(
-            &stranger_key,
-            pcs_tasks::PCS_ROOT_TYPE,
-            json!({
-                "label": format!("vetter/{PERIOD}"),
-                "id": point_text(&id).unwrap(),
-                "request": serde_json::to_value(&request).unwrap(),
-            }),
-        )
+        .post(&stranger_key, pcs_tasks::PCS_ROOT_TYPE, request.clone())
         .await;
     assert_ne!(status, StatusCode::OK);
     assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_NOT_A_VETTER);
 
     // --- 2. draw ----------------------------------------------------------------------------
-    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let mut wallet = TokenWallet::new();
     let requests = wallet
-        .prepare(issuer.tvk(), TOKEN_LABEL, &vetter_did, 1, DRIP, &mut rng)
+        .prepare(&issuer.tvk(TOKEN_LABEL), TOKEN_LABEL, &vetter_did, 1, DRIP, &mut rng)
         .unwrap();
     let batch = json!({
         "label": TOKEN_LABEL,
@@ -442,7 +426,7 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
         .map(|p| vti_vetting_pcs::scheme::dec(p.as_str().unwrap()).unwrap())
         .collect();
     wallet
-        .receive(issuer.tvk(), TOKEN_LABEL, 1, &pres)
+        .receive(&issuer.tvk(TOKEN_LABEL), TOKEN_LABEL, 1, &pres)
         .expect("the tokens verify under the published token key");
     assert_eq!(wallet.free(), DRIP);
 
@@ -454,7 +438,7 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
     // And more than the published rate is refused whatever the vetter asks for.
     let greedy = wallet
         .prepare(
-            issuer.tvk(),
+            &issuer.tvk(TOKEN_LABEL),
             TOKEN_LABEL,
             &vetter_did,
             2,
@@ -553,8 +537,17 @@ fn window() -> Value {
 /// Publish the summit on the criterion, with its label live, and grant `n` vetters.
 async fn summit_harness(approved_by: Option<&str>, n: u8) -> (Harness, Vec<(String, Secret)>) {
     let h = Harness::start().await;
-    let mut config = h.publish().await;
-    config.live_token_labels.push(EVENT_LABEL.to_string());
+    h.publish().await;
+    // The event label is published like any other, so its key is in the published list
+    // (one token key per label under `pcreds`).
+    let mut config = vtc_service::vetting::pcs_issue::publish(
+        &h.tv.state,
+        &h.community,
+        vec![PERIOD.to_string()],
+        vec![TOKEN_LABEL.to_string(), EVENT_LABEL.to_string()],
+        DRIP,
+    )
+    .expect("publish with the event label");
     config.events.push(summit(approved_by));
     h.store_config(&config).await;
 
@@ -603,10 +596,10 @@ async fn an_event_stays_shut_until_enough_vetters_have_asked() {
     // And the label it would unlock is shut, with the code the drip declares for exactly this.
     let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community).unwrap();
     let mut rng = StdRng::seed_from_u64(0x2026_1012);
-    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let mut wallet = TokenWallet::new();
     let requests = wallet
         .prepare(
-            issuer.tvk(),
+            &issuer.tvk(EVENT_LABEL),
             EVENT_LABEL,
             &vetters[0].0,
             1,
@@ -664,7 +657,7 @@ async fn an_approved_event_opens_its_label_at_the_tier_rate() {
 
     let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community).unwrap();
     let mut rng = StdRng::seed_from_u64(0x2026_1013);
-    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let mut wallet = TokenWallet::new();
     let batch = |reqs: &[vti_vetting_pcs::token::TokenRequest], tick: u32| {
         json!({
             "label": EVENT_LABEL,
@@ -683,7 +676,7 @@ async fn an_approved_event_opens_its_label_at_the_tier_rate() {
     // under the monthly label — and nothing is recorded, so the tick is still theirs to draw.
     let greedy = wallet
         .prepare(
-            issuer.tvk(),
+            &issuer.tvk(EVENT_LABEL),
             EVENT_LABEL,
             &vetters[0].0,
             0,
@@ -701,7 +694,7 @@ async fn an_approved_event_opens_its_label_at_the_tier_rate() {
     // days, so tick 1 has not begun and cannot be drawn ahead.
     let ahead = wallet
         .prepare(
-            issuer.tvk(),
+            &issuer.tvk(EVENT_LABEL),
             EVENT_LABEL,
             &vetters[0].0,
             1,
@@ -721,7 +714,7 @@ async fn an_approved_event_opens_its_label_at_the_tier_rate() {
 
     let requests = wallet
         .prepare(
-            issuer.tvk(),
+            &issuer.tvk(EVENT_LABEL),
             EVENT_LABEL,
             &vetters[0].0,
             0,
@@ -745,7 +738,7 @@ async fn an_approved_event_opens_its_label_at_the_tier_rate() {
         .map(|p| vti_vetting_pcs::scheme::dec(p.as_str().unwrap()).unwrap())
         .collect();
     wallet
-        .receive(issuer.tvk(), EVENT_LABEL, 0, &pres)
+        .receive(&issuer.tvk(EVENT_LABEL), EVENT_LABEL, 0, &pres)
         .expect("event tokens verify under the same published key");
     assert_eq!(wallet.free(), EVENT_DRIP, "the tier's rate, not the drip's");
 }
@@ -771,11 +764,11 @@ async fn an_event_approved_by_one_of_its_own_vetters_opens_nothing() {
 
     let issuer = vtc_service::vetting::pcs_issue::derive_issuer(&h.tv.state, &h.community).unwrap();
     let mut rng = StdRng::seed_from_u64(0x2026_1014);
-    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let mut wallet = TokenWallet::new();
     // The one who did not approve, so that what is refused is the event and not the approver.
     let requests = wallet
         .prepare(
-            issuer.tvk(),
+            &issuer.tvk(EVENT_LABEL),
             EVENT_LABEL,
             &vetters[0].0,
             1,
@@ -913,49 +906,42 @@ async fn the_enrolment_and_the_drip_refuse_with_the_codes_they_declare() {
     let (vetter_did, vetter_key) = identity(0xC7);
     h.grant_vetter(&vetter_did).await;
 
-    let (id, usk) = issuer.open().user_keygen(&mut rng).unwrap();
-    let root = |label: &str, id: &vti_vetting_pcs::scheme::G1, request: &Value| json!({ "label": label, "id": point_text(id).unwrap(), "request": request });
-    let request_for = |period: &str, rng: &mut StdRng| {
-        let (request, _) = issuer
-            .open()
-            .root_request(issuer.hvk(), &vetter_predicate(period), &id, &usk, rng)
-            .unwrap();
-        serde_json::to_value(&request).unwrap()
+    let usk = fresh_usk(&issuer, &mut rng);
+    let relabel = |mut payload: Value, label: &str| {
+        payload["label"] = json!(label);
+        payload
     };
 
     // A label this community is not issuing under.
-    let good = request_for(PERIOD, &mut rng);
+    let (good, _) = root_request(&issuer, &vetter_did, PERIOD, &usk, &mut rng);
     let (status, body) = h
         .post(
             &vetter_key,
             pcs_tasks::PCS_ROOT_TYPE,
-            root("vetter/1999-01", &id, &good),
+            relabel(good.clone(), "vetter/1999-01"),
         )
         .await;
     assert_ne!(status, StatusCode::OK);
     assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_WRONG_LABEL);
 
-    // The right label, but a request proved for another period's predicate: it does not verify.
-    let stale = request_for("1999-01", &mut rng);
+    // The right label, but a request made under another period's key: it does not verify.
+    let (stale, _) = root_request(&issuer, &vetter_did, "1999-01", &usk, &mut rng);
     let label = format!("vetter/{PERIOD}");
     let (status, body) = h
         .post(
             &vetter_key,
             pcs_tasks::PCS_ROOT_TYPE,
-            root(&label, &id, &stale),
+            relabel(stale, &label),
         )
         .await;
     assert_ne!(status, StatusCode::OK);
     assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_BAD_REQUEST);
 
-    // Enrol, then rotate the label: the member is bound to the identifier they enrolled with,
-    // and a second one is refused rather than counted as a second vetter.
+    // Enrol, then rotate the label. Under `pcreds` a period is a helper key, so the member's
+    // identifier under the next period is a new one, and is bound; a second identifier in that
+    // period is refused rather than counted as a second vetter.
     let (status, body) = h
-        .post(
-            &vetter_key,
-            pcs_tasks::PCS_ROOT_TYPE,
-            root(&label, &id, &good),
-        )
+        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, good.clone())
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let rotated = vtc_service::vetting::pcs_issue::publish(
@@ -967,19 +953,21 @@ async fn the_enrolment_and_the_drip_refuse_with_the_codes_they_declare() {
     )
     .expect("the community rotates its vetter label");
     h.store_config(&rotated).await;
-    let (other_id, _) = issuer.open().user_keygen(&mut rng).unwrap();
+    let (next, _) = root_request(&issuer, &vetter_did, NEXT, &usk, &mut rng);
     let (status, body) = h
-        .post(
-            &vetter_key,
-            pcs_tasks::PCS_ROOT_TYPE,
-            root(&format!("vetter/{NEXT}"), &other_id, &good),
-        )
+        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, next)
+        .await;
+    assert_eq!(status, StatusCode::OK, "a new period binds afresh: {body}");
+    let other_usk = fresh_usk(&issuer, &mut rng);
+    let (other, _) = root_request(&issuer, &vetter_did, NEXT, &other_usk, &mut rng);
+    let (status, body) = h
+        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, other)
         .await;
     assert_ne!(status, StatusCode::OK);
     assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_IDENTIFIER_REBOUND);
 
     // The drip: a token label that is not live.
-    let mut wallet = TokenWallet::new(&h.community).unwrap();
+    let mut wallet = TokenWallet::new();
     let batch = |label: &str, requests: &[vti_vetting_pcs::token::TokenRequest]| {
         json!({
             "label": label,
@@ -994,7 +982,7 @@ async fn the_enrolment_and_the_drip_refuse_with_the_codes_they_declare() {
         })
     };
     let requests = wallet
-        .prepare(issuer.tvk(), TOKEN_LABEL, &vetter_did, 1, 1, &mut rng)
+        .prepare(&issuer.tvk(TOKEN_LABEL), TOKEN_LABEL, &vetter_did, 1, 1, &mut rng)
         .unwrap();
     let (status, body) = h
         .post(
@@ -1009,7 +997,7 @@ async fn the_enrolment_and_the_drip_refuse_with_the_codes_they_declare() {
     // Opening proofs bind who asks: ones made for another member do not verify for this one.
     let borrowed = wallet
         .prepare(
-            issuer.tvk(),
+            &issuer.tvk(TOKEN_LABEL),
             TOKEN_LABEL,
             "did:key:z6MkSomeoneElse",
             1,
@@ -1988,16 +1976,8 @@ async fn a_lost_key_is_shown_reset_and_rebound_over_the_wire() {
     let (vetter_did, vetter) = identity(0x82);
     h.grant_vetter(&vetter_did).await;
     let enrol = |period: &str, rng: &mut StdRng| {
-        let (id, usk) = issuer.open().user_keygen(rng).unwrap();
-        let (request, _) = issuer
-            .open()
-            .root_request(issuer.hvk(), &vetter_predicate(period), &id, &usk, rng)
-            .unwrap();
-        json!({
-            "label": format!("vetter/{period}"),
-            "id": point_text(&id).unwrap(),
-            "request": serde_json::to_value(&request).unwrap(),
-        })
+        let usk = fresh_usk(&issuer, rng);
+        root_request(&issuer, &vetter_did, period, &usk, rng).0
     };
 
     // Not a member: refused, whoever they are.
@@ -2042,7 +2022,7 @@ async fn a_lost_key_is_shown_reset_and_rebound_over_the_wire() {
         .post(&vetter, pcs_tasks::BINDING_SHOW_TYPE, json!({}))
         .await;
     assert_eq!(body["payload"]["bound"], json!(true), "{body}");
-    assert_eq!(body["payload"]["id"], first["id"], "{body}");
+    assert_eq!(bound_id(&body), first["id"], "{body}");
     assert_eq!(
         body["payload"]["enrolledLabels"],
         json!([format!("vetter/{SEP}")])
@@ -2098,7 +2078,7 @@ async fn a_lost_key_is_shown_reset_and_rebound_over_the_wire() {
     let (_, body) = h
         .post(&vetter, pcs_tasks::BINDING_SHOW_TYPE, json!({}))
         .await;
-    assert_eq!(body["payload"]["id"], second["id"], "{body}");
+    assert_eq!(bound_id(&body), second["id"], "{body}");
     assert_eq!(
         body["payload"]["enrolledLabels"],
         json!([format!("vetter/{OCT}")])

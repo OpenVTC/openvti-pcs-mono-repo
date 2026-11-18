@@ -9,10 +9,12 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
+use predicate_credential_system::pcreds::{AttestationStatement, Backend};
+
 use crate::{
     VotingError,
     election::Election,
-    scheme::{Fr, G1, Hvk, Open, VotingParams},
+    scheme::{Bk, CheckedHvk, Fr, Open, VotingParams},
     voter::Cast,
 };
 
@@ -108,10 +110,10 @@ impl NullifierStore for MemoryNullifiers {
 
 pub struct BallotBox<S> {
     open: Open,
-    hvk: Hvk,
+    hvk: CheckedHvk,
     election: Election,
-    phi: Fr,
-    point: G1,
+    /// `x_E`, the point every cast of this election attests at.
+    point: Fr,
     revote: Revote,
     store: S,
 }
@@ -144,8 +146,7 @@ impl<S: NullifierStore> BallotBox<S> {
             });
         }
         Ok(Self {
-            phi: params.open().enc_pred(&election.predicate())?,
-            point: election.point()?,
+            point: params.cast_point(&election)?,
             open: params.open().clone(),
             hvk: params.hvk().clone(),
             election,
@@ -161,26 +162,29 @@ impl<S: NullifierStore> BallotBox<S> {
         &self.store
     }
 
-    /// Check a cast against this election, statelessly: its class is this election's, and its
-    /// attestation verifies for this election's point with `ballot` bound into it. Returns the
-    /// tag.
+    /// Check a cast against this election, statelessly: its tag is a tag at this election's
+    /// point, and its proof of `R_att` verifies under this election's key with `ballot` bound
+    /// into it. Returns the tag.
     ///
     /// # Errors
-    /// - [`VotingError::WrongClass`] for a ticket of another election, or another credential.
-    /// - [`VotingError::ProofRejected`] if the attestation does not verify: a forged ticket,
-    ///   another community's, or a ballot other than the one it was cast with.
+    /// [`VotingError::ProofRejected`] if the attestation does not verify: a forged ticket, a
+    /// ticket of another election (another key) or community, or a ballot other than the one it
+    /// was cast with.
     pub fn verify(&self, cast: &Cast, ballot: &[u8]) -> Result<String, VotingError> {
-        // The class first: it is a field comparison, and the pairing check is not.
-        if cast.attestation.phi != self.phi {
-            return Err(VotingError::WrongClass);
-        }
-        self.open
-            .check_attestation_in_context(
-                &self.hvk,
-                &self.point,
-                &cast.attestation,
-                &self.election.ballot_context(ballot),
-            )
+        let pp = self.open.params();
+        let att = &cast.attestation;
+        <Bk as Backend>::check_tag(pp, &att.tag, &self.point, "t")
+            .map_err(VotingError::ProofRejected)?;
+        let ctx = self
+            .open
+            .attestation_context_in(self.hvk.vk(), Some(&self.election.ballot_context(ballot)))
+            .map_err(VotingError::ProofRejected)?;
+        let statement = AttestationStatement {
+            vk: self.hvk.vk(),
+            tag: &att.tag,
+            point: &self.point,
+        };
+        <Bk as Backend>::check_attestation_proof(pp, &statement, &att.show, &ctx, &att.proof)
             .map_err(VotingError::ProofRejected)?;
         cast.tag()
     }

@@ -1,15 +1,18 @@
 //! The wire form of a hidden-vetting submission: what the applicant puts in
 //! `JoinRequestSubmitBody.extensions` and what the VTC reads back (design §8).
 //!
-//! **MIRRORED FILE.** The same as `openvtc-vetting-pcs/src/wire.rs` on the openvtc `zkp-pcs`
-//! branch, apart from where `Submission` is imported from. The two sides must agree on this JSON exactly, so change both, and keep
-//! `tests/fixtures/submission.json` — which the VTI branch reads back — regenerated.
+//! The applicant's VTA builds it (`vta/pcs/prove`) and the community reads it; both use this
+//! module, and `tests/fixtures/submission.json` freezes the JSON (`tests/cross_repo_fixture.rs`).
+//!
+//! Under `pcreds` the `proof` member carries the credential request `(id_Q, att⃗, Ĉ, π_iss)` with
+//! the vetter label of its period (`crate::scheme::labelled_text`); `id` repeats `id_Q`, and a
+//! submission whose two disagree is refused.
 //!
 //! Binary values travel as multibase base58btc (`z…`) over the crate's validated canonical
 //! encoding, the convention the rest of the stack uses for `proofValue`.
 
 use predicate_credential_system::{
-    pcs::IssuanceProof,
+    pcreds::CredentialRequest,
     serialization::{from_bytes, from_multibase, to_bytes, to_multibase},
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ProtoError,
     meta::StatementMeta,
-    scheme::{Base, E, Fr, G1},
+    scheme::{Bk, Fr, labelled_from_text, labelled_text, point_text},
     token::TokenSpend,
     verifier::Submission,
 };
@@ -27,7 +30,9 @@ use crate::{
 /// what the design asks for before this ships.
 pub const EXTENSIONS_MEMBER: &str = "hiddenVetting";
 
-/// The only suite this branch implements: `Σ-PS` with `Tag_DDH` over BLS12-381.
+/// The only suite this crate implements: `Σ-PS` with `Tag_DDH` over BLS12-381, run as `pcreds`
+/// (`Π_PCreds`) with a helper key per vetter period. The name is the one the earlier, game-based
+/// `pcs` construction used; nothing made under that construction verifies under this one.
 pub const SUITE: &str = "ps-ddh-bls12381";
 
 /// One statement as it travels: its public metadata and the token spent on it. The attestation
@@ -45,7 +50,7 @@ pub struct TokenWire {
     pub label: String,
     /// The revealed serial.
     pub serial: String,
-    /// The re-randomised signature on `(serial, φ_label)`.
+    /// The re-randomised signature on `serial` under the label's key.
     pub shown: String,
 }
 
@@ -64,7 +69,8 @@ pub struct SubmissionWire {
     pub challenge: String,
     /// One per attestation of `proof`, in the same order.
     pub statements: Vec<StatementWire>,
-    /// The issuance proof `π`, which carries the `k` attestations.
+    /// The `pcreds` credential request `(id_Q, att⃗, Ĉ, π_iss)`, which carries the attestations,
+    /// with the vetter label of its period ([`labelled_text`]).
     pub proof: String,
 }
 
@@ -91,7 +97,7 @@ impl SubmissionWire {
     pub fn from_submission(sub: &Submission) -> Result<Self, ProtoError> {
         Ok(Self {
             suite: SUITE.to_string(),
-            id: to_multibase(&to_bytes(&sub.id)?),
+            id: point_text(sub.id())?,
             join_did: sub.join_did.clone(),
             id_binding: sub.id_binding.clone(),
             challenge: sub.challenge.clone(),
@@ -105,7 +111,7 @@ impl SubmissionWire {
                     })
                 })
                 .collect::<Result<_, ProtoError>>()?,
-            proof: to_multibase(&to_bytes(&sub.proof)?),
+            proof: labelled_text(&sub.label, &sub.request)?,
         })
     }
 
@@ -119,15 +125,20 @@ impl SubmissionWire {
                 self.suite
             )));
         }
-        let proof: IssuanceProof<E, Base> = from_bytes(&from_multibase(&self.proof)?)?;
-        if proof.attestations.len() != self.statements.len() {
+        let (label, request): (String, CredentialRequest<Bk>) = labelled_from_text(&self.proof)?;
+        if request.attestations.len() != self.statements.len() {
             return Err(ProtoError::CountMismatch {
                 statements: self.statements.len(),
-                attestations: proof.attestations.len(),
+                attestations: request.attestations.len(),
             });
         }
+        if point_text(&request.id)? != self.id {
+            return Err(ProtoError::Serialization(
+                "`id` is not the identifier the request is for".into(),
+            ));
+        }
         Ok(Submission {
-            id: from_bytes::<G1>(&from_multibase(&self.id)?)?,
+            label,
             join_did: self.join_did.clone(),
             id_binding: self.id_binding.clone(),
             challenge: self.challenge.clone(),
@@ -136,7 +147,7 @@ impl SubmissionWire {
                 .iter()
                 .map(|s| Ok((s.meta.clone(), s.token.to_spend()?)))
                 .collect::<Result<_, ProtoError>>()?,
-            proof,
+            request,
         })
     }
 

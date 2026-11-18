@@ -6,26 +6,33 @@
 //! adversary links one election, never a member's voting history. One key may also not hold two
 //! tickets for an election: the registrar's caller allows one ticket per member per election.
 
-use predicate_credential_system::pcs::{
-    Attestation, Credential, IssuanceState, PredicateCredentialSystem, RootRequest, UserSecretKey,
+use predicate_credential_system::pcreds::{
+    Attestation, AttestationStatement, Backend, Credential, CredentialRequest, IssuanceState,
 };
 use rand::{CryptoRng, RngCore};
+use zeroize::Zeroize;
 
 use crate::{
     VotingError,
     election::Election,
     registrar::PreTicket,
-    scheme::{Base, E, G1, VotingParams, point_text},
+    scheme::{Bk, G1, Usk, VotingParams, point_text, ticket_ssid},
 };
 
-/// The blinded request a voter sends the registrar for a ticket.
-pub type TicketRequest = RootRequest<E, Base>;
+/// The blinded request a voter sends the registrar for a ticket: a `pcreds` credential request
+/// with no attestations, under the election's helper key and [`ticket_ssid`].
+pub type TicketRequest = CredentialRequest<Bk>;
 /// What unblinds the registrar's answer. Secret, kept by the voter until the answer arrives.
-pub type TicketState = IssuanceState<E, Base>;
+pub type TicketState = IssuanceState<Bk>;
 
 pub struct Voter {
-    usk: UserSecretKey<E>,
-    id: G1,
+    usk: Usk,
+}
+
+impl Drop for Voter {
+    fn drop(&mut self) {
+        self.usk.zeroize();
+    }
 }
 
 impl std::fmt::Debug for Voter {
@@ -38,7 +45,7 @@ impl std::fmt::Debug for Voter {
 /// A voter's ticket for one election. Secret: whoever holds it and the voter's key can vote.
 pub struct Ticket {
     election: Election,
-    cred: Credential<E, Base>,
+    cred: Credential<Bk>,
 }
 
 impl std::fmt::Debug for Ticket {
@@ -76,10 +83,10 @@ impl Ticket {
 }
 
 /// A cast: the attestation that admits one ballot. The ballot's bytes travel beside it.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Cast {
-    pub attestation: Attestation<E, Base>,
+    pub attestation: Attestation<Bk>,
 }
 
 impl Cast {
@@ -93,19 +100,20 @@ impl Cast {
 }
 
 impl Voter {
-    /// A fresh key pair from `rng`.
+    /// A fresh key from `rng`.
     ///
     /// # Errors
-    /// [`VotingError::Pcs`] if the key pair cannot be generated.
+    /// Never, today; kept fallible for a key generation that can refuse.
     pub fn generate<R: RngCore + CryptoRng>(
         params: &VotingParams,
         rng: &mut R,
     ) -> Result<Self, VotingError> {
-        let (id, usk) = params.open().user_keygen(rng)?;
-        Ok(Self { usk, id })
+        Ok(Self {
+            usk: <Bk as Backend>::tag_keygen(params.open().params(), rng),
+        })
     }
 
-    /// The key pair from a 32-byte seed: the same seed always gives the same key, so a VTA never
+    /// The key from a 32-byte seed: the same seed always gives the same key, so a VTA never
     /// stores it.
     ///
     /// # Errors
@@ -114,9 +122,21 @@ impl Voter {
         Self::generate(params, &mut vti_vetting_pcs::scheme::seeded_rng(seed))
     }
 
-    /// The voter's PCS identifier. The registrar sees it in the request; no cast reveals it.
-    pub fn id(&self) -> &G1 {
-        &self.id
+    /// The voter as a user of the election's helper key.
+    fn user(
+        &self,
+        params: &VotingParams,
+    ) -> Result<predicate_credential_system::pcreds::User<Bk>, VotingError> {
+        Ok(params.open().user(params.hvk(), self.usk)?)
+    }
+
+    /// The voter's PCS identifier under the election's key. The registrar sees it in the
+    /// request; no cast reveals it.
+    ///
+    /// # Errors
+    /// [`VotingError::Pcs`] if the tag is undefined.
+    pub fn id(&self, params: &VotingParams) -> Result<G1, VotingError> {
+        Ok(*self.user(params)?.id())
     }
 
     /// The blinded request for a ticket to `election`, and the state that unblinds the answer.
@@ -130,11 +150,12 @@ impl Voter {
         rng: &mut R,
     ) -> Result<(TicketRequest, TicketState), VotingError> {
         same_community(params, election)?;
-        Ok(params.open().root_request(
+        let user = self.user(params)?;
+        Ok(params.open().request_credential(
             params.hvk(),
-            &election.predicate(),
-            &self.id,
-            &self.usk,
+            &user,
+            Vec::new(),
+            &ticket_ssid(election),
             rng,
         )?)
     }
@@ -149,13 +170,11 @@ impl Voter {
         params: &VotingParams,
         election: &Election,
         pre: &PreTicket,
-        state: &TicketState,
+        state: TicketState,
     ) -> Result<Ticket, VotingError> {
         same_community(params, election)?;
-        let cred =
-            params
-                .open()
-                .unblind(params.hvk(), &self.usk, &election.predicate(), pre, state)?;
+        let user = self.user(params)?;
+        let cred = params.open().unblind(params.hvk(), &user, pre, state)?;
         Ok(Ticket {
             election: election.clone(),
             cred,
@@ -231,10 +250,13 @@ impl Voter {
         }))
     }
 
-    /// Cast `ballot` with `ticket`: an attestation for the election's point, bound to the ballot.
+    /// Cast `ballot` with `ticket`: `t = Tag(usk, x_E)` at the election's point, and the proof of
+    /// `R_att` (possession of a credential under the election's key, and `t` made with the
+    /// certified key) bound to the ballot as the attestation's application context.
     ///
     /// # Errors
-    /// [`VotingError::WrongCommunity`], or [`VotingError::Pcs`] if the attestation cannot be made.
+    /// [`VotingError::WrongCommunity`]; [`VotingError::WrongElection`] if `params` are not the
+    /// ticket's election's; [`VotingError::Pcs`] if the attestation cannot be made.
     pub fn cast<R: RngCore + CryptoRng>(
         &self,
         params: &VotingParams,
@@ -244,16 +266,36 @@ impl Voter {
     ) -> Result<Cast, VotingError> {
         let election = &ticket.election;
         same_community(params, election)?;
-        let attestation = params.open().attest_in_context(
-            params.hvk(),
+        let user = self.user(params)?;
+        if !params
+            .open()
+            .verify_credential(params.hvk(), &user, &ticket.cred)
+        {
+            return Err(VotingError::WrongElection);
+        }
+        let pp = params.open().params();
+        let point = params.cast_point(election)?;
+        let tag = <Bk as Backend>::tag(pp, &self.usk, &point)
+            .ok_or(predicate_credential_system::Error::UndefinedTag)?;
+        let ctx = params
+            .open()
+            .attestation_context_in(params.hvk().vk(), Some(&election.ballot_context(ballot)))?;
+        let statement = AttestationStatement {
+            vk: params.hvk().vk(),
+            tag: &tag,
+            point: &point,
+        };
+        let (show, proof) = <Bk as Backend>::prove_attestation(
+            pp,
+            &statement,
             &self.usk,
-            &election.predicate(),
-            &ticket.cred,
-            &election.point()?,
-            &election.ballot_context(ballot),
+            ticket.cred.as_inner(),
+            &ctx,
             rng,
         )?;
-        Ok(Cast { attestation })
+        Ok(Cast {
+            attestation: Attestation { tag, show, proof },
+        })
     }
 }
 

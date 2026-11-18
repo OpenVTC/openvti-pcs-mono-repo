@@ -1,41 +1,41 @@
-//! Attestation tokens (design §5.1, with §13 C1 and C3): Pointcheval–Sanders blind signatures
-//! on secret serials, made with the PCS credential layer. No RSA, no new dependency.
+//! Attestation tokens (design §5.1, with §13 C3 and C5): Pointcheval–Sanders blind signatures
+//! on secret serials, made with the credential base `Σ-PS` of `pcreds`. No RSA, no new
+//! dependency.
 //!
-//! - One token key `(tvk, tsk)` per community, never `hvk`. A PS signature on `(s, φ)` under
-//!   `hvk` would be a PCS credential whose "`usk`" the vetter knows.
-//! - The period is in the token LABEL (`token/<period>`, `token/event/<id>`): `φ_token` is
-//!   `EncPred` of that label under the token deployment.
-//! - Drip: the vetter commits to fresh serials `C_i = g_1^{ρ_i} Y_1^{s_i}` with a proof of
-//!   knowledge of each opening; the VTC blind-signs one at a time (C3), at most once per member
-//!   per tick.
-//! - Spend: the serial is revealed with a RE-RANDOMISED signature; the VTC checks it under a
-//!   live label and records the serial in that label's spent set.
+//! - One token key `(tvk, tsk)` per live LABEL (`token/<period>`, `token/event/<id>`), never a
+//!   helper key: a `Σ-PS` signature on `s` under a period's helper key would be a credential of
+//!   that period on the "`usk`" `s`, which the vetter knows. `Σ-PS` signs one scalar, the
+//!   serial, so the label is in the key and not in the message, as with the per-month token keys
+//!   of design §5.1. Closing a label forgets its key.
+//! - Drip: the vetter commits to fresh serials `C_i = g_1^{ρ_i} Y^{s_i}` (the `PrepareIssue` of
+//!   `Σ-PS`) with a proof of knowledge of each opening; the community blind-signs them one at a
+//!   time under the label's key (C3), at most once per member, label and tick.
+//! - Spend: the serial is revealed with a RE-RANDOMISED signature `(σ_1^r, σ_2^r)`; the
+//!   community checks it under the key of a live label and records the serial in that label's
+//!   spent set. For a uniform `r ≠ 0`, `σ_1^r` is uniform in `G_1 \ {1}` and fixes `σ_2^r`, so
+//!   the spend is independent of the blind signing that made the token.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Mutex,
 };
 
 use ark_ec::PrimeGroup;
-use ark_ff::UniformRand;
+use ark_ff::{UniformRand, Zero};
 use predicate_credential_system::{
-    cred::{
-        CredentialBase,
-        ps::{
-            PSCredential, PSMessage, PSPreCredential, PSShownCredential, PSSigningKey,
-            PSVerificationKey,
-        },
-    },
-    pcs::{Predicate, PredicateCredentialSystem, SetupParams},
+    Error as PcsError,
+    pcreds::pairing::{Base as PairingBase, G1Request, PSPair, PSSigningKey},
     serialization::to_bytes,
     sigma::{FSProof, GroupRelation, LinearEquation, fiat_shamir},
 };
-use rand::{CryptoRng, RngCore};
+use rand::{CryptoRng, RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ProtoError,
-    scheme::{Base, E, Fr, G1, Open, dec, enc, scalar_text, token_deployment_label},
+    scheme::{Base, E, Fr, G1, Tvk, dec, enc, scalar_text},
 };
 
 /// One committed serial with its proof of opening.
@@ -51,7 +51,7 @@ pub struct TokenRequest {
 pub struct TokenSpend {
     pub label: String,
     pub serial: Fr,
-    pub shown: PSShownCredential<E>,
+    pub shown: PSPair<E>,
 }
 
 /// What the spent set said about a spend.
@@ -61,31 +61,13 @@ pub enum SpendOutcome {
     Fresh,
     /// Seen before with the same `(id, tag)`: a resubmission after `requestMore`.
     AlreadyCounted,
-    /// Seen before with another `(id, tag)`. Recorded as an anomaly; the VTC cannot name who.
+    /// Seen before with another `(id, tag)`. Recorded as an anomaly; the community cannot name
+    /// who.
     DoubleSpend,
 }
 
-/// `φ_token` of a label, under the token deployment of a community.
-pub struct TokenParams {
-    open: Open,
-}
-
-impl TokenParams {
-    pub fn new(community: &str) -> Result<Self, ProtoError> {
-        Ok(Self {
-            open: Open::setup(SetupParams::new(token_deployment_label(community)))?,
-        })
-    }
-
-    pub fn phi(&self, label: &str) -> Result<Fr, ProtoError> {
-        Ok(self
-            .open
-            .enc_pred(&Predicate::root(label.as_bytes().to_vec()))?)
-    }
-}
-
-/// The statement `C = g_1^ρ Y_1^s` over the variables `(s, ρ)`, in that order.
-fn opening_relation(tvk: &PSVerificationKey<E>, c: &G1) -> Result<GroupRelation<G1>, ProtoError> {
+/// The statement `C = g_1^ρ Y^s` over the variables `(s, ρ)`, in that order.
+fn opening_relation(tvk: &Tvk, c: &G1) -> Result<GroupRelation<G1>, ProtoError> {
     let mut rel = GroupRelation::new();
     let s = rel.alloc_scalar();
     let rho = rel.alloc_scalar();
@@ -99,14 +81,14 @@ fn opening_relation(tvk: &PSVerificationKey<E>, c: &G1) -> Result<GroupRelation<
 /// The context of an opening proof: the key, the label, who asks, for which tick, which slot.
 /// A proof made for one request cannot be replayed into another.
 fn opening_context(
-    tvk: &PSVerificationKey<E>,
+    tvk: &Tvk,
     label: &str,
     member: &str,
     tick: u32,
     index: usize,
     c: &G1,
 ) -> Result<Vec<u8>, ProtoError> {
-    let mut ctx = b"openvtc/hidden-vetting/token-open/0.1\0".to_vec();
+    let mut ctx = b"openvtc/hidden-vetting/token-open/0.2\0".to_vec();
     for part in [
         to_bytes(tvk)?,
         label.as_bytes().to_vec(),
@@ -121,13 +103,28 @@ fn opening_context(
     Ok(ctx)
 }
 
+/// A uniform nonzero scalar.
+fn nonzero_scalar<R: RngCore + CryptoRng>(rng: &mut R) -> Fr {
+    loop {
+        let r = Fr::rand(rng);
+        if !r.is_zero() {
+            return r;
+        }
+    }
+}
+
+/// `Verify(tvk, s, σ')`, under the key of the spend's label.
+pub fn verify_spend(tvk: &Tvk, spend: &TokenSpend) -> bool {
+    <Base as PairingBase<E>>::verify(&(), tvk, &spend.serial, &spend.shown)
+}
+
 // -------------------------------------------------------------------------------------------
-// VTC side
+// Community side
 // -------------------------------------------------------------------------------------------
 
-/// Where spent serials are remembered. A serial that un-spends is a double spend, so the VTC
-/// backs this with durable storage; the in-memory default is for tests and for a client that
-/// is predicting a verdict.
+/// Where spent serials are remembered. A serial that un-spends is a double spend, so the
+/// community backs this with durable storage; the in-memory default is for tests and for a
+/// client that is predicting a verdict.
 pub trait SpentLedger: std::any::Any + Send {
     /// Record `(label, serial)` as spent by `(id, tag)`, and say what was there before.
     fn record(
@@ -181,44 +178,29 @@ impl SpentLedger for MemoryLedger {
     }
 }
 
-/// What a VERIFIER needs about tokens: the public key, the live labels, and the spent set. The
-/// VTC service holds one of these; so does anything that re-checks a submission from public
-/// data alone (the fixture tests do).
+/// What a VERIFIER needs about tokens: the public key of each live label, and the spent set.
+/// The community service holds one of these; so does anything that re-checks a submission from
+/// public data alone.
 pub struct TokenVerifier {
-    params: TokenParams,
-    tvk: PSVerificationKey<E>,
+    keys: BTreeMap<String, Tvk>,
     live: BTreeSet<String>,
     spent: Box<dyn SpentLedger>,
     pub anomalies: Vec<String>,
 }
 
-/// The signing half: only the community that mints tokens has one. It takes the
-/// [`TokenVerifier`] as an argument rather than owning it, so that one spent set and one set of
-/// live labels serve both minting and verification.
-pub struct TokenIssuer {
-    tsk: PSSigningKey<E>,
-    /// One lock per signing key: blind signing is sequential (§13 C3).
-    sign_lock: Mutex<()>,
-    served: HashSet<(String, String, u32)>,
-}
-
 impl TokenVerifier {
-    /// From public data only: the token key and the labels that are live.
-    pub fn new(
-        community: &str,
-        tvk: PSVerificationKey<E>,
-        live: impl IntoIterator<Item = String>,
-    ) -> Result<Self, ProtoError> {
-        Ok(Self {
-            params: TokenParams::new(community)?,
-            tvk,
-            live: live.into_iter().collect(),
+    /// From public data only: the key of each live label.
+    pub fn new(keys: impl IntoIterator<Item = (String, Tvk)>) -> Self {
+        let keys: BTreeMap<String, Tvk> = keys.into_iter().collect();
+        Self {
+            live: keys.keys().cloned().collect(),
+            keys,
             spent: Box::new(MemoryLedger::default()),
             anomalies: Vec::new(),
-        })
+        }
     }
 
-    /// Swap in a durable ledger (the VTC service does this at startup).
+    /// Swap in a durable ledger (the community service does this at startup).
     #[must_use]
     pub fn with_ledger(mut self, ledger: Box<dyn SpentLedger>) -> Self {
         self.spent = ledger;
@@ -236,32 +218,33 @@ impl TokenVerifier {
         std::mem::replace(&mut self.spent, Box::new(MemoryLedger::default())).into_any()
     }
 
-    pub fn tvk(&self) -> &PSVerificationKey<E> {
-        &self.tvk
+    /// The key of a live label, as the manifest publishes it.
+    pub fn tvk(&self, label: &str) -> Option<&Tvk> {
+        self.keys.get(label)
     }
 
     pub fn live_labels(&self) -> &BTreeSet<String> {
         &self.live
     }
 
-    pub fn open_label(&mut self, label: &str) {
+    /// Open `label` under `tvk`. A label that is live already keeps its key.
+    pub fn open_label(&mut self, label: &str, tvk: Tvk) {
+        self.keys.entry(label.to_string()).or_insert(tvk);
         self.live.insert(label.to_string());
     }
 
     /// Closing a label expires its tokens and drops its spent set: nothing under it can be
     /// spent any more, so nothing needs remembering.
     pub fn close_label(&mut self, label: &str) {
+        self.keys.remove(label);
         self.live.remove(label);
         self.spent.forget_label(label);
     }
 
-    /// The signature check alone: valid under a live label. Also what the applicant's engine
-    /// runs on receipt (§13 C5), with the public `tvk`.
+    /// The signature check alone: valid under the key of a live label. Also what the
+    /// applicant's engine runs on receipt (§13 C5), with the published keys.
     pub fn signature_ok(&self, spend: &TokenSpend) -> Result<bool, ProtoError> {
-        if !self.live.contains(&spend.label) {
-            return Ok(false);
-        }
-        verify_spend(&self.params, &self.tvk, spend)
+        Ok(self.tvk(&spend.label).is_some_and(|tvk| verify_spend(tvk, spend)))
     }
 
     /// Record a verified spend in its label's spent set.
@@ -283,27 +266,67 @@ impl TokenVerifier {
     }
 }
 
+/// Domain separator for the derivation of a label's token key. Versioned: a change is a key
+/// rotation for every label of every deployment that derives.
+const TOKEN_KEY_INFO: &[u8] = b"vtc-vetting-pcs-token-key/v2\0";
+
+/// The signing half: only the community that mints tokens has one. Each label's key is derived
+/// from the community's secret and the label, so a restart finds the same key and the key never
+/// has to be stored. It takes the [`TokenVerifier`] as an argument rather than owning it, so that
+/// one spent set and one set of live labels serve both minting and verification.
+pub struct TokenIssuer {
+    community: String,
+    seed: [u8; 32],
+    /// One lock per signing key would be finer; one for the issuer keeps blind signing
+    /// sequential (§13 C3) and costs nothing at a drip's rate.
+    sign_lock: Mutex<()>,
+    served: HashSet<(String, String, u32)>,
+}
+
+impl std::fmt::Debug for TokenIssuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenIssuer")
+            .field("community", &self.community)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TokenIssuer {
-    /// A fresh token key pair: the verifier half is returned with it, because the two are one
-    /// key and the caller keeps them together.
-    pub fn new<R: RngCore + CryptoRng>(
-        community: &str,
-        rng: &mut R,
-    ) -> Result<(Self, TokenVerifier), ProtoError> {
-        let (tvk, tsk) = Base::keygen(&(), rng);
-        let verifier = TokenVerifier::new(community, tvk, [])?;
-        Ok((
-            Self {
-                tsk,
-                sign_lock: Mutex::new(()),
-                served: HashSet::new(),
-            },
-            verifier,
-        ))
+    /// The issuer of `community`, from a 32-byte secret.
+    pub fn new(community: &str, seed: [u8; 32]) -> Self {
+        Self {
+            community: community.to_string(),
+            seed,
+            sign_lock: Mutex::new(()),
+            served: HashSet::new(),
+        }
+    }
+
+    /// `label`'s key pair, derived.
+    fn key_pair(&self, label: &str) -> (Tvk, PSSigningKey<E>) {
+        let mut h = Sha256::new();
+        h.update(TOKEN_KEY_INFO);
+        for part in [self.community.as_bytes(), label.as_bytes()] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
+        h.update(self.seed);
+        let mut rng = ChaCha20Rng::from_seed(h.finalize().into());
+        <Base as PairingBase<E>>::keygen(&(), &mut rng)
+    }
+
+    /// The verification key of `label`, as the community publishes it.
+    pub fn tvk(&self, label: &str) -> Tvk {
+        self.key_pair(label).0
     }
 
     /// Blind-sign one tick's drip for `member` under `label`. The caller has checked that
     /// `member` holds a live grant (and, for an event label, belongs to the event group).
+    ///
+    /// # Errors
+    /// - [`ProtoError::LabelNotLive`] if `label` is not open, or is open under another key.
+    /// - [`ProtoError::AlreadyServedThisTick`] on a second ask for the same tick.
+    /// - [`ProtoError::BadOpeningProof`] if a request's opening proof does not verify.
     pub fn issue<R: RngCore + CryptoRng>(
         &mut self,
         verifier: &TokenVerifier,
@@ -312,48 +335,38 @@ impl TokenIssuer {
         label: &str,
         requests: &[TokenRequest],
         rng: &mut R,
-    ) -> Result<Vec<PSPreCredential<E>>, ProtoError> {
-        if !verifier.live.contains(label) {
+    ) -> Result<Vec<PSPair<E>>, ProtoError> {
+        let (tvk, tsk) = self.key_pair(label);
+        if verifier.tvk(label) != Some(&tvk) {
             return Err(ProtoError::LabelNotLive(label.to_string()));
         }
-        let key = (member.to_string(), label.to_string(), tick);
-        if self.served.contains(&key) {
+        let served = (member.to_string(), label.to_string(), tick);
+        if self.served.contains(&served) {
             return Err(ProtoError::AlreadyServedThisTick {
                 member: member.to_string(),
                 tick,
             });
         }
         for (i, req) in requests.iter().enumerate() {
-            let rel = opening_relation(verifier.tvk(), &req.commitment)?;
-            let ctx = opening_context(verifier.tvk(), label, member, tick, i, &req.commitment)?;
+            let rel = opening_relation(&tvk, &req.commitment)?;
+            let ctx = opening_context(&tvk, label, member, tick, i, &req.commitment)?;
             if !fiat_shamir::verify(&rel, &ctx, &req.opening_proof) {
                 return Err(ProtoError::BadOpeningProof(i));
             }
         }
-        let phi = verifier.params.phi(label)?;
-        let _guard = self.sign_lock.lock().expect("token signing lock");
-        let pres = requests
-            .iter()
-            .map(|req| Base::blind_issue(&(), &self.tsk, &req.commitment, &phi, rng))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.served.insert(key);
+        let pres = {
+            let _guard = self.sign_lock.lock().expect("token signing lock");
+            requests
+                .iter()
+                .map(|req| {
+                    <Base as PairingBase<E>>::blind_issue(&(), &tsk, &G1Request(req.commitment), rng)
+                        .ok_or(ProtoError::Pcs(PcsError::InvalidIssuanceEncoding))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        self.served.insert(served);
         Ok(pres)
     }
-}
-
-/// `Verify(tvk, (s, φ_label), σ')`.
-pub fn verify_spend(
-    params: &TokenParams,
-    tvk: &PSVerificationKey<E>,
-    spend: &TokenSpend,
-) -> Result<bool, ProtoError> {
-    let m = PSMessage::new(spend.serial, params.phi(&spend.label)?);
-    Ok(Base::verify(
-        &(),
-        tvk,
-        &m,
-        &PSCredential::from(spend.shown.clone()),
-    ))
 }
 
 // -------------------------------------------------------------------------------------------
@@ -364,7 +377,7 @@ struct Held {
     label: String,
     serial: Fr,
     minted_tick: u32,
-    cred: PSCredential<E>,
+    cred: PSPair<E>,
     reserved: bool,
 }
 
@@ -411,7 +424,7 @@ impl HeldToken {
         label: &str,
         serial: &Fr,
         minted_tick: u32,
-        cred: &PSCredential<E>,
+        cred: &PSPair<E>,
     ) -> Result<Self, ProtoError> {
         Ok(Self {
             label: label.to_string(),
@@ -421,17 +434,14 @@ impl HeldToken {
         })
     }
 
-    pub fn parts(&self) -> Result<(Fr, PSCredential<E>), ProtoError> {
-        Ok((
-            dec::<Fr>(&self.serial)?,
-            dec::<PSCredential<E>>(&self.credential)?,
-        ))
+    pub fn parts(&self) -> Result<(Fr, PSPair<E>), ProtoError> {
+        Ok((dec::<Fr>(&self.serial)?, dec::<PSPair<E>>(&self.credential)?))
     }
 }
 
 /// The vetter's bucket.
+#[derive(Default)]
 pub struct TokenWallet {
-    params: TokenParams,
     held: Vec<Held>,
     pending: Vec<Pending>,
 }
@@ -444,22 +454,18 @@ pub struct Reservation {
 }
 
 impl TokenWallet {
-    pub fn new(community: &str) -> Result<Self, ProtoError> {
-        Ok(Self {
-            params: TokenParams::new(community)?,
-            held: Vec::new(),
-            pending: Vec::new(),
-        })
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Draw `r` serials for one tick and commit to them.
+    /// Draw `r` serials for one tick and commit to them under the label's key `tvk`.
     ///
     /// Replaces whatever was in flight for the same `(label, tick)` — asking again is a new
     /// request, and the old one's answer would not unblind under these serials — and leaves every
     /// other draw in flight alone.
     pub fn prepare<R: RngCore + CryptoRng>(
         &mut self,
-        tvk: &PSVerificationKey<E>,
+        tvk: &Tvk,
         label: &str,
         member: &str,
         tick: u32,
@@ -470,7 +476,9 @@ impl TokenWallet {
         let mut out = Vec::with_capacity(r);
         for i in 0..r {
             let (serial, rho) = (Fr::rand(rng), Fr::rand(rng));
-            let c = Base::issuance_encoding(&(), tvk, &serial, &Fr::from(0u64), &rho)?;
+            let c = <Base as PairingBase<E>>::prepare_issue(&(), tvk, &serial, &rho)
+                .ok_or(ProtoError::Pcs(PcsError::InvalidIssuanceEncoding))?
+                .0;
             let rel = opening_relation(tvk, &c)?;
             let ctx = opening_context(tvk, label, member, tick, i, &c)?;
             let opening_proof = fiat_shamir::prove(&rel, &[serial, rho], &ctx, rng)?;
@@ -495,10 +503,10 @@ impl TokenWallet {
     /// will not unblind on a second try either.
     pub fn receive(
         &mut self,
-        tvk: &PSVerificationKey<E>,
+        tvk: &Tvk,
         label: &str,
         tick: u32,
-        pres: &[PSPreCredential<E>],
+        pres: &[PSPair<E>],
     ) -> Result<(), ProtoError> {
         let (pending, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
             .into_iter()
@@ -511,12 +519,10 @@ impl TokenWallet {
             });
         }
         for (p, pre) in pending.into_iter().zip(pres) {
-            let m = PSMessage::new(p.serial, self.params.phi(&p.label)?);
-            let cred = Base::unblind(&(), tvk, &m, pre, &p.rho)?;
-            if !Base::verify(&(), tvk, &m, &cred) {
-                return Err(ProtoError::Pcs(
-                    predicate_credential_system::Error::InvalidPreCredential,
-                ));
+            let cred = <Base as PairingBase<E>>::unblind(&(), tvk, &p.serial, pre, &p.rho)
+                .ok_or(ProtoError::Pcs(PcsError::InvalidPreCredential))?;
+            if !<Base as PairingBase<E>>::verify(&(), tvk, &p.serial, &cred) {
+                return Err(ProtoError::Pcs(PcsError::InvalidPreCredential));
             }
             self.held.push(Held {
                 label: p.label,
@@ -572,7 +578,7 @@ impl TokenWallet {
     }
 
     /// Put stored draws back in flight, so an answer that arrives after the engine was stored
-    /// and restored — which in openvtc is every answer — still unblinds.
+    /// and restored still unblinds.
     pub fn restore_pending(&mut self, pending: &[PendingToken]) -> Result<(), ProtoError> {
         for p in pending {
             self.pending.push(Pending {
@@ -595,8 +601,8 @@ impl TokenWallet {
     }
 
     /// Restore a bucket from storage.
-    pub fn restore(community: &str, tokens: &[HeldToken]) -> Result<Self, ProtoError> {
-        let mut wallet = Self::new(community)?;
+    pub fn restore(tokens: &[HeldToken]) -> Result<Self, ProtoError> {
+        let mut wallet = Self::new();
         for t in tokens {
             let (serial, cred) = t.parts()?;
             wallet.held.push(Held {
@@ -642,7 +648,6 @@ impl TokenWallet {
     /// Spend a reservation: the token leaves the wallet as a re-randomised signature.
     pub fn spend<R: RngCore + CryptoRng>(
         &mut self,
-        tvk: &PSVerificationKey<E>,
         r: &Reservation,
         rng: &mut R,
     ) -> Result<TokenSpend, ProtoError> {
@@ -652,12 +657,14 @@ impl TokenWallet {
             .position(|h| h.serial == r.serial && h.reserved)
             .ok_or(ProtoError::AtCapacity { available_from: 0 })?;
         let h = self.held.remove(pos);
-        let m = PSMessage::new(h.serial, self.params.phi(&h.label)?);
-        let (shown, ()) = Base::rerand(&(), tvk, &m, &h.cred, rng)?;
+        let k = nonzero_scalar(rng);
         Ok(TokenSpend {
             label: h.label,
             serial: h.serial,
-            shown,
+            shown: PSPair {
+                s1: h.cred.s1 * k,
+                s2: h.cred.s2 * k,
+            },
         })
     }
 }

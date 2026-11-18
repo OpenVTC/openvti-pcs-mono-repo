@@ -15,10 +15,7 @@
 
 use std::sync::Mutex;
 
-use predicate_credential_system::{
-    cred::CredentialBase,
-    pcs::{HelperSecretKey, PredicateCredentialSystem},
-};
+use predicate_credential_system::pcreds::{Backend, Decision, Helper, Reply};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
@@ -26,20 +23,20 @@ use sha2::{Digest, Sha256};
 use crate::{
     VotingError,
     election::{Election, check_community},
-    scheme::{Base, G1, Hvk, Open, VotingParams, key_text, open},
+    scheme::{Bk, G1, Hvk, Pcreds, VotingParams, key_text, open, policy, ticket_ssid},
     voter::TicketRequest,
 };
 
-pub const KEY_DERIVATION_INFO: &[u8] = b"vti-voting-pcs-keys/v1\0";
+/// v2: one helper key per election, on `pcreds`.
+pub const KEY_DERIVATION_INFO: &[u8] = b"vti-voting-pcs-keys/v2\0";
 
 /// What [`Registrar::issue_ticket`] returns: the voter unblinds it into their ticket.
-pub type PreTicket = <Base as CredentialBase>::PreCredential;
+pub type PreTicket = <Bk as Backend>::PreCredential;
 
 pub struct Registrar {
     community: String,
-    open: Open,
-    hvk: Hvk,
-    hsk: HelperSecretKey<Base>,
+    open: Pcreds,
+    seed: [u8; 32],
     /// Issuance is sequential: the scheme's security argument holds for sequential issuance
     /// under one helper key, and the library does not enforce it.
     hsk_lock: Mutex<()>,
@@ -55,7 +52,7 @@ impl std::fmt::Debug for Registrar {
 }
 
 impl Registrar {
-    /// The key pair from one secret, deterministically.
+    /// Every election's key from one secret, deterministically.
     ///
     /// # Errors
     /// [`VotingError::InvalidCommunity`] or [`VotingError::Pcs`].
@@ -66,8 +63,7 @@ impl Registrar {
         h.update((community.len() as u64).to_le_bytes());
         h.update(community.as_bytes());
         h.update(secret);
-        let seed: [u8; 32] = h.finalize().into();
-        Self::generate(community, &mut ChaCha20Rng::from_seed(seed))
+        Self::from_seed(community, h.finalize().into())
     }
 
     /// Fresh keys from `rng`. Tests use this; a service uses [`Self::derive`].
@@ -79,13 +75,16 @@ impl Registrar {
         rng: &mut R,
     ) -> Result<Self, VotingError> {
         check_community(community)?;
-        let open = open(community)?;
-        let (hvk, hsk) = open.helper_keygen(rng);
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        Self::from_seed(community, seed)
+    }
+
+    fn from_seed(community: &str, seed: [u8; 32]) -> Result<Self, VotingError> {
         Ok(Self {
             community: community.to_string(),
-            open,
-            hvk,
-            hsk,
+            open: open(community)?,
+            seed,
             hsk_lock: Mutex::new(()),
         })
     }
@@ -93,25 +92,46 @@ impl Registrar {
     pub fn community(&self) -> &str {
         &self.community
     }
-    pub fn hvk(&self) -> &Hvk {
-        &self.hvk
+
+    /// `election`'s helper: its key pair, derived from the secret and the election's identity,
+    /// with an empty issuance record — the community keeps the durable record of who holds a
+    /// ticket.
+    fn helper(&self, election: &Election) -> Helper<Bk> {
+        let mut h = Sha256::new();
+        h.update(b"voter-election\0");
+        for part in [
+            election.id().as_str().as_bytes(),
+            election.manifest_digest().as_slice(),
+        ] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
+        h.update(self.seed);
+        self.open
+            .helper_keygen(policy(), &mut ChaCha20Rng::from_seed(h.finalize().into()))
     }
 
-    /// The public half, as voters and ballot boxes take it.
-    pub fn params(&self) -> VotingParams {
-        VotingParams::new(&self.community, self.hvk.clone())
-            .expect("the community was checked at construction")
+    /// `election`'s helper verification key: its published `votingKey`.
+    pub fn hvk(&self, election: &Election) -> Hvk {
+        self.helper(election).key().vk().clone()
     }
 
-    /// `hvk` as the community publishes it, multibase.
+    /// The public half of `election`, as voters and ballot boxes take it.
+    pub fn params(&self, election: &Election) -> VotingParams {
+        VotingParams::new(&self.community, self.hvk(election))
+            .expect("the community was checked at construction, and the key is the deployment's")
+    }
+
+    /// `election`'s `votingKey` as the community publishes it, multibase.
     ///
     /// # Errors
     /// [`VotingError::Serialization`] if the key cannot be encoded.
-    pub fn public_text(&self) -> Result<String, VotingError> {
-        key_text(&self.hvk).map_err(|e| VotingError::Serialization(e.to_string()))
+    pub fn public_text(&self, election: &Election) -> Result<String, VotingError> {
+        key_text(&self.hvk(election)).map_err(|e| VotingError::Serialization(e.to_string()))
     }
 
-    /// Sign one voter's blinded request for a ticket to `election`.
+    /// Sign one voter's blinded request for a ticket to `election`: a root admission under the
+    /// election's key, for the identifier `id` the request is for.
     ///
     /// The request carries a commitment; what comes back is a pre-credential only the voter can
     /// unblind. The registrar never sees the ticket it made, which is why it cannot recognise
@@ -119,7 +139,8 @@ impl Registrar {
     ///
     /// # Errors
     /// - [`VotingError::WrongCommunity`] if `election` is another community's.
-    /// - [`VotingError::Pcs`] if the request does not verify.
+    /// - [`VotingError::Pcs`] if the request does not verify for `election`, or is for another
+    ///   identifier than `id`.
     pub fn issue_ticket<R: RngCore + CryptoRng>(
         &self,
         election: &Election,
@@ -133,10 +154,22 @@ impl Registrar {
                 actual: election.community().to_string(),
             });
         }
-        let f = election.predicate();
-        let _guard = self.hsk_lock.lock().expect("helper signing lock");
-        Ok(self
+        if request.id != *id {
+            return Err(VotingError::Pcs(
+                predicate_credential_system::Error::IdentifierMismatch,
+            ));
+        }
+        let mut helper = self.helper(election);
+        let evaluated = self
             .open
-            .issue_root(&self.hvk, &self.hsk, &f, id, request, rng)?)
+            .evaluate_request(&helper, request, &ticket_ssid(election))?;
+        let _guard = self.hsk_lock.lock().expect("helper signing lock");
+        match self.open.respond(&mut helper, evaluated, Decision::Root, rng)? {
+            Reply::PreCredential(pre) => Ok(pre),
+            // The record is fresh on every call: neither occurs for a root admission.
+            Reply::Issued | Reply::Fail => Err(VotingError::Pcs(
+                predicate_credential_system::Error::IdentifierMismatch,
+            )),
+        }
     }
 }

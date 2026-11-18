@@ -232,7 +232,7 @@ pub(crate) async fn publish_hidden_vetting_core(
         .hidden_vetting
         .as_ref()
         .and_then(|v| serde_json::from_value::<HiddenVettingConfig>(v.clone()).ok())
-        && (stored.hvk != config.hvk || stored.tvk != config.tvk)
+        && !crate::vetting::pcs_issue::same_keys(&stored, &config)
     {
         return Err(Halted::declared(
             HIDDEN_PUBLISH_ERR_SIGNER_CHANGED,

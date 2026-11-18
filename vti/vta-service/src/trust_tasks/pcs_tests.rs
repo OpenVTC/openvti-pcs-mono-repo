@@ -11,7 +11,7 @@ use vta_sdk::trust_tasks as uris;
 use vti_vetting_pcs::{
     issuer::{RootRequestWire, TokenBatchRequestWire},
     rand::{SeedableRng, rngs::StdRng},
-    scheme::{enc, key_text, point_from_text},
+    scheme::{enc, keys_text},
     vtc::Vtc,
     wire::{SUITE, SubmissionWire},
 };
@@ -65,14 +65,19 @@ fn requirements() -> Value {
     })
 }
 
+fn token_labels(vtc: &Vtc) -> Vec<String> {
+    vtc.token_verifier().live_labels().iter().cloned().collect()
+}
+
 /// The parameters exactly as the community's manifest publishes them.
 fn published(vtc: &Vtc) -> Value {
     json!({
         "suite": SUITE,
-        "helperKey": key_text(vtc.hvk()).unwrap(),
-        "tokenKey": key_text(vtc.tvk()).unwrap(),
+        // One key per live period and per live token label, in their order.
+        "helperKey": keys_text(&vtc.live_periods().iter().map(|p| vtc.hvk(p)).collect::<Vec<_>>()).unwrap(),
+        "tokenKey": keys_text(&token_labels(vtc).iter().map(|l| vtc.tvk(l).unwrap().clone()).collect::<Vec<_>>()).unwrap(),
         "vetterLabels": vtc.live_periods().iter().map(|p| format!("vetter/{p}")).collect::<Vec<_>>(),
-        "tokenLabels": [vtc.current_token_label()],
+        "tokenLabels": token_labels(vtc),
         "dripPerTick": vtc.drip_rate(),
         "tickLength": "P3D",
         "events": [],
@@ -122,9 +127,9 @@ async fn enrolled_vetter(
     )
     .await;
     let wire: RootRequestWire = serde_json::from_value(ok(&out)["request"].clone()).unwrap();
-    let request = serde_json::from_value(wire.request.clone()).unwrap();
+    let (_, request) = wire.parse().unwrap();
     let pre = vtc
-        .issue_vetter_root(member, &point_from_text(&wire.id).unwrap(), &request, rng)
+        .issue_vetter_root(member, &request, rng)
         .expect("the community signs the blinded request");
     let out = handle_root_accept(
         state,
@@ -582,16 +587,34 @@ async fn burn_paths(state: &AppState, ctx: &str, n: usize) {
     }
 }
 
-/// A valid PCS identifier no key of this VTA has.
-fn stranger_id() -> String {
-    let (id, _) = vti_vetting_pcs::scheme::member_key_from_seed(COMMUNITY, &[0x5A; 32]).unwrap();
-    vti_vetting_pcs::scheme::point_text(&id).unwrap()
+/// A valid binding (`BindingRef`) of an identifier no key of this VTA has.
+fn stranger_id(vtc: &Vtc) -> String {
+    let usk = vti_vetting_pcs::scheme::member_key_from_seed(COMMUNITY, &[0x5A; 32]).unwrap();
+    let hvk = vtc.pcreds().helper_key(&vtc.hvk("2026-10")).unwrap();
+    vti_vetting_pcs::scheme::BindingRef {
+        label: "vetter/2026-10".into(),
+        hvk: hvk.vk().clone(),
+        id: vti_vetting_pcs::scheme::member_id(vtc.pcreds(), &hvk, &usk).unwrap(),
+    }
+    .to_text()
+    .unwrap()
+}
+
+/// The identifier a binding names, as a root request carries it.
+fn bound_point(binding: &str) -> String {
+    vti_vetting_pcs::scheme::point_text(
+        &vti_vetting_pcs::scheme::BindingRef::from_text(binding)
+            .unwrap()
+            .id,
+    )
+    .unwrap()
 }
 
 /// The whole recovery: the vetter enrols, its engine record is lost and the seed rotated, a new
-/// root request makes a key the community refuses as a rebind, and recovering with the bound
-/// identifier restores the original key — found under the retired seed generation — so the
-/// next enrolment carries it and the community accepts it.
+/// root request makes a key the community refuses (a second identifier in the period), and
+/// recovering with the bound identifier restores the original key — found under the retired
+/// seed generation, by deriving identifiers under the bound period's key — so the next
+/// enrolment carries it and the community re-issues to it.
 #[tokio::test]
 async fn recover_restores_the_bound_key_after_the_engine_record_was_lost() {
     let (state, _dir) = build_signing_test_app_state().await;
@@ -618,23 +641,18 @@ async fn recover_restores_the_bound_key_after_the_engine_record_was_lost() {
         .await
         .expect("rotate the seed");
 
-    // The next root request makes a fresh key, which the community refuses as a rebind.
-    vtc.rotate("2026-11").unwrap();
+    // The next root request makes a fresh key, which the community refuses: a second identifier
+    // in the period.
     let params = published(&vtc);
-    let label = "vetter/2026-11";
+    let label = "vetter/2026-10";
     let (wire, fresh_id) = root_request_id(&state, &alice, "vetter-a", &params, label).await;
-    assert_ne!(fresh_id, bound_id, "a lost record means a fresh key");
-    let request = serde_json::from_value(wire.request.clone()).unwrap();
-    let refused = vtc.issue_vetter_root(
-        member,
-        &point_from_text(&fresh_id).unwrap(),
-        &request,
-        &mut rng,
-    );
+    assert_ne!(fresh_id, bound_point(&bound_id), "a lost record means a fresh key");
+    let (_, request) = wire.parse().unwrap();
+    let refused = vtc.issue_vetter_root(member, &request, &mut rng);
     assert!(
         matches!(
             refused,
-            Err(vti_vetting_pcs::ProtoError::IdentifierRebound(_))
+            Err(vti_vetting_pcs::ProtoError::AlreadyIssued { .. })
         ),
         "the community refuses the fresh key"
     );
@@ -656,7 +674,7 @@ async fn recover_restores_the_bound_key_after_the_engine_record_was_lost() {
     assert!(text.contains("pcs.vetter.recover"));
     assert!(text.contains("key.pcs_search"));
     assert!(
-        !text.contains(&bound_id),
+        !text.contains(&bound_id) && !text.contains(&bound_point(&bound_id)),
         "no audit row names the identifier"
     );
 
@@ -666,11 +684,11 @@ async fn recover_restores_the_bound_key_after_the_engine_record_was_lost() {
 
     // The next enrolment carries the bound key, and the community takes it.
     let (wire, id) = root_request_id(&state, &alice, "vetter-a", &params, label).await;
-    assert_eq!(id, bound_id);
-    let request = serde_json::from_value(wire.request.clone()).unwrap();
+    assert_eq!(id, bound_point(&bound_id));
+    let (_, request) = wire.parse().unwrap();
     let pre = vtc
-        .issue_vetter_root(member, &point_from_text(&id).unwrap(), &request, &mut rng)
-        .expect("the community accepts the bound key");
+        .issue_vetter_root(member, &request, &mut rng)
+        .expect("the community re-issues to the bound key");
     let out = handle_root_accept(
         &state,
         &alice,
@@ -720,7 +738,7 @@ async fn recover_refuses_with_the_codes_its_specification_declares() {
     let out = handle_vetter_recover(
         &state,
         &alice,
-        recover("vetter-a", alice_did, &stranger_id()),
+        recover("vetter-a", alice_did, &stranger_id(&vtc)),
     )
     .await;
     assert_eq!(code(&out), "vta/pcs/vetter/recover:engineEnrolled");
@@ -736,7 +754,7 @@ async fn recover_refuses_with_the_codes_its_specification_declares() {
     let out = handle_vetter_recover(
         &state,
         &only_c,
-        recover("vetter-c", bob_did, &stranger_id()),
+        recover("vetter-c", bob_did, &stranger_id(&vtc)),
     )
     .await;
     assert_eq!(

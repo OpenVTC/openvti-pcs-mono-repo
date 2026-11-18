@@ -10,7 +10,7 @@ use predicate_credential_system::hash::{HashToGroup, bls12_381::G1Hasher};
 
 use crate::{
     VotingError,
-    scheme::{G1, voter_predicate},
+    scheme::G1,
 };
 
 /// Domain of the election point oracle. A new derivation is a new domain, never a parameter.
@@ -86,11 +86,6 @@ impl Election {
     }
     pub fn manifest_digest(&self) -> &ManifestDigest {
         &self.manifest_digest
-    }
-
-    /// The voter class of this election.
-    pub fn predicate(&self) -> predicate_credential_system::pcs::Predicate {
-        voter_predicate(&self.id)
     }
 
     /// `id_E`: the public point every cast in this election attests for. A hash to the curve, so

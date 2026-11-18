@@ -97,9 +97,12 @@ fn mask_key(state: &AppState) -> Result<[u8; 32], ProtoError> {
 pub struct HiddenVettingConfig {
     /// `ps-ddh-bls12381`, the only suite this branch implements.
     pub suite: String,
-    /// The helper verification key `hvk`, multibase.
+    /// The helper verification keys, one per live period in the order of `live_periods`,
+    /// multibase over the list (`vti_vetting_pcs::scheme::keys_text`): under `pcreds` a vetter
+    /// period is a helper key.
     pub hvk: String,
-    /// The token verification key `tvk`, multibase. Never the same key as `hvk` (§5.1).
+    /// The token verification keys, one per live token label in the order of
+    /// `live_token_labels`, in the same form. Never a helper key (§5.1).
     pub tvk: String,
     /// Live vetter class labels, current first: `["2026-10", "2026-09"]` (§13 C1).
     pub live_periods: Vec<String>,
@@ -487,7 +490,7 @@ pub async fn decide(
     extensions: &serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<Option<Decision>, DecideError> {
-    use predicate_credential_system::serialization::{from_bytes, from_multibase};
+    use vti_vetting_pcs::scheme::{Hvk, Tvk, keys_from_text};
 
     let Some(wire) = SubmissionWire::from_extensions(extensions)? else {
         return Ok(None);
@@ -535,10 +538,23 @@ pub async fn decide(
     }
 
     // 2. Decide against those.
-    let hvk = from_bytes(&from_multibase(&config.hvk)?)?;
-    let tvk = from_bytes(&from_multibase(&config.tvk)?)?;
+    let hvks: Vec<Hvk> = keys_from_text(&config.hvk)?;
+    let tvks: Vec<Tvk> = keys_from_text(&config.tvk)?;
+    if hvks.len() != config.live_periods.len() || tvks.len() != config.live_token_labels.len() {
+        return Err(ProtoError::Serialization(
+            "the stored hidden-vetting keys do not match the live labels".into(),
+        )
+        .into());
+    }
     let accepted_labels = accepted_token_labels(config, now);
-    let tokens = TokenVerifier::new(community_did, tvk, accepted_labels.clone())?;
+    let tokens = TokenVerifier::new(
+        config
+            .live_token_labels
+            .iter()
+            .cloned()
+            .zip(tvks)
+            .filter(|(l, _)| accepted_labels.contains(l)),
+    );
     let mut verifier = Verifier::new(
         VerifierParams {
             community: community_did.to_string(),
@@ -546,9 +562,13 @@ pub async fn decide(
             requirements: requirements.clone(),
             requirements_digest: requirements_digest.to_string(),
         },
-        hvk,
+        config
+            .live_periods
+            .iter()
+            .map(|p| format!("vetter/{p}"))
+            .zip(hvks)
+            .collect(),
         tokens,
-        config.live_periods.clone(),
     )?;
     // The ledger moves into the verifier for the call and comes back with what it took.
     let ledger = Box::new(ledger);
@@ -670,10 +690,20 @@ fn explain_statements(
 mod tests {
     use super::*;
 
-    /// The submission the openvtc client produced, which `vti-vetting-pcs`'s own fixture test
-    /// reads back with the verifier. Here it drives the *service* path: the store, the
+    /// The frozen submission `vti-vetting-pcs`'s own fixture test reads back with the verifier
+    /// (built by the member-side engines). Here it drives the *service* path: the store, the
     /// challenge, the spend commit.
     const FIXTURE: &str = include_str!("../../../vti-vetting-pcs/tests/fixtures/submission.json");
+
+    /// The fixture's live vetter periods, as the store keeps them (bare, not `vetter/…`).
+    fn fixture_periods(f: &serde_json::Value) -> Vec<String> {
+        f["vetterLabels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().trim_start_matches("vetter/").to_string())
+            .collect()
+    }
 
     /// End to end on the service: a VTC-issued challenge is spent by the submission that was
     /// bound to it, and the same submission replayed finds nothing to spend.
@@ -699,10 +729,10 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .to_string(),
-            hvk: f["hvk"].as_str().unwrap().to_string(),
-            tvk: f["tvk"].as_str().unwrap().to_string(),
-            live_periods: serde_json::from_value(f["livePeriods"].clone()).unwrap(),
-            live_token_labels: serde_json::from_value(f["liveTokenLabels"].clone()).unwrap(),
+            hvk: f["helperKey"].as_str().unwrap().to_string(),
+            tvk: f["tokenKey"].as_str().unwrap().to_string(),
+            live_periods: fixture_periods(&f),
+            live_token_labels: serde_json::from_value(f["tokenLabels"].clone()).unwrap(),
             drip_per_tick: default_drip_per_tick(),
             tick_length: default_tick_length(),
             events: Vec::new(),
@@ -817,9 +847,11 @@ mod tests {
         let challenge = hidden["challenge"].as_str().unwrap();
         let config = HiddenVettingConfig {
             suite: hidden["suite"].as_str().unwrap().to_string(),
-            hvk: f["hvk"].as_str().unwrap().to_string(),
-            tvk: f["tvk"].as_str().unwrap().to_string(),
-            live_periods: serde_json::from_value(f["livePeriods"].clone()).unwrap(),
+            hvk: f["helperKey"].as_str().unwrap().to_string(),
+            // One key for the one label below: the fixture's, now under a label its tokens were
+            // not drawn under.
+            tvk: f["tokenKey"].as_str().unwrap().to_string(),
+            live_periods: fixture_periods(&f),
             // The month moved on: the label the fixture's tokens were drawn under is gone.
             live_token_labels: vec!["token/1999-01".into()],
             drip_per_tick: default_drip_per_tick(),

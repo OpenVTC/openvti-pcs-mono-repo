@@ -1,48 +1,69 @@
 //! Verifying a hidden-vetting submission from PUBLIC data only, and turning it into the facts
 //! VTI already counts (design §2).
 //!
-//! This half holds no secret: the helper key it uses is `hvk`, the token key is `tvk`, and both
-//! are published in the manifest. The VTC service runs it beside its own state; so does the
-//! applicant's client when it wants to know what the VTC will make of what it holds.
+//! This half holds no secret: the helper keys it uses are the published `hvk` of each live
+//! vetter period, the token keys the published `tvk` of each live label. The VTC service runs
+//! it beside its own state.
 //!
-//! **THIS IS THE ONE THAT DECIDES.** `openvtc-vetting-pcs/src/verifier.rs` mirrors it so a client
-//! can predict the verdict; when they disagree, this file is right and the fixture test says so.
+//! # Evaluation from public data
+//!
+//! A submission is a `pcreds` credential request `(id_Q, att⃗, Ĉ, π_iss)` under the session
+//! `ssid = challenge`, with application contexts. `Protocol::evaluate_request` takes a
+//! [`Helper`](predicate_credential_system::pcreds::Helper), which holds the helper's signing key
+//! although evaluation reads only its public key. [`evaluate`] performs the same steps (protocol
+//! box, `CredentialRequest`, the helper's steps (i) and (ii)) with the library's public checks
+//! and nothing else: `id_Q ∈ T` at the identifier point of the period's key, `π_iss` under the
+//! issuance context rebuilt from the request and the verifier's own copy of the contexts, and
+//! each attestation under its own context ([`Pcreds::check_attestation_in_context`]). The
+//! community never answers the request with a credential (design §13 C4).
+//!
+//! **THIS IS THE ONE THAT DECIDES.**
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, NaiveTime, Utc};
 use predicate_credential_system::{
-    kiprf::verify_tag, pcs::PredicateCredentialSystem, sigma::FSProof,
+    pcreds::{Backend, CredentialRequest, IssuanceStatement},
+    sigma::FSProof,
 };
 use serde::Serialize;
 use vta_sdk::{
     protocols::vetting::{VettingMethod, VettingRelationship, VettingRequirements},
-    vetting::requirements::{Evaluation, StatementFacts, evaluate},
+    vetting::requirements::{Evaluation, StatementFacts, evaluate as count},
 };
 
 use crate::{
     ProtoError,
     meta::{ProofContext, StatementMeta, id_binding},
-    scheme::{
-        Base, E, Fr, G1, Helper, Hvk, Open, deployment_label, hidden_vetting_predicate, point_text,
-        scalar_text, vetter_predicate,
-    },
+    scheme::{Bk, CheckedHvk, Fr, G1, Hvk, Pcreds, pcreds, point_text, scalar_text},
     token::{SpendOutcome, TokenSpend, TokenVerifier},
 };
-use predicate_credential_system::pcs::{IssuanceProof, SetupParams};
+
+/// The most attestations one submission may carry. Every attestation costs a pairing check, so
+/// a submission is refused above this before any is verified.
+pub const MAX_ATTESTATIONS: usize = 64;
 
 /// The hidden-vetting part of a join submission (`extensions.hiddenVetting`, design §8).
 #[derive(Debug, Clone)]
 pub struct Submission {
-    pub id: G1,
+    /// The vetter label of the applicant's period: the request is under its helper key.
+    pub label: String,
     pub join_did: String,
     /// The binding of `id` to the join persona (§4.2), as the applicant computed it. The
     /// verifier recomputes it and compares; it never takes the applicant's word for it.
     pub id_binding: String,
     pub challenge: String,
-    /// One per attestation in `proof`, in the same order.
+    /// One per attestation of `request`, in the same order.
     pub statements: Vec<(StatementMeta, TokenSpend)>,
-    pub proof: IssuanceProof<E, Base>,
+    /// `(id_Q, att⃗, Ĉ, π_iss)` under the session `ssid = challenge`.
+    pub request: CredentialRequest<Bk>,
+}
+
+impl Submission {
+    /// The applicant's PCS identifier.
+    pub fn id(&self) -> &G1 {
+        &self.request.id
+    }
 }
 
 /// One row of `VettingFacts.statements`, as the VTC builds it today, with `issuer` = the tag.
@@ -71,6 +92,7 @@ pub struct Decision {
 pub(crate) struct Kept {
     pub facts: StatementFacts,
     pub tag: String,
+    pub verified: bool,
     pub method: VettingMethod,
     pub relationship: VettingRelationship,
     pub failures: Vec<String>,
@@ -84,93 +106,158 @@ pub struct VerifierParams {
     pub requirements_digest: String,
 }
 
+/// `N''` of a credential request under `hvk`: the distinct tags of the attestations that verify,
+/// in their order, after `id_Q ∈ T` and `π_iss` (module docs, "Evaluation from public data").
+///
+/// # Errors
+/// [`ProtoError::ProofRejected`] if `id_Q` or `π_iss` does not verify; [`ProtoError::DuplicateTag`]
+/// for two attestations with one tag; [`ProtoError::CountMismatch`] if `att_apps` does not hold
+/// one context per attestation.
+pub fn evaluate(
+    pcreds: &Pcreds,
+    hvk: &CheckedHvk,
+    request: &CredentialRequest<Bk>,
+    ssid: &[u8],
+    att_apps: &[&[u8]],
+    app: &[u8],
+) -> Result<Vec<G1>, ProtoError> {
+    if att_apps.len() != request.attestations.len() {
+        return Err(ProtoError::CountMismatch {
+            statements: att_apps.len(),
+            attestations: request.attestations.len(),
+        });
+    }
+    let pp = pcreds.params();
+    // (i) id_Q ∈ T at x_0, and π_iss under (ssid, att⃗) and the contexts.
+    <Bk as Backend>::check_tag(pp, &request.id, hvk.identifier_point(), "id_Q")
+        .map_err(ProtoError::ProofRejected)?;
+    let ctx = pcreds
+        .issuance_context_in(
+            hvk.vk(),
+            ssid,
+            &request.attestations,
+            Some(att_apps),
+            Some(app),
+        )
+        .map_err(ProtoError::ProofRejected)?;
+    let statement = IssuanceStatement {
+        vk: hvk.vk(),
+        request: &request.request,
+        id: &request.id,
+        x0: hvk.identifier_point(),
+    };
+    <Bk as Backend>::check_issuance_proof(pp, &statement, &ctx, &request.proof)
+        .map_err(ProtoError::ProofRejected)?;
+    // (ii) N'': each attestation under its own context. One attestation per tag, so that N''
+    // says exactly which attestations verified.
+    let mut seen = HashSet::new();
+    let mut valid = Vec::new();
+    for (att, att_app) in request.attestations.iter().zip(att_apps) {
+        if !seen.insert(point_text(&att.tag)?) {
+            return Err(ProtoError::DuplicateTag);
+        }
+        if pcreds
+            .check_attestation_in_context(hvk, &request.id, att, att_app)
+            .is_ok()
+        {
+            valid.push(att.tag);
+        }
+    }
+    Ok(valid)
+}
+
 pub struct Verifier {
     pub params: VerifierParams,
-    open: Open,
-    helper: Helper,
-    hvk: Hvk,
+    pcreds: Pcreds,
+    /// Live vetter labels, current first, each with its checked helper key.
+    periods: Vec<(String, CheckedHvk)>,
     pub tokens: TokenVerifier,
-    live_periods: Vec<String>,
     withdrawn: HashSet<(String, String)>,
     applications: HashMap<String, BTreeMap<String, Kept>>,
 }
 
 impl Verifier {
-    /// From public parameters: the helper key, the token verifier, and the live vetter periods
-    /// (current first).
+    /// From public parameters: the helper key of each live vetter label (current first), and
+    /// the token verifier.
+    ///
+    /// # Errors
+    /// [`ProtoError::Pcs`] if the deployment parameters cannot be derived, or a helper key is
+    /// not one of its keys.
     pub fn new(
         params: VerifierParams,
-        hvk: Hvk,
+        helper_keys: Vec<(String, Hvk)>,
         tokens: TokenVerifier,
-        live_periods: Vec<String>,
     ) -> Result<Self, ProtoError> {
-        let open = Open::setup(SetupParams::new(deployment_label(&params.community)))?;
-        let helper = Self::helper_for(&open, &live_periods)?;
-        Ok(Self {
+        let pcreds = pcreds(&params.community)?;
+        let mut verifier = Self {
             params,
-            open,
-            helper,
-            hvk,
+            pcreds,
+            periods: Vec::new(),
             tokens,
-            live_periods,
             withdrawn: HashSet::new(),
             applications: HashMap::new(),
-        })
+        };
+        verifier.set_live_periods(helper_keys)?;
+        Ok(verifier)
     }
 
-    /// The helper runs with an AllowList of the live vetter labels, never with `P ≡ 1`
-    /// (`docs/operating-a-helper.md`).
-    pub(crate) fn helper_for(open: &Open, periods: &[String]) -> Result<Helper, ProtoError> {
-        let predicates: Vec<_> = periods.iter().map(|p| vetter_predicate(p)).collect();
-        let policy = open.allow_list(predicates.iter())?;
-        Ok(Helper::from_public_parameters(
-            open.public_parameters().clone(),
-            policy,
-        )?)
+    pub fn pcreds(&self) -> &Pcreds {
+        &self.pcreds
     }
-
-    pub fn open(&self) -> &Open {
-        &self.open
+    /// The live vetter labels, current first.
+    pub fn live_labels(&self) -> Vec<String> {
+        self.periods.iter().map(|(l, _)| l.clone()).collect()
     }
-    pub fn hvk(&self) -> &Hvk {
-        &self.hvk
-    }
-    pub fn live_periods(&self) -> &[String] {
-        &self.live_periods
-    }
-    pub fn current_period(&self) -> &str {
-        &self.live_periods[0]
-    }
-
-    /// Rotation and emergency drops both land here: the AllowList is rebuilt from the periods
-    /// that are live now.
-    pub fn set_live_periods(&mut self, periods: Vec<String>) -> Result<(), ProtoError> {
-        self.helper = Self::helper_for(&self.open, &periods)?;
-        self.live_periods = periods;
-        Ok(())
-    }
-
-    /// `φ` of every live vetter label: what a client checks an attestation's class against.
-    pub fn live_vetter_phis(&self) -> Result<Vec<Fr>, ProtoError> {
-        self.live_periods
+    /// The checked helper key of a live vetter label.
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if the label is not live.
+    pub fn hvk(&self, label: &str) -> Result<&CheckedHvk, ProtoError> {
+        self.periods
             .iter()
-            .map(|p| Ok(self.open.enc_pred(&vetter_predicate(p))?))
-            .collect()
+            .find(|(l, _)| l == label)
+            .map(|(_, k)| k)
+            .ok_or_else(|| ProtoError::PeriodNotLive(label.to_string()))
+    }
+
+    /// Rotation and emergency drops both land here: the live periods are the ones given now.
+    ///
+    /// # Errors
+    /// [`ProtoError::Pcs`] if a helper key is not a key of this deployment.
+    pub fn set_live_periods(&mut self, helper_keys: Vec<(String, Hvk)>) -> Result<(), ProtoError> {
+        self.periods = helper_keys
+            .into_iter()
+            .map(|(label, vk)| Ok((label, self.pcreds.helper_key(&vk)?)))
+            .collect::<Result<_, ProtoError>>()?;
+        Ok(())
     }
 
     /// Verify a submission, spend its tokens, and count. Records are kept per applicant `id`,
     /// so a resubmission after `requestMore` adds to what was already counted.
     ///
     /// The caller has already checked that the challenge is one it issued and unused.
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if the submission's period is not live;
+    /// [`ProtoError::TooManyAttestations`], [`ProtoError::CountMismatch`],
+    /// [`ProtoError::DuplicateTag`] for a malformed submission;
+    /// [`ProtoError::AttestationRejected`] if the identifier binding does not match;
+    /// [`ProtoError::ProofRejected`] if `id_Q` or `π_iss` does not verify.
     pub fn submit(&mut self, sub: &Submission, now: DateTime<Utc>) -> Result<Decision, ProtoError> {
-        let n = sub.proof.attestations.len();
-        if sub.statements.len() != n {
-            return Err(ProtoError::CountMismatch {
-                statements: sub.statements.len(),
-                attestations: n,
+        let attestations = &sub.request.attestations;
+        if attestations.len() > MAX_ATTESTATIONS {
+            return Err(ProtoError::TooManyAttestations {
+                count: attestations.len(),
+                max: MAX_ATTESTATIONS,
             });
         }
-        let id_text = point_text(&sub.id)?;
+        if sub.statements.len() != attestations.len() {
+            return Err(ProtoError::CountMismatch {
+                statements: sub.statements.len(),
+                attestations: attestations.len(),
+            });
+        }
+        let id_text = point_text(sub.id())?;
         let binding = id_binding(
             &id_text,
             &self.params.community,
@@ -195,18 +282,42 @@ impl Verifier {
             .map(|(m, _)| m.context_bytes())
             .collect::<Result<_, _>>()?;
         let app_refs: Vec<&[u8]> = apps.iter().map(Vec::as_slice).collect();
-        let f = hidden_vetting_predicate(u32::try_from(n).unwrap_or(u32::MAX));
-        self.helper
-            .check_proof_in_context(&self.hvk, &f, &sub.id, &sub.proof, &app_refs, &app0)
-            .map_err(ProtoError::ProofRejected)?;
+        let valid: HashSet<String> = evaluate(
+            &self.pcreds,
+            self.hvk(&sub.label)?,
+            &sub.request,
+            sub.challenge.as_bytes(),
+            &app_refs,
+            &app0,
+        )?
+        .iter()
+        .map(point_text)
+        .collect::<Result<_, _>>()?;
 
-        // The proof holds: every attestation is from a holder of a live vetter label, the tags
-        // are pairwise distinct, and each is bound to its metadata (its token serial included).
-        for ((meta, spend), att) in sub.statements.iter().zip(&sub.proof.attestations) {
+        // `π_iss` holds: the applicant owns `id`, and the request is bound to this challenge, to
+        // the proof context and to the metadata of every statement, in order. A statement whose
+        // tag is in `N''` is a valid attestation from a holder of a credential of the period,
+        // bound to its metadata (including its token serial).
+        for ((meta, spend), att) in sub.statements.iter().zip(attestations) {
             let tag = point_text(&att.tag)?;
+            let verified = valid.contains(&tag);
             let mut failures = Vec::new();
-            let mut eligible = true;
-            if meta.token_label != spend.label || meta.token_serial != scalar_text(&spend.serial)? {
+            // The checks that need no token come first, so that a statement already ineligible
+            // for them does not burn its token in the spent set.
+            if meta.requirements_digest != self.params.requirements_digest {
+                failures.push("requirements-digest-mismatch".to_string());
+            }
+            if now.date_naive() > meta.valid_until {
+                failures.push("expired".to_string());
+            }
+            let mut eligible = verified && failures.is_empty();
+            if !verified {
+                failures.push("unverified".to_string());
+            } else if !eligible {
+                // Not spent: see above.
+            } else if meta.token_label != spend.label
+                || meta.token_serial != scalar_text(&spend.serial)?
+            {
                 failures.push("token-mismatch".to_string());
                 eligible = false;
             } else if !self.tokens.signature_ok(spend)? {
@@ -215,14 +326,6 @@ impl Verifier {
             } else if self.tokens.record_spend(spend, &id_text, &tag)? == SpendOutcome::DoubleSpend
             {
                 failures.push("token-double-spend".to_string());
-                eligible = false;
-            }
-            if meta.requirements_digest != self.params.requirements_digest {
-                failures.push("requirements-digest-mismatch".to_string());
-                eligible = false;
-            }
-            if now.date_naive() > meta.valid_until {
-                failures.push("expired".to_string());
                 eligible = false;
             }
             let facts = StatementFacts {
@@ -249,6 +352,7 @@ impl Verifier {
                     Kept {
                         facts,
                         tag,
+                        verified,
                         method: meta.method,
                         relationship: meta.declared_relationship,
                         failures,
@@ -275,7 +379,7 @@ impl Verifier {
                 f
             })
             .collect();
-        let evaluation = evaluate(&self.params.requirements, &facts, now);
+        let evaluation = count(&self.params.requirements, &facts, now);
         let statements = kept
             .iter()
             .zip(&facts)
@@ -292,7 +396,7 @@ impl Verifier {
                 StatementRecord {
                     id: f.statement_id.clone(),
                     issuer: k.tag.clone(),
-                    verified: true,
+                    verified: k.verified,
                     eligible: f.eligible,
                     revoked: f.revoked,
                     method: k.method,
@@ -308,22 +412,38 @@ impl Verifier {
         }
     }
 
-    /// Withdrawal of one statement by its tag (§4.4). The proof shows knowledge of the key
-    /// behind the tag and nothing else, so the notice may come from a fresh sender (§13 C6).
-    pub fn withdraw(&mut self, id: &G1, tag: &G1, proof: &FSProof<Fr>) -> Result<bool, ProtoError> {
-        let s = self.open.tag_point(id)?;
-        let ctx = withdraw_context(&self.params.community, &point_text(id)?);
-        if !verify_tag(self.open.tag(), tag, &s, &ctx, proof) {
+    /// Withdrawal of one statement by its tag (§4.4), for the applicant `id` of the vetter
+    /// period `label`. The proof shows knowledge of the key behind the tag at the applicant's
+    /// recipient point and nothing else, so the notice may come from a fresh sender (§13 C6).
+    ///
+    /// # Errors
+    /// [`ProtoError::PeriodNotLive`] if `label` is not live.
+    pub fn withdraw(
+        &mut self,
+        label: &str,
+        id: &G1,
+        tag: &G1,
+        proof: &FSProof<Fr>,
+    ) -> Result<bool, ProtoError> {
+        let hvk = self.hvk(label)?;
+        let pp = self.pcreds.params();
+        let xq = self.pcreds.recipient_point(hvk.vk(), id)?;
+        let id_text = point_text(id)?;
+        let ctx = withdraw_context(&self.params.community, label, &id_text);
+        if <Bk as Backend>::check_tag(pp, tag, &xq, "t").is_err()
+            || <Bk as Backend>::check_tag_proof(pp, tag, &xq, &ctx, proof).is_err()
+        {
             return Ok(false);
         }
-        self.withdrawn.insert((point_text(id)?, point_text(tag)?));
+        self.withdrawn.insert((id_text, point_text(tag)?));
         Ok(true)
     }
 }
 
-pub fn withdraw_context(community: &str, id_text: &str) -> Vec<u8> {
-    let mut ctx = b"openvtc/hidden-vetting/withdraw/0.1\0".to_vec();
-    for part in [community, id_text] {
+/// The context of a withdrawal proof: the community, the vetter label and the applicant.
+pub fn withdraw_context(community: &str, label: &str, id_text: &str) -> Vec<u8> {
+    let mut ctx = b"openvtc/hidden-vetting/withdraw/0.2\0".to_vec();
+    for part in [community, label, id_text] {
         ctx.extend((part.len() as u64).to_le_bytes());
         ctx.extend(part.as_bytes());
     }

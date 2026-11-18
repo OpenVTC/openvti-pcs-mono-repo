@@ -489,8 +489,8 @@ fn ask(b: &Ballot, voter: &Voter, label: &str) -> (Value, vti_voting::voter::Tic
             "manifestDigest": b.digest,
             "request": {
                 "label": label,
-                "id": vti_voting::scheme::point_text(voter.id()).unwrap(),
-                "request": serde_json::to_value(&request).unwrap(),
+                "id": vti_voting::scheme::point_text(&voter.id(&b.params).unwrap()).unwrap(),
+                "request": vti_vetting_pcs::issuer::request_value(&request).unwrap(),
             }
         }),
         blinding,
@@ -507,7 +507,7 @@ async fn take_ticket(tv: &TestVtc, party: &Party, b: &Ballot) -> (Voter, Ticket)
     let pre =
         vti_vetting_pcs::scheme::dec(payload(&issued)["preCredential"].as_str().unwrap()).unwrap();
     let ticket = voter
-        .accept_ticket(&b.params, &b.election, &pre, &blinding)
+        .accept_ticket(&b.params, &b.election, &pre, blinding)
         .expect("the pre-credential unblinds into a ticket");
     (voter, ticket)
 }
@@ -578,7 +578,7 @@ async fn an_election_is_created_registered_shown_and_a_member_takes_a_ticket_bli
             &b.params,
             &b.election,
             &vti_vetting_pcs::scheme::dec(&pre).unwrap(),
-            &blinding,
+            blinding,
         )
         .expect("the pre-credential unblinds into a ticket");
 
@@ -1098,13 +1098,13 @@ async fn a_board_with_more_ballots_than_tickets_is_not_certified() {
     let pre = reg
         .issue_ticket(
             &b.election,
-            ghost.id(),
+            &ghost.id(&b.params).unwrap(),
             &req,
             &mut vti_voting::rand::rngs::OsRng,
         )
         .unwrap();
     let ghost_ticket = ghost
-        .accept_ticket(&b.params, &b.election, &pre, &st)
+        .accept_ticket(&b.params, &b.election, &pre, st)
         .unwrap();
     bx.cast(cast_for(&b, &ghost, &ghost_ticket, "bob"), "agm");
 

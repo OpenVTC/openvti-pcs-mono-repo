@@ -125,6 +125,23 @@ fn ballot(manifest: &Value, choice: &str) -> Value {
     })
 }
 
+/// The voting parameters of `m`'s election: under `pcreds` every election has its own key.
+fn params_for(reg: &Registrar, m: &Value) -> Value {
+    let election = Election::new(
+        COMMUNITY,
+        ElectionId::new(m["electionId"].as_str().unwrap()).unwrap(),
+        manifest_digest(m).unwrap(),
+    )
+    .unwrap();
+    json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&election).unwrap() })
+}
+
+/// A valid voting key of this registrar, for checks that never reach the registrar.
+fn any_params(reg: &Registrar) -> Value {
+    let election = Election::new(COMMUNITY, ElectionId::new("any").unwrap(), [0; 32]).unwrap();
+    json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text(&election).unwrap() })
+}
+
 fn register_doc(params: &Value, m: &Value) -> TrustTask<Value> {
     doc(
         uris::TASK_VTA_PCS_VOTER_REGISTER_0_5,
@@ -158,10 +175,10 @@ async fn a_member_votes_through_the_vta_and_checks_the_receipt() {
     let auth = claims("did:key:z6MkVoter", Role::Admin, "member");
     let mut rng = StdRng::seed_from_u64(0xB0);
     let reg = Registrar::generate(COMMUNITY, &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
     let (box_did, box_signer) = box_key(5);
     let m = manifest("agm-2027", &box_did, true, "open");
     let digest = manifest_digest(&m).unwrap();
+    let params = params_for(&reg, &m);
 
     // Register: a blinded request under a key made for this election; a repeat before the
     // ticket is held answers with the same request.
@@ -175,7 +192,7 @@ async fn a_member_votes_through_the_vta_and_checks_the_receipt() {
     let election = Election::new(COMMUNITY, ElectionId::new("agm-2027").unwrap(), digest).unwrap();
     let id =
         vti_vetting_pcs::scheme::point_from_text(first["request"]["id"].as_str().unwrap()).unwrap();
-    let request = serde_json::from_value(first["request"]["request"].clone()).unwrap();
+    let request = vti_vetting_pcs::issuer::request_from_value(&first["request"]["request"]).unwrap();
     let pre = reg
         .issue_ticket(&election, &id, &request, &mut rng)
         .unwrap();
@@ -347,7 +364,7 @@ async fn the_voter_tasks_refuse_with_the_codes_their_specifications_declare() {
     let auth = claims("did:key:z6MkVoter", Role::Admin, "member");
     let mut rng = StdRng::seed_from_u64(0xB1);
     let reg = Registrar::generate(COMMUNITY, &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
+    let params = any_params(&reg);
     let bad_key = json!({ "suite": "ps-ddh-bls12381", "votingKey": B58 });
     let (box_did, _) = box_key(5);
 
@@ -459,7 +476,7 @@ async fn the_ticket_request_is_signed_as_the_member_and_kept() {
     .await;
     let mut rng = StdRng::seed_from_u64(0xB7);
     let reg = Registrar::generate(COMMUNITY, &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
+    let params = any_params(&reg);
     let (box_did, _) = box_key(9);
     let m = manifest("agm-2028", &box_did, true, "open");
     let with_member = |did: &str| {
@@ -561,10 +578,10 @@ async fn the_vta_keeps_no_clear_pairing_and_discards_after_the_election() {
     .await;
     let mut rng = StdRng::seed_from_u64(0xB8);
     let reg = Registrar::generate(COMMUNITY, &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
     let (box_did, box_signer) = box_key(10);
     let m = manifest("agm-2029", &box_did, true, "open");
     let digest = manifest_digest(&m).unwrap();
+    let params = params_for(&reg, &m);
     let registered = ok(&handle_voter_register(
         &state,
         &auth,
@@ -587,7 +604,7 @@ async fn the_vta_keeps_no_clear_pairing_and_discards_after_the_election() {
     let id =
         vti_vetting_pcs::scheme::point_from_text(registered["request"]["id"].as_str().unwrap())
             .unwrap();
-    let request = serde_json::from_value(registered["request"]["request"].clone()).unwrap();
+    let request = vti_vetting_pcs::issuer::request_from_value(&registered["request"]["request"]).unwrap();
     let pre = vti_vetting_pcs::scheme::enc(
         &reg.issue_ticket(&election, &id, &request, &mut rng)
             .unwrap(),
@@ -888,7 +905,7 @@ async fn vti_vot_025_the_ticket_request_presents_the_membership_bound_to_it() {
     held_membership(&state, "vmc-eng", GROUP, &persona.did).await;
     let mut rng = StdRng::seed_from_u64(0xC1);
     let reg = Registrar::generate(COMMUNITY, &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
+    let params = any_params(&reg);
     let (box_did, _) = box_key(21);
     let mut m = manifest("eng-2027", &box_did, true, "open");
     m["roll"] = json!({ "rule": "credential", "memberOf": GROUP });
@@ -941,7 +958,7 @@ async fn vti_vot_025_a_credential_roll_refuses_a_missing_or_unusable_credential(
     .await;
     let mut rng = StdRng::seed_from_u64(0xC2);
     let reg = Registrar::generate(COMMUNITY, &mut rng).unwrap();
-    let params = json!({ "suite": "ps-ddh-bls12381", "votingKey": reg.public_text().unwrap() });
+    let params = any_params(&reg);
     let (box_did, _) = box_key(22);
     let mut credential_roll = manifest("eng-2028", &box_did, true, "open");
     credential_roll["roll"] = json!({ "rule": "credential", "memberOf": GROUP });

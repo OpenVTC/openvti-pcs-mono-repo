@@ -39,6 +39,7 @@ serde_json_canonicalizer.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 # The counting rule the VTC already uses: `requirements::evaluate` and
 # `StatementFacts`, unchanged.
 vta-sdk = { path = "../vta-sdk", version = "0.90", features = ["vetting"] }

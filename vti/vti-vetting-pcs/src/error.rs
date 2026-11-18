@@ -11,6 +11,16 @@ pub enum ProtoError {
     NotAVetter(String),
     #[error("label {0} is not live")]
     LabelNotLive(String),
+    #[error("vetter period {0} is not live")]
+    PeriodNotLive(String),
+    #[error("no credential under vetter period {0}")]
+    NoCredentialForPeriod(String),
+    #[error("the request carries {count} attestations, more than the limit of {max}")]
+    TooManyAttestations { count: usize, max: usize },
+    #[error("the request carries two attestations with one tag")]
+    DuplicateTag,
+    #[error("no statement was made for that applicant")]
+    NoSuchStatement,
     #[error("member {0} is bound to another PCS identifier")]
     IdentifierRebound(String),
     #[error("member {member} already holds a credential under {label}")]
