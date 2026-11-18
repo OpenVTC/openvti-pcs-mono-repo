@@ -35,7 +35,7 @@ use vta_sdk::keys::KeyType;
 use vta_sdk::provision_client::EphemeralSetupKey;
 use vta_sdk::trust_task_proof::TrustTaskVmResolver;
 use vta_sdk::trust_task_sign::{HolderKey, sign_in_place_with, sign_object_for_assertion};
-use vta_service::test_support::MockVta;
+use vta_test_support::MockVta;
 
 const CTX: &str = "personal";
 

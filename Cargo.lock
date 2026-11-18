@@ -8128,6 +8128,7 @@ dependencies = [
  "vgi-core",
  "vta-sdk",
  "vta-service",
+ "vta-test-support",
  "vti-vetting-pcs",
  "vti-voting",
  "wiremock",

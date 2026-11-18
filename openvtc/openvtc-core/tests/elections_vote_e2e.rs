@@ -28,7 +28,7 @@ use vta_sdk::client::{ClientIdentity, CreateContextRequest, VtaClient};
 use vta_sdk::provision_client::EphemeralSetupKey;
 use vta_sdk::trust_task_proof::TrustTaskVmResolver;
 use vta_sdk::trust_task_sign::{HolderKey, sign_in_place_with};
-use vta_service::test_support::MockVta;
+use vta_test_support::MockVta;
 use vti_vetting_pcs::scheme::{enc, point_from_text};
 use vti_voting::{
     election::{Election, ElectionId},
@@ -114,14 +114,18 @@ async fn a_member_takes_a_ticket_then_votes_and_keeps_the_receipt() {
     // The community and its ballot box.
     let mut rng = StdRng::seed_from_u64(0xE1);
     let registrar = Registrar::generate(COMMUNITY, &mut rng).unwrap();
-    let parameters =
-        json!({ "suite": "ps-ddh-bls12381", "votingKey": registrar.public_text().unwrap() });
     let box_key = EphemeralSetupKey::generate().unwrap();
     let box_signer =
         HolderKey::from_did_key(&box_key.did, box_key.private_key_multibase()).unwrap();
     let m = manifest(&box_key.did);
     let digest = manifest_digest(&m).unwrap();
     let digest_text = digest_multibase(&digest);
+    // One registrar key per election: the election's `votingKey`.
+    let election = Election::new(COMMUNITY, ElectionId::new("agm-2027").unwrap(), digest).unwrap();
+    let parameters = json!({
+        "suite": "ps-ddh-bls12381",
+        "votingKey": registrar.public_text(&election).unwrap()
+    });
     let shown = ShownElection::from_payload(json!({
         "manifest": m, "manifestDigest": digest_text, "state": "voting",
         "parameters": parameters,
@@ -155,7 +159,6 @@ async fn a_member_takes_a_ticket_then_votes_and_keeps_the_receipt() {
     )
     .unwrap();
     assert_eq!(sent.payload["manifestDigest"], json!(digest_text));
-    let election = Election::new(COMMUNITY, ElectionId::new("agm-2027").unwrap(), digest).unwrap();
     let id = point_from_text(sent.payload["request"]["id"].as_str().unwrap()).unwrap();
     let blinded = serde_json::from_value(sent.payload["request"]["request"].clone()).unwrap();
     let pre = registrar

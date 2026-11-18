@@ -64,20 +64,16 @@ exclude = ["infra"]
 resolver = "3"
 
 [workspace.package]
-description = "OpenVTC research mono-repo: PCS, VTI (VTA, VTC) and OpenVTC"
 edition = "2024"
 publish = false
 authors = ["Glenn Gore <glenn@affinidi.com>"]
 rust-version = "1.95.0"
-readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/OpenVTC/verifiable-trust-infrastructure"
 
 [workspace.dependencies]
 
 # Foreign-language bindings for the mobile engine crate (`vta-mobile-core`).
-uniffi = "0.32"
-
 # Affinidi Trust Development Kit.
 # The enforced-authcrypt fix (affinidi-tdk-rs #671 — `unpack` rejects plaintext
 # / anoncrypt / forged-`from` envelopes by default) landed in 0.8.5, which is
@@ -797,8 +793,6 @@ trust-tasks-didcomm = { version = "0.39", default-features = false }
 # upstream, of the shape `affinidi_data_integrity::Signer` already provides.
 trust-tasks-tsp = { version = "0.39", default-features = false }
 # 0.33.2: a did:scid key named with its `?src=` locator verifies (trust-tasks-tf #863).
-trust-tasks-proof = { version = "0.39.0", default-features = false, features = ["affinidi"] }
-
 # Axum extras (typed headers for Bearer auth)
 axum-extra = { version = "0.12", features = ["typed-header"] }
 
@@ -995,7 +989,6 @@ tower = "0.5"
 http-body-util = "0.1"
 wiremock = "0.6"
 metrics = "0.24"
-schemars = "1"
 flate2 = "1"
 unicode-normalization = "0.1"
 ciborium = "0.2"
@@ -1031,7 +1024,6 @@ ark-serialize = { version = "0.6.0", default-features = false, features = ["std"
 # says why).
 rand_chacha = "0.3"
 # MCP SDK for the `*-mcp` bridges; each member names its transports.
-rmcp = "3"
 # Source parsing for the census tests that read a crate's own code.
 syn = "3"
 

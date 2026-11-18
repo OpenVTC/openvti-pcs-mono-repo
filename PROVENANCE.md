@@ -18,9 +18,8 @@ Every other crate is resolved from crates.io at the versions pinned in
 
 ## What was taken
 
-- **`pcs/`**: the `predicate-credential-system` crate. The prototype under
-  `demo/` was left out because the integration in `vti/vti-vetting-pcs`
-  replaces it.
+- **`pcs/`**: the `predicate-credential-system` crate and its hidden-vetting
+  prototype (`pcs/demo`, package `pcs-vetting-prototype`).
 - **`vti/`**: the crates the VTA (`vta-service`) and the VTC (`vtc-service`)
   need to build, plus the two admin CLIs (`pnm-cli` for the VTA and `cnm-cli`
   for the VTC) and `vti/docs`. `room-host`, `vti-witness` and
@@ -54,7 +53,53 @@ All the changes are in this repository's git history (`git log -p`).
    It needs PC/SC and isn't part of vetting. The code is still there behind
    the `openpgp-card` feature.
 4. **`did-git-sign`** was adapted to `vta/dids/list` and keeps `sysinfo` 0.39.
-5. **VTI ported to the `pcreds` API** of `pcs/` (`feat/pcreds-jali-0.3`). See
-   the port notes in `vti/vti-vetting-pcs`.
-6. Removed: release, CI and process files (`CHANGELOG.md`, `CLAUDE.md`,
+5. **VTI ported to the `pcreds` API** of `pcs/` (`feat/pcreds-jali-0.3`).
+   Upstream VTI is built on the published PCS 0.1, whose API was replaced.
+   The port follows `pcs/demo`:
+   - **Periods.** Each vetter period is its own helper key, derived
+     deterministically from the community's secret. An application lives in
+     one period.
+   - **Tokens.** One PS key per attestation-token label.
+   - **Elections.** One registrar key per election.
+   - **Root admission.** A credential request with no attestations. The
+     session id is rebuilt for the submitting member.
+   - **Hardening carried over from the demo.** The demo's review fixes are
+     carried over: at most 64 attestations per request, duplicate tags
+     refused, and a vetter's token spent only after its attestation succeeds.
+
+   JSON message shapes are unchanged. Some opaque values changed meaning:
+   `helperKey` and `tokenKey` are now per-label key lists, and the applicant's
+   `id` is now an `ApplicantRef` (label, session id, identifier and `π_id`)
+   rather than a point. Persisted state formats changed, with no migration.
+
+   **Where the integration departs from the paper's protocol.** This list is
+   for reviewers:
+   - **`π_id` is bound to the community, not to each vetter.** The VTA builds
+     the applicant's reference once, before it knows the vetters, so anyone
+     holding a copy can present it to another vetter. Binding per vetter
+     needs one VTA call per vetter.
+   - **`π_id`'s nonce is derived.** It is `SHA-256(usk ‖ ssid ‖ community)`,
+     seeding ChaCha20, so the reference is stable across calls. This has not
+     been reviewed.
+   - **A vetter keeps one `usk` across periods.** It is derived from a seed.
+     If that key is ever recovered, it links the vetter's periods.
+   - **"Issue once per identifier" is enforced by the VTC's durable records,**
+     not the helper's in-memory issuance record. This allows a bounded
+     re-issue to a client that lost an answer.
+   - **The community evaluates requests from public data only.** It
+     reimplements `evaluate_request_at` with the library's public checks,
+     because `Protocol::evaluate_request` needs the signing key. One
+     difference: duplicate tags are refused outright, not retried.
+   - **A vote cast calls the backend's attestation proof directly** at
+     `x_E = H_req(pp, hvk_E, Election::point())`, outside the `attest` flow.
+     Its soundness rests on `x_E ≠ x_0`.
+6. **`pcs/demo`** depends on the in-repo `vta-sdk` instead of the pinned
+   `=0.56.1`. One renamed constant was updated (`VETTED_PREDICATE`).
+7. **OpenVTC's resolvers honour `VTA_ALLOW_PRIVATE_ENDPOINTS`**
+   (`openvtc-core/src/resolver_policy.rs`), as the VTI services do, so the
+   client works against the `localhost` stack in `infra/`. Without the
+   variable, behaviour is unchanged.
+8. **OpenVTC's tests** take `MockVta` from `vta-test-support`, where it now
+   lives, and follow the `pcreds` API changes.
+9. Removed: release, CI and process files (`CHANGELOG.md`, `CLAUDE.md`,
    `RELEASES.md`, `.github/`, release scripts).

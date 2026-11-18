@@ -228,7 +228,9 @@ mod tests {
     }
 
     async fn signed_vmc() -> (Secret, Value) {
-        let secret = Secret::generate_ed25519(None, None);
+        // The key id must be a verification method of the issuer: the credential
+        // verifier refuses a proof from any other key (`ProofNotFromIssuer`).
+        let secret = Secret::generate_ed25519(Some(&format!("{MEMBER}#key-0")), None);
         let vc = build_member_vmc(&secret, MEMBER, &grant())
             .await
             .expect("build the member VMC");

@@ -293,7 +293,7 @@ pub async fn build_presentation(
         "type": ["VerifiablePresentation"],
         "holder": member_did,
         "verifiableCredential": credentials,
-        "nonce": challenge,
+        "nonce": challenge.clone(),
     });
 
     let proof = DataIntegrityProof::sign(
@@ -301,20 +301,19 @@ pub async fn build_presentation(
         signing_secret,
         SignOptions::new()
             .with_proof_purpose("authentication")
-            .with_cryptosuite(CryptoSuite::EddsaJcs2022),
+            .with_cryptosuite(CryptoSuite::EddsaJcs2022)
+            // `proof.challenge` is part of the signed proof configuration
+            // (affinidi-data-integrity >= 0.8.7 carries and verifies it), so it
+            // is set here. It used to be spliced into the serialised proof after
+            // signing, which a current verifier rejects as a bad signature.
+            // `nonce` above still binds the challenge inside the document.
+            .with_challenge(challenge),
     )
     .await
     .map_err(|e| OpenVTCError::Config(format!("sign personhood presentation: {e}")))?;
 
-    let mut proof_value = serde_json::to_value(&proof)
+    let proof_value = serde_json::to_value(&proof)
         .map_err(|e| OpenVTCError::Config(format!("serialize presentation proof: {e}")))?;
-    // `challenge` is not a field `DataIntegrityProof` carries, so it is
-    // added to the serialised proof rather than set through `SignOptions`.
-    // That is precisely why it is unsigned, and why `nonce` above exists.
-    proof_value
-        .as_object_mut()
-        .ok_or_else(|| OpenVTCError::Config("proof did not serialize to an object".into()))?
-        .insert("challenge".to_string(), Value::String(challenge));
 
     let mut signed = vp;
     signed

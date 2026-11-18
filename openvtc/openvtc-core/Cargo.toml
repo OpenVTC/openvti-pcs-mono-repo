@@ -129,6 +129,8 @@ vta-service = { path = "../../vti/vta-service", default-features = false, featur
 # The community's half of hidden vetting, in process (`vtc::Vtc`, feature
 # `harness`), for `tests/hidden_vetting_onboarding.rs`. The PCS engine is the
 # VTA's; this client holds no PCS key. Same `vta-sdk` line as `vta-service`.
+# `MockVta` itself (it moved out of `vta-service::test_support`).
+vta-test-support = { path = "../../vti/vta-test-support", features = ["transport-harness"] }
 vti-vetting-pcs = { path = "../../vti/vti-vetting-pcs", features = ["harness"] }
 # The registrar and ballot box of an election, in process, for
 # `tests/elections_vote_e2e.rs`. The line `vta-service` itself runs.

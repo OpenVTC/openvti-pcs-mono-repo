@@ -26,11 +26,11 @@ use serde_json::{Value, json};
 use vta_sdk::client::{ClientIdentity, CreateContextRequest, VtaClient};
 use vta_sdk::protocols::vetting::VETTED_PREDICATE;
 use vta_sdk::provision_client::EphemeralSetupKey;
-use vta_service::test_support::MockVta;
+use vta_test_support::MockVta;
 use vti_vetting_pcs::{
-    issuer::{RootRequestWire, TokenRequestWire},
+    issuer::{RootRequestWire, TokenRequestWire, request_from_value},
     rand::{SeedableRng, rngs::StdRng},
-    scheme::{enc, key_text, point_from_text},
+    scheme::{enc, keys_text},
     vtc::Vtc,
     wire::SubmissionWire,
 };
@@ -56,8 +56,13 @@ fn published_criterion(vtc: &Vtc) -> Value {
     vetting["ext"] = json!({
         hidden::HIDDEN_VETTING_NS: {
             "suite": hidden::SUITE,
-            "helperKey": key_text(vtc.hvk()).unwrap(),
-            "tokenKey": key_text(vtc.tvk()).unwrap(),
+            // One helper key per live vetter period, one token key per token label, aligned
+            // with the label lists below.
+            "helperKey": keys_text(
+                &vtc.live_periods().iter().map(|p| vtc.hvk(p)).collect::<Vec<_>>()
+            )
+            .unwrap(),
+            "tokenKey": keys_text(&[vtc.tvk(vtc.current_token_label()).unwrap().clone()]).unwrap(),
             "vetterLabels": vtc.live_periods().iter().map(|p| format!("vetter/{p}")).collect::<Vec<_>>(),
             "tokenLabels": [vtc.current_token_label()],
             "dripPerTick": vtc.drip_rate(),
@@ -139,12 +144,7 @@ async fn enrolled_vetter(
     let carried: RootRequestWire = serde_json::from_value(serde_json::to_value(&request).unwrap())
         .expect("the community reads what the client sends");
     let pre = vtc
-        .issue_vetter_root(
-            member,
-            &point_from_text(&carried.id).unwrap(),
-            &serde_json::from_value(carried.request).unwrap(),
-            rng,
-        )
+        .issue_vetter_root(member, &request_from_value(&carried.request).unwrap(), rng)
         .expect("the community signs the blinded request");
     let view = pcs_vta::root_accept(
         client,
