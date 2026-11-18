@@ -95,10 +95,21 @@ All the changes are in this repository's git history (`git log -p`).
      Its soundness rests on `x_E ≠ x_0`.
 6. **`pcs/demo`** depends on the in-repo `vta-sdk` instead of the pinned
    `=0.56.1`. One renamed constant was updated (`VETTED_PREDICATE`).
-7. **OpenVTC's resolvers honour `VTA_ALLOW_PRIVATE_ENDPOINTS`**
-   (`openvtc-core/src/resolver_policy.rs`), as the VTI services do, so the
-   client works against the `localhost` stack in `infra/`. Without the
+7. **OpenVTC honours `VTA_ALLOW_PRIVATE_ENDPOINTS`**, as the VTI services do,
+   so the client works against the `localhost` stack in `infra/`. Without the
    variable, behaviour is unchanged.
+   - Every resolver and TDK instance the client builds takes its host policy
+     from `openvtc-core/src/resolver_policy.rs`. That includes the runtime's
+     own TDK in `state_handler/mod.rs`.
+   - Under the opt-in, a community's status list (`vetting/status.rs`) and
+     manifest (`join/sequence.rs`) may be fetched over http from a private
+     host. Without that, the client refuses a membership credential whose
+     revocation status it cannot check.
+   - **A research harness, `openvtc script …`**, sits behind the off-by-default
+     feature `scripted` (`openvtc/src/script_cmd.rs`). It drives the real state
+     handler with the TUI's actions instead of a terminal, and in that build
+     the encrypted-file key store is allowed on any Unix. It is used by
+     `infra/scripts/vetting-run.sh`.
 8. **OpenVTC's tests** take `MockVta` from `vta-test-support`, where it now
    lives, and follow the `pcreds` API changes.
 9. Removed: release, CI and process files (`CHANGELOG.md`, `CLAUDE.md`,

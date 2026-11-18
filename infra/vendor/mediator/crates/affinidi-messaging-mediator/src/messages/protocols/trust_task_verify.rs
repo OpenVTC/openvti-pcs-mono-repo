@@ -364,7 +364,14 @@ fn retention_end(doc: &TrustTask<Value>, policy: SpecPolicy, now: DateTime<Utc>)
 /// asking the resolver service to fetch an internal host on an attacker's
 /// behalf, whatever that service's own host policy is.
 pub(crate) fn signing_key_resolver(client: DIDCacheClient) -> CachedDidResolver {
-    CachedDidResolver::new(Arc::new(client))
+    // OPENVTC-RESEARCH LOCAL PATCH (infra/PROVENANCE.md): the same opt-in as
+    // the resolver's host policy (common/config/mod.rs). The local stack's
+    // DIDs are all on `localhost`, so a proof signed by the VTC (its delivery
+    // status checks) is otherwise refused before resolution.
+    let allow_private = std::env::var("MEDIATOR_ALLOW_PRIVATE_DID_HOSTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    CachedDidResolver::new(Arc::new(client)).allow_private_hosts(allow_private)
 }
 
 /// The proof verifier: `eddsa` suites only, over keys the issuer's DID

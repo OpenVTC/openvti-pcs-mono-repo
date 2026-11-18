@@ -49,6 +49,8 @@ mod headless;
 mod health_cmd;
 mod holder_grant;
 mod repos_cmd;
+#[cfg(feature = "scripted")]
+mod script_cmd;
 mod setup_cmd;
 mod signing_cmd;
 mod state_handler;
@@ -229,8 +231,9 @@ fn init_default_keyring_store(profile: &str) -> Result<()> {
             Ok(())
         }
 
-        // Deliberate, durable file storage for machines with no keyring.
-        #[cfg(target_os = "linux")]
+        // Deliberate, durable file storage for machines with no keyring. The
+        // research harness (feature `scripted`) takes it on any Unix too.
+        #[cfg(any(target_os = "linux", feature = "scripted"))]
         "file" => {
             let dir = openvtc_core::secure_store::secrets_dir(profile)
                 .map_err(|e| anyhow::anyhow!("resolve secrets directory: {e}"))?;
@@ -628,6 +631,11 @@ async fn main() -> Result<()> {
         Some(("setup", args)) if setup_cmd::requested(args) => {
             Some(setup_cmd::run(args, &profile).await)
         }
+        #[cfg(feature = "scripted")]
+        Some(("script", args)) => Some(match load_fast(&profile, unlock_code_arg.as_ref()) {
+            Err(e) => Err(anyhow::anyhow!("{}", redact_paths(&e.to_string()))),
+            Ok(deferred) => script_cmd::run(args, &profile, deferred).await,
+        }),
         Some((name @ ("community" | "repo"), args)) => {
             Some(match load_fast(&profile, unlock_code_arg.as_ref()) {
                 Err(e) => Err(anyhow::anyhow!("{}", redact_paths(&e.to_string()))),

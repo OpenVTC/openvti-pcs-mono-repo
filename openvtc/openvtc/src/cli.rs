@@ -131,6 +131,7 @@ pub fn cli() -> Command {
                 .subcommand(crate::state_handler::join_cmd::command()),
         )
         .subcommand(crate::repos_cmd::command())
+        .subcommand(scripted_command())
 }
 
 /// Read an unlock passphrase from `path`, or from standard input when `path` is
@@ -484,4 +485,16 @@ mod tests {
             .try_get_matches_from(["openvtc"])
             .expect("bare invocation should parse");
     }
+}
+
+/// `script`, in a `scripted` build only.
+#[cfg(feature = "scripted")]
+fn scripted_command() -> Command {
+    crate::script_cmd::command()
+}
+
+/// A hidden placeholder elsewhere, so the builder chain is the same.
+#[cfg(not(feature = "scripted"))]
+fn scripted_command() -> Command {
+    Command::new("script").hide(true)
 }

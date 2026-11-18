@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Drive the VTC admin console headlessly (claim the invitation, add/remove join
+# criteria, turn on hidden vetting, show criteria) with a CDP virtual passkey.
+# Example: ./bin/console claim; ./bin/console add-criterion scripts/console/criterion-peer.json
+# See scripts/console/console.mjs and README.md §4a.
+set -euo pipefail
+INFRA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+command -v node >/dev/null || { echo "console: node (22+) is required" >&2; exit 1; }
+exec node "${INFRA}/scripts/console/console.mjs" "$@"

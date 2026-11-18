@@ -29,6 +29,11 @@ openpgp-card = [
 # DEV OVERRIDE indicator). Without it those variables are ignored and the user
 # is told so. Never enable this for a build you distribute.
 dev-overrides = []
+# Research harness: `openvtc script …` drives the real client from a script
+# instead of the TUI (src/script_cmd.rs), and OPENVTC_SECURE_STORE=file is
+# accepted on any Unix, so a run needs no OS keychain or desktop prompt.
+# Never enable this for a build you distribute.
+scripted = []
 
 [dependencies]
 openvtc-core.workspace = true

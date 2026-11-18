@@ -28,7 +28,6 @@ use crate::config::{
 };
 use crate::didcomm::MessagingTransport;
 use crate::errors::OpenVTCError;
-use crate::health::ProbePolicy;
 use crate::vetting::discover;
 
 /// How long resolving a community's DID may take before its endpoint is given
@@ -114,7 +113,7 @@ pub async fn fetch_over_http(
         .map_err(|e| NotLearned::Unresolvable(format!("it could not be resolved ({e})")))?;
     let doc = serde_json::to_value(&resolved.doc)
         .map_err(|e| NotLearned::Unanswered(format!("its DID document could not be read ({e})")))?;
-    let fetched = discover::fetch_manifest(&doc, vtc_did, resolver, ProbePolicy::PublicOnly)
+    let fetched = discover::fetch_manifest(&doc, vtc_did, resolver, crate::resolver_policy::probe_policy())
         .await
         .map_err(|e| NotLearned::Unanswered(e.to_string()))?;
     Ok(OverHttp {

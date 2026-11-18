@@ -285,3 +285,107 @@ Not verified:
   are human steps.
 - Whether the VTA publishes persona DIDs to the DID host without further
   configuration. This happens on a profile's first community join.
+
+## Scripting the console steps (`bin/console`)
+
+`./bin/console` drives the real admin console in headless Chrome over the Chrome
+DevTools Protocol. A CDP WebAuthn virtual authenticator acts as the passkey.
+Nothing on the server is bypassed: every criteria change still takes a passkey
+assertion bound to that change (VTI-APV-023), and the virtual authenticator
+makes it. It needs Node 22+ and Chrome at `/Applications/Google Chrome.app`
+(`CHROME_BIN` overrides the path). It installs no packages.
+
+```sh
+./bin/console claim                      # claims .state/vtc-admin-invite.txt, then signs in
+./bin/console add-criterion scripts/console/criterion-peer.json     # kernel-developer (exits 0 if it exists)
+./bin/console add-criterion scripts/console/criterion-hidden.json   # kernel-developer-hidden
+./bin/console hidden-on kernel-developer-hidden                     # prints labels, drip rate, keys
+./bin/console remove-criterion review    # then add it back, so it is decided last:
+./bin/console add-criterion scripts/console/criterion-review.json
+./bin/console show                       # criteria in decision order, with digests, as JSON
+./bin/console join-requests              # pending join requests
+./bin/console approve-join <request id | persona DID>
+```
+
+Order: add the vetting criteria first, then move `review` to the end
+(`remove-criterion review`, then `add-criterion criterion-review.json`). New
+criteria go last, so without the move `review`, which asks for nothing, decides
+every applicant who names no criterion. Only one criterion can have hidden
+vetting at a time.
+
+State, all under `.state/`:
+
+- `console-passkey.json` holds the passkey credential, private key included.
+  It is re-added on every run. Its signature counter is raised by 1000 on each
+  run, because the VTC refuses an assertion whose counter does not go up.
+- `console-chrome/` holds the browser profile, the session cookies and
+  `failure-*.png` screenshots.
+- `console-removed-<id>.json` holds a copy of each removed criterion.
+
+The VTC allows each address a burst of 10 anonymous calls, then one every 5 s,
+and every host client shares that budget. Console-key reads count against it
+too. The script drops the sign-in page's unused wallet and theme calls, and it
+retries a rate-limited sign-in after the wait the VTC names. Running it while
+`openvtc` clients are busy can still make it wait.
+
+## Automated vetting run (no human in the loop)
+
+`scripts/vetting-run.sh` walks people through vetting against this stack with
+the real OpenVTC client and no TUI:
+- **carol** and **dave**: vetters.
+- **alice**: peer vetting.
+- **bob**: hidden vetting.
+
+Each person is one `openvtc` process, driven by `openvtc script …` (feature
+`scripted`, `openvtc/openvtc/src/script_cmd.rs`). That mode runs the client's
+own state handler, VTA session, mediator listeners and inbound handling, and
+sends the actions the TUI's keys would send. The admin's steps go through
+`bin/console`, the console driven with a virtual passkey, and `bin/cnm`.
+
+```sh
+cargo build -p openvtc --features scripted          # from the repository root
+infra/bin/console claim                             # once
+infra/bin/console add-criterion infra/scripts/console/criterion-peer.json
+STEP_TIMEOUT=300 infra/scripts/vetting-run.sh peer  # or: hidden, all
+```
+
+- `scripts/client-setup.sh <name>` creates a profile with no prompts. Keys are
+  kept in the client's encrypted-file store (`OPENVTC_SECURE_STORE=file`), so
+  there is no OS keychain dialog.
+- `docker/openvtc.Dockerfile` (the compose `client` service, profile `clients`)
+  builds the same client for Linux.
+- Logs are in `.state/client-logs/`.
+
+A vetter's client treats a community that hides any criterion's vetters as
+hiding all of them. So the script runs peer vetting with no hidden criterion,
+then adds `kernel-developer-hidden` and turns hidden vetting on for the hidden
+run.
+
+**Status (2026-11-18): in progress, not yet passing end to end.**
+
+Verified against this stack:
+- Profiles are created with no prompts.
+- The vetters join with the administrator approving in the console.
+- The membership credentials are delivered and stored.
+- The vetter grants arrive.
+- The applicant creates a persona, starts an application, and makes a face
+  carrying its legal name.
+- A vetter's ticket request reaches the community and asks how it vets.
+
+Not yet passing: the ticket, request, session, card, attestation and join
+steps. These are still being scripted against the live stack. The same
+protocol steps pass in process (`../scripts/run-demos.sh`, demos `peer` and
+`hidden`).
+
+Getting this far found four client bugs that block any localhost stack. They
+are fixed in this repository (see `PROVENANCE.md`):
+- Two places still resolved DIDs with the public-only host policy.
+- Membership credentials were refused because the community's status list was
+  served over http.
+- The community's manifest was refused over http.
+
+The mediator's Trust Task proof verifier also needs its private-host opt-in
+(`vendor/patches/mediator-local.patch`). The patched mediator image is not
+built yet: the build needs more than an 8 GB Docker VM at its release
+settings. Until it is rebuilt, the VTC logs refused delivery-status checks.
+That is noise; delivery itself works.

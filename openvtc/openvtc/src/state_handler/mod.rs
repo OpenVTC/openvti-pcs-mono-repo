@@ -22,7 +22,7 @@ use crate::{
         state::{ActivePage, State},
     },
 };
-use affinidi_tdk::{TDK, common::config::TDKConfig};
+use affinidi_tdk::TDK;
 use anyhow::Result;
 use openvtc_core::config::{Config, UnlockCode, public_config::PublicConfig};
 #[cfg(feature = "openpgp-card")]
@@ -514,7 +514,7 @@ impl StateHandler {
             StartingMode::SetupWizard => {
                 // Instantiate TDK
                 let tdk = TDK::new(
-                    TDKConfig::builder().with_load_environment(false).build()?,
+                    openvtc_core::resolver_policy::tdk_config_builder().build()?,
                     None,
                 )
                 .await?;
@@ -618,8 +618,7 @@ impl StateHandler {
 
                     on_progress("Local configuration", "Starting TDK");
                     let mut tdk = TDK::new(
-                        TDKConfig::builder()
-                            .with_load_environment(false)
+                        openvtc_core::resolver_policy::tdk_config_builder()
                             .build()
                             .map_err(|e| anyhow::anyhow!("TDK config failed: {e}"))?,
                         None,

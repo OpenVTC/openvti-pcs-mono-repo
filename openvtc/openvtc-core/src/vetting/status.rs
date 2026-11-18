@@ -135,7 +135,12 @@ pub fn shared_status_client() -> Result<Client, String> {
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let client = status_client(true, STATUS_FETCH_TIMEOUT)?;
+    // A local stack (`VTA_ALLOW_PRIVATE_ENDPOINTS`, crate::resolver_policy)
+    // serves its status lists over plain http on loopback.
+    let client = status_client(
+        !crate::resolver_policy::allow_private_hosts(),
+        STATUS_FETCH_TIMEOUT,
+    )?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 
@@ -149,6 +154,13 @@ pub fn shared_status_client() -> Result<Client, String> {
 pub fn status_list_url(url: &str) -> Result<Url, String> {
     let parsed =
         Url::parse(url).map_err(|_| "the grant's status list URL does not parse".to_string())?;
+    // The local-stack opt-in (crate::resolver_policy): http, and private hosts.
+    if crate::resolver_policy::allow_private_hosts()
+        && matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some_and(|h| !h.is_empty())
+    {
+        return Ok(parsed);
+    }
     if parsed.scheme() != "https" {
         return Err(format!(
             "the grant's status list is not served over https ({})",

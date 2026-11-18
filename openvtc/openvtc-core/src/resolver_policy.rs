@@ -6,7 +6,11 @@
 //! (`vta_sdk::resolver`). OpenVTC honours the same switch, from here, so the
 //! client and the services it talks to always agree on what resolves.
 //!
-//! Unset (the default), nothing changes: public hosts only.
+//! The same switch lets this client fetch a community's status lists and
+//! manifest over plain http on such a stack (`vetting::status`,
+//! `join::sequence`).
+//!
+//! Unset (the default), nothing changes: public hosts only, https only.
 
 use affinidi_did_resolver_cache_sdk::config::DIDCacheConfig;
 use affinidi_tdk::common::config::{TDKConfig, TDKConfigBuilder};
@@ -15,6 +19,17 @@ use affinidi_tdk::common::config::{TDKConfig, TDKConfigBuilder};
 #[must_use]
 pub fn allow_private_hosts() -> bool {
     vta_sdk::resolver::allow_private_did_hosts()
+}
+
+/// The policy for this client's own HTTP probes of community endpoints
+/// (reading a manifest): private and plain-http endpoints only under the opt-in.
+#[must_use]
+pub fn probe_policy() -> crate::health::ProbePolicy {
+    if allow_private_hosts() {
+        crate::health::ProbePolicy::AllowPrivate
+    } else {
+        crate::health::ProbePolicy::PublicOnly
+    }
 }
 
 /// A resolver configuration carrying the host policy.

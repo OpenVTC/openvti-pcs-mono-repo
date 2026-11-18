@@ -53,7 +53,11 @@ the mediator and the DID host did not, so:
 - **mediator** (`crates/affinidi-messaging-mediator/src/common/config/mod.rs`):
   `MEDIATOR_ALLOW_PRIVATE_DID_HOSTS=1` makes the mediator's resolver use
   `HostPolicy::AllowPrivate`. Needed so the mediator can authenticate the VTA,
-  the VTC and persona DIDs.
+  the VTC and persona DIDs. The same variable also lifts the private-host
+  check of the Trust Task proof verifier's resolver
+  (`messages/protocols/trust_task_verify.rs`, `signing_key_resolver`); without
+  it the mediator refuses the VTC's `messaging/message/status` checks on its
+  own deliveries.
 - **did-hosting** (`did-hosting-common/src/research_local.rs`, used by the
   resolver constructions in `did-hosting-common` and
   `did-hosting-server/src/bootstrap.rs`, and by

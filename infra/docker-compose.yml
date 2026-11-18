@@ -193,10 +193,32 @@ services:
       - cli-home:/home/vti/.config
       - ./.state:/state:ro
 
+  # OpenVTC clients (applicants, vetters), one profile per person, in Linux so
+  # keys live in the client's encrypted-file store rather than an OS keychain.
+  # Not started by `up`; run with `docker compose run --rm client -p alice …`
+  # or the scripted vetting run (scripts/vetting-run.sh).
+  client:
+    profiles: ["clients"]
+    build:
+      context: ..
+      dockerfile: infra/docker/openvtc.Dockerfile
+    image: openvtc-research/openvtc:local
+    pull_policy: never
+    network_mode: "service:net"
+    environment:
+      VTA_ALLOW_PRIVATE_ENDPOINTS: "1"
+      OPENVTC_SECURE_STORE: file
+      OPENVTC_CONFIG_PATH: /home/openvtc/profiles
+      RUST_LOG: ${CLIENT_LOG:-warn}
+    volumes:
+      - client-profiles:/home/openvtc/profiles
+      - ./.state:/state:ro
+
 networks:
   research:
     name: openvtc-research
     internal: false
+
 
 volumes:
   redis-data:
@@ -205,3 +227,4 @@ volumes:
   vta-data:
   vtc-data:
   cli-home:
+  client-profiles:
