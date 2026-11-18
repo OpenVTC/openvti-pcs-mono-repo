@@ -80,3 +80,6 @@ tempfile = { workspace = true }
 serial_test = { workspace = true }
 rand = "0.8"
 proptest = { workspace = true }
+
+# Upstream VGI lint table is not carried over; keep the crate as released.
+[lints]
