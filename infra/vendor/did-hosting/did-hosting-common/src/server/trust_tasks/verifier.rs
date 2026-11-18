@@ -608,7 +608,13 @@ impl TransportBoundVerifier {
     /// DID cache's own default; a client built with another policy needs
     /// [`Self::with_did_cache_and_host_policy`].
     pub fn with_did_cache(client: DIDCacheClient) -> Self {
-        Self::with_did_cache_and_host_policy(client, HostPolicy::PublicOnly)
+        // OPENVTC-RESEARCH LOCAL PATCH: follow the local-stack opt-in.
+        let policy = if crate::research_local::allow_private_did_hosts() {
+            HostPolicy::AllowPrivate
+        } else {
+            HostPolicy::PublicOnly
+        };
+        Self::with_did_cache_and_host_policy(client, policy)
     }
 
     /// [`Self::with_did_cache`] for a client built with `host_policy` — pass

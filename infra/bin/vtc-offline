@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run an offline `vtc` admin command against the VTC's store (break-glass ACL
+# writes, admin invites, ...). Stops the VTC for the duration, then restarts it.
+# Example: ./bin/vtc-offline admin invite --ttl 3600
+set -euo pipefail
+INFRA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dc() { docker compose -f "${INFRA}/docker-compose.yml" "$@"; }
+dc stop vtc >/dev/null
+trap 'dc up -d vtc >/dev/null' EXIT
+dc run --rm --no-deps -T --entrypoint vtc vtc --config /var/lib/vtc/config.toml "$@"

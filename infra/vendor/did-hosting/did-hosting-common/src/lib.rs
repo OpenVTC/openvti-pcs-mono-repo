@@ -33,6 +33,9 @@
 pub mod cli_reference;
 #[cfg(feature = "server-core")]
 mod client;
+/// OPENVTC-RESEARCH LOCAL PATCH: opt-in private DID hosts for a local stack.
+#[cfg(feature = "server-core")]
+pub mod research_local;
 pub mod did;
 pub mod did_ops;
 pub mod didcomm_types;

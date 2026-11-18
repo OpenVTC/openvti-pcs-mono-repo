@@ -1,0 +1,236 @@
+# Local changes to vendor/mediator relative to upstream (see infra/PROVENANCE.md).
+# Removed files/directories are listed in PROVENANCE.md and not shown here.
+--- a/mediator/Cargo.lock
++++ b/mediator/Cargo.lock
+@@ -377,31 +377,6 @@
+ ]
+ 
+ [[package]]
+-name = "affinidi-messaging-didcomm-service"
+-version = "0.32.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "69c8d49cb7a0d597c8ab41e01269ce591e16c52510a3693a2bbf2cfdad5b380a"
+-dependencies = [
+- "affinidi-did-common",
+- "affinidi-messaging-didcomm",
+- "affinidi-messaging-sdk",
+- "affinidi-secrets-resolver",
+- "affinidi-tdk-common",
+- "affinidi-tsp",
+- "async-trait",
+- "regex",
+- "serde",
+- "serde_json",
+- "sha256",
+- "thiserror 2.0.21",
+- "tokio",
+- "tokio-util",
+- "tracing",
+- "tracing-subscriber",
+- "uuid",
+-]
+-
+-[[package]]
+ name = "affinidi-messaging-didcomm-v1"
+ version = "0.2.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -505,31 +480,6 @@
+ ]
+ 
+ [[package]]
+-name = "affinidi-messaging-mediator-admin"
+-version = "0.54.0"
+-dependencies = [
+- "affinidi-did-common",
+- "affinidi-messaging-core",
+- "affinidi-messaging-didcomm",
+- "affinidi-messaging-mediator-common",
+- "affinidi-messaging-sdk",
+- "affinidi-messaging-test-mediator",
+- "affinidi-secrets-resolver",
+- "affinidi-tdk-common",
+- "async-trait",
+- "chrono",
+- "serde",
+- "serde_json",
+- "sha256",
+- "thiserror 2.0.21",
+- "tokio",
+- "tracing",
+- "trust-tasks-rs",
+- "uuid",
+- "zeroize",
+-]
+-
+-[[package]]
+ name = "affinidi-messaging-mediator-common"
+ version = "0.54.0"
+ dependencies = [
+@@ -603,20 +553,6 @@
+ ]
+ 
+ [[package]]
+-name = "affinidi-messaging-mediator-processors"
+-version = "0.54.0"
+-dependencies = [
+- "affinidi-messaging-mediator-common",
+- "clap",
+- "serde",
+- "sha256",
+- "tokio",
+- "toml",
+- "tracing",
+- "tracing-subscriber",
+-]
+-
+-[[package]]
+ name = "affinidi-messaging-mediator-setup"
+ version = "0.54.0"
+ dependencies = [
+@@ -661,29 +597,6 @@
+  "vta-sdk",
+  "wiremock",
+  "zeroize",
+-]
+-
+-[[package]]
+-name = "affinidi-messaging-mediator-tui"
+-version = "0.54.0"
+-dependencies = [
+- "affinidi-messaging-didcomm",
+- "affinidi-messaging-mediator-admin",
+- "affinidi-messaging-mediator-common",
+- "affinidi-messaging-sdk",
+- "affinidi-messaging-test-mediator",
+- "chrono",
+- "clap",
+- "crossterm",
+- "futures-util",
+- "ratatui",
+- "serde",
+- "serde_json",
+- "sha256",
+- "tokio",
+- "tracing",
+- "tracing-subscriber",
+- "uuid",
+ ]
+ 
+ [[package]]
+@@ -708,7 +621,6 @@
+  "affinidi-crypto",
+  "affinidi-did-authentication",
+  "affinidi-did-common",
+- "affinidi-did-resolver-cache-sdk",
+  "affinidi-encoding",
+  "affinidi-messaging-core",
+  "affinidi-messaging-delivery",
+@@ -717,13 +629,11 @@
+  "affinidi-secrets-resolver",
+  "affinidi-task-utils",
+  "affinidi-tdk-common",
+- "affinidi-tsp",
+  "ahash",
+  "async-trait",
+  "base64 0.23.1",
+  "chrono",
+  "futures-util",
+- "hyper",
+  "rand 0.10.3",
+  "reqwest",
+  "rustls",
+@@ -735,51 +645,8 @@
+  "tokio-tungstenite 0.30.0",
+  "tracing",
+  "trust-tasks-build",
+- "trust-tasks-proof",
+- "trust-tasks-rs",
+- "uuid",
+-]
+-
+-[[package]]
+-name = "affinidi-messaging-test-mediator"
+-version = "0.54.0"
+-dependencies = [
+- "affinidi-crypto",
+- "affinidi-data-integrity",
+- "affinidi-did-common",
+- "affinidi-did-resolver-cache-sdk",
+- "affinidi-messaging-core",
+- "affinidi-messaging-didcomm",
+- "affinidi-messaging-didcomm-service",
+- "affinidi-messaging-didcomm-v1",
+- "affinidi-messaging-mediator",
+- "affinidi-messaging-mediator-common",
+- "affinidi-messaging-sdk",
+- "affinidi-secrets-resolver",
+- "affinidi-tdk",
+- "affinidi-tdk-common",
+- "affinidi-tsp",
+- "async-trait",
+- "axum",
+- "base64 0.23.1",
+- "chrono",
+- "futures-util",
+- "redis",
+- "reqwest",
+- "ring",
+- "rustls",
+- "serde_json",
+- "sha256",
+- "tempfile",
+- "thiserror 2.0.21",
+- "tokio",
+- "tokio-tungstenite 0.30.0",
+- "tokio-util",
+- "tracing",
+- "tracing-subscriber",
+  "trust-tasks-proof",
+  "trust-tasks-rs",
+- "url",
+  "uuid",
+ ]
+ 
+@@ -8107,7 +7974,6 @@
+  "bytes",
+  "futures-core",
+  "futures-sink",
+- "futures-util",
+  "libc",
+  "pin-project-lite",
+  "tokio",
+--- a/mediator/Cargo.toml
++++ b/mediator/Cargo.toml
+@@ -3,11 +3,7 @@
+   "crates/affinidi-messaging-mediator",
+   "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-common",
+   "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-config",
+-  "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-processors",
+   "crates/affinidi-messaging-mediator/tools/mediator-setup",
+-  "crates/affinidi-messaging-test-mediator",
+-  "crates/affinidi-messaging-mediator-admin",
+-  "crates/affinidi-messaging-mediator-tui",
+ ]
+ resolver = "3"
+ 
+--- a/mediator/crates/affinidi-messaging-mediator/src/common/config/mod.rs
++++ b/mediator/crates/affinidi-messaging-mediator/src/common/config/mod.rs
+@@ -95,6 +95,18 @@
+         .with_network_cache_limit_count(settings.network_limit);
+     if let Some(address) = &settings.address {
+         config = config.with_network_mode(address);
++    }
++    // OPENVTC-RESEARCH LOCAL PATCH (infra/PROVENANCE.md): the local research
++    // stack publishes every did:webvh on `localhost`, which the resolver's
++    // default `HostPolicy::PublicOnly` refuses. Opt in with
++    // MEDIATOR_ALLOW_PRIVATE_DID_HOSTS=1 (local stacks only, never deploy).
++    if std::env::var("MEDIATOR_ALLOW_PRIVATE_DID_HOSTS")
++        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
++        .unwrap_or(false)
++    {
++        config = config.with_host_policy(
++            affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy::AllowPrivate,
++        );
+     }
+     config.build()
+ }

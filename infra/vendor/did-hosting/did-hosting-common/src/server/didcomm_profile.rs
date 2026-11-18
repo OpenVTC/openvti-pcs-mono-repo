@@ -30,7 +30,7 @@ pub async fn resolve_mediator_did(
     let owned;
     let resolver = match did_resolver {
         Some(r) => r,
-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
             Ok(r) => {
                 owned = r;
                 &owned
@@ -155,7 +155,7 @@ pub async fn resolve_service_types(
     let owned;
     let resolver = match did_resolver {
         Some(r) => r,
-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
             Ok(r) => {
                 owned = r;
                 &owned
@@ -226,7 +226,7 @@ pub async fn resolve_transport(
     let owned;
     let resolver = match did_resolver {
         Some(r) => r,
-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
             Ok(r) => {
                 owned = r;
                 &owned
@@ -437,7 +437,7 @@ pub async fn advertised_protocols(
     let owned;
     let resolver = match did_resolver {
         Some(r) => r,
-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
             Ok(r) => {
                 owned = r;
                 &owned
@@ -804,7 +804,7 @@ mod tests {
     /// mediator, or to no route); a public `https` one is used.
     #[tokio::test]
     async fn a_peer_advertised_https_endpoint_must_be_public() {
-        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        let resolver = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
             .await
             .expect("resolver");
 

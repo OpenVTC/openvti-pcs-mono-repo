@@ -1,0 +1,43 @@
+# mediator-setup recipe for the research stack (`mediator-setup --from`).
+# Derived from the mediator's docker/quickstart/mediator-build.toml.
+#
+# Run once by the mediator container's entrypoint when its config volume is
+# empty: generates a fresh did:peer identity, an admin did:key and the JWT
+# signing key into /etc/mediator/conf (the `mediator-conf` volume). Nothing
+# secret is committed here.
+
+[deployment]
+type = "container"
+protocols = ["didcomm"]
+use_vta = false
+
+[identity]
+# did:peer is self-resolving (the endpoint is embedded), so the mediator needs
+# no DID hosting. Every container in the stack shares one network namespace,
+# so `localhost:7037` is the mediator for containers and host alike.
+did_method = "peer"
+public_url = "http://localhost:7037"
+
+[secrets]
+# Plain file backend inside the volume. Local playground only.
+storage = "file://"
+allow_plaintext_file = true
+
+[security]
+ssl = "none"
+admin = "generate"
+network_mode = "open"
+cors = "none"
+
+[database]
+url = "redis://localhost:6379/"
+
+[storage]
+backend = "redis"
+
+[output]
+config_path = "conf/mediator.toml"
+listen_address = "0.0.0.0:7037"
+
+[install]
+enabled = false

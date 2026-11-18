@@ -742,7 +742,7 @@ mod tests {
         let mut proof = signed.proof.take().unwrap();
         proof.verification_method = format!("{did}#key-1");
         signed.proof = Some(proof);
-        let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        let client = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
             .await
             .unwrap();
         let err = verify_sender_bound(

@@ -148,7 +148,7 @@ pub async fn send_signed_task(
     // default, and a service provisioned on `localhost` serves its DID log
     // from a host the default `PublicOnly` policy would refuse.
     let resolver = DIDCacheClient::new(
-        DIDCacheConfigBuilder::default()
+        crate::research_local::cache_config_builder()
             .with_host_policy(CacheHostPolicy::AllowPrivate)
             .build(),
     )

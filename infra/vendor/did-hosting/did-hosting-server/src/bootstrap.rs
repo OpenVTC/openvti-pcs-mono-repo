@@ -57,7 +57,7 @@ pub async fn request_witness_proof(
     let mut signer = signing_secret.clone();
     signer.id = format!("{}#key-0", result.did_id);
     let resolver = affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
-        affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+        did_hosting_common::research_local::cache_config_builder().build(),
     )
     .await
     .map_err(|e| AppError::Internal(format!("DID resolver: {e}")))?;

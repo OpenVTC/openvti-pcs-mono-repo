@@ -340,7 +340,7 @@ pub fn active_store_backend() -> &'static str {
 pub async fn check_did_resolution(report: &mut HealthReport, label: &str, did: &str) -> bool {
     use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 
-    let client = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
+    let client = match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
         Ok(c) => c,
         Err(e) => {
             report.fail(&format!("{label}: DID resolver init failed: {e}"));

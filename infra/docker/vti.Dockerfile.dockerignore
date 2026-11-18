@@ -1,0 +1,13 @@
+# Build-context excludes for infra/docker/vti.Dockerfile (context = repo root).
+# BuildKit reads <Dockerfile>.dockerignore beside the Dockerfile, so the repo
+# root needs no .dockerignore of its own.
+.git
+**/.git
+target
+**/target
+**/node_modules
+infra
+**/.DS_Store
+**/*.armor
+**/admin-key*.json
+**/setup-key*.json

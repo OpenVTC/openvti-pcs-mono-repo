@@ -1,0 +1,47 @@
+# `vta setup --from` inputs for the research VTA. Rendered by bootstrap.sh
+# (${MEDIATOR_DID} is filled in) into the VTA's volume.
+#
+# One VTA serves the whole stack: the community's VTC is provisioned in its
+# `community` context, and every OpenVTC client gets its own context. See
+# README.md ("What this stack is not") for what that means for the threat
+# model.
+
+config_path = "/var/lib/vta/config.toml"
+data_dir    = "/var/lib/vta/data"
+vta_name    = "research-vta"
+# Every container shares one network namespace, so localhost:8100 is the VTA
+# for containers and for the host alike.
+public_url  = "http://localhost:8100"
+
+# No admin_did: the VTA is left UNSEALED so bootstrap.sh can make offline
+# grants (vta import-did / vta acl). Seal it yourself if you want to:
+# `vta bootstrap-admin`, see vti/docs/02-vta/seal-and-unseal.md.
+
+[services]
+rest    = true
+didcomm = true
+# The mediator is set up for DIDComm only.
+tsp     = false
+
+[server]
+host = "0.0.0.0"
+port = 8100
+
+[log]
+level  = "info"
+format = "text"
+
+[secrets]
+# Plaintext seed file under data_dir. DEV ONLY.
+backend = "plaintext"
+
+[messaging]
+kind = "existing"
+did  = "${MEDIATOR_DID}"
+
+[vta_did]
+# Root did:webvh served by the VTA itself at /.well-known/did.jsonl:
+# did:webvh:<scid>:localhost%3A8100. Resolving it needs
+# VTA_ALLOW_PRIVATE_ENDPOINTS=1 in every process that does (see README).
+kind = "create_webvh"
+url  = "http://localhost:8100"

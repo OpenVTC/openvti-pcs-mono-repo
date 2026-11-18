@@ -1,0 +1,9 @@
+target/
+**/target/
+.git/
+**/*.md
+!README.md
+**/data/
+**/config.toml
+**/*.key
+**/*.armor

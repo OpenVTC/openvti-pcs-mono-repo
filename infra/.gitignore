@@ -1,0 +1,2 @@
+# Per-stack secrets and DIDs written by bootstrap.sh.
+.state/

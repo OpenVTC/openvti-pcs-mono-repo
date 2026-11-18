@@ -88,7 +88,7 @@ impl WebVHClient {
     /// Nothing is sent: each request carries its own proof, and `did` must
     /// hold an ACL entry on the control plane for any of them to succeed.
     pub async fn sign_as(&mut self, did: &str, signer: &Secret, service_did: &str) -> Result<()> {
-        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        let did_resolver = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
             .await
             .map_err(|e| WebVHError::Resolver(e.to_string()))?;
         self.requester = Some(Requester {

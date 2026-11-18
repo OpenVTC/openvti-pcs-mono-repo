@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run an offline `vta` admin command against the VTA's store (the VTA is left
+# unsealed). Stops the VTA for the duration, then restarts it.
+# Example: ./bin/vta-offline acl list
+set -euo pipefail
+INFRA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dc() { docker compose -f "${INFRA}/docker-compose.yml" "$@"; }
+dc stop vta >/dev/null
+trap 'dc up -d vta >/dev/null' EXIT
+dc run --rm --no-deps -T --entrypoint vta vta --config /var/lib/vta/config.toml "$@"

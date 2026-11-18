@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# pnm (VTA admin CLI) inside the stack, as the VTA's bootstrap administrator.
+# Sessions live in the `cli-home` volume. Example: ./bin/pnm acl list
+INFRA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tty_flag=(); [ -t 0 ] && [ -t 1 ] || tty_flag=(-T)
+exec docker compose -f "${INFRA}/docker-compose.yml" run --rm "${tty_flag[@]}" tools pnm "$@"

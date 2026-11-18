@@ -397,7 +397,7 @@ mod tests {
         let token = format!("{signing_input}.{sig_b64}");
 
         let resolver = DIDCacheClient::new(
-            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+            crate::research_local::cache_config_builder().build(),
         )
         .await
         .expect("did:key resolver");
@@ -438,7 +438,7 @@ mod tests {
         let token = format!("{header_b64}.{payload_b64}.{sig_b64}");
 
         let resolver = DIDCacheClient::new(
-            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+            crate::research_local::cache_config_builder().build(),
         )
         .await
         .expect("did:key resolver");
@@ -453,7 +453,7 @@ mod tests {
         let secret = Secret::generate_ed25519(None, Some(&[4u8; 32]));
         let pk = secret.get_public_keymultibase().unwrap();
         let mut resolver = DIDCacheClient::new(
-            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
+            crate::research_local::cache_config_builder().build(),
         )
         .await
         .unwrap();

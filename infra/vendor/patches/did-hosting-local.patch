@@ -1,0 +1,239 @@
+# Local changes to vendor/did-hosting relative to upstream (see infra/PROVENANCE.md).
+# Removed files/directories are listed in PROVENANCE.md and not shown here.
+--- a/did-hosting/did-hosting-common/src/client.rs
++++ b/did-hosting/did-hosting-common/src/client.rs
+@@ -88,7 +88,7 @@
+     /// Nothing is sent: each request carries its own proof, and `did` must
+     /// hold an ACL entry on the control plane for any of them to succeed.
+     pub async fn sign_as(&mut self, did: &str, signer: &Secret, service_did: &str) -> Result<()> {
+-        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
++        let did_resolver = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
+             .await
+             .map_err(|e| WebVHError::Resolver(e.to_string()))?;
+         self.requester = Some(Requester {
+--- a/did-hosting/did-hosting-common/src/lib.rs
++++ b/did-hosting/did-hosting-common/src/lib.rs
+@@ -33,6 +33,9 @@
+ pub mod cli_reference;
+ #[cfg(feature = "server-core")]
+ mod client;
++/// OPENVTC-RESEARCH LOCAL PATCH: opt-in private DID hosts for a local stack.
++#[cfg(feature = "server-core")]
++pub mod research_local;
+ pub mod did;
+ pub mod did_ops;
+ pub mod didcomm_types;
+--- /dev/null
++++ b/did-hosting/did-hosting-common/src/research_local.rs
+@@ -0,0 +1,36 @@
++//! OPENVTC-RESEARCH LOCAL PATCH (see infra/PROVENANCE.md in openvtc-research).
++//!
++//! The local research stack publishes every `did:webvh` on `localhost`, which
++//! the DID resolver's default `HostPolicy::PublicOnly` refuses before any
++//! request is made. Setting `DID_HOSTING_ALLOW_PRIVATE_DID_HOSTS=1` makes the
++//! resolvers this service builds use `HostPolicy::AllowPrivate` instead (and
++//! fetch `localhost` DIDs over plain http). Unset, behaviour is unchanged.
++//! Never set it in a deployment.
++
++use affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder;
++use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy as CacheHostPolicy;
++
++/// Environment switch for the local stack.
++pub const ALLOW_PRIVATE_ENV: &str = "DID_HOSTING_ALLOW_PRIVATE_DID_HOSTS";
++
++/// Whether the operator opted into resolving loopback/private DID hosts.
++pub fn allow_private_did_hosts() -> bool {
++    std::env::var(ALLOW_PRIVATE_ENV)
++        .map(|v| {
++            matches!(
++                v.trim().to_ascii_lowercase().as_str(),
++                "1" | "true" | "yes" | "on"
++            )
++        })
++        .unwrap_or(false)
++}
++
++/// `DIDCacheConfigBuilder::default()`, with the host policy the switch selects.
++pub fn cache_config_builder() -> DIDCacheConfigBuilder {
++    let builder = DIDCacheConfigBuilder::default();
++    if allow_private_did_hosts() {
++        builder.with_host_policy(CacheHostPolicy::AllowPrivate)
++    } else {
++        builder
++    }
++}
+--- a/did-hosting/did-hosting-common/src/server/cli_trust_task.rs
++++ b/did-hosting/did-hosting-common/src/server/cli_trust_task.rs
+@@ -148,7 +148,7 @@
+     // default, and a service provisioned on `localhost` serves its DID log
+     // from a host the default `PublicOnly` policy would refuse.
+     let resolver = DIDCacheClient::new(
+-        DIDCacheConfigBuilder::default()
++        crate::research_local::cache_config_builder()
+             .with_host_policy(CacheHostPolicy::AllowPrivate)
+             .build(),
+     )
+--- a/did-hosting/did-hosting-common/src/server/didcomm_profile.rs
++++ b/did-hosting/did-hosting-common/src/server/didcomm_profile.rs
+@@ -30,7 +30,7 @@
+     let owned;
+     let resolver = match did_resolver {
+         Some(r) => r,
+-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
++        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
+             Ok(r) => {
+                 owned = r;
+                 &owned
+@@ -155,7 +155,7 @@
+     let owned;
+     let resolver = match did_resolver {
+         Some(r) => r,
+-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
++        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
+             Ok(r) => {
+                 owned = r;
+                 &owned
+@@ -226,7 +226,7 @@
+     let owned;
+     let resolver = match did_resolver {
+         Some(r) => r,
+-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
++        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
+             Ok(r) => {
+                 owned = r;
+                 &owned
+@@ -437,7 +437,7 @@
+     let owned;
+     let resolver = match did_resolver {
+         Some(r) => r,
+-        None => match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
++        None => match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
+             Ok(r) => {
+                 owned = r;
+                 &owned
+@@ -804,7 +804,7 @@
+     /// mediator, or to no route); a public `https` one is used.
+     #[tokio::test]
+     async fn a_peer_advertised_https_endpoint_must_be_public() {
+-        let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
++        let resolver = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
+             .await
+             .expect("resolver");
+ 
+--- a/did-hosting/did-hosting-common/src/server/didcomm_unpack.rs
++++ b/did-hosting/did-hosting-common/src/server/didcomm_unpack.rs
+@@ -397,7 +397,7 @@
+         let token = format!("{signing_input}.{sig_b64}");
+ 
+         let resolver = DIDCacheClient::new(
+-            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
++            crate::research_local::cache_config_builder().build(),
+         )
+         .await
+         .expect("did:key resolver");
+@@ -438,7 +438,7 @@
+         let token = format!("{header_b64}.{payload_b64}.{sig_b64}");
+ 
+         let resolver = DIDCacheClient::new(
+-            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
++            crate::research_local::cache_config_builder().build(),
+         )
+         .await
+         .expect("did:key resolver");
+@@ -453,7 +453,7 @@
+         let secret = Secret::generate_ed25519(None, Some(&[4u8; 32]));
+         let pk = secret.get_public_keymultibase().unwrap();
+         let mut resolver = DIDCacheClient::new(
+-            affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
++            crate::research_local::cache_config_builder().build(),
+         )
+         .await
+         .unwrap();
+--- a/did-hosting/did-hosting-common/src/server/health.rs
++++ b/did-hosting/did-hosting-common/src/server/health.rs
+@@ -340,7 +340,7 @@
+ pub async fn check_did_resolution(report: &mut HealthReport, label: &str, did: &str) -> bool {
+     use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+ 
+-    let client = match DIDCacheClient::new(DIDCacheConfigBuilder::default().build()).await {
++    let client = match DIDCacheClient::new(crate::research_local::cache_config_builder().build()).await {
+         Ok(c) => c,
+         Err(e) => {
+             report.fail(&format!("{label}: DID resolver init failed: {e}"));
+--- a/did-hosting/did-hosting-common/src/server/identity.rs
++++ b/did-hosting/did-hosting-common/src/server/identity.rs
+@@ -313,7 +313,7 @@
+     /// Carries no key-agreement key, so it cannot back a DIDComm listener.
+     pub async fn from_signing_secret(did: &str, secret: Secret) -> Result<Arc<Self>, AppError> {
+         let did_resolver = DIDCacheClient::new(
+-            DIDCacheConfigBuilder::default()
++            crate::research_local::cache_config_builder()
+                 .with_cache_ttl(DID_CACHE_TTL_SECS)
+                 .build(),
+         )
+@@ -374,7 +374,7 @@
+         protocols: ProtocolSet,
+     ) -> Result<Arc<Self>, AppError> {
+         let did_resolver = DIDCacheClient::new(
+-            DIDCacheConfigBuilder::default()
++            crate::research_local::cache_config_builder()
+                 .with_cache_ttl(DID_CACHE_TTL_SECS)
+                 .build(),
+         )
+@@ -415,7 +415,7 @@
+     /// only read generations.
+     #[cfg(test)]
+     pub(crate) async fn for_test(did: &str, generations: Vec<IdentityGeneration>) -> Arc<Self> {
+-        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
++        let did_resolver = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
+             .await
+             .expect("local DID cache");
+         let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
+@@ -786,7 +786,7 @@
+     };
+ 
+     let did_resolver = match DIDCacheClient::new(
+-        DIDCacheConfigBuilder::default()
++        crate::research_local::cache_config_builder()
+             .with_cache_ttl(DID_CACHE_TTL_SECS)
+             .build(),
+     )
+--- a/did-hosting/did-hosting-common/src/server/trust_tasks/bound.rs
++++ b/did-hosting/did-hosting-common/src/server/trust_tasks/bound.rs
+@@ -742,7 +742,7 @@
+         let mut proof = signed.proof.take().unwrap();
+         proof.verification_method = format!("{did}#key-1");
+         signed.proof = Some(proof);
+-        let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
++        let client = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
+             .await
+             .unwrap();
+         let err = verify_sender_bound(
+--- a/did-hosting/did-hosting-common/src/server/trust_tasks/verifier.rs
++++ b/did-hosting/did-hosting-common/src/server/trust_tasks/verifier.rs
+@@ -608,7 +608,13 @@
+     /// DID cache's own default; a client built with another policy needs
+     /// [`Self::with_did_cache_and_host_policy`].
+     pub fn with_did_cache(client: DIDCacheClient) -> Self {
+-        Self::with_did_cache_and_host_policy(client, HostPolicy::PublicOnly)
++        // OPENVTC-RESEARCH LOCAL PATCH: follow the local-stack opt-in.
++        let policy = if crate::research_local::allow_private_did_hosts() {
++            HostPolicy::AllowPrivate
++        } else {
++            HostPolicy::PublicOnly
++        };
++        Self::with_did_cache_and_host_policy(client, policy)
+     }
+ 
+     /// [`Self::with_did_cache`] for a client built with `host_policy` — pass
+--- a/did-hosting/did-hosting-server/src/bootstrap.rs
++++ b/did-hosting/did-hosting-server/src/bootstrap.rs
+@@ -57,7 +57,7 @@
+     let mut signer = signing_secret.clone();
+     signer.id = format!("{}#key-0", result.did_id);
+     let resolver = affinidi_did_resolver_cache_sdk::DIDCacheClient::new(
+-        affinidi_did_resolver_cache_sdk::config::DIDCacheConfigBuilder::default().build(),
++        did_hosting_common::research_local::cache_config_builder().build(),
+     )
+     .await
+     .map_err(|e| AppError::Internal(format!("DID resolver: {e}")))?;

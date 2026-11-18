@@ -1,0 +1,30 @@
+# `vtc setup --from` inputs for the research community. Rendered by
+# bootstrap.sh (${VTA_DID} and ${MEDIATOR_DID} are filled in) into the VTC's
+# volume. Schema: vti/docs/03-vtc/examples/vtc-setup.example.toml.
+
+config_path    = "/var/lib/vtc/config.toml"
+base_url       = "http://localhost:8200"
+vta_did        = "${VTA_DID}"
+context        = "community"
+setup_key_file = "/var/lib/vtc/setup-key.json"
+
+# One person administers the research community, so a step-up gesture stands
+# in for a second administrator's consent (VTI-APV-022). Without it, changing
+# join criteria or hidden vetting at runtime would need two administrators.
+single_admin_mode = true
+
+# Provision over REST: the VTA advertises it on localhost and it avoids the
+# mediator round trip during setup.
+provision_transport = "rest"
+
+# No [webvh] table: the community's did:webvh is serverless, served by the VTC
+# itself at http://localhost:8200/.well-known/did.jsonl.
+
+[messaging]
+mediator_did = "${MEDIATOR_DID}"
+mediator_url = "http://localhost:7037"
+transports   = ["didcomm"]
+
+[secrets]
+# Plaintext key bundle under the data dir. DEV ONLY.
+backend = "plaintext"

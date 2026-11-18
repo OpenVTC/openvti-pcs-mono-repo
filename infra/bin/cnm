@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# cnm (VTC admin CLI) inside the stack, as the community administrator profile
+# bootstrap.sh created. Example: ./bin/cnm vetting vetters list
+INFRA="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tty_flag=(); [ -t 0 ] && [ -t 1 ] || tty_flag=(-T)
+exec docker compose -f "${INFRA}/docker-compose.yml" run --rm "${tty_flag[@]}" tools cnm "$@"

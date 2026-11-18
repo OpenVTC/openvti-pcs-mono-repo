@@ -313,7 +313,7 @@ impl ServiceIdentity {
     /// Carries no key-agreement key, so it cannot back a DIDComm listener.
     pub async fn from_signing_secret(did: &str, secret: Secret) -> Result<Arc<Self>, AppError> {
         let did_resolver = DIDCacheClient::new(
-            DIDCacheConfigBuilder::default()
+            crate::research_local::cache_config_builder()
                 .with_cache_ttl(DID_CACHE_TTL_SECS)
                 .build(),
         )
@@ -374,7 +374,7 @@ impl ServiceIdentity {
         protocols: ProtocolSet,
     ) -> Result<Arc<Self>, AppError> {
         let did_resolver = DIDCacheClient::new(
-            DIDCacheConfigBuilder::default()
+            crate::research_local::cache_config_builder()
                 .with_cache_ttl(DID_CACHE_TTL_SECS)
                 .build(),
         )
@@ -415,7 +415,7 @@ impl ServiceIdentity {
     /// only read generations.
     #[cfg(test)]
     pub(crate) async fn for_test(did: &str, generations: Vec<IdentityGeneration>) -> Arc<Self> {
-        let did_resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        let did_resolver = DIDCacheClient::new(crate::research_local::cache_config_builder().build())
             .await
             .expect("local DID cache");
         let (secrets_resolver, _handle) = ThreadedSecretsResolver::new(None).await;
@@ -786,7 +786,7 @@ pub async fn load_identity(
     };
 
     let did_resolver = match DIDCacheClient::new(
-        DIDCacheConfigBuilder::default()
+        crate::research_local::cache_config_builder()
             .with_cache_ttl(DID_CACHE_TTL_SECS)
             .build(),
     )

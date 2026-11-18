@@ -1,0 +1,207 @@
+# OpenVTC research stack: Redis, a DIDComm mediator, did:webvh hosting, one VTA
+# and one VTC (built with `vetting-pcs` for hidden vetting).
+#
+#   cd infra
+#   docker compose build                # first build takes a while (see README)
+#   ./bootstrap.sh                      # provisions everything, starts the stack
+#
+# README.md has the full walkthrough. Nothing here is fit for anything but a
+# local experiment: plaintext key files, no TLS, open mediator.
+#
+# NETWORKING. Every service joins the network namespace of the `net` service
+# (`network_mode: service:net`), so all of them share one `localhost`. That is
+# what makes the stack's DIDs work everywhere: the VTA's DID is
+# did:webvh:<scid>:localhost%3A8100, and `localhost:8100` reaches the VTA from
+# inside any container AND from the host (through the ports `net` publishes, on
+# 127.0.0.1 only). `net` itself sits on a private bridge network. Services talk
+# to each other on localhost:<port>; nothing is reachable from the LAN.
+#
+#   127.0.0.1:7037  mediator        http://localhost:7037/mediator/v1/
+#   127.0.0.1:8534  did hosting     http://localhost:8534/  (persona DIDs)
+#   127.0.0.1:8100  VTA             http://localhost:8100/
+#   127.0.0.1:8200  VTC             http://localhost:8200/  (/admin/ console)
+#   (redis listens on localhost:6379 inside the namespace; not published)
+
+name: openvtc-research
+
+x-vti-env: &vti-env
+  # localhost DIDs and REST endpoints are refused by default
+  # (HostPolicy::PublicOnly). This is the documented local-dev opt-in
+  # (vti/vta-sdk/src/resolver.rs). Never set it in a deployment.
+  VTA_ALLOW_PRIVATE_ENDPOINTS: "1"
+  RUST_LOG: ${VTI_LOG:-info}
+
+services:
+  # Holds the shared network namespace and publishes the stack's ports.
+  net:
+    image: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+    command: ["sleep", "infinity"]
+    init: true
+    networks: [research]
+    ports:
+      - "127.0.0.1:7037:7037"   # mediator
+      - "127.0.0.1:8534:8534"   # did-hosting-daemon
+      - "127.0.0.1:8100:8100"   # VTA
+      - "127.0.0.1:8200:8200"   # VTC
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    network_mode: "service:net"
+    depends_on: [net]
+    command: ["redis-server", "--appendonly", "yes", "--bind", "127.0.0.1", "--port", "6379"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # DIDComm mediator (vendored affinidi-messaging-mediator, infra/vendor/mediator).
+  # did:peer identity generated on first start into the mediator-conf volume.
+  mediator:
+    build:
+      context: ./vendor/mediator
+      dockerfile: ../../docker/mediator.Dockerfile
+    image: openvtc-research/mediator:local
+    pull_policy: never
+    network_mode: "service:net"
+    depends_on:
+      redis:
+        condition: service_healthy
+    working_dir: /etc/mediator
+    entrypoint: ["/scripts/mediator-entrypoint.sh"]
+    environment:
+      DATABASE_URL: redis://localhost:6379/
+      # The URL in the mediator's did:peer service endpoints, so Routing 2.0
+      # forwards addressed to this mediator are delivered locally.
+      LOCAL_ENDPOINTS: http://localhost:7037
+      # Local patch (PROVENANCE.md): let the mediator resolve did:webvh DIDs
+      # hosted on localhost, i.e. authenticate the VTA, VTC and personas.
+      MEDIATOR_ALLOW_PRIVATE_DID_HOSTS: "1"
+    volumes:
+      - mediator-conf:/etc/mediator/conf
+      - ./config/mediator-build.toml:/config/mediator-build.toml:ro
+      - ./scripts:/scripts:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mediator", "-c", "conf/mediator.toml", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+    restart: unless-stopped
+
+  # did:webvh hosting (vendored affinidi-webvh-service, infra/vendor/did-hosting):
+  # control plane + public resolver + witness in one self-managed daemon. The
+  # VTA publishes OpenVTC persona DIDs here.
+  did-hosting:
+    build:
+      context: ./vendor/did-hosting
+      dockerfile: ../../docker/did-hosting.Dockerfile
+    image: openvtc-research/did-hosting:local
+    pull_policy: never
+    network_mode: "service:net"
+    depends_on: [net]
+    entrypoint: ["/scripts/did-hosting-entrypoint.sh"]
+    environment:
+      # Local patch (PROVENANCE.md): verify Trust Tasks signed by the VTA,
+      # whose did:webvh is hosted on localhost.
+      DID_HOSTING_ALLOW_PRIVATE_DID_HOSTS: "1"
+      RUST_LOG: ${DID_HOSTING_LOG:-info}
+    volumes:
+      - did-hosting-data:/var/lib/did-hosting
+      - ./config/did-hosting-daemon.toml:/config/did-hosting-daemon.toml:ro
+      - ./scripts:/scripts:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8534/.well-known/did.jsonl"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    restart: unless-stopped
+
+  # The VTA (vti/vta-service). Idles until bootstrap.sh has provisioned it.
+  vta:
+    build:
+      context: ..
+      dockerfile: infra/docker/vti.Dockerfile
+      args:
+        VTC_ADMIN_UI: ${VTC_ADMIN_UI:-build}
+    image: openvtc-research/vti:local
+    pull_policy: never
+    network_mode: "service:net"
+    depends_on:
+      mediator:
+        condition: service_healthy
+    entrypoint: ["/scripts/vti-entrypoint.sh"]
+    command: ["vta"]
+    environment:
+      <<: *vti-env
+    volumes:
+      - vta-data:/var/lib/vta
+      - ./scripts:/scripts:ro
+      - ./.state:/state:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8100/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    restart: unless-stopped
+
+  # The VTC (vti/vtc-service, --features vetting-pcs). Idles until
+  # bootstrap.sh has provisioned it.
+  vtc:
+    image: openvtc-research/vti:local
+    pull_policy: never
+    network_mode: "service:net"
+    depends_on:
+      vta:
+        condition: service_started
+    entrypoint: ["/scripts/vti-entrypoint.sh"]
+    command: ["vtc"]
+    environment:
+      <<: *vti-env
+    volumes:
+      - vtc-data:/var/lib/vtc
+      - ./scripts:/scripts:ro
+      - ./.state:/state:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8200/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+    restart: unless-stopped
+
+  # Admin CLIs (pnm for the VTA, cnm for the VTC) with their sessions in the
+  # cli-home volume. Not started by `up`; use `./bin/pnm …` / `./bin/cnm …`,
+  # which wrap `docker compose run --rm tools …`.
+  tools:
+    image: openvtc-research/vti:local
+    pull_policy: never
+    profiles: ["tools"]
+    network_mode: "service:net"
+    depends_on: [net]
+    entrypoint: []
+    command: ["sh"]
+    environment:
+      <<: *vti-env
+    volumes:
+      - cli-home:/home/vti/.config
+      - ./.state:/state:ro
+
+networks:
+  research:
+    name: openvtc-research
+    internal: false
+
+volumes:
+  redis-data:
+  mediator-conf:
+  did-hosting-data:
+  vta-data:
+  vtc-data:
+  cli-home:
