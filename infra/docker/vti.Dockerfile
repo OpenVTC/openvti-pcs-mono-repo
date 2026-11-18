@@ -63,16 +63,21 @@ COPY . .
 COPY --from=admin-ui /ui/dist/ vti/vtc-service/admin-ui/dist/
 COPY --from=admin-ui /ui/dist-members/ vti/vtc-service/admin-ui/dist-members/
 ENV VTC_SKIP_ADMIN_UI_BUILD=1
-ARG VTA_FEATURES="vta-service/setup,vta-service/rest,vta-service/didcomm,vta-service/tsp,vta-service/cli-synthesis,vta-service/webs,vta-service/webvh,vta-service/jemalloc"
-ARG VTC_FEATURES="vtc-service/setup,vtc-service/website,vtc-service/admin-ui,vtc-service/tsp,vtc-service/jemalloc,vtc-service/vetting-pcs"
-ARG CLI_FEATURES="pnm-cli/config-session,pnm-cli/tsp,cnm-cli/config-session"
+# One cargo invocation per package, as upstream VTI's Dockerfile does: in a
+# single multi-package `--no-default-features` build the `pkg/feature` flags did
+# not all reach `vta-service` / `vtc-service` (e.g. `rest`), and both failed to
+# compile. Each set below is checked to build on its own.
+ARG VTA_FEATURES="setup,rest,didcomm,tsp,cli-synthesis,webs,webvh,jemalloc"
+ARG VTC_FEATURES="setup,website,admin-ui,tsp,jemalloc,vetting-pcs"
+ARG PNM_FEATURES="config-session,tsp"
+ARG CNM_FEATURES="config-session"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target,id=openvtc-research-vti-target \
-    cargo build --release --locked \
-        -p vta-service -p vtc-service -p pnm-cli -p cnm-cli \
-        --no-default-features \
-        --features "${VTA_FEATURES},${VTC_FEATURES},${CLI_FEATURES}" && \
+    cargo build --release --locked -p vta-service --no-default-features --features "${VTA_FEATURES}" && \
+    cargo build --release --locked -p vtc-service --no-default-features --features "${VTC_FEATURES}" && \
+    cargo build --release --locked -p pnm-cli --no-default-features --features "${PNM_FEATURES}" && \
+    cargo build --release --locked -p cnm-cli --no-default-features --features "${CNM_FEATURES}" && \
     mkdir -p /out && \
     cp target/release/vta target/release/vtc target/release/pnm target/release/cnm /out/
 

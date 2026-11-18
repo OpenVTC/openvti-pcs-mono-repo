@@ -4,8 +4,8 @@
 #   ./scripts/run-demos.sh            # all of them, in order
 #   ./scripts/run-demos.sh pcs        # one of: pcs, prototype, engines, peer, hidden
 #
-# Each demo is a test suite. --nocapture shows what the tests print (the PCS
-# suites print the size of each protocol object).
+# Each demo is a test suite; the comment at the top of each test file walks
+# through the flow it runs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,7 +17,7 @@ run() {
 
 pcs() {
   run "1. PCS: the pcreds protocol (issuance by threshold, membership proofs, object sizes)" \
-    cargo test --release -p predicate-credential-system --test pcreds -- --nocapture
+    cargo test --release -p predicate-credential-system --test pcreds
 }
 prototype() {
   run "2. PCS: hidden-vetter admission prototype (VTC, vetters, applicant in memory)" \

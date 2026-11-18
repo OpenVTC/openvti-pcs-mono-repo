@@ -43,7 +43,7 @@ Every demo runs in process, so nothing needs deploying:
 
 | Name | What runs | Command |
 |---|---|---|
-| `pcs` | **PCS protocol.** A helper issues a credential once `k` distinct credentialed users attest for a user. The user then proves membership anonymously. Covers every base/tag pair over BLS12-381 and prints the size of each object. | `cargo test --release -p predicate-credential-system --test pcreds -- --nocapture` |
+| `pcs` | **PCS protocol.** A helper issues a credential once `k` distinct credentialed users attest for a user. The user then proves membership anonymously. Covers every base/tag pair over BLS12-381 and prints the size of each object. | `cargo test --release -p predicate-credential-system --test pcreds` |
 | `prototype` | **Hidden-vetter admission prototype.** A VTC as PCS helper, vetters with periods and attestation tokens, and an applicant proving `k` distinct eligible vetters. Everything is in memory; there is no transport. | `cargo test --release -p pcs-vetting-prototype` |
 | `engines` | **The production hidden-vetting engines.** The community's issuer and verifier, and the vetter and applicant engines the VTA runs, end to end. | `cargo test --release -p vti-vetting-pcs --test end_to_end` |
 | `peer` | **Peer vetting ceremony.** An applicant and a vetter exchange the request, session, Vetting Card and Vetting Statement through a real DIDComm mediator. | `cargo test -p openvtc-core --test vetting_e2e -- --include-ignored` |
@@ -56,7 +56,7 @@ Read those alongside the output.
 
 ```sh
 cargo test --release -p predicate-credential-system                    # the full suite: correctness, soundness, adversarial, IETF vectors
-cargo bench -p predicate-credential-system --bench pcreds              # sizes and running times, the rows of the paper's comparison table
+cargo bench -p predicate-credential-system --bench pcreds              # prints every object's size, then times each party's algorithms (the paper's comparison table)
 cargo test --release -p predicate-credential-system --features lattice --test lattice_flows   # post-quantum instantiation (slow, about 0.7 GB per proof)
 cargo doc -p predicate-credential-system --open                        # API docs, with a paper-to-module map on the front page
 ```
