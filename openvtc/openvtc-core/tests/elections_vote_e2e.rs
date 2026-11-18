@@ -160,7 +160,9 @@ async fn a_member_takes_a_ticket_then_votes_and_keeps_the_receipt() {
     .unwrap();
     assert_eq!(sent.payload["manifestDigest"], json!(digest_text));
     let id = point_from_text(sent.payload["request"]["id"].as_str().unwrap()).unwrap();
-    let blinded = serde_json::from_value(sent.payload["request"]["request"].clone()).unwrap();
+    // The inner request is `{"proof": <multibase CredentialRequest>}`, read as the VTC reads it.
+    let blinded: vti_voting::voter::TicketRequest =
+        vti_vetting_pcs::issuer::request_from_value(&sent.payload["request"]["request"]).unwrap();
     let pre = registrar
         .issue_ticket(&election, &id, &blinded, &mut rng)
         .expect("the registrar signs the ticket blind");
