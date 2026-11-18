@@ -213,7 +213,8 @@ Build the client on the host and keep each person's profile apart:
 cargo build --release -p openvtc            # from the repository root
 set -a; . infra/.state/stack.env; set +a    # VTA_DID, VTC_DID, VTA_ALLOW_PRIVATE_ENDPOINTS=1
 export OPENVTC_CONFIG_PATH="$HOME/.openvtc-research"
-export OPENVTC_SECURE_STORE=file            # optional: keep keys out of the OS keychain
+export OPENVTC_SECURE_STORE=file            # Linux only, optional: encrypted-file storage instead of the keyring.
+                                            # On macOS leave it unset; setup asks for Keychain access once per profile.
 alias openvtc="$PWD/target/release/openvtc"
 ```
 
@@ -256,36 +257,31 @@ Then do §4 for the vetters, and walk the flows in the TUI (`openvtc -p <name>`)
 
 ## What was verified, and what was not
 
-Verified when this directory was written (2026-11-17, Docker Desktop on macOS,
-arm64, 8 GB VM):
+Verified on 2026-11-18 with Docker Desktop on macOS (arm64, 8 GB VM):
 
-- `docker compose config` validates.
-- The mediator and DID-host images build from `vendor/` (with the local
-  patches), and `redis`, `mediator` and `did-hosting` come up **healthy** under
-  this compose file. The mediator generates its `did:peer` identity, answers
-  `http://localhost:7037/mediator/v1/livez` from the host, and logs that its
-  resolver runs with `AllowPrivate`. The DID host sets itself up self-managed,
-  serves `did:webvh:…:localhost%3A8534` at `/.well-known/did.jsonl` to the host,
-  and advertises `TrustTaskHTTPS` at `http://localhost:8534/api` (a loopback
-  endpoint the VTA accepts). The offline `add-acl` / `list-acl` /
-  `remove-acl` round trip `bootstrap.sh` uses works with the daemon stopped.
-- `bootstrap.sh` step 1 (reading the mediator's and DID host's DIDs).
-- `docker/vti.Dockerfile` mechanics: the root-context build with its
-  `.dockerignore`, the admin-console Node stage (`npm ci`, both bundles), and
-  compiling the whole third-party dependency graph with `CARGO_BUILD_JOBS=2`
-  in 8 GB.
+- `docker compose config` validates. All three images build, including
+  `openvtc-research/vti:local`. The VTI build takes over an hour with one job.
+- **`./bootstrap.sh` runs all five steps** on a fresh stack. Afterwards every
+  service is healthy:
+  - `livez` and `/health` answer for the mediator, the VTA and the VTC.
+  - The VTA and VTC serve their `did:webvh` logs on `localhost`.
+  - `./bin/pnm acl list` works.
+  - The console invitation is written to `.state/`.
+- **An `openvtc` client sets up against the stack** (`openvtc -p alice setup
+  --vta-did …`, §5):
+  - It resolves the VTA's `localhost` DID and the mediator.
+  - It mints its setup DID and prints the `pnm` grant.
+  - Once `./bin/pnm contexts create …` runs, it opens a DIDComm session with
+    the VTA through the mediator.
+  - It then stops at the OS secure-storage prompt (the macOS Keychain
+    dialog), which needs a person.
+- The vetting protocols themselves are covered by the in-process demos
+  (`../scripts/run-demos.sh`), which run the same VTA, VTC and client code.
 
 Not verified:
 
-- The `openvtc-research/vti:local` image itself: the root workspace did not
-  compile at the time (`vti/vti-voting` against the in-repo `pcs/` API —
-  `predicate_credential_system::{cred, pcs}` not found — while the workspace
-  was being restructured). Consequently **steps 2–5 of `bootstrap.sh` have not
-  run**. They follow the documented commands and output formats; expect to fix
-  small things (a flag spelling, a parse of some output) on the first run.
-  Every step says what it is doing, and the script is safe to re-run.
-- The VTA/VTC with `--no-default-features` (no `keyring`) and the plaintext
-  secret backends, as configured here.
-- The OpenVTC client against the stack.
-- Whether the VTA, once running, publishes persona DIDs to the DID host over
-  its `TrustTaskHTTPS` endpoint without further configuration.
+- **Walking a full vetting flow across several `openvtc` profiles in the TUI**
+  (§4–5). This needs the console passkey claim and the Keychain prompts, which
+  are human steps.
+- Whether the VTA publishes persona DIDs to the DID host without further
+  configuration. This happens on a profile's first community join.
