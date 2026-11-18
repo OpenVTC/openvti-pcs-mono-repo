@@ -12,7 +12,9 @@ use crate::state_handler::main_page::content::{NewFaceFocus, VettingMode};
 /// The values typed for claims a community may require.
 fn value_for(claim_type: &str) -> String {
     match claim_type {
-        "name.legal" => std::env::var("SCRIPT_LEGAL_NAME").unwrap_or_else(|_| "Research Applicant".into()),
+        "name.legal" => {
+            std::env::var("SCRIPT_LEGAL_NAME").unwrap_or_else(|_| "Research Applicant".into())
+        }
         other => format!("research value for {other}"),
     }
 }

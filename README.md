@@ -90,6 +90,15 @@ Then follow `infra/README.md`:
      ceremony runs, and the applicant submits one proof. The VTC's join request
      shows anonymous tags where member DIDs would be.
 
+**Or run it all unattended:** `infra/scripts/vetting-run.sh all` drives four
+real OpenVTC clients through peer vetting and then hidden vetting, with no
+human in the loop:
+- two vetters
+- one applicant per flow
+
+The administrator's console steps are scripted with a virtual passkey. See
+"Automated vetting run" in `infra/README.md`.
+
 Both the services and the client accept `localhost` DIDs only with
 `VTA_ALLOW_PRIVATE_ENDPOINTS=1`. The stack sets it, and `infra/.state/stack.env`
 exports it for the clients.
@@ -113,6 +122,7 @@ exports it for the clients.
 - **PCS is the `pcreds` version** (Jali 0.3, application contexts). VTI was
   ported to it for this repository; upstream VTI still uses the published PCS
   0.1. `PROVENANCE.md` lists where the port differs from the paper's protocol.
-- Running `./scripts/run-demos.sh` exercises every flow above. The `infra/`
-  stack's bring-up beyond the mediator and DID host is less tested; see
-  `infra/README.md`, "What was verified".
+- `./scripts/run-demos.sh` exercises every flow above in process.
+  `infra/scripts/vetting-run.sh all` runs peer and hidden vetting end to end
+  across real processes; both pass (`infra/README.md`, "Automated vetting
+  run").

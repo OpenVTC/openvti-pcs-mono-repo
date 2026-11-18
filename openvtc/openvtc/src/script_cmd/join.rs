@@ -41,7 +41,11 @@ pub(super) async fn finish_join(d: &mut Driver, community: &str) -> Result<()> {
                 if i == known.row { " (highlighted)" } else { "" },
                 r.route,
                 r.label,
-                if r.available() { "available" } else { r.blocked().unwrap_or("blocked") }
+                if r.available() {
+                    "available"
+                } else {
+                    r.blocked().unwrap_or("blocked")
+                }
             );
         }
         let target = known

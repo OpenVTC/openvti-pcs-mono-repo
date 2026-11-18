@@ -89,7 +89,9 @@ fn run(revote: &str) -> Run {
         let mut r = StdRng::seed_from_u64(seed);
         let v = Voter::generate(&params, &mut r).unwrap();
         let (req, st) = v.ticket_request(&params, &election, &mut r).unwrap();
-        let pre = reg.issue_ticket(&election, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let pre = reg
+            .issue_ticket(&election, &v.id(&params).unwrap(), &req, &mut r)
+            .unwrap();
         let ticket = v.accept_ticket(&params, &election, &pre, st).unwrap();
         for choice in choices {
             if revote == "refuse" && choice == "no" && seed == 10 {

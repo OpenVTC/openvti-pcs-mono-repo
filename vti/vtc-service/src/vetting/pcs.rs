@@ -701,7 +701,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|l| l.as_str().unwrap().trim_start_matches("vetter/").to_string())
+            .map(|l| {
+                l.as_str()
+                    .unwrap()
+                    .trim_start_matches("vetter/")
+                    .to_string()
+            })
             .collect()
     }
 

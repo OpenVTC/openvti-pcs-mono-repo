@@ -47,7 +47,14 @@ impl CommunityParams {
     ) -> Result<Self, ProtoError> {
         let hvks: Vec<Hvk> = keys_from_text(helper_keys)?;
         let tvks: Vec<Tvk> = keys_from_text(token_keys)?;
-        Self::new(community, hvks, tvks, vetter_labels, token_labels, drip_per_tick)
+        Self::new(
+            community,
+            hvks,
+            tvks,
+            vetter_labels,
+            token_labels,
+            drip_per_tick,
+        )
     }
 
     /// From values already decoded: `hvks[i]` is the key of `vetter_labels[i]`, and `tvks[i]`

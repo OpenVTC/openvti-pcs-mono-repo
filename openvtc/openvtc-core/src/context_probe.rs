@@ -127,10 +127,7 @@ pub(crate) fn webvh_dids_in(context_id: &str) -> vta_sdk::client::DidListFilter 
 /// authenticated to (D6). Runs on every setup rather than behind a flag,
 /// because a user who needs the answer is by definition not expecting to.
 pub async fn probe(client: &VtaClient, context_id: &str) -> ProbeOutcome {
-    let dids = match client
-        .list_dids(&webvh_dids_in(context_id))
-        .await
-    {
+    let dids = match client.list_dids(&webvh_dids_in(context_id)).await {
         Ok(dids) => dids,
         Err(e) => {
             // The listing OpenVTC most depends on. If this one is refused the

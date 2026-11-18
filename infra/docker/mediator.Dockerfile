@@ -19,7 +19,7 @@ RUN apt-get update \
 WORKDIR /app
 # Parallel rustc jobs. Docker Desktop's default VM (~8 GiB) runs out of memory
 # with one job per core; raise this on a bigger build host.
-ARG CARGO_BUILD_JOBS=2
+ARG CARGO_BUILD_JOBS=1
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # Infrastructure only (not under study): trade a little runtime speed for a
 # much cheaper build than the upstream release profile (fat/thin LTO, 1 CGU).

@@ -32,7 +32,9 @@ use crate::{
     ProtoError,
     community::CommunityParams,
     meta::{ProofContext, StatementMeta, id_binding},
-    scheme::{Bk, G1, Member, Usk, labelled_from_text, labelled_text, member, point_text, scalar_text},
+    scheme::{
+        Bk, G1, Member, Usk, labelled_from_text, labelled_text, member, point_text, scalar_text,
+    },
     snapshot::{ApplicantSnapshot, HeldAttestation},
     verifier::Submission,
     vetter::HiddenAttestation,
@@ -158,7 +160,9 @@ impl ApplicantEngine {
         // proof is the same on every call, and no two sessions share a nonce.
         let mut h = Sha256::new();
         h.update(b"openvtc/hidden-vetting/request-nonce/0.1\0");
-        h.update(predicate_credential_system::serialization::to_bytes(self.user.expose_key())?);
+        h.update(predicate_credential_system::serialization::to_bytes(
+            self.user.expose_key(),
+        )?);
         h.update(&ssid);
         h.update(params.community().as_bytes());
         let mut rng = ChaCha20Rng::from_seed(h.finalize().into());
@@ -178,8 +182,12 @@ impl ApplicantEngine {
 
     /// The storable form. Carries `usk`: see [`crate::snapshot`].
     pub fn snapshot(&self) -> Result<ApplicantSnapshot, ProtoError> {
-        let mut snap =
-            ApplicantSnapshot::new(self.user.expose_key(), &self.label, self.id(), &self.join_did)?;
+        let mut snap = ApplicantSnapshot::new(
+            self.user.expose_key(),
+            &self.label,
+            self.id(),
+            &self.join_did,
+        )?;
         snap.held = self
             .held
             .iter()

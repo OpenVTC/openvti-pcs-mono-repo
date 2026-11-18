@@ -144,7 +144,10 @@ impl Setup {
         let v = Voter::generate(&params, &mut r).unwrap();
         let e = self.election();
         let (req, st) = v.ticket_request(&params, &e, &mut r).unwrap();
-        let pre = self.reg.issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let pre = self
+            .reg
+            .issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r)
+            .unwrap();
         let ticket = v.accept_ticket(&params, &e, &pre, st).unwrap();
         (v, ticket)
     }

@@ -41,7 +41,9 @@ pub(super) async fn create_persona(d: &mut Driver, label: &str) -> Result<String
                 println!("   persona DID: {did}");
                 return Ok(did);
             }
-            CreatePersonaPhase::Failed => bail!("creating the persona failed: {:?}", overlay.messages),
+            CreatePersonaPhase::Failed => {
+                bail!("creating the persona failed: {:?}", overlay.messages)
+            }
             CreatePersonaPhase::Working => {}
             // Label and path: Enter takes what is there (the server names the path).
             _ => d.send(Action::CreatePersonaSubmit)?,

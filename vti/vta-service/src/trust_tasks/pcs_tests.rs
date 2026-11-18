@@ -646,7 +646,11 @@ async fn recover_restores_the_bound_key_after_the_engine_record_was_lost() {
     let params = published(&vtc);
     let label = "vetter/2026-10";
     let (wire, fresh_id) = root_request_id(&state, &alice, "vetter-a", &params, label).await;
-    assert_ne!(fresh_id, bound_point(&bound_id), "a lost record means a fresh key");
+    assert_ne!(
+        fresh_id,
+        bound_point(&bound_id),
+        "a lost record means a fresh key"
+    );
     let (_, request) = wire.parse().unwrap();
     let refused = vtc.issue_vetter_root(member, &request, &mut rng);
     assert!(

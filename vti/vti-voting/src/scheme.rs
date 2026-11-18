@@ -106,6 +106,8 @@ impl VotingParams {
     /// # Errors
     /// [`VotingError::Pcs`] if a point cannot be derived.
     pub fn cast_point(&self, election: &Election) -> Result<Fr, VotingError> {
-        Ok(self.open.recipient_point(self.hvk.vk(), &election.point()?)?)
+        Ok(self
+            .open
+            .recipient_point(self.hvk.vk(), &election.point()?)?)
     }
 }

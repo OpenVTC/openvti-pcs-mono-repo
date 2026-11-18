@@ -337,9 +337,7 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
     // Asking again under the label, with the same identifier and fresh blinding, is a client
     // that lost the answer: it is re-issued, in the same shape as the first answer.
     let (again, again_blinding) = root_request(&issuer, &vetter_did, PERIOD, &usk, &mut rng);
-    let (status, body) = h
-        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, again)
-        .await;
+    let (status, body) = h.post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, again).await;
     assert_eq!(status, StatusCode::OK, "a lost answer is re-issued: {body}");
     let pre = body
         .pointer("/payload/preCredential")
@@ -351,9 +349,7 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
     // holding two in one period would count twice in one request.
     let other_usk = fresh_usk(&issuer, &mut rng);
     let (other, _) = root_request(&issuer, &vetter_did, PERIOD, &other_usk, &mut rng);
-    let (status, body) = h
-        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, other)
-        .await;
+    let (status, body) = h.post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, other).await;
     assert_ne!(
         status,
         StatusCode::OK,
@@ -401,7 +397,14 @@ async fn a_vetter_enrols_draws_and_an_applicant_gets_a_challenge() {
     // --- 2. draw ----------------------------------------------------------------------------
     let mut wallet = TokenWallet::new();
     let requests = wallet
-        .prepare(&issuer.tvk(TOKEN_LABEL), TOKEN_LABEL, &vetter_did, 1, DRIP, &mut rng)
+        .prepare(
+            &issuer.tvk(TOKEN_LABEL),
+            TOKEN_LABEL,
+            &vetter_did,
+            1,
+            DRIP,
+            &mut rng,
+        )
         .unwrap();
     let batch = json!({
         "label": TOKEN_LABEL,
@@ -954,15 +957,11 @@ async fn the_enrolment_and_the_drip_refuse_with_the_codes_they_declare() {
     .expect("the community rotates its vetter label");
     h.store_config(&rotated).await;
     let (next, _) = root_request(&issuer, &vetter_did, NEXT, &usk, &mut rng);
-    let (status, body) = h
-        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, next)
-        .await;
+    let (status, body) = h.post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, next).await;
     assert_eq!(status, StatusCode::OK, "a new period binds afresh: {body}");
     let other_usk = fresh_usk(&issuer, &mut rng);
     let (other, _) = root_request(&issuer, &vetter_did, NEXT, &other_usk, &mut rng);
-    let (status, body) = h
-        .post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, other)
-        .await;
+    let (status, body) = h.post(&vetter_key, pcs_tasks::PCS_ROOT_TYPE, other).await;
     assert_ne!(status, StatusCode::OK);
     assert_eq!(tt_error_code(&body), pcs_tasks::ROOT_ERR_IDENTIFIER_REBOUND);
 
@@ -982,7 +981,14 @@ async fn the_enrolment_and_the_drip_refuse_with_the_codes_they_declare() {
         })
     };
     let requests = wallet
-        .prepare(&issuer.tvk(TOKEN_LABEL), TOKEN_LABEL, &vetter_did, 1, 1, &mut rng)
+        .prepare(
+            &issuer.tvk(TOKEN_LABEL),
+            TOKEN_LABEL,
+            &vetter_did,
+            1,
+            1,
+            &mut rng,
+        )
         .unwrap();
     let (status, body) = h
         .post(

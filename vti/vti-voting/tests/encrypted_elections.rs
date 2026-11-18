@@ -292,7 +292,10 @@ impl Run {
         let v = Voter::generate(&params, &mut r).unwrap();
         let e = self.election();
         let (req, st) = v.ticket_request(&params, &e, &mut r).unwrap();
-        let pre = self.reg.issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let pre = self
+            .reg
+            .issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r)
+            .unwrap();
         let ticket = v.accept_ticket(&params, &e, &pre, st).unwrap();
         let status = self.status(DURING);
         let ek = wire::election_key(&status["electionKey"], Threshold::new(2, 3).unwrap()).unwrap();
@@ -313,7 +316,10 @@ impl Run {
         let v = Voter::generate(&params, &mut r).unwrap();
         let e = self.election();
         let (req, st) = v.ticket_request(&params, &e, &mut r).unwrap();
-        let pre = self.reg.issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r).unwrap();
+        let pre = self
+            .reg
+            .issue_ticket(&e, &v.id(&params).unwrap(), &req, &mut r)
+            .unwrap();
         let ticket = v.accept_ticket(&params, &e, &pre, st).unwrap();
         let cast = v
             .cast_encrypted_wire(&params, &ticket, &form, &mut r)
