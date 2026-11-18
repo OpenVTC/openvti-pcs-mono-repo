@@ -18,7 +18,7 @@
 >   active operator guide)
 
 Status: ~~Draft — awaiting human review before implementation~~ — Superseded
-Owner: Glenn Gore
+Owner: (anonymized)
 Related: `docs/02-vta/did-webvh-update.md`, `docs/05-design-notes/pnm-setup-deferred-vta-did.md`
 
 ## Objective

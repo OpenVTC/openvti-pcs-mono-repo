@@ -247,7 +247,7 @@ pub const ROOT_DID_MNEMONIC: &str = ".well-known";
 ///
 /// # The community name
 ///
-/// An **empty** local part is the community name — `webvh.storm.ws/@`, which
+/// An **empty** local part is the community name — `webvh.anon.org/@`, which
 /// the agent name FAQ defines as the name of the verifiable trust community
 /// owning the domain. It is well-formed, so this returns `Ok` for it, but
 /// being well-formed is not permission to *bind* it: that is

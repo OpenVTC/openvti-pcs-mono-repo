@@ -3658,12 +3658,12 @@ mod tests {
                 resolved: vec![
                     ResolvedClaim {
                         claim_type: "name.legal".into(),
-                        value: Some(serde_json::json!("Glenn Gore")),
+                        value: Some(serde_json::json!("Alex Example")),
                         ..ResolvedClaim::default()
                     },
                     ResolvedClaim {
                         claim_type: "email.work".into(),
-                        value: Some(serde_json::json!("glenn@example.com")),
+                        value: Some(serde_json::json!("alex@example.com")),
                         ..ResolvedClaim::default()
                     },
                     ResolvedClaim {
@@ -3710,7 +3710,7 @@ mod tests {
             "the key hint follows the cursor, which is on an unmasked row: {out}"
         );
         assert!(
-            out.contains("Glenn Gore"),
+            out.contains("Alex Example"),
             "an unmasked type is still shown whole: {out}"
         );
     }
@@ -3724,7 +3724,7 @@ mod tests {
         state.revealed_face_claim = Some(1);
 
         let out = text(&render(&state));
-        assert!(out.contains("glenn@example.com"), "the selected one: {out}");
+        assert!(out.contains("alex@example.com"), "the selected one: {out}");
         assert!(
             !out.contains("+6591234567"),
             "the other masked claim stays masked: {out}"
@@ -3749,7 +3749,7 @@ mod tests {
 
         let out = text(&render(&state));
         assert!(
-            !out.contains("glenn@example.com"),
+            !out.contains("alex@example.com"),
             "a stale grant does not open a row nobody chose: {out}"
         );
         assert!(!out.contains("+6591234567"), "{out}");

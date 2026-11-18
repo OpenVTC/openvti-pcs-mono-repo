@@ -277,7 +277,7 @@ edition = "2024"
 rust-version = "1.94.0"
 license = "Apache-2.0"
 description = "DID-VM-resolved WebAuthn assertion verifier for Verifiable Trust Infrastructure"
-repository = "https://github.com/openvtc/verifiable-trust-infrastructure"
+repository = "https://anonymized.example"
 publish = true
 
 [dependencies]

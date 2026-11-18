@@ -646,13 +646,13 @@ mod tests {
     #[test]
     fn aws_bare_namespace_gets_trailing_slash() {
         // No trailing separator → '/' is appended so concatenation with
-        // a key produces 'glenn/vtc/mediator/probe' rather than the
-        // confusing 'glenn/vtc/mediatorprobe'.
+        // a key produces 'alex/vtc/mediator/probe' rather than the
+        // confusing 'alex/vtc/mediatorprobe'.
         assert_eq!(
-            parse_url("aws_secrets://us-east-1/glenn/vtc/mediator").unwrap(),
+            parse_url("aws_secrets://us-east-1/alex/vtc/mediator").unwrap(),
             BackendUrl::Aws {
                 region: "us-east-1".into(),
-                namespace: "glenn/vtc/mediator/".into(),
+                namespace: "alex/vtc/mediator/".into(),
             }
         );
     }

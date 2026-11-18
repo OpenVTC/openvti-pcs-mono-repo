@@ -18,7 +18,7 @@ use crate::display::shorten_did;
 use crate::render::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW, is_json_output, print_json};
 
 /// The full name as an operator would type or read it, e.g.
-/// `webvh.storm.ws/@ops`.
+/// `webvh.anon.org/@ops`.
 ///
 /// Derived from the DID's host rather than asked for, because the domain is
 /// not the operator's to choose — it is wherever the DID is hosted, and the
@@ -201,8 +201,8 @@ mod tests {
     #[test]
     fn domain_comes_from_the_did_not_the_operator() {
         assert_eq!(
-            domain_of("did:webvh:QmScid:webvh.storm.ws:glenn-vta").as_deref(),
-            Some("webvh.storm.ws")
+            domain_of("did:webvh:QmScid:webvh.anon.org:alex-vta").as_deref(),
+            Some("webvh.anon.org")
         );
         assert_eq!(
             domain_of("did:web:QmScid:example.com").as_deref(),
@@ -231,8 +231,8 @@ mod tests {
         // Better than inventing a domain we cannot derive.
         assert_eq!(qualified("did:key:z6MkfrQjWz", "ops"), "@ops");
         assert_eq!(
-            qualified("did:webvh:QmScid:webvh.storm.ws", "ops"),
-            "webvh.storm.ws/@ops"
+            qualified("did:webvh:QmScid:webvh.anon.org", "ops"),
+            "webvh.anon.org/@ops"
         );
     }
 }

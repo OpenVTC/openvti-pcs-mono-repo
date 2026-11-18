@@ -65,7 +65,7 @@ The input gains `issuer_scope` (`"pairwise"`, `"directed"` or `"public"`), read 
 
 ### 5. Vetting and join: `statementType` is a predicate IRI
 
-A join manifest's `vetting.statementType` is now the predicate a counted statement carries, `https://registry.trustoverip.org/dtg/vsc/vetted/1`. The old endorsement-type URI (`https://firstperson.network/endorsements/identity-vetting/0.1`) no longer appears. A join policy that compared against the old URI needs updating.
+A join manifest's `vetting.statementType` is now the predicate a counted statement carries, `https://registry.trustoverip.org/dtg/vsc/vetted/1`. The old endorsement-type URI (`https://anonymized.example`) no longer appears. A join policy that compared against the old URI needs updating.
 
 ### 6. Ceremony rules: credential facts report the concrete type and predicate
 

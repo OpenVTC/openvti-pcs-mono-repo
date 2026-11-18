@@ -1463,7 +1463,7 @@ fn a_rendered_did_host_resolves_to_its_trust_task_base() {
 // document to list `SignInPortal` on the origin of its console login page.
 // DID hosting publishes `<origin>/login` for itself; a node minted from one of
 // these templates lacked it, and wallets refused its sign-in links with
-// "This code can't be used" (webvh.storm.ws).
+// "This code can't be used" (webvh.anon.org).
 
 const DID_HOST_HTTP_TEMPLATES: [&str; 3] = [
     "did-host-http",
@@ -1485,7 +1485,7 @@ fn every_did_host_http_template_advertises_its_login_page_as_sign_in_portal() {
     for name in DID_HOST_HTTP_TEMPLATES {
         let tpl = load_embedded(name).unwrap();
         let mut vars = did_host_http_tsp_fixture_vars();
-        vars.insert_string("URL", "https://webvh.storm.ws");
+        vars.insert_string("URL", "https://webvh.anon.org");
         let doc = tpl.render(&vars).unwrap();
         let portals = sign_in_portal_entries(&doc);
         assert_eq!(portals.len(), 1, "`{name}`: {doc}");
@@ -1494,7 +1494,7 @@ fn every_did_host_http_template_advertises_its_login_page_as_sign_in_portal() {
             json!({
                 "id": "did:webvh:QmTEST:example.com#sign-in-portal",
                 "type": "SignInPortal",
-                "serviceEndpoint": "https://webvh.storm.ws/login",
+                "serviceEndpoint": "https://webvh.anon.org/login",
             }),
             "`{name}` must publish exactly what DID hosting publishes for itself"
         );

@@ -1,5 +1,5 @@
 //! Interoperability of `Σ-BBS` under IETF parameters (`pcreds::pairing::ietf`) with
-//! `affinidi-bbs` 0.3.3, the BBS crate of the Affinidi / OpenVTC stack (IETF BBS, ciphersuite
+//! `affinidi-bbs` 0.3.3, the BBS crate of the [vendor] / OpenVTC stack (IETF BBS, ciphersuite
 //! BLS12-381-SHA-256, curve backend `bls12_381_plus`). The two stacks share no type: everything
 //! crosses as bytes, through the `to_ietf_bytes` / `from_ietf_bytes` bridges, and through their
 //! public hashing functions for the parameters.

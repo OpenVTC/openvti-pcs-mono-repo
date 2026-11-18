@@ -5,7 +5,7 @@ send) and §4.1 (device push, learn-from-inbound) is built; the rest is the plan
 it was written as. Originally a draft for review scoping SDD PR 7 (outbound seams). No send-path
 code until the §3 relationship question is decided; the probe that decides it
 already ships in `pnm health` (see §3.1) — run it against a live TSP-enabled VTA.
-**Owner:** Glenn Gore
+**Owner:** (anonymized)
 **Created:** 2026-06-28
 **Context:** `tsp-enablement.md` §7 ("outbound seams behind `send_to_member`")
 and `tsp-inbound-receive.md` (the inbound counterpart, merged #591/#592). Inbound

@@ -2,7 +2,7 @@
 
 A **Verifiable Trust Network** (VTN) curates communities and networks (`dtgwg-vti-spec`, *The Verifiable Trust Network*, VTI-VTN-001 – 063). A VTN may list this community without asking (VTI-VTN-010). The listing becomes **membership** only when the community acknowledges it (VTI-VTN-013).
 
-This page covers the community's side, `vtc/networks/*` (`vtc-service/src/networks/`). The network side is the `vtn` service in [OpenVTC/verifiable-trust-network](https://github.com/OpenVTC/verifiable-trust-network), and both share the `vti-vtn` crate.
+This page covers the community's side, `vtc/networks/*` (`vtc-service/src/networks/`). The network side is the `vtn` service in [OpenVTC/verifiable-trust-network](https://anonymized.example), and both share the `vti-vtn` crate.
 
 ## What an administrator does
 

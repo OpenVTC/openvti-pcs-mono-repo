@@ -355,7 +355,7 @@ the mediator *recorded*, failing if that is not the one asked for. `rootAdmin`
 is not offered — it reads other accounts' message bodies and changes a running
 mediator, which is not a standing to give a key held in a browser.
 
-`pnm messaging console` opens a full-screen console for an Affinidi messaging
+`pnm messaging console` opens a full-screen console for an [vendor] messaging
 mediator, acting as a DID this VTA manages — no profile file or secrets to keep:
 
 - an **administrator** DID sees the whole mediator: statistics, every account's
@@ -373,7 +373,7 @@ you pick from that context's DIDs.
 The mediator decides which view you get, from its own record of the DID. The mediator comes
 from `--mediator`, else the DID document's `DIDCommMessaging` service, else this
 pnm's configured mediator. Screens and keys are documented with the console
-itself: [`affinidi-messaging-mediator-tui`](https://github.com/affinidi/affinidi-tdk-rs/tree/main/crates/messaging/affinidi-messaging-mediator-tui).
+itself: [`affinidi-messaging-mediator-tui`](https://anonymized.example).
 
 **Names instead of hashes.** The mediator knows accounts only as SHA-256
 hashes of their DIDs. pnm fills the console's address book with every DID
@@ -400,7 +400,7 @@ console closes. `--as-session` exports nothing — pnm's own key is already here
 
 - [VTA Service & Architecture](../README.md)
 - [CNM CLI (multi-community)](../cnm-cli/README.md)
-- [First Person Network White Paper](https://www.firstperson.network/white-paper)
+- [[network] White Paper](https://anonymized.example)
 - [Documentation index](../docs/README.md)
 - [Architecture](../docs/01-concepts/architecture.md)
 - [BIP-32 Path Specification](../docs/04-reference/bip32-paths.md)

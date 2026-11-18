@@ -203,7 +203,7 @@ url = "https://personal.example.com"
 
 [communities.storm]
 name = "Storm"
-url = "https://vta.storm.ws"
+url = "https://vta.anon.org"
 vta_did = "did:key:z6MkStorm"
 "#;
         let restored: CnmConfig = toml::from_str(toml_str).unwrap();

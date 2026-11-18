@@ -51,8 +51,8 @@ const VECTORS: [string, string][] = [
   ["alice", "alice"],
   ["https://example.com/@alice", "https://example.com/@alice"],
   [
-    "did:webvh:QmXkAbCdEfGhIjKlMnOp:webvh.storm.ws:glenn-vta",
-    "did:webvh:QmXkAbCdEf…:…storm.ws:glenn-vta",
+    "did:webvh:QmXkAbCdEfGhIjKlMnOp:webvh.anon.org:alex-vta",
+    "did:webvh:QmXkAbCdEf…:…anon.org:alex-vta",
   ],
   [
     "did:webvh:QmXkAbCdEfGhIjKlMnOp:dids.firstperson.dev:stem-wall",
@@ -63,8 +63,8 @@ const VECTORS: [string, string][] = [
     "did:webvh:QmXkAbCdEf…:dids.ic3.dev:fruit-feel",
   ],
   [
-    "did:webvh:QmXkAbCdEfGhIjKlMnOp:firstperson.network:a:b",
-    "did:webvh:QmXkAbCdEf…:firstperson.network:a:b",
+    "did:webvh:QmXkAbCdEfGhIjKlMnOp:anonymized.example:a:b",
+    "did:webvh:QmXkAbCdEf…:anonymized.example:a:b",
   ],
   ["did:web:QmXkAbCdEfGhIjKlMnOp:example.com", "did:web:QmXkAbCdEf…:example.com"],
   ["did:webvh:Qm123:example.com", "did:webvh:Qm123:example.com"],
@@ -72,8 +72,8 @@ const VECTORS: [string, string][] = [
   ["did:key:z6MkfrQjWz", "did:key:z6MkfrQjWz"],
   ["did:webvh:QmXkAbCdEfGhIjKlMnOpQrSt", "did:webvh:QmXkAbCdEf…OpQrSt"],
   [
-    "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp?src=webvh.storm.ws/glenn-vta",
-    "did:scid:vh:1:QmXkAbCdEf…?src=…storm.ws/glenn-vta",
+    "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp?src=webvh.anon.org/alex-vta",
+    "did:scid:vh:1:QmXkAbCdEf…?src=…anon.org/alex-vta",
   ],
   ["did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp", "did:scid:vh:1:QmXkAbCdEf…"],
   ["did:scid:vh:1:Qm123?src=example.com", "did:scid:vh:1:Qm123?src=example.com"],

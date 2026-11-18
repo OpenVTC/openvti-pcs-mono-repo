@@ -2,7 +2,7 @@
 
 Status: **Implemented**
 Companion to: `runtime-service-management.md` (the approved spec)
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-05-06
 
 This plan decomposes the spec into ordered phases, identifies what

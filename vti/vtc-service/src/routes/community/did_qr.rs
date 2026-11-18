@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn a_did_webvh_renders_as_a_standalone_svg() {
         let did =
-            "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.storm.ws:first-vtc";
+            "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.anon.org:first-vtc";
         let svg = did_qr_svg(did).expect("a did:webvh fits");
         assert!(svg.contains("<svg"), "{svg}");
         assert!(svg.contains("viewBox"), "the page sizes it with CSS");
@@ -90,7 +90,7 @@ mod tests {
         // Level M, version 5 is 37 modules; with the 4-module quiet zone on
         // both sides and the renderer's default 8 px modules: (37 + 8) * 8.
         let did =
-            "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.storm.ws:first-vtc";
+            "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.anon.org:first-vtc";
         let code = QrCode::with_error_correction_level(did.as_bytes(), EcLevel::M).unwrap();
         assert_eq!(code.width(), 37);
         assert!(did_qr_svg(did).unwrap().contains(r#"width="360""#));

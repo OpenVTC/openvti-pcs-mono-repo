@@ -19,7 +19,7 @@
 //! {"body":{"challenge":"<challenge>","session_id":"<session_id>"},
 //!  "created_time":<unix secs>,"expires_time":<unix secs>,
 //!  "from":"<client VID>","to":"<mediator DID>",
-//!  "typ":"https://affinidi.com/atm/1.0/tsp/authenticate"}
+//!  "typ":"https://anonymized.example"}
 //! ```
 //!
 //! (shown wrapped; the signed form is one line). The request carries `to`,
@@ -543,7 +543,7 @@ mod tests {
                 r#""created_time":1800000000,"expires_time":1800000060,"#,
                 r#""from":"did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK","#,
                 r#""to":"did:web:mediator.example.com","#,
-                r#""typ":"https://affinidi.com/atm/1.0/tsp/authenticate"}"#
+                r#""typ":"https://anonymized.example/atm/1.0/tsp/authenticate"}"#
             )
         );
     }

@@ -244,7 +244,7 @@ UnpackedMessage { message_json, sender_authenticated: bool, sender_kid: Option<S
 
 ### 3.8 Mediator-connected session (`mediator`) — stateful async `Object`
 
-Wraps `vta-sdk`'s `DIDCommSession` (the Affinidi ATM client): mediator
+Wraps `vta-sdk`'s `DIDCommSession` (the [vendor] ATM client): mediator
 challenge-auth + message-pickup 3.0 + WebSocket live delivery. The mobile
 approver uses it to pull VTA-pushed step-up requests off its mediator.
 
@@ -444,7 +444,7 @@ A non-`did:key` signer is rejected before signing.
 - **Mediator delivery** wraps the inner authcrypt JWE in a
   `https://didcomm.org/routing/2.0/forward` message, anoncrypt'd to the mediator
   (`add_route`).
-- Mediator protocol itself: Affinidi ATM = challenge-auth + `messagepickup/3.0`
+- Mediator protocol itself: [vendor] ATM = challenge-auth + `messagepickup/3.0`
   + `coordinate-mediation/2.0` over WebSocket. Reuse a library; don't
   reimplement.
 

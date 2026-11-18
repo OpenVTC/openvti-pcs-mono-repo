@@ -4,7 +4,7 @@
 the mediator transport (M1–M4) have shipped as `vti-didcomm-js`, and
 both the REST auth path and the full browser → mediator → VTA →
 mediator → browser round-trip are validated against live infra
-(`glenn.storm.ws`, `webvh.storm.ws`, `mediator.vtc.storm.ws`). The
+(`alex.anon.org`, `webvh.anon.org`, `mediator.vtc.anon.org`). The
 sections below from "Why hand-rolled" onward are the original **B0
 design plan**, kept for context; where the as-built result deviates
 from the plan, the **As-built** section immediately below is
@@ -147,7 +147,7 @@ header canonicalization).
 ## File layout
 
 > **Moved (2026-05-21):** `vti-didcomm-js` now lives in its own
-> repository, [`OpenVTC/vti-didcomm-js`](https://github.com/OpenVTC/vti-didcomm-js),
+> repository, [`OpenVTC/vti-didcomm-js`](https://anonymized.example),
 > published to npm as `@openvtc/vti-didcomm-js`. It is no longer a
 > member of this Cargo/npm workspace. The cross-impl Rust round-trip
 > helper (`vti-didcomm-roundtrip-helper`) moved with it, to
@@ -347,7 +347,7 @@ receives + sends test messages.
   surfaces work against the same VTA.
 
 **Acceptance**: Demo's DIDComm tab successfully authenticates
-against `https://glenn.storm.ws` running with WebAuthn enabled.
+against `https://alex.anon.org` running with WebAuthn enabled.
 
 ### B6 — Plugin scaffold (separate workstream)
 
@@ -386,12 +386,12 @@ Before B1 starts, get explicit ack on:
    browsers via `@noble/curves` exclusively (slightly larger
    bundle, no Web Crypto fast path).
 
-4. **Mediator wire format** — Affinidi ATM uses DIDComm v2
+4. **Mediator wire format** — [vendor] ATM uses DIDComm v2
    routing/2.0 + messagepickup/3.0. Confirm we're targeting ATM
    compatibility specifically, not e.g. Hyperledger mediator.
 
 5. **Workspace location** — *Resolved (2026-05-21):* extracted to a
-   standalone repo, [`OpenVTC/vti-didcomm-js`](https://github.com/OpenVTC/vti-didcomm-js),
+   standalone repo, [`OpenVTC/vti-didcomm-js`](https://anonymized.example),
    published as `@openvtc/vti-didcomm-js`. It started life at the
    workspace root (peer of `vti-webauthn/`, `vta-sdk/`, etc.) but
    graduated to its own repo once it became a publishable,

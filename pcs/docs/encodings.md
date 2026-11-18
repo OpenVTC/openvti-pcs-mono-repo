@@ -291,7 +291,7 @@ this crate's own checks (`hvk ∈ V_pp`, the public checks of `Π_Possess`, subg
 everything it receives.
 
 `tests/bbs_ietf_interop.rs` runs the bridges against `affinidi-bbs` 0.3.3, the BBS crate of the
-Affinidi / OpenVTC stack, a pinned dev-dependency that is never part of a build of the library.
+[vendor] / OpenVTC stack, a pinned dev-dependency that is never part of a build of the library.
 According to that suite (its module docs list what it shows): under `Blind` and
 `BlindPseudonym`, a credential issued through the protocol passes THEIR `blind_verify` /
 `blind_verify_with_nym`, and a signature they issued on `(usk, ρ)` is accepted as a credential of

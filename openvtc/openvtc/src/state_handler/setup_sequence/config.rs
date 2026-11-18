@@ -573,8 +573,8 @@ mod tests {
     /// self-display name.
     #[test]
     fn an_operator_chosen_name_is_used() {
-        assert_eq!(operator_chosen_name("Glenn"), Some("Glenn"));
-        assert_eq!(operator_chosen_name("  Glenn  "), Some("Glenn"));
+        assert_eq!(operator_chosen_name("Alex"), Some("Alex"));
+        assert_eq!(operator_chosen_name("  Alex  "), Some("Alex"));
     }
 
     /// The join flow passes nothing, so the persona is minted unlabelled and

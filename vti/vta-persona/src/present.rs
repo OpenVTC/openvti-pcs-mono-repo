@@ -939,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn present_consumes_the_preview_so_the_two_calls_cannot_be_collapsed() {
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
         let pv = s
             .create_preview(
                 "ctx",
@@ -970,7 +970,7 @@ mod tests {
         // The structural property: present requires a token only create_preview
         // can mint, so there is no path that skips the summary.
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
         let err = s.present("01NEVERMINTED", None, false).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)));
     }
@@ -978,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_preview_is_refused_not_re_derived() {
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
         let mut pv = s
             .create_preview("ctx", "did:persona:a", "did:web:bar", None, None, None)
             .await
@@ -995,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn a_renderer_that_cannot_carry_a_predicate_fails_at_negotiation() {
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
 
         // jcard declares it carries no provenance; the preview must say so
         // rather than let the holder discover it from a verifier.
@@ -1032,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_claim_refuses_the_whole_disclosure() {
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
         let mut pv = s
             .create_preview("ctx", "did:persona:a", "did:web:bar", None, None, None)
             .await
@@ -1050,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn the_subject_is_pairwise_so_two_verifiers_cannot_join_a_holder() {
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
         let a = s
             .create_preview("ctx", "did:persona:a", "did:web:one", None, None, None)
             .await
@@ -1081,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn presenting_records_the_disclosure_and_marks_what_is_new() {
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
 
         let first = s
             .create_preview("ctx", "did:persona:a", "did:web:bar", None, None, None)
@@ -1121,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn requested_claims_are_a_ceiling_not_a_hint() {
         let (_d, s) = fresh().await;
-        bound(&s, "Stormer").await;
+        bound(&s, "Alexand").await;
         // Narrowing to a type the profile does not carry yields nothing rather
         // than quietly disclosing what it does carry.
         let err = s

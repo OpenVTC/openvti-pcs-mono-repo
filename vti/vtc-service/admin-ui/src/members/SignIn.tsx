@@ -130,8 +130,8 @@ function Join({
         <>
           Already a member? <a href="/members/">Sign in</a>. New to Verifiable
           Trust Communities? Start at{" "}
-          <a href="https://openvtc.net" target="_blank" rel="noopener noreferrer">
-            openvtc.net
+          <a href="https://anonymized.example" target="_blank" rel="noopener noreferrer">
+            anonymized.example
           </a>
           .
         </>,

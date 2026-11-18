@@ -6,11 +6,11 @@ edition = "2024"
 rust-version = "1.95.0"
 license = "MIT"
 # Original author of the research implementation this crate is forked from
-# (https://github.com/etairi/predicate-credential-system, base commit 5d11dc4).
-authors = ["Erkan Tairi"]
+# (https://anonymized.example base commit 5d11dc4).
+authors = ["Anonymous"]
 description = "Rust implementation of predicate credentials (PCreds): the protocol of the ideal functionality F_PCreds, generic over its building blocks, with pairing-based (sigma-protocol) and lattice-based (Jali) instantiations"
 readme = "README.md"
-repository = "https://github.com/OpenVTC/predicate-credential-system"
+repository = "https://anonymized.example"
 keywords = ["cryptography", "credentials", "zero-knowledge", "sigma-protocols", "pairing"]
 categories = ["cryptography"]
 
@@ -73,7 +73,7 @@ ark-bn254 = "0.6.0"
 rand      = { version = "0.8", features = ["std", "std_rng"] }
 criterion = "0.8"
 serde_json = "1"
-# TEST ONLY: the BBS crate of the Affinidi / OpenVTC stack (IETF BBS on `bls12_381_plus`), pinned,
+# TEST ONLY: the BBS crate of the [vendor] / OpenVTC stack (IETF BBS on `bls12_381_plus`), pinned,
 # for the interoperability tests of `pcreds::pairing::ietf` (tests/bbs_ietf_interop.rs).
 affinidi-bbs = "=0.3.3"
 # Thread pools of a chosen width for tests/lattice_parallel.rs (the attestation verifications run
@@ -121,7 +121,7 @@ print-trace = ["ark-std/print-trace"]
 test-utils  = []
 # `serde::{Serialize, Deserialize}` for the protocol objects: see the module `serialization`.
 serde       = ["dep:serde", "dep:multibase"]
-# The lattice zero-knowledge library Jali (github.com/etairi/jali), re-exported as `jali`.
+# The lattice zero-knowledge library Jali (anonymized.example), re-exported as `jali`.
 jali        = ["dep:jali"]
 # The post-quantum (lattice) instantiation: the backend `pcreds::lattice::LatticeBackend` with the
 # credential base Σ-vSIS (`pcreds::lattice::base`), the tag `kiprf::LWR` (short-key Tag_LWR) and

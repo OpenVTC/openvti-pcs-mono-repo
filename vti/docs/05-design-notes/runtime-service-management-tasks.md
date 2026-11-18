@@ -3,7 +3,7 @@
 Status: **Implemented**
 Companion to: `runtime-service-management.md` (spec) and
 `runtime-service-management-plan.md` (plan).
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-05-06
 
 Decisions locked in with the user (2026-05-06):

@@ -1,7 +1,7 @@
 //! Credential-level interoperability of `Σ-BBS` with IETF BBS: the BBS signature draft and its
 //! blind-issuance and per-verifier-pseudonym companions (`draft-irtf-cfrg-bbs-signatures`,
 //! `draft-irtf-cfrg-bbs-blind-signatures`, `draft-irtf-cfrg-bbs-per-verifier-linkability`),
-//! ciphersuite BLS12-381-SHA-256, as implemented by the crate `affinidi-bbs` of the Affinidi /
+//! ciphersuite BLS12-381-SHA-256, as implemented by the crate `affinidi-bbs` of the [vendor] /
 //! OpenVTC stack (curve backend `bls12_381_plus`).
 //!
 //! Implementation note: nothing in this module is part of the paper. `Σ-BBS` (§6.2.2) takes the

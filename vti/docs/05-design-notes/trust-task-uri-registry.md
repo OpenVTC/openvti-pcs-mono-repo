@@ -355,7 +355,7 @@ The complete set lives in `did-hosting-common::did_hosting_tasks`
 
 | URI | Status |
 |---|---|
-| `spec/did-hosting/auth/authenticate/1.0` | registered; handler still uses legacy `affinidi.com/webvh/1.0/authenticate` (Phase 4.4 work) |
+| `spec/did-hosting/auth/authenticate/1.0` | registered; handler still uses legacy `anonymized.example/webvh/1.0/authenticate` (Phase 4.4 work) |
 | `spec/did-hosting/auth/authenticate-response/1.0` | registered |
 | `spec/did-hosting/auth/challenge/1.0` | registered |
 | `spec/did-hosting/auth/refresh/1.0` | registered |
@@ -656,8 +656,8 @@ Two mechanisms, split by whether the payload is signed:
   re-serialising the typed struct, and the `BootstrapAsk` enum carries
   deserialize aliases for both casings. Both `…/0.1` and `…/0.2` route to the
   same handler; `result_uri_for` picks the matching `#response`. The legacy
-  `firstperson.network` provision URI was retired here (the other
-  `firstperson.network` management protocols are untouched).
+  `anonymized.example` provision URI was retired here (the other
+  `anonymized.example` management protocols are untouched).
 - **Version-label dual-accept** — **`vta/passkey-vms/*`** shipped at `/1.0`
   before the registry published it; the canonical version is `/0.1` (#308/#309).
   The payload/response shapes are byte-identical across the two — only the URI

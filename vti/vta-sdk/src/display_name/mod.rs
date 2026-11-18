@@ -260,10 +260,10 @@ impl NameBook {
 /// identifies it.
 ///
 /// A `did:webvh` / `did:web` carries its meaning in the *tail* — the domain
-/// and path, e.g. `…:webvh.storm.ws:glenn-vta` — and its noise in the middle:
+/// and path, e.g. `…:webvh.anon.org:glenn-vta` — and its noise in the middle:
 /// the SCID, a content hash. So the SCID is abbreviated and the path kept
 /// verbatim. A `did:webvh` host longer than 12 characters with subdomains
-/// keeps only its last two labels (`webvh.storm.ws` → `…storm.ws`): the path
+/// keeps only its last two labels (`webvh.anon.org` → `…anon.org`): the path
 /// is what tells two DIDs on one host apart, so the host yields first. That
 /// is the opposite of a CSS-style trailing ellipsis, which clips off
 /// precisely the informative half.
@@ -361,7 +361,7 @@ pub fn shorten_did_keep(did: &str, keep: usize) -> String {
 /// Hosts up to this many characters are shown whole.
 const HOST_KEEP: usize = 12;
 
-/// `webvh.storm.ws` → `…storm.ws`: a host longer than [`HOST_KEEP`] with
+/// `webvh.anon.org` → `…anon.org`: a host longer than [`HOST_KEEP`] with
 /// subdomains keeps its last two labels. A two-label host is left whole.
 fn shorten_host(host: &str) -> String {
     let labels: Vec<&str> = host.split('.').collect();
@@ -404,12 +404,12 @@ mod tests {
         // webvh: SCID abbreviated, a long host's subdomains dropped, the path
         // kept in full.
         (
-            "did:webvh:QmXkAbCdEfGhIjKlMnOp:webvh.storm.ws:glenn-vta",
-            "did:webvh:QmXkAbCdEf…:…storm.ws:glenn-vta",
+            "did:webvh:QmXkAbCdEfGhIjKlMnOp:webvh.anon.org:glenn-vta",
+            "did:webvh:QmXkAbCdEf…:…anon.org:glenn-vta",
         ),
         (
-            "did:webvh:QmXkAbCdEfGhIjKlMnOp:dids.firstperson.dev:stem-wall",
-            "did:webvh:QmXkAbCdEf…:…firstperson.dev:stem-wall",
+            "did:webvh:QmXkAbCdEfGhIjKlMnOp:dids.examplehost.dev:stem-wall",
+            "did:webvh:QmXkAbCdEf…:…examplehost.dev:stem-wall",
         ),
         // A short host, or one without subdomains, is kept whole.
         (
@@ -443,8 +443,8 @@ mod tests {
         // did:scid:vh:1 — the SCID like a webvh's, the `src` host like its
         // host, the path kept; a short one, and a bare one, as they are.
         (
-            "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp?src=webvh.storm.ws/glenn-vta",
-            "did:scid:vh:1:QmXkAbCdEf…?src=…storm.ws/glenn-vta",
+            "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp?src=webvh.anon.org/glenn-vta",
+            "did:scid:vh:1:QmXkAbCdEf…?src=…anon.org/glenn-vta",
         ),
         (
             "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp",

@@ -1,4 +1,4 @@
-# Affinidi Messaging Mediator
+# [vendor] Messaging Mediator
 
 [![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
@@ -9,7 +9,7 @@ the admin client and terminal console that operate it, and an in-process
 test mediator for other projects' integration tests.
 
 The client side (the ATM SDK, DIDComm, TSP, DID resolution) lives in
-[affinidi-tdk-rs](https://github.com/affinidi/affinidi-tdk-rs) and is taken
+[affinidi-tdk-rs](https://anonymized.example) and is taken
 from crates.io.
 
 ## Crates

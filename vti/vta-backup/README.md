@@ -30,5 +30,5 @@ Design: `docs/05-design-notes/backup-restore-portability.md`.
 `crate::{backup_bundle_store,backup_bundle_sweeper}`, so existing call sites are
 unchanged.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

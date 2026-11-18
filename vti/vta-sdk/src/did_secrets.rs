@@ -173,7 +173,7 @@ impl From<crate::client::GetKeySecretResponse> for SecretEntry {
 ///    admin `did:key` minted into the same context, or a free-text label
 ///    such as `"<did:key> signing key"`. Exclude it.
 ///
-/// Rule 3 is the fix for the storm.ws outage (PR #337): the previous
+/// Rule 3 is the fix for the anon.org outage (PR #337): the previous
 /// logic adopted the label as the kid whenever it merely *started with*
 /// `did:` or *contained* `#`, so a decorative label like
 /// `"did:key:z6Mkr4J… signing key"` silently overwrote the correct
@@ -307,7 +307,7 @@ mod tests {
     // here alongside it (moved from `client::secrets`, where the function
     // used to be, in the WS-setup follow-up).
     const KID_DID: &str =
-        "did:webvh:QmQjq4GHRH9fwSXCg4884kxpCMT5EUqHB9XY2U7aXisP8R:webvh.storm.ws:mediator-2";
+        "did:webvh:QmQjq4GHRH9fwSXCg4884kxpCMT5EUqHB9XY2U7aXisP8R:webvh.anon.org:mediator-2";
 
     #[test]
     fn keeps_store_vm_id_and_ignores_decorative_label() {
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn regression_did_prefixed_label_must_not_clobber_key_id() {
-        // Exact storm.ws failure mode: a `did:key:… key-agreement key`
+        // Exact anon.org failure mode: a `did:key:… key-agreement key`
         // label must NOT replace the correct `#key-1` kid. The old code
         // returned the label here, which is what bricked DIDComm unpack.
         let kid = select_secret_kid(

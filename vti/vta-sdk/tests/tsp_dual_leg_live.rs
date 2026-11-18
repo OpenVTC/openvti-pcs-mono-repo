@@ -51,7 +51,7 @@ use vta_sdk::session::{VtaEndpoint, resolve_vta_endpoint};
 /// that only ever proves one host was up.
 fn target_did() -> String {
     std::env::var("VTA_LIVE_TSP_DID").unwrap_or_else(|_| {
-        "did:webvh:QmWoJD2kpP6AJknNtj7UFERUstEen258ywj3ruHoh1ZAqr:webvh.storm.ws:glenn-vta"
+        "did:webvh:QmWoJD2kpP6AJknNtj7UFERUstEen258ywj3ruHoh1ZAqr:webvh.anon.org:alex-vta"
             .to_string()
     })
 }

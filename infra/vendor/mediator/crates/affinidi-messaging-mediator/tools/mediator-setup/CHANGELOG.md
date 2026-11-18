@@ -1,4 +1,4 @@
-# Affinidi Messaging Mediator Setup
+# [vendor] Messaging Mediator Setup
 
 ## Unreleased (0.1.38) — one secret in the secret store
 
@@ -382,8 +382,8 @@ VTA under test advertises no `#tsp` service. No behaviour change.
 - Bump `vta-sdk` `0.9.11` → `0.11`. Online VTA setup failed at the
   `provision-integration` step against current VTAs with
   `validation error: unsupported message type:
-  https://firstperson.network/protocols/provision-integration/1.0/provision-integration`
-  — that legacy FirstPerson-Network URI was retired upstream. `0.11`'s
+  https://anonymized.example`
+  — that legacy [network]-Network URI was retired upstream. `0.11`'s
   provision-client emits the canonical Trust Task URI
   (`https://trusttasks.org/spec/provision/integration/0.1`) the VTA accepts.
   No source changes in the tool; it builds and tests clean against `0.11`.

@@ -5,7 +5,7 @@
 //!
 //! - `@context` MUST be the W3C VC v2 context followed by the DTG v1 context
 //!   (`https://registry.trustoverip.org/dtg/context/v1`); further contexts may
-//!   follow. The retired `firstperson.network` context is refused, with no
+//!   follow. The retired `anonymized.example` context is refused, with no
 //!   alias.
 //! - `type` MUST include `VerifiableCredential`, `DTGCredential`, and exactly
 //!   one concrete subtype

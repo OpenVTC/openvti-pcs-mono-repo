@@ -2,7 +2,7 @@
 
 Two MCP servers, one VTA, two identities that cannot reach each other's data.
 
-- **[`vta-agent-memory`](https://github.com/OpenVTC/vta-agent-memory)** gives an
+- **[`vta-agent-memory`](https://anonymized.example)** gives an
   agent host durable memory — six `memory_*` tools plus a skill that says *when*
   to save and recall, four slash commands, and a `SessionStart` hook that loads
   memories before you type anything. It speaks exactly three Trust Tasks
@@ -85,7 +85,7 @@ chosen on one machine and means nothing on any other.
 memories never needs an operator credential:
 
 ```bash
-git clone https://github.com/OpenVTC/vta-agent-memory
+git clone https://anonymized.example
 cd vta-agent-memory && scripts/install.sh
 
 bin/vta-agent-memory init \

@@ -1,13 +1,13 @@
 # Open Verifiable Trust Community (OpenVTC) with First Person Protocol
 
-[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://github.com/OpenVTC/openvtc)
+[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://anonymized.example)
 
 A CLI tool for establishing verifiable trust relationships within developer
 communities using Decentralised Identifiers (DIDs) and Verifiable Credentials
 (VCs).
 
 OpenVTC implements open standards and protocols to enable _"Know Your Developer"_
-capabilities, following the [First Person Project white paper](https://www.firstperson.network/white-paper)
+capabilities, following the [First Person Project white paper](https://anonymized.example)
 for establishing and verifying **first-person trust relationships** using
 Personhood Credentials (PHCs) and Verifiable Relationship Credentials (VRCs).
 
@@ -20,9 +20,9 @@ Personhood Credentials (PHCs) and Verifiable Relationship Credentials (VRCs).
 
 The verifiable trust infrastructure that OpenVTC talks to (the VTA, key
 management, credential protocols and DIDComm services) lives in
-[verifiable-trust-infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure).
+[verifiable-trust-infrastructure](https://anonymized.example).
 The `did-git-sign` commit signer lives in
-[verifiable-git-infrastructure](https://github.com/OpenVTC/verifiable-git-infrastructure).
+[verifiable-git-infrastructure](https://anonymized.example).
 
 ## Table of Contents
 
@@ -274,7 +274,7 @@ cargo install did-git-sign
 ```
 
 `did-git-sign` is developed in
-[verifiable-git-infrastructure](https://github.com/OpenVTC/verifiable-git-infrastructure).
+[verifiable-git-infrastructure](https://anonymized.example).
 
 ## Contributing
 
@@ -286,7 +286,7 @@ for how releases are made.
 
 Additional resources to learn more about the Open Verifiable Trust Community (OpenVTC) Tool.
 
-- [First Person Project White Paper](https://www.firstperson.network/white-paper)
+- [First Person Project White Paper](https://anonymized.example)
 - [Command Reference](./docs/openvtc-tool-commands.md)
 - [Relationships and VRCs Guide](./docs/relationships-vrcs.md)
 - [Community Rooms](./docs/community-rooms.md)

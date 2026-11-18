@@ -886,7 +886,7 @@ impl TransportBoundVerifier {
             ));
         };
 
-        // ─── 2. Parse our typed Proof into the Affinidi DataIntegrityProof
+        // ─── 2. Parse our typed Proof into the [vendor] DataIntegrityProof
         //        via the crate's public helper (members-equivalent, just
         //        different serde casing).
         let proof_value = serde_json::to_value(proof)

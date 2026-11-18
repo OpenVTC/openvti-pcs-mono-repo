@@ -1,6 +1,6 @@
 # Security Notice
 
-To report a security issue, please email <security@affinidi.com> with a description
+To report a security issue, please email <security@example.org> with a description
 of the issue, the steps you took to create the issue, affected versions, and, if
 known, mitigations for the issue. Our vulnerability management team will respond
 within 5 working days of your email. If the issue is confirmed as a vulnerability,
@@ -17,5 +17,5 @@ crates on crates.io and images on `ghcr.io/affinidi/messaging-mediator`. A
 fix that needs a breaking change ships only in the next release, and the
 advisory says so. See [RELEASES.md](RELEASES.md#support) for the policy and
 the schedule table for each release's "Supported until" date. Versions up to `0.41.x` were released from
-[affinidi-tdk-rs](https://github.com/affinidi/affinidi-tdk-rs) and are not
+[affinidi-tdk-rs](https://anonymized.example) and are not
 patched from this repository.

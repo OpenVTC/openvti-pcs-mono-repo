@@ -235,7 +235,7 @@ mod operating_secrets_guard_tests {
     use affinidi_secrets_resolver::secrets::Secret;
 
     const MED: &str =
-        "did:webvh:QmQjq4GHRH9fwSXCg4884kxpCMT5EUqHB9XY2U7aXisP8R:webvh.storm.ws:mediator-2";
+        "did:webvh:QmQjq4GHRH9fwSXCg4884kxpCMT5EUqHB9XY2U7aXisP8R:webvh.anon.org:mediator-2";
 
     fn secret_with_id(id: &str) -> Secret {
         let mut s = Secret::generate_ed25519(None, None);

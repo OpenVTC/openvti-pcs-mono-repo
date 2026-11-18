@@ -9,7 +9,7 @@
 > `tsp-enablement.md` for the active plan.
 
 Status: **Research / decision record** — **superseded** (see banner above)
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-06-22
 
 ## 1. Why this note exists

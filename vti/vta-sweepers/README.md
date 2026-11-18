@@ -17,5 +17,5 @@ storage-thread sweep loop in `server.rs` and the other call sites are unchanged.
 The backup-bundle sweeper stays in `vta-service` for now: it is coupled to
 `backup_bundle_store`, part of the backup subsystem, and moves with that.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

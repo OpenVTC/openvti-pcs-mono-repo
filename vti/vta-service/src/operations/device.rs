@@ -1305,7 +1305,7 @@ mod tests {
         };
         e.device = Some(DeviceBinding {
             device_id: "dev-abc".into(),
-            display_name: "Glenn's iPhone".into(),
+            display_name: "Alex's iPhone".into(),
             platform: Some("iOS 19".into()),
             registered_at: "2026-06-02T00:00:00+00:00".into(),
             last_seen_at: Some("2026-06-02T00:00:00+00:00".into()),
@@ -1556,7 +1556,7 @@ mod tests {
             &audit,
             &device_auth(did),
             mobile_kind(),
-            "Glenn's iPhone".into(),
+            "Alex's iPhone".into(),
             Some("iOS 19".into()),
             Some("did:key:zHpke".into()),
             None,
@@ -1579,7 +1579,7 @@ mod tests {
             &audit,
             &device_auth(did),
             mobile_kind(),
-            "Glenn's iPhone".into(),
+            "Alex's iPhone".into(),
             None,
             Some("did:key:zHpke".into()),
             None,

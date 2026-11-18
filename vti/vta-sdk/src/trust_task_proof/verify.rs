@@ -21,7 +21,7 @@
 //! Any DID that can name a key. A proof's `verificationMethod` is resolved by
 //! [`TrustTaskVmResolver`](super::vm_resolver::TrustTaskVmResolver), which
 //! handles `did:key` locally and every other method through the configured DID
-//! cache — so `did:webvh:<scid>:example.com:glenn#key-0` signs a Trust Task
+//! cache — so `did:webvh:<scid>:example.com:alex#key-0` signs a Trust Task
 //! exactly as a `did:key` does.
 //!
 //! This used to be `did:key` only, on the reasoning that the mobile holder key
@@ -536,14 +536,14 @@ mod tests {
         let doc: TrustTask<Value> = serde_json::from_value(serde_json::json!({
             "id": "urn:uuid:11111111-1111-4111-8111-111111111111",
             "type": "https://trusttasks.org/spec/vta/contexts/create/1.0",
-            "issuer": "did:webvh:QmScid:example.com:glenn",
+            "issuer": "did:webvh:QmScid:example.com:alex",
             "recipient": "did:key:z6MkVta",
             "payload": {},
             "proof": {
                 "type": "DataIntegrityProof",
                 "cryptosuite": "eddsa-jcs-2022",
                 "proofPurpose": "assertionMethod",
-                "verificationMethod": "did:webvh:QmScid:example.com:glenn#key-0",
+                "verificationMethod": "did:webvh:QmScid:example.com:alex#key-0",
                 "created": "2026-08-29T00:00:00Z",
                 "proofValue": "z2aBcD"
             }

@@ -28,6 +28,6 @@ backend and, in a section of their own, its lattice backend (feature `lattice`).
   both sides.
 - [`katex-header.html`](./katex-header.html): loaded by rustdoc to render the formulas of the API
   documentation.
-- [Jali](https://github.com/etairi/jali): the standalone lattice zero-knowledge library that
+- [Jali](https://anonymized.example): the standalone lattice zero-knowledge library that
   implements the [LNP22 port design](./lnp22-rust-port-plan.md), with its own tests and
   documentation.

@@ -81,7 +81,7 @@ mod tests {
     use super::*;
 
     const DID: &str =
-        "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.storm.ws:first-vtc";
+        "did:webvh:QmXi1PZD4NEvcvjfErAzVoCGtBFEv7dhXZQJHvcFY4U83F:webvh.anon.org:first-vtc";
 
     /// Undo the half-block packing: the module grid the terminal draws.
     fn drawn_grid(lines: &[String]) -> Vec<Vec<bool>> {

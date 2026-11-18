@@ -17,5 +17,5 @@ without depending on `vta-service`. `vta-service` re-exports it as
 - `tee` — the TEE deployment config (`TeeConfig`, `TeeKmsConfig`, `TeeMode`,
   and the `AppConfig.tee` field). Off by default; the enclave binary enables it.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

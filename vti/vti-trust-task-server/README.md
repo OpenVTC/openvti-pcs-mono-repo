@@ -4,7 +4,7 @@ The receive side of a Trust Task service: what happens to a document between arr
 
 Used by:
 - **`vtc-service`**: the community's `POST /v1/trust-tasks`, and its DIDComm and TSP inbound paths.
-- **The VTN service**, in [OpenVTC/verifiable-trust-network](https://github.com/OpenVTC/verifiable-trust-network). It depends on this crate, never the reverse.
+- **The VTN service**, in [OpenVTC/verifiable-trust-network](https://anonymized.example). It depends on this crate, never the reverse.
 
 ## The pipeline
 

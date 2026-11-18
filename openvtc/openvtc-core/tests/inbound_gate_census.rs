@@ -257,7 +257,7 @@ fn every_trust_task_error_version_is_admitted() {
 }
 
 /// Types this client does not handle. The old regex admitted some of these
-/// (whole namespaces: `spec/vtc/*`, `openvtc/vtc/*`, any `linuxfoundation.org/
+/// (whole namespaces: `spec/vtc/*`, `openvtc/vtc/*`, any `anonymized.example/
 /// openvtc/*`) and the dispatcher then dropped them as unknown; the gate now
 /// drops them first, with the same outcome.
 fn not_routed() -> Vec<&'static str> {

@@ -10,7 +10,7 @@
 //! Both directions are the same operation over the same document shape, and the
 //! part worth not duplicating is [`vm_resolver`]. Resolving a
 //! `verificationMethod` looks trivial and is not: a DID document may name its
-//! methods absolutely (`did:webvh:…:glenn#key-0`) or relatively (`#key-0`),
+//! methods absolutely (`did:webvh:…:alex#key-0`) or relatively (`#key-0`),
 //! while a proof always names them absolutely, so a resolver that accepts only
 //! the spelling it expects rejects perfectly good documents from conforming
 //! peers. A second copy of that would drift, and drift here means a verifier

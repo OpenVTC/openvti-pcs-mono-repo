@@ -37,7 +37,7 @@ pub use stats::StatsStore;
 pub use streaming::StreamingStore;
 pub use v1_routing::V1RoutingKeyStore;
 
-/// Semantic storage interface for the Affinidi Messaging Mediator.
+/// Semantic storage interface for the [vendor] Messaging Mediator.
 ///
 /// Backends are held as `Arc<dyn MediatorStore>` and shared across all
 /// request handlers and background tasks. Every method takes `&self`;

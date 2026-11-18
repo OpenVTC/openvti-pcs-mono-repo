@@ -10,7 +10,7 @@ publish.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 license.workspace = true
-repository = "https://github.com/OpenVTC/verifiable-git-infrastructure"
+repository = "https://anonymized.example"
 
 [lib]
 name = "did_git_sign"

@@ -59,7 +59,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static MALLOC_CONF: &[u8; 63] =
     b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 
-/// Affinidi Messaging Mediator.
+/// [vendor] Messaging Mediator.
 ///
 /// Without a subcommand, runs the mediator HTTP server (the historical
 /// behaviour). Subcommands cover one-shot operator tasks that share

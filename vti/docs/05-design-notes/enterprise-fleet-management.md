@@ -1,7 +1,7 @@
 # Spec: Enterprise fleet management & owner/user separation of duty
 
 Status: **Proposed (design)**
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-06-23
 
 ## 1. Objective
@@ -203,7 +203,7 @@ loosen what an ancestor (ultimately the owner) set.
 That alone delivers separation of duty for a single shared or per-staff VTA.
 Everything below scales it to a fleet.
 
-## 5. Fleet management lives in the external Affinidi repo
+## 5. Fleet management lives in the external [vendor] repo
 
 The fleet-management product — **ENM**, the control plane that manages *N* VTAs
 at scale — is **not** part of this workspace. It is the proprietary,
@@ -279,7 +279,7 @@ doc §6.
 ## 9. Related docs
 
 * `affinidi-vti-enm/docs/design/fleet-management.md` — the ENM fleet-management
-  product design (external Affinidi repo).
+  product design (external [vendor] repo).
 * `docs/05-design-notes/runtime-service-management.md` — the admin-over-DIDComm
   pattern the fleet API fans out.
 * `docs/05-design-notes/hierarchical-contexts.md` — context tree + ancestry.

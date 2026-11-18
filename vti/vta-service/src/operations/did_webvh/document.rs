@@ -455,7 +455,7 @@ pub(crate) fn highest_key_fragment(document: &serde_json::Value) -> Option<u32> 
 ///   is the **x25519** one. One name, two keys, and no error anywhere;
 /// - the document's `keyAgreement` (`#key-2`) matches no record, so an authcrypt
 ///   message addressed to it unpacks to `No local secret matches any JWE
-///   recipient` — the storm.ws outage of PR #337, reached from the other side;
+///   recipient` — the anon.org outage of PR #337, reached from the other side;
 /// - `next_fragment_id` was stored as 2, so the first rotation allocates
 ///   `#key-2` over the id the key-agreement key already published under.
 ///

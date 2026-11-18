@@ -1,6 +1,6 @@
 # The VTC and the proof its tasks declare
 
-*Design note for [#1641](https://github.com/OpenVTC/verifiable-trust-infrastructure/issues/1641).
+*Design note for [#1641](https://anonymized.example).
 Covers the second of the two divergences the VTI specification's Appendix F.2
 records against `vtc-service` (trustoverip/dtgwg-vti-spec#35): the document
 dispatcher accepts a document with no `proof` for a task whose own

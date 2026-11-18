@@ -1,6 +1,6 @@
 # affinidi-messaging-mediator-config
 
-Raw TOML configuration **schema** for the Affinidi Messaging Mediator — the
+Raw TOML configuration **schema** for the [vendor] Messaging Mediator — the
 serde `*ConfigRaw` types that mirror `mediator.toml`.
 
 This crate is deliberately dependency-light (serde, toml, logging and

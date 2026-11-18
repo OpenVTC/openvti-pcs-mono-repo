@@ -198,7 +198,7 @@ call to action is **Join this community**, which opens the member
 portal's join page (`/members/?join`, see *Joining from the browser*
 under [Member portal](#member-portal)). Beside it is **Member sign-in**
 (`/members/`), and under both a link to
-[openvtc.net](https://openvtc.net), which explains what a community is
+[anonymized.example](https://anonymized.example), which explains what a community is
 and how to get a wallet. The page then outlines
 what the community runs on — git repositories governed across GitHub,
 Forgejo/Codeberg and Gitea, verifiable data rooms, access management,
@@ -1224,7 +1224,7 @@ or remove the member's others. Changes are audited as
 `MemberPasskeyChanged`.
 
 **The browser wallet** is the VTA Wallet extension
-([OpenVTC/vta-browser-plugin](https://github.com/OpenVTC/vta-browser-plugin)).
+([OpenVTC/vta-browser-plugin](https://anonymized.example)).
 It is not in a browser store yet; the sign-in page carries the manual
 install steps (build with Node 24+, load `packages/extension/dist/`
 unpacked in a Chromium browser, finish its setup) and opens them when

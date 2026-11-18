@@ -14,12 +14,12 @@ resolver = "3"
 version = "0.54.0"
 description = "Affinidi Messaging Mediator: a DIDComm v2 and TSP mediator, its admin client and console, and an in-process test mediator."
 edition = "2024"
-authors = ["Glenn Gore <glenn@affinidi.com>"]
+authors = ["Anonymous"]
 readme = "README.md"
-homepage = "https://affinidi.com/"
+homepage = "https://anonymized.example"
 license = "Apache-2.0"
 keywords = ["ssi", "affinidi", "didcomm", "mediator"]
-repository = "https://github.com/affinidi/affinidi-messaging-mediator"
+repository = "https://anonymized.example"
 publish = true
 rust-version = "1.95.0"
 
@@ -37,7 +37,7 @@ rust-version = "1.95.0"
 # requirements stay in each manifest, where scripts/release_lib.py moves them in
 # lockstep.
 
-# ── Affinidi TDK / VTI ───────────────────────────────────────────────────
+# ── [vendor] TDK / VTI ───────────────────────────────────────────────────
 # Each minimum is the highest any member needed; the member manifests say why
 # where it matters.
 # affinidi-data-integrity 0.8.7 / did-common 0.4.7 moved their public

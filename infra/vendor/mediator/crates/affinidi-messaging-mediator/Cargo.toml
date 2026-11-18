@@ -131,7 +131,7 @@ aws = ["dep:aws-config", "dep:aws-sdk-ssm", "dep:aws-sdk-s3"]
 trust-tasks-build = "0.1.2"
 
 [dependencies]
-# ── Affinidi Crates ──────────────────────────────────────────────────────
+# ── [vendor] Crates ──────────────────────────────────────────────────────
 # The minimum lives in the root Cargo.toml's [workspace.dependencies]: 0.46.3,
 # which collects a Trust Task reply sent over REST and asks for typed
 # `trust-task-error` refusals. A minimum below what the code uses would let

@@ -1,4 +1,4 @@
-//! Raw TOML configuration schema for the Affinidi Messaging Mediator.
+//! Raw TOML configuration schema for the [vendor] Messaging Mediator.
 //!
 //! This crate holds the on-disk shape of `mediator.toml` and the logic that
 //! needs nothing beyond it:

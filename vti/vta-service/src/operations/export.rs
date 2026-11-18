@@ -658,7 +658,7 @@ mod tests {
     /// `vta_sdk::did_secrets`, but this proves `build_did_secrets_bundle`
     /// feeds it the authoritative store `key_id` (and the label) so a
     /// refactor can't silently re-include non-VM secrets and re-brick the
-    /// mediator's exact-match recipient lookup (the storm.ws outage).
+    /// mediator's exact-match recipient lookup (the anon.org outage).
     #[tokio::test]
     async fn build_did_secrets_excludes_non_vm_admin_did_key() {
         let env = open_env().await;

@@ -20,5 +20,5 @@ crypto stack — never on `vta-service`. `vta-service` re-exports it as
 `crate::tee` (behind the `tee` feature), so `vta_service::tee::…` keeps
 resolving for `vta-enclave` and every existing call site.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

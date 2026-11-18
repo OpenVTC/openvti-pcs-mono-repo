@@ -6,7 +6,7 @@
 //! (`docs/05-design-notes/tsp-enablement.md` §3, §11). Services are matched on
 //! their `type` (`TSPTransport` / `DIDCommMessaging` / `VTARest`), **never** on
 //! the `#id` fragment, which is an arbitrary label (D9 — the OWF reference TSP
-//! impl names its id `#tsp-transport`, Affinidi names it `#tsp`; same type). If
+//! impl names its id `#tsp-transport`, [vendor] names it `#tsp`; same type). If
 //! the advertised sets don't intersect, [`select_protocol`] returns
 //! [`VtaError::NoMatchingProtocol`] carrying both sides' advertised sets.
 //!

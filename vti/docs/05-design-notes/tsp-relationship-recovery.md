@@ -39,7 +39,7 @@ is ephemeral:
 > `InMemoryRelationshipStore` … is **wiped on process restart**
 > — `protocols/tsp.rs` L284.
 
-The concrete failure we hit: a client held `Bidirectional` with `glenn-vta`,
+The concrete failure we hit: a client held `Bidirectional` with `alex-vta`,
 the VTA restarted onto Rev 3 with an empty store, and every subsequent
 application message from the client was dropped at the gate. The client never
 learns why — §7.2.2's silent drop means it just sees a `TspPingSession::ping`

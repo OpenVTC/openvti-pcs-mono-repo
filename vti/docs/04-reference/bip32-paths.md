@@ -3,7 +3,7 @@
 The VTA derives all cryptographic keys from a single BIP-39 mnemonic seed using
 [BIP-32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki)
 hierarchical deterministic derivation. All paths live under the `m/26'` purpose
-level, which is reserved for the First Person Network.
+level, which is reserved for the [network].
 
 ## Path Hierarchy
 

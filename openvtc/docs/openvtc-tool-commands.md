@@ -183,7 +183,7 @@ optional when the account holds exactly one active membership.
 
 `repo sign` needs the `did-git-sign` binary on `PATH` and the VTA reachable.
 Install the signer with `cargo install did-git-sign`; it is developed in
-[verifiable-git-infrastructure](https://github.com/OpenVTC/verifiable-git-infrastructure).
+[verifiable-git-infrastructure](https://anonymized.example).
 
 ## Profiles
 

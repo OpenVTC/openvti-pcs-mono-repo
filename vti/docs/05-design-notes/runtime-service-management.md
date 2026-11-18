@@ -1,7 +1,7 @@
 # Spec: Runtime service-endpoint management
 
 Status: **Implemented**
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-05-06
 
 ## 1. Objective

@@ -1,7 +1,7 @@
 # Signing from the admin console
 
-*Design note for the successor to [#1641](https://github.com/OpenVTC/verifiable-trust-infrastructure/issues/1641).
-[#1681](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1681) moved
+*Design note for the successor to [#1641](https://anonymized.example).
+[#1681](https://anonymized.example) moved
 the first four admin member verbs onto the VTC's signed-document dispatcher and
 could not retire their bearer routes, because the admin console cannot author a
 signed document. `vtc-trust-task-proof-enforcement.md` §6b states that as the

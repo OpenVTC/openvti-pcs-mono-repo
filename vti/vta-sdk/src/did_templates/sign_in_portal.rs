@@ -96,8 +96,8 @@ mod tests {
     #[test]
     fn the_endpoint_is_the_login_page_on_the_url_origin() {
         assert_eq!(
-            sign_in_portal_endpoint("https://webvh.storm.ws").unwrap(),
-            "https://webvh.storm.ws/login"
+            sign_in_portal_endpoint("https://webvh.anon.org").unwrap(),
+            "https://webvh.anon.org/login"
         );
         assert_eq!(
             sign_in_portal_endpoint("https://Host.Example.com:8443/some/path/").unwrap(),
@@ -124,13 +124,13 @@ mod tests {
 
     #[test]
     fn the_entry_is_the_contract_shape() {
-        let s = sign_in_portal_service("{DID}", "https://webvh.storm.ws").unwrap();
+        let s = sign_in_portal_service("{DID}", "https://webvh.anon.org").unwrap();
         assert_eq!(
             s,
             json!({
                 "id": "{DID}#sign-in-portal",
                 "type": "SignInPortal",
-                "serviceEndpoint": "https://webvh.storm.ws/login",
+                "serviceEndpoint": "https://webvh.anon.org/login",
             })
         );
     }

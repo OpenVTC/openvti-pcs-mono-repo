@@ -19,7 +19,7 @@ This runbook is the canonical ordering.
 |---|---|---|
 | **TT-RS** | `dtgwg-trust-tasks-tf` | New cryptosuite-free path (no work after Phase 0.1 drop). |
 | **VTA** | `verifiable-trust-infrastructure` (workspace) | Wire surface migrates to trust-tasks; passkey-login surface added. |
-| **WEBVH** | `affinidi-webvh-service` | Legacy `affinidi.com/webvh/1.0/*` URLs replaced by canonical `trusttasks.org/did-hosting/*`; `swap-did` added. |
+| **WEBVH** | `affinidi-webvh-service` | Legacy `anonymized.example/webvh/1.0/*` URLs replaced by canonical `trusttasks.org/did-hosting/*`; `swap-did` added. |
 | **PLUGIN** | `pnm-browser-plugin` | New trust-task client; passkey login flow; session-key DPoP signing. |
 
 ## Versioning convention
@@ -144,7 +144,7 @@ shim.
    - VTA — deletes legacy /auth/*, /keys/*, /contexts/* etc. REST routes;
            deletes legacy DIDComm protocol message types.
    - WEBVH — deletes legacy /api/auth/, /api/auth/refresh routes;
-             deletes affinidi.com/webvh/1.0/* DIDComm constants.
+             deletes anonymized.example/webvh/1.0/* DIDComm constants.
    - SDK — removes legacy method signatures.
    - PLUGIN — removes legacy wire support.
 

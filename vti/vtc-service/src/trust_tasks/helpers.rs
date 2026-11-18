@@ -232,14 +232,14 @@ mod tests {
         let resolver_fail_doc: TrustTask<Value> = serde_json::from_value(json!({
             "id": "urn:uuid:00000000-0000-4000-8000-000000000020",
             "type": "https://trusttasks.org/spec/acl/list/0.3",
-            "issuer": "did:webvh:QmScid:example.com:glenn",
+            "issuer": "did:webvh:QmScid:example.com:alex",
             "recipient": "did:webvh:vtc.example.com:abc",
             "payload": {},
             "proof": {
                 "type": "DataIntegrityProof",
                 "cryptosuite": "eddsa-jcs-2022",
                 "proofPurpose": "assertionMethod",
-                "verificationMethod": "did:webvh:QmScid:example.com:glenn#key-0",
+                "verificationMethod": "did:webvh:QmScid:example.com:alex#key-0",
                 "created": "2026-01-01T00:00:00Z",
                 "proofValue": "z2aBcD"
             }

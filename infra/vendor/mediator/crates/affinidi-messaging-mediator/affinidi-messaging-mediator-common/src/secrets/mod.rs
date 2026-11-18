@@ -1,4 +1,4 @@
-//! Unified secret storage for the Affinidi Messaging Mediator.
+//! Unified secret storage for the [vendor] Messaging Mediator.
 //!
 //! Two orthogonal layers:
 //!

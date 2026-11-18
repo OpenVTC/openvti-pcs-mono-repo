@@ -168,7 +168,7 @@ pub async fn register_did_with_server(
     //    or new content (no empty-404 window).
     //
     //    `WebVHURL::parse_did_url` returns `path` with leading and
-    //    trailing slashes (`/glenn-vta/`). The host expects the path
+    //    trailing slashes (`/alex-vta/`). The host expects the path
     //    without surrounding slashes.
     let parsed = WebVHURL::parse_did_url(&params.did).map_err(|e| {
         RegisterDidWithServerError::DidUrlParse {

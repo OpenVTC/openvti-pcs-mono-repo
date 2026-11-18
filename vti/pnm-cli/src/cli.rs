@@ -424,7 +424,7 @@ pub(crate) enum Commands {
         command: BoardCommands,
     },
 
-    /// Operate an Affinidi messaging mediator as a DID this VTA manages.
+    /// Operate an [vendor] messaging mediator as a DID this VTA manages.
     #[command(name = "messaging")]
     Messaging {
         #[command(subcommand)]

@@ -22,7 +22,7 @@ export function shorten(value: string, head = 8, tail = 4): string {
  * Abbreviate a DID for table display by shrinking the long opaque middle
  * segment — the `did:webvh` SCID (a content hash) or a `did:key` multibase —
  * while keeping the method prefix and, crucially, the **full tail** (the domain
- * and human-readable path, e.g. `…:webvh.storm.ws:glenn-vta`), which is the part
+ * and human-readable path, e.g. `…:webvh.anon.org:alex-vta`), which is the part
  * that actually identifies the agent. Unlike a CSS `text-overflow` ellipsis
  * (which clips the *end*), this keeps the end visible. The full DID stays
  * available via a `title` tooltip / copy.
@@ -45,21 +45,21 @@ export function shorten(value: string, head = 8, tail = 4): string {
  * implementation and check both:
  *
  *   "alice"                                        -> "alice"
- *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:webvh.storm.ws:glenn-vta"
- *                          -> "did:webvh:QmXkAbCdEf…:…storm.ws:glenn-vta"
+ *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:webvh.anon.org:alex-vta"
+ *                          -> "did:webvh:QmXkAbCdEf…:…anon.org:alex-vta"
  *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:dids.firstperson.dev:stem-wall"
  *                          -> "did:webvh:QmXkAbCdEf…:…firstperson.dev:stem-wall"
  *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:dids.ic3.dev:fruit-feel"
  *                          -> "did:webvh:QmXkAbCdEf…:dids.ic3.dev:fruit-feel"
- *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:firstperson.network:a:b"
- *                          -> "did:webvh:QmXkAbCdEf…:firstperson.network:a:b"
+ *   "did:webvh:QmXkAbCdEfGhIjKlMnOp:anonymized.example:a:b"
+ *                          -> "did:webvh:QmXkAbCdEf…:anonymized.example:a:b"
  *   "did:web:QmXkAbCdEfGhIjKlMnOp:example.com"
  *                                    -> "did:web:QmXkAbCdEf…:example.com"
  *   "did:webvh:Qm123:example.com"           -> "did:webvh:Qm123:example.com"
  *   "did:key:z6MkfrQjWzPQrTuVwXyZaBcDeFgHiJkLmNoPqRsTuVwXyZ4rT"
  *                                       -> "did:key:z6MkfrQjWz…XyZ4rT"
- *   "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp?src=webvh.storm.ws/glenn-vta"
- *                       -> "did:scid:vh:1:QmXkAbCdEf…?src=…storm.ws/glenn-vta"
+ *   "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp?src=webvh.anon.org/alex-vta"
+ *                       -> "did:scid:vh:1:QmXkAbCdEf…?src=…anon.org/alex-vta"
  *   "did:scid:vh:1:QmXkAbCdEfGhIjKlMnOp"   -> "did:scid:vh:1:QmXkAbCdEf…"
  *   "did:scid:vh:1:Qm123?src=example.com"  -> "did:scid:vh:1:Qm123?src=example.com"
  *   "did:key:z6MkfrQjWz"                       -> "did:key:z6MkfrQjWz"
@@ -102,7 +102,7 @@ function shortenDidKeep(did: string, keep: number): string {
       parts[2] = `${scid.slice(0, keep)}…`;
     }
     // The path tells two DIDs on one host apart, so a long host gives up its
-    // subdomains first (`webvh.storm.ws` → `…storm.ws`).
+    // subdomains first (`webvh.anon.org` → `…anon.org`).
     if (parts[1] === "webvh") parts[3] = shortenHost(parts[3] ?? "");
     return parts.join(":");
   }

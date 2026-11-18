@@ -411,9 +411,9 @@ mod tsp_relay_tests {
     /// This mediator.
     const US: &str = "did:web:us.example";
     /// The mediator named in the production failure, verbatim.
-    const PEER_MEDIATOR: &str = "did:webvh:QmbHZC8JUpUD1XrdEcNiAPTxke4WpDyBPjjigPpEwYZiq5:dids.firstperson.dev:firstperson-mediator";
+    const PEER_MEDIATOR: &str = "did:webvh:QmbHZC8JUpUD1XrdEcNiAPTxke4WpDyBPjjigPpEwYZiq5:dids.example.dev:firstperson-mediator";
     /// The transport URL that peer mediator's own document publishes.
-    const PEER_URL: &str = "https://mediator.firstperson.dev/mediator/v1";
+    const PEER_URL: &str = "https://mediator.example.dev/mediator/v1";
 
     fn authorities(entries: &[(&str, u16)]) -> HashSet<(String, u16)> {
         entries

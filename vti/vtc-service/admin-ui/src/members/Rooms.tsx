@@ -40,7 +40,7 @@ import { messageOf } from "@/lib/messages";
 
 /**
  * Who wrote something, short enough for a list row: "you", a `did:webvh`'s last path
- * segment (`…:glenn-vta` → `glenn-vta`), else the abbreviated DID. The full DID stays in
+ * segment (`…:alex-vta` → `alex-vta`), else the abbreviated DID. The full DID stays in
  * the row's `title`.
  */
 export function authorName(did: string, me?: string): string {

@@ -1,4 +1,4 @@
-# Affinidi Messaging Mediator Common
+# [vendor] Messaging Mediator Common
 
 ## Unreleased (0.17.7) — `types` moves to `affinidi-messaging-mediator-types`
 

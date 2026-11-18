@@ -85,7 +85,7 @@ DIDComm. Nothing downgrades past what a peer advertises, by design.
 
 **R defaults to one mediator for every transport.** That is D8's shape, what
 every existing config means, and what most deployments want: the published
-Affinidi mediator is one dual-protocol node. Splitting R is opt-in.
+[vendor] mediator is one dual-protocol node. Splitting R is opt-in.
 
 With this, the wizard rule becomes **"TSP requires a mediator that carries
 TSP"** — DIDComm stops being load-bearing for a TSP-only VTA.
@@ -240,7 +240,7 @@ one transport, exactly as it does now.
 
 ## 9. Open questions (verify before building §8.4–§8.6)
 
-1. **Does the Affinidi mediator require per-protocol registration or ACL?**
+1. **Does the [vendor] mediator require per-protocol registration or ACL?**
    `setup_acl` is DIDComm-shaped (a per-DID allow-all ACL provisioned after the
    DIDComm connect). If TSP delivery keys off the same account this is free; if
    not, TSP-only registration needs its own path.

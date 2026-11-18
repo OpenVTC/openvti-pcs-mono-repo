@@ -262,7 +262,7 @@ pub enum DidCommand {
     ListDids,
     /// Remove a DID and all its data from the store
     RemoveDid {
-        /// DID path/mnemonic to remove (e.g. "glenn", ".well-known")
+        /// DID path/mnemonic to remove (e.g. "alex", ".well-known")
         #[arg(long, visible_alias = "mnemonic")]
         path: String,
     },

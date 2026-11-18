@@ -1,7 +1,7 @@
 # affinidi-messaging-mediator
 
-[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://github.com/affinidi/affinidi-messaging-mediator/tree/main/crates/affinidi-messaging-mediator)
-[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/affinidi/affinidi-messaging-mediator/blob/main/LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.95.0%2B-blue.svg?maxAge=3600)](https://anonymized.example)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://anonymized.example)
 
 A mediator and relay service supporting
 [DIDComm v2](https://identity.foundation/didcomm-messaging/spec/) and
@@ -172,7 +172,7 @@ only if its DID document advertises a `TSPTransport` service:
   warning at startup if TSP is enabled and the service is missing.
 
 For TSP usage (sending, receiving, relationships, WebSocket, auth), see the
-[TSP cookbook](https://github.com/affinidi/affinidi-tdk-rs/blob/main/docs/tsp/cookbook.md).
+[TSP cookbook](https://anonymized.example).
 
 ### Storage backend (pick one)
 
@@ -306,7 +306,7 @@ and HA.
 
 ### VTA integration
 
-With a [Verifiable Trust Agent](https://github.com/OpenVTC/verifiable-trust-infrastructure),
+With a [Verifiable Trust Agent](https://anonymized.example),
 the VTA manages the mediator's DID and operating keys. The wizard's
 **Online** flow, or the **sealed handoff** for air-gapped hosts, writes the
 admin credential into your secret backend. See
@@ -423,7 +423,7 @@ See [affinidi-messaging-mediator-tui](../affinidi-messaging-mediator-tui/).
 For headless administration from code, use
 [`affinidi-messaging-mediator-admin`](../affinidi-messaging-mediator-admin/).
 The interactive `mediator_administration` tool and more client examples live
-in [affinidi-messaging-helpers](https://github.com/affinidi/affinidi-tdk-rs/tree/main/crates/messaging/affinidi-messaging-helpers)
+in [affinidi-messaging-helpers](https://anonymized.example)
 in affinidi-tdk-rs (`cargo run --bin mediator_administration` from that
 repository).
 
@@ -438,7 +438,7 @@ repository).
 
 ## Related crates
 
-All in [affinidi-tdk-rs](https://github.com/affinidi/affinidi-tdk-rs):
+All in [affinidi-tdk-rs](https://anonymized.example):
 
 - [`affinidi-messaging-sdk`](https://crates.io/crates/affinidi-messaging-sdk): client SDK
 - [`affinidi-messaging-didcomm`](https://crates.io/crates/affinidi-messaging-didcomm): DIDComm protocol
@@ -448,4 +448,4 @@ All in [affinidi-tdk-rs](https://github.com/affinidi/affinidi-tdk-rs):
 
 ## License
 
-[Apache-2.0](https://github.com/affinidi/affinidi-messaging-mediator/blob/main/LICENSE)
+[Apache-2.0](https://anonymized.example)

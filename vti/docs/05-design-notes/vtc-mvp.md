@@ -3,7 +3,7 @@
 Status: **Reference** — Phases 0–5 shipped. Section bodies retain
 "in Phase X this happens" wording for context; the actual code +
 operator behaviour is what's documented in `docs/03-vtc/`.
-Owner: Glenn Gore
+Owner: (anonymized)
 Last updated: 2026-05-11 (spec)
 Last reconciled: 2026-05-15 (this header)
 
@@ -34,11 +34,11 @@ Internal: `vti-common`, `vta-sdk` (REST + DIDComm + sealed-transfer),
 
 New external:
 
-- [`dtg-credentials`](https://github.com/OpenVTC/dtg-credentials) —
+- [`dtg-credentials`](https://anonymized.example) —
   the closed credential catalog.
-- [`affinidi-trust-registry-rs`](https://github.com/affinidi/affinidi-trust-registry-rs)
+- [`affinidi-trust-registry-rs`](https://anonymized.example)
   — TRQP v2.0 client.
-- [`affinidi-status-list`](https://github.com/affinidi/affinidi-tdk-rs)
+- [`affinidi-status-list`](https://anonymized.example)
   — W3C Bitstring Status List v1.0.
 - `regorus` — embedded Rego engine.
 - `webauthn-rs` — passkey enrolment.
@@ -1612,9 +1612,9 @@ validate at implementation:
   DID is minted from its VTA.
 - `docs/05-design-notes/pnm-setup-deferred-vta-did.md` — deferred-
   DID pattern, useful reference for the VTC install flow.
-- [`openvtc/dtg-credentials`](https://github.com/OpenVTC/dtg-credentials)
+- [`openvtc/dtg-credentials`](https://anonymized.example)
   — the credential catalog (§6).
-- [`affinidi/affinidi-trust-registry-rs`](https://github.com/affinidi/affinidi-trust-registry-rs)
+- [`affinidi/affinidi-trust-registry-rs`](https://anonymized.example)
   — TRQP v2.0 server + client (§8).
-- [`affinidi/affinidi-tdk-rs`](https://github.com/affinidi/affinidi-tdk-rs)
+- [`affinidi/affinidi-tdk-rs`](https://anonymized.example)
   — `affinidi-status-list`, `affinidi-vc`, `affinidi-data-integrity`.

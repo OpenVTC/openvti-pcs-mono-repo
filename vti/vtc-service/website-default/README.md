@@ -12,7 +12,7 @@ shown.
 Around that live data it introduces a VTC to a visitor: a "Join this
 community" button to the member portal's join page (`/members/?join`, where
 the browser wallet sends a join request an administrator reviews), a link to
-<https://openvtc.net>, member sign-in at `/members/` (the member portal), the community's capabilities (git repositories governed across
+<https://anonymized.example>, member sign-in at `/members/` (the member portal), the community's capabilities (git repositories governed across
 GitHub, Forgejo, Codeberg and Gitea; verifiable data rooms; access
 management; membership credentials; cross-community recognition), and a
 quieter link to the operator console at `/admin/`.

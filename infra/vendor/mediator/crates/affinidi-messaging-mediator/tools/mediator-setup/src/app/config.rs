@@ -363,8 +363,8 @@ pub struct WizardConfig {
     pub cors_mode: String,
     /// Comma-separated CORS origin allowlist, meaningful only when
     /// `cors_mode == "list"`. Each entry is an exact, scheme-qualified
-    /// origin (`https://app.affinidi.com`) or a leftmost-label sub-domain
-    /// wildcard (`https://*.affinidi.com`). Validated by
+    /// origin (`https://anonymized.example`) or a leftmost-label sub-domain
+    /// wildcard (`https://*.anonymized.example`). Validated by
     /// [`validate_cors_domains`](super::validate::validate_cors_domains) before the wizard accepts it.
     pub cors_domains: String,
     pub database_url: String,

@@ -1389,7 +1389,7 @@ pub mod test_support {
         pub did: String,
         /// The multibase private key, for signing Trust Task documents.
         pub secret_multibase: String,
-        /// The Affinidi secret, for signing credentials.
+        /// The [vendor] secret, for signing credentials.
         pub secret: affinidi_tdk::secrets_resolver::secrets::Secret,
     }
 

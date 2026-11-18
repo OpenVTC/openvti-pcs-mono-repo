@@ -1,4 +1,4 @@
-# Affinidi Messaging Mediator Config
+# [vendor] Messaging Mediator Config
 
 ## Unreleased (0.5.0) — two retired security keys
 

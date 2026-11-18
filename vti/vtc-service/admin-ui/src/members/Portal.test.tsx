@@ -109,7 +109,7 @@ describe("member portal", () => {
     expect(legacy.contains(guide)).toBe(true);
     expect(
       screen.getByRole("link", { name: /openvtc\/vta-browser-plugin/i }).getAttribute("href"),
-    ).toBe("https://github.com/OpenVTC/vta-browser-plugin");
+    ).toBe("https://anonymized.example");
     // The same footer as the console's login page: a way back home.
     expect(
       screen.getByRole("link", { name: /back to acme guild/i }).getAttribute("href"),
@@ -260,13 +260,13 @@ describe("member portal", () => {
 
   it("signs in as an identity the member picks from the wallet", async () => {
     const vtc = "did:webvh:x:acme";
-    const glenn = "did:webvh:QmcGecpMypWjgCM8sGA9Fvi8guAy2SNHU661XBNbrFHJgA:webvh.storm.ws:glenn-vta";
-    const donald = "did:webvh:QmV9swrHHt2XoMKpqL6XJVCvQDwNvvDyKPHCRJZurkSXjd:webvh.storm.ws:donald-duck";
+    const alex = "did:webvh:QmcGecpMypWjgCM8sGA9Fvi8guAy2SNHU661XBNbrFHJgA:webvh.anon.org:alex-vta";
+    const donald = "did:webvh:QmV9swrHHt2XoMKpqL6XJVCvQDwNvvDyKPHCRJZurkSXjd:webvh.anon.org:donald-duck";
     const walletProfile = vi.fn();
     const vaultList = vi.fn(async () => ({
       truncated: false,
       entries: [
-        { id: "a", label: "GG VTA", principalDid: glenn },
+        { id: "a", label: "GG VTA", principalDid: alex },
         { id: "b", label: "Donald", principalDid: donald },
         { id: "c", label: "No DID" },
       ],
@@ -296,7 +296,7 @@ describe("member portal", () => {
     // Label and abbreviated DID; the entry with no DID is not offered.
     const pick = await screen.findByRole("button", { name: /donald/i });
     expect(pick.getAttribute("title")).toBe(donald);
-    expect(screen.getByText("did:webvh:QmV9swrHHt…:…storm.ws:donald-duck")).toBeTruthy();
+    expect(screen.getByText("did:webvh:QmV9swrHHt…:…anon.org:donald-duck")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /no did/i })).toBeNull();
     expect(vaultList).toHaveBeenCalledWith({ targetDid: vtc, secretKind: "didSelfIssued" });
 
@@ -309,7 +309,7 @@ describe("member portal", () => {
   });
 
   it("offers a different identity after a refusal", async () => {
-    const persona = "did:webvh:QmcGecpMypWjgCM8sGA9Fvi8guAy2SNHU661XBNbrFHJgA:webvh.storm.ws:glenn-vta";
+    const persona = "did:webvh:QmcGecpMypWjgCM8sGA9Fvi8guAy2SNHU661XBNbrFHJgA:webvh.anon.org:alex-vta";
     (window as { vtaWallet?: unknown }).vtaWallet = {
       walletProfile: vi.fn(async () => ({ did: persona, entryId: "a", bound: false })),
       proxyLogin: vi.fn(async () => ({

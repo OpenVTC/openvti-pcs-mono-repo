@@ -4,7 +4,7 @@
 default of `vtc-service`), §3.1 landed in vta-sdk 0.20 (#765), and the §11
 CLAUDE.md flip landed with this note. The current state is in the operator guide,
 [`../02-vta/tsp.md`](../02-vta/tsp.md) (*Current status*). Originally a draft for review.
-**Owner:** Glenn Gore
+**Owner:** (anonymized)
 **Created:** 2026-06-25
 **Supersedes the decision in:** `docs/05-design-notes/messaging-routing-and-tsp.md`
 (that note deferred TSP because the mediator lacked TSP routing/bridging and
@@ -133,7 +133,7 @@ mandate. `affinidi-tsp` follows it (`TSP_SERVICE_TYPE = "TSPTransport"`). **We u
 `TSPTransport`.**
 
 Two facts from the reference code:
-- The reference uses `id` fragment **`#tsp-transport`**, Affinidi uses **`#tsp`** —
+- The reference uses `id` fragment **`#tsp-transport`**, [vendor] uses **`#tsp`** —
   same type, different id. Concrete proof that **the `#id` is arbitrary and
   discovery must key off `type`** (D9).
 - The reference `serviceEndpoint` is a **direct transport URL** (Direct Mode,
@@ -142,7 +142,7 @@ Two facts from the reference code:
   field. A bare `affinidi-tsp::DidVidResolver` would `Url::parse` the value, so
   VTI's capability/routing layer must branch on the value: **DID ⇒ Routed-Mode
   intermediary (resolve the mediator's own `TSPTransport` URL); URL ⇒ Direct
-  Mode.** Confirm the Affinidi *mediator*'s recipient-intermediary discovery
+  Mode.** Confirm the [vendor] *mediator*'s recipient-intermediary discovery
   expects a DID here before finalizing the consumer-doc shape (open question §14).
 
 ---

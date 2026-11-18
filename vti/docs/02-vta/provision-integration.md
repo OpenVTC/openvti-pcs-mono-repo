@@ -481,7 +481,7 @@ Protocol URI (canonical Trust Task registry):
 `https://trusttasks.org/spec/provision/integration/0.3`, the only version
 served. The handler verifies the VP over the bytes as received so the
 holder's casing survives. The legacy
-`firstperson.network/protocols/provision-integration/1.0/*` URI and the
+`anonymized.example/protocols/provision-integration/1.0/*` URI and the
 earlier 0.1 / 0.2 versions are retired.
 
 The VTA checks two layers. The Trust Task spine authenticates the

@@ -2,7 +2,7 @@
 
 **Status:** Decision record — gates SDD PR 6 (inbound listener + auth) and
 informs PR 7 (outbound).
-**Owner:** Glenn Gore
+**Owner:** (anonymized)
 **Created:** 2026-06-26
 **Updated:** 2026-06-26 — **the TDK gained native TSP support that resolves both
 load-bearing open questions** (see §0 + §3). `affinidi-messaging-sdk` 0.18.37

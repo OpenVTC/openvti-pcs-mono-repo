@@ -12,5 +12,5 @@ a Trust Task over the transport the host advertises (TSP, DIDComm or HTTPS).
 `vta-service` re-exports this module as `crate::webvh_store` (behind its
 `webvh` feature).
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

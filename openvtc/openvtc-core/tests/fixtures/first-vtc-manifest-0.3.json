@@ -1,9 +1,9 @@
 {
   "id": "urn:uuid:958a3d11-9f82-47a2-a21e-0147e41cb69b",
   "issuedAt": "2026-10-06T04:27:37Z",
-  "issuer": "did:webvh:Qme5ThEEr1qRLRHYMrcrmjecG3znC8FBPEoswuSjebFkhx:webvh.storm.ws:first-vtc",
+  "issuer": "did:webvh:Qme5ThEEr1qRLRHYMrcrmjecG3znC8FBPEoswuSjebFkhx:webvh.anon.org:first-vtc",
   "payload": {
-    "communityDid": "did:webvh:Qme5ThEEr1qRLRHYMrcrmjecG3znC8FBPEoswuSjebFkhx:webvh.storm.ws:first-vtc",
+    "communityDid": "did:webvh:Qme5ThEEr1qRLRHYMrcrmjecG3znC8FBPEoswuSjebFkhx:webvh.anon.org:first-vtc",
     "criteria": [
       {
         "admission": "automatic",
@@ -90,7 +90,7 @@
     "proofPurpose": "authentication",
     "proofValue": "z3RjZ1gR3Pe8z9ZNQw7DG4faNNg6yqvxjWBfZp82coZbCK7RiiWmZ2oHWEqCHZcKHBTqx8x5NjCR29qHywhffHt6Y",
     "type": "DataIntegrityProof",
-    "verificationMethod": "did:webvh:Qme5ThEEr1qRLRHYMrcrmjecG3znC8FBPEoswuSjebFkhx:webvh.storm.ws:first-vtc#key-0"
+    "verificationMethod": "did:webvh:Qme5ThEEr1qRLRHYMrcrmjecG3znC8FBPEoswuSjebFkhx:webvh.anon.org:first-vtc#key-0"
   },
   "threadId": "urn:uuid:030c8141-ac4a-478b-8a7b-3d1f61ac66b3",
   "type": "https://trusttasks.org/spec/vtc/join-requests/manifest/0.3#response"

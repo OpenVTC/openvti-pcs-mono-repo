@@ -2,7 +2,7 @@
 
 The Verifiable Trust Infrastructure (VTI) is a Rust workspace that
 implements the two service backends of the
-[First Person Network](https://www.firstperson.network/white-paper):
+[[network]](https://anonymized.example):
 the **Verifiable Trust Agent (VTA)** and the **Verifiable Trust
 Community (VTC)**. Together they let a real-world community manage
 its own identity, keys, members, credentials, and policies without

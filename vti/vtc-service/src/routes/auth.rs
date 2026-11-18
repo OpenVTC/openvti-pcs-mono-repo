@@ -289,7 +289,7 @@ async fn authenticate_and_mint(
     let sender_base = vti_common::auth::bind_authcrypt_sender(body, &msg, &metadata)
         .map_err(|e| AppError::Authentication(e.message("authenticate message")))?;
 
-    // Canonical Trust-Task URI only; the legacy `affinidi.com/atm/1.0`
+    // Canonical Trust-Task URI only; the legacy `anonymized.example/atm/1.0`
     // alias was removed (all VTC clients emit the canonical type).
     if msg.typ.as_str() != AUTHENTICATE_TASK_URI {
         return Err(AppError::Authentication(format!(
@@ -1464,7 +1464,7 @@ mod cookie_format_tests {
 
 /// The canonical `auth/refresh/0.2` Type URI, shared by both request shapes —
 /// the DIDComm envelope's `msg.typ` and the REST Trust Task's `type`. The
-/// legacy `affinidi.com/atm/1.0/authenticate/refresh` alias was removed.
+/// legacy `anonymized.example/atm/1.0/authenticate/refresh` alias was removed.
 const REFRESH_TASK_URI: &str = <refresh::Payload as trust_tasks_rs::Payload>::TYPE_URI;
 
 /// `POST /v1/auth/refresh` — exchange the presented refresh

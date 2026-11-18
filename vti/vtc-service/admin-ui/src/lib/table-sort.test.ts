@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import { compareValues, didHandle, matchScore, nextSort, searchTerms } from "./table-sort";
 
-const DID = "did:webvh:QmNvpxDbHuAbCdEf:webvh.storm.ws:glance-arrow";
+const DID = "did:webvh:QmNvpxDbHuAbCdEf:webvh.anon.org:glance-arrow";
 const fields = (name: string, did = DID) => ({
-  short: [name, "member", didHandle(did), "stormer78-2"],
+  short: [name, "member", didHandle(did), "alexh-2"],
   long: [did],
 });
 
@@ -15,8 +15,8 @@ describe("members search", () => {
 
   it("matches a substring of any field, case-insensitively", () => {
     expect(matchScore(searchTerms("ALI"), fields("Alice Wong"))).not.toBeNull();
-    expect(matchScore(searchTerms("storm.ws"), fields("Alice"))).not.toBeNull();
-    expect(matchScore(searchTerms("stormer"), fields("Alice"))).not.toBeNull();
+    expect(matchScore(searchTerms("anon.org"), fields("Alice"))).not.toBeNull();
+    expect(matchScore(searchTerms("alexh"), fields("Alice"))).not.toBeNull();
   });
 
   it("needs every term to match something", () => {

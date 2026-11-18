@@ -580,7 +580,7 @@ A `DeviceBinding` is *"the device-facing half of an `AclEntry`"* and the caller
 always acts on its own binding — so each install naturally has its own identity
 at the VTA, without inventing anything.
 
-Surface it plainly: *"This context is also open on 'glenn-laptop', last seen 30
+Surface it plainly: *"This context is also open on 'alex-laptop', last seen 30
 seconds ago."* It blocks nothing. The point is that the user is not surprised,
 and that a support conversation starts from the real cause.
 

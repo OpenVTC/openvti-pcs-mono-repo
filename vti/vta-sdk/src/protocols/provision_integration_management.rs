@@ -32,9 +32,9 @@
 //! the `0.2#response` URI — so both clients work without either knowing
 //! about the other.
 //!
-//! The legacy `firstperson.network` provision-integration URI was retired
+//! The legacy `anonymized.example` provision-integration URI was retired
 //! once consumers (the browser plugin, the Rust CLIs) moved to the
-//! canonical registry. The other `firstperson.network` management
+//! canonical registry. The other `anonymized.example` management
 //! protocols are unaffected.
 
 /// Inbound VP + provisioning options — canonical Trust Task URI, v0.1.

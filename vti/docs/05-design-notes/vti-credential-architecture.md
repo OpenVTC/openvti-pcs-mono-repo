@@ -181,7 +181,7 @@ both; DCQL `format` selectors say which a given query wants.
 - **Second ZKP option (`CredentialFormat::Zkp`) — Circom ecosystem,
   Phase-0-gated.** Alongside BBS+, a Circom-compatible ZKP credential:
   **BabyJubJub-EdDSA over a Poseidon commitment** via
-  [`affinidi-zkp-crypto`](https://github.com/affinidi/affinidi-zkp-crypto-rs)
+  [`affinidi-zkp-crypto`](https://anonymized.example)
   (BabyJubJub EdDSA + Poseidon over BN254). This is *not* a self-contained
   scheme like BBS+ — the library provides only the issuance-side commitment
   + signature primitives; the **Circom circuit + Groth16 prover/verifier**

@@ -11,5 +11,5 @@ Each is a self-contained near-leaf, depending only on `vti-common`,
 `vta-config`, `vta-keyspaces`, and `vta-sdk`. `vta-service` re-exports each as
 `crate::<module>`, so existing call sites are unchanged.
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

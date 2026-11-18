@@ -21,5 +21,5 @@ backend: `aws-secrets`, `azure-secrets`, `gcp-secrets`, `vault-secrets`,
 `k8s-secrets`, `config-seed`, `keyring`, `tee`. Off by default (the local/dev
 VTA uses the keyring or a config seed; the enclave enables `tee`).
 
-Part of the [Verifiable Trust Infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure)
+Part of the [Verifiable Trust Infrastructure](https://anonymized.example)
 workspace. Apache-2.0.

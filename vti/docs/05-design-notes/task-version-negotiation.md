@@ -1,7 +1,7 @@
 # Trust Task version negotiation, and the versioning contract it needs
 
 Status: **Design — not implemented.** Tracked by
-[#1045](https://github.com/OpenVTC/verifiable-trust-infrastructure/issues/1045).
+[#1045](https://anonymized.example).
 
 Two peers can be built against different versions of the same Trust Task. They
 should find a common version and use it, rather than one side guessing and

@@ -2,7 +2,7 @@
 
 The CNM CLI is the primary client for operating a
 [Verifiable Trust Agent (VTA)](../README.md) and participating in
-[Verifiable Trust Communities](https://www.firstperson.network/white-paper).
+[Verifiable Trust Communities](https://anonymized.example).
 It provides authentication, key management, access control, and
 multi-community support from a single command-line tool.
 
@@ -196,7 +196,7 @@ url = "https://personal.vta.example.com"
 
 [communities.storm]
 name = "Storm Network"
-url = "https://vta.storm.ws"
+url = "https://vta.anon.org"
 context_id = "cnm-storm-network"
 vta_did = "did:webvh:..."
 
@@ -329,7 +329,7 @@ rest are admin REST until their Trust Tasks are served. Guide: [Peer identity ve
 
 - [VTA Service & Architecture](../README.md)
 - [PNM CLI (single-VTA)](../pnm-cli/README.md) -- simpler alternative for personal use
-- [First Person Network White Paper](https://www.firstperson.network/white-paper)
+- [[network] White Paper](https://anonymized.example)
 - [Documentation index](../docs/README.md)
 - [Architecture](../docs/01-concepts/architecture.md)
 - [BIP-32 Path Specification](../docs/04-reference/bip32-paths.md)

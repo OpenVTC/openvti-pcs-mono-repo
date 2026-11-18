@@ -262,8 +262,8 @@ pub struct SecuritySection {
     pub cors: String,
     /// Comma-separated CORS origin allowlist, required when `cors =
     /// "list"`. Entries are exact, scheme-qualified origins
-    /// (`https://app.affinidi.com`) or leftmost-label sub-domain
-    /// wildcards (`https://*.affinidi.com`).
+    /// (`https://anonymized.example`) or leftmost-label sub-domain
+    /// wildcards (`https://*.anonymized.example`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors_domains: Option<String>,
 }

@@ -16,7 +16,7 @@ If you discover a security vulnerability in OpenVTC, please report it responsibl
 
 **Do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, please email: **security@firstperson.network**
+Instead, please email: **security@anonymized.example**
 
 Include the following in your report:
 
@@ -46,9 +46,9 @@ The following are in scope:
 Out of scope here, but reportable to the same address:
 
 - The `did-git-sign` commit signer, developed in
-  [verifiable-git-infrastructure](https://github.com/OpenVTC/verifiable-git-infrastructure).
+  [verifiable-git-infrastructure](https://anonymized.example).
 - The VTA, VTC and other services, developed in
-  [verifiable-trust-infrastructure](https://github.com/OpenVTC/verifiable-trust-infrastructure).
+  [verifiable-trust-infrastructure](https://anonymized.example).
 
 ## Security Design
 

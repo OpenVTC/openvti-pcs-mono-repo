@@ -247,7 +247,7 @@ describe("browsing and reading members", () => {
   it("folds away members who show no name, and shows them on request", async () => {
     api.listEntries.mockResolvedValue({
       items: [
-        { entryId: "dir_aaaaaaaaaaaaaaaa", fields: { displayName: "Glenn Gore", role: "admin" } },
+        { entryId: "dir_aaaaaaaaaaaaaaaa", fields: { displayName: "Alex Example", role: "admin" } },
         { entryId: "dir_bbbbbbbbbbbbbbbb", fields: { role: "member" } },
         { entryId: "dir_cccccccccccccccc", fields: { role: "member" } },
       ],
@@ -258,7 +258,7 @@ describe("browsing and reading members", () => {
         <DirectoryPage />
       </ConfirmDialogProvider></QueryClientProvider>,
     );
-    expect(await screen.findByText("Glenn Gore")).toBeTruthy();
+    expect(await screen.findByText("Alex Example")).toBeTruthy();
     expect(screen.queryByText("A member")).toBeNull();
     const fold = screen.getByRole("button", { name: /2 members haven't added a name yet/ });
     fireEvent.click(fold);
@@ -271,13 +271,13 @@ describe("browsing and reading members", () => {
       entry: {
         entryId: "dir_aaaaaaaaaaaaaaaa",
         fields: {
-          displayName: "Glenn Gore",
+          displayName: "Alex Example",
           pronouns: "He/Him",
           bio: "CEO",
-          links: ["https://affinidi.com"],
+          links: ["https://anonymized.example"],
           personhood: false,
           role: "admin",
-          did: "did:example:glenn",
+          did: "did:example:alex",
         },
       },
     });
@@ -287,11 +287,11 @@ describe("browsing and reading members", () => {
         <EntryPage entryId="dir_aaaaaaaaaaaaaaaa" />
       </ConfirmDialogProvider></QueryClientProvider>,
     );
-    expect(await screen.findByRole("heading", { name: "Glenn Gore" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Alex Example" })).toBeTruthy();
     expect(screen.queryByText(/Personhood/i)).toBeNull();
     expect(screen.queryByText("Verified person")).toBeNull();
     const link = screen.getByRole("link", { name: /affinidi\.com/ });
-    expect(link.getAttribute("href")).toBe("https://affinidi.com/");
+    expect(link.getAttribute("href")).toBe("https://anonymized.example/");
     expect(link.getAttribute("rel")).toContain("noopener");
     expect(screen.getByRole("button", { name: /Save contact/ })).toBeTruthy();
     expect(screen.getByRole("navigation", { name: "Breadcrumb" }).textContent).toContain("Directory");
@@ -301,7 +301,7 @@ describe("browsing and reading members", () => {
 
   it("offers the member an edit of their own card from their own entry", async () => {
     api.showEntry.mockResolvedValue({
-      entry: { entryId: "dir_aaaaaaaaaaaaaaaa", fields: { displayName: "Glenn Gore" } },
+      entry: { entryId: "dir_aaaaaaaaaaaaaaaa", fields: { displayName: "Alex Example" } },
     });
     api.showCard.mockResolvedValue({ card: { entryId: "dir_aaaaaaaaaaaaaaaa", values: {} } });
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
