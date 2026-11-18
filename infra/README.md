@@ -201,19 +201,11 @@ has a persona DID.
 
 ## 5. Point OpenVTC clients at the stack
 
-> **Known blocker — read this first.** The OpenVTC client in `openvtc/`
-> resolves DIDs with resolvers built at their default host policy
-> (`DIDCacheConfigBuilder::default()` / `TDKConfig::builder()`, about 37 places
-> in `openvtc` and `openvtc-core`), and that default refuses every
-> `localhost` DID before making a request. Unlike the VTI services it does
-> **not** honour `VTA_ALLOW_PRIVATE_ENDPOINTS` for DID resolution (only
-> `openvtc health --allow-private-probes` and the manifest probe take a private
-> policy). Against this stack that breaks, at least, resolving the community
-> DID, checking invitations and VICs, and verifying the community's
-> signatures. The fix belongs in `openvtc/` (one resolver-config helper that
-> applies `vta_sdk::resolver::webvh_host_policy()`, used everywhere a resolver
-> or TDK is built); it is deliberately not made from `infra/`. The steps below
-> are what to run once that is in place; they are untested end to end.
+> **`VTA_ALLOW_PRIVATE_ENDPOINTS=1` must be set for the client too.**
+> Resolvers refuse DIDs on loopback hosts by default. The OpenVTC client honours
+> the same opt-in as the VTI services: every resolver and TDK instance it builds
+> takes its host policy from `openvtc_core::resolver_policy`. `stack.env`
+> (sourced below) sets the variable.
 
 Build the client on the host and keep each person's profile apart:
 
@@ -294,6 +286,6 @@ Not verified:
   Every step says what it is doing, and the script is safe to re-run.
 - The VTA/VTC with `--no-default-features` (no `keyring`) and the plaintext
   secret backends, as configured here.
-- The OpenVTC client against the stack (see the blocker in §5).
+- The OpenVTC client against the stack.
 - Whether the VTA, once running, publishes persona DIDs to the DID host over
   its `TrustTaskHTTPS` endpoint without further configuration.

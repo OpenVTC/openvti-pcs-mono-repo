@@ -1305,7 +1305,7 @@ mod tests {
                 DeleteContextPreviewResultBody {
                     id: "openvtc/kernel".into(),
                     keys: vec!["key-1".into()],
-                    webvh_dids: vec!["did:webvh:scid:host:p".into()],
+                    dids: vec!["did:webvh:scid:host:p".into()],
                     acl_entries_removed: vec!["did:key:zDevice".into()],
                     acl_entries_updated: vec!["did:key:zWide".into()],
                     did_templates: vec![],
