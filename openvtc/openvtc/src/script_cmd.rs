@@ -104,6 +104,22 @@ pub fn command() -> Command {
                         .help("Apply on the community's hidden (PCS) vetting path"),
                 ),
         )
+        .subcommand(
+            Command::new("join")
+                .about("Join a community whose vetting requirements this applicant already meets")
+                .arg(
+                    Arg::new("community")
+                        .long("community")
+                        .required(true)
+                        .help("The community's DID"),
+                )
+                .arg(
+                    Arg::new("timeout")
+                        .long("timeout")
+                        .default_value("600")
+                        .value_parser(clap::value_parser!(u64)),
+                ),
+        )
 }
 
 /// Run a `script` subcommand on a loaded profile.
@@ -126,6 +142,7 @@ pub async fn run(args: &ArgMatches, profile: &str, deferred: DeferredLoad) -> Re
             }
             Some(("vetter", a)) => roles::vetter(&mut driver, a).await,
             Some(("applicant", a)) => roles::applicant(&mut driver, a).await,
+            Some(("join", a)) => roles::join_only(&mut driver, a).await,
             _ => Err(anyhow!("unknown script")),
         };
         driver.flush_log();

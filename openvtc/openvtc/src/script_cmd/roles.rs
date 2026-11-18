@@ -149,7 +149,8 @@ async fn issue_ticket(d: &mut Driver, community: &str) -> Result<String> {
 }
 
 async fn try_issue_ticket(d: &mut Driver, community: &str) -> Result<String> {
-    let before = vetting(&d.state()).tickets.len();
+    let before: std::collections::HashSet<String> =
+        vetting(&d.state()).tickets.iter().map(|t| t.id.clone()).collect();
     let saved = d.step_timeout;
     d.step_timeout = Duration::from_secs(90);
     let result = new_ticket(d, community, before).await;
@@ -157,7 +158,11 @@ async fn try_issue_ticket(d: &mut Driver, community: &str) -> Result<String> {
     result
 }
 
-async fn new_ticket(d: &mut Driver, community: &str, before: usize) -> Result<String> {
+async fn new_ticket(
+    d: &mut Driver,
+    community: &str,
+    before: std::collections::HashSet<String>,
+) -> Result<String> {
     let community = community.to_string();
     d.vetting(V::NewTicket)?;
     d.wait_for("the new-ticket form", |s| {
@@ -182,10 +187,11 @@ async fn new_ticket(d: &mut Driver, community: &str, before: usize) -> Result<St
     d.vetting(V::Submit)?;
     let ticket = d
         .wait_for("the ticket", |s| {
-            let tickets = &vetting(s).tickets;
-            (tickets.len() > before)
-                .then(|| tickets.iter().find(|t| t.community == community && t.live))
-                .flatten()
+            // The ticket this press made: one not listed before it.
+            vetting(s)
+                .tickets
+                .iter()
+                .find(|t| !before.contains(&t.id))
                 .map(|t| t.uri.clone().unwrap_or_else(|| t.code.clone()))
         })
         .await?;
@@ -204,12 +210,18 @@ async fn run_sessions(
     for n in 1..=sessions {
         d.say(format!("{name}: wait for applicant #{n}'s request (Requests)"));
         desk_view(d, DeskView::Requests).await?;
+        let applicant = exchange.take("applicant", d.step_timeout).await?;
+        println!("   expecting {applicant}");
         let request = d
-            .wait_for("a vetting request", |s| {
+            .wait_for("this applicant's vetting request", |s| {
                 vetting(s)
                     .desk
                     .iter()
-                    .find(|r| r.community == community && r.stage == DeskStage::Accepted)
+                    .find(|r| {
+                        r.community == community
+                            && r.applicant == applicant
+                            && r.stage == DeskStage::Accepted
+                    })
                     .map(|r| r.request_id.clone())
             })
             .await?;
@@ -372,6 +384,11 @@ pub(super) async fn applicant(d: &mut Driver, a: &ArgMatches) -> Result<()> {
         }
     };
     println!("   application {application}");
+    // The vetters are told who is coming (in person, this is the applicant
+    // standing in front of them): the DID the application joins as.
+    if let Some(join_did) = app(&d.state(), &application).map(|r| r.join_did.clone()) {
+        exchange.put("applicant", &join_did)?;
+    }
     to_list(d).await?;
 
     if hidden {
@@ -430,15 +447,52 @@ pub(super) async fn applicant(d: &mut Driver, a: &ArgMatches) -> Result<()> {
         .await?;
         select_application(d, &application).await?;
         d.vetting(V::ReviewCard)?;
-        d.wait_for("the card preview", |s| match &vetting(s).mode {
-            VettingMode::SendCard { preview: Some(_), .. } => Some(()),
-            _ => None,
+        d.wait_for("the card view", |s| {
+            matches!(vetting(s).mode, VettingMode::SendCard { .. }).then_some(())
         })
         .await?;
+        // Enter asks the VTA for the preview of what the card discloses;
+        // Enter again sends it. While another send is still going the client
+        // says so and does nothing, so Enter is pressed again, as a person would.
+        let has_preview = |s: &State| {
+            matches!(&vetting(s).mode, VettingMode::SendCard { preview: Some(_), .. })
+        };
+        for _ in 0..30 {
+            if has_preview(&d.state()) {
+                break;
+            }
+            d.vetting(V::Submit)?;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                d.flush_log();
+                if has_preview(&d.state()) {
+                    break;
+                }
+            }
+        }
+        d.wait_for("the card preview", |s| has_preview(s).then_some(()))
+            .await?;
         if let VettingMode::SendCard { preview: Some(p), .. } = &vetting(&d.state()).mode {
             println!("   card preview: {p:?}");
+            if let Some(problem) = &p.problem {
+                bail!("the card preview found a problem: {problem}");
+            }
         }
-        d.vetting(V::Submit)?;
+        // Send it: Enter, again while another send is still going, until the
+        // card view closes on the sent card.
+        for _ in 0..30 {
+            if !matches!(vetting(&d.state()).mode, VettingMode::SendCard { .. }) {
+                break;
+            }
+            d.vetting(V::Submit)?;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                d.flush_log();
+                if !matches!(vetting(&d.state()).mode, VettingMode::SendCard { .. }) {
+                    break;
+                }
+            }
+        }
         d.say(format!("applicant: wait for statement #{n}"));
         d.wait_for("the vetter's statement", |s| {
             app(s, &application)
@@ -523,4 +577,16 @@ async fn choose_face(d: &mut Driver, application: &str) -> Result<()> {
     })
     .await?;
     to_list(d).await
+}
+
+/// Only the last step: join a community whose requirements are already met.
+pub(super) async fn join_only(d: &mut Driver, a: &ArgMatches) -> Result<()> {
+    d.step_timeout = timeout(a);
+    let community = a.get_one::<String>("community").expect("required").clone();
+    open_vetting(d, VettingTab::Applications).await?;
+    d.say("applicant: join (j)");
+    d.send(Action::StartJoinFor(community.clone()))?;
+    super::join::finish_join(d, &community).await?;
+    d.say("applicant: admitted");
+    Ok(())
 }

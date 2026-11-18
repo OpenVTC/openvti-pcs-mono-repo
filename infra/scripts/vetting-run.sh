@@ -5,8 +5,8 @@
 #
 # People (one OpenVTC profile each, under infra/.state/clients):
 #   carol, dave  vetters
-#   alice        applicant, peer vetting   (criterion kernel-developer)
-#   bob          applicant, hidden vetting (criterion kernel-developer-hidden)
+#   alice-<run>  applicant, peer vetting   (criterion kernel-developer)
+#   bob-<run>    applicant, hidden vetting (criterion kernel-developer-hidden)
 #
 # Prerequisites, once (infra/README.md):
 #   ./bootstrap.sh                       the stack, provisioned
@@ -36,10 +36,15 @@ ovt() { local who=$1; shift
   OPENVTC_DEBUG_LOG="$LOGS/$who-trace.log" "$OPENVTC" -p "$who" \
     --unlock-code-file "$STATE/clients/$who.unlock" "$@"; }
 
-[ -x "$OPENVTC" ] || { echo "build the client first: cargo build -p openvtc --features scripted" >&2; exit 1; }
+[ -x "$OPENVTC" ] && "$OPENVTC" script vetter --help >/dev/null 2>&1 || {
+  echo "$OPENVTC is not a \`scripted\` build: cargo build -p openvtc --features scripted" >&2; exit 1; }
 
-# 1. Profiles.
-for who in carol dave alice bob; do
+# 1. Profiles. The vetters are made once and reused; each run's applicants are
+#    new people (an application belongs to its applicant for good).
+RUN_ID=${RUN_ID:-$(date +%m%d%H%M)}
+ALICE=${ALICE:-alice-$RUN_ID}
+BOB=${BOB:-bob-$RUN_ID}
+for who in carol dave "$ALICE" "$BOB"; do
   if [ ! -f "$STATE/clients/config-$who.json" ]; then
     say "profile $who"
     "$INFRA/scripts/client-setup.sh" "$who"
@@ -78,8 +83,13 @@ run_flow() { # name applicant criterion-flag
   done
   # Name the vetters while their clients are connected, so the grant (pushed
   # over DIDComm) arrives live. Re-granting also makes the run repeatable.
+  local i=0
   for v in carol dave; do
-    until grep -q '^== ' "$LOGS/$flow-$v.log" 2>/dev/null; do sleep 2; done
+    until grep -q '^== ' "$LOGS/$flow-$v.log" 2>/dev/null; do
+      kill -0 "${pids[$i]}" 2>/dev/null || { cat "$LOGS/$flow-$v.log"; say "$v's client exited"; return 1; }
+      sleep 2
+    done
+    i=$((i + 1))
   done
   sleep 15
   for v in carol dave; do
@@ -116,8 +126,8 @@ hidden_setup() {
 }
 
 case $what in
-  peer)   peer_setup && run_flow peer alice ;;
-  hidden) hidden_setup && run_flow hidden bob --hidden ;;
-  all)    peer_setup && run_flow peer alice && hidden_setup && run_flow hidden bob --hidden ;;
+  peer)   peer_setup && run_flow peer "$ALICE" ;;
+  hidden) hidden_setup && run_flow hidden "$BOB" --hidden ;;
+  all)    peer_setup && run_flow peer "$ALICE" && hidden_setup && run_flow hidden "$BOB" --hidden ;;
   *) echo "usage: $0 [peer|hidden|all]" >&2; exit 2 ;;
 esac
