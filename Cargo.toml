@@ -6,6 +6,8 @@
 [workspace]
 members = [
   "pcs",
+  # The in-memory hidden-vetting prototype on pcreds (tests only).
+  "pcs/demo",
   "vti/cnm-cli",
   "vti/pnm-cli",
   "vti/vta-cli-common",

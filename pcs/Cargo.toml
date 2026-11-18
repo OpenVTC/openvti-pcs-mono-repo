@@ -144,3 +144,6 @@ lattice-plain = ["lattice"]
 lattice-extractable = ["lattice"]
 
 # Optimise test builds: the tests are dominated by pairings and scalar multiplications.
+
+# Upstream builds this crate standalone, without the workspace lint table.
+[lints]
